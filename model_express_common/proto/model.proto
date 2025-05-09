@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package model_express.model;
+
+// Model service for handling model downloads and status
+service ModelService {
+  // Ensure a model is downloaded and stream status updates until completion
+  rpc EnsureModelDownloaded(ModelDownloadRequest) returns (stream ModelStatusUpdate);
+}
+
+// Request to ensure a model is downloaded
+message ModelDownloadRequest {
+  string model_name = 1;
+  ModelProvider provider = 2;
+}
+
+// Streaming status update for model download progress
+message ModelStatusUpdate {
+  string model_name = 1;
+  ModelStatus status = 2;
+  // Optional message for additional context (e.g., progress info, error details)
+  optional string message = 3;
+  ModelProvider provider = 4;
+}
+
+// Enum representing the status of a model
+enum ModelStatus {
+  DOWNLOADING = 0;
+  DOWNLOADED = 1;
+  ERROR = 2;
+}
+
+// Enum representing model providers
+enum ModelProvider {
+  HUGGING_FACE = 0;
+}

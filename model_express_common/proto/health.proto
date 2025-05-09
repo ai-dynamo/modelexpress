@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package model_express.health;
+
+// Health service for server status checks
+service HealthService {
+  // Get server health status
+  rpc GetHealth(HealthRequest) returns (HealthResponse);
+}
+
+// Request for health check (empty for now, but allows for future extensions)
+message HealthRequest {}
+
+// Response containing server health information
+message HealthResponse {
+  string version = 1;
+  string status = 2;
+  uint64 uptime = 3;
+}

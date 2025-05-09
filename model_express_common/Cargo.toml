@@ -1,0 +1,24 @@
+[package]
+name = "model_express_common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2.0"
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+hf-hub = { version = "0.4.2", default-features = false, features = ["tokio", "rustls-tls"] }
+anyhow = "1.0.98"
+async-trait = "0.1"
+
+[dev-dependencies]
+mockall = "0.13"
+tempfile = "3.8"
+tokio-test = "0.4"
+
+[build-dependencies]
+tonic-build = { workspace = true }

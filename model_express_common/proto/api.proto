@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package model_express.api;
+
+// General API service for handling various requests
+service ApiService {
+  // Send a general request to the server
+  rpc SendRequest(ApiRequest) returns (ApiResponse);
+}
+
+// Request message for general API calls
+message ApiRequest {
+  string id = 1;
+  string action = 2;
+  // Using bytes for flexible payload that can contain JSON
+  optional bytes payload = 3;
+}
+
+// Response message for general API calls
+message ApiResponse {
+  bool success = 1;
+  // Using bytes for flexible data that can contain JSON
+  optional bytes data = 2;
+  optional string error = 3;
+}
