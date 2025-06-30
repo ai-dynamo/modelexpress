@@ -9,7 +9,7 @@ use model_express_common::{
 use model_express_server::services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl};
 use std::net::SocketAddr;
 use tonic::transport::Server;
-use tracing::{info, Level};
+use tracing::{Level, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[tokio::main]
