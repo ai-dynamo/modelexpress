@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use model_express_common::models::{ModelProvider, ModelStatus};
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{Connection, Result as SqliteResult, params};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
@@ -28,7 +28,7 @@ impl ModelDatabase {
 
         // Create the models table if it doesn't exist
         conn.execute(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS models (
                 model_name TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
@@ -37,7 +37,7 @@ impl ModelDatabase {
                 last_used_at TEXT NOT NULL,
                 message TEXT
             )
-            "#,
+            ",
             [],
         )?;
 
@@ -164,12 +164,12 @@ impl ModelDatabase {
 
         // Use INSERT OR REPLACE to handle both creation and updates
         conn.execute(
-            r#"
+            r"
             INSERT OR REPLACE INTO models (model_name, provider, status, created_at, last_used_at, message)
             VALUES (?1, ?2, ?3, 
                 COALESCE((SELECT created_at FROM models WHERE model_name = ?1), ?4),
                 ?4, ?5)
-            "#,
+            ",
             params![
                 model_name,
                 provider_str,
@@ -182,7 +182,7 @@ impl ModelDatabase {
         Ok(())
     }
 
-    /// Update the last_used_at timestamp for a model
+    /// Update the `last_used_at` timestamp for a model
     pub fn touch_model(&self, model_name: &str) -> SqliteResult<()> {
         let conn = self.connection.lock().unwrap();
         let now = Utc::now();
@@ -207,7 +207,9 @@ impl ModelDatabase {
         let conn = self.connection.lock().unwrap();
 
         let query = if let Some(limit) = limit {
-            format!("SELECT model_name, provider, status, created_at, last_used_at, message FROM models ORDER BY last_used_at ASC LIMIT {}", limit)
+            format!(
+                "SELECT model_name, provider, status, created_at, last_used_at, message FROM models ORDER BY last_used_at ASC LIMIT {limit}"
+            )
         } else {
             "SELECT model_name, provider, status, created_at, last_used_at, message FROM models ORDER BY last_used_at ASC".to_string()
         };
@@ -530,7 +532,7 @@ mod tests {
         ];
 
         for (i, status) in statuses.iter().enumerate() {
-            let model_name = format!("model{}", i);
+            let model_name = format!("model{i}");
             db.set_status(&model_name, provider, *status, None).unwrap();
 
             let retrieved_status = db.get_status(&model_name).unwrap().unwrap();
@@ -545,7 +547,7 @@ mod tests {
 
         // Test that multiple operations can be performed without deadlock
         for i in 0..10 {
-            let model_name = format!("model{}", i);
+            let model_name = format!("model{i}");
             db.set_status(&model_name, provider, ModelStatus::DOWNLOADED, None)
                 .unwrap();
             let _status = db.get_status(&model_name).unwrap();

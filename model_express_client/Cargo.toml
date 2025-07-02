@@ -1,7 +1,7 @@
 [package]
 name = "model_express_client"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 model_express_common = { path = "../model_express_common" }
@@ -11,10 +11,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
-futures = "0.3"
-uuid = { version = "1.16", features = ["v4", "serde"] }
-thiserror = "2.0"
+futures = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
 tonic-build = { workspace = true }
+
+[lints]
+workspace = true

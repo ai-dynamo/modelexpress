@@ -2,14 +2,13 @@ mod config;
 mod error;
 
 use model_express_common::{
-    constants, download,
+    Result as CommonResult, constants, download,
     grpc::{
-        api::{api_service_client::ApiServiceClient, ApiRequest},
-        health::{health_service_client::HealthServiceClient, HealthRequest},
-        model::{model_service_client::ModelServiceClient, ModelDownloadRequest},
+        api::{ApiRequest, api_service_client::ApiServiceClient},
+        health::{HealthRequest, health_service_client::HealthServiceClient},
+        model::{ModelDownloadRequest, model_service_client::ModelServiceClient},
     },
     models::{ModelStatus, Status},
-    Result as CommonResult,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,7 +21,7 @@ pub use crate::config::ClientConfig;
 pub use crate::error::ClientError;
 pub use model_express_common::models::ModelProvider;
 
-/// The main client for interacting with the model_express_server via gRPC
+/// The main client for interacting with the `model_express_server` via gRPC
 pub struct Client {
     health_client: HealthServiceClient<Channel>,
     api_client: ApiServiceClient<Channel>,
@@ -138,15 +137,15 @@ impl Client {
                     // Fallback to direct download
                     match download::download_model(&model_name, provider).await {
                         Ok(_) => {
-                            info!("Model {} downloaded successfully via direct download", model_name);
+                            info!(
+                                "Model {} downloaded successfully via direct download",
+                                model_name
+                            );
                             Ok(())
                         }
-                        Err(download_err) => {
-                            Err(model_express_common::Error::Server(format!(
-                                "Both server and direct download failed. Server error: {}. Download error: {}",
-                                e, download_err
-                            )))
-                        }
+                        Err(download_err) => Err(model_express_common::Error::Server(format!(
+                            "Both server and direct download failed. Server error: {e}. Download error: {download_err}"
+                        ))),
                     }
                 } else {
                     // For other types of errors, don't fallback
@@ -205,8 +204,7 @@ impl Client {
                         .message
                         .unwrap_or_else(|| "Unknown error occurred".to_string());
                     return Err(model_express_common::Error::Server(format!(
-                        "Model download failed: {}",
-                        error_message
+                        "Model download failed: {error_message}"
                     )));
                 }
                 ModelStatus::DOWNLOADING => {
@@ -289,7 +287,7 @@ impl Client {
         download::download_model(&model_name, provider)
             .await
             .map_err(|e| {
-                model_express_common::Error::Server(format!("Direct download failed: {}", e))
+                model_express_common::Error::Server(format!("Direct download failed: {e}"))
             })?;
 
         info!("Model {} downloaded successfully", model_name);
@@ -439,7 +437,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Ignore by default since it requires a running server
+    #[ignore = "Ignore by default since it requires a running server"]
     async fn test_integration_health_check() {
         wait_for_server_startup().await;
 
@@ -458,7 +456,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Ignore by default since it requires a running server
+    #[ignore = "Ignore by default since it requires a running server"]
     async fn test_integration_ping_request() {
         wait_for_server_startup().await;
 
@@ -474,7 +472,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    #[ignore] // Ignore by default since it requires a running server and network access
+    #[ignore = "Ignore by default since it requires a running server and network access"]
     async fn test_integration_model_request_tiny_model() {
         wait_for_server_startup().await;
 
@@ -489,7 +487,7 @@ mod integration_tests {
             // In a real integration test environment, you might use a mock model
             match result {
                 Ok(()) => println!("Model download successful"),
-                Err(e) => println!("Model download failed (expected in unit test env): {}", e),
+                Err(e) => println!("Model download failed (expected in unit test env): {e}"),
             }
         } else {
             println!("Skipping integration test - server not available");

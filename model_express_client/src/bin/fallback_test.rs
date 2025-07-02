@@ -18,17 +18,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     {
         Ok(()) => {
+            println!("✅ SUCCESS: Model '{model_name}' downloaded successfully!");
             println!(
-                "✅ SUCCESS: Model '{}' downloaded successfully!",
-                model_name
+                "The download worked either via server (if running) or direct download (if server unavailable)"
             );
-            println!("The download worked either via server (if running) or direct download (if server unavailable)");
         }
         Err(e) => {
-            println!(
-                "❌ FAILED: Could not download model '{}': {}",
-                model_name, e
-            );
+            println!("❌ FAILED: Could not download model '{model_name}': {e}");
             return Err(e.into());
         }
     }

@@ -2,13 +2,12 @@ use crate::database::ModelDatabase;
 use model_express_common::{
     download,
     grpc::{
-        api::{api_service_server::ApiService, ApiRequest, ApiResponse},
-        health::{health_service_server::HealthService, HealthRequest, HealthResponse},
-        model::{model_service_server::ModelService, ModelDownloadRequest, ModelStatusUpdate},
+        api::{ApiRequest, ApiResponse, api_service_server::ApiService},
+        health::{HealthRequest, HealthResponse, health_service_server::HealthService},
+        model::{ModelDownloadRequest, ModelStatusUpdate, model_service_server::ModelService},
     },
     models::{ModelProvider, ModelStatus},
 };
-use once_cell::sync::Lazy;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -60,27 +59,24 @@ impl ApiService for ApiServiceImpl {
         info!("Received gRPC request: {:?}", api_request);
 
         // Process the request based on the action
-        match api_request.action.as_str() {
-            "ping" => {
-                info!("Processing ping request");
-                let response_data = serde_json::json!({ "message": "pong" });
-                let data_bytes = serde_json::to_vec(&response_data)
-                    .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+        if api_request.action.as_str() == "ping" {
+            info!("Processing ping request");
+            let response_data = serde_json::json!({ "message": "pong" });
+            let data_bytes = serde_json::to_vec(&response_data)
+                .map_err(|e| Status::internal(format!("Serialization error: {e}")))?;
 
-                Ok(Response::new(ApiResponse {
-                    success: true,
-                    data: Some(data_bytes),
-                    error: None,
-                }))
-            }
-            _ => {
-                error!("Unknown action: {}", api_request.action);
-                Ok(Response::new(ApiResponse {
-                    success: false,
-                    data: None,
-                    error: Some(format!("Unknown action: {}", api_request.action)),
-                }))
-            }
+            Ok(Response::new(ApiResponse {
+                success: true,
+                data: Some(data_bytes),
+                error: None,
+            }))
+        } else {
+            error!("Unknown action: {}", api_request.action);
+            Ok(Response::new(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Unknown action: {}", api_request.action)),
+            }))
         }
     }
 }
@@ -165,12 +161,13 @@ impl ModelService for ModelServiceImpl {
 }
 
 /// Type alias for the complex waiting channels type
-type WaitingChannels = Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>>>>>;
+type WaitingChannels =
+    Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>>>>>;
 
-/// Tracks the status of model downloads using SQLite for persistence
+/// Tracks the status of model downloads using `SQLite` for persistence
 #[derive(Debug, Clone)]
 pub struct ModelDownloadTracker {
-    /// SQLite database for persistent model status tracking
+    /// `SQLite` database for persistent model status tracking
     database: ModelDatabase,
     /// Maps model names to list of channels waiting for updates  
     waiting_channels: WaitingChannels,
@@ -183,6 +180,7 @@ impl Default for ModelDownloadTracker {
 }
 
 impl ModelDownloadTracker {
+    #[must_use]
     pub fn new() -> Self {
         // Initialize database in the current directory
         let database =
@@ -262,10 +260,7 @@ impl ModelDownloadTracker {
         tx: tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
     ) {
         let mut waiting = self.waiting_channels.lock().unwrap();
-        waiting
-            .entry(model_name.to_string())
-            .or_default()
-            .push(tx);
+        waiting.entry(model_name.to_string()).or_default().push(tx);
     }
 
     /// Deletes the status of a model from the database
@@ -359,7 +354,7 @@ impl ModelDownloadTracker {
                         model_name_owned,
                         ModelStatus::ERROR,
                         provider,
-                        Some(format!("Download failed: {}", e)),
+                        Some(format!("Download failed: {e}")),
                     );
                 }
             }
@@ -378,7 +373,8 @@ impl ModelDownloadTracker {
 }
 
 /// Global model download tracker
-pub static MODEL_TRACKER: Lazy<ModelDownloadTracker> = Lazy::new(ModelDownloadTracker::new);
+pub static MODEL_TRACKER: std::sync::LazyLock<ModelDownloadTracker> =
+    std::sync::LazyLock::new(ModelDownloadTracker::new);
 
 #[cfg(test)]
 mod tests {
@@ -469,7 +465,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let model_name = format!("test-model-{}", timestamp);
+        let model_name = format!("test-model-{timestamp}");
         let provider = ModelProvider::HuggingFace;
 
         // Initially should return None
@@ -495,7 +491,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let model_name = format!("test-delete-model-{}", timestamp);
+        let model_name = format!("test-delete-model-{timestamp}");
         let provider = ModelProvider::HuggingFace;
 
         // Set status
@@ -514,7 +510,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let model_name = format!("test-already-downloaded-model-{}", timestamp);
+        let model_name = format!("test-already-downloaded-model-{timestamp}");
 
         // Pre-populate the model as downloaded
         MODEL_TRACKER.set_status(
@@ -586,10 +582,7 @@ mod tests {
         // Verify the channel was added by checking internal state
         let waiting_count = {
             let waiting = tracker.waiting_channels.lock().unwrap();
-            waiting
-                .get(model_name)
-                .map(|channels| channels.len())
-                .unwrap_or(0)
+            waiting.get(model_name).map_or(0, std::vec::Vec::len)
         };
         assert_eq!(waiting_count, 1);
 
@@ -604,10 +597,7 @@ mod tests {
         // Channels should be cleared for final statuses
         let waiting_count_after = {
             let waiting = tracker.waiting_channels.lock().unwrap();
-            waiting
-                .get(model_name)
-                .map(|channels| channels.len())
-                .unwrap_or(0)
+            waiting.get(model_name).map_or(0, std::vec::Vec::len)
         };
         assert_eq!(waiting_count_after, 0);
     }
