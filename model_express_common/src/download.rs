@@ -1,10 +1,13 @@
 use crate::models::ModelProvider;
 use anyhow::Result;
 use hf_hub::api::tokio::ApiBuilder;
+use std::env;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
 const IGNORED: [&str; 3] = [".gitattributes", "LICENSE", "README.md"];
+
+const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 
 /// Trait for model providers
 /// This trait provides the framework for supporting multiple model providers.
@@ -58,7 +61,11 @@ pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
         name.as_ref().display()
     );
     let name = name.as_ref();
-    let api = ApiBuilder::new().with_progress(false).build()?;
+    let token = env::var(HF_TOKEN_ENV_VAR).ok();
+    let api = ApiBuilder::new()
+        .with_progress(true)
+        .with_token(token)
+        .build()?;
     let model_name = name.display().to_string();
 
     let repo = api.model(model_name.clone());
