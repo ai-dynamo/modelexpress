@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run the concurrent model download test
     println!("\nRunning integration test for concurrent model downloads");
     let model_name = test_model.unwrap();
-    println!("Testing with model: {}", model_name);
+    println!("Testing with model: {model_name}");
 
     run_concurrent_model_test(&model_name).await?;
 
@@ -62,7 +62,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         let mut client1 = Client::new(ClientConfig::default())
             .await
             .expect("Failed to create client 1");
-        println!("Client 1: Requesting model {}", model_name1);
+        println!("Client 1: Requesting model {model_name1}");
         let start = Instant::now();
         client1
             .request_model(model_name1)
@@ -78,7 +78,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         let mut client2 = Client::new(ClientConfig::default())
             .await
             .expect("Failed to create client 2");
-        println!("Client 2: Requesting model {}", model_name2);
+        println!("Client 2: Requesting model {model_name2}");
         let start = Instant::now();
         client2
             .request_model(model_name2)

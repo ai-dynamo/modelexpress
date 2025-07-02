@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use model_express_common::models::{ModelProvider, ModelStatus, Status};
 use model_express_server::database::ModelDatabase;
 use tempfile::TempDir;
@@ -11,7 +11,7 @@ fn benchmark_database_operations(c: &mut Criterion) {
 
         let mut counter = 0;
         b.iter(|| {
-            let model_name = format!("benchmark-model-{}", counter);
+            let model_name = format!("benchmark-model-{counter}");
             counter += 1;
             db.set_status(
                 black_box(&model_name),
@@ -30,7 +30,7 @@ fn benchmark_database_operations(c: &mut Criterion) {
 
         // Pre-populate with some data
         for i in 0..1000 {
-            let model_name = format!("benchmark-model-{}", i);
+            let model_name = format!("benchmark-model-{i}");
             db.set_status(
                 &model_name,
                 ModelProvider::HuggingFace,
@@ -55,7 +55,7 @@ fn benchmark_database_operations(c: &mut Criterion) {
 
         // Pre-populate with data
         for i in 0..100 {
-            let model_name = format!("benchmark-model-{}", i);
+            let model_name = format!("benchmark-model-{i}");
             db.set_status(
                 &model_name,
                 ModelProvider::HuggingFace,

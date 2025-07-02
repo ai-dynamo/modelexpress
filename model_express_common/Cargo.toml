@@ -1,7 +1,7 @@
 [package]
 name = "model_express_common"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 serde = { workspace = true }
@@ -11,9 +11,9 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-hf-hub = { version = "0.4.2", default-features = false, features = ["tokio", "rustls-tls"] }
-anyhow = "1.0.98"
-async-trait = "0.1"
+hf-hub = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 mockall = "0.13"
@@ -22,3 +22,6 @@ tokio-test = "0.4"
 
 [build-dependencies]
 tonic-build = { workspace = true }
+
+[lints]
+workspace = true

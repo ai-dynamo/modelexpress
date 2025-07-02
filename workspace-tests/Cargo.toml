@@ -1,7 +1,7 @@
 [package]
 name = "model-express-workspace-tests"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 model_express_client = { path = "../model_express_client" }
@@ -9,7 +9,7 @@ model_express_common = { path = "../model_express_common" }
 model_express_server = { path = "../model_express_server" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
-tempfile = "3.8"
+tempfile = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -18,3 +18,7 @@ tokio-test = "0.4"
 [[bench]]
 name = "performance"
 harness = false
+
+
+[lints]
+workspace = true

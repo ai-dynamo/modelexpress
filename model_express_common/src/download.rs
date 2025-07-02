@@ -36,6 +36,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
 }
 
 /// Provider factory to get the appropriate provider implementation
+#[must_use]
 pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
     match provider {
         ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
@@ -93,7 +94,7 @@ pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
     let mut files_downloaded = false;
 
     for sib in info.siblings {
-        if IGNORED.contains(&sib.rfilename.as_str()) || is_image(&sib.rfilename) {
+        if IGNORED.contains(&sib.rfilename.as_str()) || is_image(Path::new(&sib.rfilename)) {
             continue;
         }
 
@@ -128,16 +129,23 @@ pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
     }
 }
 
-fn is_image(s: &str) -> bool {
-    s.ends_with(".png")
-        || s.ends_with("PNG")
-        || s.ends_with(".jpg")
-        || s.ends_with("JPG")
-        || s.ends_with(".jpeg")
-        || s.ends_with("JPEG")
+fn is_image(s: &Path) -> bool {
+    s.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("png")
+            || ext.eq_ignore_ascii_case("jpg")
+            || ext.eq_ignore_ascii_case("jpeg")
+            || ext.eq_ignore_ascii_case("gif")
+            || ext.eq_ignore_ascii_case("webp")
+            || ext.eq_ignore_ascii_case("svg")
+            || ext.eq_ignore_ascii_case("ico")
+            || ext.eq_ignore_ascii_case("bmp")
+            || ext.eq_ignore_ascii_case("tiff")
+            || ext.eq_ignore_ascii_case("tif")
+    })
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -166,17 +174,17 @@ mod tests {
 
     #[test]
     fn test_is_image_function() {
-        assert!(is_image("test.png"));
-        assert!(is_image("test.PNG"));
-        assert!(is_image("test.jpg"));
-        assert!(is_image("test.JPG"));
-        assert!(is_image("test.jpeg"));
-        assert!(is_image("test.JPEG"));
+        assert!(is_image(Path::new("test.png")));
+        assert!(is_image(Path::new("test.PNG")));
+        assert!(is_image(Path::new("test.jpg")));
+        assert!(is_image(Path::new("test.JPG")));
+        assert!(is_image(Path::new("test.jpeg")));
+        assert!(is_image(Path::new("test.JPEG")));
 
-        assert!(!is_image("test.txt"));
-        assert!(!is_image("test.py"));
-        assert!(!is_image("test"));
-        assert!(!is_image("test.model"));
+        assert!(!is_image(Path::new("test.txt")));
+        assert!(!is_image(Path::new("test.py")));
+        assert!(!is_image(Path::new("test")));
+        assert!(!is_image(Path::new("test.model")));
     }
 
     #[test]
@@ -216,10 +224,12 @@ mod tests {
 
         let result = mock_provider.download_model("test-model").await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Mock download failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Mock download failed")
+        );
     }
 
     #[tokio::test]
