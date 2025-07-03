@@ -299,6 +299,60 @@ impl ModelDatabase {
 
         Ok((downloading, downloaded, error))
     }
+
+    /// Atomically attempt to claim a model for downloading using compare-and-swap semantics
+    /// Returns the current status of the model:
+    /// - If model doesn't exist, creates it with DOWNLOADING status and returns DOWNLOADING
+    /// - If model exists, returns its current status without modification
+    /// This prevents race conditions in distributed environments
+    pub fn try_claim_for_download(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> SqliteResult<ModelStatus> {
+        let conn = self.connection.lock().unwrap();
+        let now = Utc::now();
+
+        let provider_str = match provider {
+            ModelProvider::HuggingFace => "HuggingFace",
+        };
+
+        // Use INSERT OR IGNORE to atomically create the record only if it doesn't exist
+        // This is our compare-and-swap operation
+        let rows_affected = conn.execute(
+            r#"
+            INSERT OR IGNORE INTO models (model_name, provider, status, created_at, last_used_at, message)
+            VALUES (?1, ?2, 'DOWNLOADING', ?3, ?3, 'Starting download...')
+            "#,
+            params![model_name, provider_str, now.to_rfc3339()],
+        )?;
+
+        if rows_affected > 0 {
+            // We successfully inserted the record, so we claimed it for download
+            Ok(ModelStatus::DOWNLOADING)
+        } else {
+            // Record already exists, get its current status directly
+            let mut stmt = conn.prepare("SELECT status FROM models WHERE model_name = ?1")?;
+            let mut rows = stmt.query_map([model_name], |row| {
+                let status_str: String = row.get(0)?;
+                Ok(status_str)
+            })?;
+
+            if let Some(row) = rows.next() {
+                let status_str = row?;
+                let status = match status_str.as_str() {
+                    "DOWNLOADING" => ModelStatus::DOWNLOADING,
+                    "DOWNLOADED" => ModelStatus::DOWNLOADED,
+                    "ERROR" => ModelStatus::ERROR,
+                    _ => ModelStatus::ERROR,
+                };
+                Ok(status)
+            } else {
+                // This should never happen, but handle it gracefully
+                Err(rusqlite::Error::QueryReturnedNoRows)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +610,87 @@ mod tests {
 
         let models = db.get_models_by_last_used(None).unwrap();
         assert_eq!(models.len(), 10);
+    }
+
+    #[test]
+    fn test_try_claim_for_download_new_model() {
+        let (db, _temp_dir) = create_test_database();
+        let model_name = "new-model";
+        let provider = ModelProvider::HuggingFace;
+
+        // Try to claim the model for download
+        let status = db.try_claim_for_download(model_name, provider).unwrap();
+        assert_eq!(status, ModelStatus::DOWNLOADING);
+
+        // Verify the model record was created
+        let record = db.get_model_record(model_name).unwrap().unwrap();
+        assert_eq!(record.model_name, model_name);
+        assert_eq!(record.provider, provider);
+        assert_eq!(record.status, ModelStatus::DOWNLOADING);
+    }
+
+    #[test]
+    fn test_try_claim_for_download_existing_model() {
+        let (db, _temp_dir) = create_test_database();
+        let model_name = "existing-model";
+        let provider = ModelProvider::HuggingFace;
+
+        // Pre-create the model record as DOWNLOADED
+        db.set_status(model_name, provider, ModelStatus::DOWNLOADED, None)
+            .unwrap();
+
+        // Try to claim the model for download
+        let status = db.try_claim_for_download(model_name, provider).unwrap();
+        assert_eq!(status, ModelStatus::DOWNLOADED);
+
+        // Verify the model record was not modified
+        let record = db.get_model_record(model_name).unwrap().unwrap();
+        assert_eq!(record.model_name, model_name);
+        assert_eq!(record.provider, provider);
+        assert_eq!(record.status, ModelStatus::DOWNLOADED);
+    }
+
+    #[test]
+    fn test_try_claim_for_download_race_condition() {
+        let (db, _temp_dir) = create_test_database();
+        let model_name = "race-condition-model";
+        let provider = ModelProvider::HuggingFace;
+
+        // Simulate two concurrent attempts to claim the model
+        let status1 = db.try_claim_for_download(model_name, provider).unwrap();
+        let status2 = db.try_claim_for_download(model_name, provider).unwrap();
+
+        // First call should claim it (DOWNLOADING), second should see it exists (DOWNLOADING)
+        assert_eq!(status1, ModelStatus::DOWNLOADING);
+        assert_eq!(status2, ModelStatus::DOWNLOADING);
+
+        // Verify the model record reflects the DOWNLOADING status
+        let record = db.get_model_record(model_name).unwrap().unwrap();
+        assert_eq!(record.model_name, model_name);
+        assert_eq!(record.provider, provider);
+        assert_eq!(record.status, ModelStatus::DOWNLOADING);
+    }
+
+    #[test]
+    fn test_try_claim_for_download_compare_and_swap() {
+        let (db, _temp_dir) = create_test_database();
+        let model_name = "test-cas-model";
+        let provider = ModelProvider::HuggingFace;
+
+        // First claim should succeed and return DOWNLOADING
+        let status1 = db.try_claim_for_download(model_name, provider).unwrap();
+        assert_eq!(status1, ModelStatus::DOWNLOADING);
+
+        // Second claim should return DOWNLOADING (existing status)
+        let status2 = db.try_claim_for_download(model_name, provider).unwrap();
+        assert_eq!(status2, ModelStatus::DOWNLOADING);
+
+        // Update to DOWNLOADED
+        db.set_status(model_name, provider, ModelStatus::DOWNLOADED, None)
+            .unwrap();
+
+        // Third claim should return DOWNLOADED (existing status)
+        let status3 = db.try_claim_for_download(model_name, provider).unwrap();
+        assert_eq!(status3, ModelStatus::DOWNLOADED);
     }
 }
