@@ -3,7 +3,7 @@ use model_express_common::constants;
 /// Configuration for the client
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// The gRPC endpoint of the server, e.g. "http://localhost:8001"
+    /// The gRPC endpoint of the server, e.g. "<http://localhost:8001>"
     pub grpc_endpoint: String,
 
     /// Timeout in seconds for requests (defaults to 30 if None)
@@ -20,6 +20,7 @@ impl ClientConfig {
     }
 
     /// Set a custom timeout
+    #[must_use]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = Some(timeout_secs);
         self

@@ -77,7 +77,7 @@ async fn test_integration_direct_download_invalid_model() {
 }
 
 #[tokio::test]
-#[ignore] // Ignore by default since it requires network access and takes time
+#[ignore = "Ignore by default since it requires network access and takes time"]
 async fn test_integration_small_model_download() {
     // Test with a very small, real model (only run this in CI or when explicitly requested)
     // Note: This test requires internet access and may take some time

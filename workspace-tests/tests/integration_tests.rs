@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 #[tokio::test]
-#[ignore] // Ignore by default since it requires a running server
+#[ignore = "Ignore by default since it requires a running server"]
 async fn test_integration_full_workflow() {
     // This test requires the server to be running
     let config = ClientConfig {
@@ -13,20 +13,19 @@ async fn test_integration_full_workflow() {
     };
 
     // Try to connect to the server
-    let mut client = match timeout(Duration::from_secs(5), Client::new(config)).await {
-        Ok(Ok(client)) => client,
-        _ => {
+    let mut client =
+        if let Ok(Ok(client)) = timeout(Duration::from_secs(5), Client::new(config)).await {
+            client
+        } else {
             println!("Server not available, skipping integration test");
             return;
-        }
-    };
+        };
 
     // Test health check
     let health_result = client.health_check().await;
     assert!(
         health_result.is_ok(),
-        "Health check failed: {:?}",
-        health_result
+        "Health check failed: {health_result:?}"
     );
 
     let status = health_result.unwrap();
@@ -35,11 +34,7 @@ async fn test_integration_full_workflow() {
 
     // Test ping request
     let ping_result: Result<serde_json::Value, _> = client.send_request("ping", None).await;
-    assert!(
-        ping_result.is_ok(),
-        "Ping request failed: {:?}",
-        ping_result
-    );
+    assert!(ping_result.is_ok(), "Ping request failed: {ping_result:?}");
 
     let ping_response = ping_result.unwrap();
     assert_eq!(ping_response["message"], "pong");
@@ -50,7 +45,7 @@ async fn test_integration_full_workflow() {
 }
 
 #[tokio::test]
-#[ignore] // Ignore by default since it may require network access
+#[ignore = "Ignore by default since it may require network access"]
 async fn test_integration_model_download_fallback() {
     let config = ClientConfig {
         grpc_endpoint: "http://127.0.0.1:99999".to_string(), // Invalid port to force fallback
@@ -87,7 +82,7 @@ async fn test_integration_direct_download_invalid_model() {
 }
 
 #[tokio::test]
-#[ignore] // Ignore by default since it requires network access and takes time
+#[ignore = "Ignore by default since it requires network access and takes time"]
 async fn test_integration_small_model_download() {
     // Test with a very small, real model (only run this in CI or when explicitly requested)
     // Note: This test requires internet access and may take some time
@@ -102,7 +97,7 @@ async fn test_integration_small_model_download() {
         Ok(()) => println!("Small model download successful"),
         Err(e) => {
             // In CI environments, this might fail due to network restrictions
-            println!("Model download failed (may be expected in test env): {}", e);
+            println!("Model download failed (may be expected in test env): {e}");
         }
     }
 }
@@ -119,9 +114,11 @@ async fn test_integration_client_config_validation() {
     // Default configuration
     let default_config = ClientConfig::default();
     assert!(default_config.grpc_endpoint.contains("localhost"));
-    assert!(default_config
-        .grpc_endpoint
-        .contains(&constants::DEFAULT_GRPC_PORT.to_string()));
+    assert!(
+        default_config
+            .grpc_endpoint
+            .contains(&constants::DEFAULT_GRPC_PORT.to_string())
+    );
 
     // Configuration with invalid endpoint should still create but fail on connection
     let invalid_config = ClientConfig::new("invalid-url");
