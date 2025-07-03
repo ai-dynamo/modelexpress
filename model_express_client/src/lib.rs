@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod cache_config;
 
 use model_express_common::{
     Result as CommonResult, constants, download,
@@ -21,6 +22,7 @@ use uuid::Uuid;
 // Re-export for public use
 pub use crate::config::ClientConfig;
 pub use crate::error::ClientError;
+pub use crate::cache_config::{CacheConfig, CacheStats, ModelInfo};
 pub use model_express_common::models::ModelProvider;
 
 /// The main client for interacting with the `model_express_server` via gRPC
@@ -28,6 +30,7 @@ pub struct Client {
     health_client: HealthServiceClient<Channel>,
     api_client: ApiServiceClient<Channel>,
     model_client: ModelServiceClient<Channel>,
+    cache_config: Option<CacheConfig>,
 }
 
 impl Client {
@@ -48,11 +51,77 @@ impl Client {
         let api_client = ApiServiceClient::new(channel.clone());
         let model_client = ModelServiceClient::new(channel);
 
+        // Try to discover cache configuration
+        let cache_config = CacheConfig::discover().ok();
+
         Ok(Self {
             health_client,
             api_client,
             model_client,
+            cache_config,
         })
+    }
+
+    /// Create a new client with cache configuration
+    pub async fn new_with_cache(config: ClientConfig, cache_config: CacheConfig) -> CommonResult<Self> {
+        let mut client = Self::new(config).await?;
+        client.cache_config = Some(cache_config);
+        Ok(client)
+    }
+
+    /// Get cache configuration
+    pub fn get_cache_config(&self) -> Option<&CacheConfig> {
+        self.cache_config.as_ref()
+    }
+
+    /// Set cache configuration
+    pub fn set_cache_config(&mut self, cache_config: CacheConfig) {
+        self.cache_config = Some(cache_config);
+    }
+
+    /// List cached models
+    pub fn list_cached_models(&self) -> CommonResult<CacheStats> {
+        let cache_config = self.cache_config.as_ref()
+            .ok_or_else(|| model_express_common::Error::Server("Cache not configured".to_string()))?;
+        
+        cache_config.get_cache_stats()
+            .map_err(|e| model_express_common::Error::Server(format!("Failed to get cache stats: {}", e)))
+    }
+
+    /// Clear specific model from cache
+    pub fn clear_cached_model(&self, model_name: &str) -> CommonResult<()> {
+        let cache_config = self.cache_config.as_ref()
+            .ok_or_else(|| model_express_common::Error::Server("Cache not configured".to_string()))?;
+        
+        cache_config.clear_model(model_name)
+            .map_err(|e| model_express_common::Error::Server(format!("Failed to clear model: {}", e)))
+    }
+
+    /// Clear entire cache
+    pub fn clear_all_cached_models(&self) -> CommonResult<()> {
+        let cache_config = self.cache_config.as_ref()
+            .ok_or_else(|| model_express_common::Error::Server("Cache not configured".to_string()))?;
+        
+        cache_config.clear_all()
+            .map_err(|e| model_express_common::Error::Server(format!("Failed to clear cache: {}", e)))
+    }
+
+    /// Pre-download model to cache
+    pub async fn preload_model_to_cache(&mut self, model_name: &str, provider: ModelProvider) -> CommonResult<()> {
+        info!("Pre-loading model {} to cache", model_name);
+        
+        // First try to download via server
+        match self.request_model_with_provider(model_name, provider).await {
+            Ok(()) => {
+                info!("Model {} pre-loaded successfully via server", model_name);
+                Ok(())
+            }
+            Err(e) => {
+                // Fallback to direct download
+                info!("Server unavailable, pre-loading model {} directly", model_name);
+                Self::download_model_directly(model_name, provider).await
+            }
+        }
     }
 
     /// Get the server health status

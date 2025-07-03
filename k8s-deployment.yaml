@@ -25,6 +25,8 @@ spec:
           value: "8000"
         - name: LOG_LEVEL
           value: "info"
+        - name: HF_HUB_CACHE
+          value: "/cache/models"
         resources:
           limits:
             cpu: "500m"
@@ -32,6 +34,12 @@ spec:
           requests:
             cpu: "200m"
             memory: "128Mi"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /cache
+        - name: model-db
+          mountPath: /app/models.db
+          subPath: models.db
         livenessProbe:
           tcpSocket:
             port: 8000
@@ -42,6 +50,37 @@ spec:
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 10
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache-pvc
+      - name: model-db
+        persistentVolumeClaim:
+          claimName: model-db-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-db-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: standard
 ---
 apiVersion: v1
 kind: Service
