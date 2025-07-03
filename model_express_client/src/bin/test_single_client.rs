@@ -66,28 +66,6 @@ async fn run_model_test(model_name: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-// Function to test provider selection
-#[allow(dead_code)]
-async fn run_provider_test(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = Client::new(ClientConfig::default()).await?;
-
-    println!("Testing explicit Hugging Face provider selection...");
-    let start = Instant::now();
-
-    client
-        .request_model_with_provider(model_name, ModelProvider::HuggingFace)
-        .await
-        .expect("Failed to download model with explicit Hugging Face provider");
-
-    println!(
-        "Model downloaded with explicit provider in {:?}",
-        start.elapsed()
-    );
-    println!("PROVIDER TEST PASSED: Model was downloaded using explicit provider selection");
-
-    Ok(())
-}
-
 // Function to test fallback functionality
 async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing fallback functionality (assuming server is running)...");
