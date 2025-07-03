@@ -279,96 +279,96 @@ impl ModelDownloadTracker {
         provider: ModelProvider,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
     ) -> ModelStatus {
-        // First check if we already know about this model
-        if let Some(status) = self.get_status(model_name) {
-            // Send current status
-            let update = ModelStatusUpdate {
-                model_name: model_name.to_string(),
-                status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
-                message: match status {
-                    ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
-                    ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
-                    ModelStatus::ERROR => Some("Previous download failed".to_string()),
-                },
-                provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
-            };
-
-            let _ = tx.send(Ok(update)).await;
-
-            // If downloading, add this channel to wait for updates
-            if status == ModelStatus::DOWNLOADING {
-                self.add_waiting_channel(model_name, tx.clone());
-                // Wait for completion by monitoring the status
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    if let Some(current_status) = self.get_status(model_name) {
-                        if current_status != ModelStatus::DOWNLOADING {
-                            return current_status;
-                        }
-                    }
-                }
+        // Atomically try to claim this model for download using compare-and-swap
+        let status = match self.database.try_claim_for_download(model_name, provider) {
+            Ok(status) => status,
+            Err(e) => {
+                error!("Failed to claim model for download: {}", e);
+                // Send error and return
+                let error_update = ModelStatusUpdate {
+                    model_name: model_name.to_string(),
+                    status: model_express_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
+                        as i32,
+                    message: Some("Database error occurred".to_string()),
+                    provider: model_express_common::grpc::model::ModelProvider::from(provider)
+                        as i32,
+                };
+                let _ = tx.send(Ok(error_update)).await;
+                return ModelStatus::ERROR;
             }
+        };
 
-            return status;
-        }
-
-        // Add this channel to waiting list before starting download
-        self.add_waiting_channel(model_name, tx.clone());
-
-        // Start the download process
-        self.set_status(model_name.to_string(), ModelStatus::DOWNLOADING, provider);
-
-        // Send initial downloading status
-        let downloading_update = ModelStatusUpdate {
+        // Send current status
+        let update = ModelStatusUpdate {
             model_name: model_name.to_string(),
-            status: model_express_common::grpc::model::ModelStatus::from(ModelStatus::DOWNLOADING)
-                as i32,
-            message: Some("Starting model download...".to_string()),
+            status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
+            message: match status {
+                ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
+                ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
+                ModelStatus::ERROR => Some("Previous download failed".to_string()),
+            },
             provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
         };
 
-        if tx.send(Ok(downloading_update)).await.is_err() {
-            return ModelStatus::ERROR; // Client disconnected
-        }
+        let _ = tx.send(Ok(update)).await;
 
-        // Clone values for the download
-        let tracker = self.clone();
-        let model_name_owned = model_name.to_string();
+        // If the model already existed and is downloading, add this channel to wait for updates
+        if status == ModelStatus::DOWNLOADING {
+            self.add_waiting_channel(model_name, tx.clone());
 
-        // Perform the download in the background
-        tokio::spawn(async move {
-            match download::download_model(&model_name_owned, provider).await {
-                Ok(_path) => {
-                    // Download completed successfully
-                    tracker.set_status_and_notify(
-                        model_name_owned,
-                        ModelStatus::DOWNLOADED,
-                        provider,
-                        Some("Model download completed successfully".to_string()),
-                    );
-                }
-                Err(e) => {
-                    // Download failed
-                    error!("Failed to download model {}: {}", model_name_owned, e);
-                    tracker.set_status_and_notify(
-                        model_name_owned,
-                        ModelStatus::ERROR,
-                        provider,
-                        Some(format!("Download failed: {e}")),
-                    );
+            // Check if we were the ones who just claimed it vs. it was already downloading
+            // If we just claimed it, we need to start the actual download
+            // We can determine this by checking if there are any waiting channels yet
+            let should_start_download = {
+                let waiting = self.waiting_channels.lock().unwrap();
+                waiting
+                    .get(model_name)
+                    .map_or(true, |channels| channels.len() <= 1)
+            };
+
+            if should_start_download {
+                // We claimed the model, so we're responsible for downloading it
+                let tracker = self.clone();
+                let model_name_owned = model_name.to_string();
+
+                // Perform the download in the background
+                tokio::spawn(async move {
+                    match download::download_model(&model_name_owned, provider).await {
+                        Ok(_path) => {
+                            // Download completed successfully
+                            tracker.set_status_and_notify(
+                                model_name_owned,
+                                ModelStatus::DOWNLOADED,
+                                provider,
+                                Some("Model download completed successfully".to_string()),
+                            );
+                        }
+                        Err(e) => {
+                            // Download failed
+                            error!("Failed to download model {model_name_owned}: {e}");
+                            tracker.set_status_and_notify(
+                                model_name_owned,
+                                ModelStatus::ERROR,
+                                provider,
+                                Some(format!("Download failed: {e}")),
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Wait for completion by monitoring the status
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if let Some(current_status) = self.get_status(model_name) {
+                    if current_status != ModelStatus::DOWNLOADING {
+                        return current_status;
+                    }
                 }
             }
-        });
-
-        // Wait for completion
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            if let Some(current_status) = self.get_status(model_name) {
-                if current_status != ModelStatus::DOWNLOADING {
-                    return current_status;
-                }
-            }
         }
+
+        return status;
     }
 }
 
@@ -633,5 +633,39 @@ mod tests {
 
         // Cleanup
         MODEL_TRACKER.delete_status(model_name);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_model_download_no_race_condition() {
+        let _temp_dir = TempDir::new().unwrap();
+        let tracker = ModelDownloadTracker::new();
+        let model_name = "test-concurrent-model";
+        let provider = ModelProvider::HuggingFace;
+
+        // Test that the compare-and-swap mechanism works
+        // First attempt should claim the model
+        let status1 = tracker
+            .database
+            .try_claim_for_download(model_name, provider)
+            .unwrap();
+        assert_eq!(status1, ModelStatus::DOWNLOADING);
+
+        // Second attempt should see it's already claimed
+        let status2 = tracker
+            .database
+            .try_claim_for_download(model_name, provider)
+            .unwrap();
+        assert_eq!(status2, ModelStatus::DOWNLOADING);
+
+        // Verify only one record exists
+        let record = tracker
+            .database
+            .get_model_record(model_name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, ModelStatus::DOWNLOADING);
+
+        // Cleanup
+        tracker.delete_status(model_name);
     }
 }
