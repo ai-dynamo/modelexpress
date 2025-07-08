@@ -13,7 +13,7 @@ use model_express_common::{
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 // Re-export for public use
