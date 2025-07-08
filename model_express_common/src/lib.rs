@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod download;
 pub mod models;
+pub mod cache;
 
 // Generated gRPC code
 #[allow(clippy::similar_names)]

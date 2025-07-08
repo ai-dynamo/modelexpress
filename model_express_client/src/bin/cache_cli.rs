@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
-use model_express_client::{Client, ClientConfig, CacheConfig, CacheStats, ModelProvider};
+use model_express_client::{Client, ClientConfig, ModelProvider};
+use model_express_common::cache::{CacheConfig, CacheStats};
 use std::path::PathBuf;
 use anyhow::Result;
 use tracing::{info, warn, error, debug};
+use std::io::Write;
 
 #[derive(Parser)]
 #[command(name = "model-express")]

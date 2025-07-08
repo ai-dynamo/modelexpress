@@ -1,3 +1,4 @@
+use crate::constants;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
@@ -191,7 +192,7 @@ impl CacheConfig {
     /// Get default server endpoint
     fn get_default_server_endpoint() -> String {
         env::var("MODEL_EXPRESS_SERVER_ENDPOINT")
-            .unwrap_or_else(|_| format!("http://localhost:{}", model_express_common::constants::DEFAULT_GRPC_PORT))
+            .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT))
     }
 
     /// Get configuration file path
@@ -395,13 +396,13 @@ pub struct ModelInfo {
 }
 
 impl CacheStats {
-    /// Format total size as human readable string
-    pub fn format_total_size(&self) -> String {
+    /// Format bytes as human readable string
+    fn format_bytes(bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
         const GB: u64 = MB * 1024;
 
-        match self.total_size {
+        match bytes {
             size if size >= GB => format!("{:.2} GB", size as f64 / GB as f64),
             size if size >= MB => format!("{:.2} MB", size as f64 / MB as f64),
             size if size >= KB => format!("{:.2} KB", size as f64 / KB as f64),
@@ -409,18 +410,14 @@ impl CacheStats {
         }
     }
 
+    /// Format total size as human readable string
+    pub fn format_total_size(&self) -> String {
+        Self::format_bytes(self.total_size)
+    }
+
     /// Format individual model size as human readable string
     pub fn format_model_size(&self, model: &ModelInfo) -> String {
-        const KB: u64 = 1024;
-        const MB: u64 = KB * 1024;
-        const GB: u64 = MB * 1024;
-
-        match model.size {
-            size if size >= GB => format!("{:.2} GB", size as f64 / GB as f64),
-            size if size >= MB => format!("{:.2} MB", size as f64 / MB as f64),
-            size if size >= KB => format!("{:.2} KB", size as f64 / KB as f64),
-            size => format!("{} bytes", size),
-        }
+        Self::format_bytes(model.size)
     }
 }
 

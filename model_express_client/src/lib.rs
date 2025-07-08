@@ -1,9 +1,8 @@
 mod config;
 mod error;
-mod cache_config;
 
 use model_express_common::{
-    Result as CommonResult, constants, download,
+    Result as CommonResult, constants, download, cache::{CacheConfig, CacheStats, ModelInfo},
     grpc::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
         health::{HealthRequest, health_service_client::HealthServiceClient},
@@ -22,7 +21,7 @@ use uuid::Uuid;
 // Re-export for public use
 pub use crate::config::ClientConfig;
 pub use crate::error::ClientError;
-pub use crate::cache_config::{CacheConfig, CacheStats, ModelInfo};
+// pub use model_express_common::cache::{CacheConfig, CacheStats, ModelInfo};
 pub use model_express_common::models::ModelProvider;
 
 /// The main client for interacting with the `model_express_server` via gRPC
@@ -118,7 +117,7 @@ impl Client {
             }
             Err(e) => {
                 // Fallback to direct download
-                info!("Server unavailable, pre-loading model {} directly", model_name);
+                info!("Server unavailable, pre-loading model {} directly. Error: {}", model_name, e);
                 Self::download_model_directly(model_name, provider).await
             }
         }
