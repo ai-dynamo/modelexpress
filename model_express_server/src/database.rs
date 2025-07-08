@@ -22,6 +22,16 @@ pub struct ModelDatabase {
 }
 
 impl ModelDatabase {
+    /// Helper method to acquire the database connection with proper poison recovery
+    fn acquire_connection(&self) -> SqliteResult<std::sync::MutexGuard<Connection>> {
+        self.connection.lock().map_err(|_| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+                Some("Rust mutex protecting database connection is poisoned".to_string()),
+            )
+        })
+    }
+
     /// Create a new database instance and initialize the schema
     pub fn new(database_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::open(database_path)?;
@@ -56,12 +66,7 @@ impl ModelDatabase {
 
     /// Get the status of a model
     pub fn get_status(&self, model_name: &str) -> SqliteResult<Option<ModelStatus>> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
         let mut stmt = conn.prepare("SELECT status FROM models WHERE model_name = ?1")?;
 
         let mut rows = stmt.query_map([model_name], |row| {
@@ -85,12 +90,7 @@ impl ModelDatabase {
 
     /// Get the full record for a model
     pub fn get_model_record(&self, model_name: &str) -> SqliteResult<Option<ModelRecord>> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
         let mut stmt = conn.prepare(
             "SELECT model_name, provider, status, created_at, last_used_at, message FROM models WHERE model_name = ?1"
         )?;
@@ -159,12 +159,7 @@ impl ModelDatabase {
         status: ModelStatus,
         message: Option<String>,
     ) -> SqliteResult<()> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
         let now = Utc::now();
 
         let provider_str = match provider {
@@ -199,12 +194,7 @@ impl ModelDatabase {
 
     /// Update the `last_used_at` timestamp for a model
     pub fn touch_model(&self, model_name: &str) -> SqliteResult<()> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
         let now = Utc::now();
 
         conn.execute(
@@ -217,24 +207,14 @@ impl ModelDatabase {
 
     /// Delete a model record
     pub fn delete_model(&self, model_name: &str) -> SqliteResult<()> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
         conn.execute("DELETE FROM models WHERE model_name = ?1", [model_name])?;
         Ok(())
     }
 
     /// Get models ordered by last used (oldest first) - for future LRU cleanup
     pub fn get_models_by_last_used(&self, limit: Option<u32>) -> SqliteResult<Vec<ModelRecord>> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
 
         let query = if let Some(limit) = limit {
             format!(
@@ -304,12 +284,7 @@ impl ModelDatabase {
 
     /// Get count of models with each status - for monitoring
     pub fn get_status_counts(&self) -> SqliteResult<(u32, u32, u32)> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
 
         let mut downloading = 0u32;
         let mut downloaded = 0u32;
@@ -345,12 +320,7 @@ impl ModelDatabase {
         model_name: &str,
         provider: ModelProvider,
     ) -> SqliteResult<ModelStatus> {
-        let conn = self.connection.lock().map_err(|_| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
-                Some("Rust mutex protecting database connection is poisoned".to_string()),
-            )
-        })?;
+        let conn = self.acquire_connection()?;
         let now = Utc::now();
 
         let provider_str = match provider {
