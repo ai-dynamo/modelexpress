@@ -186,8 +186,7 @@ impl ModelDownloadTracker {
         let database = match ModelDatabase::new("./models.db") {
             Ok(db) => db,
             Err(e) => {
-                // Log the error and panic with a descriptive message
-                eprintln!("Failed to initialize model database: {e}");
+                error!("Critical error: Could not initialize model database at ./models.db: {e}");
                 panic!("Critical error: Could not initialize model database at ./models.db");
             }
         };
