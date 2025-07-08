@@ -4,9 +4,13 @@ use model_express_client::{Client, ClientConfig};
 use model_express_common::models::ModelProvider;
 use std::env;
 use std::time::{Duration, Instant};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    tracing_subscriber::fmt::init();
+
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
 
@@ -20,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(next_arg) = args.get(model_index.saturating_add(1)) {
             Some(next_arg.clone())
         } else {
-            println!("Error: --test-model requires a model name");
+            error!("Error: --test-model requires a model name");
             return Err("Missing model name".into());
         }
     } else {
@@ -31,21 +35,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = Client::new(ClientConfig::default()).await?;
 
     // Check server health
-    println!("Checking server health...");
+    info!("Checking server health...");
     let health = client.health_check().await?;
-    println!("Server status: {}", health.status);
-    println!("Server version: {}", health.version);
-    println!("Server uptime: {} seconds", health.uptime);
+    info!("Server status: {}", health.status);
+    info!("Server version: {}", health.version);
+    info!("Server uptime: {} seconds", health.uptime);
 
     // Run the concurrent model download test
-    println!("\nRunning integration test for concurrent model downloads");
+    info!("\nRunning integration test for concurrent model downloads");
     let model_name = test_model.expect("Model name should be present");
-    println!("Testing with model: {model_name}");
+    info!("Testing with model: {model_name}");
 
     run_concurrent_model_test(&model_name).await?;
 
     // Test provider selection with fallback
-    println!("\nTesting provider selection with fallback...");
+    info!("\nTesting provider selection with fallback...");
     run_fallback_test(&model_name).await?;
 
     Ok(())
@@ -67,13 +71,13 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         let mut client1 = Client::new(ClientConfig::default())
             .await
             .expect("Failed to create client 1");
-        println!("Client 1: Requesting model {model_name1}");
+        info!("Client 1: Requesting model {model_name1}");
         let start = Instant::now();
         client1
             .request_model(model_name1)
             .await
             .expect("Client 1 failed to download model");
-        println!("Client 1: Model downloaded in {:?}", start.elapsed());
+        info!("Client 1: Model downloaded in {:?}", start.elapsed());
     });
 
     // Wait a short time so the first client starts first
@@ -83,22 +87,22 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         let mut client2 = Client::new(ClientConfig::default())
             .await
             .expect("Failed to create client 2");
-        println!("Client 2: Requesting model {model_name2}");
+        info!("Client 2: Requesting model {model_name2}");
         let start = Instant::now();
         client2
             .request_model(model_name2)
             .await
             .expect("Client 2 failed to download model");
-        println!("Client 2: Model downloaded in {:?}", start.elapsed());
+        info!("Client 2: Model downloaded in {:?}", start.elapsed());
     });
 
     // Wait for both clients to complete
     client1_task.await?;
     client2_task.await?;
 
-    println!("Both clients completed in {:?}", start_time.elapsed());
+    info!("Both clients completed in {:?}", start_time.elapsed());
 
-    println!("INTEGRATION TEST PASSED: Model was downloaded and both clients received it");
+    info!("INTEGRATION TEST PASSED: Model was downloaded and both clients received it");
 
     Ok(())
 }
@@ -108,7 +112,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
 async fn run_provider_test(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = Client::new(ClientConfig::default()).await?;
 
-    println!("Testing explicit Hugging Face provider selection...");
+    info!("Testing explicit Hugging Face provider selection...");
     let start = Instant::now();
 
     client
@@ -116,18 +120,18 @@ async fn run_provider_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         .await
         .expect("Failed to download model with explicit Hugging Face provider");
 
-    println!(
+    info!(
         "Model downloaded with explicit provider in {:?}",
         start.elapsed()
     );
-    println!("PROVIDER TEST PASSED: Model was downloaded using explicit provider selection");
+    info!("PROVIDER TEST PASSED: Model was downloaded using explicit provider selection");
 
     Ok(())
 }
 
 // Function to test fallback functionality
 async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Testing fallback functionality (assuming server is running)...");
+    info!("Testing fallback functionality (assuming server is running)...");
     let mut client = Client::new(ClientConfig::default()).await?;
 
     let start = Instant::now();
@@ -138,23 +142,23 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         .await
         .expect("Failed to download model with fallback enabled");
 
-    println!(
+    info!(
         "Model downloaded with fallback capability in {:?}",
         start.elapsed()
     );
 
     // Test direct download functionality
-    println!("Testing direct download (bypassing server)...");
+    info!("Testing direct download (bypassing server)...");
     let start_direct = Instant::now();
 
     Client::download_model_directly(model_name, ModelProvider::HuggingFace)
         .await
         .expect("Failed to download model directly");
 
-    println!("Model downloaded directly in {:?}", start_direct.elapsed());
+    info!("Model downloaded directly in {:?}", start_direct.elapsed());
 
     // Test smart fallback (will use server if available, direct download if not)
-    println!("Testing smart fallback...");
+    info!("Testing smart fallback...");
     let start_smart = Instant::now();
 
     Client::request_model_with_smart_fallback(
@@ -165,11 +169,11 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
     .await
     .expect("Failed to download model with smart fallback");
 
-    println!(
+    info!(
         "Model downloaded with smart fallback in {:?}",
         start_smart.elapsed()
     );
-    println!(
+    info!(
         "FALLBACK TEST PASSED: Server-with-fallback, direct download, and smart fallback all work"
     );
 

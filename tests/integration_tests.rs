@@ -2,10 +2,14 @@ use model_express_client::{Client, ClientConfig};
 use model_express_common::{constants, models::ModelProvider};
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 #[tokio::test]
 #[ignore] // Ignore by default since it requires a running server
 async fn test_integration_full_workflow() {
+    // Initialize logging for tests
+    let _ = tracing_subscriber::fmt::try_init();
+
     // This test requires the server to be running
     let config = ClientConfig {
         grpc_endpoint: format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT),
@@ -16,7 +20,7 @@ async fn test_integration_full_workflow() {
     let mut client = match timeout(Duration::from_secs(5), Client::new(config)).await {
         Ok(Ok(client)) => client,
         _ => {
-            println!("Server not available, skipping integration test");
+            info!("Server not available, skipping integration test");
             return;
         }
     };
@@ -24,7 +28,7 @@ async fn test_integration_full_workflow() {
     // Test health check
     let health_result = client.health_check().await;
     assert!(health_result.is_ok(), "Health check failed: {:?}", health_result);
-    
+
     let status = health_result.unwrap();
     assert!(!status.version.is_empty());
     assert_eq!(status.status, "ok");
@@ -32,7 +36,7 @@ async fn test_integration_full_workflow() {
     // Test ping request
     let ping_result: Result<serde_json::Value, _> = client.send_request("ping", None).await;
     assert!(ping_result.is_ok(), "Ping request failed: {:?}", ping_result);
-    
+
     let ping_response = ping_result.unwrap();
     assert_eq!(ping_response["message"], "pong");
 
@@ -81,17 +85,17 @@ async fn test_integration_direct_download_invalid_model() {
 async fn test_integration_small_model_download() {
     // Test with a very small, real model (only run this in CI or when explicitly requested)
     // Note: This test requires internet access and may take some time
-    
+
     let result = Client::download_model_directly(
         "prajjwal1/bert-tiny", // A very small BERT model for testing
         ModelProvider::HuggingFace,
     ).await;
 
     match result {
-        Ok(()) => println!("Small model download successful"),
+        Ok(()) => info!("Small model download successful"),
         Err(e) => {
             // In CI environments, this might fail due to network restrictions
-            println!("Model download failed (may be expected in test env): {}", e);
+            warn!("Model download failed (may be expected in test env): {}", e);
         }
     }
 }
@@ -99,7 +103,7 @@ async fn test_integration_small_model_download() {
 #[tokio::test]
 async fn test_integration_client_config_validation() {
     // Test various client configurations
-    
+
     // Valid configuration
     let valid_config = ClientConfig::new("http://localhost:8001").with_timeout(30);
     assert_eq!(valid_config.grpc_endpoint, "http://localhost:8001");

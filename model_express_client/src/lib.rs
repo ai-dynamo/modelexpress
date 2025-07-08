@@ -455,7 +455,7 @@ mod integration_tests {
             // uptime is u64, so it's always >= 0, just check it exists
             let _uptime = status.uptime;
         } else {
-            println!("Skipping integration test - server not available");
+            info!("Skipping integration test - server not available");
         }
     }
 
@@ -471,7 +471,7 @@ mod integration_tests {
             let response = result.expect("Ping request should succeed");
             assert_eq!(response["message"], "pong");
         } else {
-            println!("Skipping integration test - server not available");
+            info!("Skipping integration test - server not available");
         }
     }
 
@@ -490,11 +490,11 @@ mod integration_tests {
             // We don't assert success here because it depends on network availability
             // In a real integration test environment, you might use a mock model
             match result {
-                Ok(()) => println!("Model download successful"),
-                Err(e) => println!("Model download failed (expected in unit test env): {e}"),
+                Ok(()) => info!("Model download successful"),
+                Err(e) => warn!("Model download failed (expected in unit test env): {e}"),
             }
         } else {
-            println!("Skipping integration test - server not available");
+            info!("Skipping integration test - server not available");
         }
     }
 }
