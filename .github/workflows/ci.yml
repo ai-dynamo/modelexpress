@@ -217,7 +217,7 @@ jobs:
         sleep 10
         # Test that the server is responding (basic health check)
         timeout 30 bash -c 'until curl -s http://localhost:8001/health; do sleep 1; done' || echo "Health check failed (expected for gRPC)"
-        docker stop test-server
+        docker stop test-server || true
 
   benchmark:
     name: Performance Benchmarks
