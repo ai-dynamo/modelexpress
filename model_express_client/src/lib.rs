@@ -13,7 +13,9 @@ use model_express_common::{
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(test)]
+use tracing::warn;
 use uuid::Uuid;
 
 // Re-export for public use
