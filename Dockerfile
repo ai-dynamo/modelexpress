@@ -1,25 +1,17 @@
-FROM rust:1.76 as builder
+FROM rust:1.84 AS builder
 
 WORKDIR /app
 
-# Copy the Cargo.toml files first to cache dependencies
-COPY Cargo.toml .
-COPY model_express_common/Cargo.toml model_express_common/
-COPY model_express_server/Cargo.toml model_express_server/
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create dummy source files to build dependencies
-RUN mkdir -p model_express_common/src model_express_server/src && \
-    touch model_express_common/src/lib.rs && \
-    touch model_express_server/src/main.rs && \
-    cargo build --release -p model_express_server
+# Copy the entire source code
+COPY . .
 
-# Copy the actual source code
-COPY model_express_common/src model_express_common/src
-COPY model_express_server/src model_express_server/src
-
-# Build the application with the actual source code
-RUN touch model_express_common/src/lib.rs model_express_server/src/main.rs && \
-    cargo build --release -p model_express_server
+# Build the application
+RUN cargo build --release -p model_express_server
 
 # Create a minimal runtime image
 FROM debian:bullseye-slim

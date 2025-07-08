@@ -1,11 +1,17 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use model_express_client::{Client, ClientConfig};
 use model_express_common::{constants, models::ModelProvider};
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 #[tokio::test]
 #[ignore = "Ignore by default since it requires a running server"]
 async fn test_integration_full_workflow() {
+    // Initialize logging for tests
+    let _ = tracing_subscriber::fmt::try_init();
+
     // This test requires the server to be running
     let config = ClientConfig {
         grpc_endpoint: format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT),
@@ -17,7 +23,7 @@ async fn test_integration_full_workflow() {
         if let Ok(Ok(client)) = timeout(Duration::from_secs(5), Client::new(config)).await {
             client
         } else {
-            println!("Server not available, skipping integration test");
+            info!("Server not available, skipping integration test");
             return;
         };
 
@@ -94,10 +100,10 @@ async fn test_integration_small_model_download() {
     .await;
 
     match result {
-        Ok(()) => println!("Small model download successful"),
+        Ok(()) => info!("Small model download successful"),
         Err(e) => {
             // In CI environments, this might fail due to network restrictions
-            println!("Model download failed (may be expected in test env): {e}");
+            warn!("Model download failed (may be expected in test env): {e}");
         }
     }
 }

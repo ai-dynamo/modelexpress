@@ -207,18 +207,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
     - name: Build Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile
-        push: false
-        tags: model-express:latest
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      run: |
+        docker build -t model-express:latest .
 
     - name: Test Docker image
       run: |
@@ -226,7 +217,7 @@ jobs:
         sleep 10
         # Test that the server is responding (basic health check)
         timeout 30 bash -c 'until curl -s http://localhost:8001/health; do sleep 1; done' || echo "Health check failed (expected for gRPC)"
-        docker stop test-server
+        docker stop test-server || true
 
   benchmark:
     name: Performance Benchmarks
