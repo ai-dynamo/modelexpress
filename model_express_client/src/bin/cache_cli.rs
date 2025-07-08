@@ -89,6 +89,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing subscriber for console output
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .init();
+    
     let cli = Cli::parse();
 
     match cli.command {
@@ -322,6 +328,27 @@ async fn show_cache_stats(detailed: bool) -> Result<()> {
 }
 
 fn get_cache_config() -> Result<CacheConfig> {
+    // Get CLI arguments
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Check for --cache-path argument
+    let cache_path = args.iter()
+        .position(|arg| arg == "--cache-path")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| PathBuf::from(s));
+    
+    // Check for --server-endpoint argument
+    let server_endpoint = args.iter()
+        .position(|arg| arg == "--server-endpoint")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    
+    // If cache path is provided via CLI, use it
+    if let Some(path) = cache_path {
+        return CacheConfig::from_path(path);
+    }
+    
+    // Otherwise, try to discover configuration
     CacheConfig::discover()
         .map_err(|e| anyhow::anyhow!("Failed to discover cache configuration: {}", e))
 }
