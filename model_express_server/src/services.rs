@@ -183,8 +183,14 @@ impl ModelDownloadTracker {
     #[must_use]
     pub fn new() -> Self {
         // Initialize database in the current directory
-        let database =
-            ModelDatabase::new("./models.db").expect("Failed to initialize model database");
+        let database = match ModelDatabase::new("./models.db") {
+            Ok(db) => db,
+            Err(e) => {
+                // Log the error and panic with a descriptive message
+                eprintln!("Failed to initialize model database: {e}");
+                panic!("Critical error: Could not initialize model database at ./models.db");
+            }
+        };
 
         Self {
             database,
@@ -228,7 +234,13 @@ impl ModelDownloadTracker {
         }
 
         // Notify all waiting channels
-        let mut waiting = self.waiting_channels.lock().unwrap();
+        let mut waiting = match self.waiting_channels.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Waiting channels mutex is poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         if let Some(channels) = waiting.get(&model_name) {
             let update = ModelStatusUpdate {
                 model_name: model_name.clone(),
@@ -259,7 +271,13 @@ impl ModelDownloadTracker {
         model_name: &str,
         tx: tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
     ) {
-        let mut waiting = self.waiting_channels.lock().unwrap();
+        let mut waiting = match self.waiting_channels.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Waiting channels mutex is poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
         waiting.entry(model_name.to_string()).or_default().push(tx);
     }
 
@@ -269,7 +287,14 @@ impl ModelDownloadTracker {
         if let Err(e) = self.database.delete_model(model_name) {
             error!("Failed to delete model from database: {}", e);
         }
-        self.waiting_channels.lock().unwrap().remove(model_name);
+        let mut waiting = match self.waiting_channels.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("Waiting channels mutex is poisoned, recovering");
+                poisoned.into_inner()
+            }
+        };
+        waiting.remove(model_name);
     }
 
     /// Initiates a download for a model and streams status updates
@@ -320,10 +345,16 @@ impl ModelDownloadTracker {
             // If we just claimed it, we need to start the actual download
             // We can determine this by checking if there are any waiting channels yet
             let should_start_download = {
-                let waiting = self.waiting_channels.lock().unwrap();
+                let waiting = match self.waiting_channels.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        error!("Waiting channels mutex is poisoned, recovering");
+                        poisoned.into_inner()
+                    }
+                };
                 waiting
                     .get(model_name)
-                    .map_or(true, |channels| channels.len() <= 1)
+                    .is_none_or(|channels| channels.len() <= 1)
             };
 
             if should_start_download {
@@ -368,7 +399,7 @@ impl ModelDownloadTracker {
             }
         }
 
-        return status;
+        status
     }
 }
 
@@ -377,6 +408,7 @@ pub static MODEL_TRACKER: std::sync::LazyLock<ModelDownloadTracker> =
     std::sync::LazyLock::new(ModelDownloadTracker::new);
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use model_express_common::grpc::{
@@ -394,7 +426,7 @@ mod tests {
         let response = service.get_health(request).await;
         assert!(response.is_ok());
 
-        let health_response = response.unwrap().into_inner();
+        let health_response = response.expect("Health response should be ok").into_inner();
         assert_eq!(health_response.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(health_response.status, "ok");
         // uptime is u64, always >= 0, so just verify it exists
@@ -413,14 +445,15 @@ mod tests {
         let response = service.send_request(request).await;
         assert!(response.is_ok());
 
-        let api_response = response.unwrap().into_inner();
+        let api_response = response.expect("API response should be ok").into_inner();
         assert!(api_response.success);
         assert!(api_response.data.is_some());
         assert!(api_response.error.is_none());
 
         // Check that the response data contains "pong"
-        let data_bytes = api_response.data.unwrap();
-        let data: serde_json::Value = serde_json::from_slice(&data_bytes).unwrap();
+        let data_bytes = api_response.data.expect("Data should be present");
+        let data: serde_json::Value =
+            serde_json::from_slice(&data_bytes).expect("Data should be valid JSON");
         assert_eq!(data["message"], "pong");
     }
 
@@ -436,18 +469,18 @@ mod tests {
         let response = service.send_request(request).await;
         assert!(response.is_ok());
 
-        let api_response = response.unwrap().into_inner();
+        let api_response = response.expect("API response should be ok").into_inner();
         assert!(!api_response.success);
         assert!(api_response.data.is_none());
         assert!(api_response.error.is_some());
 
-        let error_message = api_response.error.unwrap();
+        let error_message = api_response.error.expect("Error should be present");
         assert!(error_message.contains("Unknown action"));
     }
 
     #[test]
     fn test_model_download_tracker_new() {
-        let _temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
         let tracker = ModelDownloadTracker::new();
 
         // Test that we can get status for a non-existent model
@@ -457,13 +490,13 @@ mod tests {
 
     #[test]
     fn test_model_download_tracker_set_and_get_status() {
-        let _temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
         let tracker = ModelDownloadTracker::new();
 
         // Use a unique model name based on current time to avoid conflicts
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("Time went backwards")
             .as_nanos();
         let model_name = format!("test-model-{timestamp}");
         let provider = ModelProvider::HuggingFace;
@@ -477,7 +510,10 @@ mod tests {
         // Should now return the status
         let status = tracker.get_status(&model_name);
         assert!(status.is_some());
-        assert_eq!(status.unwrap(), ModelStatus::DOWNLOADING);
+        assert_eq!(
+            status.expect("Status should be present"),
+            ModelStatus::DOWNLOADING
+        );
 
         // Cleanup
         tracker.delete_status(&model_name);
@@ -485,11 +521,11 @@ mod tests {
 
     #[test]
     fn test_model_download_tracker_delete_status() {
-        let _temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
         let tracker = ModelDownloadTracker::new();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("Time went backwards")
             .as_nanos();
         let model_name = format!("test-delete-model-{timestamp}");
         let provider = ModelProvider::HuggingFace;
@@ -508,7 +544,7 @@ mod tests {
         let service = ModelServiceImpl;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("Time went backwards")
             .as_nanos();
         let model_name = format!("test-already-downloaded-model-{timestamp}");
 
@@ -527,16 +563,16 @@ mod tests {
         let response = service.ensure_model_downloaded(request).await;
         assert!(response.is_ok());
 
-        let mut stream = response.unwrap().into_inner();
+        let mut stream = response.expect("Response should be ok").into_inner();
 
         // Should get at least one update indicating it's already downloaded
         let update = stream.next().await;
         assert!(update.is_some());
 
-        let update = update.unwrap();
+        let update = update.expect("Update should be present");
         assert!(update.is_ok());
 
-        let status_update = update.unwrap();
+        let status_update = update.expect("Status update should be ok");
         assert_eq!(status_update.model_name, model_name);
         assert_eq!(
             status_update.status,
@@ -549,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_model_download_tracker_set_status_and_notify() {
-        let _temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
         let tracker = ModelDownloadTracker::new();
         let model_name = "test-notify-model".to_string();
         let provider = ModelProvider::HuggingFace;
@@ -565,12 +601,15 @@ mod tests {
         // Verify status was set
         let status = tracker.get_status(&model_name);
         assert!(status.is_some());
-        assert_eq!(status.unwrap(), ModelStatus::DOWNLOADED);
+        assert_eq!(
+            status.expect("Status should be present"),
+            ModelStatus::DOWNLOADED
+        );
     }
 
     #[test]
     fn test_waiting_channels_management() {
-        let _temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
         let tracker = ModelDownloadTracker::new();
         let model_name = "test-channels-model";
 
@@ -581,7 +620,10 @@ mod tests {
 
         // Verify the channel was added by checking internal state
         let waiting_count = {
-            let waiting = tracker.waiting_channels.lock().unwrap();
+            let waiting = match tracker.waiting_channels.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             waiting.get(model_name).map_or(0, std::vec::Vec::len)
         };
         assert_eq!(waiting_count, 1);
@@ -596,7 +638,10 @@ mod tests {
 
         // Channels should be cleared for final statuses
         let waiting_count_after = {
-            let waiting = tracker.waiting_channels.lock().unwrap();
+            let waiting = match tracker.waiting_channels.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             waiting.get(model_name).map_or(0, std::vec::Vec::len)
         };
         assert_eq!(waiting_count_after, 0);
@@ -615,7 +660,7 @@ mod tests {
         let response = service.ensure_model_downloaded(request).await;
         assert!(response.is_ok());
 
-        let mut stream = response.unwrap().into_inner();
+        let mut stream = response.expect("Response should be ok").into_inner();
 
         // Read a few updates (may include initial status and progress)
         let mut update_count = 0;
@@ -637,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_model_download_no_race_condition() {
-        let _temp_dir = TempDir::new().unwrap();
+        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
         let tracker = ModelDownloadTracker::new();
         let model_name = "test-concurrent-model";
         let provider = ModelProvider::HuggingFace;
@@ -647,22 +692,22 @@ mod tests {
         let status1 = tracker
             .database
             .try_claim_for_download(model_name, provider)
-            .unwrap();
+            .expect("Failed to claim for download 1");
         assert_eq!(status1, ModelStatus::DOWNLOADING);
 
         // Second attempt should see it's already claimed
         let status2 = tracker
             .database
             .try_claim_for_download(model_name, provider)
-            .unwrap();
+            .expect("Failed to claim for download 2");
         assert_eq!(status2, ModelStatus::DOWNLOADING);
 
         // Verify only one record exists
         let record = tracker
             .database
             .get_model_record(model_name)
-            .unwrap()
-            .unwrap();
+            .expect("Failed to get model record")
+            .expect("Record should exist");
         assert_eq!(record.status, ModelStatus::DOWNLOADING);
 
         // Cleanup

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use model_express_client::{Client, ClientConfig, ModelProvider};
 
 #[tokio::main]

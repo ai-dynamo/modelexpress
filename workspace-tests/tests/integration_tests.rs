@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use model_express_client::{Client, ClientConfig};
 use model_express_common::{constants, models::ModelProvider};
 use std::time::Duration;

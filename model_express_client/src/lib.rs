@@ -296,6 +296,7 @@ impl Client {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -373,9 +374,11 @@ mod tests {
             serde_json::Value::Number(serde_json::Number::from(42)),
         );
 
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let payload_bytes =
+            serde_json::to_vec(&payload).expect("Serialization should not fail in test");
         let deserialized: HashMap<String, serde_json::Value> =
-            serde_json::from_slice(&payload_bytes).unwrap();
+            serde_json::from_slice(&payload_bytes)
+                .expect("Deserialization should not fail in test");
 
         assert_eq!(payload, deserialized);
     }
@@ -398,7 +401,7 @@ mod tests {
         // Should fail because the model doesn't exist, but we should get past the connection attempt
         assert!(result.is_err());
         // The error should indicate it tried to connect to the server but failed
-        let error_msg = result.unwrap_err().to_string();
+        let error_msg = result.expect_err("Result should be an error").to_string();
         assert!(
             error_msg.contains("Direct download failed")
                 || error_msg.contains("Cannot connect")
@@ -410,6 +413,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod integration_tests {
     use super::*;
     use model_express_common::constants;
@@ -445,7 +449,7 @@ mod integration_tests {
             let result = client.health_check().await;
             assert!(result.is_ok());
 
-            let status = result.unwrap();
+            let status = result.expect("Health check should succeed");
             assert!(!status.version.is_empty());
             assert_eq!(status.status, "ok");
             // uptime is u64, so it's always >= 0, just check it exists
@@ -464,7 +468,7 @@ mod integration_tests {
             let result: Result<serde_json::Value, _> = client.send_request("ping", None).await;
             assert!(result.is_ok());
 
-            let response = result.unwrap();
+            let response = result.expect("Ping request should succeed");
             assert_eq!(response["message"], "pong");
         } else {
             println!("Skipping integration test - server not available");

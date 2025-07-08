@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use model_express_client::{Client, ClientConfig};
 use model_express_common::models::ModelProvider;
 use std::env;
@@ -11,9 +13,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test_mode = args.iter().any(|arg| arg == "--test-model");
     let test_model = if test_mode {
         // Get the model name from the next argument
-        let model_index = args.iter().position(|arg| arg == "--test-model").unwrap();
-        if model_index + 1 < args.len() {
-            Some(args[model_index + 1].clone())
+        let model_index = args
+            .iter()
+            .position(|arg| arg == "--test-model")
+            .expect("--test-model should be present when test_mode is true");
+        if let Some(next_arg) = args.get(model_index.saturating_add(1)) {
+            Some(next_arg.clone())
         } else {
             println!("Error: --test-model requires a model name");
             return Err("Missing model name".into());
@@ -34,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run the concurrent model download test
     println!("\nRunning integration test for concurrent model downloads");
-    let model_name = test_model.unwrap();
+    let model_name = test_model.expect("Model name should be present");
     println!("Testing with model: {model_name}");
 
     run_concurrent_model_test(&model_name).await?;
