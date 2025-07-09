@@ -1,12 +1,12 @@
 use crate::constants;
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
-use std::fs;
+use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io::{self, Write};
-use tracing::{info, warn, error, debug};
+use std::path::{Path, PathBuf};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for model cache management
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ impl CacheConfig {
     /// Create config from a specific path
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let local_path = path.as_ref().to_path_buf();
-        
+
         // Ensure the directory exists
         fs::create_dir_all(&local_path)
             .with_context(|| format!("Failed to create cache directory: {:?}", local_path))?;
@@ -80,7 +80,7 @@ impl CacheConfig {
     /// Load configuration from file
     pub fn from_config_file() -> Result<Self> {
         let config_path = Self::get_config_path()?;
-        
+
         if !config_path.exists() {
             return Err(anyhow::anyhow!("Config file not found: {:?}", config_path));
         }
@@ -97,15 +97,14 @@ impl CacheConfig {
     /// Save configuration to file
     pub fn save_to_config_file(&self) -> Result<()> {
         let config_path = Self::get_config_path()?;
-        
+
         // Ensure config directory exists
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
         }
 
-        let content = serde_yaml::to_string(self)
-            .context("Failed to serialize config")?;
+        let content = serde_yaml::to_string(self).context("Failed to serialize config")?;
 
         fs::write(&config_path, content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
@@ -136,7 +135,9 @@ impl CacheConfig {
             }
         }
 
-        Err(anyhow::anyhow!("No cache directory found in common locations"))
+        Err(anyhow::anyhow!(
+            "No cache directory found in common locations"
+        ))
     }
 
     /// Query server for cache information
@@ -150,13 +151,13 @@ impl CacheConfig {
     pub fn prompt_user() -> Result<Self> {
         info!("ModelExpress Cache Configuration");
         info!("================================");
-        
+
         // Get cache path
         let cache_path = Self::prompt_cache_path()?;
-        
+
         // Get server endpoint
         let server_endpoint = Self::prompt_server_endpoint()?;
-        
+
         // Get auto-mount preference
         let auto_mount = Self::prompt_auto_mount()?;
 
@@ -179,13 +180,13 @@ impl CacheConfig {
     /// Get cache path from command line arguments
     fn get_cache_path_from_args() -> Option<String> {
         let args: Vec<String> = env::args().collect();
-        
+
         for (i, arg) in args.iter().enumerate() {
             if arg == "--cache-path" && i + 1 < args.len() {
                 return Some(args[i + 1].clone());
             }
         }
-        
+
         None
     }
 
@@ -200,14 +201,16 @@ impl CacheConfig {
         let home = env::var("HOME")
             .or_else(|_| env::var("USERPROFILE"))
             .context("Could not determine home directory")?;
-        
-        Ok(PathBuf::from(home).join(".model-express").join("config.yaml"))
+
+        Ok(PathBuf::from(home)
+            .join(".model-express")
+            .join("config.yaml"))
     }
 
     /// Expand path with tilde and environment variables
     fn expand_path(path: &Path) -> Result<PathBuf> {
         let path_str = path.to_string_lossy();
-        
+
         if path_str.starts_with("~/") {
             let home = env::var("HOME")
                 .or_else(|_| env::var("USERPROFILE"))
@@ -223,30 +226,31 @@ impl CacheConfig {
         loop {
             print!("Enter your local cache mount path [~/.model-express/cache]: ");
             io::stdout().flush()?;
-            
+
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             let input = input.trim();
-            
+
             let path = if input.is_empty() {
                 PathBuf::from("~/.model-express/cache")
             } else {
                 PathBuf::from(input)
             };
-            
+
             let expanded_path = Self::expand_path(&path)?;
-            
+
             // Create directory if it doesn't exist
             if !expanded_path.exists() {
                 print!("Directory does not exist. Create it? [Y/n]: ");
                 io::stdout().flush()?;
-                
+
                 let mut create_input = String::new();
                 io::stdin().read_line(&mut create_input)?;
-                
+
                 if create_input.trim().to_lowercase() != "n" {
-                    fs::create_dir_all(&expanded_path)
-                        .with_context(|| format!("Failed to create directory: {:?}", expanded_path))?;
+                    fs::create_dir_all(&expanded_path).with_context(|| {
+                        format!("Failed to create directory: {:?}", expanded_path)
+                    })?;
                     return Ok(expanded_path);
                 }
             } else if expanded_path.is_dir() {
@@ -260,13 +264,16 @@ impl CacheConfig {
 
     /// Prompt for server endpoint
     fn prompt_server_endpoint() -> Result<String> {
-        print!("Enter your server endpoint [{}]: ", Self::get_default_server_endpoint());
+        print!(
+            "Enter your server endpoint [{}]: ",
+            Self::get_default_server_endpoint()
+        );
         io::stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         let input = input.trim();
-        
+
         Ok(if input.is_empty() {
             Self::get_default_server_endpoint()
         } else {
@@ -278,10 +285,10 @@ impl CacheConfig {
     fn prompt_auto_mount() -> Result<bool> {
         print!("Auto-mount cache on startup? [Y/n]: ");
         io::stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         Ok(input.trim().to_lowercase() != "n")
     }
 
@@ -289,10 +296,10 @@ impl CacheConfig {
     fn prompt_save_config() -> Result<bool> {
         print!("Save this configuration? [Y/n]: ");
         io::stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         Ok(input.trim().to_lowercase() != "n")
     }
 
@@ -311,14 +318,15 @@ impl CacheConfig {
         for entry in fs::read_dir(&self.local_path)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.is_dir() {
                 let size = Self::get_directory_size(&path)?;
-                let model_name = path.file_name()
+                let model_name = path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                
+
                 stats.total_models += 1;
                 stats.total_size += size;
                 stats.models.push(ModelInfo {
@@ -335,25 +343,25 @@ impl CacheConfig {
     /// Get directory size recursively
     fn get_directory_size(path: &Path) -> Result<u64> {
         let mut size = 0;
-        
+
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.is_file() {
                 size += fs::metadata(&path)?.len();
             } else if path.is_dir() {
                 size += Self::get_directory_size(&path)?;
             }
         }
-        
+
         Ok(size)
     }
 
     /// Clear specific model from cache
     pub fn clear_model(&self, model_name: &str) -> Result<()> {
         let model_path = self.local_path.join(model_name);
-        
+
         if model_path.exists() {
             fs::remove_dir_all(&model_path)
                 .with_context(|| format!("Failed to remove model: {:?}", model_path))?;
@@ -361,7 +369,7 @@ impl CacheConfig {
         } else {
             warn!("Model not found in cache: {}", model_name);
         }
-        
+
         Ok(())
     }
 
@@ -374,7 +382,7 @@ impl CacheConfig {
         } else {
             warn!("Cache directory does not exist");
         }
-        
+
         Ok(())
     }
 }
@@ -430,7 +438,7 @@ mod tests {
     fn test_cache_config_from_path() {
         let temp_dir = TempDir::new().unwrap();
         let config = CacheConfig::from_path(temp_dir.path()).unwrap();
-        
+
         assert_eq!(config.local_path, temp_dir.path());
         assert!(config.auto_mount);
     }
@@ -450,9 +458,12 @@ mod tests {
 
         // Load config
         let loaded_config = CacheConfig::from_config_file().unwrap();
-        
+
         assert_eq!(loaded_config.local_path, original_config.local_path);
-        assert_eq!(loaded_config.server_endpoint, original_config.server_endpoint);
+        assert_eq!(
+            loaded_config.server_endpoint,
+            original_config.server_endpoint
+        );
         assert_eq!(loaded_config.auto_mount, original_config.auto_mount);
         assert_eq!(loaded_config.timeout_secs, original_config.timeout_secs);
     }
@@ -480,4 +491,4 @@ mod tests {
         assert_eq!(stats.format_model_size(&stats.models[0]), "2.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[1]), "3.00 MB");
     }
-} 
+}

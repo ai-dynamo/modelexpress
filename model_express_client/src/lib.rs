@@ -2,7 +2,9 @@ mod config;
 mod error;
 
 use model_express_common::{
-    Result as CommonResult, constants, download, cache::{CacheConfig, CacheStats, ModelInfo},
+    Result as CommonResult,
+    cache::{CacheConfig, CacheStats, ModelInfo},
+    constants, download,
     grpc::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
         health::{HealthRequest, health_service_client::HealthServiceClient},
@@ -62,7 +64,10 @@ impl Client {
     }
 
     /// Create a new client with cache configuration
-    pub async fn new_with_cache(config: ClientConfig, cache_config: CacheConfig) -> CommonResult<Self> {
+    pub async fn new_with_cache(
+        config: ClientConfig,
+        cache_config: CacheConfig,
+    ) -> CommonResult<Self> {
         let mut client = Self::new(config).await?;
         client.cache_config = Some(cache_config);
         Ok(client)
@@ -80,35 +85,45 @@ impl Client {
 
     /// List cached models
     pub fn list_cached_models(&self) -> CommonResult<CacheStats> {
-        let cache_config = self.cache_config.as_ref()
-            .ok_or_else(|| model_express_common::Error::Server("Cache not configured".to_string()))?;
-        
-        cache_config.get_cache_stats()
-            .map_err(|e| model_express_common::Error::Server(format!("Failed to get cache stats: {}", e)))
+        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
+            model_express_common::Error::Server("Cache not configured".to_string())
+        })?;
+
+        cache_config.get_cache_stats().map_err(|e| {
+            model_express_common::Error::Server(format!("Failed to get cache stats: {}", e))
+        })
     }
 
     /// Clear specific model from cache
     pub fn clear_cached_model(&self, model_name: &str) -> CommonResult<()> {
-        let cache_config = self.cache_config.as_ref()
-            .ok_or_else(|| model_express_common::Error::Server("Cache not configured".to_string()))?;
-        
-        cache_config.clear_model(model_name)
-            .map_err(|e| model_express_common::Error::Server(format!("Failed to clear model: {}", e)))
+        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
+            model_express_common::Error::Server("Cache not configured".to_string())
+        })?;
+
+        cache_config.clear_model(model_name).map_err(|e| {
+            model_express_common::Error::Server(format!("Failed to clear model: {}", e))
+        })
     }
 
     /// Clear entire cache
     pub fn clear_all_cached_models(&self) -> CommonResult<()> {
-        let cache_config = self.cache_config.as_ref()
-            .ok_or_else(|| model_express_common::Error::Server("Cache not configured".to_string()))?;
-        
-        cache_config.clear_all()
-            .map_err(|e| model_express_common::Error::Server(format!("Failed to clear cache: {}", e)))
+        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
+            model_express_common::Error::Server("Cache not configured".to_string())
+        })?;
+
+        cache_config.clear_all().map_err(|e| {
+            model_express_common::Error::Server(format!("Failed to clear cache: {}", e))
+        })
     }
 
     /// Pre-download model to cache
-    pub async fn preload_model_to_cache(&mut self, model_name: &str, provider: ModelProvider) -> CommonResult<()> {
+    pub async fn preload_model_to_cache(
+        &mut self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> CommonResult<()> {
         info!("Pre-loading model {} to cache", model_name);
-        
+
         // First try to download via server
         match self.request_model_with_provider(model_name, provider).await {
             Ok(()) => {
@@ -117,7 +132,10 @@ impl Client {
             }
             Err(e) => {
                 // Fallback to direct download
-                info!("Server unavailable, pre-loading model {} directly. Error: {}", model_name, e);
+                info!(
+                    "Server unavailable, pre-loading model {} directly. Error: {}",
+                    model_name, e
+                );
                 Self::download_model_directly(model_name, provider).await
             }
         }

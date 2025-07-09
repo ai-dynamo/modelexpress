@@ -1,10 +1,10 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use model_express_client::{Client, ClientConfig, ModelProvider};
 use model_express_common::cache::{CacheConfig, CacheStats};
-use std::path::PathBuf;
-use anyhow::Result;
-use tracing::{info, warn, error, debug};
 use std::io::Write;
+use std::path::PathBuf;
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "model-express")]
@@ -30,11 +30,11 @@ enum Commands {
         /// Cache path
         #[arg(long, value_name = "PATH")]
         cache_path: Option<PathBuf>,
-        
+
         /// Server endpoint
         #[arg(long, value_name = "ENDPOINT")]
         server_endpoint: Option<String>,
-        
+
         /// Auto-mount on startup
         #[arg(long)]
         auto_mount: Option<bool>,
@@ -67,7 +67,7 @@ enum Commands {
     Preload {
         /// Model name to preload
         model_name: String,
-        
+
         /// Model provider
         #[arg(long, default_value = "huggingface")]
         provider: String,
@@ -94,11 +94,15 @@ async fn main() -> Result<()> {
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
         .init();
-    
+
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { cache_path, server_endpoint, auto_mount } => {
+        Commands::Init {
+            cache_path,
+            server_endpoint,
+            auto_mount,
+        } => {
             init_cache(cache_path, server_endpoint, auto_mount).await?;
         }
         Commands::List { detailed } => {
@@ -113,7 +117,10 @@ async fn main() -> Result<()> {
         Commands::ClearAll { yes } => {
             clear_all_cached_models(yes).await?;
         }
-        Commands::Preload { model_name, provider } => {
+        Commands::Preload {
+            model_name,
+            provider,
+        } => {
             preload_model(&model_name, &provider).await?;
         }
         Commands::Validate { model_name } => {
@@ -177,16 +184,14 @@ async fn list_cached_models(detailed: bool) -> Result<()> {
     info!("Models:");
     for model in &stats.models {
         if detailed {
-            info!("  {} ({}) - {:?}", 
-                model.name, 
-                stats.format_model_size(model), 
+            info!(
+                "  {} ({}) - {:?}",
+                model.name,
+                stats.format_model_size(model),
                 model.path
             );
         } else {
-            info!("  {} ({})", 
-                model.name, 
-                stats.format_model_size(model)
-            );
+            info!("  {} ({})", model.name, stats.format_model_size(model));
         }
     }
 
@@ -223,61 +228,64 @@ async fn show_cache_status() -> Result<()> {
 
 async fn clear_cached_model(model_name: &str) -> Result<()> {
     let cache_config = get_cache_config()?;
-    
+
     info!("Clearing model: {}", model_name);
     cache_config.clear_model(model_name)?;
-    
+
     Ok(())
 }
 
 async fn clear_all_cached_models(yes: bool) -> Result<()> {
     let cache_config = get_cache_config()?;
-    
+
     if !yes {
         print!("Are you sure you want to clear all cached models? [y/N]: ");
         std::io::stdout().flush()?;
-        
+
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        
+
         if input.trim().to_lowercase() != "y" {
             info!("Operation cancelled.");
             return Ok(());
         }
     }
-    
+
     info!("Clearing all cached models...");
     cache_config.clear_all()?;
-    
+
     Ok(())
 }
 
 async fn preload_model(model_name: &str, provider_str: &str) -> Result<()> {
     let cache_config = get_cache_config()?;
     let provider = parse_provider(provider_str)?;
-    
-    info!("Pre-loading model: {} (provider: {:?})", model_name, provider);
-    
+
+    info!(
+        "Pre-loading model: {} (provider: {:?})",
+        model_name, provider
+    );
+
     let client_config = ClientConfig::new(&cache_config.server_endpoint);
     let mut client = Client::new_with_cache(client_config, cache_config).await?;
-    
+
     client.preload_model_to_cache(model_name, provider).await?;
     info!("Model pre-loaded successfully!");
-    
+
     Ok(())
 }
 
 async fn validate_cache(model_name: Option<String>) -> Result<()> {
     let cache_config = get_cache_config()?;
-    
+
     info!("Validating cache...");
-    
+
     if let Some(name) = model_name {
         // Validate specific model
         let model_path = cache_config.local_path.join(&name);
         if model_path.exists() {
             info!("✅ Model '{}' found in cache", name);
-            
+
             // Check for common model files
             let required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"];
             for file in &required_files {
@@ -295,59 +303,62 @@ async fn validate_cache(model_name: Option<String>) -> Result<()> {
         // Validate entire cache
         let stats = cache_config.get_cache_stats()?;
         info!("Found {} models in cache", stats.total_models);
-        
+
         for model in &stats.models {
             info!("  {} ({})", model.name, stats.format_model_size(model));
         }
     }
-    
+
     Ok(())
 }
 
 async fn show_cache_stats(detailed: bool) -> Result<()> {
     let cache_config = get_cache_config()?;
     let stats = cache_config.get_cache_stats()?;
-    
+
     info!("Cache Statistics");
     info!("================");
     info!("Total models: {}", stats.total_models);
     info!("Total size: {}", stats.format_total_size());
-    
+
     if detailed && !stats.models.is_empty() {
         info!("Detailed Statistics:");
         for model in &stats.models {
-            info!("  {}: {} bytes ({})", 
-                model.name, 
-                model.size, 
+            info!(
+                "  {}: {} bytes ({})",
+                model.name,
+                model.size,
                 stats.format_model_size(model)
             );
         }
     }
-    
+
     Ok(())
 }
 
 fn get_cache_config() -> Result<CacheConfig> {
     // Get CLI arguments
     let args: Vec<String> = std::env::args().collect();
-    
+
     // Check for --cache-path argument
-    let cache_path = args.iter()
+    let cache_path = args
+        .iter()
         .position(|arg| arg == "--cache-path")
         .and_then(|i| args.get(i + 1))
         .map(|s| PathBuf::from(s));
-    
+
     // Check for --server-endpoint argument
-    let server_endpoint = args.iter()
+    let server_endpoint = args
+        .iter()
         .position(|arg| arg == "--server-endpoint")
         .and_then(|i| args.get(i + 1))
         .cloned();
-    
+
     // If cache path is provided via CLI, use it
     if let Some(path) = cache_path {
         return CacheConfig::from_path(path);
     }
-    
+
     // Otherwise, try to discover configuration
     CacheConfig::discover()
         .map_err(|e| anyhow::anyhow!("Failed to discover cache configuration: {}", e))
@@ -358,4 +369,4 @@ fn parse_provider(provider_str: &str) -> Result<ModelProvider> {
         "huggingface" | "hf" => Ok(ModelProvider::HuggingFace),
         _ => Err(anyhow::anyhow!("Unknown provider: {}", provider_str)),
     }
-} 
+}
