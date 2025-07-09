@@ -23,7 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting model_express_server with gRPC...");
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], constants::DEFAULT_GRPC_PORT));
+    // Read port from environment variable or use default
+    let port = std::env::var("SERVER_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(constants::DEFAULT_GRPC_PORT);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     // Create service implementations
     let health_service = HealthServiceImpl;
