@@ -90,7 +90,7 @@ impl Client {
         })?;
 
         cache_config.get_cache_stats().map_err(|e| {
-            model_express_common::Error::Server(format!("Failed to get cache stats: {}", e))
+            model_express_common::Error::Server(format!("Failed to get cache stats: {e}")).into()
         })
     }
 
@@ -101,7 +101,7 @@ impl Client {
         })?;
 
         cache_config.clear_model(model_name).map_err(|e| {
-            model_express_common::Error::Server(format!("Failed to clear model: {}", e))
+            model_express_common::Error::Server(format!("Failed to clear model: {e}")).into()
         })
     }
 
@@ -112,7 +112,7 @@ impl Client {
         })?;
 
         cache_config.clear_all().map_err(|e| {
-            model_express_common::Error::Server(format!("Failed to clear cache: {}", e))
+            model_express_common::Error::Server(format!("Failed to clear cache: {e}")).into()
         })
     }
 
@@ -182,7 +182,7 @@ impl Client {
                 api_response
                     .error
                     .unwrap_or_else(|| "Unknown server error".to_string()),
-            ));
+            ).into());
         }
 
         let data_bytes = api_response.data.ok_or_else(|| {
@@ -216,7 +216,7 @@ impl Client {
             }
             Err(e) => {
                 // Check if it's a connection error (server not available)
-                if let model_express_common::Error::Transport(_) = e {
+                if let model_express_common::Error::Transport(_) = *e {
                     info!(
                         "Server unavailable, falling back to direct download for model: {}",
                         model_name
@@ -233,7 +233,7 @@ impl Client {
                         }
                         Err(download_err) => Err(model_express_common::Error::Server(format!(
                             "Both server and direct download failed. Server error: {e}. Download error: {download_err}"
-                        ))),
+                        )).into()),
                     }
                 } else {
                     // For other types of errors, don't fallback
@@ -293,7 +293,7 @@ impl Client {
                         .unwrap_or_else(|| "Unknown error occurred".to_string());
                     return Err(model_express_common::Error::Server(format!(
                         "Model download failed: {error_message}"
-                    )));
+                    )).into());
                 }
                 ModelStatus::DOWNLOADING => {
                     // Continue processing updates
@@ -305,7 +305,7 @@ impl Client {
         // If stream ended without DOWNLOADED status, treat as error
         Err(model_express_common::Error::Server(
             "Model download stream ended unexpectedly".to_string(),
-        ))
+        ).into())
     }
 
     /// Request a model from the server using the default provider (Hugging Face) with automatic fallback

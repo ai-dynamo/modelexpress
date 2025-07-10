@@ -107,15 +107,12 @@ async fn download_model(
         model_name, provider, strategy
     );
 
-    match format {
-        OutputFormat::Human => {
-            println!("{}", "Model Download".green().bold());
-            println!("  {}: {}", "Model".cyan().bold(), model_name);
-            println!("  {}: {:?}", "Provider".cyan().bold(), provider);
-            println!("  {}: {:?}", "Strategy".cyan().bold(), strategy);
-            println!();
-        }
-        _ => {} // JSON output will be at the end
+    if let OutputFormat::Human = format {
+        println!("{}", "Model Download".green().bold());
+        println!("  {}: {}", "Model".cyan().bold(), model_name);
+        println!("  {}: {:?}", "Provider".cyan().bold(), provider);
+        println!("  {}: {:?}", "Strategy".cyan().bold(), strategy);
+        println!();
     }
 
     info!("Downloading model: {}", model_name);
@@ -170,11 +167,11 @@ async fn download_model(
     match result {
         Ok(()) => {
             info!("Model download completed successfully: {}", model_name);
-            let success_msg = format!("Model '{}' downloaded successfully", model_name);
+            let success_msg = format!("Model '{model_name}' downloaded successfully");
             match format {
                 OutputFormat::Human => {
                     println!("{}", "✅ SUCCESS".green().bold());
-                    println!("  {}", success_msg);
+                    println!("  {success_msg}");
                 }
                 _ => {
                     let output = serde_json::json!({
@@ -190,11 +187,11 @@ async fn download_model(
         }
         Err(e) => {
             error!("Model download failed for {}: {}", model_name, e);
-            let error_msg = format!("Failed to download model '{}': {}", model_name, e);
+            let error_msg = format!("Failed to download model '{model_name}': {e}");
             match format {
                 OutputFormat::Human => {
                     println!("{}", "❌ FAILED".red().bold());
-                    println!("  {}", error_msg);
+                    println!("  {error_msg}");
                 }
                 _ => {
                     let output = serde_json::json!({
@@ -231,16 +228,13 @@ pub async fn handle_api_send(
         debug!("API request includes payload data");
     }
 
-    match format {
-        OutputFormat::Human => {
-            println!("{}", "API Request".green().bold());
-            println!("  {}: {}", "Action".cyan().bold(), action);
-            if payload_data.is_some() {
-                println!("  {}: Yes", "Payload".cyan().bold());
-            }
-            println!();
+    if let OutputFormat::Human = format {
+        println!("{}", "API Request".green().bold());
+        println!("  {}: {}", "Action".cyan().bold(), action);
+        if payload_data.is_some() {
+            println!("  {}: Yes", "Payload".cyan().bold());
         }
-        _ => {} // JSON output will be at the end
+        println!();
     }
 
     info!("Sending API request: {}", action);
@@ -439,7 +433,7 @@ async fn clear_model(
 
     match format {
         OutputFormat::Human => {
-            println!("✅ Model '{}' cleared from storage", model_name);
+            println!("✅ Model '{model_name}' cleared from storage");
         }
         _ => {
             let output = serde_json::json!({
@@ -508,7 +502,7 @@ async fn validate_models(
             OutputFormat::Human => {
                 println!("{}", "Model Validation".green().bold());
                 if exists {
-                    println!("✅ Model '{}' found in storage", name);
+                    println!("✅ Model '{name}' found in storage");
 
                     // Check for common model files
                     let required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"];
@@ -517,11 +511,11 @@ async fn validate_models(
                         if file_path.exists() {
                             debug!("  ✅ {} found", file);
                         } else {
-                            println!("  ⚠️  {} missing", file);
+                            println!("  ⚠️  {file} missing");
                         }
                     }
                 } else {
-                    println!("❌ Model '{}' not found in storage", name);
+                    println!("❌ Model '{name}' not found in storage");
                 }
             }
             _ => {
@@ -637,5 +631,5 @@ fn get_storage_config(
 
     // Otherwise, try to discover configuration
     CacheConfig::discover()
-        .map_err(|e| format!("Failed to discover storage configuration: {}", e).into())
+        .map_err(|e| format!("Failed to discover storage configuration: {e}").into())
 }

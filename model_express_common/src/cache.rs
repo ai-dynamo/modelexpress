@@ -66,7 +66,7 @@ impl CacheConfig {
 
         // Ensure the directory exists
         fs::create_dir_all(&local_path)
-            .with_context(|| format!("Failed to create cache directory: {:?}", local_path))?;
+            .with_context(|| format!("Failed to create cache directory: {local_path:?}"))?;
 
         Ok(Self {
             local_path,
@@ -85,10 +85,10 @@ impl CacheConfig {
         }
 
         let content = fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
+            .with_context(|| format!("Failed to read config file: {config_path:?}"))?;
 
         let config: Self = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {:?}", config_path))?;
+            .with_context(|| format!("Failed to parse config file: {config_path:?}"))?;
 
         Ok(config)
     }
@@ -100,13 +100,13 @@ impl CacheConfig {
         // Ensure config directory exists
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {:?}", parent))?;
+                .with_context(|| format!("Failed to create config directory: {parent:?}"))?;
         }
 
         let content = serde_yaml::to_string(self).context("Failed to serialize config")?;
 
         fs::write(&config_path, content)
-            .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
+            .with_context(|| format!("Failed to write config file: {config_path:?}"))?;
 
         Ok(())
     }
@@ -181,8 +181,10 @@ impl CacheConfig {
         let args: Vec<String> = env::args().collect();
 
         for (i, arg) in args.iter().enumerate() {
-            if arg == "--cache-path" && i + 1 < args.len() {
-                return Some(args[i + 1].clone());
+            if arg == "--cache-path" {
+                if let Some(next_arg) = args.get(i.saturating_add(1)) {
+                    return Some(next_arg.clone());
+                }
             }
         }
 
@@ -210,11 +212,11 @@ impl CacheConfig {
     fn expand_path(path: &Path) -> Result<PathBuf> {
         let path_str = path.to_string_lossy();
 
-        if path_str.starts_with("~/") {
+        if let Some(stripped) = path_str.strip_prefix("~/") {
             let home = env::var("HOME")
                 .or_else(|_| env::var("USERPROFILE"))
                 .context("Could not determine home directory")?;
-            Ok(PathBuf::from(home).join(&path_str[2..]))
+            Ok(PathBuf::from(home).join(stripped))
         } else {
             Ok(path.to_path_buf())
         }
@@ -248,7 +250,7 @@ impl CacheConfig {
 
                 if create_input.trim().to_lowercase() != "n" {
                     fs::create_dir_all(&expanded_path).with_context(|| {
-                        format!("Failed to create directory: {:?}", expanded_path)
+                        format!("Failed to create directory: {expanded_path:?}")
                     })?;
                     return Ok(expanded_path);
                 }
@@ -326,8 +328,8 @@ impl CacheConfig {
                     .unwrap_or("unknown")
                     .to_string();
 
-                stats.total_models += 1;
-                stats.total_size += size;
+                stats.total_models = stats.total_models.saturating_add(1);
+                stats.total_size = stats.total_size.saturating_add(size);
                 stats.models.push(ModelInfo {
                     name: model_name,
                     size,
@@ -341,16 +343,16 @@ impl CacheConfig {
 
     /// Get directory size recursively
     fn get_directory_size(path: &Path) -> Result<u64> {
-        let mut size = 0;
+        let mut size: u64 = 0;
 
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
 
             if path.is_file() {
-                size += fs::metadata(&path)?.len();
+                size = size.saturating_add(fs::metadata(&path)?.len());
             } else if path.is_dir() {
-                size += Self::get_directory_size(&path)?;
+                size = size.saturating_add(Self::get_directory_size(&path)?);
             }
         }
 
@@ -363,7 +365,7 @@ impl CacheConfig {
 
         if model_path.exists() {
             fs::remove_dir_all(&model_path)
-                .with_context(|| format!("Failed to remove model: {:?}", model_path))?;
+                .with_context(|| format!("Failed to remove model: {model_path:?}"))?;
             info!("Cleared model: {}", model_name);
         } else {
             warn!("Model not found in cache: {}", model_name);
@@ -413,7 +415,7 @@ impl CacheStats {
             size if size >= GB => format!("{:.2} GB", size as f64 / GB as f64),
             size if size >= MB => format!("{:.2} MB", size as f64 / MB as f64),
             size if size >= KB => format!("{:.2} KB", size as f64 / KB as f64),
-            size => format!("{} bytes", size),
+            size => format!("{size} bytes"),
         }
     }
 
@@ -434,17 +436,19 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn test_cache_config_from_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = CacheConfig::from_path(temp_dir.path()).unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let config = CacheConfig::from_path(temp_dir.path()).expect("Failed to create config from path");
 
         assert_eq!(config.local_path, temp_dir.path());
         assert!(config.auto_mount);
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn test_cache_config_save_and_load() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let original_config = CacheConfig {
             local_path: temp_dir.path().join("cache"),
             server_endpoint: "http://localhost:8001".to_string(),
@@ -453,10 +457,10 @@ mod tests {
         };
 
         // Save config
-        original_config.save_to_config_file().unwrap();
+        original_config.save_to_config_file().expect("Failed to save config");
 
         // Load config
-        let loaded_config = CacheConfig::from_config_file().unwrap();
+        let loaded_config = CacheConfig::from_config_file().expect("Failed to load config");
 
         assert_eq!(loaded_config.local_path, original_config.local_path);
         assert_eq!(

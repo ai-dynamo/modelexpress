@@ -34,18 +34,28 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn test_read_payload_json() {
         let payload = r#"{"key": "value", "number": 42}"#;
-        let result = read_payload(Some(payload.to_string()), None).unwrap();
+        let result = read_payload(Some(payload.to_string()), None)
+            .expect("Should be able to parse valid JSON payload");
         assert!(result.is_some());
-        let map = result.unwrap();
-        assert_eq!(map.get("key").unwrap(), "value");
-        assert_eq!(map.get("number").unwrap(), 42);
+        let map = result.expect("Result should contain a payload map");
+        assert_eq!(
+            map.get("key").expect("Map should contain 'key' field"),
+            "value"
+        );
+        assert_eq!(
+            map.get("number").expect("Map should contain 'number' field"),
+            42
+        );
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn test_read_payload_empty() {
-        let result = read_payload(None, None).unwrap();
+        let result = read_payload(None, None)
+            .expect("Should succeed when no payload is provided");
         assert!(result.is_none());
     }
 
