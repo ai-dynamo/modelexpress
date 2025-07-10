@@ -3,7 +3,7 @@ mod error;
 
 use model_express_common::{
     Result as CommonResult,
-    cache::{CacheConfig, CacheStats, ModelInfo},
+    cache::{CacheConfig, CacheStats},
     constants, download,
     grpc::{
         api::{ApiRequest, api_service_client::ApiServiceClient},

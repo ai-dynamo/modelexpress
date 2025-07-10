@@ -1,684 +1,440 @@
-# ModelExpress Cache CLI Documentation
+# ModelExpress CLI
 
-The ModelExpress Cache CLI provides a powerful command-line interface for managing model downloads, cache operations, and model lifecycle management. This document covers how to use the CLI to download models and manage your local model cache.
+A comprehensive command-line interface for interacting with ModelExpress server, providing easy access to model downloads, cache management, health checks, and API operations.
 
-## Table of Contents
+## Features
 
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Commands Reference](#commands-reference)
-- [Downloading Models](#downloading-models)
-- [Cache Management](#cache-management)
-- [Examples](#examples)
-- [Troubleshooting](#troubleshooting)
+- **Health Monitoring**: Check server status, version, and uptime
+- **Model Management**: Download, list, clear, validate, and manage models with automatic storage
+- **API Operations**: Send custom API requests with JSON payloads
+- **Multiple Output Formats**: Human-readable, JSON, or pretty-printed JSON
+- **Flexible Configuration**: Server endpoint, timeouts, and logging levels
+- **Robust Error Handling**: Clear error messages and proper exit codes
 
 ## Installation
 
-The cache CLI is included with the ModelExpress client. Build it from source:
+Build the CLI from the ModelExpress workspace:
 
 ```bash
-# Build the entire workspace
-cargo build
-
-# The cache CLI binary will be available at:
-./target/debug/cache_cli
+cargo build --bin model-express-cli
 ```
 
-## Quick Start
+The compiled binary will be available at `target/debug/model-express-cli` (or `target/release/model-express-cli` for release builds).
 
-### 1. Initialize Cache Configuration
-
-First, set up your cache configuration:
-
-```bash
-# Initialize with default settings
-./target/debug/cache_cli init
-
-# Or specify custom settings
-./target/debug/cache_cli init \
-  --cache-path /path/to/your/cache \
-  --server-endpoint http://localhost:8001 \
-  --auto-mount true
-```
-
-### 2. Download Your First Model
-
-```bash
-# Download a model to cache
-./target/debug/cache_cli preload "sentence-transformers/all-MiniLM-L6-v2"
-
-# Download with specific provider
-./target/debug/cache_cli preload "google/gemma-2b" --provider huggingface
-```
-
-### 3. Check Cache Status
-
-```bash
-# View cache status
-./target/debug/cache_cli status
-
-# List cached models
-./target/debug/cache_cli list
-
-# View detailed statistics
-./target/debug/cache_cli stats
-```
-
-## Configuration
-
-The CLI uses a hybrid configuration system that discovers settings from multiple sources in order of priority:
-
-1. **Command-line arguments** (highest priority)
-2. **Environment variables**
-3. **Configuration file** (`~/.config/model_express/cache.toml`)
-4. **Auto-detection** (default paths)
-5. **Server query** (if server is available)
-6. **User prompt** (interactive mode)
-
-### Environment Variables
-
-```bash
-export MODEL_EXPRESS_CACHE_PATH="/path/to/cache"
-export MODEL_EXPRESS_SERVER_ENDPOINT="http://localhost:8001"
-export MODEL_EXPRESS_AUTO_MOUNT="true"
-```
-
-### Configuration File
-
-The CLI automatically creates and manages a configuration file at `~/.config/model_express/cache.toml`:
-
-```toml
-local_path = "/home/user/.cache/model_express"
-server_endpoint = "http://localhost:8001"
-auto_mount = true
-timeout_secs = 30
-```
-
-## Commands Reference
+## Usage
 
 ### Global Options
 
-All commands support these global options:
+```bash
+model-express-cli [OPTIONS] <COMMAND>
+```
+
+**Options:**
+- `-e, --endpoint <ENDPOINT>`: Server endpoint (default: http://localhost:8001)
+- `-t, --timeout <TIMEOUT>`: Request timeout in seconds (default: 30)
+- `-f, --format <FORMAT>`: Output format: `human`, `json`, `json-pretty` (default: human)
+- `-v, -vv, -vvv`: Verbose mode (info, debug, trace)
+- `-q, --quiet`: Quiet mode (suppress all output except errors)
+- `--cache-path <PATH>`: Model storage path override
+- `-h, --help`: Print help information
+- `-V, --version`: Print version
+
+**Environment Variables:**
+- `MODEL_EXPRESS_ENDPOINT`: Set the default server endpoint
+- `MODEL_EXPRESS_CACHE_PATH`: Set the default model storage path
+
+### Commands
+
+#### Health Check
+
+Check server health and status:
 
 ```bash
---cache-path <PATH>           # Override cache path
---server-endpoint <ENDPOINT>  # Override server endpoint
--h, --help                    # Show help
--V, --version                 # Show version
+# Basic health check
+model-express-cli health
+
+# JSON output
+model-express-cli --format json health
 ```
 
-### Available Commands
+**Example output:**
+```
+Server Health Status
+  Status: ok
+  Version: 0.1.0
+  Uptime: 120 seconds
+```
 
-#### `init` - Initialize Cache Configuration
+#### Model Operations
 
-Sets up cache configuration interactively or with provided options.
+Download and manage models with various strategies:
 
 ```bash
-# Interactive initialization
-./target/debug/cache_cli init
+# Download with smart fallback (tries server first, then direct)
+model-express-cli model download google-t5/t5-small
 
-# Non-interactive with options
-./target/debug/cache_cli init \
-  --cache-path /opt/models \
-  --server-endpoint http://model-server:8001 \
-  --auto-mount true
+# Use specific provider and strategy
+model-express-cli model download google-t5/t5-small \
+  --provider hugging-face \
+  --strategy server-only
+
+# Direct download (bypass server)
+model-express-cli model download microsoft/DialoGPT-medium \
+  --strategy direct
+
+# Initialize model storage configuration
+model-express-cli model init
+
+# Initialize with custom settings
+model-express-cli model init \
+  --storage-path /path/to/your/models \
+  --server-endpoint http://localhost:8001 \
+  --auto-mount
+
+# List downloaded models
+model-express-cli model list
+
+# Show detailed model information
+model-express-cli model list --detailed
+
+# Check model storage status
+model-express-cli model status
+
+# Clear specific model from storage
+model-express-cli model clear google-t5/t5-small
+
+# Clear all models from storage (with confirmation)
+model-express-cli model clear-all
+
+# Clear all models without confirmation
+model-express-cli model clear-all --yes
+
+# Validate model integrity
+model-express-cli model validate
+
+# Validate specific model
+model-express-cli model validate google-t5/t5-small
+
+# Show model storage statistics
+model-express-cli model stats
+
+# Show detailed storage statistics
+model-express-cli model stats --detailed
 ```
 
-#### `preload` - Download Model to Cache
+**Download Strategies:**
+- `smart-fallback`: Try server first, fallback to direct download (default)
+- `server-fallback`: Use server with fallback to direct download
+- `server-only`: Use server only (no fallback)
+- `direct`: Direct download only (bypass server)
 
-Downloads a model to the local cache for faster subsequent access.
+**Providers:**
+- `hugging-face`: Hugging Face model hub (default)
+
+**Model Commands:**
+- `download`: Download model with automatic storage (use `--strategy` and `--provider` for options)
+- `init`: Initialize model storage configuration
+- `list`: List downloaded models (use `--detailed` for more info)
+- `status`: Show model storage status and usage
+- `clear`: Clear specific model from storage
+- `clear-all`: Clear all models from storage (use `--yes` to skip confirmation)
+- `validate`: Validate model integrity
+- `stats`: Show model storage statistics (use `--detailed` for more info)
+
+#### API Operations
+
+Send custom API requests:
 
 ```bash
-# Basic model download
-./target/debug/cache_cli preload "bert-base-uncased"
+# Simple ping
+model-express-cli api send ping
 
-# Download with specific provider
-./target/debug/cache_cli preload "google/gemma-2b" --provider huggingface
+# Custom action with JSON payload
+model-express-cli api send my-action \
+  --payload '{"key": "value", "number": 42}'
 
-# Download with custom cache path
-./target/debug/cache_cli --cache-path /custom/cache preload "roberta-base"
+# Read payload from file
+model-express-cli api send process-data \
+  --payload-file data.json
+
+# Read payload from stdin
+echo '{"input": "data"}' | model-express-cli api send process \
+  --payload -
 ```
 
-#### `list` - List Cached Models
+### Output Formats
 
-Shows all models currently cached locally.
+#### Human-readable (default)
+Colorized, structured output optimized for terminal viewing.
 
+#### JSON
+Compact JSON output suitable for scripting:
 ```bash
-# List all cached models
-./target/debug/cache_cli list
-
-# List with custom cache path
-./target/debug/cache_cli --cache-path /custom/cache list
+model-express-cli --format json health
+# Output: {"version":"0.1.0","status":"ok","uptime":120}
 ```
 
-#### `status` - Show Cache Status
-
-Displays cache health, usage statistics, and configuration.
-
+#### Pretty JSON
+Formatted JSON with indentation:
 ```bash
-# Show cache status
-./target/debug/cache_cli status
-
-# Show status for specific cache
-./target/debug/cache_cli --cache-path /custom/cache status
-```
-
-#### `stats` - Show Detailed Statistics
-
-Provides detailed cache statistics including size, model count, and individual model information.
-
-```bash
-# Show detailed statistics
-./target/debug/cache_cli stats
-
-# Show stats for specific cache
-./target/debug/cache_cli --cache-path /custom/cache stats
-```
-
-#### `validate` - Validate Cache Integrity
-
-Checks cache integrity and validates cached models.
-
-```bash
-# Validate entire cache
-./target/debug/cache_cli validate
-
-# Validate specific cache
-./target/debug/cache_cli --cache-path /custom/cache validate
-```
-
-#### `clear` - Clear Specific Model
-
-Removes a specific model from the cache.
-
-```bash
-# Clear specific model
-./target/debug/cache_cli clear "bert-base-uncased"
-
-# Clear with custom cache path
-./target/debug/cache_cli --cache-path /custom/cache clear "google/gemma-2b"
-```
-
-#### `clear-all` - Clear Entire Cache
-
-Removes all cached models.
-
-```bash
-# Clear entire cache
-./target/debug/cache_cli clear-all
-
-# Clear with custom cache path
-./target/debug/cache_cli --cache-path /custom/cache clear-all
-```
-
-## Downloading Models
-
-### Understanding Server vs Client Cache
-
-ModelExpress uses a **two-tier caching system**:
-
-1. **Server Cache**: Models are downloaded and cached on the server in `~/.cache/huggingface/hub/`
-2. **Client Cache**: Optional local cache for faster subsequent access
-
-When you request a model, the system intelligently handles two scenarios:
-
-### Scenario 1: Server Downloads New Model
-
-When a model is **not cached** on the server:
-
-```bash
-# Request a model that's not on the server
-./target/debug/cache_cli preload "google/gemma-7b"
-
-# What happens:
-# 1. Client connects to server via gRPC
-# 2. Server checks ~/.cache/huggingface/hub/ - model not found
-# 3. Server starts downloading from Hugging Face Hub
-# 4. Server streams progress updates to client:
-#    INFO: Model google/gemma-7b: Downloading model files...
-#    INFO: Model google/gemma-7b: Downloaded config.json
-#    INFO: Model google/gemma-7b: Downloaded pytorch_model-00001-of-00002.safetensors
-#    INFO: Model google/gemma-7b: Downloaded pytorch_model-00002-of-00002.safetensors
-#    INFO: Model google/gemma-7b: Downloaded tokenizer.json
-#    INFO: Model google/gemma-7b: Model download completed successfully
-# 5. Server saves model to ~/.cache/huggingface/hub/
-# 6. Client receives confirmation
-```
-
-**Server-side process:**
-```rust
-// Server checks cache
-if let Some(status) = MODEL_TRACKER.get_status("google/gemma-7b") {
-    // Model not found, status is None
-}
-
-// Server downloads to HF cache
-download::download_model("google/gemma-7b", ModelProvider::HuggingFace).await
-// Downloads to: ~/.cache/huggingface/hub/models--google--gemma-7b--main/
-
-// Server updates database
-MODEL_TRACKER.set_status("google/gemma-7b", ModelStatus::DOWNLOADED)
-```
-
-### Scenario 2: Server Streams Existing Cached Model
-
-When a model is **already cached** on the server:
-
-```bash
-# Request a model that's already on the server
-./target/debug/cache_cli preload "google/gemma-7b"
-
-# What happens:
-# 1. Client connects to server via gRPC
-# 2. Server checks ~/.cache/huggingface/hub/ - model found!
-# 3. Server immediately returns cached status:
-#    INFO: Model google/gemma-7b: Model already downloaded
-# 4. No download occurs - instant response
-# 5. Client receives immediate confirmation
-```
-
-**Server-side process:**
-```rust
-// Server checks cache
-if let Some(status) = MODEL_TRACKER.get_status("google/gemma-7b") {
-    // Model found, status is DOWNLOADED
-    let update = ModelStatusUpdate {
-        status: ModelStatus::DOWNLOADED,
-        message: Some("Model already downloaded".to_string()),
-        // ...
-    };
-    // Immediate response, no download needed
-}
-```
-
-### Real-World Examples
-
-#### Example 1: First-Time Model Download
-
-```bash
-# First time requesting a model
-./target/debug/cache_cli preload "google/gemma-7b"
-
-# Expected output:
-# INFO: Pre-loading model: google/gemma-7b (provider: HuggingFace)
-# INFO: Model google/gemma-7b: Starting download from Hugging Face Hub...
-# INFO: Model google/gemma-7b: Downloading config.json (1.8 KB)
-# INFO: Model google/gemma-7b: Downloading pytorch_model-00001-of-00002.safetensors (13.1 GB)
-# INFO: Model google/gemma-7b: Downloading pytorch_model-00002-of-00002.safetensors (13.1 GB)
-# INFO: Model google/gemma-7b: Downloading tokenizer.json (2.1 MB)
-# INFO: Model google/gemma-7b: Model download completed successfully
-# INFO: Model pre-loaded successfully!
-```
-
-#### Example 2: Subsequent Model Request
-
-```bash
-# Request the same model again
-./target/debug/cache_cli preload "google/gemma-7b"
-
-# Expected output:
-# INFO: Pre-loading model: google/gemma-7b (provider: HuggingFace)
-# INFO: Model google/gemma-7b: Model already downloaded
-# INFO: Model pre-loaded successfully!
-```
-
-#### Example 3: Mixed Cache Status
-
-```bash
-# Check what's cached
-./target/debug/cache_cli list
-
+model-express-cli --format json-pretty health
 # Output:
-# INFO: Cached Models
-# INFO: =============
-# INFO: Total models: 2
-# INFO: Total size: 26.3 GB
-# INFO: Models:
-# INFO:   google/gemma-7b (26.2 GB)
-# INFO:   google/gemma-2b (5.1 GB)
-
-# Request cached model (instant)
-./target/debug/cache_cli preload "google/gemma-7b"
-# INFO: Model google/gemma-7b: Model already downloaded
-
-# Request new model (downloads)
-./target/debug/cache_cli preload "google/gemma-2b"
-# INFO: Model google/gemma-2b: Starting download from Hugging Face Hub...
-# INFO: Model google/gemma-2b: Model download completed successfully
-```
-
-### Monitoring Download Progress
-
-The CLI provides real-time feedback during downloads:
-
-```bash
-# Watch download progress
-./target/debug/cache_cli preload "google/gemma-7b"
-
-# Real-time output:
-# INFO: Pre-loading model: google/gemma-7b (provider: HuggingFace)
-# INFO: Model google/gemma-7b: Starting download from Hugging Face Hub...
-# INFO: Model google/gemma-7b: Downloading config.json (1.8 KB)
-# INFO: Model google/gemma-7b: Downloading pytorch_model-00001-of-00002.safetensors (13.1 GB)
-# INFO: Model google/gemma-7b: Downloading pytorch_model-00002-of-00002.safetensors (13.1 GB)
-# INFO: Model google/gemma-7b: Downloading tokenizer.json (2.1 MB)
-# INFO: Model google/gemma-7b: Model download completed successfully
-# INFO: Model pre-loaded successfully!
-```
-
-### Cache Status Verification
-
-Verify what's cached on the server:
-
-```bash
-# Check server cache status
-./target/debug/cache_cli status
-
-# Output shows:
-# INFO: Cache Status
-# INFO: ============
-# INFO: Cache path: /home/user/.cache/model_express
-# INFO: Server endpoint: http://localhost:8001
-# INFO: Server connection: ✅ Available
-# INFO: Total models: 3
-# INFO: Total size: 31.4 GB
-
-# List specific cached models
-./target/debug/cache_cli list --detailed
-
-# Output:
-# INFO: Cached Models
-# INFO: =============
-# INFO: Total models: 3
-# INFO: Total size: 31.4 GB
-# INFO: Models:
-# INFO:   google/gemma-7b (26.2 GB) - /home/user/.cache/model_express/google/gemma-7b
-# INFO:   google/gemma-2b (5.1 GB) - /home/user/.cache/model_express/google/gemma-2b
-# INFO:   microsoft/DialoGPT-medium (1.5 GB) - /home/user/.cache/model_express/microsoft/DialoGPT-medium
-```
-
-### Performance Comparison
-
-| Scenario | Response Time | Network Usage | Server Load |
-|----------|---------------|---------------|-------------|
-| **New Model Download** | 5-15min | High (download) | High (processing) |
-| **Cached Model Access** | <1s | Low (gRPC only) | Low (status check) |
-
-### Best Practices
-
-1. **Preload Frequently Used Models**: Download large models like Gemma-7B during off-peak hours
-2. **Monitor Cache Status**: Regularly check what's cached, especially for large models
-3. **Use Appropriate Models**: Choose smaller models like Gemma-2B for development
-4. **Validate Downloads**: Verify model integrity after download, especially for multi-part models
-5. **Consider Storage**: Large models like Gemma-7B require significant disk space (26+ GB)
-
-### Supported Model Providers
-
-Currently supported providers:
-- `huggingface` (default) - Hugging Face Hub models
-- Additional providers can be added in future versions
-
-### Model Naming
-
-Models can be specified using:
-- **Full model names**: `"google/gemma-7b"`
-- **Short names**: `"gemma-7b"` (resolves to `"google/gemma-7b"`)
-- **Versioned models**: `"google/gemma-7b@v1.0"`
-
-### Error Handling
-
-The CLI handles various error scenarios:
-
-```bash
-# Network timeout for large model
-./target/debug/cache_cli preload "invalid-model-name"
-# ERROR: Model download failed: Failed to fetch model from HuggingFace
-
-# Server unavailable
-./target/debug/cache_cli preload "google/gemma-7b" --server-endpoint http://invalid:8001
-# WARN: Server connection: ❌ Unavailable
-# INFO: Server unavailable, pre-loading model google/gemma-7b directly
-
-# Insufficient disk space for large model
-./target/debug/cache_cli preload "google/gemma-7b"
-# ERROR: No space left on device
-# Solution: Ensure you have at least 30GB free space for Gemma-7B
-```
-
-## Cache Management
-
-### Understanding Cache Structure
-
-The cache is organized as follows:
-
-```
-~/.cache/model_express/
-├── models/
-│   ├── bert-base-uncased/
-│   │   ├── config.json
-│   │   ├── pytorch_model.bin
-│   │   └── tokenizer.json
-│   ├── google/gemma-2b/
-│   │   ├── config.json
-│   │   ├── pytorch_model-00001-of-00002.safetensors
-│   │   ├── pytorch_model-00002-of-00002.safetensors
-│   │   └── tokenizer.json
-│   └── ...
-└── cache.db
-```
-
-### Cache Statistics
-
-View detailed cache information:
-
-```bash
-# Show cache statistics
-./target/debug/cache_cli stats
-
-# Example output:
-# Total models: 5
-# Total size: 2.34 GB
-# Models:
-#   - bert-base-uncased: 420.5 MB
-#   - google/gemma-2b: 5.1 GB
-#   - roberta-base: 1.37 GB
-```
-
-### Cache Validation
-
-Validate cache integrity:
-
-```bash
-# Validate all cached models
-./target/debug/cache_cli validate
-
-# Check for corrupted files
-./target/debug/cache_cli validate --check-integrity
+# {
+#   "version": "0.1.0",
+#   "status": "ok",
+#   "uptime": 120
+# }
 ```
 
 ## Examples
 
-### Example 1: Setting Up Cache for Development
+### Basic Usage
 
 ```bash
-# 1. Initialize cache
-./target/debug/cache_cli init --cache-path ~/dev_models
+# Check if server is running
+model-express-cli health
 
-# 2. Download common models
-./target/debug/cache_cli preload "bert-base-uncased"
-./target/debug/cache_cli preload "google/gemma-2b"
-./target/debug/cache_cli preload "sentence-transformers/all-MiniLM-L6-v2"
+# Initialize model storage
+model-express-cli model init
 
-# 3. Check status
-./target/debug/cache_cli status
+# Download a model with automatic storage
+model-express-cli model download google-t5/t5-small
+
+# Check model storage status
+model-express-cli model status
+
+# Test API connectivity
+model-express-cli api send ping
 ```
 
-### Example 2: Production Cache Setup
+### Advanced Usage
 
 ```bash
-# 1. Initialize with production settings
-./target/debug/cache_cli init \
-  --cache-path /opt/model_cache \
-  --server-endpoint http://model-server:8001 \
-  --auto-mount true
+# Connect to remote server with custom timeout
+model-express-cli --endpoint https://my-server.com:8001 \
+  --timeout 60 \
+  health
 
-# 2. Preload production models
-./target/debug/cache_cli preload "microsoft/DialoGPT-medium"
-./target/debug/cache_cli preload "facebook/bart-large-cnn"
+# Download model with verbose logging
+model-express-cli -vv model download microsoft/DialoGPT-small \
+  --strategy server-only
 
-# 3. Validate cache
-./target/debug/cache_cli validate
+# Download model with custom storage path
+model-express-cli --cache-path /custom/storage/path \
+  model download google-t5/t5-small
 
-# 4. Monitor usage
-./target/debug/cache_cli stats
+# Send API request with file payload and JSON output
+model-express-cli --format json api send process-batch \
+  --payload-file batch-data.json
+
+# Get model storage statistics in JSON format
+model-express-cli --format json model stats --detailed
 ```
 
-### Example 3: Cache Maintenance
+### Error Handling
+
+The CLI provides clear error messages and appropriate exit codes:
+
+- **Exit Code 0**: Success
+- **Exit Code 1**: General error (network, server, validation)
+- **Exit Code 2**: Invalid command line arguments
 
 ```bash
-# 1. Check cache usage
-./target/debug/cache_cli stats
-
-# 2. Remove unused models
-./target/debug/cache_cli clear "old-model-name"
-
-# 3. Clear entire cache if needed
-./target/debug/cache_cli clear-all
-
-# 4. Re-download essential models
-./target/debug/cache_cli preload "essential-model"
+# Handle connection errors gracefully
+if ! model-express-cli health >/dev/null 2>&1; then
+    echo "Server is not available, trying direct download..."
+    model-express-cli model download my-model --strategy direct
+fi
 ```
 
-### Example 4: Integration with ModelExpress Server
+## Integration Examples
+
+### Shell Scripts
 
 ```bash
-# 1. Configure for server integration
-./target/debug/cache_cli init \
-  --server-endpoint http://localhost:8001
+#!/bin/bash
+# check-and-download.sh
 
-# 2. Download models through server
-./target/debug/cache_cli preload "bert-base-uncased"
+MODEL_NAME="$1"
+if [ -z "$MODEL_NAME" ]; then
+    echo "Usage: $0 <model-name>"
+    exit 1
+fi
 
-# 3. Check server-cached models
-./target/debug/cache_cli list
+# Check server health first
+if model-express-cli --quiet health; then
+    echo "Server is healthy, downloading via server..."
+    model-express-cli model download "$MODEL_NAME" --strategy server-fallback
+else
+    echo "Server unavailable, downloading directly..."
+    model-express-cli model download "$MODEL_NAME" --strategy direct
+fi
+
+# Check if model was stored successfully
+if model-express-cli --format json model validate "$MODEL_NAME" | jq -r '.exists' | grep -q true; then
+    echo "Model '$MODEL_NAME' is now available in storage"
+else
+    echo "Warning: Model may not be properly stored"
+fi
+```
+
+### JSON Processing with jq
+
+```bash
+# Get server uptime in a script
+UPTIME=$(model-express-cli --format json health | jq -r '.uptime')
+echo "Server has been running for $UPTIME seconds"
+
+# Check if server is healthy
+STATUS=$(model-express-cli --format json health | jq -r '.status')
+if [ "$STATUS" = "ok" ]; then
+    echo "Server is healthy"
+else
+    echo "Server is not healthy: $STATUS"
+    exit 1
+fi
+
+# Get model storage statistics
+TOTAL_MODELS=$(model-express-cli --format json model stats | jq -r '.total_models')
+TOTAL_SIZE=$(model-express-cli --format json model stats | jq -r '.total_size')
+echo "Storage contains $TOTAL_MODELS models using $TOTAL_SIZE"
+
+# Check if specific model is stored
+MODEL_EXISTS=$(model-express-cli --format json model validate "google-t5/t5-small" | jq -r '.exists')
+if [ "$MODEL_EXISTS" = "true" ]; then
+    echo "Model is available in storage"
+else
+    echo "Model not found in storage"
+fi
+
+# List all stored model names
+model-express-cli --format json model list | jq -r '.models[].name'
+```
+
+### CI/CD Integration
+
+```yaml
+# .github/workflows/test.yml
+- name: Test ModelExpress server
+  run: |
+    # Start server in background
+    ./target/release/model-express-server &
+    sleep 5
+
+    # Test health endpoint
+    ./target/release/model-express-cli health
+
+    # Initialize model storage
+    ./target/release/model-express-cli model init --auto-mount
+
+    # Test model download
+    ./target/release/model-express-cli model download google-t5/t5-small \
+      --strategy server-only
+
+    # Verify model was stored
+    ./target/release/model-express-cli model validate google-t5/t5-small
+
+    # Test API
+    ./target/release/model-express-cli api send ping
+
+    # Clean up storage
+    ./target/release/model-express-cli model clear-all --yes
+```
+
+## Configuration
+
+### Environment Variables
+
+Set default values using environment variables:
+
+```bash
+# Set default server endpoint
+export MODEL_EXPRESS_ENDPOINT="https://my-server.com:8001"
+
+# Set default cache path
+export MODEL_EXPRESS_CACHE_PATH="/path/to/storage"
+
+# Use the CLI without specifying endpoint or storage path
+model-express-cli health
+model-express-cli model status
+```
+
+### Configuration File Support
+
+While the CLI doesn't currently support configuration files, you can create wrapper scripts:
+
+```bash
+#!/bin/bash
+# modelexpress-prod
+exec model-express-cli --endpoint "https://prod-server.com:8001" "$@"
 ```
 
 ## Troubleshooting
 
-### Common Issues
-
-#### 1. Permission Denied
+### Connection Issues
 
 ```bash
-# Error: Permission denied when accessing cache
-# Solution: Check cache directory permissions
-ls -la ~/.cache/model_express/
-chmod 755 ~/.cache/model_express/
+# Test with verbose output
+model-express-cli -vv health
+
+# Check network connectivity
+curl -v http://localhost:8001/health 2>&1 | grep -i connect
 ```
 
-#### 2. Network Connectivity Issues
+### Server Not Running
 
 ```bash
-# Error: Failed to download model
-# Solution: Check network and try again
-./target/debug/cache_cli preload "model-name" --timeout 60
+# Try direct download instead
+model-express-cli model download my-model --strategy direct
+
+# Check model storage status without server connection
+model-express-cli model status
 ```
 
-#### 3. Insufficient Disk Space
+### Storage Issues
 
 ```bash
-# Error: No space left on device
-# Solution: Check available space and clear cache if needed
-df -h ~/.cache/model_express/
-./target/debug/cache_cli clear-all
-```
+# Validate model storage integrity
+model-express-cli model validate
 
-#### 4. Corrupted Cache
+# Check storage statistics to find problematic models
+model-express-cli model stats --detailed
 
-```bash
-# Error: Cache validation failed
-# Solution: Clear and re-download
-./target/debug/cache_cli clear-all
-./target/debug/cache_cli preload "model-name"
+# Clear corrupted model and re-download
+model-express-cli model clear problematic-model
+model-express-cli model download problematic-model
 ```
 
 ### Debug Mode
 
-Enable verbose logging for troubleshooting:
-
 ```bash
-# Set debug logging
-export RUST_LOG=debug
-
-# Run CLI with debug output
-./target/debug/cache_cli preload "model-name"
+# Maximum verbosity for debugging
+model-express-cli -vvv model download my-model
 ```
 
-### Configuration Issues
+## Development
 
-If the CLI can't find your configuration:
+### Building from Source
 
 ```bash
-# Check configuration file
-cat ~/.config/model_express/cache.toml
+# Debug build
+cargo build --bin model-express-cli
 
-# Re-initialize configuration
-./target/debug/cache_cli init
+# Release build
+cargo build --release --bin model-express-cli
+
+# Run tests
+cargo test --bin model-express-cli
 ```
 
-## Best Practices
+### Adding New Commands
 
-### 1. Cache Organization
+The CLI is built using the `clap` crate with derive macros. To add new commands:
 
-- Use dedicated cache directories for different environments
-- Regularly monitor cache usage with `stats` command
-- Implement cache rotation policies for large deployments
+1. Add the command to the `Commands` enum in `src/bin/cli.rs`
+2. Implement the handler function
+3. Add the handler to the main match statement
 
-### 2. Model Selection
+## License
 
-- Preload frequently used models
-- Use specific model versions for reproducibility
-- Monitor model sizes before downloading
-
-### 3. Performance Optimization
-
-- Use SSD storage for cache directories
-- Implement cache warming strategies
-- Monitor download speeds and optimize network settings
-
-### 4. Security
-
-- Secure cache directories with appropriate permissions
-- Use HTTPS endpoints for model downloads
-- Regularly validate cache integrity
-
-### 5. Monitoring
-
-- Set up regular cache health checks
-- Monitor disk usage and cache growth
-- Implement alerting for cache issues
-
-## Integration with ModelExpress
-
-The cache CLI integrates seamlessly with the ModelExpress ecosystem:
-
-- **Server Integration**: Models downloaded via CLI are available to the server
-- **Client Integration**: Client applications can use cached models
-- **Kubernetes**: Cache volumes can be mounted in containerized deployments
-- **Fluid**: Advanced caching with distributed storage systems
-
-For more information about server integration, see the [Server Documentation](../README.md#running-the-server).
-
-## Support
-
-For issues and questions:
-
-1. Check this documentation
-2. Review the [troubleshooting section](#troubleshooting)
-3. Check the [ModelExpress repository](https://github.com/your-repo/model-express)
-4. Open an issue with detailed error information
-
----
-
-*Last updated: $(date)* 
+This CLI is part of the ModelExpress project and follows the same license terms.

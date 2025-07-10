@@ -1,12 +1,11 @@
 use crate::constants;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Configuration for model cache management
 #[derive(Debug, Clone, Serialize, Deserialize)]
