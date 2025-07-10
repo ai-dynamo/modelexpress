@@ -439,7 +439,8 @@ mod tests {
     #[allow(clippy::expect_used)]
     fn test_cache_config_from_path() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let config = CacheConfig::from_path(temp_dir.path()).expect("Failed to create config from path");
+        let config =
+            CacheConfig::from_path(temp_dir.path()).expect("Failed to create config from path");
 
         assert_eq!(config.local_path, temp_dir.path());
         assert!(config.auto_mount);
@@ -457,7 +458,9 @@ mod tests {
         };
 
         // Save config
-        original_config.save_to_config_file().expect("Failed to save config");
+        original_config
+            .save_to_config_file()
+            .expect("Failed to save config");
 
         // Load config
         let loaded_config = CacheConfig::from_config_file().expect("Failed to load config");

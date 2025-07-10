@@ -46,7 +46,8 @@ mod tests {
             "value"
         );
         assert_eq!(
-            map.get("number").expect("Map should contain 'number' field"),
+            map.get("number")
+                .expect("Map should contain 'number' field"),
             42
         );
     }
@@ -54,8 +55,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)]
     fn test_read_payload_empty() {
-        let result = read_payload(None, None)
-            .expect("Should succeed when no payload is provided");
+        let result = read_payload(None, None).expect("Should succeed when no payload is provided");
         assert!(result.is_none());
     }
 

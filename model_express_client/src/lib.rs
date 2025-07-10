@@ -182,7 +182,8 @@ impl Client {
                 api_response
                     .error
                     .unwrap_or_else(|| "Unknown server error".to_string()),
-            ).into());
+            )
+            .into());
         }
 
         let data_bytes = api_response.data.ok_or_else(|| {
@@ -293,7 +294,8 @@ impl Client {
                         .unwrap_or_else(|| "Unknown error occurred".to_string());
                     return Err(model_express_common::Error::Server(format!(
                         "Model download failed: {error_message}"
-                    )).into());
+                    ))
+                    .into());
                 }
                 ModelStatus::DOWNLOADING => {
                     // Continue processing updates
@@ -305,7 +307,8 @@ impl Client {
         // If stream ended without DOWNLOADED status, treat as error
         Err(model_express_common::Error::Server(
             "Model download stream ended unexpectedly".to_string(),
-        ).into())
+        )
+        .into())
     }
 
     /// Request a model from the server using the default provider (Hugging Face) with automatic fallback
