@@ -1,5 +1,5 @@
 use super::args::{CliModelProvider, DownloadStrategy, ModelCommands, OutputFormat};
-use super::output::{print_output, print_human_readable};
+use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
 use model_express_client::{Client, ClientConfig, ModelProvider};
@@ -14,7 +14,10 @@ pub async fn handle_health_command(
     config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("Initiating health check to server: {}", config.grpc_endpoint);
+    debug!(
+        "Initiating health check to server: {}",
+        config.grpc_endpoint
+    );
 
     let mut client = Client::new(config).await?;
     let status = client.health_check().await?;
@@ -34,11 +37,7 @@ pub async fn handle_health_command(
                 }
             );
             println!("  {}: {}", "Version".cyan().bold(), status.version);
-            println!(
-                "  {}: {} seconds",
-                "Uptime".cyan().bold(),
-                status.uptime
-            );
+            println!("  {}: {} seconds", "Uptime".cyan().bold(), status.uptime);
         }
         _ => print_output(&status, format),
     }
@@ -58,18 +57,38 @@ pub async fn handle_model_command(
             model_name,
             provider,
             strategy,
-        } => download_model(storage_path_override, model_name, provider, strategy, server_config, format).await,
+        } => {
+            download_model(
+                storage_path_override,
+                model_name,
+                provider,
+                strategy,
+                server_config,
+                format,
+            )
+            .await
+        }
         ModelCommands::Init {
             storage_path,
             server_endpoint,
             auto_mount,
         } => init_model_storage(storage_path, server_endpoint, auto_mount, format).await,
-        ModelCommands::List { detailed } => list_models(storage_path_override, detailed, format).await,
+        ModelCommands::List { detailed } => {
+            list_models(storage_path_override, detailed, format).await
+        }
         ModelCommands::Status => show_model_status(storage_path_override, format).await,
-        ModelCommands::Clear { model_name } => clear_model(storage_path_override, &model_name, format).await,
-        ModelCommands::ClearAll { yes } => clear_all_models(storage_path_override, yes, format).await,
-        ModelCommands::Validate { model_name } => validate_models(storage_path_override, model_name, format).await,
-        ModelCommands::Stats { detailed } => show_model_stats(storage_path_override, detailed, format).await,
+        ModelCommands::Clear { model_name } => {
+            clear_model(storage_path_override, &model_name, format).await
+        }
+        ModelCommands::ClearAll { yes } => {
+            clear_all_models(storage_path_override, yes, format).await
+        }
+        ModelCommands::Validate { model_name } => {
+            validate_models(storage_path_override, model_name, format).await
+        }
+        ModelCommands::Stats { detailed } => {
+            show_model_stats(storage_path_override, detailed, format).await
+        }
     }
 }
 
@@ -115,7 +134,8 @@ async fn download_model(
                 let mut client = Client::new_with_cache(config, cache_config).await?;
                 client.preload_model_to_cache(&model_name, provider).await
             } else {
-                Client::request_model_with_smart_fallback(model_name.clone(), provider, config).await
+                Client::request_model_with_smart_fallback(model_name.clone(), provider, config)
+                    .await
             }
         }
         DownloadStrategy::ServerFallback => {
@@ -322,22 +342,26 @@ async fn list_models(
             }
         }
         _ => {
-            let models_json: Vec<serde_json::Value> = stats.models.iter().map(|model| {
-                if detailed {
-                    serde_json::json!({
-                        "name": model.name,
-                        "size": model.size,
-                        "formatted_size": stats.format_model_size(model),
-                        "path": model.path
-                    })
-                } else {
-                    serde_json::json!({
-                        "name": model.name,
-                        "size": model.size,
-                        "formatted_size": stats.format_model_size(model)
-                    })
-                }
-            }).collect();
+            let models_json: Vec<serde_json::Value> = stats
+                .models
+                .iter()
+                .map(|model| {
+                    if detailed {
+                        serde_json::json!({
+                            "name": model.name,
+                            "size": model.size,
+                            "formatted_size": stats.format_model_size(model),
+                            "path": model.path
+                        })
+                    } else {
+                        serde_json::json!({
+                            "name": model.name,
+                            "size": model.size,
+                            "formatted_size": stats.format_model_size(model)
+                        })
+                    }
+                })
+                .collect();
 
             let output = serde_json::json!({
                 "total_models": stats.total_models,
@@ -359,7 +383,9 @@ async fn show_model_status(
     let stats = storage_config.get_cache_stats()?;
 
     let storage_accessible = storage_config.local_path.exists();
-    let server_available = Client::new(ClientConfig::new(&storage_config.server_endpoint)).await.is_ok();
+    let server_available = Client::new(ClientConfig::new(&storage_config.server_endpoint))
+        .await
+        .is_ok();
 
     match format {
         OutputFormat::Human => {
@@ -568,13 +594,19 @@ async fn show_model_stats(
         }
         _ => {
             let models_data = if detailed {
-                Some(stats.models.iter().map(|model| {
-                    serde_json::json!({
-                        "name": model.name,
-                        "size": model.size,
-                        "formatted_size": stats.format_model_size(model)
-                    })
-                }).collect::<Vec<_>>())
+                Some(
+                    stats
+                        .models
+                        .iter()
+                        .map(|model| {
+                            serde_json::json!({
+                                "name": model.name,
+                                "size": model.size,
+                                "formatted_size": stats.format_model_size(model)
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
             } else {
                 None
             };
@@ -595,7 +627,9 @@ async fn show_model_stats(
     Ok(())
 }
 
-fn get_storage_config(storage_path_override: Option<PathBuf>) -> Result<CacheConfig, Box<dyn std::error::Error>> {
+fn get_storage_config(
+    storage_path_override: Option<PathBuf>,
+) -> Result<CacheConfig, Box<dyn std::error::Error>> {
     // If storage path is provided via CLI, use it
     if let Some(path) = storage_path_override {
         return Ok(CacheConfig::from_path(path)?);

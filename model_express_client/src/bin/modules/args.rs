@@ -11,7 +11,12 @@ pub struct Cli {
     pub command: Commands,
 
     /// Server endpoint (can also be set via MODEL_EXPRESS_ENDPOINT env var)
-    #[arg(long, short = 'e', env = "MODEL_EXPRESS_ENDPOINT", default_value = "http://localhost:8001")]
+    #[arg(
+        long,
+        short = 'e',
+        env = "MODEL_EXPRESS_ENDPOINT",
+        default_value = "http://localhost:8001"
+    )]
     pub endpoint: String,
 
     /// Request timeout in seconds

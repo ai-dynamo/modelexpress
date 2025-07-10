@@ -5,11 +5,11 @@ mod modules {
     pub mod payload;
 }
 
-use modules::args::{ApiCommands, Cli, Commands};
 use clap::Parser;
 use colored::*;
-use modules::handlers::{handle_api_send, handle_health_command, handle_model_command};
 use model_express_client::ClientConfig;
+use modules::args::{ApiCommands, Cli, Commands};
+use modules::handlers::{handle_api_send, handle_health_command, handle_model_command};
 use modules::output::{print_output, setup_logging};
 use std::process;
 use tracing::{debug, error};
@@ -72,7 +72,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::modules::args::{CliModelProvider};
+    use super::modules::args::CliModelProvider;
     use model_express_client::ModelProvider;
 
     #[test]
