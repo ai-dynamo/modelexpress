@@ -4,7 +4,6 @@
 *.pdb
 
 # IDE specific files
-.vscode/
 .idea/
 *.iml
 .DS_Store

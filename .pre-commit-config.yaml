@@ -1,0 +1,54 @@
+# Pre-commit configuration for ModelExpress
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+
+repos:
+  # General hooks for all file types
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.md$'
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-case-conflict
+      - id: mixed-line-ending
+
+  # Rust-specific hooks
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      # Format code with rustfmt
+      - id: fmt
+        name: cargo fmt
+        description: Format Rust code with rustfmt
+        args: ["--all", "--"]
+
+      # Run clippy for linting
+      - id: clippy
+        name: cargo clippy
+        description: Run clippy lints
+        args:
+          [
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--fix",
+            "--",
+            "-D",
+            "warnings",
+          ]
+
+      # Check that the code compiles
+      - id: cargo-check
+        name: cargo check
+        description: Check that the code compiles
+        args: ["--workspace", "--all-targets", "--all-features"]
+
+fail_fast: false
+default_stages: [pre-commit]

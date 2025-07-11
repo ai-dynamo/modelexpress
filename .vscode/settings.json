@@ -1,0 +1,38 @@
+{
+    "rust-analyzer.check.command": "clippy",
+    "rust-analyzer.check.extraArgs": [
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+    ],
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "rust-analyzer.procMacro.enable": true,
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.fixAll": "explicit"
+    },
+    "files.associations": {
+        "*.toml": "toml",
+        "*.yml": "yaml",
+        "*.yaml": "yaml"
+    },
+    "terminal.integrated.defaultProfile.linux": "bash",
+    "search.exclude": {
+        "**/target/**": true
+    },
+    "files.exclude": {
+        "**/target/**": true
+    },
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.rulers": [
+            100
+        ]
+    },
+    "[markdown]": {
+        "editor.wordWrap": "on"
+    }
+}

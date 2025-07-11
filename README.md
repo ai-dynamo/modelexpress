@@ -89,6 +89,7 @@ chmod +x run_integration_tests.sh
 ```
 
 This script:
+
 - Starts the gRPC server in the background
 - Runs a test client that downloads a model ("google-t5/t5-small")
 - Performs concurrent model download tests
@@ -172,12 +173,22 @@ ModelExpress/
 ### Dependencies
 
 Key dependencies include:
+
 - `tokio`: Async runtime
 - `tonic`: gRPC framework
 - `axum`: Web framework (if needed)
 - `serde`: Serialization
 - `hf-hub`: Hugging Face Hub integration
 - `rusqlite`: SQLite database
+
+### Pre-commit Hooks
+
+This repository uses pre-commit hooks to maintain code quality. In order to contribute effectively, please set up the pre-commit hooks:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
 
 ## Performance
 
@@ -213,6 +224,7 @@ RUST_LOG=debug cargo run --bin model_express_server
 ## Support
 
 For issues and questions:
+
 - Create an issue in the repository
 - Check the integration tests for usage examples
 - Review the client library documentation
@@ -223,4 +235,4 @@ For issues and questions:
 - [ ] Model versioning support
 - [ ] Performance optimizations
 - [ ] Additional model format support
-- [ ] Web UI for model management 
+- [ ] Web UI for model management
