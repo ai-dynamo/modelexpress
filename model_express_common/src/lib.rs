@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod cache;
 pub mod download;
 pub mod models;
 
@@ -47,8 +48,21 @@ pub enum Error {
     Transport(#[from] tonic::transport::Error),
 }
 
+// Implement From traits for Box<Error> to work with the Result<T> type
+impl From<tonic::Status> for Box<Error> {
+    fn from(err: tonic::Status) -> Self {
+        Box::new(Error::Grpc(err))
+    }
+}
+
+impl From<tonic::transport::Error> for Box<Error> {
+    fn from(err: tonic::transport::Error) -> Self {
+        Box::new(Error::Transport(err))
+    }
+}
+
 /// Common result type for the project
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Box<Error>>;
 
 /// Constants shared between client and server
 pub mod constants {

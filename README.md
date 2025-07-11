@@ -17,6 +17,19 @@ The project is organized as a Rust workspace with the following components:
 - **`model_express_common`**: Shared code and constants between client and server
 - **`workspace-tests`**: Integration tests and test utilities
 
+### CLI Tool
+
+The client library includes a comprehensive command-line interface:
+
+- **`model-express-cli`**: A robust CLI tool for interacting with ModelExpress server
+  - Health monitoring and server status checks
+  - Model downloads with multiple strategies (server, direct, fallback)
+  - API operations with JSON payload support
+  - Multiple output formats (human-readable, JSON, pretty JSON)
+  - Comprehensive error handling and logging
+
+See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
+
 ## Prerequisites
 
 - **Rust**: Latest stable version (recommended: 1.70+)
@@ -77,23 +90,6 @@ docker run -p 8000:8000 model-express
 ```bash
 kubectl apply -f k8s-deployment.yaml
 ```
-
-### Option 4: Integration Testing
-
-```bash
-# Make the script executable
-chmod +x run_integration_tests.sh
-
-# Run the integration test suite
-./run_integration_tests.sh
-```
-
-This script:
-
-- Starts the gRPC server in the background
-- Runs a test client that downloads a model ("google-t5/t5-small")
-- Performs concurrent model download tests
-- Cleans up the server process when done
 
 ## Configuration
 
