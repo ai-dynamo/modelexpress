@@ -169,12 +169,22 @@ ModelExpress/
 ### Dependencies
 
 Key dependencies include:
+
 - `tokio`: Async runtime
 - `tonic`: gRPC framework
 - `axum`: Web framework (if needed)
 - `serde`: Serialization
 - `hf-hub`: Hugging Face Hub integration
 - `rusqlite`: SQLite database
+
+### Pre-commit Hooks
+
+This repository uses pre-commit hooks to maintain code quality. In order to contribute effectively, please set up the pre-commit hooks:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
 
 ## Performance
 
@@ -210,6 +220,7 @@ RUST_LOG=debug cargo run --bin model_express_server
 ## Support
 
 For issues and questions:
+
 - Create an issue in the repository
 - Check the integration tests for usage examples
 - Review the client library documentation
