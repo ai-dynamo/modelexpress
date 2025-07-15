@@ -45,7 +45,7 @@ pub struct ModelStatusResponse {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -53,16 +53,19 @@ mod tests {
     #[test]
     fn test_model_status_serialization() {
         let status = ModelStatus::DOWNLOADING;
-        let serialized = serde_json::to_string(&status).unwrap();
-        let deserialized: ModelStatus = serde_json::from_str(&serialized).unwrap();
+        let serialized = serde_json::to_string(&status).expect("Failed to serialize ModelStatus");
+        let deserialized: ModelStatus =
+            serde_json::from_str(&serialized).expect("Failed to deserialize ModelStatus");
         assert_eq!(status, deserialized);
     }
 
     #[test]
     fn test_model_provider_serialization() {
         let provider = ModelProvider::HuggingFace;
-        let serialized = serde_json::to_string(&provider).unwrap();
-        let deserialized: ModelProvider = serde_json::from_str(&serialized).unwrap();
+        let serialized =
+            serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
+        let deserialized: ModelProvider =
+            serde_json::from_str(&serialized).expect("Failed to deserialize ModelProvider");
         assert_eq!(provider, deserialized);
     }
 
@@ -83,8 +86,9 @@ mod tests {
             payload: Some(payload),
         };
 
-        let serialized = serde_json::to_string(&request).unwrap();
-        let deserialized: Request = serde_json::from_str(&serialized).unwrap();
+        let serialized = serde_json::to_string(&request).expect("Failed to serialize Request");
+        let deserialized: Request =
+            serde_json::from_str(&serialized).expect("Failed to deserialize Request");
 
         assert_eq!(request.id, deserialized.id);
         assert_eq!(request.action, deserialized.action);
@@ -100,8 +104,9 @@ mod tests {
             uptime: 3600,
         };
 
-        let serialized = serde_json::to_string(&status).unwrap();
-        let deserialized: Status = serde_json::from_str(&serialized).unwrap();
+        let serialized = serde_json::to_string(&status).expect("Failed to serialize Status");
+        let deserialized: Status =
+            serde_json::from_str(&serialized).expect("Failed to deserialize Status");
 
         assert_eq!(status.version, deserialized.version);
         assert_eq!(status.status, deserialized.status);
@@ -116,8 +121,10 @@ mod tests {
             provider: ModelProvider::HuggingFace,
         };
 
-        let serialized = serde_json::to_string(&response).unwrap();
-        let deserialized: ModelStatusResponse = serde_json::from_str(&serialized).unwrap();
+        let serialized =
+            serde_json::to_string(&response).expect("Failed to serialize ModelStatusResponse");
+        let deserialized: ModelStatusResponse =
+            serde_json::from_str(&serialized).expect("Failed to deserialize ModelStatusResponse");
 
         assert_eq!(response.model_name, deserialized.model_name);
         assert_eq!(response.status, deserialized.status);

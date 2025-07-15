@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 use model_express_client::{Client, ClientConfig};
 use model_express_common::{constants, models::ModelProvider};
@@ -34,7 +34,7 @@ async fn test_integration_full_workflow() {
         "Health check failed: {health_result:?}"
     );
 
-    let status = health_result.unwrap();
+    let status = health_result.expect("Expected health check to succeed");
     assert!(!status.version.is_empty());
     assert_eq!(status.status, "ok");
 
@@ -42,7 +42,7 @@ async fn test_integration_full_workflow() {
     let ping_result: Result<serde_json::Value, _> = client.send_request("ping", None).await;
     assert!(ping_result.is_ok(), "Ping request failed: {ping_result:?}");
 
-    let ping_response = ping_result.unwrap();
+    let ping_response = ping_result.expect("Expected ping request to succeed");
     assert_eq!(ping_response["message"], "pong");
 
     // Test unknown action
@@ -68,7 +68,7 @@ async fn test_integration_model_download_fallback() {
 
     // Should fail because model doesn't exist, but we should get a meaningful error
     assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
+    let error_msg = result.expect_err("Expected error result").to_string();
     assert!(error_msg.contains("Direct download failed") || error_msg.contains("Failed to fetch"));
 }
 
@@ -83,7 +83,7 @@ async fn test_integration_direct_download_invalid_model() {
 
     // Should fail with a meaningful error
     assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
+    let error_msg = result.expect_err("Expected error result").to_string();
     assert!(error_msg.contains("Direct download failed"));
 }
 

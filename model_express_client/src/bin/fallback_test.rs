@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 use model_express_client::{Client, ClientConfig, ModelProvider};
 use tracing::{error, info};

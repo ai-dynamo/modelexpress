@@ -169,7 +169,7 @@ type WaitingChannels =
 pub struct ModelDownloadTracker {
     /// `SQLite` database for persistent model status tracking
     database: ModelDatabase,
-    /// Maps model names to list of channels waiting for updates  
+    /// Maps model names to list of channels waiting for updates
     waiting_channels: WaitingChannels,
 }
 
