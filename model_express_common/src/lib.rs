@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 pub mod cache;
 pub mod download;
 pub mod models;
+#[allow(clippy::mod_module_files)]
+pub mod providers;
 
 // Generated gRPC code
 #[allow(clippy::similar_names)]

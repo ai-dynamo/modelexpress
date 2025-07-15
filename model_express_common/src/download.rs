@@ -1,39 +1,8 @@
 use crate::models::ModelProvider;
+use crate::providers::{HuggingFaceProvider, ModelProviderTrait};
 use anyhow::Result;
-use hf_hub::api::tokio::ApiBuilder;
-use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::info;
-
-const IGNORED: [&str; 3] = [".gitattributes", "LICENSE", "README.md"];
-
-const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
-
-/// Trait for model providers
-/// This trait provides the framework for supporting multiple model providers.
-/// It allows for easy extension to support providers like OpenAI, Anthropic, etc.
-#[async_trait::async_trait]
-pub trait ModelProviderTrait: Send + Sync {
-    /// Download a model and return the path where it was downloaded
-    async fn download_model(&self, model_name: &str) -> Result<PathBuf>;
-
-    /// Get the provider name for logging
-    fn provider_name(&self) -> &'static str;
-}
-
-/// Hugging Face model provider implementation
-pub struct HuggingFaceProvider;
-
-#[async_trait::async_trait]
-impl ModelProviderTrait for HuggingFaceProvider {
-    async fn download_model(&self, model_name: &str) -> Result<PathBuf> {
-        download_from_hf(model_name).await
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "Hugging Face"
-    }
-}
 
 /// Provider factory to get the appropriate provider implementation
 #[must_use]
@@ -54,98 +23,8 @@ pub async fn download_model(model_name: &str, provider: ModelProvider) -> Result
     provider_impl.download_model(model_name).await
 }
 
-/// Attempt to download a model from Hugging Face
-/// Returns the directory it is in
-pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
-    info!(
-        "Downloading model from Hugging Face: {}",
-        name.as_ref().display()
-    );
-    let name = name.as_ref();
-    let token = env::var(HF_TOKEN_ENV_VAR).ok();
-    let api = ApiBuilder::new()
-        .with_progress(true)
-        .with_token(token)
-        .build()?;
-    let model_name = name.display().to_string();
-
-    let repo = api.model(model_name.clone());
-
-    let info = match repo.info().await {
-        Ok(info) => info,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to fetch model '{}' from HuggingFace: {}. Is this a valid HuggingFace ID?",
-                model_name,
-                e
-            ));
-        }
-    };
-    info!("Got model info: {:?}", info);
-
-    if info.siblings.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Model '{}' exists but contains no downloadable files.",
-            model_name
-        ));
-    }
-
-    let mut p = PathBuf::new();
-    let mut files_downloaded = false;
-
-    for sib in info.siblings {
-        if IGNORED.contains(&sib.rfilename.as_str()) || is_image(Path::new(&sib.rfilename)) {
-            continue;
-        }
-
-        match repo.get(&sib.rfilename).await {
-            Ok(path) => {
-                p = path;
-                files_downloaded = true;
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Failed to download file '{}' from model '{}': {}",
-                    sib.rfilename,
-                    model_name,
-                    e
-                ));
-            }
-        }
-    }
-
-    if !files_downloaded {
-        return Err(anyhow::anyhow!(
-            "No valid files found for model '{}'.",
-            model_name
-        ));
-    }
-
-    info!("Downloaded model files for {}", model_name);
-
-    match p.parent() {
-        Some(p) => Ok(p.to_path_buf()),
-        None => Err(anyhow::anyhow!("Invalid HF cache path: {}", p.display())),
-    }
-}
-
-fn is_image(s: &Path) -> bool {
-    s.extension().is_some_and(|ext| {
-        ext.eq_ignore_ascii_case("png")
-            || ext.eq_ignore_ascii_case("jpg")
-            || ext.eq_ignore_ascii_case("jpeg")
-            || ext.eq_ignore_ascii_case("gif")
-            || ext.eq_ignore_ascii_case("webp")
-            || ext.eq_ignore_ascii_case("svg")
-            || ext.eq_ignore_ascii_case("ico")
-            || ext.eq_ignore_ascii_case("bmp")
-            || ext.eq_ignore_ascii_case("tiff")
-            || ext.eq_ignore_ascii_case("tif")
-    })
-}
-
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -167,32 +46,25 @@ mod tests {
             }
         }
 
+        async fn delete_model(&self, _model_name: &str) -> Result<()> {
+            if self.should_succeed {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Mock delete failed"))
+            }
+        }
+
         fn provider_name(&self) -> &'static str {
             "Mock Provider"
         }
-    }
 
-    #[test]
-    fn test_is_image_function() {
-        assert!(is_image(Path::new("test.png")));
-        assert!(is_image(Path::new("test.PNG")));
-        assert!(is_image(Path::new("test.jpg")));
-        assert!(is_image(Path::new("test.JPG")));
-        assert!(is_image(Path::new("test.jpeg")));
-        assert!(is_image(Path::new("test.JPEG")));
+        fn is_ignored(_filename: &str) -> bool {
+            false // Mock provider doesn't ignore any files
+        }
 
-        assert!(!is_image(Path::new("test.txt")));
-        assert!(!is_image(Path::new("test.py")));
-        assert!(!is_image(Path::new("test")));
-        assert!(!is_image(Path::new("test.model")));
-    }
-
-    #[test]
-    fn test_ignored_files() {
-        assert!(IGNORED.contains(&".gitattributes"));
-        assert!(IGNORED.contains(&"LICENSE"));
-        assert!(IGNORED.contains(&"README.md"));
-        assert_eq!(IGNORED.len(), 3);
+        fn is_image(_path: &std::path::Path) -> bool {
+            false // Mock provider doesn't consider any files as images
+        }
     }
 
     #[test]
@@ -203,7 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_provider_success() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let mock_provider = MockProvider {
             should_succeed: true,
             return_path: temp_dir.path().to_path_buf(),
@@ -211,12 +83,12 @@ mod tests {
 
         let result = mock_provider.download_model("test-model").await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), temp_dir.path());
+        assert_eq!(result.expect("Expected successful result"), temp_dir.path());
     }
 
     #[tokio::test]
     async fn test_mock_provider_failure() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let mock_provider = MockProvider {
             should_succeed: false,
             return_path: temp_dir.path().to_path_buf(),
@@ -226,7 +98,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("Expected error result")
                 .to_string()
                 .contains("Mock download failed")
         );
@@ -242,16 +114,41 @@ mod tests {
         let provider_impl = get_provider(provider);
         assert_eq!(provider_impl.provider_name(), "Hugging Face");
     }
-
     #[test]
-    fn test_hugging_face_provider_name() {
-        let provider = HuggingFaceProvider;
-        assert_eq!(provider.provider_name(), "Hugging Face");
-    }
+    fn test_default_trait_implementations() {
+        // Create a minimal provider that uses default implementations
+        struct DefaultProvider;
 
-    #[test]
-    fn test_provider_trait_object() {
-        let provider: Box<dyn ModelProviderTrait> = Box::new(HuggingFaceProvider);
-        assert_eq!(provider.provider_name(), "Hugging Face");
+        #[async_trait::async_trait]
+        impl ModelProviderTrait for DefaultProvider {
+            async fn download_model(&self, _model_name: &str) -> Result<PathBuf> {
+                Ok(PathBuf::from("/tmp"))
+            }
+
+            async fn delete_model(&self, _model_name: &str) -> Result<()> {
+                Ok(())
+            }
+
+            fn provider_name(&self) -> &'static str {
+                "Default Provider"
+            }
+            // Note: is_ignored and is_image are not implemented, so they use defaults
+        }
+
+        // Test default is_ignored behavior
+        assert!(DefaultProvider::is_ignored(".gitattributes"));
+        assert!(DefaultProvider::is_ignored(".gitignore"));
+        assert!(DefaultProvider::is_ignored("README.md"));
+        assert!(!DefaultProvider::is_ignored("LICENSE"));
+        assert!(!DefaultProvider::is_ignored("model.bin"));
+        assert!(!DefaultProvider::is_ignored("config.json"));
+
+        // Test default is_image behavior
+        use std::path::Path;
+        assert!(DefaultProvider::is_image(Path::new("test.png")));
+        assert!(DefaultProvider::is_image(Path::new("test.JPG")));
+        assert!(DefaultProvider::is_image(Path::new("test.gif")));
+        assert!(!DefaultProvider::is_image(Path::new("test.txt")));
+        assert!(!DefaultProvider::is_image(Path::new("model.bin")));
     }
 }
