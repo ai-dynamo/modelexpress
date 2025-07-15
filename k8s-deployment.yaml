@@ -15,48 +15,54 @@ spec:
         app: model-express-server
     spec:
       containers:
-      - name: model-express-server
-        image: model-express-server:latest
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8000
-        env:
-        - name: SERVER_PORT
-          value: "8000"
-        - name: LOG_LEVEL
-          value: "info"
-        - name: HF_HUB_CACHE
-          value: "/cache/models"
-        resources:
-          limits:
-            cpu: "500m"
-            memory: "256Mi"
-          requests:
-            cpu: "200m"
-            memory: "128Mi"
-        volumeMounts:
-        - name: model-cache
-          mountPath: /cache
-        - name: model-db
-          mountPath: /app/models.db
-          subPath: models.db
-        livenessProbe:
-          tcpSocket:
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        readinessProbe:
-          tcpSocket:
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 10
+        - name: model-express-server
+          image: model-express-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MODEL_EXPRESS_SERVER_PORT
+              value: "8000"
+            - name: MODEL_EXPRESS_LOGGING_LEVEL
+              value: "info"
+            - name: MODEL_EXPRESS_CACHE_DIRECTORY
+              value: "/cache/models"
+            - name: MODEL_EXPRESS_DATABASE_PATH
+              value: "/app/models.db"
+            - name: MODEL_EXPRESS_CACHE_EVICTION_ENABLED
+              value: "true"
+            - name: MODEL_EXPRESS_CACHE_EVICTION_CHECK_INTERVAL_SECONDS
+              value: "3600"
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /cache
+            - name: model-db
+              mountPath: /app/models.db
+              subPath: models.db
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
       volumes:
-      - name: model-cache
-        persistentVolumeClaim:
-          claimName: model-cache-pvc
-      - name: model-db
-        persistentVolumeClaim:
-          claimName: model-db-pvc
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache-pvc
+        - name: model-db
+          persistentVolumeClaim:
+            claimName: model-db-pvc
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -90,6 +96,6 @@ spec:
   selector:
     app: model-express-server
   ports:
-  - port: 8000
-    targetPort: 8000
+    - port: 8000
+      targetPort: 8000
   type: ClusterIP

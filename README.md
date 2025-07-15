@@ -93,17 +93,103 @@ kubectl apply -f k8s-deployment.yaml
 
 ## Configuration
 
+ModelExpress uses a layered configuration system that supports multiple sources in order of precedence:
+
+1. **Command line arguments** (highest priority)
+2. **Environment variables**
+3. **Configuration files** (YAML)
+4. **Default values** (lowest priority)
+
+### Configuration File
+
+Create a configuration file (supports YAML):
+
+```bash
+# Generate a sample configuration file
+cargo run --bin config_gen -- --output model-express.yaml
+
+# Or use the provided sample
+cp model-express.yaml my-config.yaml
+```
+
+Start the server with a configuration file:
+
+```bash
+cargo run --bin model_express_server -- --config my-config.yaml
+```
+
+### Environment Variables
+
+You can use structured environment variables with the `MODEL_EXPRESS_` prefix:
+
+```bash
+# Server settings
+export MODEL_EXPRESS_SERVER_HOST="127.0.0.1"
+export MODEL_EXPRESS_SERVER_PORT=8080
+
+# Database settings
+export MODEL_EXPRESS_DATABASE_PATH="/path/to/models.db"
+
+# Cache settings
+export MODEL_EXPRESS_CACHE_DIRECTORY="/path/to/cache"
+export MODEL_EXPRESS_CACHE_EVICTION_ENABLED=true
+
+# Logging settings
+export MODEL_EXPRESS_LOGGING_LEVEL=debug
+export MODEL_EXPRESS_LOGGING_FORMAT=json
+```
+
+### Command Line Arguments
+
+```bash
+# Basic usage
+cargo run --bin model_express_server -- --port 8080 --log-level debug
+
+# With configuration file
+cargo run --bin model_express_server -- --config my-config.yaml --port 8080
+
+# Validate configuration
+cargo run --bin model_express_server -- --config my-config.yaml --validate-config
+```
+
+### Configuration Options
+
+#### Server Settings
+
+- `host`: Server host address (default: "0.0.0.0")
+- `port`: Server port (default: 8001)
+- `graceful_shutdown`: Enable graceful shutdown (default: true)
+- `shutdown_timeout_seconds`: Shutdown timeout (default: 30)
+
+#### Database Settings
+
+- `path`: SQLite database file path (default: "./models.db")
+- `wal_mode`: Enable WAL mode (default: true)
+- `pool_size`: Connection pool size (default: 10)
+- `connection_timeout_seconds`: Connection timeout (default: 30)
+
+#### Cache Settings
+
+- `directory`: Cache directory path (default: "./cache")
+- `max_size_bytes`: Maximum cache size in bytes (default: null/unlimited)
+- `eviction.enabled`: Enable cache eviction (default: true)
+- `eviction.check_interval_seconds`: Eviction check interval (default: 3600)
+- `eviction.policy.unused_threshold_seconds`: Unused threshold (default: 604800/7 days)
+- `eviction.policy.max_models`: Maximum models to keep (default: null/unlimited)
+- `eviction.policy.min_free_space_bytes`: Minimum free space (default: null/unlimited)
+
+#### Logging Settings
+
+- `level`: Log level - trace, debug, info, warn, error (default: "info")
+- `format`: Log format - json, pretty, compact (default: "pretty")
+- `file`: Log file path (default: null/stdout)
+- `structured`: Enable structured logging (default: false)
+
 ### Default Settings
 
 - **gRPC Port**: 8001
 - **Server Address**: `0.0.0.0:8001` (listens on all interfaces)
 - **Client Endpoint**: `http://localhost:8001`
-
-### Environment Variables
-
-- `SERVER_PORT`: Override the default server port
-- `LOG_LEVEL`: Set logging level (default: info)
-- `RUST_LOG`: Configure tracing/logging output
 
 ## API Services
 
