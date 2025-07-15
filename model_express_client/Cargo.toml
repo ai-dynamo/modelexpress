@@ -22,7 +22,7 @@ colored = "2.1"
 [dev-dependencies]
 tokio-test = "0.4"
 tonic-build = { workspace = true }
-tempfile = "3.8"
+tempfile = "3.20"
 
 [lints]
 workspace = true
