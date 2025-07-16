@@ -1,5 +1,6 @@
 use crate::database::ModelDatabase;
 use model_express_common::{
+    cache::CacheConfig,
     download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
@@ -82,8 +83,16 @@ impl ApiService for ApiServiceImpl {
 }
 
 /// Model service implementation
-#[derive(Debug, Default)]
-pub struct ModelServiceImpl;
+#[derive(Debug)]
+pub struct ModelServiceImpl {
+    cache_config: Option<CacheConfig>,
+}
+
+impl ModelServiceImpl {
+    pub fn new(cache_config: Option<CacheConfig>) -> Self {
+        Self { cache_config }
+    }
+}
 
 #[tonic::async_trait]
 impl ModelService for ModelServiceImpl {
@@ -108,56 +117,66 @@ impl ModelService for ModelServiceImpl {
                 .unwrap_or(model_express_common::grpc::model::ModelProvider::HuggingFace)
                 .into();
 
+        let cache_config = self.cache_config.clone();
         // Spawn a task to handle the streaming download updates
-        tokio::spawn(async move {
-            // Check if the model is already downloaded
-            if let Some(status) = MODEL_TRACKER.get_status(&model_name) {
-                let update = ModelStatusUpdate {
-                    model_name: model_name.clone(),
-                    status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
-                    message: match status {
-                        ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
-                        ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
-                        ModelStatus::ERROR => Some("Previous download failed".to_string()),
-                    },
-                    provider: model_express_common::grpc::model::ModelProvider::from(provider)
-                        as i32,
-                };
-
-                if tx.send(Ok(update)).await.is_err() {
-                    return; // Client disconnected
-                }
-
-                // If already downloaded, we're done
-                if status == ModelStatus::DOWNLOADED {
-                    return;
-                }
-            }
-
-            // Start or monitor the download process
-            let final_status = MODEL_TRACKER
-                .ensure_model_downloaded(&model_name, provider, &tx)
-                .await;
-
-            // Send final status update
-            let final_update = ModelStatusUpdate {
-                model_name: model_name.clone(),
-                status: model_express_common::grpc::model::ModelStatus::from(final_status) as i32,
-                message: match final_status {
-                    ModelStatus::DOWNLOADED => {
-                        Some("Model download completed successfully".to_string())
-                    }
-                    ModelStatus::ERROR => Some("Model download failed".to_string()),
-                    ModelStatus::DOWNLOADING => Some("Download still in progress".to_string()),
-                },
-                provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
-            };
-
-            let _ = tx.send(Ok(final_update)).await;
-        });
+        tokio::spawn(handle_model_download_stream(
+            model_name.clone(),
+            provider,
+            tx.clone(),
+            cache_config,
+        ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+async fn handle_model_download_stream(
+    model_name: String,
+    provider: ModelProvider,
+    tx: tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
+    cache_config: Option<CacheConfig>,
+) {
+    // Check if the model is already downloaded
+    if let Some(status) = MODEL_TRACKER.get_status(&model_name) {
+        let update = ModelStatusUpdate {
+            model_name: model_name.clone(),
+            status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
+            message: match status {
+                ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
+                ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
+                ModelStatus::ERROR => Some("Previous download failed".to_string()),
+            },
+            provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
+        };
+
+        if tx.send(Ok(update)).await.is_err() {
+            return; // Client disconnected
+        }
+
+        // If already downloaded, we're done
+        if status == ModelStatus::DOWNLOADED {
+            return;
+        }
+    }
+
+    // Start or monitor the download process
+    let final_status = MODEL_TRACKER
+        .ensure_model_downloaded(&model_name, provider, &tx, cache_config)
+        .await;
+
+    // Send final status update
+    let final_update = ModelStatusUpdate {
+        model_name: model_name.clone(),
+        status: model_express_common::grpc::model::ModelStatus::from(final_status) as i32,
+        message: match final_status {
+            ModelStatus::DOWNLOADED => Some("Model download completed successfully".to_string()),
+            ModelStatus::ERROR => Some("Model download failed".to_string()),
+            ModelStatus::DOWNLOADING => Some("Download still in progress".to_string()),
+        },
+        provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
+    };
+
+    let _ = tx.send(Ok(final_update)).await;
 }
 
 /// Type alias for the complex waiting channels type
@@ -302,6 +321,7 @@ impl ModelDownloadTracker {
         model_name: &str,
         provider: ModelProvider,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
+        cache_config: Option<CacheConfig>,
     ) -> ModelStatus {
         // Atomically try to claim this model for download using compare-and-swap
         let status = match self.database.try_claim_for_download(model_name, provider) {
@@ -360,11 +380,21 @@ impl ModelDownloadTracker {
                 // We claimed the model, so we're responsible for downloading it
                 let tracker = self.clone();
                 let model_name_owned = model_name.to_string();
+                let cache_dir = cache_config.map(|config| config.local_path);
+
+                info!(
+                    "Starting download for model '{}' with cache_dir: {:?}",
+                    model_name_owned, cache_dir
+                );
 
                 // Perform the download in the background
                 tokio::spawn(async move {
-                    match download::download_model(&model_name_owned, provider).await {
-                        Ok(_path) => {
+                    match download::download_model(&model_name_owned, provider, cache_dir).await {
+                        Ok(path) => {
+                            info!(
+                                "Download completed successfully for '{}' at path: {:?}",
+                                model_name_owned, path
+                            );
                             // Download completed successfully
                             tracker.set_status_and_notify(
                                 model_name_owned,
@@ -540,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_service_already_downloaded() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::new(None); // Pass None for cache_config
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -648,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_service_stream_closes_properly() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::new(None); // Pass None for cache_config
         let model_name = "test-stream-model";
 
         let request = Request::new(ModelDownloadRequest {

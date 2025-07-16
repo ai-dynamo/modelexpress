@@ -224,7 +224,7 @@ impl Client {
                     );
 
                     // Fallback to direct download
-                    match download::download_model(&model_name, provider).await {
+                    match download::download_model(&model_name, provider, None).await {
                         Ok(_) => {
                             info!(
                                 "Model {} downloaded successfully via direct download",
@@ -375,7 +375,7 @@ impl Client {
             model_name, provider
         );
 
-        download::download_model(&model_name, provider)
+        download::download_model(&model_name, provider, None)
             .await
             .map_err(|e| {
                 model_express_common::Error::Server(format!("Direct download failed: {e}"))

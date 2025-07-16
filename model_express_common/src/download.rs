@@ -22,12 +22,20 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 
 /// Hugging Face model provider implementation
-pub struct HuggingFaceProvider;
+pub struct HuggingFaceProvider {
+    cache_dir: Option<PathBuf>,
+}
+
+impl HuggingFaceProvider {
+    pub fn new(cache_dir: Option<PathBuf>) -> Self {
+        Self { cache_dir }
+    }
+}
 
 #[async_trait::async_trait]
 impl ModelProviderTrait for HuggingFaceProvider {
     async fn download_model(&self, model_name: &str) -> Result<PathBuf> {
-        download_from_hf(model_name).await
+        download_from_hf_with_cache(model_name, self.cache_dir.clone()).await
     }
 
     fn provider_name(&self) -> &'static str {
@@ -37,15 +45,22 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
 /// Provider factory to get the appropriate provider implementation
 #[must_use]
-pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
+pub fn get_provider(
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+) -> Box<dyn ModelProviderTrait> {
     match provider {
-        ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
+        ModelProvider::HuggingFace => Box::new(HuggingFaceProvider::new(cache_dir)),
     }
 }
 
 /// Download a model using the specified provider
-pub async fn download_model(model_name: &str, provider: ModelProvider) -> Result<PathBuf> {
-    let provider_impl = get_provider(provider);
+pub async fn download_model(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let provider_impl = get_provider(provider, cache_dir);
     info!(
         "Downloading model '{}' using provider: {}",
         model_name,
@@ -54,19 +69,30 @@ pub async fn download_model(model_name: &str, provider: ModelProvider) -> Result
     provider_impl.download_model(model_name).await
 }
 
-/// Attempt to download a model from Hugging Face
+/// Attempt to download a model from Hugging Face with custom cache directory
 /// Returns the directory it is in
-pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
+pub async fn download_from_hf_with_cache(
+    name: impl AsRef<Path>,
+    cache_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
     info!(
         "Downloading model from Hugging Face: {}",
         name.as_ref().display()
     );
     let name = name.as_ref();
     let token = env::var(HF_TOKEN_ENV_VAR).ok();
-    let api = ApiBuilder::new()
-        .with_progress(true)
-        .with_token(token)
-        .build()?;
+
+    // Configure API with custom cache directory if provided
+    let mut api_builder = ApiBuilder::new().with_progress(true).with_token(token);
+
+    if let Some(cache_path) = cache_dir {
+        info!("Using custom cache directory: {:?}", cache_path);
+        api_builder = api_builder.with_cache_dir(cache_path);
+    } else {
+        info!("No custom cache directory provided, using default");
+    }
+
+    let api = api_builder.build()?;
     let model_name = name.display().to_string();
 
     let repo = api.model(model_name.clone());
@@ -100,6 +126,7 @@ pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
 
         match repo.get(&sib.rfilename).await {
             Ok(path) => {
+                info!("Downloaded file '{}' to: {:?}", sib.rfilename, path);
                 p = path;
                 files_downloaded = true;
             }
@@ -122,11 +149,21 @@ pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
     }
 
     info!("Downloaded model files for {}", model_name);
+    info!("Final downloaded path: {:?}", p);
 
     match p.parent() {
-        Some(p) => Ok(p.to_path_buf()),
+        Some(parent) => {
+            info!("Returning parent directory: {:?}", parent);
+            Ok(parent.to_path_buf())
+        }
         None => Err(anyhow::anyhow!("Invalid HF cache path: {}", p.display())),
     }
+}
+
+/// Attempt to download a model from Hugging Face
+/// Returns the directory it is in
+pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
+    download_from_hf_with_cache(name, None).await
 }
 
 fn is_image(s: &Path) -> bool {
@@ -197,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_get_provider() {
-        let provider = get_provider(ModelProvider::HuggingFace);
+        let provider = get_provider(ModelProvider::HuggingFace, None);
         assert_eq!(provider.provider_name(), "Hugging Face");
     }
 
@@ -239,19 +276,19 @@ mod tests {
         // In a real scenario, you might want to mock the hf-hub dependency
 
         let provider = ModelProvider::HuggingFace;
-        let provider_impl = get_provider(provider);
+        let provider_impl = get_provider(provider, None);
         assert_eq!(provider_impl.provider_name(), "Hugging Face");
     }
 
     #[test]
     fn test_hugging_face_provider_name() {
-        let provider = HuggingFaceProvider;
+        let provider = HuggingFaceProvider::new(None);
         assert_eq!(provider.provider_name(), "Hugging Face");
     }
 
     #[test]
     fn test_provider_trait_object() {
-        let provider: Box<dyn ModelProviderTrait> = Box::new(HuggingFaceProvider);
+        let provider: Box<dyn ModelProviderTrait> = Box::new(HuggingFaceProvider::new(None));
         assert_eq!(provider.provider_name(), "Hugging Face");
     }
 }

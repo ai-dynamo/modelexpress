@@ -34,7 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create service implementations
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
-    let model_service = ModelServiceImpl;
+    let cache_config = model_express_common::cache::CacheConfig::discover().ok();
+    let model_service = ModelServiceImpl::new(cache_config);
 
     // Start the gRPC server
     info!("Listening on gRPC endpoint: {}", addr);
