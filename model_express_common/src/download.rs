@@ -8,6 +8,34 @@ use tracing::info;
 const IGNORED: [&str; 3] = [".gitattributes", "LICENSE", "README.md"];
 
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
+const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
+
+/// Get the cache directory for Hugging Face models
+/// Priority order:
+/// 1. Provided cache_dir parameter
+/// 2. HF_HUB_CACHE environment variable
+/// 3. Default location (~/.cache/huggingface/hub)
+fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
+    // Use provided cache directory if available
+    if let Some(dir) = cache_dir {
+        return dir;
+    }
+
+    // Try environment variable
+    if let Ok(cache_path) = env::var(HF_HUB_CACHE_ENV_VAR) {
+        return PathBuf::from(cache_path);
+    }
+
+    // Fall back to default location
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+
+    PathBuf::from(home)
+        .join(".cache")
+        .join("huggingface")
+        .join("hub")
+}
 
 /// Trait for model providers
 /// This trait provides the framework for supporting multiple model providers.
@@ -15,7 +43,8 @@ const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 #[async_trait::async_trait]
 pub trait ModelProviderTrait: Send + Sync {
     /// Download a model and return the path where it was downloaded
-    async fn download_model(&self, model_name: &str) -> Result<PathBuf>;
+    async fn download_model(&self, model_name: &str, cache_dir: Option<PathBuf>)
+    -> Result<PathBuf>;
 
     /// Get the provider name for logging
     fn provider_name(&self) -> &'static str;
@@ -26,8 +55,12 @@ pub struct HuggingFaceProvider;
 
 #[async_trait::async_trait]
 impl ModelProviderTrait for HuggingFaceProvider {
-    async fn download_model(&self, model_name: &str) -> Result<PathBuf> {
-        download_from_hf(model_name).await
+    async fn download_model(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        download_from_hf(model_name, cache_dir).await
     }
 
     fn provider_name(&self) -> &'static str {
@@ -44,28 +77,44 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
 }
 
 /// Download a model using the specified provider
-pub async fn download_model(model_name: &str, provider: ModelProvider) -> Result<PathBuf> {
+pub async fn download_model(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
     let provider_impl = get_provider(provider);
     info!(
         "Downloading model '{}' using provider: {}",
         model_name,
         provider_impl.provider_name()
     );
-    provider_impl.download_model(model_name).await
+    provider_impl.download_model(model_name, cache_dir).await
 }
 
 /// Attempt to download a model from Hugging Face
 /// Returns the directory it is in
-pub async fn download_from_hf(name: impl AsRef<Path>) -> Result<PathBuf> {
+pub async fn download_from_hf(
+    name: impl AsRef<Path>,
+    cache_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
     info!(
         "Downloading model from Hugging Face: {}",
         name.as_ref().display()
     );
     let name = name.as_ref();
     let token = env::var(HF_TOKEN_ENV_VAR).ok();
+
+    // Get cache directory and ensure it exists
+    let cache_dir = get_cache_dir(cache_dir);
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e))?;
+
+    info!("Using cache directory: {:?}", cache_dir);
+
     let api = ApiBuilder::new()
         .with_progress(true)
         .with_token(token)
+        .with_cache_dir(cache_dir)
         .build()?;
     let model_name = name.display().to_string();
 
@@ -159,7 +208,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelProviderTrait for MockProvider {
-        async fn download_model(&self, _model_name: &str) -> Result<PathBuf> {
+        async fn download_model(
+            &self,
+            _model_name: &str,
+            _cache_dir: Option<PathBuf>,
+        ) -> Result<PathBuf> {
             if self.should_succeed {
                 Ok(self.return_path.clone())
             } else {
@@ -209,7 +262,9 @@ mod tests {
             return_path: temp_dir.path().to_path_buf(),
         };
 
-        let result = mock_provider.download_model("test-model").await;
+        let result = mock_provider
+            .download_model("test-model", Some(temp_dir.path().to_path_buf()))
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), temp_dir.path());
     }
@@ -222,7 +277,9 @@ mod tests {
             return_path: temp_dir.path().to_path_buf(),
         };
 
-        let result = mock_provider.download_model("test-model").await;
+        let result = mock_provider
+            .download_model("test-model", Some(temp_dir.path().to_path_buf()))
+            .await;
         assert!(result.is_err());
         assert!(
             result
