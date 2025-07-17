@@ -31,10 +31,7 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
         .or_else(|_| env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
 
-    PathBuf::from(home)
-        .join(".cache")
-        .join("huggingface")
-        .join("hub")
+    PathBuf::from(home).join(".cache/huggingface/hub")
 }
 
 /// Trait for model providers
