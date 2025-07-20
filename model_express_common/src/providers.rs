@@ -48,7 +48,6 @@ pub trait ModelProviderTrait: Send + Sync {
     }
 }
 
-#[allow(clippy::mod_module_files)]
 pub mod huggingface;
 
 pub use huggingface::HuggingFaceProvider;
