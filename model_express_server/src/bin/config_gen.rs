@@ -1,6 +1,7 @@
 use clap::Parser;
 use model_express_server::config::ServerConfig;
 use std::fs;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -18,7 +19,7 @@ struct ConfigGenArgs {
     #[arg(short, long)]
     input: Option<PathBuf>,
 
-    /// Output format (yaml only for now - probably ever)
+    /// Output format (yaml only for now)
     #[arg(short, long, default_value = "yaml")]
     format: String,
 
@@ -133,9 +134,7 @@ fn load_existing_config(input_path: &PathBuf) -> Result<ServerConfig, Box<dyn st
             Ok(config)
         }
         Err(e) => {
-            eprintln!(
-                "Warning: Could not parse existing config as current format: {e}"
-            );
+            eprintln!("Warning: Could not parse existing config as current format: {e}");
             eprintln!("Attempting to migrate from older format...");
 
             // Try to parse as a generic YAML value and merge with defaults
@@ -192,10 +191,12 @@ fn merge_server_config(
                         }
                     }
                     "port" => {
-                        if let serde_yaml::Value::Number(n) = val {
-                            if let Some(port) = n.as_u64() {
-                                server.port = port as u16;
-                            }
+                        if let serde_yaml::Value::Number(n) = val
+                            && let Some(port_u64) = n.as_u64()
+                            && let Ok(port_u16) = u16::try_from(port_u64)
+                            && let Some(port) = NonZeroU16::new(port_u16)
+                        {
+                            server.port = port;
                         }
                     }
                     "graceful_shutdown" => {
@@ -204,12 +205,12 @@ fn merge_server_config(
                         }
                     }
                     "shutdown_timeout_seconds" => {
-                        if let serde_yaml::Value::Number(n) = val {
-                            if let Some(timeout) = n.as_u64() {
+                        if let serde_yaml::Value::Number(n) = val
+                            && let Some(timeout) = n.as_u64()
+                        {
                                 server.shutdown_timeout_seconds = timeout;
                             }
                         }
-                    }
                     _ => {
                         eprintln!("Warning: Unknown configuration key '{key_str}', ignoring");
                     }
@@ -239,19 +240,19 @@ fn merge_database_config(
                         }
                     }
                     "pool_size" => {
-                        if let serde_yaml::Value::Number(n) = val {
-                            if let Some(size) = n.as_u64() {
+                        if let serde_yaml::Value::Number(n) = val
+                            && let Some(size) = n.as_u64()
+                        {
                                 database.pool_size = size as u32;
                             }
                         }
-                    }
                     "connection_timeout_seconds" => {
-                        if let serde_yaml::Value::Number(n) = val {
-                            if let Some(timeout) = n.as_u64() {
+                        if let serde_yaml::Value::Number(n) = val
+                            && let Some(timeout) = n.as_u64()
+                        {
                                 database.connection_timeout_seconds = timeout;
                             }
                         }
-                    }
                     _ => {
                         eprintln!("Warning: Unknown configuration key '{key_str}', ignoring");
                     }
@@ -309,12 +310,22 @@ fn merge_logging_config(
                 match key_str.as_str() {
                     "level" => {
                         if let serde_yaml::Value::String(level) = val {
-                            logging.level = level.clone();
+                            match level.parse() {
+                                Ok(parsed_level) => logging.level = parsed_level,
+                                Err(_) => eprintln!(
+                                    "Warning: Invalid log level '{level}', keeping default"
+                                ),
+                            }
                         }
                     }
                     "format" => {
                         if let serde_yaml::Value::String(format) = val {
-                            logging.format = format.clone();
+                            match format.parse() {
+                                Ok(parsed_format) => logging.format = parsed_format,
+                                Err(_) => eprintln!(
+                                    "Warning: Invalid log format '{format}', keeping default"
+                                ),
+                            }
                         }
                     }
                     "file" => {

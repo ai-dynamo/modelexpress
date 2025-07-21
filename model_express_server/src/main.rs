@@ -1,35 +1,53 @@
-use model_express_common::{
-    constants,
-    grpc::{
-        api::api_service_server::ApiServiceServer,
-        health::health_service_server::HealthServiceServer,
-        model::model_service_server::ModelServiceServer,
-    },
+use clap::Parser;
+use model_express_common::grpc::{
+    api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
+    model::model_service_server::ModelServiceServer,
 };
-use model_express_server::services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl};
+use model_express_server::{
+    config::{ServerArgs, ServerConfig},
+    services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl},
+};
 use std::net::SocketAddr;
 use tonic::transport::Server;
-use tracing::{Level, info};
+use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
+    // Parse command line arguments
+    let args = ServerArgs::parse();
+
+    // Check if we should validate config and exit
+    if args.validate_config {
+        match ServerConfig::load(args) {
+            Ok(_) => {
+                println!("Configuration is valid");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Configuration validation failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Load configuration from multiple sources
+    let config = ServerConfig::load(args)?;
+
+    // Initialize tracing with the configured log level
+    let log_level = config.log_level();
+
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_max_level(Level::INFO)
+        .with_max_level(log_level)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting model_express_server with gRPC...");
 
-    // Read port from environment variable or use default
-    let port = std::env::var("SERVER_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(constants::DEFAULT_GRPC_PORT);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Use configured port instead of environment variable or default
+    let port = config.server.port;
+    let addr = SocketAddr::from(([0, 0, 0, 0], port.get()));
 
     // Create service implementations
     let health_service = HealthServiceImpl;

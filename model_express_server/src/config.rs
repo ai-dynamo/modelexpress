@@ -1,11 +1,96 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use config::{Config, ConfigError, Environment, File};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
+use std::str::FromStr;
 use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
+
+/// Log level wrapper for clap ValueEnum
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Serialize, Deserialize, Default)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogLevel::Trace => write!(f, "trace"),
+            LogLevel::Debug => write!(f, "debug"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Warn => write!(f, "warn"),
+            LogLevel::Error => write!(f, "error"),
+        }
+    }
+}
+
+impl From<LogLevel> for Level {
+    fn from(log_level: LogLevel) -> Self {
+        match log_level {
+            LogLevel::Trace => Level::TRACE,
+            LogLevel::Debug => Level::DEBUG,
+            LogLevel::Info => Level::INFO,
+            LogLevel::Warn => Level::WARN,
+            LogLevel::Error => Level::ERROR,
+        }
+    }
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "trace" => Ok(LogLevel::Trace),
+            "debug" => Ok(LogLevel::Debug),
+            "info" => Ok(LogLevel::Info),
+            "warn" => Ok(LogLevel::Warn),
+            "error" => Ok(LogLevel::Error),
+            _ => Err(format!("Invalid log level: {s}")),
+        }
+    }
+}
+
+/// Log format wrapper for clap ValueEnum
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Serialize, Deserialize, Default)]
+pub enum LogFormat {
+    Json,
+    #[default]
+    Pretty,
+    Compact,
+}
+
+impl fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogFormat::Json => write!(f, "json"),
+            LogFormat::Pretty => write!(f, "pretty"),
+            LogFormat::Compact => write!(f, "compact"),
+        }
+    }
+}
+
+impl FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "json" => Ok(LogFormat::Json),
+            "pretty" => Ok(LogFormat::Pretty),
+            "compact" => Ok(LogFormat::Compact),
+            _ => Err(format!("Invalid log format: {s}")),
+        }
+    }
+}
 
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
@@ -17,15 +102,19 @@ pub struct ServerArgs {
 
     /// Server port
     #[arg(short, long, env = "SERVER_PORT")]
-    pub port: Option<u16>,
+    pub port: Option<NonZeroU16>,
 
     /// Server host address
     #[arg(long, env = "SERVER_HOST")]
     pub host: Option<String>,
 
     /// Log level
-    #[arg(short, long, env = "LOG_LEVEL")]
-    pub log_level: Option<String>,
+    #[arg(short, long, env = "LOG_LEVEL", value_enum)]
+    pub log_level: Option<LogLevel>,
+
+    /// Log format
+    #[arg(long, env = "LOG_FORMAT", value_enum)]
+    pub log_format: Option<LogFormat>,
 
     /// Database file path
     #[arg(short, long, env = "DATABASE_PATH")]
@@ -55,7 +144,7 @@ pub struct ServerSettings {
     /// Server host address
     pub host: String,
     /// Server port
-    pub port: u16,
+    pub port: NonZeroU16,
     /// Enable graceful shutdown
     pub graceful_shutdown: bool,
     /// Shutdown timeout in seconds
@@ -87,12 +176,14 @@ pub struct CacheConfig {
 }
 
 /// Logging configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LoggingConfig {
     /// Log level
-    pub level: String,
+    #[serde(default)]
+    pub level: LogLevel,
     /// Log format (json, pretty, compact)
-    pub format: String,
+    #[serde(default)]
+    pub format: LogFormat,
     /// Log to file
     pub file: Option<PathBuf>,
     /// Enable structured logging
@@ -127,17 +218,6 @@ impl Default for CacheConfig {
             eviction: CacheEvictionConfig::default(),
             directory: PathBuf::from("./cache"),
             max_size_bytes: None,
-        }
-    }
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: "info".to_string(),
-            format: "pretty".to_string(),
-            file: None,
-            structured: false,
         }
     }
 }
@@ -204,6 +284,10 @@ impl ServerConfig {
             config.logging.level = log_level;
         }
 
+        if let Some(log_format) = args.log_format {
+            config.logging.format = log_format;
+        }
+
         if let Some(database_path) = args.database_path {
             config.database.path = database_path;
         }
@@ -216,33 +300,6 @@ impl ServerConfig {
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Validate log level
-        match self.logging.level.to_lowercase().as_str() {
-            "trace" | "debug" | "info" | "warn" | "error" => {}
-            _ => {
-                return Err(ConfigError::Message(format!(
-                    "Invalid log level: {}. Must be one of: trace, debug, info, warn, error",
-                    self.logging.level
-                )));
-            }
-        }
-
-        // Validate log format
-        match self.logging.format.to_lowercase().as_str() {
-            "json" | "pretty" | "compact" => {}
-            _ => {
-                return Err(ConfigError::Message(format!(
-                    "Invalid log format: {}. Must be one of: json, pretty, compact",
-                    self.logging.format
-                )));
-            }
-        }
-
-        // Validate port range
-        if self.server.port == 0 {
-            return Err(ConfigError::Message("Server port cannot be 0".to_string()));
-        }
-
         // Validate database path parent directory exists
         if let Some(parent) = self.database.path.parent() {
             if !parent.exists() {
@@ -275,14 +332,7 @@ impl ServerConfig {
 
     /// Get the logging level as a tracing Level
     pub fn log_level(&self) -> Level {
-        match self.logging.level.to_lowercase().as_str() {
-            "trace" => Level::TRACE,
-            "debug" => Level::DEBUG,
-            "info" => Level::INFO,
-            "warn" => Level::WARN,
-            "error" => Level::ERROR,
-            _ => Level::INFO, // Default fallback
-        }
+        self.logging.level.into()
     }
 
     /// Print the configuration for debugging
@@ -321,5 +371,152 @@ impl ServerConfig {
         info!("  Format: {}", self.logging.format);
         info!("  File: {:?}", self.logging.file);
         info!("  Structured: {}", self.logging.structured);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_log_level_enum_parsing() {
+        // Test valid log levels
+        let valid_levels = [
+            ("trace", LogLevel::Trace),
+            ("debug", LogLevel::Debug),
+            ("info", LogLevel::Info),
+            ("warn", LogLevel::Warn),
+            ("error", LogLevel::Error),
+        ];
+
+        for (level_str, expected_level) in &valid_levels {
+            let args = vec!["test", "--log-level", level_str];
+            if let Ok(parsed_args) = ServerArgs::try_parse_from(args) {
+                assert_eq!(parsed_args.log_level, Some(*expected_level));
+
+                // Test conversion to string
+                assert_eq!(expected_level.to_string(), *level_str);
+
+                // Test conversion to tracing::Level
+                let tracing_level: Level = (*expected_level).into();
+                // Just verify the conversion works - the exact debug format may vary
+                match expected_level {
+                    LogLevel::Trace => assert_eq!(tracing_level, Level::TRACE),
+                    LogLevel::Debug => assert_eq!(tracing_level, Level::DEBUG),
+                    LogLevel::Info => assert_eq!(tracing_level, Level::INFO),
+                    LogLevel::Warn => assert_eq!(tracing_level, Level::WARN),
+                    LogLevel::Error => assert_eq!(tracing_level, Level::ERROR),
+                }
+            } else {
+                panic!("Failed to parse valid log level: {level_str}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_level_enum_invalid() {
+        // Test invalid log level
+        let args = vec!["test", "--log-level", "invalid"];
+        let result = ServerArgs::try_parse_from(args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_log_level_display() {
+        assert_eq!(LogLevel::Trace.to_string(), "trace");
+        assert_eq!(LogLevel::Debug.to_string(), "debug");
+        assert_eq!(LogLevel::Info.to_string(), "info");
+        assert_eq!(LogLevel::Warn.to_string(), "warn");
+        assert_eq!(LogLevel::Error.to_string(), "error");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_log_level_from_str() {
+        assert_eq!(
+            "trace"
+                .parse::<LogLevel>()
+                .expect("Failed to parse 'trace'"),
+            LogLevel::Trace
+        );
+        assert_eq!(
+            "debug"
+                .parse::<LogLevel>()
+                .expect("Failed to parse 'debug'"),
+            LogLevel::Debug
+        );
+        assert_eq!(
+            "info".parse::<LogLevel>().expect("Failed to parse 'info'"),
+            LogLevel::Info
+        );
+        assert_eq!(
+            "warn".parse::<LogLevel>().expect("Failed to parse 'warn'"),
+            LogLevel::Warn
+        );
+        assert_eq!(
+            "error"
+                .parse::<LogLevel>()
+                .expect("Failed to parse 'error'"),
+            LogLevel::Error
+        );
+
+        // Test case insensitive
+        assert_eq!(
+            "TRACE"
+                .parse::<LogLevel>()
+                .expect("Failed to parse 'TRACE'"),
+            LogLevel::Trace
+        );
+        assert_eq!(
+            "Info".parse::<LogLevel>().expect("Failed to parse 'Info'"),
+            LogLevel::Info
+        );
+
+        // Test invalid
+        assert!("invalid".parse::<LogLevel>().is_err());
+    }
+
+    #[test]
+    fn test_log_format_display() {
+        assert_eq!(LogFormat::Json.to_string(), "json");
+        assert_eq!(LogFormat::Pretty.to_string(), "pretty");
+        assert_eq!(LogFormat::Compact.to_string(), "compact");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_log_format_from_str() {
+        assert_eq!(
+            "json".parse::<LogFormat>().expect("Failed to parse 'json'"),
+            LogFormat::Json
+        );
+        assert_eq!(
+            "pretty"
+                .parse::<LogFormat>()
+                .expect("Failed to parse 'pretty'"),
+            LogFormat::Pretty
+        );
+        assert_eq!(
+            "compact"
+                .parse::<LogFormat>()
+                .expect("Failed to parse 'compact'"),
+            LogFormat::Compact
+        );
+
+        // Test case insensitive
+        assert_eq!(
+            "JSON".parse::<LogFormat>().expect("Failed to parse 'JSON'"),
+            LogFormat::Json
+        );
+        assert_eq!(
+            "Pretty"
+                .parse::<LogFormat>()
+                .expect("Failed to parse 'Pretty'"),
+            LogFormat::Pretty
+        );
+
+        // Test invalid
+        assert!("invalid".parse::<LogFormat>().is_err());
     }
 }
