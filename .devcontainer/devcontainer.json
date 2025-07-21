@@ -35,7 +35,7 @@
         }
     },
     "forwardPorts": [
-        8001, // gRPC
+        8001 // gRPC
     ],
     "portsAttributes": {
         "8001": {
