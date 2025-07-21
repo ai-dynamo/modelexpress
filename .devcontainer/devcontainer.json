@@ -1,0 +1,54 @@
+{
+    "name": "ModelExpress Rust Development",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "fill-labs.dependi",
+                "vadimcn.vscode-lldb",
+                "ms-kubernetes-tools.vscode-kubernetes-tools",
+                "github.vscode-github-actions",
+                "GitHub.copilot",
+                "GitHub.copilot-chat"
+            ],
+            "settings": {
+                "rust-analyzer.checkOnSave.command": "clippy",
+                "rust-analyzer.cargo.allFeatures": true,
+                "rust-analyzer.procMacro.enable": true,
+                "rust-analyzer.completion.autoimport.enable": true,
+                "rust-analyzer.inlayHints.typeHints.enable": true,
+                "rust-analyzer.inlayHints.parameterHints.enable": true,
+                "rust-analyzer.inlayHints.chainingHints.enable": true,
+                "editor.formatOnSave": true,
+                "editor.codeActionsOnSave": {
+                    "source.fixAll": "explicit"
+                },
+                "terminal.integrated.defaultProfile.linux": "zsh",
+                "files.watcherExclude": {
+                    "**/target/**": true
+                }
+            }
+        }
+    },
+    "forwardPorts": [
+        8001, // gRPC
+    ],
+    "portsAttributes": {
+        "8001": {
+            "label": "gRPC Server",
+            "onAutoForward": "notify"
+        }
+    },
+    "remoteUser": "vscode",
+    "mounts": [
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+    ],
+    "containerEnv": {
+        "RUST_LOG": "debug",
+        "CARGO_TARGET_DIR": "/tmp/target"
+    }
+}
