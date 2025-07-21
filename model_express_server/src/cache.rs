@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{debug, error, info, warn};
 
+use crate::config::DurationConfig;
 use crate::database::{ModelDatabase, ModelRecord};
 use model_express_common::models::ModelStatus;
 
@@ -13,8 +14,8 @@ pub struct CacheEvictionConfig {
     pub enabled: bool,
     /// The eviction policy to use
     pub policy: EvictionPolicyType,
-    /// How often to run the eviction process (in seconds)
-    pub check_interval_seconds: u64,
+    /// How often to run the eviction process (accepts duration strings like "2h", "30m", "45s")
+    pub check_interval: DurationConfig,
 }
 
 impl Default for CacheEvictionConfig {
@@ -22,7 +23,7 @@ impl Default for CacheEvictionConfig {
         Self {
             enabled: true,
             policy: EvictionPolicyType::Lru(LruConfig::default()),
-            check_interval_seconds: 3600, // Default: check every hour
+            check_interval: DurationConfig::hours(1), // Default: check every hour
         }
     }
 }
@@ -38,8 +39,8 @@ pub enum EvictionPolicyType {
 /// Configuration for LRU eviction policy
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LruConfig {
-    /// Time threshold in seconds before an unused model is eligible for removal
-    pub unused_threshold_seconds: i64,
+    /// Time threshold before an unused model is eligible for removal
+    pub unused_threshold: DurationConfig,
     /// Maximum number of models to keep (None = no limit based on count)
     pub max_models: Option<u32>,
     /// Minimum free disk space to maintain (in bytes, None = no disk space checks)
@@ -49,7 +50,7 @@ pub struct LruConfig {
 impl Default for LruConfig {
     fn default() -> Self {
         Self {
-            unused_threshold_seconds: 7 * 24 * 3600, // Default: 7 days
+            unused_threshold: DurationConfig::new(Duration::days(7)), // Default: 7 days
             max_models: None,
             min_free_space_bytes: None,
         }
@@ -98,11 +99,12 @@ pub struct LruEvictionPolicy;
 
 impl LruEvictionPolicy {
     /// Check if a model should be evicted based on time threshold
-    fn is_time_expired(model: &ModelRecord, threshold_seconds: i64) -> bool {
-        let threshold = Duration::seconds(threshold_seconds);
-        let cutoff_time = Utc::now()
-            .checked_sub_signed(threshold)
-            .unwrap_or(Utc::now());
+    fn is_time_expired(model: &ModelRecord, threshold: &DurationConfig) -> bool {
+        let threshold_duration = threshold.as_chrono_duration();
+        let cutoff_time = match Utc::now().checked_sub_signed(threshold_duration) {
+            Some(time) => time,
+            None => Utc::now(),
+        };
         model.last_used_at < cutoff_time
     }
 
@@ -140,7 +142,7 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
 
         // 1. Check time-based eviction
         for model in &downloaded_models {
-            if Self::is_time_expired(model, lru_config.unused_threshold_seconds) {
+            if Self::is_time_expired(model, &lru_config.unused_threshold) {
                 debug!(
                     "Model '{model_name}' is expired (last used: {last_used_at})",
                     model_name = model.model_name,
@@ -218,11 +220,12 @@ impl CacheEvictionService {
         info!(
             "Starting cache eviction service with policy: {policy:?}, check interval: {interval}s",
             policy = self.config.policy,
-            interval = self.config.check_interval_seconds
+            interval = self.config.check_interval.num_seconds()
         );
 
-        let mut interval_timer =
-            interval(TokioDuration::from_secs(self.config.check_interval_seconds));
+        let mut interval_timer = interval(TokioDuration::from_secs(
+            self.config.check_interval.num_seconds() as u64,
+        ));
 
         loop {
             tokio::select! {
@@ -250,7 +253,10 @@ impl CacheEvictionService {
 
         // Get all models from the database
         let models = self.database.get_models_by_last_used(None)?;
-        debug!("Found {total_models} total models in database", total_models = models.len());
+        debug!(
+            "Found {total_models} total models in database",
+            total_models = models.len()
+        );
 
         // Select models for eviction based on the configured policy
         let models_to_evict = match &self.config.policy {
@@ -274,7 +280,11 @@ impl CacheEvictionService {
             });
         }
 
-        info!("Evicting {evicted_count} models: {models:?}", evicted_count = evicted_count, models = models_to_evict);
+        info!(
+            "Evicting {evicted_count} models: {models:?}",
+            evicted_count = evicted_count,
+            models = models_to_evict
+        );
 
         // Remove models from the database and filesystem
         let mut successfully_evicted = Vec::new();
@@ -282,10 +292,17 @@ impl CacheEvictionService {
             match self.evict_model(model_name).await {
                 Ok(()) => {
                     successfully_evicted.push(model_name.clone());
-                    info!("Successfully evicted model: {model_name}", model_name = model_name);
+                    info!(
+                        "Successfully evicted model: {model_name}",
+                        model_name = model_name
+                    );
                 }
                 Err(e) => {
-                    warn!("Failed to evict model '{model_name}': {e}", model_name = model_name, e = e);
+                    warn!(
+                        "Failed to evict model '{model_name}': {e}",
+                        model_name = model_name,
+                        e = e
+                    );
                 }
             }
         }
@@ -321,7 +338,10 @@ impl CacheEvictionService {
         // This is where you would implement actual file removal
         // For now, we'll just log the action since the download module
         // would need to be consulted for the actual file paths
-        debug!("Would remove model files for: {model_name}", model_name = model_name);
+        debug!(
+            "Would remove model files for: {model_name}",
+            model_name = model_name
+        );
 
         // In a real implementation, you would:
         // 1. Get the model file path from the download module
@@ -336,17 +356,27 @@ impl CacheEvictionService {
         &self,
         model_names: &[String],
     ) -> Result<EvictionResult, Box<dyn std::error::Error + Send + Sync>> {
-        info!("Manual eviction requested for models: {models:?}", models = model_names);
+        info!(
+            "Manual eviction requested for models: {models:?}",
+            models = model_names
+        );
 
         let mut successfully_evicted = Vec::new();
         for model_name in model_names {
             match self.evict_model(model_name).await {
                 Ok(()) => {
                     successfully_evicted.push(model_name.clone());
-                    info!("Successfully evicted model: {model_name}", model_name = model_name);
+                    info!(
+                        "Successfully evicted model: {model_name}",
+                        model_name = model_name
+                    );
                 }
                 Err(e) => {
-                    warn!("Failed to evict model '{model_name}': {e}", model_name = model_name, e = e);
+                    warn!(
+                        "Failed to evict model '{model_name}': {e}",
+                        model_name = model_name,
+                        e = e
+                    );
                 }
             }
         }
@@ -423,16 +453,59 @@ mod tests {
     fn test_default_config() {
         let config = CacheEvictionConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.check_interval_seconds, 3600);
+        assert_eq!(config.check_interval.num_seconds(), 3600);
         assert!(matches!(config.policy, EvictionPolicyType::Lru(_)));
     }
 
     #[test]
     fn test_lru_config_defaults() {
         let lru_config = LruConfig::default();
-        assert_eq!(lru_config.unused_threshold_seconds, 7 * 24 * 3600);
+        assert_eq!(lru_config.unused_threshold.num_seconds(), 7 * 24 * 3600);
         assert!(lru_config.max_models.is_none());
         assert!(lru_config.min_free_space_bytes.is_none());
+    }
+
+    #[test]
+    fn test_duration_config_parsing() {
+        use crate::config::parse_duration_string;
+
+        // Test string parsing
+        let json = r#"{"enabled": true, "policy": {"type": "lru", "unused_threshold": "7d"}, "check_interval": "2h"}"#;
+        let config: CacheEvictionConfig =
+            serde_json::from_str(json).expect("Failed to parse config");
+        assert_eq!(config.check_interval.num_seconds(), 2 * 3600); // 2 hours
+
+        // Test number parsing (seconds)
+        let json = r#"{"enabled": true, "policy": {"type": "lru", "unused_threshold": 604800}, "check_interval": 1800}"#;
+        let config: CacheEvictionConfig =
+            serde_json::from_str(json).expect("Failed to parse config");
+        assert_eq!(config.check_interval.num_seconds(), 1800); // 30 minutes
+
+        // Test various duration formats
+        assert_eq!(
+            parse_duration_string("30m")
+                .expect("Failed to parse 30m")
+                .num_seconds(),
+            30 * 60
+        );
+        assert_eq!(
+            parse_duration_string("45s")
+                .expect("Failed to parse 45s")
+                .num_seconds(),
+            45
+        );
+        assert_eq!(
+            parse_duration_string("1d")
+                .expect("Failed to parse 1d")
+                .num_seconds(),
+            24 * 3600
+        );
+        assert_eq!(
+            parse_duration_string("2h30m")
+                .expect("Failed to parse 2h30m")
+                .num_seconds(),
+            2 * 3600 + 30 * 60
+        );
     }
 
     #[test]
@@ -459,15 +532,12 @@ mod tests {
             message: None,
         };
 
-        let threshold_seconds = 7 * 24 * 3600; // 7 days
+        let threshold = DurationConfig::new(Duration::days(7)); // 7 days
 
-        assert!(LruEvictionPolicy::is_time_expired(
-            &old_model,
-            threshold_seconds
-        ));
+        assert!(LruEvictionPolicy::is_time_expired(&old_model, &threshold));
         assert!(!LruEvictionPolicy::is_time_expired(
             &recent_model,
-            threshold_seconds
+            &threshold
         ));
     }
 
@@ -505,11 +575,11 @@ mod tests {
         let config = CacheEvictionConfig {
             enabled: true,
             policy: EvictionPolicyType::Lru(LruConfig {
-                unused_threshold_seconds: 7 * 24 * 3600, // 7 days
+                unused_threshold: DurationConfig::new(Duration::days(7)), // 7 days
                 max_models: None,
                 min_free_space_bytes: None,
             }),
-            check_interval_seconds: 3600,
+            check_interval: DurationConfig::hours(1),
         };
 
         let policy = LruEvictionPolicy;
@@ -557,11 +627,11 @@ mod tests {
         let config = CacheEvictionConfig {
             enabled: true,
             policy: EvictionPolicyType::Lru(LruConfig {
-                unused_threshold_seconds: 30 * 24 * 3600, // 30 days (none should be expired)
-                max_models: Some(2),                      // Limit to 2 models
+                unused_threshold: DurationConfig::new(Duration::days(30)), // 30 days (none should be expired)
+                max_models: Some(2),                                       // Limit to 2 models
                 min_free_space_bytes: None,
             }),
-            check_interval_seconds: 3600,
+            check_interval: DurationConfig::hours(1),
         };
 
         let policy = LruEvictionPolicy;

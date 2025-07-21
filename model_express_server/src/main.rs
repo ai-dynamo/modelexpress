@@ -18,26 +18,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = ServerArgs::parse();
 
-    // Load configuration
-    let config = match ServerConfig::load(args) {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Configuration error: {e}");
-            std::process::exit(1);
+    // Check if we should validate config and exit
+    if args.validate_config {
+        match ServerConfig::load(args) {
+            Ok(config) => {
+                println!("Configuration is valid ✓");
+                config.print_config();
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Configuration validation failed: {e}");
+                std::process::exit(1);
+            }
         }
-    };
-
-    // If validation was requested, exit after successful validation
-    if std::env::args().any(|arg| arg == "--validate-config") {
-        println!("Configuration is valid ✓");
-        config.print_config();
-        return Ok(());
     }
 
-    // Initialize tracing with configured settings
+    // Load configuration from multiple sources
+    let config = ServerConfig::load(args)?;
+
+    // Initialize tracing with the configured log level
+    let log_level = config.log_level();
+
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(EnvFilter::from_default_env())
-        .with_max_level(config.log_level())
+        .with_max_level(log_level)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -90,9 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Failed to install CTRL+C signal handler: {e}");
             return;
         }
-        info!(
-            "Received CTRL+C, shutting down gracefully... (timeout: {shutdown_timeout}s)",
-        );
+        info!("Received CTRL+C, shutting down gracefully... (timeout: {shutdown_timeout}s)",);
 
         // Signal cache eviction service to shutdown
         if shutdown_tx.send(()).is_err() {
