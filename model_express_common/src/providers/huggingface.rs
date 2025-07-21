@@ -1,5 +1,5 @@
 use crate::providers::ModelProviderTrait;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hf_hub::api::tokio::ApiBuilder;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -25,20 +25,11 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         let repo = api.model(model_name.clone());
 
-        let info = match repo.info().await {
-            Ok(info) => info,
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Failed to fetch model '{model_name}' from HuggingFace: {e}. Is this a valid HuggingFace ID?"
-                ));
-            }
-        };
+        let info = repo.info().await.map_err(|e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"))?;
         info!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Model '{model_name}' exists but contains no downloadable files."
-            ));
+            anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
         }
 
         let mut p = PathBuf::new();
@@ -87,7 +78,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
     async fn delete_model(&self, model_name: &str) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
-        let api = ApiBuilder::new().with_token(token).build()?;
+        let api = ApiBuilder::new()
+            .with_token(token)
+            .build()
+            .context("Failed to create Hugging Face API client")?;
         let model_name = model_name.to_string();
 
         let repo = api.model(model_name.clone());
@@ -117,26 +111,18 @@ impl ModelProviderTrait for HuggingFaceProvider {
             }
 
             // Try to get the file path from cache first
-            match repo.get(&sib.rfilename).await {
-                Ok(cached_path) => {
-                    // Delete the cached file
-                    match std::fs::remove_file(&cached_path) {
-                        Ok(_) => {
-                            files_deleted = files_deleted.saturating_add(1);
-                            info!("Deleted cached file: {}", cached_path.display());
-                        }
-                        Err(e) => {
-                            let error_msg = format!(
-                                "Failed to delete cached file '{}': {e}",
-                                cached_path.display()
-                            );
-                            deletion_errors.push(error_msg);
-                        }
+            if let Ok(cached_path) = repo.get(&sib.rfilename).await {
+                // Delete the cached file
+                match std::fs::remove_file(&cached_path) {
+                    Ok(_) => {
+                        files_deleted = files_deleted.saturating_add(1);
+                        info!("Deleted cached file: {}", cached_path.display());
                     }
-                }
-                Err(_) => {
-                    // File not in cache, skip
-                    continue;
+                    Err(e) => {
+                        let error_msg =
+                            format!("Failed to delete cached file '{}'", cached_path.display());
+                        deletion_errors.push(anyhow::anyhow!(e).context(error_msg));
+                    }
                 }
             }
         }
@@ -145,18 +131,15 @@ impl ModelProviderTrait for HuggingFaceProvider {
         if files_deleted > 0 && deletion_errors.is_empty() {
             // Get any file path to find the model directory
             for sib in &info.siblings {
-                if let Ok(cached_path) = repo.get(&sib.rfilename).await {
-                    if let Some(model_dir) = cached_path.parent() {
-                        // Only try to remove if directory is empty
-                        if let Ok(mut entries) = std::fs::read_dir(model_dir) {
-                            if entries.next().is_none() {
-                                if let Err(e) = std::fs::remove_dir(model_dir) {
-                                    info!("Could not remove empty model directory: {e}");
-                                } else {
-                                    info!("Removed empty model directory: {}", model_dir.display());
-                                }
-                            }
-                        }
+                if let Ok(cached_path) = repo.get(&sib.rfilename).await
+                    && let Some(model_dir) = cached_path.parent()
+                    && let Ok(mut entries) = std::fs::read_dir(model_dir)
+                    && entries.next().is_none()
+                {
+                    if let Err(e) = std::fs::remove_dir(model_dir) {
+                        info!("Could not remove empty model directory: {e}");
+                    } else {
+                        info!("Removed empty model directory: {}", model_dir.display());
                     }
                     break;
                 }
@@ -164,10 +147,15 @@ impl ModelProviderTrait for HuggingFaceProvider {
         }
 
         if !deletion_errors.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Failed to delete some files for model '{model_name}': {}",
-                deletion_errors.join("; ")
-            ));
+            let mut compound_error =
+                anyhow::anyhow!("Failed to delete some files for model '{model_name}'");
+
+            for (i, error) in deletion_errors.into_iter().enumerate() {
+                compound_error =
+                    compound_error.context(format!("Error {}: {:#}", i.saturating_add(1), error));
+            }
+
+            return Err(compound_error);
         }
 
         if files_deleted == 0 {

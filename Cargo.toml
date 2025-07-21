@@ -8,10 +8,13 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
-anyhow = "1.0.98"
+anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+config = { version = "0.15", features = ["yaml", "toml", "json"] }
+colored = "3.0.0"
 hf-hub = { version = "0.4.3", default-features = false, features = [
     "tokio",
     "rustls-tls",

@@ -15,9 +15,9 @@ prost = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive", "env"] }
-colored = "2.1"
+anyhow = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
