@@ -224,7 +224,8 @@ impl Client {
                     );
 
                     // Fallback to direct download
-                    match download::download_model(&model_name, provider).await {
+                    let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
+                    match download::download_model(&model_name, provider, cache_dir).await {
                         Ok(_) => {
                             info!(
                                 "Model {} downloaded successfully via direct download",
@@ -375,7 +376,10 @@ impl Client {
             model_name, provider
         );
 
-        download::download_model(&model_name, provider)
+        // Try to get cache configuration, but don't fail if not available
+        let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
+
+        download::download_model(&model_name, provider, cache_dir)
             .await
             .map_err(|e| {
                 model_express_common::Error::Server(format!("Direct download failed: {e}"))
