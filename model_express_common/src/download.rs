@@ -13,14 +13,18 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
 }
 
 /// Download a model using the specified provider
-pub async fn download_model(model_name: &str, provider: ModelProvider) -> Result<PathBuf> {
+pub async fn download_model(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
     let provider_impl = get_provider(provider);
     info!(
         "Downloading model '{}' using provider: {}",
         model_name,
         provider_impl.provider_name()
     );
-    provider_impl.download_model(model_name).await
+    provider_impl.download_model(model_name, cache_dir).await
 }
 
 #[cfg(test)]
@@ -38,7 +42,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelProviderTrait for MockProvider {
-        async fn download_model(&self, _model_name: &str) -> Result<PathBuf> {
+        async fn download_model(
+            &self,
+            _model_name: &str,
+            _cache_dir: Option<PathBuf>,
+        ) -> Result<PathBuf> {
             if self.should_succeed {
                 Ok(self.return_path.clone())
             } else {
@@ -81,7 +89,9 @@ mod tests {
             return_path: temp_dir.path().to_path_buf(),
         };
 
-        let result = mock_provider.download_model("test-model").await;
+        let result = mock_provider
+            .download_model("test-model", Some(temp_dir.path().to_path_buf()))
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.expect("Expected successful result"), temp_dir.path());
     }
@@ -94,7 +104,9 @@ mod tests {
             return_path: temp_dir.path().to_path_buf(),
         };
 
-        let result = mock_provider.download_model("test-model").await;
+        let result = mock_provider
+            .download_model("test-model", Some(temp_dir.path().to_path_buf()))
+            .await;
         assert!(result.is_err());
         assert!(
             result
