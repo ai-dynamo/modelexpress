@@ -215,10 +215,6 @@ RUST_LOG=debug cargo run --bin model_express_server
 5. Run the test suite
 6. Submit a pull request
 
-## License
-
-[Add license information here]
-
 ## Support
 
 For issues and questions:
