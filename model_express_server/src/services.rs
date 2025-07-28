@@ -1,5 +1,6 @@
 use crate::database::ModelDatabase;
 use model_express_common::{
+    cache::CacheConfig,
     download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
@@ -18,6 +19,19 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
+/// Get the configured cache directory for model downloads
+fn get_server_cache_dir() -> Option<std::path::PathBuf> {
+    // Try to get cache configuration
+    if let Ok(config) = CacheConfig::discover() {
+        Some(config.local_path)
+    } else {
+        // Fall back to environment variable
+        std::env::var("HF_HUB_CACHE")
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+}
 
 /// Health service implementation
 #[derive(Debug, Default)]
@@ -363,7 +377,8 @@ impl ModelDownloadTracker {
 
                 // Perform the download in the background
                 tokio::spawn(async move {
-                    match download::download_model(&model_name_owned, provider).await {
+                    let cache_dir = get_server_cache_dir();
+                    match download::download_model(&model_name_owned, provider, cache_dir).await {
                         Ok(_path) => {
                             // Download completed successfully
                             tracker.set_status_and_notify(
