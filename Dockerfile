@@ -1,4 +1,4 @@
-FROM rust:1.84 AS builder
+FROM rust:1.88 AS builder
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ COPY . .
 RUN cargo build --release -p model_express_server
 
 # Create a minimal runtime image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim 
 
 WORKDIR /app
 
