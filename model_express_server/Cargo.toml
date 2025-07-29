@@ -8,6 +8,8 @@ model_express_common = { path = "../model_express_common" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
 futures = { workspace = true }
 hf-hub = { workspace = true }
 once_cell = { workspace = true }
@@ -15,14 +17,16 @@ prost = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+toml = "0.9"
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.20"
 tokio-test = "0.4"
 tonic-build = { workspace = true }
 
