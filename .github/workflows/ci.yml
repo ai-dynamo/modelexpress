@@ -42,7 +42,7 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -96,7 +96,7 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -283,7 +283,7 @@ jobs:
         tar -czf model-express-linux-x86_64.tar.gz -C release .
 
     - name: Upload release artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: model-express-binaries
         path: model-express-linux-x86_64.tar.gz
