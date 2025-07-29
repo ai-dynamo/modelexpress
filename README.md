@@ -1,5 +1,7 @@
 ![ModelExpress Logo](ModelExpressTrainLogo.jpeg)
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 # Dynamo Model Express
 
 A Rust-based gRPC service for efficient model management and serving, with support for downloading and serving machine learning models from Hugging Face Hub.
@@ -212,10 +214,6 @@ RUST_LOG=debug cargo run --bin model_express_server
 4. Add tests for new functionality
 5. Run the test suite
 6. Submit a pull request
-
-## License
-
-[Add license information here]
 
 ## Support
 

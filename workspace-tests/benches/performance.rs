@@ -4,9 +4,10 @@
     clippy::arithmetic_side_effects
 )]
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use model_express_common::models::{ModelProvider, ModelStatus, Status};
 use model_express_server::database::ModelDatabase;
+use std::hint::black_box;
 use tempfile::TempDir;
 
 fn benchmark_database_operations(c: &mut Criterion) {
