@@ -122,20 +122,20 @@ jobs:
       run: cargo test --test integration_tests -- --ignored
       continue-on-error: true  # Integration tests may fail in CI due to network restrictions
 
-    - name: Stop server
-      if: always()
-      run: |
-        if [ -f server.pid ]; then
-          kill $(cat server.pid) || true
-          rm server.pid
-        fi
-
     - name: Run integration test script
       if: always()
       run: |
         if [ -f run_integration_tests.sh ]; then
           chmod +x run_integration_tests.sh
           ./run_integration_tests.sh || echo "Integration test script failed (expected in CI)"
+        fi
+
+    - name: Stop server
+      if: always()
+      run: |
+        if [ -f server.pid ]; then
+          kill $(cat server.pid) || true
+          rm server.pid
         fi
 
   security-audit:
