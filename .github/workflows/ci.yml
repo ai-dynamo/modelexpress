@@ -118,10 +118,6 @@ jobs:
         echo $! > server.pid
         sleep 5  # Give server time to start
 
-    - name: Run integration tests
-      run: cargo test --test integration_tests -- --ignored
-      continue-on-error: true  # Integration tests may fail in CI due to network restrictions
-
     - name: Run integration test script
       if: always()
       run: |
