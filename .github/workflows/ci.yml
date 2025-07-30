@@ -117,6 +117,10 @@ jobs:
         ./target/release/model_express_server &
         echo $! > server.pid
         sleep 5  # Give server time to start
+        if [ -f server.pid ]; then
+          kill $(cat server.pid) || true
+          rm server.pid
+        fi
 
     - name: Run integration test script
       if: always()
