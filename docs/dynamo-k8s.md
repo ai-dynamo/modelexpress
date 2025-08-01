@@ -167,12 +167,12 @@ spec:
     Frontend:
       <..Other Contents Remain the Same..>
       pvc:
-        name: model-cache-pvc
+        name: model-express-cache-pvc
         mountPoint: /model
     VllmDecodeWorker:
       <..Other Contents Remain the Same..>
       pvc:
-        name: model-cache-pvc
+        name: model-express-cache-pvc
         mountPoint: /model
 ```
 
@@ -208,7 +208,7 @@ vllm-agg-vllmdecodeworker-67986d65b-7sx9j                         1/1     Runnin
 If you look at the logs of the decode worker, you can see we bypass downloading the model
 ```
 $ kubectl logs vllm-agg-vllmdecodeworker-67986d65b-7sx9j 
-``
+```
 
 Now lets make an inference request, by first port-forwarding the front end to our local 8000 port:
 ```
