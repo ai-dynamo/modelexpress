@@ -181,7 +181,7 @@ Additionally, we must specify the right path to the model hash snapshot (from ab
 VllmDecodeWorker:
     <..Other Contents Remain the Same..> 
           args:
-            - "ls -la /model && python3 -m dynamo.vllm --model Qwen/Qwen3-0.6B | tee /tmp/vllm.log"
+            - "python3 -m dynamo.vllm --model /model/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca | tee /tmp/vllm.log"
     <..Other Contents Remain the Same..>
 ```
 
