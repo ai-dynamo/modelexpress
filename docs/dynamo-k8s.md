@@ -185,7 +185,7 @@ VllmDecodeWorker:
     <..Other Contents Remain the Same..>
 ```
 
-Lastly you will need to accquire an [access token from Huggingface](https://huggingface.co/docs/hub/en/security-tokens), and will need to create a kubernetes secret:
+Lastly you will need to acquire an [access token from Huggingface](https://huggingface.co/docs/hub/en/security-tokens), and will need to create a kubernetes secret:
 ```
 kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=$HF_TOKEN
 ```
