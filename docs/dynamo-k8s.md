@@ -22,12 +22,12 @@ This section describes modelexpress workflow on a single node with both client a
 
 Ensure that the file structure here can be accessible for a volume we will mount into the cluster in a later step.
 
-[Follow primary README.md for guidance on starting ModelExpress](https://github.com/ai-dynamo/modelexpress/blob/main/README.md)
+[Follow primary README.md for guidance on starting modelexpress](https://github.com/ai-dynamo/modelexpress/blob/main/README.md)
 
 #### Ensure Repository is cloned
 ```
 $ git clone <repository-url>
-$ cd ModelExpress
+$ cd modelexpress
 ```
 
 #### Build the project
