@@ -2,7 +2,7 @@
 
 ## 0. Prerequisites 
 
-- [Install Dynamo Cloud on your Cluster](https://github.com/ai-dynamo/dynamo/blob/a8cb6554779f8283edd0c62d50743f2cb58e989b/docs/guides/dynamo_deploy/dynamo_cloud.md)
+- [Install Dynamo Cloud on your Cluster](https://github.com/ai-dynamo/dynamo/blob/a8cb6554779f8283edd0c62d50743f2cb58e989b/docs/guides/dynamo_deploy/quickstart.md)
 
 Should have respective pods running as shown here:
 
@@ -183,6 +183,11 @@ VllmDecodeWorker:
           args:
             - "python3 -m dynamo.vllm --model /model/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca | tee /tmp/vllm.log"
     <..Other Contents Remain the Same..>
+```
+
+Lastly you will need to accquire an [access token from Huggingface](https://huggingface.co/docs/hub/en/security-tokens), and will need to create a kubernetes secret:
+```
+kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=$HF_TOKEN
 ```
 
 Now we can create the dynamo deployment:
