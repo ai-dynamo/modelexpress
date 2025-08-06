@@ -1,5 +1,7 @@
 ![ModelExpress Logo](ModelExpressTrainLogo.jpeg)
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 # Dynamo Model Express
 
 A Rust-based gRPC service for efficient model management and serving, with support for downloading and serving machine learning models from Hugging Face Hub.
@@ -21,7 +23,7 @@ The project is organized as a Rust workspace with the following components:
 
 The client library includes a comprehensive command-line interface:
 
-- **`model-express-cli`**: A robust CLI tool for interacting with ModelExpress server
+- **`model-express-cli`**: A robust CLI tool for interacting with modelexpress server
   - Health monitoring and server status checks
   - Model downloads with multiple strategies (server, direct, fallback)
   - API operations with JSON payload support
@@ -32,7 +34,7 @@ See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
 
 ## Prerequisites
 
-- **Rust**: Latest stable version (recommended: 1.70+)
+- **Rust**: Latest stable version (recommended: 1.88)
 - **Cargo**: Rust's package manager (included with Rust)
 - **Docker** (optional): For containerized deployment
 
@@ -42,7 +44,7 @@ See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
 
 ```bash
 git clone <repository-url>
-cd ModelExpress
+cd modelexpress
 ```
 
 ### 2. Build the Project
@@ -127,7 +129,7 @@ cargo test
 # Integration tests
 cargo test --test integration_tests
 
-# Client tests
+# Client tests with specific model
 cargo run --bin test_client -- --test-model "google-t5/t5-small"
 
 # Fallback tests
@@ -151,12 +153,10 @@ ModelExpress/
 ├── model_express_client/     # Client library
 ├── model_express_common/     # Shared code
 ├── workspace-tests/          # Integration tests
-├── tests/                    # Additional tests
-├── benches/                  # Performance benchmarks
 ├── docker-compose.yml        # Docker configuration
-├── Dockerfile               # Docker build file
-├── k8s-deployment.yaml      # Kubernetes deployment
-└── run_integration_tests.sh # Test runner script
+├── Dockerfile                # Docker build file
+├── k8s-deployment.yaml       # Kubernetes deployment
+└── run_integration_tests.sh  # Test runner script
 ```
 
 ### Adding New Features
@@ -164,7 +164,7 @@ ModelExpress/
 1. **Server Features**: Add to `model_express_server/src/`
 2. **Client Features**: Add to `model_express_client/src/`
 3. **Shared Code**: Add to `model_express_common/src/`
-4. **Tests**: Add to appropriate test directory
+4. **Tests**: Add to appropriate directory under `workspace-tests/`
 
 ### Dependencies
 
@@ -212,10 +212,6 @@ RUST_LOG=debug cargo run --bin model_express_server
 4. Add tests for new functionality
 5. Run the test suite
 6. Submit a pull request
-
-## License
-
-[Add license information here]
 
 ## Support
 
