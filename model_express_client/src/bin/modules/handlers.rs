@@ -19,7 +19,8 @@ pub async fn handle_health_command(
         config.grpc_endpoint
     );
 
-    let mut client = Client::new(config).await?;
+    let mut client =
+        Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint)).await?;
     let status = client.health_check().await?;
 
     info!("Health check completed successfully");
@@ -128,7 +129,7 @@ async fn download_model(
         DownloadStrategy::SmartFallback => {
             debug!("Using smart fallback strategy");
             if let Some(cache_config) = cache_config {
-                let mut client = Client::new_with_cache(config, cache_config).await?;
+                let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
                 client.preload_model_to_cache(&model_name, provider).await
             } else {
                 Client::request_model_with_smart_fallback(model_name.clone(), provider, config)
@@ -138,10 +139,12 @@ async fn download_model(
         DownloadStrategy::ServerFallback => {
             debug!("Using server fallback strategy");
             if let Some(cache_config) = cache_config {
-                let mut client = Client::new_with_cache(config, cache_config).await?;
+                let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
                 client.preload_model_to_cache(&model_name, provider).await
             } else {
-                let mut client = Client::new(config).await?;
+                let mut client =
+                    Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint))
+                        .await?;
                 client
                     .request_model_with_provider_and_fallback(&model_name, provider)
                     .await
@@ -150,9 +153,10 @@ async fn download_model(
         DownloadStrategy::ServerOnly => {
             debug!("Using server-only strategy");
             let mut client = if let Some(cache_config) = cache_config {
-                Client::new_with_cache(config, cache_config).await?
+                Client::new_with_cache(config.clone(), cache_config).await?
             } else {
-                Client::new(config).await?
+                Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint))
+                    .await?
             };
             client
                 .request_model_with_provider(&model_name, provider)
@@ -221,7 +225,8 @@ pub async fn handle_api_send(
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!("Preparing API request for action: {}", action);
 
-    let mut client = Client::new(config).await?;
+    let mut client =
+        Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint)).await?;
     let payload_data = read_payload(payload, payload_file)?;
 
     if payload_data.is_some() {

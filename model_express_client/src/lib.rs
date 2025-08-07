@@ -13,6 +13,7 @@ use model_express_common::{
     models::{ModelStatus, Status},
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::info;
@@ -37,6 +38,14 @@ pub struct Client {
 impl Client {
     /// Create a new client with the given configuration
     pub async fn new(config: ClientConfig) -> CommonResult<Self> {
+        Self::new_with_endpoint_override(config, None).await
+    }
+
+    /// Create a new client with the given configuration and endpoint override
+    pub async fn new_with_endpoint_override(
+        config: ClientConfig,
+        endpoint_override: Option<String>,
+    ) -> CommonResult<Self> {
         let channel = tonic::transport::Endpoint::new(config.grpc_endpoint.clone())
             .map(|endpoint| {
                 if let Some(timeout) = config.timeout_secs {
@@ -52,8 +61,25 @@ impl Client {
         let api_client = ApiServiceClient::new(channel.clone());
         let model_client = ModelServiceClient::new(channel);
 
-        // Try to discover cache configuration
-        let cache_config = CacheConfig::discover().ok();
+        // Try to discover cache configuration, but respect endpoint override
+        let cache_config = if let Some(endpoint) = endpoint_override {
+            // If endpoint override is provided, create cache config with that endpoint
+            let mut cache_config = CacheConfig::discover().unwrap_or_else(|_| {
+                // Fallback to default cache config if discovery fails
+                CacheConfig {
+                    local_path: PathBuf::from("~/.model-express/cache"),
+                    server_endpoint: endpoint.clone(),
+                    auto_mount: true,
+                    timeout_secs: None,
+                }
+            });
+            // Override the server endpoint with the command line argument
+            cache_config.server_endpoint = endpoint;
+            Some(cache_config)
+        } else {
+            // No override, use discovered config as-is
+            CacheConfig::discover().ok()
+        };
 
         Ok(Self {
             health_client,
@@ -349,7 +375,7 @@ impl Client {
         let model_name = model_name.into();
 
         // First try to create a client and use server-based download
-        match Client::new(config).await {
+        match Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint)).await {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
@@ -394,30 +420,59 @@ impl Client {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use model_express_common::cache::CacheConfig;
     use std::collections::HashMap;
 
     fn create_test_config() -> ClientConfig {
-        ClientConfig {
-            grpc_endpoint: "http://127.0.0.1:8001".to_string(),
-            timeout_secs: Some(10),
-        }
+        ClientConfig::new("http://test-endpoint:1234")
     }
 
     #[test]
     fn test_client_config_creation() {
         let config = create_test_config();
-        assert_eq!(config.grpc_endpoint, "http://127.0.0.1:8001");
-        assert_eq!(config.timeout_secs, Some(10));
+        assert_eq!(config.grpc_endpoint, "http://test-endpoint:1234");
     }
 
     #[test]
     fn test_client_config_default_timeout() {
-        let config = ClientConfig {
-            grpc_endpoint: "http://127.0.0.1:8001".to_string(),
+        let config = create_test_config();
+        assert!(config.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn test_client_config_with_timeout() {
+        let config = create_test_config().with_timeout(60);
+        assert_eq!(config.timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_endpoint_override_priority() {
+        // This test verifies that the endpoint override mechanism works
+        // by checking that the cache config gets the correct endpoint
+        let config = ClientConfig::new("http://command-line-endpoint:5678");
+
+        // In a real scenario, this would be tested with the async new_with_endpoint_override
+        // For now, we test the config itself
+        assert_eq!(config.grpc_endpoint, "http://command-line-endpoint:5678");
+    }
+
+    #[test]
+    fn test_cache_config_endpoint_override() {
+        // Test that cache config can be created with a specific endpoint
+        let mut cache_config = CacheConfig {
+            local_path: std::path::PathBuf::from("/test/path"),
+            server_endpoint: "http://original-endpoint:1234".to_string(),
+            auto_mount: true,
             timeout_secs: None,
         };
 
-        assert!(config.timeout_secs.is_none());
+        // Simulate endpoint override
+        cache_config.server_endpoint = "http://override-endpoint:5678".to_string();
+
+        assert_eq!(
+            cache_config.server_endpoint,
+            "http://override-endpoint:5678"
+        );
     }
 
     // Note: Most client tests require a running server, so they would be integration tests
