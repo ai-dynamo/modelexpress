@@ -12,6 +12,7 @@ clap = { workspace = true }
 config = { workspace = true }
 futures = { workspace = true }
 hf-hub = { workspace = true }
+jiff = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
 rusqlite = { workspace = true }

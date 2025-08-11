@@ -1,6 +1,7 @@
+use chrono::Duration;
 use clap::{Parser, ValueEnum};
 use config::{Config, ConfigError, Environment, File};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
@@ -9,6 +10,115 @@ use std::str::FromStr;
 use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
+
+/// Parse a duration string into a `chrono::Duration`.
+/// Supports formats like "2h", "30m", "45s", "1d", etc.
+pub fn parse_duration_string(value: &str) -> Result<Duration, String> {
+    use jiff::{Span, SpanRelativeTo};
+    let span = Span::from_str(value).map_err(|err| format!("Invalid duration: {err}"))?;
+
+    // Convert jiff::Span to chrono::Duration
+    // For spans with days, we need to specify that days are 24 hours
+    let signed_duration = span
+        .to_duration(SpanRelativeTo::days_are_24_hours())
+        .map_err(|err| format!("Invalid duration: {err}"))?;
+
+    let std_duration = std::time::Duration::try_from(signed_duration)
+        .map_err(|err| format!("Invalid duration: {err}"))?;
+
+    Duration::from_std(std_duration).map_err(|err| format!("Duration out of range: {err}"))
+}
+
+/// A wrapper around chrono::Duration that can be deserialized from string or seconds
+#[derive(Debug, Clone, Serialize)]
+pub struct DurationConfig {
+    #[serde(with = "duration_serde")]
+    duration: Duration,
+}
+
+impl DurationConfig {
+    pub fn new(duration: Duration) -> Self {
+        Self { duration }
+    }
+
+    pub fn hours(hours: i64) -> Self {
+        Self {
+            duration: Duration::hours(hours),
+        }
+    }
+
+    pub fn as_chrono_duration(&self) -> Duration {
+        self.duration
+    }
+
+    pub fn num_seconds(&self) -> i64 {
+        self.duration.num_seconds()
+    }
+}
+
+impl fmt::Display for DurationConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}s", self.duration.num_seconds())
+    }
+}
+
+impl<'de> Deserialize<'de> for DurationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct DurationVisitor;
+
+        impl<'de> Visitor<'de> for DurationVisitor {
+            type Value = DurationConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter
+                    .write_str("a duration string like '2h', '30m', '45s' or number of seconds")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<DurationConfig, E>
+            where
+                E: de::Error,
+            {
+                parse_duration_string(value)
+                    .map(DurationConfig::new)
+                    .map_err(de::Error::custom)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<DurationConfig, E>
+            where
+                E: de::Error,
+            {
+                Ok(DurationConfig::new(Duration::seconds(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<DurationConfig, E>
+            where
+                E: de::Error,
+            {
+                Ok(DurationConfig::new(Duration::seconds(value as i64)))
+            }
+        }
+
+        deserializer.deserialize_any(DurationVisitor)
+    }
+}
+
+// Helper module for serializing Duration
+mod duration_serde {
+    use chrono::Duration;
+    use serde::{Serialize, Serializer};
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        duration.num_seconds().serialize(serializer)
+    }
+}
 
 /// Log level wrapper for clap ValueEnum
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Serialize, Deserialize, Default)]
@@ -363,7 +473,7 @@ impl ServerConfig {
         info!("  Eviction Enabled: {}", self.cache.eviction.enabled);
         info!(
             "  Eviction Check Interval: {}s",
-            self.cache.eviction.check_interval_seconds
+            self.cache.eviction.check_interval.num_seconds()
         );
 
         info!("Logging Configuration:");
@@ -518,5 +628,78 @@ mod tests {
 
         // Test invalid
         assert!("invalid".parse::<LogFormat>().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_parse_duration_string() {
+        // Test various duration formats
+        assert_eq!(
+            parse_duration_string("30m")
+                .expect("Failed to parse 30m")
+                .num_seconds(),
+            30 * 60
+        );
+        assert_eq!(
+            parse_duration_string("45s")
+                .expect("Failed to parse 45s")
+                .num_seconds(),
+            45
+        );
+        assert_eq!(
+            parse_duration_string("1d")
+                .expect("Failed to parse 1d")
+                .num_seconds(),
+            24 * 3600
+        );
+        assert_eq!(
+            parse_duration_string("2h")
+                .expect("Failed to parse 2h")
+                .num_seconds(),
+            2 * 3600
+        );
+        assert_eq!(
+            parse_duration_string("2h30m")
+                .expect("Failed to parse 2h30m")
+                .num_seconds(),
+            2 * 3600 + 30 * 60
+        );
+
+        // Test invalid format
+        assert!(parse_duration_string("invalid").is_err());
+    }
+
+    #[test]
+    fn test_duration_config() {
+        // Test creation
+        let duration_config = DurationConfig::new(Duration::hours(2));
+        assert_eq!(duration_config.num_seconds(), 2 * 3600);
+        assert_eq!(duration_config.as_chrono_duration(), Duration::hours(2));
+
+        // Test hours constructor
+        let duration_config = DurationConfig::hours(3);
+        assert_eq!(duration_config.num_seconds(), 3 * 3600);
+
+        // Test display
+        assert_eq!(duration_config.to_string(), "10800s");
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_duration_config_serde() {
+        // Test deserializing from string
+        let json = r#""2h""#;
+        let duration_config: DurationConfig = serde_json::from_str(json).expect("Failed to parse");
+        assert_eq!(duration_config.num_seconds(), 2 * 3600);
+
+        // Test deserializing from number (seconds)
+        let json = r#"3600"#;
+        let duration_config: DurationConfig = serde_json::from_str(json).expect("Failed to parse");
+        assert_eq!(duration_config.num_seconds(), 3600);
+
+        // Test serializing (it serializes as an object with the duration field)
+        let duration_config = DurationConfig::hours(1);
+        let serialized = serde_json::to_string(&duration_config).expect("Failed to serialize");
+        assert_eq!(serialized, r#"{"duration":3600}"#);
     }
 }

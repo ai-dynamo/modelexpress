@@ -27,17 +27,25 @@ async fn test_integration_full_workflow() {
 
     // Test health check
     let health_result = client.health_check().await;
-    assert!(health_result.is_ok(), "Health check failed: {:?}", health_result);
+    assert!(
+        health_result.is_ok(),
+        "Health check failed: {:?}",
+        health_result
+    );
 
-    let status = health_result.unwrap();
+    let status = health_result.expect("Expected health check to succeed");
     assert!(!status.version.is_empty());
     assert_eq!(status.status, "ok");
 
     // Test ping request
     let ping_result: Result<serde_json::Value, _> = client.send_request("ping", None).await;
-    assert!(ping_result.is_ok(), "Ping request failed: {:?}", ping_result);
+    assert!(
+        ping_result.is_ok(),
+        "Ping request failed: {:?}",
+        ping_result
+    );
 
-    let ping_response = ping_result.unwrap();
+    let ping_response = ping_result.expect("Expected ping request to succeed");
     assert_eq!(ping_response["message"], "pong");
 
     // Test unknown action
@@ -58,7 +66,8 @@ async fn test_integration_model_download_fallback() {
         "invalid-model-name-12345", // Use invalid model to test error handling
         ModelProvider::HuggingFace,
         config,
-    ).await;
+    )
+    .await;
 
     // Should fail because model doesn't exist, but we should get a meaningful error
     assert!(result.is_err());
@@ -72,7 +81,8 @@ async fn test_integration_direct_download_invalid_model() {
     let result = Client::download_model_directly(
         "definitely-not-a-real-model-name-12345",
         ModelProvider::HuggingFace,
-    ).await;
+    )
+    .await;
 
     // Should fail with a meaningful error
     assert!(result.is_err());
@@ -89,7 +99,8 @@ async fn test_integration_small_model_download() {
     let result = Client::download_model_directly(
         "prajjwal1/bert-tiny", // A very small BERT model for testing
         ModelProvider::HuggingFace,
-    ).await;
+    )
+    .await;
 
     match result {
         Ok(()) => info!("Small model download successful"),
@@ -112,7 +123,11 @@ async fn test_integration_client_config_validation() {
     // Default configuration
     let default_config = ClientConfig::default();
     assert!(default_config.grpc_endpoint.contains("localhost"));
-    assert!(default_config.grpc_endpoint.contains(&constants::DEFAULT_GRPC_PORT.to_string()));
+    assert!(
+        default_config
+            .grpc_endpoint
+            .contains(&constants::DEFAULT_GRPC_PORT.to_string())
+    );
 
     // Configuration with invalid endpoint should still create but fail on connection
     let invalid_config = ClientConfig::new("invalid-url");
