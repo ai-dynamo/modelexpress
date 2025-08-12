@@ -6,7 +6,11 @@ use std::path::PathBuf;
 #[async_trait::async_trait]
 pub trait ModelProviderTrait: Send + Sync {
     /// Download a model and return the path where it was downloaded
-    async fn download_model(&self, model_name: &str) -> Result<PathBuf>;
+    async fn download_model(
+        &self,
+        model_name: &str,
+        cache_path: Option<PathBuf>,
+    ) -> Result<PathBuf>;
 
     /// Delete a model from the provider's cache
     /// Returns Ok(()) if the model was successfully deleted or didn't exist

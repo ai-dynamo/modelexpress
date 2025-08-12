@@ -6,6 +6,31 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
+const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
+
+/// Get the cache directory for Hugging Face models
+/// Priority order:
+/// 1. Provided cache_dir parameter
+/// 2. HF_HUB_CACHE environment variable
+/// 3. Default location (~/.cache/huggingface/hub)
+fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
+    // Use provided cache directory if available
+    if let Some(dir) = cache_dir {
+        return dir;
+    }
+
+    // Try environment variable
+    if let Ok(cache_path) = env::var(HF_HUB_CACHE_ENV_VAR) {
+        return PathBuf::from(cache_path);
+    }
+
+    // Fall back to default location
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+
+    PathBuf::from(home).join(".cache/huggingface/hub")
+}
 
 /// Hugging Face model provider implementation
 pub struct HuggingFaceProvider;
@@ -14,12 +39,26 @@ pub struct HuggingFaceProvider;
 impl ModelProviderTrait for HuggingFaceProvider {
     /// Attempt to download a model from Hugging Face
     /// Returns the directory it is in
-    async fn download_model(&self, model_name: &str) -> Result<PathBuf> {
+    async fn download_model(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<PathBuf> {
         info!("Downloading model from Hugging Face: {model_name}");
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
+
+        // Get cache directory and ensure it exists
+        let cache_dir = get_cache_dir(cache_dir);
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
+        })?;
+
+        info!("Using cache directory: {:?}", cache_dir);
+
         let api = ApiBuilder::new()
             .with_progress(true)
             .with_token(token)
+            .with_cache_dir(cache_dir)
             .build()?;
         let model_name = model_name.to_string();
 
