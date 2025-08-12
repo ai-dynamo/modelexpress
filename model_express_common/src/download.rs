@@ -133,7 +133,11 @@ mod tests {
 
         #[async_trait::async_trait]
         impl ModelProviderTrait for DefaultProvider {
-            async fn download_model(&self, _model_name: &str) -> Result<PathBuf> {
+            async fn download_model(
+                &self,
+                _model_name: &str,
+                _cache_dir: Option<PathBuf>,
+            ) -> Result<PathBuf> {
                 Ok(PathBuf::from("/tmp"))
             }
 
