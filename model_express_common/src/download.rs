@@ -30,8 +30,6 @@ pub async fn download_model(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use crate::cache;
-
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
