@@ -390,7 +390,7 @@ impl ServerConfig {
                         // Apply values from the config if they exist
                         if let Ok(server_port) = c.get::<u16>("server.port") {
                             default_config.server.port = NonZeroU16::new(server_port)
-                                .unwrap_or(NonZeroU16::new(8001).unwrap());
+                                .unwrap_or(model_express_common::constants::DEFAULT_GRPC_PORT);
                         }
                         if let Ok(server_host) = c.get::<String>("server.host") {
                             default_config.server.host = server_host;
