@@ -10,8 +10,12 @@ RUN apt-get update && \
 # Copy the entire source code
 COPY . .
 
-# Build the application
-RUN cargo build --release -p model_express_server
+# Build all available binaries
+RUN cargo build --release --bin model_express_server && \
+    cargo build --release --bin model-express-cli && \
+    cargo build --release --bin test_client && \
+    cargo build --release --bin test_single_client && \
+    cargo build --release --bin fallback_test
 
 # Create a minimal runtime image
 FROM debian:bookworm-slim 
@@ -23,8 +27,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy the built binary
+# Copy all built binaries
 COPY --from=builder /app/target/release/model_express_server .
+COPY --from=builder /app/target/release/model-express-cli .
+COPY --from=builder /app/target/release/test_client .
+COPY --from=builder /app/target/release/test_single_client .
+COPY --from=builder /app/target/release/fallback_test .
 
 # Expose the default port
 EXPOSE 8000
@@ -33,5 +41,5 @@ EXPOSE 8000
 ENV SERVER_PORT=8000
 ENV LOG_LEVEL=info
 
-# Run the server
+# Run the server by default
 CMD ["./model_express_server"]
