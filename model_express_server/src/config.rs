@@ -341,9 +341,6 @@ impl ServerConfig {
     pub fn load(args: ServerArgs) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
 
-        // Start with default values
-        builder = builder.add_source(Config::try_from(&ServerConfig::default())?);
-
         // Add configuration file if specified or if default exists
         if let Some(config_path) = &args.config {
             if config_path.exists() {
@@ -379,7 +376,51 @@ impl ServerConfig {
                 .list_separator(","),
         );
 
-        let mut config: ServerConfig = builder.build()?.try_deserialize()?;
+        // Build the config and merge with defaults
+        let config_result = builder.build();
+        let mut config = match config_result {
+            Ok(c) => {
+                // Clone the config before trying to deserialize since try_deserialize consumes it
+                match c.clone().try_deserialize::<ServerConfig>() {
+                    Ok(full_config) => full_config,
+                    Err(_) => {
+                        // Start with default and manually merge what we can
+                        let mut default_config = ServerConfig::default();
+
+                        // Apply values from the config if they exist
+                        if let Ok(server_port) = c.get::<u16>("server.port") {
+                            default_config.server.port = NonZeroU16::new(server_port)
+                                .unwrap_or(NonZeroU16::new(8001).unwrap());
+                        }
+                        if let Ok(server_host) = c.get::<String>("server.host") {
+                            default_config.server.host = server_host;
+                        }
+                        if let Ok(logging_level) = c.get::<String>("logging.level") {
+                            if let Ok(level) = logging_level.parse::<LogLevel>() {
+                                default_config.logging.level = level;
+                            }
+                        }
+                        if let Ok(logging_format) = c.get::<String>("logging.format") {
+                            if let Ok(format) = logging_format.parse::<LogFormat>() {
+                                default_config.logging.format = format;
+                            }
+                        }
+                        if let Ok(database_path) = c.get::<String>("database.path") {
+                            default_config.database.path = PathBuf::from(database_path);
+                        }
+                        if let Ok(cache_directory) = c.get::<String>("cache.directory") {
+                            default_config.cache.directory = PathBuf::from(cache_directory);
+                        }
+
+                        default_config
+                    }
+                }
+            }
+            Err(_) => {
+                // If building the config fails entirely, just use defaults
+                ServerConfig::default()
+            }
+        };
 
         // Override with command line arguments
         if let Some(port) = args.port {
