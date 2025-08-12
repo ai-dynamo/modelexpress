@@ -61,7 +61,7 @@ Save this configuration? [Y/n]:
 ModelExpress Storage Configuration
 ===================================
 Configuration saved successfully!
-Storage path: "/home/kavink/.model-express/cache"
+Storage path: "/home/user/.model-express/cache"
 Server endpoint: http://localhost:8001
 Auto-mount: true
 ```
@@ -84,9 +84,9 @@ Model Download
 ```
 $ ls -al ~/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/
 total 12
-drwxr-xr-x 3 kavink domain-users 4096 Aug  1 15:27 .
-drwxr-xr-x 5 kavink domain-users 4096 Aug  1 15:27 ..
-drwxr-xr-x 2 kavink domain-users 4096 Aug  1 15:27 c1899de289a04d12100db370d81485cdf75e47ca
+drwxr-xr-x 3 user domain-users 4096 Aug  1 15:27 .
+drwxr-xr-x 5 user domain-users 4096 Aug  1 15:27 ..
+drwxr-xr-x 2 user domain-users 4096 Aug  1 15:27 c1899de289a04d12100db370d81485cdf75e47ca
 ```
 
 Remember the hash path `/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca` for a later step when we start Dynamo
@@ -112,7 +112,7 @@ spec:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
   local:
-    path: /home/kavink/.model-express/cache
+    path: /home/user/.model-express/cache
   nodeAffinity:
     required:
       nodeSelectorTerms:
