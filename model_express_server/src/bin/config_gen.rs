@@ -208,9 +208,9 @@ fn merge_server_config(
                         if let serde_yaml::Value::Number(n) = val
                             && let Some(timeout) = n.as_u64()
                         {
-                                server.shutdown_timeout_seconds = timeout;
-                            }
+                            server.shutdown_timeout_seconds = timeout;
                         }
+                    }
                     _ => {
                         eprintln!("Warning: Unknown configuration key '{key_str}', ignoring");
                     }
@@ -243,16 +243,16 @@ fn merge_database_config(
                         if let serde_yaml::Value::Number(n) = val
                             && let Some(size) = n.as_u64()
                         {
-                                database.pool_size = size as u32;
-                            }
+                            database.pool_size = size as u32;
                         }
+                    }
                     "connection_timeout_seconds" => {
                         if let serde_yaml::Value::Number(n) = val
                             && let Some(timeout) = n.as_u64()
                         {
-                                database.connection_timeout_seconds = timeout;
-                            }
+                            database.connection_timeout_seconds = timeout;
                         }
+                    }
                     _ => {
                         eprintln!("Warning: Unknown configuration key '{key_str}', ignoring");
                     }
