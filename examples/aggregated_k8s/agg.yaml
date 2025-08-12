@@ -1,0 +1,224 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+    limits:
+      storage: 100Gi
+  storageClassName: microk8s-hostpath
+
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: vllm-agg
+spec:
+  services:
+    ModelExpressServer:
+      livenessProbe:
+        tcpSocket:
+          port: 8002
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+      readinessProbe:
+        tcpSocket:
+          port: 8002
+        initialDelaySeconds: 10
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 3
+      dynamoNamespace: vllm-agg
+      componentType: main
+      replicas: 1
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+        limits:
+          cpu: "500m"
+          memory: "256Mi"
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: nnoble-desktop
+        mainContainer:
+          image: localhost:5000/model-express:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVER_PORT
+              value: "8002"
+            - name: LOG_LEVEL
+              value: "info"
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              echo "Starting Model Express Server..."
+              ./model_express_server &
+              SERVER_PID=$!
+              echo "Server started with PID: $SERVER_PID"
+
+              echo "Setting up Model Express configuration..."
+              mkdir -p /root/.model-express/cache
+              cat > /root/.model-express/config.yaml << EOF
+              local_path: /root/.model-express/cache
+              server_endpoint: http://localhost:8002
+              auto_mount: true
+              timeout_secs: null
+              EOF
+
+              echo "Waiting for server to be ready..."
+              for i in {1..60}; do
+                if ./model-express-cli --endpoint http://localhost:8002 health > /dev/null 2>&1; then
+                  echo "Server is ready!"
+                  break
+                fi
+                echo "Waiting for server... ($i/60)"
+                sleep 2
+              done
+
+              echo "Cleaning up any stale lock files..."
+              find /root/.model-express -name "*.lock" -type f -delete 2>/dev/null || true
+
+              echo "Downloading Qwen/Qwen3-0.6B model..."
+              ./model-express-cli --endpoint http://localhost:8002 --cache-path /root model download Qwen/Qwen3-0.6B
+
+              echo "Model download completed. Creating symlink for VLLM worker..."
+              # Find the latest snapshot and create a symlink
+              SNAPSHOT_DIR=$(find /root/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots -maxdepth 1 -type d -name "*" -not -name "snapshots" | head -1)
+              if [ -n "$SNAPSHOT_DIR" ]; then
+                cd /root/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots
+                ln -sf "$(basename $SNAPSHOT_DIR)" latest
+                echo "Created symlink: latest -> $(basename $SNAPSHOT_DIR)"
+                echo "Symlink target: $SNAPSHOT_DIR"
+              else
+                echo "Warning: No snapshot directory found"
+              fi
+
+              echo "Server PID: $SERVER_PID"
+              wait $SERVER_PID
+      pvc:
+        name: model-cache-pvc
+        mountPoint: /root
+    Frontend:
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 60
+        periodSeconds: 60
+        timeoutSeconds: 30
+        failureThreshold: 10
+      readinessProbe:
+        exec:
+          command:
+            - /bin/sh
+            - -c
+            - 'curl -s http://localhost:8000/health | jq -e ".status == \"healthy\""'
+        initialDelaySeconds: 60
+        periodSeconds: 60
+        timeoutSeconds: 30
+        failureThreshold: 10
+      dynamoNamespace: vllm-agg
+      componentType: main
+      replicas: 1
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "1"
+          memory: "2Gi"
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: nnoble-desktop
+        mainContainer:
+          image: nvcr.io/nvidian/nim-llm-dev/vllm-runtime:hzhou-0729-2
+          workingDir: /workspace/components/backends/vllm
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - "python3 -m dynamo.frontend --http-port 8000"
+      pvc:
+        name: model-cache-pvc
+        mountPoint: /model
+    VllmDecodeWorker:
+      envFromSecret: hf-token-secret
+      livenessProbe:
+        httpGet:
+          path: /live
+          port: 9090
+        periodSeconds: 5
+        timeoutSeconds: 30
+        failureThreshold: 1
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9090
+        periodSeconds: 10
+        timeoutSeconds: 30
+        failureThreshold: 60
+      dynamoNamespace: vllm-agg
+      componentType: worker
+      replicas: 1
+      resources:
+        requests:
+          cpu: "10"
+          memory: "20Gi"
+          gpu: "1"
+        limits:
+          cpu: "10"
+          memory: "20Gi"
+          gpu: "1"
+      envs:
+        - name: DYN_SYSTEM_ENABLED
+          value: "true"
+        - name: DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS
+          value: '["generate"]'
+        - name: DYN_SYSTEM_PORT
+          value: "9090"
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: nnoble-desktop
+        mainContainer:
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9090
+            periodSeconds: 10
+            failureThreshold: 60
+          image: nvcr.io/nvidian/nim-llm-dev/vllm-runtime:hzhou-0729-2
+          workingDir: /workspace/components/backends/vllm
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              echo "Waiting for model to be ready..."
+              for i in {1..120}; do
+                if [ -L "/model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest" ] && [ -d "/model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest" ]; then
+                  echo "Model is ready! Starting VLLM worker..."
+                  break
+                fi
+                echo "Waiting for model... ($i/120)"
+                sleep 5
+              done
+
+              echo "Model path: /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest/"
+              ls -la /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/
+              python3 -m dynamo.vllm --model /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest/ | tee /tmp/vllm.log
+      pvc:
+        name: model-cache-pvc
+        mountPoint: /model
