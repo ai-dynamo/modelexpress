@@ -1,4 +1,4 @@
-version: '3'
+version: "3"
 
 services:
   model-express-server:
@@ -8,6 +8,6 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - SERVER_PORT=8000
-      - LOG_LEVEL=info
+      - MODEL_EXPRESS_SERVER_PORT=8000
+      - MODEL_EXPRESS_LOG_LEVEL=info
     restart: unless-stopped

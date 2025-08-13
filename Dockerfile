@@ -37,9 +37,11 @@ COPY --from=builder /app/target/release/fallback_test .
 # Expose the default port
 EXPOSE 8000
 
-# Set environment variables
-ENV SERVER_PORT=8000
-ENV LOG_LEVEL=info
+# Set default environment variables (can be overridden)
+ENV MODEL_EXPRESS_SERVER_PORT=8000
+ENV MODEL_EXPRESS_LOGGING_LEVEL=info
+ENV MODEL_EXPRESS_DATABASE_PATH=/app/models.db
+ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
 
 # Run the server by default
 CMD ["./model_express_server"]

@@ -10,46 +10,49 @@ echo "======================================================"
 # Function to check if Rust toolchain is stable
 check_rust_toolchain() {
     echo "Checking Rust toolchain status..."
-    
+
     # Check if we have a stable toolchain
     if ! rustup toolchain list | grep -q "stable"; then
         echo "Installing stable Rust toolchain..."
         rustup toolchain install stable
     fi
-    
+
     # Set stable as default if not already set
     if [[ "$(rustup default)" != *"stable"* ]]; then
         echo "Setting stable as default toolchain..."
         rustup default stable
     fi
-    
+
     # Verify toolchain is working
     if ! cargo --version > /dev/null 2>&1; then
         echo "ERROR: Cargo is not working properly. Please check your Rust installation."
         exit 1
     fi
-    
+
     echo "Rust toolchain is ready: $(cargo --version)"
 }
+
+# Determine the target directory (honor CARGO_TARGET_DIR if set)
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 # Function to build the project safely
 build_project() {
     echo "Building ModelExpress project..."
-    
+
     # Clean any previous builds to avoid stale artifacts
     cargo clean
-    
+
     # Build in release mode for better performance
     if ! cargo build --release --bin model_express_server; then
         echo "ERROR: Failed to build model_express_server"
         exit 1
     fi
-    
+
     if ! cargo build --release --bin test_client; then
         echo "ERROR: Failed to build test_client"
         exit 1
     fi
-    
+
     echo "Build completed successfully"
 }
 
@@ -61,7 +64,7 @@ build_project
 
 # Start the server in the background using the built binary
 echo "Starting model_express_server (gRPC) in the background..."
-./target/release/model_express_server > server.log 2>&1 &
+"$TARGET_DIR/release/model_express_server" > server.log 2>&1 &
 SERVER_PID=$!
 
 # Give the server time to start
@@ -90,6 +93,6 @@ echo "gRPC Server started successfully with PID $SERVER_PID"
 
 # Run the client test using the built binary
 echo "Running concurrent model download test with gRPC..."
-./target/release/test_client --test-model "google-t5/t5-small"
+"$TARGET_DIR/release/test_client" --test-model "google-t5/t5-small"
 
 echo "gRPC Test completed successfully!"
