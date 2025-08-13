@@ -19,7 +19,7 @@ jobs:
   trigger:
     uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@pvijayakrish/add-centralized-workflows
     with:
-      ref: ${{ github.ref_name }}
+      ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
     secrets:
       TOKEN: ${{ secrets.TOKEN }}
       MIRROR_URL: ${{ secrets.MIRROR_URL }}
