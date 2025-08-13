@@ -10,6 +10,10 @@ on:
       - main
       - 'release/*.*.*'
 
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || '' }}
+  cancel-in-progress: true
+
 jobs:
   trigger:
     uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@pvijayakrish/add-centralized-workflows
