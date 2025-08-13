@@ -1,0 +1,20 @@
+name: Trigger GitLab CI for ModelExpress
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  trigger:
+    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@main
+    with:
+      ref: ${{ github.ref_name }}
+    secrets:
+      TOKEN: ${{ secrets.TOKEN }}
+      MIRROR_URL: ${{ secrets.MIRROR_URL }}
+      PIPELINE_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+      PIPELINE_URL: ${{ secrets.PIPELINE_URL }}
