@@ -16,11 +16,10 @@ pub async fn handle_health_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!(
         "Initiating health check to server: {}",
-        config.grpc_endpoint
+        config.connection.endpoint
     );
 
-    let mut client =
-        Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint)).await?;
+    let mut client = Client::new(config).await?;
     let status = client.health_check().await?;
 
     info!("Health check completed successfully");
@@ -142,9 +141,7 @@ async fn download_model(
                 let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
                 client.preload_model_to_cache(&model_name, provider).await
             } else {
-                let mut client =
-                    Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint))
-                        .await?;
+                let mut client = Client::new(config.clone()).await?;
                 client
                     .request_model_with_provider_and_fallback(&model_name, provider)
                     .await
@@ -155,8 +152,7 @@ async fn download_model(
             let mut client = if let Some(cache_config) = cache_config {
                 Client::new_with_cache(config.clone(), cache_config).await?
             } else {
-                Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint))
-                    .await?
+                Client::new(config.clone()).await?
             };
             client
                 .request_model_with_provider(&model_name, provider)
@@ -225,8 +221,7 @@ pub async fn handle_api_send(
 ) -> Result<(), Box<dyn std::error::Error>> {
     debug!("Preparing API request for action: {}", action);
 
-    let mut client =
-        Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint)).await?;
+    let mut client = Client::new(config).await?;
     let payload_data = read_payload(payload, payload_file)?;
 
     if payload_data.is_some() {
@@ -268,7 +263,8 @@ async fn init_model_storage(
     let config = if let Some(path) = storage_path {
         CacheConfig::from_path(path)?
     } else {
-        CacheConfig::prompt_user()?
+        // Use default configuration instead of prompting
+        CacheConfig::default()
     };
 
     // Override with command line options if provided
@@ -382,7 +378,7 @@ async fn show_model_status(
     let stats = storage_config.get_cache_stats()?;
 
     let storage_accessible = storage_config.local_path.exists();
-    let server_available = Client::new(ClientConfig::new(&storage_config.server_endpoint))
+    let server_available = Client::new(ClientConfig::for_testing(&storage_config.server_endpoint))
         .await
         .is_ok();
 

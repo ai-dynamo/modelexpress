@@ -15,6 +15,10 @@ tracing = { workspace = true }
 hf-hub = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
+jiff = { workspace = true }
 
 [dev-dependencies]
 mockall = "0.13"
