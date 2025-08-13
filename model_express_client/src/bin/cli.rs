@@ -7,7 +7,7 @@ mod modules {
 
 use clap::Parser;
 use colored::*;
-use model_express_client::ClientConfig;
+use model_express_client::{ClientArgs, ClientConfig};
 use modules::args::{ApiCommands, Cli, Commands};
 use modules::handlers::{handle_api_send, handle_health_command, handle_model_command};
 use modules::output::{print_output, setup_logging};
@@ -20,12 +20,34 @@ async fn main() {
 
     setup_logging(cli.verbose, cli.quiet);
 
-    debug!(
-        "CLI initialized with config: endpoint={}, timeout={}, format={:?}",
-        cli.endpoint, cli.timeout, cli.format
-    );
+    let client_args = ClientArgs {
+        config: None, // CLI doesn't have a config file option yet
+        endpoint: Some(cli.endpoint),
+        timeout: Some(cli.timeout),
+        cache_path: cli.cache_path.clone(),
+        log_level: None, // Could map from verbose levels if needed
+        log_format: None,
+        quiet: cli.quiet,
+        max_retries: None,
+        retry_delay: None,
+    };
 
-    let config = ClientConfig::new(cli.endpoint).with_timeout(cli.timeout);
+    // Load the configuration
+    let config = match ClientConfig::load(client_args) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Configuration error: {e}");
+            if !cli.quiet {
+                eprintln!("{}: {e}", "Configuration Error".red().bold());
+            }
+            process::exit(1);
+        }
+    };
+
+    debug!(
+        "CLI initialized with config: endpoint={}, timeout={:?}, format={:?}",
+        config.connection.endpoint, config.connection.timeout_secs, cli.format
+    );
 
     let result = match cli.command {
         Commands::Health => {

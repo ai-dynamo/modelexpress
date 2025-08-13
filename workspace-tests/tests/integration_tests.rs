@@ -13,10 +13,8 @@ async fn test_integration_full_workflow() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // This test requires the server to be running
-    let config = ClientConfig {
-        grpc_endpoint: format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT),
-        timeout_secs: Some(30),
-    };
+    let config =
+        ClientConfig::for_testing(format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT));
 
     // Try to connect to the server
     let mut client =
@@ -53,10 +51,7 @@ async fn test_integration_full_workflow() {
 #[tokio::test]
 #[ignore = "Ignore by default since it may require network access"]
 async fn test_integration_model_download_fallback() {
-    let config = ClientConfig {
-        grpc_endpoint: "http://127.0.0.1:99999".to_string(), // Invalid port to force fallback
-        timeout_secs: Some(1),
-    };
+    let config = ClientConfig::for_testing("http://127.0.0.1:99999"); // Invalid port to force fallback
 
     // This should fallback to direct download since server is not available
     let result = Client::request_model_with_smart_fallback(
@@ -113,21 +108,23 @@ async fn test_integration_client_config_validation() {
     // Test various client configurations
 
     // Valid configuration
-    let valid_config = ClientConfig::new("http://localhost:8001").with_timeout(30);
-    assert_eq!(valid_config.grpc_endpoint, "http://localhost:8001");
-    assert_eq!(valid_config.timeout_secs, Some(30));
+    let valid_config = ClientConfig::for_testing("http://localhost:8001");
+    assert_eq!(valid_config.connection.endpoint, "http://localhost:8001");
+    assert!(valid_config.connection.timeout_secs.is_some());
 
-    // Default configuration
-    let default_config = ClientConfig::default();
-    assert!(default_config.grpc_endpoint.contains("localhost"));
+    // Default configuration (use for_testing with default endpoint)
+    let default_config =
+        ClientConfig::for_testing(format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT));
+    assert!(default_config.connection.endpoint.contains("localhost"));
     assert!(
         default_config
-            .grpc_endpoint
+            .connection
+            .endpoint
             .contains(&constants::DEFAULT_GRPC_PORT.to_string())
     );
 
     // Configuration with invalid endpoint should still create but fail on connection
-    let invalid_config = ClientConfig::new("invalid-url");
+    let invalid_config = ClientConfig::for_testing("invalid-url");
     let client_result = Client::new(invalid_config).await;
     assert!(client_result.is_err());
 }

@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{debug, error, info, warn};
 
-use crate::config::DurationConfig;
 use crate::database::{ModelDatabase, ModelRecord};
+use model_express_common::config::DurationConfig;
 use model_express_common::models::ModelStatus;
 
 /// Configuration for cache eviction policies
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_duration_config_parsing() {
-        use crate::config::parse_duration_string;
+        use model_express_common::config::parse_duration_string;
 
         // Test string parsing
         let json = r#"{"enabled": true, "policy": {"type": "lru", "unused_threshold": "7d"}, "check_interval": "2h"}"#;

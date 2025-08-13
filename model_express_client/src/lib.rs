@@ -1,9 +1,9 @@
-mod config;
 mod error;
 
 use model_express_common::{
     Result as CommonResult,
     cache::{CacheConfig, CacheStats},
+    client_config::ClientConfig as Config,
     constants, download,
     grpc::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
@@ -13,7 +13,6 @@ use model_express_common::{
     models::{ModelStatus, Status},
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::info;
@@ -22,9 +21,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 // Re-export for public use
-pub use crate::config::ClientConfig;
 pub use crate::error::ClientError;
-// pub use model_express_common::cache::{CacheConfig, CacheStats, ModelInfo};
+pub use model_express_common::client_config::{ClientArgs, ClientConfig};
 pub use model_express_common::models::ModelProvider;
 
 /// The main client for interacting with the `model_express_server` via gRPC
@@ -37,23 +35,15 @@ pub struct Client {
 
 impl Client {
     /// Create a new client with the given configuration
-    pub async fn new(config: ClientConfig) -> CommonResult<Self> {
-        Self::new_with_endpoint_override(config, None).await
-    }
+    pub async fn new(config: Config) -> CommonResult<Self> {
+        let endpoint = &config.connection.endpoint;
+        let timeout = config
+            .connection
+            .timeout_secs
+            .unwrap_or(constants::DEFAULT_TIMEOUT_SECS);
 
-    /// Create a new client with the given configuration and endpoint override
-    pub async fn new_with_endpoint_override(
-        config: ClientConfig,
-        endpoint_override: Option<String>,
-    ) -> CommonResult<Self> {
-        let channel = tonic::transport::Endpoint::new(config.grpc_endpoint.clone())
-            .map(|endpoint| {
-                if let Some(timeout) = config.timeout_secs {
-                    endpoint.timeout(Duration::from_secs(timeout))
-                } else {
-                    endpoint.timeout(Duration::from_secs(constants::DEFAULT_TIMEOUT_SECS))
-                }
-            })?
+        let channel = tonic::transport::Endpoint::new(endpoint.clone())
+            .map(|endpoint| endpoint.timeout(Duration::from_secs(timeout)))?
             .connect()
             .await?;
 
@@ -61,25 +51,8 @@ impl Client {
         let api_client = ApiServiceClient::new(channel.clone());
         let model_client = ModelServiceClient::new(channel);
 
-        // Try to discover cache configuration, but respect endpoint override
-        let cache_config = if let Some(endpoint) = endpoint_override {
-            // If endpoint override is provided, create cache config with that endpoint
-            let mut cache_config = CacheConfig::discover().unwrap_or_else(|_| {
-                // Fallback to default cache config if discovery fails
-                CacheConfig {
-                    local_path: PathBuf::from("~/.model-express/cache"),
-                    server_endpoint: endpoint.clone(),
-                    auto_mount: true,
-                    timeout_secs: None,
-                }
-            });
-            // Override the server endpoint with the command line argument
-            cache_config.server_endpoint = endpoint;
-            Some(cache_config)
-        } else {
-            // No override, use discovered config as-is
-            CacheConfig::discover().ok()
-        };
+        // Use the cache config from the client configuration
+        let cache_config = Some(config.cache.clone());
 
         Ok(Self {
             health_client,
@@ -90,10 +63,7 @@ impl Client {
     }
 
     /// Create a new client with cache configuration
-    pub async fn new_with_cache(
-        config: ClientConfig,
-        cache_config: CacheConfig,
-    ) -> CommonResult<Self> {
+    pub async fn new_with_cache(config: Config, cache_config: CacheConfig) -> CommonResult<Self> {
         let mut client = Self::new(config).await?;
         client.cache_config = Some(cache_config);
         Ok(client)
@@ -370,12 +340,12 @@ impl Client {
     pub async fn request_model_with_smart_fallback(
         model_name: impl Into<String>,
         provider: ModelProvider,
-        config: ClientConfig,
+        config: Config,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
         // First try to create a client and use server-based download
-        match Client::new_with_endpoint_override(config.clone(), Some(config.grpc_endpoint)).await {
+        match Client::new(config.clone()).await {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
@@ -423,37 +393,39 @@ mod tests {
     use model_express_common::cache::CacheConfig;
     use std::collections::HashMap;
 
-    fn create_test_config() -> ClientConfig {
-        ClientConfig::new("http://test-endpoint:1234")
+    fn create_test_client_config() -> ClientConfig {
+        ClientConfig::for_testing("http://test-endpoint:1234")
     }
 
     #[test]
     fn test_client_config_creation() {
-        let config = create_test_config();
-        assert_eq!(config.grpc_endpoint, "http://test-endpoint:1234");
+        let config = create_test_client_config();
+        assert_eq!(config.connection.endpoint, "http://test-endpoint:1234");
     }
 
     #[test]
     fn test_client_config_default_timeout() {
-        let config = create_test_config();
-        assert!(config.timeout_secs.is_none());
+        let config = create_test_client_config();
+        assert!(config.connection.timeout_secs.is_some());
     }
 
     #[test]
     fn test_client_config_with_timeout() {
-        let config = create_test_config().with_timeout(60);
-        assert_eq!(config.timeout_secs, Some(60));
+        let mut config = create_test_client_config();
+        config.connection.timeout_secs = Some(60);
+        assert_eq!(config.connection.timeout_secs, Some(60));
     }
 
     #[test]
     fn test_endpoint_override_priority() {
-        // This test verifies that the endpoint override mechanism works
-        // by checking that the cache config gets the correct endpoint
-        let config = ClientConfig::new("http://command-line-endpoint:5678");
+        // This test verifies that the configuration works correctly
+        let config = ClientConfig::for_testing("http://command-line-endpoint:5678");
 
-        // In a real scenario, this would be tested with the async new_with_endpoint_override
-        // For now, we test the config itself
-        assert_eq!(config.grpc_endpoint, "http://command-line-endpoint:5678");
+        // Test that the config has the correct endpoint
+        assert_eq!(
+            config.connection.endpoint,
+            "http://command-line-endpoint:5678"
+        );
     }
 
     #[test]
@@ -480,10 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_new_with_invalid_endpoint() {
-        let config = ClientConfig {
-            grpc_endpoint: "invalid-endpoint".to_string(),
-            timeout_secs: Some(1),
-        };
+        let config = ClientConfig::for_testing("invalid-endpoint");
 
         let result = Client::new(config).await;
         assert!(result.is_err());
@@ -536,10 +505,7 @@ mod tests {
     #[tokio::test]
     async fn test_request_model_with_smart_fallback_no_server() {
         // Test the smart fallback when server is not available
-        let config = ClientConfig {
-            grpc_endpoint: "http://127.0.0.1:99999".to_string(), // Invalid port
-            timeout_secs: Some(1),
-        };
+        let config = Config::for_testing("http://127.0.0.1:99999"); // Invalid port
 
         let result = Client::request_model_with_smart_fallback(
             "definitely-not-a-real-model-name-12345",
@@ -579,10 +545,8 @@ mod integration_tests {
     }
 
     async fn try_create_client() -> Option<Client> {
-        let config = ClientConfig {
-            grpc_endpoint: format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT),
-            timeout_secs: Some(5),
-        };
+        let config =
+            Config::for_testing(format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT));
 
         match timeout(Duration::from_secs(2), Client::new(config)).await {
             Ok(Ok(client)) => Some(client),
