@@ -1,4 +1,4 @@
-name: Trigger GitLab CI for ModelExpress
+name: Trigger CI for modelexpress
 
 on:
   push:
