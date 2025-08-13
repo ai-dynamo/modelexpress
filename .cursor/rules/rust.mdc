@@ -9,7 +9,7 @@ alwaysApply: true
 
 - In this repository, the use of `unwrap` in Rust code is **strictly forbidden** except in benchmarks. Using expect is allowed in tests. Always handle errors using proper error handling patterns such as `match`, `?`, or custom error types.
 - All pull requests will be reviewed for accidental use of `unwrap`, and shouldn't pass clippy checks. Trying to circumvent these rules except in benchmark code will result in immediate rejection of the pull request.
-- All cargo dependencies should be in the root `cargo.toml` file, and any dependency for the sub crates should be workspace exclusively.
+- All cargo dependencies should be in the root `Cargo.toml` file, and any dependency for the sub crates should be workspace exclusively.
 
 # General Guidelines
 
