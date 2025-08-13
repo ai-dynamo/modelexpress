@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod cache;
 pub mod download;
 pub mod models;
+pub mod providers;
 
 // Generated gRPC code
 #[allow(clippy::similar_names)]
@@ -66,9 +67,9 @@ pub type Result<T> = std::result::Result<T, Box<Error>>;
 
 /// Constants shared between client and server
 pub mod constants {
-    pub const DEFAULT_PORT: u16 = 8000;
-    pub const DEFAULT_GRPC_PORT: u16 = 8001;
-    pub const API_VERSION: &str = "v1";
+    use std::num::NonZeroU16;
+
+    pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 }
 
@@ -268,9 +269,7 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert_eq!(constants::DEFAULT_PORT, 8000);
-        assert_eq!(constants::DEFAULT_GRPC_PORT, 8001);
-        assert_eq!(constants::API_VERSION, "v1");
+        assert_eq!(constants::DEFAULT_GRPC_PORT.get(), 8001);
         assert_eq!(constants::DEFAULT_TIMEOUT_SECS, 30);
     }
 
