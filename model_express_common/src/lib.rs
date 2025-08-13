@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod cache;
+pub mod client_config;
+pub mod config;
 pub mod download;
 pub mod models;
 pub mod providers;
