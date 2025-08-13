@@ -1,0 +1,241 @@
+use crate::providers::ModelProviderTrait;
+use anyhow::{Context, Result};
+use hf_hub::api::tokio::ApiBuilder;
+use std::env;
+use std::path::{Path, PathBuf};
+use tracing::info;
+
+const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
+const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
+
+/// Get the cache directory for Hugging Face models
+/// Priority order:
+/// 1. Provided cache_dir parameter
+/// 2. HF_HUB_CACHE environment variable
+/// 3. Default location (~/.cache/huggingface/hub)
+fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
+    // Use provided cache directory if available
+    if let Some(dir) = cache_dir {
+        return dir;
+    }
+
+    // Try environment variable
+    if let Ok(cache_path) = env::var(HF_HUB_CACHE_ENV_VAR) {
+        return PathBuf::from(cache_path);
+    }
+
+    // Fall back to default location
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+
+    PathBuf::from(home).join(".cache/huggingface/hub")
+}
+
+/// Hugging Face model provider implementation
+pub struct HuggingFaceProvider;
+
+#[async_trait::async_trait]
+impl ModelProviderTrait for HuggingFaceProvider {
+    /// Attempt to download a model from Hugging Face
+    /// Returns the directory it is in
+    async fn download_model(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        info!("Downloading model from Hugging Face: {model_name}");
+        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+
+        // Get cache directory and ensure it exists
+        let cache_dir = get_cache_dir(cache_dir);
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
+        })?;
+
+        info!("Using cache directory: {:?}", cache_dir);
+
+        let api = ApiBuilder::new()
+            .with_progress(true)
+            .with_token(token)
+            .with_cache_dir(cache_dir)
+            .build()?;
+        let model_name = model_name.to_string();
+
+        let repo = api.model(model_name.clone());
+
+        let info = repo.info().await.map_err(|e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"))?;
+        info!("Got model info: {info:?}");
+
+        if info.siblings.is_empty() {
+            anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
+        }
+
+        let mut p = PathBuf::new();
+        let mut files_downloaded = false;
+
+        for sib in info.siblings {
+            if HuggingFaceProvider::is_ignored(&sib.rfilename)
+                || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
+            {
+                continue;
+            }
+
+            match repo.get(&sib.rfilename).await {
+                Ok(path) => {
+                    p = path;
+                    files_downloaded = true;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to download file '{sib}' from model '{model_name}': {e}",
+                        sib = sib.rfilename,
+                        model_name = model_name,
+                        e = e
+                    ));
+                }
+            }
+        }
+
+        if !files_downloaded {
+            return Err(anyhow::anyhow!(
+                "No valid files found for model '{}'.",
+                model_name
+            ));
+        }
+
+        info!("Downloaded model files for {model_name}");
+
+        match p.parent() {
+            Some(p) => Ok(p.to_path_buf()),
+            None => Err(anyhow::anyhow!("Invalid HF cache path: {}", p.display())),
+        }
+    }
+
+    /// Attempt to delete a model from Hugging Face cache
+    /// Returns Ok(()) if the model was successfully deleted or didn't exist
+    async fn delete_model(&self, model_name: &str) -> Result<()> {
+        info!("Deleting model from Hugging Face cache: {model_name}");
+        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let api = ApiBuilder::new()
+            .with_token(token)
+            .build()
+            .context("Failed to create Hugging Face API client")?;
+        let model_name = model_name.to_string();
+
+        let repo = api.model(model_name.clone());
+
+        let info = match repo.info().await {
+            Ok(info) => info,
+            Err(_) => {
+                // If we can't get model info, assume it doesn't exist or is already deleted
+                info!("Model '{model_name}' not found or already deleted");
+                return Ok(());
+            }
+        };
+
+        if info.siblings.is_empty() {
+            info!("Model '{model_name}' has no files to delete");
+            return Ok(());
+        }
+
+        let mut files_deleted: u32 = 0;
+        let mut deletion_errors = Vec::new();
+
+        for sib in &info.siblings {
+            if HuggingFaceProvider::is_ignored(&sib.rfilename)
+                || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
+            {
+                continue;
+            }
+
+            // Try to get the file path from cache first
+            if let Ok(cached_path) = repo.get(&sib.rfilename).await {
+                // Delete the cached file
+                match std::fs::remove_file(&cached_path) {
+                    Ok(_) => {
+                        files_deleted = files_deleted.saturating_add(1);
+                        info!("Deleted cached file: {}", cached_path.display());
+                    }
+                    Err(e) => {
+                        let error_msg =
+                            format!("Failed to delete cached file '{}'", cached_path.display());
+                        deletion_errors.push(anyhow::anyhow!(e).context(error_msg));
+                    }
+                }
+            }
+        }
+
+        // Try to remove the empty model directory if all files were deleted
+        if files_deleted > 0 && deletion_errors.is_empty() {
+            // Get any file path to find the model directory
+            for sib in &info.siblings {
+                if let Ok(cached_path) = repo.get(&sib.rfilename).await
+                    && let Some(model_dir) = cached_path.parent()
+                    && let Ok(mut entries) = std::fs::read_dir(model_dir)
+                    && entries.next().is_none()
+                {
+                    if let Err(e) = std::fs::remove_dir(model_dir) {
+                        info!("Could not remove empty model directory: {e}");
+                    } else {
+                        info!("Removed empty model directory: {}", model_dir.display());
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !deletion_errors.is_empty() {
+            let mut compound_error =
+                anyhow::anyhow!("Failed to delete some files for model '{model_name}'");
+
+            for (i, error) in deletion_errors.into_iter().enumerate() {
+                compound_error =
+                    compound_error.context(format!("Error {}: {:#}", i.saturating_add(1), error));
+            }
+
+            return Err(compound_error);
+        }
+
+        if files_deleted == 0 {
+            info!("No cached files found to delete for model '{model_name}'");
+        } else {
+            info!("Successfully deleted {files_deleted} cached files for model '{model_name}'");
+        }
+
+        Ok(())
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "Hugging Face"
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hugging_face_provider_name() {
+        let provider = HuggingFaceProvider;
+        assert_eq!(provider.provider_name(), "Hugging Face");
+    }
+
+    #[test]
+    fn test_provider_trait_object() {
+        let provider: Box<dyn ModelProviderTrait> = Box::new(HuggingFaceProvider);
+        assert_eq!(provider.provider_name(), "Hugging Face");
+    }
+
+    #[tokio::test]
+    async fn test_delete_model_trait() {
+        let provider = HuggingFaceProvider;
+        // Test that the delete method exists and can be called
+        // Note: This won't actually delete anything since we're not providing a real model
+        // but it tests the trait implementation
+        let result = provider.delete_model("nonexistent/model").await;
+        // Should succeed (return Ok(())) even if model doesn't exist
+        assert!(result.is_ok());
+    }
+}
