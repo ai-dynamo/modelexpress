@@ -36,6 +36,7 @@ RUN apt-get update \
     redis-tools \
     ripgrep \
     sudo \
+    tofrodos \
     tree \
     unzip \
     wget \
