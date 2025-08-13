@@ -369,11 +369,23 @@ impl ServerConfig {
         }
 
         // Add environment variables (with MODEL_EXPRESS_ prefix)
+        // Enable debug logging for environment variable parsing
+        if std::env::var("RUST_LOG")
+            .unwrap_or_default()
+            .contains("debug")
+        {
+            eprintln!("Debug: Parsing environment variables with MODEL_EXPRESS_ prefix...");
+            for (key, value) in std::env::vars() {
+                if key.starts_with("MODEL_EXPRESS_") {
+                    eprintln!("  Found env var: {key}={value}");
+                }
+            }
+        }
+
         builder = builder.add_source(
             Environment::with_prefix("MODEL_EXPRESS")
                 .try_parsing(true)
-                .separator("_")
-                .list_separator(","),
+                .separator("_"),
         );
 
         // Build the config and merge with defaults
@@ -383,7 +395,37 @@ impl ServerConfig {
                 // Clone the config before trying to deserialize since try_deserialize consumes it
                 match c.clone().try_deserialize::<ServerConfig>() {
                     Ok(full_config) => full_config,
-                    Err(_) => {
+                    Err(deserialize_err) => {
+                        // Provide detailed error information about what went wrong
+                        eprintln!(
+                            "Warning: Configuration deserialization failed with error: {deserialize_err}"
+                        );
+
+                        // Check for common issues and provide better guidance
+                        if deserialize_err.to_string().contains("missing field") {
+                            eprintln!(
+                                "  This is likely due to incomplete environment configuration."
+                            );
+                            eprintln!(
+                                "  The configuration system expects all fields to be present or uses defaults."
+                            );
+                            eprintln!(
+                                "  Falling back to default configuration with manual value extraction..."
+                            );
+                        } else if deserialize_err.to_string().contains("sequence") {
+                            eprintln!(
+                                "  This was likely caused by the previous list separator configuration."
+                            );
+                            eprintln!(
+                                "  This should be fixed now, but if you still see this error,"
+                            );
+                            eprintln!("  please check your environment variable values.");
+                        } else {
+                            eprintln!(
+                                "  Unexpected deserialization error. Falling back to manual configuration."
+                            );
+                        }
+
                         // Start with default and manually merge what we can
                         let mut default_config = ServerConfig::default();
 
@@ -416,8 +458,14 @@ impl ServerConfig {
                     }
                 }
             }
-            Err(_) => {
-                // If building the config fails entirely, just use defaults
+            Err(build_err) => {
+                // If building the config fails entirely, show the error and use defaults
+                eprintln!("Error: Configuration building failed: {build_err}");
+                eprintln!("  This could be due to:");
+                eprintln!("  - Invalid environment variable values");
+                eprintln!("  - Malformed configuration file");
+                eprintln!("  - Environment variables with unexpected types");
+                eprintln!("  Falling back to default configuration...");
                 ServerConfig::default()
             }
         };
