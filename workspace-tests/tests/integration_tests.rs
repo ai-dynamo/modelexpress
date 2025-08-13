@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 use model_express_client::{Client, ClientConfig};
 use model_express_common::{constants, models::ModelProvider};
@@ -13,10 +13,8 @@ async fn test_integration_full_workflow() {
     let _ = tracing_subscriber::fmt::try_init();
 
     // This test requires the server to be running
-    let config = ClientConfig {
-        grpc_endpoint: format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT),
-        timeout_secs: Some(30),
-    };
+    let config =
+        ClientConfig::for_testing(format!("http://127.0.0.1:{}", constants::DEFAULT_GRPC_PORT));
 
     // Try to connect to the server
     let mut client =
@@ -34,7 +32,7 @@ async fn test_integration_full_workflow() {
         "Health check failed: {health_result:?}"
     );
 
-    let status = health_result.unwrap();
+    let status = health_result.expect("Expected health check to succeed");
     assert!(!status.version.is_empty());
     assert_eq!(status.status, "ok");
 
@@ -42,7 +40,7 @@ async fn test_integration_full_workflow() {
     let ping_result: Result<serde_json::Value, _> = client.send_request("ping", None).await;
     assert!(ping_result.is_ok(), "Ping request failed: {ping_result:?}");
 
-    let ping_response = ping_result.unwrap();
+    let ping_response = ping_result.expect("Expected ping request to succeed");
     assert_eq!(ping_response["message"], "pong");
 
     // Test unknown action
@@ -53,10 +51,7 @@ async fn test_integration_full_workflow() {
 #[tokio::test]
 #[ignore = "Ignore by default since it may require network access"]
 async fn test_integration_model_download_fallback() {
-    let config = ClientConfig {
-        grpc_endpoint: "http://127.0.0.1:99999".to_string(), // Invalid port to force fallback
-        timeout_secs: Some(1),
-    };
+    let config = ClientConfig::for_testing("http://127.0.0.1:99999"); // Invalid port to force fallback
 
     // This should fallback to direct download since server is not available
     let result = Client::request_model_with_smart_fallback(
@@ -68,7 +63,7 @@ async fn test_integration_model_download_fallback() {
 
     // Should fail because model doesn't exist, but we should get a meaningful error
     assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
+    let error_msg = result.expect_err("Expected error result").to_string();
     assert!(error_msg.contains("Direct download failed") || error_msg.contains("Failed to fetch"));
 }
 
@@ -83,7 +78,7 @@ async fn test_integration_direct_download_invalid_model() {
 
     // Should fail with a meaningful error
     assert!(result.is_err());
-    let error_msg = result.unwrap_err().to_string();
+    let error_msg = result.expect_err("Expected error result").to_string();
     assert!(error_msg.contains("Direct download failed"));
 }
 
@@ -113,21 +108,23 @@ async fn test_integration_client_config_validation() {
     // Test various client configurations
 
     // Valid configuration
-    let valid_config = ClientConfig::new("http://localhost:8001").with_timeout(30);
-    assert_eq!(valid_config.grpc_endpoint, "http://localhost:8001");
-    assert_eq!(valid_config.timeout_secs, Some(30));
+    let valid_config = ClientConfig::for_testing("http://localhost:8001");
+    assert_eq!(valid_config.connection.endpoint, "http://localhost:8001");
+    assert!(valid_config.connection.timeout_secs.is_some());
 
-    // Default configuration
-    let default_config = ClientConfig::default();
-    assert!(default_config.grpc_endpoint.contains("localhost"));
+    // Default configuration (use for_testing with default endpoint)
+    let default_config =
+        ClientConfig::for_testing(format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT));
+    assert!(default_config.connection.endpoint.contains("localhost"));
     assert!(
         default_config
-            .grpc_endpoint
+            .connection
+            .endpoint
             .contains(&constants::DEFAULT_GRPC_PORT.to_string())
     );
 
     // Configuration with invalid endpoint should still create but fail on connection
-    let invalid_config = ClientConfig::new("invalid-url");
+    let invalid_config = ClientConfig::for_testing("invalid-url");
     let client_result = Client::new(invalid_config).await;
     assert!(client_result.is_err());
 }

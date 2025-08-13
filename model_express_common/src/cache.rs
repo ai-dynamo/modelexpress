@@ -3,9 +3,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Configuration for model cache management
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,16 +19,26 @@ pub struct CacheConfig {
     pub timeout_secs: Option<u64>,
 }
 
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            local_path: PathBuf::from("~/.model-express/cache"),
+            server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
+            auto_mount: true,
+            timeout_secs: None,
+        }
+    }
+}
+
 impl CacheConfig {
-    /// Discover cache configuration using the hybrid approach
+    /// Discover cache configuration
     pub fn discover() -> Result<Self> {
         // Priority order:
         // 1. Command line argument (--cache-path)
         // 2. Environment variable (MODEL_EXPRESS_CACHE_PATH)
         // 3. Config file (~/.model-express/config.yaml)
         // 4. Auto-detection (common paths)
-        // 5. Server query (if server is reachable)
-        // 6. User prompt (fallback)
+        // 5. Default fallback
 
         // Try command line args first
         if let Some(path) = Self::get_cache_path_from_args() {
@@ -51,13 +60,27 @@ impl CacheConfig {
             return Ok(config);
         }
 
-        // Try server query (non-blocking)
-        if let Ok(config) = Self::from_server() {
-            return Ok(config);
-        }
+        // Use default configuration as fallback
+        debug!("Using default cache configuration");
+        Ok(Self::default())
+    }
 
-        // Prompt user as fallback
-        Self::prompt_user()
+    /// Create a cache configuration with explicit parameters
+    pub fn new(
+        local_path: PathBuf,
+        server_endpoint: Option<String>,
+        auto_mount: Option<bool>,
+    ) -> Result<Self> {
+        // Ensure the directory exists
+        fs::create_dir_all(&local_path)
+            .with_context(|| format!("Failed to create cache directory: {local_path:?}"))?;
+
+        Ok(Self {
+            local_path,
+            server_endpoint: server_endpoint.unwrap_or_else(Self::get_default_server_endpoint),
+            auto_mount: auto_mount.unwrap_or(true),
+            timeout_secs: None,
+        })
     }
 
     /// Create config from a specific path
@@ -146,36 +169,6 @@ impl CacheConfig {
         Err(anyhow::anyhow!("Server not available for cache discovery"))
     }
 
-    /// Interactive user prompt for configuration
-    pub fn prompt_user() -> Result<Self> {
-        info!("ModelExpress Cache Configuration");
-        info!("================================");
-
-        // Get cache path
-        let cache_path = Self::prompt_cache_path()?;
-
-        // Get server endpoint
-        let server_endpoint = Self::prompt_server_endpoint()?;
-
-        // Get auto-mount preference
-        let auto_mount = Self::prompt_auto_mount()?;
-
-        let config = Self {
-            local_path: cache_path,
-            server_endpoint,
-            auto_mount,
-            timeout_secs: None,
-        };
-
-        // Save configuration
-        if Self::prompt_save_config()? {
-            config.save_to_config_file()?;
-            info!("Configuration saved to {:?}", Self::get_config_path()?);
-        }
-
-        Ok(config)
-    }
-
     /// Get cache path from command line arguments
     fn get_cache_path_from_args() -> Option<String> {
         let args: Vec<String> = env::args().collect();
@@ -220,88 +213,6 @@ impl CacheConfig {
         } else {
             Ok(path.to_path_buf())
         }
-    }
-
-    /// Prompt for cache path
-    fn prompt_cache_path() -> Result<PathBuf> {
-        loop {
-            print!("Enter your local cache mount path [~/.model-express/cache]: ");
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let input = input.trim();
-
-            let path = if input.is_empty() {
-                PathBuf::from("~/.model-express/cache")
-            } else {
-                PathBuf::from(input)
-            };
-
-            let expanded_path = Self::expand_path(&path)?;
-
-            // Create directory if it doesn't exist
-            if !expanded_path.exists() {
-                print!("Directory does not exist. Create it? [Y/n]: ");
-                io::stdout().flush()?;
-
-                let mut create_input = String::new();
-                io::stdin().read_line(&mut create_input)?;
-
-                if create_input.trim().to_lowercase() != "n" {
-                    fs::create_dir_all(&expanded_path).with_context(|| {
-                        format!("Failed to create directory: {expanded_path:?}")
-                    })?;
-                    return Ok(expanded_path);
-                }
-            } else if expanded_path.is_dir() {
-                return Ok(expanded_path);
-            } else {
-                error!("Path exists but is not a directory");
-                continue;
-            }
-        }
-    }
-
-    /// Prompt for server endpoint
-    fn prompt_server_endpoint() -> Result<String> {
-        print!(
-            "Enter your server endpoint [{}]: ",
-            Self::get_default_server_endpoint()
-        );
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
-        Ok(if input.is_empty() {
-            Self::get_default_server_endpoint()
-        } else {
-            input.to_string()
-        })
-    }
-
-    /// Prompt for auto-mount preference
-    fn prompt_auto_mount() -> Result<bool> {
-        print!("Auto-mount cache on startup? [Y/n]: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        Ok(input.trim().to_lowercase() != "n")
-    }
-
-    /// Prompt to save configuration
-    fn prompt_save_config() -> Result<bool> {
-        print!("Save this configuration? [Y/n]: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        Ok(input.trim().to_lowercase() != "n")
     }
 
     /// Get cache statistics
