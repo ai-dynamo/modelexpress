@@ -10,7 +10,7 @@ on:
 
 jobs:
   trigger:
-    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@main
+    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@pvijayakrish/add-centralized-workflows
     with:
       ref: ${{ github.ref_name }}
     secrets:
