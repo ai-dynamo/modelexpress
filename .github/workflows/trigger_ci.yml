@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   trigger:
-    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@pvijayakrish/add-centralized-workflows
+    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@main
     with:
       ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
     secrets:
