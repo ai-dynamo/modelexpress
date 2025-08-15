@@ -2,6 +2,9 @@
 name = "model_express_server"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "High-performance gRPC server for model serving and management"
+repository = "https://github.com/ai-dynamo/modelexpress"
 
 [dependencies]
 model_express_common = { path = "../model_express_common" }
