@@ -49,10 +49,8 @@ spec:
           cpu: "500m"
           memory: "256Mi"
       extraPodSpec:
-        nodeSelector:
-          kubernetes.io/hostname: nnoble-desktop
         mainContainer:
-          image: localhost:5000/model-express:latest
+          image: model-express:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: SERVER_PORT
@@ -150,10 +148,8 @@ spec:
           cpu: "1"
           memory: "2Gi"
       extraPodSpec:
-        nodeSelector:
-          kubernetes.io/hostname: nnoble-desktop
         mainContainer:
-          image: nvcr.io/nvidian/nim-llm-dev/vllm-runtime:hzhou-0729-2
+          image: nvcr.io/nvstaging/ai-dynamo/vllm-runtime:0.4.0
           workingDir: /workspace/components/backends/vllm
           command:
             - /bin/sh
@@ -203,8 +199,6 @@ spec:
         - name: MODEL_CACHE_PATH
           value: "/model/.model-express/cache"
       extraPodSpec:
-        nodeSelector:
-          kubernetes.io/hostname: nnoble-desktop
         mainContainer:
           startupProbe:
             httpGet:
@@ -212,7 +206,7 @@ spec:
               port: 9090
             periodSeconds: 10
             failureThreshold: 60
-          image: nvcr.io/nvidian/nim-llm-dev/vllm-runtime:hzhou-0729-2
+          image: nvcr.io/nvstaging/ai-dynamo/vllm-runtime:0.4.0
           workingDir: /workspace/components/backends/vllm
           command:
             - /bin/sh
