@@ -59,6 +59,10 @@ spec:
               value: "8002"
             - name: LOG_LEVEL
               value: "info"
+            - name: MODEL_NAME
+              value: "Qwen/Qwen3-0.6B"
+            - name: MODEL_CACHE_PATH
+              value: "/root/.model-express/cache"
           command:
             - /bin/sh
             - -c
@@ -70,9 +74,9 @@ spec:
               echo "Server started with PID: $SERVER_PID"
 
               echo "Setting up Model Express configuration..."
-              mkdir -p /root/.model-express/cache
+              mkdir -p $MODEL_CACHE_PATH
               cat > /root/.model-express/config.yaml << EOF
-              local_path: /root/.model-express/cache
+              local_path: $MODEL_CACHE_PATH
               server_endpoint: http://localhost:8002
               auto_mount: true
               timeout_secs: null
@@ -89,21 +93,26 @@ spec:
               done
 
               echo "Cleaning up any stale lock files..."
-              find /root/.model-express -name "*.lock" -type f -delete 2>/dev/null || true
+              find $MODEL_CACHE_PATH -name "*.lock" -type f -delete 2>/dev/null || true
 
-              echo "Downloading Qwen/Qwen3-0.6B model..."
-              ./model-express-cli --endpoint http://localhost:8002 --cache-path /root model download Qwen/Qwen3-0.6B
+              echo "Downloading $MODEL_NAME model..."
+              ./model-express-cli --endpoint http://localhost:8002 --cache-path /root model download $MODEL_NAME
 
               echo "Model download completed. Creating symlink for VLLM worker..."
+              # Convert model name to cache directory format (e.g., "Qwen/Qwen3-0.6B" -> "models--Qwen--Qwen3-0.6B")
+              MODEL_CACHE_DIR=$(echo $MODEL_NAME | sed 's/\//--/g')
+              MODEL_CACHE_DIR="models--$MODEL_CACHE_DIR"
+
               # Find the latest snapshot and create a symlink
-              SNAPSHOT_DIR=$(find /root/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots -maxdepth 1 -type d -name "*" -not -name "snapshots" | head -1)
+              SNAPSHOT_DIR=$(find $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots -maxdepth 1 -type d -name "*" -not -name "snapshots" | head -1)
               if [ -n "$SNAPSHOT_DIR" ]; then
-                cd /root/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots
+                cd $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots
                 ln -sf "$(basename $SNAPSHOT_DIR)" latest
                 echo "Created symlink: latest -> $(basename $SNAPSHOT_DIR)"
                 echo "Symlink target: $SNAPSHOT_DIR"
+                echo "Model cache directory: $MODEL_CACHE_DIR"
               else
-                echo "Warning: No snapshot directory found"
+                echo "Warning: No snapshot directory found for $MODEL_CACHE_DIR"
               fi
 
               echo "Server PID: $SERVER_PID"
@@ -189,6 +198,10 @@ spec:
           value: '["generate"]'
         - name: DYN_SYSTEM_PORT
           value: "9090"
+        - name: MODEL_NAME
+          value: "Qwen/Qwen3-0.6B"
+        - name: MODEL_CACHE_PATH
+          value: "/model/.model-express/cache"
       extraPodSpec:
         nodeSelector:
           kubernetes.io/hostname: nnoble-desktop
@@ -207,8 +220,12 @@ spec:
           args:
             - |
               echo "Waiting for model to be ready..."
+              # Convert model name to cache directory format (e.g., "Qwen/Qwen3-0.6B" -> "models--Qwen--Qwen3-0.6B")
+              MODEL_CACHE_DIR=$(echo $MODEL_NAME | sed 's/\//--/g')
+              MODEL_CACHE_DIR="models--$MODEL_CACHE_DIR"
+
               for i in {1..120}; do
-                if [ -L "/model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest" ] && [ -d "/model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest" ]; then
+                if [ -L "$MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest" ] && [ -d "$MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest" ]; then
                   echo "Model is ready! Starting VLLM worker..."
                   break
                 fi
@@ -216,9 +233,9 @@ spec:
                 sleep 5
               done
 
-              echo "Model path: /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest/"
-              ls -la /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/
-              python3 -m dynamo.vllm --model /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest/ | tee /tmp/vllm.log
+              echo "Model path: $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest/"
+              ls -la $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/
+              python3 -m dynamo.vllm --model $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest/ | tee /tmp/vllm.log
       pvc:
         name: model-cache-pvc
         mountPoint: /model
