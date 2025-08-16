@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::args::{CliModelProvider, DownloadStrategy, ModelCommands, OutputFormat};
 use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;

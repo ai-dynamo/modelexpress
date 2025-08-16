@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::providers::ModelProviderTrait;
 use anyhow::{Context, Result};
 use hf_hub::api::tokio::ApiBuilder;

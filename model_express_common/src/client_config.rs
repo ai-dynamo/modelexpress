@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::cache::CacheConfig;
 use crate::config::{ConnectionConfig, LogFormat, LogLevel, load_layered_config};
 use anyhow::Result;

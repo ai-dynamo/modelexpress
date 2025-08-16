@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use model_express_client::{Client, ClientConfig};
 use model_express_common::models::ModelProvider;
 use std::env;

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Repository Coding Standards
 
 - In this repository, the use of `unwrap` in Rust code is **strictly forbidden** except in benchmarks. Using expect is allowed in tests. Always handle errors using proper error handling patterns such as `match`, `?`, or custom error types.
