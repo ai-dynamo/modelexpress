@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Trigger CI for modelexpress
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*.*.*'
+  pull_request:
+    branches:
+      - main
+      - 'release/*.*.*'
+
+# Autocancel any previous check runs for the same pull request to avoid redundant workflows.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  trigger:
+    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@main
+    with:
+      ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+    secrets:
+      TOKEN: ${{ secrets.TOKEN }}
+      MIRROR_URL: ${{ secrets.MIRROR_URL }}
+      PIPELINE_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+      PIPELINE_URL: ${{ secrets.PIPELINE_URL }}
