@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::models::ModelProvider;
 use crate::providers::{HuggingFaceProvider, ModelProviderTrait};
 use anyhow::Result;

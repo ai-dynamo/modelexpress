@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Pre-commit configuration for ModelExpress
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use clap::{Parser, Subcommand, ValueEnum};
 use model_express_client::ModelProvider;
 use std::path::PathBuf;

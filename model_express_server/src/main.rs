@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use clap::Parser;
 use model_express_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,

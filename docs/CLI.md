@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # ModelExpress CLI
 
 A comprehensive command-line interface for interacting with ModelExpress server, providing easy access to model downloads, cache management, health checks, and API operations.

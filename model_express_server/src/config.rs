@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use clap::Parser;
 use config::ConfigError;
 use model_express_common::config::{LogFormat, LogLevel, load_layered_config};
