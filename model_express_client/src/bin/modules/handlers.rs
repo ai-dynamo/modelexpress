@@ -74,8 +74,7 @@ pub async fn handle_model_command(
         ModelCommands::Init {
             storage_path,
             server_endpoint,
-            auto_mount,
-        } => init_model_storage(storage_path, server_endpoint, auto_mount, format).await,
+        } => init_model_storage(storage_path, server_endpoint, format).await,
         ModelCommands::List { detailed } => {
             list_models(storage_path_override, detailed, format).await
         }
@@ -135,18 +134,6 @@ async fn download_model(
                 client.preload_model_to_cache(&model_name, provider).await
             } else {
                 Client::request_model_with_smart_fallback(model_name.clone(), provider, config)
-                    .await
-            }
-        }
-        DownloadStrategy::ServerFallback => {
-            debug!("Using server fallback strategy");
-            if let Some(cache_config) = cache_config {
-                let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
-                client.preload_model_to_cache(&model_name, provider).await
-            } else {
-                let mut client = Client::new(config.clone()).await?;
-                client
-                    .request_model_with_provider_and_fallback(&model_name, provider)
                     .await
             }
         }
@@ -260,7 +247,6 @@ pub async fn handle_api_send(
 async fn init_model_storage(
     storage_path: Option<PathBuf>,
     server_endpoint: Option<String>,
-    auto_mount: Option<bool>,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = if let Some(path) = storage_path {
@@ -275,9 +261,6 @@ async fn init_model_storage(
     if let Some(endpoint) = server_endpoint {
         config.server_endpoint = endpoint;
     }
-    if let Some(mount) = auto_mount {
-        config.auto_mount = mount;
-    }
 
     // Save configuration
     config.save_to_config_file()?;
@@ -289,14 +272,12 @@ async fn init_model_storage(
             println!("Configuration saved successfully!");
             println!("Storage path: {:?}", config.local_path);
             println!("Server endpoint: {}", config.server_endpoint);
-            println!("Auto-mount: {}", config.auto_mount);
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
                 "storage_path": config.local_path,
                 "server_endpoint": config.server_endpoint,
-                "auto_mount": config.auto_mount
             });
             print_output(&output, format);
         }
@@ -391,7 +372,6 @@ async fn show_model_status(
             println!("{}", "====================".green().bold());
             println!("Storage path: {:?}", storage_config.local_path);
             println!("Server endpoint: {}", storage_config.server_endpoint);
-            println!("Auto-mount: {}", storage_config.auto_mount);
             println!("Total models: {}", stats.total_models);
             println!("Total size: {}", stats.format_total_size());
 
@@ -413,7 +393,6 @@ async fn show_model_status(
             let output = serde_json::json!({
                 "storage_path": storage_config.local_path,
                 "server_endpoint": storage_config.server_endpoint,
-                "auto_mount": storage_config.auto_mount,
                 "total_models": stats.total_models,
                 "total_size": stats.format_total_size(),
                 "storage_accessible": storage_accessible,
