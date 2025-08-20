@@ -53,22 +53,22 @@ cleanup() {
 # Function to setup test environment
 setup_test_env() {
     print_status "Setting up test environment..."
-    
+
     # Create test cache directory
     mkdir -p "$TEST_CACHE_PATH"
-    
+
     # Set environment variables
     export MODEL_EXPRESS_CACHE_PATH="$TEST_CACHE_PATH"
     export MODEL_EXPRESS_SERVER_ENDPOINT="$SERVER_ENDPOINT"
     export RUST_LOG=info
-    
+
     print_success "Test environment setup completed"
 }
 
 # Function to test cache CLI
 test_cache_cli() {
     print_status "Testing Cache CLI functionality..."
-    
+
     # Test cache initialization
     print_status "Testing cache initialization..."
     cargo run --bin cache_cli init --cache-path "$TEST_CACHE_PATH" || {
@@ -76,7 +76,7 @@ test_cache_cli() {
         return 1
     }
     print_success "Cache initialization passed"
-    
+
     # Test cache status
     print_status "Testing cache status..."
     cargo run --bin cache_cli status || {
@@ -84,7 +84,7 @@ test_cache_cli() {
         return 1
     }
     print_success "Cache status check passed"
-    
+
     # Test cache list (should be empty initially)
     print_status "Testing cache list..."
     cargo run --bin cache_cli list || {
@@ -92,7 +92,7 @@ test_cache_cli() {
         return 1
     }
     print_success "Cache list passed"
-    
+
     # Test cache stats
     print_status "Testing cache statistics..."
     cargo run --bin cache_cli stats || {
@@ -100,7 +100,7 @@ test_cache_cli() {
         return 1
     }
     print_success "Cache stats passed"
-    
+
     # Test cache validation
     print_status "Testing cache validation..."
     cargo run --bin cache_cli validate || {
@@ -113,14 +113,14 @@ test_cache_cli() {
 # Function to test client with server
 test_client_with_server() {
     print_status "Testing client with server..."
-    
+
     # Check if server is running
     if ! check_server; then
         print_warning "Server not running, starting server..."
         cargo run --bin model_express_server > server.log 2>&1 &
         SERVER_PID=$!
         sleep 5
-        
+
         if ! check_server; then
             print_error "Failed to start server"
             return 1
@@ -129,7 +129,7 @@ test_client_with_server() {
     else
         print_success "Server is already running"
     fi
-    
+
     # Test basic client functionality
     print_status "Testing basic client functionality..."
     cargo run --bin test_client -- --test-model "$TEST_MODEL" || {
@@ -137,7 +137,7 @@ test_client_with_server() {
         return 1
     }
     print_success "Basic client test passed"
-    
+
     # Test cache CLI after model download
     print_status "Testing cache CLI after model download..."
     cargo run --bin cache_cli list || {
@@ -145,7 +145,7 @@ test_client_with_server() {
         return 1
     }
     print_success "Cache list after download passed"
-    
+
     # Test cache stats after model download
     print_status "Testing cache stats after model download..."
     cargo run --bin cache_cli stats --detailed || {
@@ -158,19 +158,19 @@ test_client_with_server() {
 # Function to test error handling
 test_error_handling() {
     print_status "Testing error handling..."
-    
+
     # Test with invalid server endpoint
     print_status "Testing with invalid server endpoint..."
     cargo run --bin cache_cli --server-endpoint "http://invalid:9999" status || {
         print_success "Correctly handled invalid server endpoint"
     }
-    
+
     # Test with non-existent cache path
     print_status "Testing with non-existent cache path..."
     cargo run --bin cache_cli --cache-path "/non/existent/path" list || {
         print_success "Correctly handled non-existent cache path"
     }
-    
+
     # Test cache clearing
     print_status "Testing cache clearing..."
     cargo run --bin cache_cli clear "non-existent-model" || {
@@ -181,7 +181,7 @@ test_error_handling() {
 # Function to test cache discovery methods
 test_cache_discovery() {
     print_status "Testing cache discovery methods..."
-    
+
     # Test command line argument discovery
     print_status "Testing command line argument discovery..."
     cargo run --bin cache_cli --cache-path "$TEST_CACHE_PATH" list || {
@@ -189,7 +189,7 @@ test_cache_discovery() {
         return 1
     }
     print_success "Command line argument discovery passed"
-    
+
     # Test environment variable discovery
     print_status "Testing environment variable discovery..."
     MODEL_EXPRESS_CACHE_PATH="$TEST_CACHE_PATH" cargo run --bin cache_cli list || {
@@ -197,17 +197,16 @@ test_cache_discovery() {
         return 1
     }
     print_success "Environment variable discovery passed"
-    
+
     # Test config file discovery
     print_status "Testing config file discovery..."
     mkdir -p ~/.model-express
     cat > ~/.model-express/config.yaml << EOF
 local_path: $TEST_CACHE_PATH
 server_endpoint: $SERVER_ENDPOINT
-auto_mount: true
 timeout_secs: 30
 EOF
-    
+
     cargo run --bin cache_cli list || {
         print_error "Config file discovery failed"
         return 1
@@ -218,14 +217,14 @@ EOF
 # Function to test unit tests
 test_unit_tests() {
     print_status "Running unit tests..."
-    
+
     # Test cache configuration
     cargo test --package model_express_client cache_config::tests || {
         print_error "Cache configuration unit tests failed"
         return 1
     }
     print_success "Cache configuration unit tests passed"
-    
+
     # Test client library
     cargo test --package model_express_client lib || {
         print_error "Client library unit tests failed"
@@ -237,7 +236,7 @@ test_unit_tests() {
 # Function to test integration tests
 test_integration_tests() {
     print_status "Running integration tests..."
-    
+
     # Test workspace integration tests
     cargo test --package workspace-tests || {
         print_warning "Integration tests failed (may require server)"
@@ -250,13 +249,13 @@ test_integration_tests() {
 main() {
     print_status "Starting ModelExpress Client Tests"
     print_status "=================================="
-    
+
     # Setup trap for cleanup
     trap cleanup EXIT
-    
+
     # Setup test environment
     setup_test_env
-    
+
     # Run tests
     test_unit_tests
     test_cache_discovery
@@ -264,7 +263,7 @@ main() {
     test_error_handling
     test_client_with_server
     test_integration_tests
-    
+
     print_success "All tests completed successfully!"
     print_status "Test Summary:"
     print_status "- Unit tests: ✓"
@@ -322,4 +321,4 @@ else
             exit 1
             ;;
     esac
-fi 
+fi
