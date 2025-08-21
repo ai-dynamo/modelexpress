@@ -57,12 +57,12 @@ impl ModelProviderTrait for HuggingFaceProvider {
         })?;
 
         info!("Using cache directory: {:?}", cache_dir);
-        /// High CPU download
-        ///
-        /// This may cause issues on regular desktops as it will saturate
-        /// CPUs by multiplexing the downloads.
-        /// However in data-center focused environments with model express
-        /// this may help saturate the bandwidth (>500MB/s) better.
+        // High CPU download
+        //
+        // This may cause issues on regular desktops as it will saturate
+        // CPUs by multiplexing the downloads.
+        // However in data-center focused environments with model express
+        // this may help saturate the bandwidth (>500MB/s) better.
         let api = ApiBuilder::new()
             .with_progress(true)
             .with_token(token)
