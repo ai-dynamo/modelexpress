@@ -149,10 +149,6 @@ impl ModelService for ModelServiceImpl {
                 if status == ModelStatus::DOWNLOADED {
                     return;
                 }
-                
-                // For ERROR status, we should retry the download
-                // For DOWNLOADING status, we should wait for completion
-                // In both cases, we continue to ensure_model_downloaded
             }
 
             // Start or monitor the download process
