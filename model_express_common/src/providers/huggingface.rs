@@ -179,17 +179,19 @@ impl ModelProviderTrait for HuggingFaceProvider {
         if files_deleted > 0 && deletion_errors.is_empty() {
             // Get any file path to find the model directory
             for sib in &info.siblings {
-                if let Ok(cached_path) = repo.get(&sib.rfilename).await
-                    && let Some(model_dir) = cached_path.parent()
-                    && let Ok(mut entries) = std::fs::read_dir(model_dir)
-                    && entries.next().is_none()
-                {
-                    if let Err(e) = std::fs::remove_dir(model_dir) {
-                        info!("Could not remove empty model directory: {e}");
-                    } else {
-                        info!("Removed empty model directory: {}", model_dir.display());
+                if let Ok(cached_path) = repo.get(&sib.rfilename).await {
+                    if let Some(model_dir) = cached_path.parent() {
+                        if let Ok(mut entries) = std::fs::read_dir(model_dir) {
+                            if entries.next().is_none() {
+                                if let Err(e) = std::fs::remove_dir(model_dir) {
+                                    info!("Could not remove empty model directory: {e}");
+                                } else {
+                                    info!("Removed empty model directory: {}", model_dir.display());
+                                }
+                                break;
+                            }
+                        }
                     }
-                    break;
                 }
             }
         }
