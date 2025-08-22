@@ -9,11 +9,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Dynamo Model Express
 
-A Rust-based gRPC service for efficient model management and serving, capable of downloading and serving machine learning models from multiple providers, including HuggingFace and other sources.
+Model Express is a Rust-based component meant to be placed next to existing model inference systems to speed up their startup times and improve overall performance.
 
 ## Project Overview
 
-ModelExpress is a high-performance model serving platform built with Rust and gRPC. It provides efficient model downloading, caching, and serving capabilities with a focus on performance and reliability.
+The current version of Model Express acts as a cache for HuggingFace, providing fast access to pre-trained models and reducing the need for repeated downloads across multiple servers. Future versions will expand support to additional model providers and include features like model versioning, advanced caching strategies, advanced networking using [NIXL](https://github.com/ai-dynamo/nixl), checkpoint storage, as well as a peer-to-peer model sharing system.
 
 ## Architecture
 
@@ -22,18 +22,31 @@ The project is organized as a Rust workspace with the following components:
 - **`model_express_server`**: The main gRPC server that provides model services
 - **`model_express_client`**: Client library for interacting with the server
 - **`model_express_common`**: Shared code and constants between client and server
-- **`workspace-tests`**: Integration tests and test utilities
+
+The current diagram represents a high-level overview of the Model Express architecture. It will evolve with time as we add new features and components.
+
+```mermaid
+architecture-beta
+    group MXS(cloud)[Model Express]
+
+    service db(database)[Database] in MXS
+    service disk(disk)[Persistent Volume Storage] in MXS
+    service server(server)[Server] in MXS
+
+    db:L -- R:server
+    disk:T -- B:server
+
+    group MXC(cloud)[Inference Server]
+
+    service client(server)[Client] in MXC
+    disk:T -- B:client
+```
+
+The client is either a library embedded in the inference server of your choice, or a CLI tool which can be used beforehand to hydrate the model cache.
 
 ### CLI Tool
 
-The client library includes a comprehensive command-line interface:
-
-- **`model-express-cli`**: A robust CLI tool for interacting with modelexpress server
-  - Health monitoring and server status checks
-  - Model downloads with multiple strategies (server, direct, fallback)
-  - API operations with JSON payload support
-  - Multiple output formats (human-readable, JSON, pretty JSON)
-  - Comprehensive error handling and logging
+The client library includes a command-line interface, meant to facilitate interaction with the Model Express server, and act as a HuggingFace CLI replacement. In the future, it will also abstract other model providers, making it a one-stop shop for interacting with various model APIs.
 
 See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
 
@@ -41,6 +54,7 @@ See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
 
 - **Rust**: Latest stable version (recommended: 1.88)
 - **Cargo**: Rust's package manager (included with Rust)
+- **protoc**: The Protocol Buffers compiler is expected to be installed and usable
 - **Docker** (optional): For containerized deployment
 
 ## Quick Start
@@ -165,15 +179,10 @@ cargo run --bin model_express_server -- --config my-config.yaml --validate-confi
 
 - `host`: Server host address (default: "0.0.0.0")
 - `port`: Server port (default: 8001)
-- `graceful_shutdown`: Enable graceful shutdown (default: true)
-- `shutdown_timeout_seconds`: Shutdown timeout (default: 30)
 
 #### Database Settings
 
-- `path`: SQLite database file path (default: "./models.db")
-- `wal_mode`: Enable WAL mode (default: true)
-- `pool_size`: Connection pool size (default: 10)
-- `connection_timeout_seconds`: Connection timeout (default: 30)
+- `path`: SQLite database file path (default: "./models.db"). Note that in the case of a multi node kubernetes deployment, the database should be shared among all nodes using a persistent volume.
 
 #### Cache Settings
 
@@ -335,7 +344,7 @@ For issues and questions:
 - Pre-compiled model weight transfer
 - Transfer of weights for LoRA / NeMo RL workloads
 - Support for LoRA / NeMo RL and related checkpoint files
-- Peer-to-peer communication support in the Model Express Client library 
+- Peer-to-peer communication support in the Model Express Client library
 - Peer-to-peer network status querying for optimal node startup decisions
 - Enhanced fault tolerance, allowing clients to operate independently from the server
 - Enhanced model caching
