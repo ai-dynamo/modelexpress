@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if we should validate config and exit
     if args.validate_config {
-        match ServerConfig::load(args) {
+        match ServerConfig::load_and_validate_strict(args) {
             Ok(config) => {
                 println!("Configuration is valid ✓");
                 config.print_config();
