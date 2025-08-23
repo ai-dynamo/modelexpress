@@ -129,7 +129,6 @@ model-express-cli model stats --detailed
 
 **Download Strategies:**
 - `smart-fallback`: Try server first, fallback to direct download (default)
-- `server-fallback`: Use server with fallback to direct download
 - `server-only`: Use server only (no fallback)
 - `direct`: Direct download only (bypass server)
 
@@ -269,7 +268,7 @@ fi
 # Check server health first
 if model-express-cli --quiet health; then
     echo "Server is healthy, downloading via server..."
-    model-express-cli model download "$MODEL_NAME" --strategy server-fallback
+    model-express-cli model download "$MODEL_NAME" --strategy smart-fallback
 else
     echo "Server unavailable, downloading directly..."
     model-express-cli model download "$MODEL_NAME" --strategy direct

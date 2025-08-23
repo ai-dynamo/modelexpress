@@ -76,7 +76,7 @@ _model_express_cli_completions() {
                         COMPREPLY=($(compgen -W "hugging-face" -- "$cur"))
                         ;;
                     --strategy|-s)
-                        COMPREPLY=($(compgen -W "smart-fallback server-fallback server-only direct" -- "$cur"))
+                        COMPREPLY=($(compgen -W "smart-fallback server-only direct" -- "$cur"))
                         ;;
                     download)
                         # Common model names for completion
