@@ -63,7 +63,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         // CPUs by multiplexing the downloads.
         // However in data-center focused environments with model express
         // this may help saturate the bandwidth (>500MB/s) better.
-        let api = ApiBuilder::new()
+        let api = ApiBuilder::from_env()
             .with_progress(true)
             .with_token(token)
             .high()
