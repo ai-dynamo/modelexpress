@@ -22,11 +22,11 @@ spec:
         image: model-express-server:latest
         imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: 8000
+        - containerPort: 8001
         env:
-        - name: SERVER_PORT
-          value: "8000"
-        - name: LOG_LEVEL
+        - name: MODEL_EXPRESS_SERVER_PORT
+          value: "8001"
+        - name: MODEL_EXPRESS_LOGGING_LEVEL
           value: "info"
         resources:
           limits:
@@ -40,12 +40,12 @@ spec:
           mountPath: /root
         livenessProbe:
           tcpSocket:
-            port: 8000
+            port: 8001
           initialDelaySeconds: 5
           periodSeconds: 10
         readinessProbe:
           tcpSocket:
-            port: 8000
+            port: 8001
           initialDelaySeconds: 5
           periodSeconds: 10
       volumes:
@@ -61,6 +61,6 @@ spec:
   selector:
     app: model-express-server
   ports:
-  - port: 8000
-    targetPort: 8000
+  - port: 8001
+    targetPort: 8001
   type: ClusterIP
