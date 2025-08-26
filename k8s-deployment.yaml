@@ -24,9 +24,9 @@ spec:
         ports:
         - containerPort: 8000
         env:
-        - name: SERVER_PORT
+        - name: MODEL_EXPRESS_SERVER_PORT
           value: "8000"
-        - name: LOG_LEVEL
+        - name: MODEL_EXPRESS_LOGGING_LEVEL
           value: "info"
         resources:
           limits:
