@@ -135,7 +135,9 @@ impl ModelService for ModelServiceImpl {
                     message: match status {
                         ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
                         ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
-                        ModelStatus::ERROR => Some("Previous download failed - retrying".to_string()),
+                        ModelStatus::ERROR => {
+                            Some("Previous download failed - retrying".to_string())
+                        }
                     },
                     provider: model_express_common::grpc::model::ModelProvider::from(provider)
                         as i32,
@@ -417,18 +419,23 @@ impl ModelDownloadTracker {
         } else if status == ModelStatus::ERROR {
             // If the model is in ERROR status, try to retry the download
             // First, reset the status to DOWNLOADING
-            if let Err(e) = self.database.set_status(model_name, provider, ModelStatus::DOWNLOADING, Some("Retrying download...".to_string())) {
+            if let Err(e) = self.database.set_status(
+                model_name,
+                provider,
+                ModelStatus::DOWNLOADING,
+                Some("Retrying download...".to_string()),
+            ) {
                 error!("Failed to reset status for retry: {}", e);
                 return ModelStatus::ERROR;
             }
-            
+
             // Add this channel to wait for updates
             self.add_waiting_channel(model_name, tx.clone());
-            
+
             // Start the download
             let tracker = self.clone();
             let model_name_owned = model_name.to_string();
-            
+
             tokio::spawn(async move {
                 let cache_dir = get_server_cache_dir();
                 match download::download_model(&model_name_owned, provider, cache_dir).await {
@@ -453,7 +460,7 @@ impl ModelDownloadTracker {
                     }
                 }
             });
-            
+
             // Wait for completion by monitoring the status
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

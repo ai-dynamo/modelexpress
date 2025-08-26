@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-express-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+    limits:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-express-server
+  labels:
+    app: model-express-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: model-express-server
+  template:
+    metadata:
+      labels:
+        app: model-express-server
+    spec:
+      # Add nodeSelector to schedule on the current node where image exists
+      nodeSelector:
+        kubernetes.io/hostname: nnoble-desktop
+      containers:
+      - name: model-express-server
+        image: localhost:5001/model-express:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8002
+        env:
+        - name: SERVER_PORT
+          value: "8002"
+        - name: LOG_LEVEL
+          value: "info"
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+          requests:
+            cpu: "200m"
+            memory: "128Mi"
+        volumeMounts:
+          - name: model-cache
+            mountPath: /root
+        livenessProbe:
+          tcpSocket:
+            port: 8002
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 8002
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-express-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-express-server
+spec:
+  selector:
+    app: model-express-server
+  ports:
+  - port: 8002
+    targetPort: 8002
+  type: ClusterIP
