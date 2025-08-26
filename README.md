@@ -322,7 +322,7 @@ For issues and questions:
 - Review the client library documentation
 
 
-## Dynamo 0.4.1 Release
+## ModelExpress 0.1.0 Release
 
 **Includes:**
 - Model Express being released as a CLI tool.
@@ -331,24 +331,3 @@ For issues and questions:
 - Basic model download and storage management.
 - Documentation for Kubernetes deployment and CLI usage.
 
----
-
-## Tentative Feature Roadmap:
-
-**Planned Features:**
-- Swap Dynamo’s model download client with ModelExpress for AWS S3 and other model storage support.
-- **Performance Goal:** Reduce latency from seconds to microseconds
-- Integration of **NIXL** through Run:ai Model Streamer to facilitate peer-to-peer transfer for model weights
-- Bypass kernel cache RAM in ModelExpress Cluster to reduce Kernel I/O costs
-- Highest-tier GPU-to-GPU weight transfer caching (potentially via a sidecar process)
-- Pre-compiled model weight transfer
-- Transfer of weights for LoRA / NeMo RL workloads
-- Support for LoRA / NeMo RL and related checkpoint files
-- Peer-to-peer communication support in the Model Express Client library
-- Peer-to-peer network status querying for optimal node startup decisions
-- Enhanced fault tolerance, allowing clients to operate independently from the server
-- Enhanced model caching
-- Performance optimizations
-- Model versioning support
-- Additional model format support
-- Web UI for model management
