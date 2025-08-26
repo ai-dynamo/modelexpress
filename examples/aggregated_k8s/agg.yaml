@@ -53,10 +53,14 @@ spec:
           image: model-express:latest
           imagePullPolicy: IfNotPresent
           env:
-            - name: SERVER_PORT
+            - name: MODEL_EXPRESS_SERVER_PORT
               value: "8002"
-            - name: LOG_LEVEL
+            - name: MODEL_EXPRESS_LOGGING_LEVEL
               value: "info"
+            - name: MODEL_EXPRESS_DATABASE_PATH
+              value: "/root/models.db"
+            - name: MODEL_EXPRESS_CACHE_DIRECTORY
+              value: "/root/.model-express/cache"
             - name: MODEL_NAME
               value: "Qwen/Qwen3-0.6B"
             - name: MODEL_CACHE_PATH
