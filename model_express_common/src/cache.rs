@@ -16,8 +16,6 @@ pub struct CacheConfig {
     pub local_path: PathBuf,
     /// Server endpoint for model downloads
     pub server_endpoint: String,
-    /// Whether to auto-mount cache on startup
-    pub auto_mount: bool,
     /// Timeout for cache operations
     pub timeout_secs: Option<u64>,
 }
@@ -27,7 +25,6 @@ impl Default for CacheConfig {
         Self {
             local_path: PathBuf::from("~/.model-express/cache"),
             server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
-            auto_mount: true,
             timeout_secs: None,
         }
     }
@@ -69,11 +66,7 @@ impl CacheConfig {
     }
 
     /// Create a cache configuration with explicit parameters
-    pub fn new(
-        local_path: PathBuf,
-        server_endpoint: Option<String>,
-        auto_mount: Option<bool>,
-    ) -> Result<Self> {
+    pub fn new(local_path: PathBuf, server_endpoint: Option<String>) -> Result<Self> {
         // Ensure the directory exists
         fs::create_dir_all(&local_path)
             .with_context(|| format!("Failed to create cache directory: {local_path:?}"))?;
@@ -81,7 +74,6 @@ impl CacheConfig {
         Ok(Self {
             local_path,
             server_endpoint: server_endpoint.unwrap_or_else(Self::get_default_server_endpoint),
-            auto_mount: auto_mount.unwrap_or(true),
             timeout_secs: None,
         })
     }
@@ -97,7 +89,6 @@ impl CacheConfig {
         Ok(Self {
             local_path,
             server_endpoint: Self::get_default_server_endpoint(),
-            auto_mount: true,
             timeout_secs: None,
         })
     }
@@ -154,7 +145,6 @@ impl CacheConfig {
                 return Ok(Self {
                     local_path: expanded_path,
                     server_endpoint: Self::get_default_server_endpoint(),
-                    auto_mount: true,
                     timeout_secs: None,
                 });
             }
@@ -357,7 +347,6 @@ mod tests {
             CacheConfig::from_path(temp_dir.path()).expect("Failed to create config from path");
 
         assert_eq!(config.local_path, temp_dir.path());
-        assert!(config.auto_mount);
     }
 
     #[test]
@@ -367,7 +356,6 @@ mod tests {
         let original_config = CacheConfig {
             local_path: temp_dir.path().join("cache"),
             server_endpoint: "http://localhost:8001".to_string(),
-            auto_mount: true,
             timeout_secs: Some(30),
         };
 
@@ -384,7 +372,6 @@ mod tests {
             loaded_config.server_endpoint,
             original_config.server_endpoint
         );
-        assert_eq!(loaded_config.auto_mount, original_config.auto_mount);
         assert_eq!(loaded_config.timeout_secs, original_config.timeout_secs);
     }
 
