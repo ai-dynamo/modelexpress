@@ -65,10 +65,6 @@ pub struct ServerSettings {
     pub host: String,
     /// Server port
     pub port: NonZeroU16,
-    /// Enable graceful shutdown
-    pub graceful_shutdown: bool,
-    /// Shutdown timeout in seconds
-    pub shutdown_timeout_seconds: u64,
 }
 
 /// Database configuration
@@ -76,12 +72,6 @@ pub struct ServerSettings {
 pub struct DatabaseSettings {
     /// Database file path
     pub path: PathBuf,
-    /// Enable WAL mode
-    pub wal_mode: bool,
-    /// Connection pool size
-    pub pool_size: u32,
-    /// Connection timeout in seconds
-    pub connection_timeout_seconds: u64,
 }
 
 /// Cache configuration wrapper
@@ -115,8 +105,6 @@ impl Default for ServerSettings {
         Self {
             host: "0.0.0.0".to_string(),
             port: model_express_common::constants::DEFAULT_GRPC_PORT,
-            graceful_shutdown: true,
-            shutdown_timeout_seconds: 30,
         }
     }
 }
@@ -125,9 +113,6 @@ impl Default for DatabaseSettings {
     fn default() -> Self {
         Self {
             path: PathBuf::from("./models.db"),
-            wal_mode: true,
-            pool_size: 10,
-            connection_timeout_seconds: 30,
         }
     }
 }
@@ -246,20 +231,9 @@ impl ServerConfig {
         info!("Server Configuration:");
         info!("  Host: {}", self.server.host);
         info!("  Port: {}", self.server.port);
-        info!("  Graceful Shutdown: {}", self.server.graceful_shutdown);
-        info!(
-            "  Shutdown Timeout: {}s",
-            self.server.shutdown_timeout_seconds
-        );
 
         info!("Database Configuration:");
         info!("  Path: {}", self.database.path.display());
-        info!("  WAL Mode: {}", self.database.wal_mode);
-        info!("  Pool Size: {}", self.database.pool_size);
-        info!(
-            "  Connection Timeout: {}s",
-            self.database.connection_timeout_seconds
-        );
 
         info!("Cache Configuration:");
         info!("  Directory: {}", self.cache.directory.display());
