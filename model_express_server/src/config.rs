@@ -21,23 +21,23 @@ pub struct ServerArgs {
     pub config: Option<PathBuf>,
 
     /// Server port
-    #[arg(short, long, env = "SERVER_PORT")]
+    #[arg(short, long, env = "MODEL_EXPRESS_SERVER_PORT")]
     pub port: Option<NonZeroU16>,
 
     /// Server host address
-    #[arg(long, env = "SERVER_HOST")]
+    #[arg(long, env = "MODEL_EXPRESS_SERVER_HOST")]
     pub host: Option<String>,
 
     /// Log level
-    #[arg(short, long, env = "LOG_LEVEL", value_enum)]
+    #[arg(short, long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
-    #[arg(long, env = "LOG_FORMAT", value_enum)]
+    #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
     pub log_format: Option<LogFormat>,
 
     /// Database file path
-    #[arg(short, long, env = "DATABASE_PATH")]
+    #[arg(short, long, env = "MODEL_EXPRESS_DATABASE_PATH")]
     pub database_path: Option<PathBuf>,
 
     /// Validate configuration and exit
