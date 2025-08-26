@@ -321,3 +321,7 @@ For issues and questions:
 - Database tracking of which models are stored on which nodes.
 - Basic model download and storage management.
 - Documentation for Kubernetes deployment and CLI usage.
+<<<<<<< HEAD
+=======
+
+>>>>>>> 28f0fbe (docs: Update README to reflect correct Model Express release numbering and removed roadmap (#57))
