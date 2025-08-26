@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check if we should validate config and exit
     if args.validate_config {
-        match ServerConfig::load(args) {
+        match ServerConfig::load_and_validate_strict(args) {
             Ok(config) => {
                 println!("Configuration is valid ✓");
                 config.print_config();
@@ -91,13 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_service = ModelServiceImpl;
 
     // Setup graceful shutdown handler
-    let shutdown_timeout = config.server.shutdown_timeout_seconds;
     let shutdown_signal = async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
             error!("Failed to install CTRL+C signal handler: {e}");
             return;
         }
-        info!("Received CTRL+C, shutting down gracefully... (timeout: {shutdown_timeout}s)",);
+        info!("Received CTRL+C, shutting down gracefully...");
 
         // Signal cache eviction service to shutdown
         if shutdown_tx.send(()).is_err() {

@@ -86,10 +86,6 @@ pub enum ModelCommands {
         /// Server endpoint
         #[arg(long, value_name = "ENDPOINT")]
         server_endpoint: Option<String>,
-
-        /// Auto-mount on startup
-        #[arg(long)]
-        auto_mount: Option<bool>,
     },
 
     /// List downloaded models
@@ -175,9 +171,6 @@ pub enum DownloadStrategy {
     /// Try server first, fallback to direct download if needed
     #[value(name = "smart-fallback")]
     SmartFallback,
-    /// Use server with fallback to direct download
-    #[value(name = "server-fallback")]
-    ServerFallback,
     /// Use server only (no fallback)
     #[value(name = "server-only")]
     ServerOnly,

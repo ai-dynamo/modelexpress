@@ -21,23 +21,23 @@ pub struct ServerArgs {
     pub config: Option<PathBuf>,
 
     /// Server port
-    #[arg(short, long, env = "SERVER_PORT")]
+    #[arg(short, long, env = "MODEL_EXPRESS_SERVER_PORT")]
     pub port: Option<NonZeroU16>,
 
     /// Server host address
-    #[arg(long, env = "SERVER_HOST")]
+    #[arg(long, env = "MODEL_EXPRESS_SERVER_HOST")]
     pub host: Option<String>,
 
     /// Log level
-    #[arg(short, long, env = "LOG_LEVEL", value_enum)]
+    #[arg(short, long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
-    #[arg(long, env = "LOG_FORMAT", value_enum)]
+    #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
     pub log_format: Option<LogFormat>,
 
     /// Database file path
-    #[arg(short, long, env = "DATABASE_PATH")]
+    #[arg(short, long, env = "MODEL_EXPRESS_DATABASE_PATH")]
     pub database_path: Option<PathBuf>,
 
     /// Validate configuration and exit
@@ -65,10 +65,6 @@ pub struct ServerSettings {
     pub host: String,
     /// Server port
     pub port: NonZeroU16,
-    /// Enable graceful shutdown
-    pub graceful_shutdown: bool,
-    /// Shutdown timeout in seconds
-    pub shutdown_timeout_seconds: u64,
 }
 
 /// Database configuration
@@ -76,12 +72,6 @@ pub struct ServerSettings {
 pub struct DatabaseSettings {
     /// Database file path
     pub path: PathBuf,
-    /// Enable WAL mode
-    pub wal_mode: bool,
-    /// Connection pool size
-    pub pool_size: u32,
-    /// Connection timeout in seconds
-    pub connection_timeout_seconds: u64,
 }
 
 /// Cache configuration wrapper
@@ -115,8 +105,6 @@ impl Default for ServerSettings {
         Self {
             host: "0.0.0.0".to_string(),
             port: model_express_common::constants::DEFAULT_GRPC_PORT,
-            graceful_shutdown: true,
-            shutdown_timeout_seconds: 30,
         }
     }
 }
@@ -125,9 +113,6 @@ impl Default for DatabaseSettings {
     fn default() -> Self {
         Self {
             path: PathBuf::from("./models.db"),
-            wal_mode: true,
-            pool_size: 10,
-            connection_timeout_seconds: 30,
         }
     }
 }
@@ -149,11 +134,33 @@ impl ServerConfig {
     /// 3. Configuration file
     /// 4. Default values (lowest priority)
     pub fn load(args: ServerArgs) -> Result<Self, ConfigError> {
-        // Use the common layered config loading
-        let mut config =
-            load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?;
+        Self::load_internal(args, false)
+    }
 
-        // Override with command line arguments
+    /// Load and validate configuration file strictly without fallbacks.
+    /// This method should be used when validating configuration files.
+    /// It will return an error if the file has invalid syntax or values.
+    pub fn load_and_validate_strict(args: ServerArgs) -> Result<Self, ConfigError> {
+        Self::load_internal(args, true)
+    }
+
+    /// Internal method to load configuration with optional strict mode
+    fn load_internal(args: ServerArgs, strict_mode: bool) -> Result<Self, ConfigError> {
+        let mut config = if strict_mode {
+            // Use strict loading - fail on any configuration errors
+            if let Some(ref config_file) = args.config {
+                // Load file strictly without fallbacks
+                model_express_common::config::validate_config_file(config_file)?
+            } else {
+                // No config file specified, use defaults
+                Self::default()
+            }
+        } else {
+            // Use layered config loading with fallbacks to defaults
+            load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?
+        };
+
+        // Apply command line overrides (same for both modes)
         if let Some(port) = args.port {
             config.server.port = port;
         }
@@ -174,7 +181,7 @@ impl ServerConfig {
             config.database.path = database_path;
         }
 
-        // Validate configuration
+        // Validate the final configuration
         config.validate()?;
 
         Ok(config)
@@ -224,20 +231,9 @@ impl ServerConfig {
         info!("Server Configuration:");
         info!("  Host: {}", self.server.host);
         info!("  Port: {}", self.server.port);
-        info!("  Graceful Shutdown: {}", self.server.graceful_shutdown);
-        info!(
-            "  Shutdown Timeout: {}s",
-            self.server.shutdown_timeout_seconds
-        );
 
         info!("Database Configuration:");
         info!("  Path: {}", self.database.path.display());
-        info!("  WAL Mode: {}", self.database.wal_mode);
-        info!("  Pool Size: {}", self.database.pool_size);
-        info!(
-            "  Connection Timeout: {}s",
-            self.database.connection_timeout_seconds
-        );
 
         info!("Cache Configuration:");
         info!("  Directory: {}", self.cache.directory.display());
@@ -262,6 +258,8 @@ mod tests {
     use chrono::Duration;
     use clap::Parser;
     use model_express_common::config::{DurationConfig, parse_duration_string};
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_log_level_enum_parsing() {
@@ -475,5 +473,179 @@ mod tests {
         let duration_config = DurationConfig::hours(1);
         let serialized = serde_json::to_string(&duration_config).expect("Failed to serialize");
         assert_eq!(serialized, r#"{"duration":3600}"#);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_server_config_load_and_validate_strict_valid_config() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("valid_server_config.yaml");
+
+        let valid_config = r#"
+server:
+  host: "127.0.0.1"
+  port: 8002
+  graceful_shutdown: true
+  shutdown_timeout_seconds: 60
+database:
+  path: "./test.db"
+  wal_mode: false
+  pool_size: 5
+  connection_timeout_seconds: 15
+cache:
+  eviction:
+    enabled: false
+    policy:
+      type: lru
+      unused_threshold: "3d"
+      max_models: 10
+      min_free_space_bytes: 1000000
+    check_interval: "30m"
+  directory: "./test_cache"
+  max_size_bytes: 5000000
+logging:
+  level: Debug
+  format: Json
+  file: null
+  structured: true
+"#;
+
+        fs::write(&config_file, valid_config).expect("Failed to write config file");
+
+        let args = ServerArgs {
+            config: Some(config_file),
+            port: None,
+            host: None,
+            log_level: None,
+            log_format: None,
+            database_path: None,
+            validate_config: false,
+        };
+
+        let result = ServerConfig::load_and_validate_strict(args);
+        assert!(result.is_ok());
+
+        let config = result.expect("Expected successful config parsing");
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port.get(), 8002);
+        assert_eq!(config.database.path, PathBuf::from("./test.db"));
+        assert!(!config.cache.eviction.enabled);
+        assert_eq!(config.logging.level, LogLevel::Debug);
+        assert_eq!(config.logging.format, LogFormat::Json);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_server_config_load_and_validate_strict_invalid_config() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("invalid_server_config.yaml");
+
+        let invalid_config = r#"
+server:
+  host: "127.0.0.1"
+  port: 8002
+database:
+  pat: "./test.db"  # Wrong field name (should be 'path')
+cache:
+  eviction:
+    enabled: "not_a_boolean"  # Invalid type
+"#;
+
+        fs::write(&config_file, invalid_config).expect("Failed to write config file");
+
+        let args = ServerArgs {
+            config: Some(config_file),
+            port: None,
+            host: None,
+            log_level: None,
+            log_format: None,
+            database_path: None,
+            validate_config: false,
+        };
+
+        let result = ServerConfig::load_and_validate_strict(args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_server_config_load_and_validate_strict_with_cli_overrides() {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let config_file = temp_dir.path().join("override_test_config.yaml");
+
+        let base_config = r#"
+server:
+  host: "127.0.0.1"
+  port: 8002
+  graceful_shutdown: true
+  shutdown_timeout_seconds: 30
+database:
+  path: "./test.db"
+  wal_mode: true
+  pool_size: 10
+  connection_timeout_seconds: 30
+cache:
+  eviction:
+    enabled: true
+    policy:
+      type: lru
+      unused_threshold: "1d"
+      max_models: null
+      min_free_space_bytes: null
+    check_interval: "1h"
+  directory: "./cache"
+  max_size_bytes: null
+logging:
+  level: Info
+  format: Pretty
+  file: null
+  structured: false
+"#;
+
+        fs::write(&config_file, base_config).expect("Failed to write config file");
+
+        let args = ServerArgs {
+            config: Some(config_file),
+            port: Some(NonZeroU16::new(9000).expect("9000 is non-zero")),
+            host: Some("0.0.0.0".to_string()),
+            log_level: Some(LogLevel::Error),
+            log_format: Some(LogFormat::Json),
+            database_path: Some(PathBuf::from("./override.db")),
+            validate_config: false,
+        };
+
+        let result = ServerConfig::load_and_validate_strict(args);
+        assert!(result.is_ok());
+
+        let config = result.expect("Expected successful config parsing");
+        // CLI overrides should be applied
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port.get(), 9000);
+        assert_eq!(config.database.path, PathBuf::from("./override.db"));
+        assert_eq!(config.logging.level, LogLevel::Error);
+        assert_eq!(config.logging.format, LogFormat::Json);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_server_config_load_and_validate_strict_no_config_file() {
+        let args = ServerArgs {
+            config: None,
+            port: Some(NonZeroU16::new(9001).expect("9001 is non-zero")),
+            host: Some("localhost".to_string()),
+            log_level: Some(LogLevel::Warn),
+            log_format: None,
+            database_path: None,
+            validate_config: false,
+        };
+
+        // When no config file is specified, it should fall back to normal loading
+        let result = ServerConfig::load_and_validate_strict(args);
+        assert!(result.is_ok());
+
+        let config = result.expect("Expected successful config parsing");
+        assert_eq!(config.server.host, "localhost");
+        assert_eq!(config.server.port.get(), 9001);
+        assert_eq!(config.logging.level, LogLevel::Warn);
     }
 }

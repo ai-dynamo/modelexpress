@@ -202,18 +202,6 @@ fn merge_server_config(
                             server.port = port;
                         }
                     }
-                    "graceful_shutdown" => {
-                        if let serde_yaml::Value::Bool(b) = val {
-                            server.graceful_shutdown = *b;
-                        }
-                    }
-                    "shutdown_timeout_seconds" => {
-                        if let serde_yaml::Value::Number(n) = val
-                            && let Some(timeout) = n.as_u64()
-                        {
-                            server.shutdown_timeout_seconds = timeout;
-                        }
-                    }
                     _ => {
                         eprintln!("Warning: Unknown configuration key '{key_str}', ignoring");
                     }
@@ -235,25 +223,6 @@ fn merge_database_config(
                     "path" => {
                         if let serde_yaml::Value::String(path) = val {
                             database.path = PathBuf::from(path);
-                        }
-                    }
-                    "wal_mode" => {
-                        if let serde_yaml::Value::Bool(b) = val {
-                            database.wal_mode = *b;
-                        }
-                    }
-                    "pool_size" => {
-                        if let serde_yaml::Value::Number(n) = val
-                            && let Some(size) = n.as_u64()
-                        {
-                            database.pool_size = size as u32;
-                        }
-                    }
-                    "connection_timeout_seconds" => {
-                        if let serde_yaml::Value::Number(n) = val
-                            && let Some(timeout) = n.as_u64()
-                        {
-                            database.connection_timeout_seconds = timeout;
                         }
                     }
                     _ => {

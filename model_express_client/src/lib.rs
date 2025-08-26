@@ -437,7 +437,6 @@ mod tests {
         let mut cache_config = CacheConfig {
             local_path: std::path::PathBuf::from("/test/path"),
             server_endpoint: "http://original-endpoint:1234".to_string(),
-            auto_mount: true,
             timeout_secs: None,
         };
 
