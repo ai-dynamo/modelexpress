@@ -10,9 +10,9 @@ description = "Tests for Model Express workspace"
 publish = false
 
 [dependencies]
-modelexpress-client = { path = "../model_express_client", version = "0.1.0" }
-modelexpress-common = { path = "../model_express_common", version = "0.1.0" }
-modelexpress-server = { path = "../model_express_server", version = "0.1.0" }
+modelexpress-client = { version = "0.1.0" , path = "../model_express_client" }
+modelexpress-common = { version = "0.1.0" , path = "../model_express_common" }
+modelexpress-server = { version = "0.1.0" , path = "../model_express_server" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

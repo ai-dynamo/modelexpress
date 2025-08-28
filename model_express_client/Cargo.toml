@@ -10,7 +10,7 @@ description = "Client library for Model Express gRPC server"
 repository = "https://github.com/ai-dynamo/modelexpress"
 
 [dependencies]
-modelexpress-common = { path = "../model_express_common" }
+modelexpress-common ={ version = "0.1.0", path = "../model_express_common" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
