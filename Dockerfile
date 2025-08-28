@@ -13,7 +13,7 @@ RUN apt-get update && \
 COPY . .
 
 # Build all available binaries
-RUN cargo build --release --bin modelexpress_server && \
+RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin model-express-cli && \
     cargo build --release --bin test_client && \
     cargo build --release --bin test_single_client && \
