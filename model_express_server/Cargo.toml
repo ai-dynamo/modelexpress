@@ -10,7 +10,7 @@ description = "High-performance gRPC server for model serving and management"
 repository = "https://github.com/ai-dynamo/modelexpress"
 
 [dependencies]
-modelexpress-common = "0.1.0"
+modelexpress-common = { path = "../model_express_common" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

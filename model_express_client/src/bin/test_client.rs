@@ -3,8 +3,8 @@
 
 #![allow(clippy::expect_used)]
 
-use model_express_client::{Client, ClientConfig};
-use model_express_common::models::ModelProvider;
+use modelexpress_client::{Client, ClientConfig};
+use modelexpress_common::models::ModelProvider;
 use std::env;
 use std::time::{Duration, Instant};
 use tracing::{error, info};

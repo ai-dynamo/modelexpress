@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use chrono::{DateTime, Utc};
-use modelexpress-common::models::{ModelProvider, ModelStatus};
+use modelexpress_common::models::{ModelProvider, ModelStatus};
 use rusqlite::{Connection, Result as SqliteResult, params};
 use std::sync::{Arc, Mutex};
 use tracing::info;

@@ -122,7 +122,7 @@ jobs:
 
     - name: Start server in background
       run: |
-        ./target/release/model_express_server &
+        ./target/release/modelexpress-server &
         echo $! > server.pid
         sleep 5  # Give server time to start
         if [ -f server.pid ]; then
@@ -284,12 +284,12 @@ jobs:
     - name: Build release binaries
       run: |
         cargo build --release
-        strip target/release/model_express_server
+        strip target/release/modelexpress-server
 
     - name: Create release archive
       run: |
         mkdir -p release
-        cp target/release/model_express_server release/
+        cp target/release/modelexpress-server release/
         cp target/release/test_client release/ || true
         cp target/release/fallback_test release/ || true
         cp README.md LICENSE release/ || true
