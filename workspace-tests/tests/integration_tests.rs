@@ -3,8 +3,8 @@
 
 #![allow(clippy::expect_used)]
 
-use model_express_client::{Client, ClientConfig};
-use model_express_common::{constants, models::ModelProvider};
+use modelexpress_client::{Client, ClientConfig};
+use modelexpress_common::{constants, models::ModelProvider};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};

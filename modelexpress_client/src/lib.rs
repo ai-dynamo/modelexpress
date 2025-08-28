@@ -3,7 +3,7 @@
 
 mod error;
 
-use model_express_common::{
+use modelexpress_common::{
     Result as CommonResult,
     cache::{CacheConfig, CacheStats},
     client_config::ClientConfig as Config,
@@ -25,10 +25,10 @@ use uuid::Uuid;
 
 // Re-export for public use
 pub use crate::error::ClientError;
-pub use model_express_common::client_config::{ClientArgs, ClientConfig};
-pub use model_express_common::models::ModelProvider;
+pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
+pub use modelexpress_common::models::ModelProvider;
 
-/// The main client for interacting with the `model_express_server` via gRPC
+/// The main client for interacting with the `modelexpress_server` via gRPC
 pub struct Client {
     health_client: HealthServiceClient<Channel>,
     api_client: ApiServiceClient<Channel>,
@@ -85,33 +85,33 @@ impl Client {
     /// List cached models
     pub fn list_cached_models(&self) -> CommonResult<CacheStats> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            model_express_common::Error::Server("Cache not configured".to_string())
+            modelexpress_common::Error::Server("Cache not configured".to_string())
         })?;
 
         cache_config.get_cache_stats().map_err(|e| {
-            model_express_common::Error::Server(format!("Failed to get cache stats: {e}")).into()
+            modelexpress_common::Error::Server(format!("Failed to get cache stats: {e}")).into()
         })
     }
 
     /// Clear specific model from cache
     pub fn clear_cached_model(&self, model_name: &str) -> CommonResult<()> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            model_express_common::Error::Server("Cache not configured".to_string())
+            modelexpress_common::Error::Server("Cache not configured".to_string())
         })?;
 
         cache_config.clear_model(model_name).map_err(|e| {
-            model_express_common::Error::Server(format!("Failed to clear model: {e}")).into()
+            modelexpress_common::Error::Server(format!("Failed to clear model: {e}")).into()
         })
     }
 
     /// Clear entire cache
     pub fn clear_all_cached_models(&self) -> CommonResult<()> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            model_express_common::Error::Server("Cache not configured".to_string())
+            modelexpress_common::Error::Server("Cache not configured".to_string())
         })?;
 
         cache_config.clear_all().map_err(|e| {
-            model_express_common::Error::Server(format!("Failed to clear cache: {e}")).into()
+            modelexpress_common::Error::Server(format!("Failed to clear cache: {e}")).into()
         })
     }
 
@@ -161,7 +161,7 @@ impl Client {
         let payload_bytes = if let Some(payload) = payload {
             Some(
                 serde_json::to_vec(&payload)
-                    .map_err(|e| model_express_common::Error::Serialization(e.to_string()))?,
+                    .map_err(|e| modelexpress_common::Error::Serialization(e.to_string()))?,
             )
         } else {
             None
@@ -177,7 +177,7 @@ impl Client {
         let api_response = response.into_inner();
 
         if !api_response.success {
-            return Err(model_express_common::Error::Server(
+            return Err(modelexpress_common::Error::Server(
                 api_response
                     .error
                     .unwrap_or_else(|| "Unknown server error".to_string()),
@@ -186,11 +186,11 @@ impl Client {
         }
 
         let data_bytes = api_response.data.ok_or_else(|| {
-            model_express_common::Error::Server("Server returned success but no data".to_string())
+            modelexpress_common::Error::Server("Server returned success but no data".to_string())
         })?;
 
         let data: T = serde_json::from_slice(&data_bytes)
-            .map_err(|e| model_express_common::Error::Serialization(e.to_string()))?;
+            .map_err(|e| modelexpress_common::Error::Serialization(e.to_string()))?;
 
         Ok(data)
     }
@@ -216,7 +216,7 @@ impl Client {
             }
             Err(e) => {
                 // Check if it's a connection error (server not available)
-                if let model_express_common::Error::Transport(_) = *e {
+                if let modelexpress_common::Error::Transport(_) = *e {
                     info!(
                         "Server unavailable, falling back to direct download for model: {}",
                         model_name
@@ -232,7 +232,7 @@ impl Client {
                             );
                             Ok(())
                         }
-                        Err(download_err) => Err(model_express_common::Error::Server(format!(
+                        Err(download_err) => Err(modelexpress_common::Error::Server(format!(
                             "Both server and direct download failed. Server error: {e}. Download error: {download_err}"
                         )).into()),
                     }
@@ -259,7 +259,7 @@ impl Client {
 
         let grpc_request = tonic::Request::new(ModelDownloadRequest {
             model_name: model_name.clone(),
-            provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
+            provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
         });
 
         let mut stream = self
@@ -271,8 +271,8 @@ impl Client {
         // Process streaming updates until the download is complete
         while let Some(update_result) = stream.message().await? {
             let status: ModelStatus =
-                model_express_common::grpc::model::ModelStatus::try_from(update_result.status)
-                    .unwrap_or(model_express_common::grpc::model::ModelStatus::Error)
+                modelexpress_common::grpc::model::ModelStatus::try_from(update_result.status)
+                    .unwrap_or(modelexpress_common::grpc::model::ModelStatus::Error)
                     .into();
 
             // Log progress messages if available
@@ -292,7 +292,7 @@ impl Client {
                     let error_message = update_result
                         .message
                         .unwrap_or_else(|| "Unknown error occurred".to_string());
-                    return Err(model_express_common::Error::Server(format!(
+                    return Err(modelexpress_common::Error::Server(format!(
                         "Model download failed: {error_message}"
                     ))
                     .into());
@@ -305,7 +305,7 @@ impl Client {
         }
 
         // If stream ended without DOWNLOADED status, treat as error
-        Err(model_express_common::Error::Server(
+        Err(modelexpress_common::Error::Server(
             "Model download stream ended unexpectedly".to_string(),
         )
         .into())
@@ -381,7 +381,7 @@ impl Client {
         download::download_model(&model_name, provider, cache_dir)
             .await
             .map_err(|e| {
-                model_express_common::Error::Server(format!("Direct download failed: {e}"))
+                modelexpress_common::Error::Server(format!("Direct download failed: {e}"))
             })?;
 
         info!("Model {} downloaded successfully", model_name);
@@ -393,7 +393,7 @@ impl Client {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use model_express_common::cache::CacheConfig;
+    use modelexpress_common::cache::CacheConfig;
     use std::collections::HashMap;
 
     fn create_test_client_config() -> ClientConfig {
@@ -534,7 +534,7 @@ mod tests {
 #[allow(clippy::expect_used)]
 mod integration_tests {
     use super::*;
-    use model_express_common::constants;
+    use modelexpress_common::constants;
     use std::time::Duration;
     use tokio::time::timeout;
 

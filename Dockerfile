@@ -13,7 +13,7 @@ RUN apt-get update && \
 COPY . .
 
 # Build all available binaries
-RUN cargo build --release --bin model_express_server && \
+RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin model-express-cli && \
     cargo build --release --bin test_client && \
     cargo build --release --bin test_single_client && \
@@ -30,7 +30,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy all built binaries
-COPY --from=builder /app/target/release/model_express_server .
+COPY --from=builder /app/target/release/modelexpress-server .
 COPY --from=builder /app/target/release/model-express-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/test_single_client .
@@ -46,4 +46,4 @@ ENV MODEL_EXPRESS_DATABASE_PATH=/app/models.db
 ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
 
 # Run the server by default
-CMD ["./model_express_server"]
+CMD ["./modelexpress-server"]
