@@ -13,7 +13,7 @@ pub enum ClientError {
     Timeout(String),
 
     #[error("Common error: {0}")]
-    Common(#[from] model_express_common::Error),
+    Common(#[from] modelexpress_common::Error),
 
     #[error("Invalid configuration: {0}")]
     Config(String),
@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn test_client_error_from_common_error() {
-        let common_error = model_express_common::Error::Network("Network issue".to_string());
+        let common_error = modelexpress_common::Error::Network("Network issue".to_string());
         let client_error: ClientError = common_error.into();
 
         match client_error {
@@ -63,7 +63,7 @@ mod tests {
             ClientError::ConnectionFailed("test".to_string()),
             ClientError::Timeout("test".to_string()),
             ClientError::Config("test".to_string()),
-            ClientError::Common(model_express_common::Error::Network("test".to_string())),
+            ClientError::Common(modelexpress_common::Error::Network("test".to_string())),
         ];
 
         for error in errors {
