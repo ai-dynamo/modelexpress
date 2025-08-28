@@ -46,4 +46,4 @@ ENV MODEL_EXPRESS_DATABASE_PATH=/app/models.db
 ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
 
 # Run the server by default
-CMD ["./model_express_server"]
+CMD ["./modelexpress-server"]

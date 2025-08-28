@@ -44,8 +44,8 @@ $ cargo build
 ```
 $ cargo run --bin modelexpress-server
 
-2025-08-01T22:22:50.568827Z  INFO model_express_server: Starting model_express_server with gRPC...
-2025-08-01T22:22:50.568850Z  INFO model_express_server: Listening on gRPC endpoint: 0.0.0.0:8001
+2025-08-01T22:22:50.568827Z  INFO modelexpress-server: Starting model_express_server with gRPC...
+2025-08-01T22:22:50.568850Z  INFO modelexpress-server: Listening on gRPC endpoint: 0.0.0.0:8001
 ```
 
 Open a seperate shell to use the CLI

@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Parser;
-use model_express_common::grpc::{
+use modelexpress-common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer,
 };
-use model_express_server::{
+use modelexpress-server::{
     cache::CacheEvictionService,
     config::{ServerArgs, ServerConfig},
     database::ModelDatabase,

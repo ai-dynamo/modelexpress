@@ -7,8 +7,8 @@ use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{debug, error, info, warn};
 
 use crate::database::{ModelDatabase, ModelRecord};
-use model_express_common::config::DurationConfig;
-use model_express_common::models::ModelStatus;
+use modelexpress-common::config::DurationConfig;
+use modelexpress-common::models::ModelStatus;
 
 /// Configuration for cache eviction policies
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,7 +441,7 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::database::ModelDatabase;
-    use model_express_common::models::ModelProvider;
+    use modelexpress-common::models::ModelProvider;
     use tempfile::TempDir;
 
     fn create_test_database() -> (ModelDatabase, TempDir) {
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_duration_config_parsing() {
-        use model_express_common::config::parse_duration_string;
+        use modelexpress-common::config::parse_duration_string;
 
         // Test string parsing
         let json = r#"{"enabled": true, "policy": {"type": "lru", "unused_threshold": "7d"}, "check_interval": "2h"}"#;

@@ -3,9 +3,10 @@
 
 [workspace]
 members = [
-    "modelexpress-server",
-    "modelexpress-client",
-    "modelexpress-common",
+    # Directory names remain for path, but crates are published as:
+    "model_express_server", # modelexpress-server
+    "model_express_client", # modelexpress-client
+    "model_express_common", # modelexpress-common
     "workspace-tests",
 ]
 resolver = "3"

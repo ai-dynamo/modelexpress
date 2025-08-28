@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Parser;
-use model_express_server::config::ServerConfig;
+use modelexpress-server::config::ServerConfig;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
@@ -181,7 +181,7 @@ fn merge_yaml_into_config(
 
 /// Helper functions to merge specific config sections
 fn merge_server_config(
-    server: &mut model_express_server::config::ServerSettings,
+    server: &mut modelexpress-server::config::ServerSettings,
     value: &serde_yaml::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let serde_yaml::Value::Mapping(map) = value {
@@ -213,7 +213,7 @@ fn merge_server_config(
 }
 
 fn merge_database_config(
-    database: &mut model_express_server::config::DatabaseSettings,
+    database: &mut modelexpress-server::config::DatabaseSettings,
     value: &serde_yaml::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let serde_yaml::Value::Mapping(map) = value {
@@ -236,7 +236,7 @@ fn merge_database_config(
 }
 
 fn merge_cache_config(
-    cache: &mut model_express_server::config::CacheConfig,
+    cache: &mut modelexpress-server::config::CacheConfig,
     value: &serde_yaml::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let serde_yaml::Value::Mapping(map) = value {
@@ -273,7 +273,7 @@ fn merge_cache_config(
 }
 
 fn merge_logging_config(
-    logging: &mut model_express_server::config::LoggingConfig,
+    logging: &mut modelexpress-server::config::LoggingConfig,
     value: &serde_yaml::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let serde_yaml::Value::Mapping(map) = value {

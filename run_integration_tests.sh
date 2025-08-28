@@ -67,7 +67,7 @@ build_project
 
 # Start the server in the background using the built binary
 echo "Starting modelexpress-server (gRPC) in the background..."
-"$TARGET_DIR/release/model_express_server" > server.log 2>&1 &
+"$TARGET_DIR/release/modelexpress-server" > server.log 2>&1 &
 SERVER_PID=$!
 
 # Give the server time to start
