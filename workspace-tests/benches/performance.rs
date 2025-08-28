@@ -8,8 +8,8 @@
 )]
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use modelexpress_server::database::ModelDatabase;
 use modelexpress_common::models::{ModelProvider, ModelStatus, Status};
+use modelexpress_server::database::ModelDatabase;
 use std::hint::black_box;
 use tempfile::TempDir;
 
