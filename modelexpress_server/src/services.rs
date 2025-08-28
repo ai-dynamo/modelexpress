@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::database::ModelDatabase;
-use model_express_common::{
+use modelexpress_common::{
     cache::CacheConfig,
     download,
     grpc::{
@@ -121,8 +121,8 @@ impl ModelService for ModelServiceImpl {
 
         // Convert gRPC provider to our enum
         let provider: ModelProvider =
-            model_express_common::grpc::model::ModelProvider::try_from(model_request.provider)
-                .unwrap_or(model_express_common::grpc::model::ModelProvider::HuggingFace)
+            modelexpress_common::grpc::model::ModelProvider::try_from(model_request.provider)
+                .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
                 .into();
 
         // Spawn a task to handle the streaming download updates
@@ -131,13 +131,13 @@ impl ModelService for ModelServiceImpl {
             if let Some(status) = MODEL_TRACKER.get_status(&model_name) {
                 let update = ModelStatusUpdate {
                     model_name: model_name.clone(),
-                    status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
+                    status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
                     message: match status {
                         ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
                         ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
                         ModelStatus::ERROR => Some("Previous download failed".to_string()),
                     },
-                    provider: model_express_common::grpc::model::ModelProvider::from(provider)
+                    provider: modelexpress_common::grpc::model::ModelProvider::from(provider)
                         as i32,
                 };
 
@@ -159,7 +159,7 @@ impl ModelService for ModelServiceImpl {
             // Send final status update
             let final_update = ModelStatusUpdate {
                 model_name: model_name.clone(),
-                status: model_express_common::grpc::model::ModelStatus::from(final_status) as i32,
+                status: modelexpress_common::grpc::model::ModelStatus::from(final_status) as i32,
                 message: match final_status {
                     ModelStatus::DOWNLOADED => {
                         Some("Model download completed successfully".to_string())
@@ -167,7 +167,7 @@ impl ModelService for ModelServiceImpl {
                     ModelStatus::ERROR => Some("Model download failed".to_string()),
                     ModelStatus::DOWNLOADING => Some("Download still in progress".to_string()),
                 },
-                provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
+                provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             };
 
             let _ = tx.send(Ok(final_update)).await;
@@ -260,9 +260,9 @@ impl ModelDownloadTracker {
         if let Some(channels) = waiting.get(&model_name) {
             let update = ModelStatusUpdate {
                 model_name: model_name.clone(),
-                status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
+                status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
                 message,
-                provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
+                provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             };
 
             for channel in channels {
@@ -328,10 +328,10 @@ impl ModelDownloadTracker {
                 // Send error and return
                 let error_update = ModelStatusUpdate {
                     model_name: model_name.to_string(),
-                    status: model_express_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
+                    status: modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
                         as i32,
                     message: Some("Database error occurred".to_string()),
-                    provider: model_express_common::grpc::model::ModelProvider::from(provider)
+                    provider: modelexpress_common::grpc::model::ModelProvider::from(provider)
                         as i32,
                 };
                 let _ = tx.send(Ok(error_update)).await;
@@ -342,13 +342,13 @@ impl ModelDownloadTracker {
         // Send current status
         let update = ModelStatusUpdate {
             model_name: model_name.to_string(),
-            status: model_express_common::grpc::model::ModelStatus::from(status) as i32,
+            status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
             message: match status {
                 ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
                 ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
                 ModelStatus::ERROR => Some("Previous download failed".to_string()),
             },
-            provider: model_express_common::grpc::model::ModelProvider::from(provider) as i32,
+            provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
         };
 
         let _ = tx.send(Ok(update)).await;
@@ -428,7 +428,7 @@ pub static MODEL_TRACKER: std::sync::LazyLock<ModelDownloadTracker> =
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use model_express_common::grpc::{
+    use modelexpress_common::grpc::{
         api::ApiRequest, health::HealthRequest, model::ModelDownloadRequest,
     };
     use tempfile::TempDir;
@@ -574,7 +574,7 @@ mod tests {
 
         let request = Request::new(ModelDownloadRequest {
             model_name: model_name.clone(),
-            provider: model_express_common::grpc::model::ModelProvider::HuggingFace as i32,
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
         });
 
         let response = service.ensure_model_downloaded(request).await;
@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(status_update.model_name, model_name);
         assert_eq!(
             status_update.status,
-            model_express_common::grpc::model::ModelStatus::Downloaded as i32
+            modelexpress_common::grpc::model::ModelStatus::Downloaded as i32
         );
 
         // Cleanup
@@ -671,7 +671,7 @@ mod tests {
 
         let request = Request::new(ModelDownloadRequest {
             model_name: model_name.to_string(),
-            provider: model_express_common::grpc::model::ModelProvider::HuggingFace as i32,
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
         });
 
         let response = service.ensure_model_downloaded(request).await;
