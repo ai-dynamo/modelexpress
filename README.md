@@ -75,7 +75,7 @@ cargo build
 ### 3. Run the Server
 
 ```bash
-cargo run --bin model_express_server
+cargo run --bin modelexpress-server
 ```
 
 The server will start on `0.0.0.0:8001` by default.
@@ -86,7 +86,7 @@ The server will start on `0.0.0.0:8001` by default.
 
 ```bash
 # Start the gRPC server
-cargo run --bin model_express_server
+cargo run --bin modelexpress-server
 
 # In another terminal, run tests
 cargo test
@@ -136,7 +136,7 @@ cp model-express.yaml my-config.yaml
 Start the server with a configuration file:
 
 ```bash
-cargo run --bin model_express_server -- --config my-config.yaml
+cargo run --bin modelexpress-server -- --config my-config.yaml
 ```
 
 ### Environment Variables
@@ -164,13 +164,13 @@ export MODEL_EXPRESS_LOGGING_FORMAT=json
 
 ```bash
 # Basic usage
-cargo run --bin model_express_server -- --port 8080 --log-level debug
+cargo run --bin modelexpress-server -- --port 8080 --log-level debug
 
 # With configuration file
-cargo run --bin model_express_server -- --config my-config.yaml --port 8080
+cargo run --bin modelexpress-server -- --config my-config.yaml --port 8080
 
 # Validate configuration
-cargo run --bin model_express_server -- --config my-config.yaml --validate-config
+cargo run --bin modelexpress-server -- --config my-config.yaml --validate-config
 ```
 
 ### Configuration Options
@@ -301,7 +301,7 @@ The server uses structured logging with `tracing`:
 
 ```bash
 # Set log level
-RUST_LOG=debug cargo run --bin model_express_server
+RUST_LOG=debug cargo run --bin modelexpress-server
 ```
 
 ## Contributing

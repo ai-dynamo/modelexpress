@@ -13,7 +13,7 @@ RUN apt-get update && \
 COPY . .
 
 # Build all available binaries
-RUN cargo build --release --bin model_express_server && \
+RUN cargo build --release --bin modelexpress_server && \
     cargo build --release --bin model-express-cli && \
     cargo build --release --bin test_client && \
     cargo build --release --bin test_single_client && \
@@ -30,7 +30,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy all built binaries
-COPY --from=builder /app/target/release/model_express_server .
+COPY --from=builder /app/target/release/modelexpress-server .
 COPY --from=builder /app/target/release/model-express-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/test_single_client .

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "model_express_common"
+name = "modelexpress-common"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"

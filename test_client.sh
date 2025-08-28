@@ -117,7 +117,7 @@ test_client_with_server() {
     # Check if server is running
     if ! check_server; then
         print_warning "Server not running, starting server..."
-        cargo run --bin model_express_server > server.log 2>&1 &
+        cargo run --bin modelexpress-server > server.log 2>&1 &
         SERVER_PID=$!
         sleep 5
 
@@ -219,14 +219,14 @@ test_unit_tests() {
     print_status "Running unit tests..."
 
     # Test cache configuration
-    cargo test --package model_express_client cache_config::tests || {
+    cargo test --package modelexpress-client cache_config::tests || {
         print_error "Cache configuration unit tests failed"
         return 1
     }
     print_success "Cache configuration unit tests passed"
 
     # Test client library
-    cargo test --package model_express_client lib || {
+    cargo test --package modelexpress-client lib || {
         print_error "Client library unit tests failed"
         return 1
     }

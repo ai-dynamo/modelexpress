@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "model_express_client"
+name = "modelexpress-client"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ description = "Client library for Model Express gRPC server"
 repository = "https://github.com/ai-dynamo/modelexpress"
 
 [dependencies]
-model_express_common = { path = "../model_express_common" }
+modelexpress-common = "0.1.0"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

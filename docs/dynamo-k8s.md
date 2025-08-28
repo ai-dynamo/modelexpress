@@ -42,7 +42,7 @@ $ cargo build
 
 #### Start ModelExpress (will start on 0.0.0.0:8001 by default). 
 ```
-$ cargo run --bin model_express_server
+$ cargo run --bin modelexpress-server
 
 2025-08-01T22:22:50.568827Z  INFO model_express_server: Starting model_express_server with gRPC...
 2025-08-01T22:22:50.568850Z  INFO model_express_server: Listening on gRPC endpoint: 0.0.0.0:8001

@@ -1468,7 +1468,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "model_express_client",
- "model_express_common",
+ "model_express_common 0.1.0",
  "model_express_server",
  "serde_json",
  "tempfile",
@@ -1486,7 +1486,7 @@ dependencies = [
  "clap",
  "colored",
  "futures",
- "model_express_common",
+ "model_express_common 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "prost",
  "serde",
  "serde_json",
@@ -1527,6 +1527,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "model_express_common"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfc9b364a61482d0f5b0ac305739b07b8d1c7f01726400a844aa7453c32407de"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "config",
+ "hf-hub",
+ "jiff",
+ "prost",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tracing",
+]
+
+[[package]]
 name = "model_express_server"
 version = "0.1.0"
 dependencies = [
@@ -1538,7 +1562,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "jiff",
- "model_express_common",
+ "model_express_common 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "once_cell",
  "prost",
  "rusqlite",

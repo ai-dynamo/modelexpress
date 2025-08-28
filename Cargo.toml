@@ -3,9 +3,9 @@
 
 [workspace]
 members = [
-    "model_express_server",
-    "model_express_client",
-    "model_express_common",
+    "modelexpress-server",
+    "modelexpress-client",
+    "modelexpress-common",
     "workspace-tests",
 ]
 resolver = "3"
