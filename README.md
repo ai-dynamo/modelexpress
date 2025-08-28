@@ -19,9 +19,9 @@ The current version of Model Express acts as a cache for HuggingFace, providing 
 
 The project is organized as a Rust workspace with the following components:
 
-- **`model_express_server`**: The main gRPC server that provides model services
-- **`model_express_client`**: Client library for interacting with the server
-- **`model_express_common`**: Shared code and constants between client and server
+- **`modelexpress_server`**: The main gRPC server that provides model services
+- **`modelexpress_client`**: Client library for interacting with the server
+- **`modelexpress_common`**: Shared code and constants between client and server
 
 The current diagram represents a high-level overview of the Model Express architecture. It will evolve with time as we add new features and components.
 
@@ -249,9 +249,9 @@ cargo tarpaulin --out Html
 
 ```
 ModelExpress/
-├── model_express_server/     # Main gRPC server
-├── model_express_client/     # Client library
-├── model_express_common/     # Shared code
+├── modelexpress_server/     # Main gRPC server
+├── modelexpress_client/     # Client library
+├── modelexpress_common/     # Shared code
 ├── workspace-tests/          # Integration tests
 ├── docker-compose.yml        # Docker configuration
 ├── Dockerfile                # Docker build file
@@ -261,9 +261,9 @@ ModelExpress/
 
 ### Adding New Features
 
-1. **Server Features**: Add to `model_express_server/src/`
-2. **Client Features**: Add to `model_express_client/src/`
-3. **Shared Code**: Add to `model_express_common/src/`
+1. **Server Features**: Add to `modelexpress_server/src/`
+2. **Client Features**: Add to `modelexpress_client/src/`
+3. **Shared Code**: Add to `modelexpress_common/src/`
 4. **Tests**: Add to appropriate directory under `workspace-tests/`
 
 ### Dependencies
