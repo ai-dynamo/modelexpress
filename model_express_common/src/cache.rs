@@ -46,7 +46,7 @@ impl CacheConfig {
         }
 
         // Try environment variable
-        if let Ok(path) = env::var("MODEL_EXPRESS_CACHE_PATH") {
+        if let Ok(path) = env::var("MODEL_EXPRESS_CACHE_DIRECTORY") {
             return Self::from_path(path);
         }
 
