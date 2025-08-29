@@ -40,6 +40,14 @@ pub struct ServerArgs {
     #[arg(short, long, env = "MODEL_EXPRESS_DATABASE_PATH")]
     pub database_path: Option<PathBuf>,
 
+    /// Cache directory path
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
+    pub cache_directory: Option<PathBuf>,
+
+    /// Enable cache eviction
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED")]
+    pub cache_eviction_enabled: Option<bool>,
+
     /// Validate configuration and exit
     #[arg(long)]
     pub validate_config: bool,
@@ -179,6 +187,15 @@ impl ServerConfig {
 
         if let Some(database_path) = args.database_path {
             config.database.path = database_path;
+        }
+
+        // Apply cache overrides
+        if let Some(cache_directory) = args.cache_directory {
+            config.cache.directory = cache_directory;
+        }
+
+        if let Some(cache_eviction_enabled) = args.cache_eviction_enabled {
+            config.cache.eviction.enabled = cache_eviction_enabled;
         }
 
         // Validate the final configuration
@@ -482,33 +499,33 @@ mod tests {
         let config_file = temp_dir.path().join("valid_server_config.yaml");
 
         let valid_config = r#"
-server:
-  host: "127.0.0.1"
-  port: 8002
-  graceful_shutdown: true
-  shutdown_timeout_seconds: 60
-database:
-  path: "./test.db"
-  wal_mode: false
-  pool_size: 5
-  connection_timeout_seconds: 15
-cache:
-  eviction:
-    enabled: false
-    policy:
-      type: lru
-      unused_threshold: "3d"
-      max_models: 10
-      min_free_space_bytes: 1000000
-    check_interval: "30m"
-  directory: "./test_cache"
-  max_size_bytes: 5000000
-logging:
-  level: Debug
-  format: Json
-  file: null
-  structured: true
-"#;
+            server:
+              host: "127.0.0.1"
+              port: 8002
+              graceful_shutdown: true
+              shutdown_timeout_seconds: 60
+            database:
+              path: "./test.db"
+              wal_mode: false
+              pool_size: 5
+              connection_timeout_seconds: 15
+            cache:
+              eviction:
+                enabled: false
+                policy:
+                  type: lru
+                  unused_threshold: "3d"
+                  max_models: 10
+                  min_free_space_bytes: 1000000
+                check_interval: "30m"
+              directory: "./test_cache"
+              max_size_bytes: 5000000
+            logging:
+              level: Debug
+              format: Json
+              file: null
+              structured: true
+        "#;
 
         fs::write(&config_file, valid_config).expect("Failed to write config file");
 
@@ -519,6 +536,8 @@ logging:
             log_level: None,
             log_format: None,
             database_path: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
             validate_config: false,
         };
 
@@ -541,15 +560,15 @@ logging:
         let config_file = temp_dir.path().join("invalid_server_config.yaml");
 
         let invalid_config = r#"
-server:
-  host: "127.0.0.1"
-  port: 8002
-database:
-  pat: "./test.db"  # Wrong field name (should be 'path')
-cache:
-  eviction:
-    enabled: "not_a_boolean"  # Invalid type
-"#;
+            server:
+              host: "127.0.0.1"
+              port: 8002
+            database:
+              pat: "./test.db"  # Wrong field name (should be 'path')
+            cache:
+              eviction:
+                enabled: "not_a_boolean"  # Invalid type
+        "#;
 
         fs::write(&config_file, invalid_config).expect("Failed to write config file");
 
@@ -560,6 +579,8 @@ cache:
             log_level: None,
             log_format: None,
             database_path: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
             validate_config: false,
         };
 
@@ -574,33 +595,33 @@ cache:
         let config_file = temp_dir.path().join("override_test_config.yaml");
 
         let base_config = r#"
-server:
-  host: "127.0.0.1"
-  port: 8002
-  graceful_shutdown: true
-  shutdown_timeout_seconds: 30
-database:
-  path: "./test.db"
-  wal_mode: true
-  pool_size: 10
-  connection_timeout_seconds: 30
-cache:
-  eviction:
-    enabled: true
-    policy:
-      type: lru
-      unused_threshold: "1d"
-      max_models: null
-      min_free_space_bytes: null
-    check_interval: "1h"
-  directory: "./cache"
-  max_size_bytes: null
-logging:
-  level: Info
-  format: Pretty
-  file: null
-  structured: false
-"#;
+            server:
+              host: "127.0.0.1"
+              port: 8002
+              graceful_shutdown: true
+              shutdown_timeout_seconds: 30
+            database:
+              path: "./test.db"
+              wal_mode: true
+              pool_size: 10
+              connection_timeout_seconds: 30
+            cache:
+              eviction:
+                enabled: true
+                policy:
+                  type: lru
+                  unused_threshold: "1d"
+                  max_models: null
+                  min_free_space_bytes: null
+                check_interval: "1h"
+              directory: "./cache"
+              max_size_bytes: null
+            logging:
+              level: Info
+              format: Pretty
+              file: null
+              structured: false
+        "#;
 
         fs::write(&config_file, base_config).expect("Failed to write config file");
 
@@ -611,6 +632,8 @@ logging:
             log_level: Some(LogLevel::Error),
             log_format: Some(LogFormat::Json),
             database_path: Some(PathBuf::from("./override.db")),
+            cache_directory: Some(PathBuf::from("/tmp/override_cache")),
+            cache_eviction_enabled: Some(false),
             validate_config: false,
         };
 
@@ -624,6 +647,8 @@ logging:
         assert_eq!(config.database.path, PathBuf::from("./override.db"));
         assert_eq!(config.logging.level, LogLevel::Error);
         assert_eq!(config.logging.format, LogFormat::Json);
+        assert_eq!(config.cache.directory, PathBuf::from("/tmp/override_cache"));
+        assert!(!config.cache.eviction.enabled);
     }
 
     #[test]
@@ -636,6 +661,8 @@ logging:
             log_level: Some(LogLevel::Warn),
             log_format: None,
             database_path: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
             validate_config: false,
         };
 

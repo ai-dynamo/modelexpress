@@ -10,6 +10,7 @@ use tracing::info;
 
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
+const MODEL_EXPRESS_CACHE_ENV_VAR: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 
 /// Get the cache directory for Hugging Face models
 /// Priority order:
@@ -20,6 +21,11 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     // Use provided cache directory if available
     if let Some(dir) = cache_dir {
         return dir;
+    }
+
+    // Try MODEL_EXPRESS_CACHE_DIRECTORY environment variable first
+    if let Ok(cache_path) = env::var(MODEL_EXPRESS_CACHE_ENV_VAR) {
+        return PathBuf::from(cache_path);
     }
 
     // Try environment variable
