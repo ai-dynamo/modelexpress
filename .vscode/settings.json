@@ -19,7 +19,6 @@
         "*.yml": "yaml",
         "*.yaml": "yaml"
     },
-    "terminal.integrated.defaultProfile.linux": "bash",
     "search.exclude": {
         "**/target/**": true
     },
