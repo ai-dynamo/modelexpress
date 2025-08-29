@@ -5,8 +5,8 @@ use super::args::{CliModelProvider, DownloadStrategy, ModelCommands, OutputForma
 use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
-use model_express_client::{Client, ClientConfig, ModelProvider};
-use model_express_common::cache::CacheConfig;
+use modelexpress_client::{Client, ClientConfig, ModelProvider};
+use modelexpress_common::cache::CacheConfig;
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;

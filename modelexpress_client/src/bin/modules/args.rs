@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::{Parser, Subcommand, ValueEnum};
-use model_express_client::ModelProvider;
+use modelexpress_client::ModelProvider;
 use std::path::PathBuf;
 
 #[derive(Parser)]

@@ -8,8 +8,8 @@
 )]
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use model_express_common::models::{ModelProvider, ModelStatus, Status};
-use model_express_server::database::ModelDatabase;
+use modelexpress_common::models::{ModelProvider, ModelStatus, Status};
+use modelexpress_server::database::ModelDatabase;
 use std::hint::black_box;
 use tempfile::TempDir;
 
@@ -99,7 +99,7 @@ fn benchmark_serialization(c: &mut Criterion) {
         let model_status = ModelStatus::DOWNLOADED;
 
         b.iter(|| {
-            let grpc_status: model_express_common::grpc::model::ModelStatus =
+            let grpc_status: modelexpress_common::grpc::model::ModelStatus =
                 black_box(model_status).into();
             let _back_to_model: ModelStatus = grpc_status.into();
         });
@@ -117,7 +117,7 @@ fn benchmark_model_provider_operations(c: &mut Criterion) {
         let provider = ModelProvider::HuggingFace;
 
         b.iter(|| {
-            let grpc_provider: model_express_common::grpc::model::ModelProvider =
+            let grpc_provider: modelexpress_common::grpc::model::ModelProvider =
                 black_box(provider).into();
             let _back_to_model: ModelProvider = grpc_provider.into();
         });
