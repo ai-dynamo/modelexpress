@@ -80,7 +80,6 @@ spec:
               cat > /root/.model-express/config.yaml << EOF
               local_path: $MODEL_CACHE_PATH
               server_endpoint: http://localhost:8002
-              auto_mount: true
               timeout_secs: null
               EOF
 

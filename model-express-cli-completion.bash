@@ -98,7 +98,7 @@ _model_express_cli_completions() {
                         ;;
                     *)
                         if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "--storage-path --server-endpoint --auto-mount --help" -- "$cur"))
+                            COMPREPLY=($(compgen -W "--storage-path --server-endpoint --help" -- "$cur"))
                         fi
                         ;;
                 esac

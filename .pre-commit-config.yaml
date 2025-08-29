@@ -14,6 +14,7 @@ repos:
         exclude: '\.md$'
       - id: end-of-file-fixer
       - id: check-yaml
+        args: ["--allow-multiple-documents"]
       - id: check-toml
       - id: check-json
       - id: check-merge-conflict
