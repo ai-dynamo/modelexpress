@@ -3,7 +3,7 @@
 
 #![allow(clippy::expect_used)]
 
-use model_express_client::{Client, ClientConfig, ModelProvider};
+use modelexpress_client::{Client, ClientConfig, ModelProvider};
 use tracing::{error, info};
 
 #[tokio::main]

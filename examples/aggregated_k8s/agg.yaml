@@ -71,7 +71,7 @@ spec:
           args:
             - |
               echo "Starting Model Express Server..."
-              ./model_express_server &
+              ./modelexpress-server &
               SERVER_PID=$!
               echo "Server started with PID: $SERVER_PID"
 

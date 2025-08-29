@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use config::ConfigError;
-use model_express_common::config::{LogFormat, LogLevel, load_layered_config};
+use modelexpress_common::config::{LogFormat, LogLevel, load_layered_config};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
@@ -104,7 +104,7 @@ impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             host: "0.0.0.0".to_string(),
-            port: model_express_common::constants::DEFAULT_GRPC_PORT,
+            port: modelexpress_common::constants::DEFAULT_GRPC_PORT,
         }
     }
 }
@@ -150,7 +150,7 @@ impl ServerConfig {
             // Use strict loading - fail on any configuration errors
             if let Some(ref config_file) = args.config {
                 // Load file strictly without fallbacks
-                model_express_common::config::validate_config_file(config_file)?
+                modelexpress_common::config::validate_config_file(config_file)?
             } else {
                 // No config file specified, use defaults
                 Self::default()
@@ -257,7 +257,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use clap::Parser;
-    use model_express_common::config::{DurationConfig, parse_duration_string};
+    use modelexpress_common::config::{DurationConfig, parse_duration_string};
     use std::fs;
     use tempfile::tempdir;
 

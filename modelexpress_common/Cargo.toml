@@ -2,37 +2,37 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "model_express_client"
+name = "modelexpress-common"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Client library for Model Express gRPC server"
+description = "Shared utilities for Model Express client and server"
 repository = "https://github.com/ai-dynamo/modelexpress"
 
 [dependencies]
-model_express_common = { path = "../model_express_common" }
-tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+serde_yaml = "0.9"
+thiserror = "2.0"
 tonic = { workspace = true }
 prost = { workspace = true }
-futures = { workspace = true }
-uuid = { workspace = true }
-thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+hf-hub = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
-colored = { workspace = true }
+config = { workspace = true }
+jiff = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
-tonic-build = { workspace = true }
+mockall = "0.13"
 tempfile = "3.20"
+tokio-test = "0.4"
+
+[build-dependencies]
+tonic-build = { workspace = true }
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "model-express-cli"
-path = "src/bin/cli.rs"

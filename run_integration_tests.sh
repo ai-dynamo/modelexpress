@@ -46,8 +46,8 @@ build_project() {
     cargo clean
 
     # Build in release mode for better performance
-    if ! cargo build --release --bin model_express_server; then
-        echo "ERROR: Failed to build model_express_server"
+    if ! cargo build --release --bin modelexpress-server; then
+        echo "ERROR: Failed to build modelexpress-server"
         exit 1
     fi
 
@@ -66,8 +66,8 @@ check_rust_toolchain
 build_project
 
 # Start the server in the background using the built binary
-echo "Starting model_express_server (gRPC) in the background..."
-"$TARGET_DIR/release/model_express_server" > server.log 2>&1 &
+echo "Starting modelexpress-server (gRPC) in the background..."
+"$TARGET_DIR/release/modelexpress-server" > server.log 2>&1 &
 SERVER_PID=$!
 
 # Give the server time to start

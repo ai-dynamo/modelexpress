@@ -10,7 +10,7 @@ mod modules {
 
 use clap::Parser;
 use colored::*;
-use model_express_client::{ClientArgs, ClientConfig};
+use modelexpress_client::{ClientArgs, ClientConfig};
 use modules::args::{ApiCommands, Cli, Commands};
 use modules::handlers::{handle_api_send, handle_health_command, handle_model_command};
 use modules::output::{print_output, setup_logging};
@@ -98,7 +98,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::modules::args::CliModelProvider;
-    use model_express_client::ModelProvider;
+    use modelexpress_client::ModelProvider;
 
     #[test]
     fn test_cli_model_provider_conversion() {
