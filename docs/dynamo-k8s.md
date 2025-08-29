@@ -61,14 +61,12 @@ $ ./target/release/model-express-cli model init
 
 Enter your local cache mount path [~/.model-express/cache]: 
 Enter your server endpoint [http://localhost:8001]: 
-Auto-mount cache on startup? [Y/n]: 
 Save this configuration? [Y/n]: 
 ModelExpress Storage Configuration
 ===================================
 Configuration saved successfully!
 Storage path: "/home/user/.model-express/cache"
 Server endpoint: http://localhost:8001
-Auto-mount: true
 ```
 
 #### Download a model using the CLI (should see more info on server log)
@@ -237,6 +235,3 @@ $ curl -s -N --no-buffer -X POST http://localhost:8000/v1/chat/completions -H 'a
 ```
 
 We have just demonstrated running dynamo with a cache managed by the ModelExpress
-
-
-

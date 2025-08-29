@@ -93,8 +93,7 @@ model-express-cli model init
 # Initialize with custom settings
 model-express-cli model init \
   --storage-path /path/to/your/models \
-  --server-endpoint http://localhost:8001 \
-  --auto-mount
+  --server-endpoint http://localhost:8001
 
 # List downloaded models
 model-express-cli model list
@@ -329,7 +328,7 @@ model-express-cli --format json model list | jq -r '.models[].name'
     ./target/release/model-express-cli health
 
     # Initialize model storage
-    ./target/release/model-express-cli model init --auto-mount
+    ./target/release/model-express-cli model init
 
     # Test model download
     ./target/release/model-express-cli model download google-t5/t5-small \
