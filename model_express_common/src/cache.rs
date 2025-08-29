@@ -35,7 +35,7 @@ impl CacheConfig {
     pub fn discover() -> Result<Self> {
         // Priority order:
         // 1. Command line argument (--cache-path)
-        // 2. Environment variable (MODEL_EXPRESS_CACHE_PATH)
+        // 2. Environment variable (MODEL_EXPRESS_CACHE_DIRECTORY)
         // 3. Config file (~/.model-express/config.yaml)
         // 4. Auto-detection (common paths)
         // 5. Default fallback
