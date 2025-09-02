@@ -9,6 +9,7 @@ image:
 serviceAccount:
   create: true
   annotations: {}
+  automount: true
 
 podAnnotations: {}
 
