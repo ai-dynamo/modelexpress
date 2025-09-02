@@ -1,0 +1,15 @@
+apiVersion: v2
+name: model-express
+description: A Helm chart for ModelExpress - a model serving and management platform
+type: application
+version: 0.1.1
+appVersion: "1.0.0"
+keywords:
+  - model-serving
+  - ai
+  - machine-learning
+  - inference
+home: https://github.com/nvidia/model-express
+sources:
+  - https://github.com/nvidia/model-express
+icon: https://raw.githubusercontent.com/nvidia/model-express/main/ModelExpressTrainLogo.jpeg
