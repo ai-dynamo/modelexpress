@@ -54,9 +54,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 Create the name of the service account to use
 */}}
 {{- define "model-express.serviceAccountName" -}}
-{{- if .Values.serviceAccount.create }}
-{{- default (include "model-express.fullname" .) .Values.serviceAccount.name }}
+{{- if and .Values.serviceAccount .Values.serviceAccount.create }}
+{{- default (include "model-express.fullname" .) (default "" .Values.serviceAccount.name) }}
 {{- else }}
-{{- default "default" .Values.serviceAccount.name }}
+{{- default "default" (default "" .Values.serviceAccount.name) }}
 {{- end }}
 {{- end }}
