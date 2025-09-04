@@ -73,46 +73,46 @@ helm install my-model-express ./helm --namespace model-express --create-namespac
 
 The following table lists the configurable parameters of the ModelExpress chart and their default values.
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `replicaCount` | Number of ModelExpress replicas | `1` |
-| `image.repository` | ModelExpress image repository | `nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta` |
-| `image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `image.tag` | ModelExpress image tag | `0.1.1rc0` |
-| `imagePullSecrets` | Image pull secrets for nvcr.io access | `[]` |
-| `nameOverride` | Override the chart name | `""` |
-| `fullnameOverride` | Override the full app name | `""` |
-| `serviceAccount.create` | Create a service account | `true` |
-| `serviceAccount.annotations` | Service account annotations | `{}` |
-| `serviceAccount.name` | Service account name | `""` |
-| `podAnnotations` | Pod annotations | `{}` |
-| `podSecurityContext` | Pod security context | `{}` |
-| `securityContext` | Container security context | `{}` |
-| `service.type` | Service type | `ClusterIP` |
-| `service.port` | Service port | `8001` |
-| `ingress.enabled` | Enable ingress | `false` |
-| `ingress.className` | Ingress class name | `""` |
-| `ingress.annotations` | Ingress annotations | `{}` |
-| `ingress.hosts` | Ingress hosts | `[]` |
-| `ingress.tls` | Ingress TLS configuration | `[]` |
-| `resources.limits.cpu` | CPU limit | `500m` |
-| `resources.limits.memory` | Memory limit | `256Mi` |
-| `resources.requests.cpu` | CPU request | `200m` |
-| `resources.requests.memory` | Memory request | `128Mi` |
-| `persistence.enabled` | Enable persistence | `true` |
-| `persistence.storageClass` | Storage class | `""` |
-| `persistence.accessMode` | Access mode | `ReadWriteOnce` |
-| `persistence.size` | Storage size | `10Gi` |
-| `persistence.mountPath` | Mount path | `/root` |
-| `env.MODEL_EXPRESS_SERVER_PORT` | Server port | `8001` |
-| `env.MODEL_EXPRESS_LOGGING_LEVEL` | Logging level | `info` |
-| `env.MODEL_EXPRESS_DATABASE_PATH` | Database path | `/app/models.db` |
-| `env.MODEL_EXPRESS_CACHE_DIRECTORY` | Cache directory | `/app/cache` |
-| `probes.liveness.enabled` | Enable liveness probe | `true` |
-| `probes.readiness.enabled` | Enable readiness probe | `true` |
-| `nodeSelector` | Node selector | `{}` |
-| `tolerations` | Tolerations | `[]` |
-| `affinity` | Affinity rules | `{}` |
+| Parameter                                    | Description                                    | Default |
+|----------------------------------------------|------------------------------------------------|---------|
+| `replicaCount`                               | Number of ModelExpress replicas                | `1`     |
+| `image.repository`                           | ModelExpress image repository                  | `nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta` |
+| `image.pullPolicy`                           | Image pull policy                              | `IfNotPresent` |
+| `image.tag`                                  | ModelExpress image tag                         | `0.1.1rc0` |
+| `imagePullSecrets`                           | Image pull secrets for nvcr.io access          | `[]`     |
+| `nameOverride`                               | Override the chart name                        | `""`     |
+| `fullnameOverride`                           | Override the full app name                     | `""`     |
+| `serviceAccount.create`                      | Create a service account                       | `true`   |
+| `serviceAccount.annotations`                 | Service account annotations                    | `{}`     |
+| `serviceAccount.name`                        | Service account name                           | `""`     |
+| `podAnnotations`                             | Pod annotations                                | `{}`     |
+| `podSecurityContext`                         | Pod security context                           | `{}`     |
+| `securityContext`                            | Container security context                     | `{}`     |
+| `service.type`                               | Service type                                   | `ClusterIP` |
+| `service.port`                               | Service port                                   | `8001`   |
+| `ingress.enabled`                            | Enable ingress                                 | `false`  |
+| `ingress.className`                          | Ingress class name                             | `""`     |
+| `ingress.annotations`                        | Ingress annotations                            | `{}`     |
+| `ingress.hosts`                              | Ingress hosts                                  | `[]`     |
+| `ingress.tls`                                | Ingress TLS configuration                      | `[]`     |
+| `resources.limits.cpu`                       | CPU limit                                      | `500m`   |
+| `resources.limits.memory`                    | Memory limit                                   | `256Mi`  |
+| `resources.requests.cpu`                     | CPU request                                    | `200m`   |
+| `resources.requests.memory`                  | Memory request                                 | `128Mi`  |
+| `persistence.enabled`                        | Enable persistence                             | `true`   |
+| `persistence.storageClass`                   | Storage class                                  | `""`     |
+| `persistence.accessMode`                     | Access mode                                    | `ReadWriteOnce` |
+| `persistence.size`                           | Storage size                                   | `10Gi`   |
+| `persistence.mountPath`                      | Mount path                                     | `/root`  |
+| `env.MODEL_EXPRESS_SERVER_PORT`              | Server port                                    | `8001`   |
+| `env.MODEL_EXPRESS_LOGGING_LEVEL`            | Logging level                                  | `info`   |
+| `env.MODEL_EXPRESS_DATABASE_PATH`            | Database path                                  | `/app/models.db` |
+| `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/app/cache` |
+| `probes.liveness.enabled`                    | Enable liveness probe                          | `true`   |
+| `probes.readiness.enabled`                   | Enable readiness probe                         | `true`   |
+| `nodeSelector`                               | Node selector                                  | `{}`     |
+| `tolerations`                                | Tolerations                                    | `[]`     |
+| `affinity`                                   | Affinity rules                                 | `{}`     |
 
 ## Examples
 

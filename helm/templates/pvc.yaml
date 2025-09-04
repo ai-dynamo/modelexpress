@@ -7,8 +7,8 @@ metadata:
     {{- include "model-express.labels" . | nindent 4 }}
 spec:
   accessModes:
-    - {{ .Values.persistence.accessMode | default "ReadWriteOnce" | quote }}
-  {{- if .Values.persistence.storageClass }}
+    - {{ (.Values.persistence.accessMode | default "ReadWriteOnce") | quote }}
+  {{- if and .Values.persistence .Values.persistence.storageClass }}
   storageClassName: {{ .Values.persistence.storageClass }}
   {{- end }}
   resources:
