@@ -7,7 +7,7 @@ replicaCount: 1
 image:
   repository: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta
   pullPolicy: IfNotPresent
-  tag: "0.1.1rc0"
+  tag: "0.1.1rc1"
 
 imagePullSecrets:
   - name: nvcr-secret
