@@ -1,4 +1,4 @@
-{{- if .Values.ingress.enabled -}}
+{{- if and .Values.ingress .Values.ingress.enabled -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -37,7 +37,7 @@ spec:
               service:
                 name: {{ include "model-express.fullname" $ }}
                 port:
-                  number: {{ $.Values.service.port }}
+                  number: {{ $.Values.service.port | default 8001 }}
           {{- end }}
     {{- end }}
 {{- end }}

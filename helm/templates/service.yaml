@@ -4,9 +4,9 @@ metadata:
   name: { { include "model-express.fullname" . } }
   labels: { { - include "model-express.labels" . | nindent 4 } }
 spec:
-  type: { { .Values.service.type } }
+  type: { { .Values.service.type | default "ClusterIP" } }
   ports:
-    - port: { { .Values.service.port } }
+    - port: { { .Values.service.port | default 8001 } }
       targetPort: http
       protocol: TCP
       name: http
