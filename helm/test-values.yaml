@@ -12,6 +12,8 @@ serviceAccount:
 
 podAnnotations: {}
 
+podLabels: {}
+
 service:
   type: ClusterIP
   port: 8001

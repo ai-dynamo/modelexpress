@@ -111,23 +111,25 @@ create_namespace() {
 
 # Function to deploy the chart
 deploy_chart() {
-    local helm_cmd="helm"
+    local helm_args=()
     
     if [ "$DRY_RUN" = true ]; then
-        helm_cmd="$helm_cmd --dry-run"
+        helm_args+=("--dry-run")
         print_status "Performing dry run..."
     fi
     
-    if [ "$UPGRADE" = true ]; then
-        print_status "Upgrading release: $RELEASE_NAME"
-        $helm_cmd upgrade "$RELEASE_NAME" . --namespace "$NAMESPACE"
-    else
-        print_status "Installing release: $RELEASE_NAME"
-        $helm_cmd install "$RELEASE_NAME" . --namespace "$NAMESPACE"
+    if [ -n "$VALUES_FILE" ]; then
+        helm_args+=("-f" "$VALUES_FILE")
     fi
     
-    if [ -n "$VALUES_FILE" ]; then
-        helm_cmd="$helm_cmd -f $VALUES_FILE"
+    helm_args+=("--namespace" "$NAMESPACE")
+    
+    if [ "$UPGRADE" = true ]; then
+        print_status "Upgrading release: $RELEASE_NAME"
+        helm upgrade "${helm_args[@]}" "$RELEASE_NAME" .
+    else
+        print_status "Installing release: $RELEASE_NAME"
+        helm install "${helm_args[@]}" "$RELEASE_NAME" .
     fi
     
     print_success "Deployment completed successfully"
