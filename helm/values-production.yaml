@@ -2,7 +2,7 @@
 replicaCount: 3
 
 image:
-  repository: nvcr.io/nvidian/nim-llm-dev/modelexpress-server-beta
+  repository: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta
   pullPolicy: Always
   tag: "0.1.1rc0"
 

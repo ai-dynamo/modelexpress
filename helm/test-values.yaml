@@ -1,4 +1,4 @@
-# Development values for ModelExpress
+# Test values for ModelExpress Helm chart validation
 replicaCount: 1
 
 image:
@@ -9,7 +9,6 @@ image:
 serviceAccount:
   create: true
   annotations: {}
-  automount: true
 
 podAnnotations: {}
 
@@ -22,17 +21,17 @@ ingress:
 
 resources:
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 100m
+    memory: 128Mi
   requests:
-    cpu: 200m
-    memory: 256Mi
+    cpu: 50m
+    memory: 64Mi
 
 persistence:
   enabled: true
   storageClass: ""
   accessMode: ReadWriteOnce
-  size: 10Gi
+  size: 1Gi
   mountPath: /root
 
 env:
@@ -46,9 +45,9 @@ probes:
     enabled: true
     tcpSocket:
       port: 8001
-    initialDelaySeconds: 10
-    periodSeconds: 30
-    timeoutSeconds: 10
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
     failureThreshold: 3
   readiness:
     enabled: true
@@ -65,8 +64,8 @@ tolerations: []
 
 affinity: {}
 
-extraEnv:
-  - name: MODEL_EXPRESS_ENVIRONMENT
-    value: "development"
-  - name: MODEL_EXPRESS_DEBUG
-    value: "true"
+extraEnv: []
+
+args: []
+
+command: []

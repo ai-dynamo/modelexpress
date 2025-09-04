@@ -76,7 +76,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of ModelExpress replicas | `1` |
-| `image.repository` | ModelExpress image repository | `nvcr.io/nvidian/nim-llm-dev/modelexpress-server-beta` |
+| `image.repository` | ModelExpress image repository | `nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `image.tag` | ModelExpress image tag | `0.1.1rc0` |
 | `imagePullSecrets` | Image pull secrets for nvcr.io access | `[]` |
@@ -269,7 +269,7 @@ The Helm chart uses the official NVIDIA ModelExpress image from the NVIDIA Conta
 docker login nvcr.io -u '$oauthtoken' -p 'YOUR_NVCR_API_KEY'
 
 # Pull the image
-docker pull nvcr.io/nvidian/nim-llm-dev/modelexpress-server-beta:0.1.1rc0
+docker pull nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta:0.1.1rc0
 ```
 
 **Note:** The default image requires authentication. See the [Installation](#installation) section for creating the required Kubernetes secret.
