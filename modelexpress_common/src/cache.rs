@@ -208,6 +208,26 @@ impl CacheConfig {
         }
     }
 
+    /// Convert a Hugging Face folder name back to the original model ID
+    /// Examples:
+    /// - "models--google-t5--t5-small" -> "google-t5/t5-small"
+    pub fn folder_name_to_model_id(folder_name: &str) -> String {
+        // Handle models
+        if let Some(stripped) = folder_name.strip_prefix("models--") {
+            // Convert models--owner--repo to owner/repo
+            stripped.replace("--", "/")
+        } else if folder_name.starts_with("datasets--") {
+            // TODO: Handle datasets names conversion
+            folder_name.to_string()
+        } else if folder_name.starts_with("spaces--") {
+            // TODO: Handle spaces names conversion
+            folder_name.to_string()
+        } else {
+            // If it doesn't match the expected pattern, return as-is
+            folder_name.to_string()
+        }
+    }
+
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> Result<CacheStats> {
         let mut stats = CacheStats {
@@ -226,11 +246,14 @@ impl CacheConfig {
 
             if path.is_dir() {
                 let size = Self::get_directory_size(&path)?;
-                let model_name = path
+                let folder_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
+                info!("Folder name: {}", folder_name);
+                // Convert folder name back to human-readable model ID
+                let model_name = Self::folder_name_to_model_id(&folder_name);
 
                 stats.total_models = stats.total_models.saturating_add(1);
                 stats.total_size = stats.total_size.saturating_add(size);
@@ -397,5 +420,64 @@ mod tests {
         assert_eq!(stats.format_total_size(), "5.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[0]), "2.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[1]), "3.00 MB");
+    }
+
+    #[test]
+    fn test_folder_name_to_model_id() {
+        // Test models conversion
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("models--google-t5--t5-small"),
+            "google-t5/t5-small"
+        );
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("models--microsoft--DialoGPT-medium"),
+            "microsoft/DialoGPT-medium"
+        );
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("models--huggingface--CodeBERTa-small-v1"),
+            "huggingface/CodeBERTa-small-v1"
+        );
+
+        // Test single name models (no organization)
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("models--bert-base-uncased"),
+            "bert-base-uncased"
+        );
+
+        // Test datasets (TODO - should return as-is for now)
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("datasets--squad"),
+            "datasets--squad"
+        );
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("datasets--huggingface--squad"),
+            "datasets--huggingface--squad"
+        );
+
+        // Test spaces (TODO - should return as-is for now)
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("spaces--gradio--hello-world"),
+            "spaces--gradio--hello-world"
+        );
+
+        // Test unrecognized patterns (should return as-is)
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("random-folder-name"),
+            "random-folder-name"
+        );
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("some--other--format"),
+            "some--other--format"
+        );
+
+        // Test edge cases
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("models--"),
+            ""
+        );
+        assert_eq!(
+            CacheConfig::folder_name_to_model_id("models--single"),
+            "single"
+        );
     }
 }
