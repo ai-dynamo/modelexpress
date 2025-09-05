@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::providers::ModelProviderTrait;
+use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
 use hf_hub::api::tokio::ApiBuilder;
 use std::env;
@@ -34,11 +34,8 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     }
 
     // Fall back to default location
-    let home = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-
-    PathBuf::from(home).join(".cache/huggingface/hub")
+    let home = Utils::get_home_dir();
+    PathBuf::from(home).join(constants::DEFAULT_HF_CACHE_PATH)
 }
 
 /// Hugging Face model provider implementation

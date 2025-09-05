@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::constants;
+use crate::{Utils, constants};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -22,8 +22,9 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
+        let home = Utils::get_home_dir();
         Self {
-            local_path: PathBuf::from("~/.model-express/cache"),
+            local_path: PathBuf::from(home).join(constants::DEFAULT_CACHE_PATH),
             server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
             timeout_secs: None,
         }
@@ -130,9 +131,10 @@ impl CacheConfig {
 
     /// Auto-detect cache configuration
     pub fn auto_detect() -> Result<Self> {
+        let home = PathBuf::from(Utils::get_home_dir());
         let common_paths = vec![
-            PathBuf::from("~/.model-express/cache"),
-            PathBuf::from("~/.cache/huggingface/hub"),
+            home.join(constants::DEFAULT_CACHE_PATH),
+            home.join(constants::DEFAULT_HF_CACHE_PATH),
             PathBuf::from("/cache"),
             PathBuf::from("/app/models"),
             PathBuf::from("./cache"),
@@ -185,13 +187,9 @@ impl CacheConfig {
 
     /// Get configuration file path
     fn get_config_path() -> Result<PathBuf> {
-        let home = env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .context("Could not determine home directory")?;
+        let home = Utils::get_home_dir();
 
-        Ok(PathBuf::from(home)
-            .join(".model-express")
-            .join("config.yaml"))
+        Ok(PathBuf::from(home).join(constants::DEFAULT_CONFIG_PATH))
     }
 
     /// Expand path with tilde and environment variables
@@ -199,9 +197,7 @@ impl CacheConfig {
         let path_str = path.to_string_lossy();
 
         if let Some(stripped) = path_str.strip_prefix("~/") {
-            let home = env::var("HOME")
-                .or_else(|_| env::var("USERPROFILE"))
-                .context("Could not determine home directory")?;
+            let home = Utils::get_home_dir();
             Ok(PathBuf::from(home).join(stripped))
         } else {
             Ok(path.to_path_buf())

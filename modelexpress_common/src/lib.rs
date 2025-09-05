@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use std::env;
 
 pub mod cache;
 pub mod client_config;
@@ -70,9 +71,25 @@ impl From<tonic::transport::Error> for Box<Error> {
 /// Common result type for the project
 pub type Result<T> = std::result::Result<T, Box<Error>>;
 
+/// Marker struct to use Utils methods
+pub struct Utils;
+
+impl Utils {
+    /// Get home directory from environment variables
+    pub fn get_home_dir() -> String {
+        env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string())
+    }
+}
+
 /// Constants shared between client and server
 pub mod constants {
     use std::num::NonZeroU16;
+
+    pub const DEFAULT_CACHE_PATH: &str = ".model-express/cache";
+    pub const DEFAULT_HF_CACHE_PATH: &str = ".cache/huggingface/hub";
+    pub const DEFAULT_CONFIG_PATH: &str = ".model-express/config.yaml";
 
     pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
