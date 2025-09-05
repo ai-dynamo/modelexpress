@@ -471,10 +471,7 @@ mod tests {
         );
 
         // Test edge cases
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("models--"),
-            ""
-        );
+        assert_eq!(CacheConfig::folder_name_to_model_id("models--"), "");
         assert_eq!(
             CacheConfig::folder_name_to_model_id("models--single"),
             "single"
