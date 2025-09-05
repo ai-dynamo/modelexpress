@@ -41,25 +41,25 @@ env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
   MODEL_EXPRESS_LOGGING_LEVEL: "debug"
   MODEL_EXPRESS_DATABASE_PATH: "/app/models.db"
-  MODEL_EXPRESS_CACHE_DIRECTORY: "/app/cache"
+  MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
 
-probes:
-  liveness:
-    enabled: true
-    tcpSocket:
-      port: 8001
-    initialDelaySeconds: 10
-    periodSeconds: 30
-    timeoutSeconds: 10
-    failureThreshold: 3
-  readiness:
-    enabled: true
-    tcpSocket:
-      port: 8001
-    initialDelaySeconds: 5
-    periodSeconds: 10
-    timeoutSeconds: 5
-    failureThreshold: 3
+livenessProbe:
+  enabled: true
+  tcpSocket:
+    port: 8001
+  initialDelaySeconds: 15
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  tcpSocket:
+    port: 8001
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
 
 nodeSelector: {}
 

@@ -32,9 +32,9 @@ spec:
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
-          {{- with .Values.securityContext }}
+          {{- if .Values.securityContext }}
           securityContext:
-            {{- toYaml . | nindent 12 }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
           {{- end }}
           {{- if .Values.image }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -62,27 +62,27 @@ spec:
           args:
             {{- toYaml .Values.args | nindent 12 }}
           {{- end }}
-          {{- if and .Values.probes .Values.probes.liveness .Values.probes.liveness.enabled }}
+          {{- if and .Values.livenessProbe .Values.livenessProbe.enabled }}
           livenessProbe:
-            {{- if .Values.probes.liveness.tcpSocket }}
+            {{- if .Values.livenessProbe.tcpSocket }}
             tcpSocket:
-              {{- toYaml .Values.probes.liveness.tcpSocket | nindent 14 }}
+              {{- toYaml .Values.livenessProbe.tcpSocket | nindent 14 }}
             {{- end }}
-            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds | default 5 }}
-            periodSeconds: {{ .Values.probes.liveness.periodSeconds | default 10 }}
-            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds | default 5 }}
-            failureThreshold: {{ .Values.probes.liveness.failureThreshold | default 3 }}
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds | default 5 }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold | default 3 }}
           {{- end }}
-          {{- if and .Values.probes .Values.probes.readiness .Values.probes.readiness.enabled }}
+          {{- if and .Values.readinessProbe .Values.readinessProbe.enabled }}
           readinessProbe:
-            {{- if .Values.probes.readiness.tcpSocket }}
+            {{- if .Values.readinessProbe.tcpSocket }}
             tcpSocket:
-              {{- toYaml .Values.probes.readiness.tcpSocket | nindent 14 }}
+              {{- toYaml .Values.readinessProbe.tcpSocket | nindent 14 }}
             {{- end }}
-            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds | default 5 }}
-            periodSeconds: {{ .Values.probes.readiness.periodSeconds | default 10 }}
-            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds | default 5 }}
-            failureThreshold: {{ .Values.probes.readiness.failureThreshold | default 3 }}
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 10 }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds | default 5 }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold | default 3 }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -96,7 +96,7 @@ spec:
             {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
             {{- end }}
           {{- end }}
-            {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumes }}
+      {{- if or (and .Values.persistence .Values.persistence.enabled) .Values.extraVolumes }}
       volumes:
         {{- if and .Values.persistence .Values.persistence.enabled }}
         - name: model-cache
