@@ -71,6 +71,24 @@ helm install my-model-express ./helm --namespace model-express --create-namespac
 
 ## Configuration
 
+### ⚠️ Important: Override Production Values
+
+**CRITICAL:** The `values-production.yaml` file contains example values that **MUST** be overridden for your environment:
+
+- **Domain Names**: `model-express.yourdomain.com` is a placeholder - replace with your actual domain
+- **TLS Certificates**: The TLS configuration references `model-express-tls` secret - ensure this exists or update the configuration
+- **Storage Classes**: `fast-ssd` storage class may not exist in your cluster - verify or change to an available storage class
+- **Node Selectors**: `node-type: "compute"` and tolerations may not match your cluster setup
+
+**Always review and customize production values before deployment:**
+
+```bash
+# Copy and customize production values
+cp helm/values-production.yaml helm/my-production-values.yaml
+# Edit my-production-values.yaml with your actual values
+helm install model-express ./helm -f helm/my-production-values.yaml
+```
+
 The following table lists the configurable parameters of the ModelExpress chart and their default values.
 
 | Parameter                                    | Description                                    | Default |
@@ -78,7 +96,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `replicaCount`                               | Number of ModelExpress replicas                | `1`     |
 | `image.repository`                           | ModelExpress image repository                  | `nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta` |
 | `image.pullPolicy`                           | Image pull policy                              | `IfNotPresent` |
-| `image.tag`                                  | ModelExpress image tag                         | `0.1.1rc0` |
+| `image.tag`                                  | ModelExpress image tag                         | `0.1.1rc1` |
 | `imagePullSecrets`                           | Image pull secrets for nvcr.io access          | `[]`     |
 | `nameOverride`                               | Override the chart name                        | `""`     |
 | `fullnameOverride`                           | Override the full app name                     | `""`     |
@@ -108,8 +126,8 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `env.MODEL_EXPRESS_LOGGING_LEVEL`            | Logging level                                  | `info`   |
 | `env.MODEL_EXPRESS_DATABASE_PATH`            | Database path                                  | `/app/models.db` |
 | `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/app/cache` |
-| `probes.liveness.enabled`                    | Enable liveness probe                          | `true`   |
-| `probes.readiness.enabled`                   | Enable readiness probe                         | `true`   |
+| `livenessProbe.enabled`                      | Enable liveness probe                          | `true`   |
+| `readinessProbe.enabled`                     | Enable readiness probe                         | `true`   |
 | `nodeSelector`                               | Node selector                                  | `{}`     |
 | `tolerations`                                | Tolerations                                    | `[]`     |
 | `affinity`                                   | Affinity rules                                 | `{}`     |
@@ -134,6 +152,8 @@ image:
 
 ### With Ingress
 
+**⚠️ Warning:** Replace `model-express.example.com` with your actual domain and ensure the TLS secret exists.
+
 ```yaml
 # values.yaml
 ingress:
@@ -143,14 +163,14 @@ ingress:
     kubernetes.io/ingress.class: nginx
     cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
-    - host: model-express.example.com
+    - host: model-express.example.com  # ← Replace with your actual domain
       paths:
         - path: /
           pathType: Prefix
   tls:
-    - secretName: model-express-tls
+    - secretName: model-express-tls  # ← Ensure this secret exists
       hosts:
-        - model-express.example.com
+        - model-express.example.com  # ← Replace with your actual domain
 ```
 
 ### With Custom Resources

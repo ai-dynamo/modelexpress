@@ -49,6 +49,12 @@ Options:
     -u, --upgrade              Upgrade existing release
     -h, --help                 Show this help message
 
+Available values files (in script directory):
+    values-production.yaml     Production configuration
+    values-development.yaml    Development configuration  
+    values.yaml               Default configuration
+    test-values.yaml          Test configuration
+
 Examples:
     # Deploy with default values
     $0
@@ -68,13 +74,43 @@ Examples:
 EOF
 }
 
+# Function to find default values files
+find_default_values() {
+    local script_dir=$(dirname "$0")
+    local available_files=()
+    
+    # Check for common values files in the script directory
+    for file in "values-production.yaml" "values-development.yaml" "values.yaml" "test-values.yaml"; do
+        if [[ -f "$script_dir/$file" ]]; then
+            available_files+=("$file")
+        fi
+    done
+    
+    if [[ ${#available_files[@]} -gt 0 ]]; then
+        print_status "Available values files in $(basename "$script_dir"):"
+        for i in "${!available_files[@]}"; do
+            echo "  $((i+1)). ${available_files[$i]}"
+        done
+        echo ""
+    fi
+}
+
 # Function to check prerequisites
 check_prerequisites() {
     print_status "Checking prerequisites..."
     
-    # Check if kubectl is installed
-    if ! command -v kubectl &> /dev/null; then
-        print_error "kubectl is not installed. Please install kubectl first."
+    # Check for kubectl or microk8s kubectl (prioritize microk8s if available)
+    KUBECTL_CMD=""
+    if command -v microk8s &> /dev/null && microk8s kubectl version --client &> /dev/null; then
+        KUBECTL_CMD="microk8s kubectl"
+        # Set KUBECONFIG for MicroK8s
+        export KUBECONFIG=/var/snap/microk8s/current/credentials/client.config
+        print_status "Using microk8s kubectl (KUBECONFIG set to MicroK8s)"
+    elif command -v kubectl &> /dev/null; then
+        KUBECTL_CMD="kubectl"
+        print_status "Using kubectl"
+    else
+        print_error "Neither kubectl nor microk8s kubectl is available. Please install one of them."
         exit 1
     fi
     
@@ -85,7 +121,7 @@ check_prerequisites() {
     fi
     
     # Check if we can connect to Kubernetes cluster
-    if ! kubectl cluster-info &> /dev/null; then
+    if ! $KUBECTL_CMD cluster-info &> /dev/null; then
         print_error "Cannot connect to Kubernetes cluster. Please check your kubeconfig."
         exit 1
     fi
@@ -100,9 +136,9 @@ check_prerequisites() {
 
 # Function to create namespace if it doesn't exist
 create_namespace() {
-    if ! kubectl get namespace "$NAMESPACE" &> /dev/null; then
+    if ! $KUBECTL_CMD get namespace "$NAMESPACE" &> /dev/null; then
         print_status "Creating namespace: $NAMESPACE"
-        kubectl create namespace "$NAMESPACE"
+        $KUBECTL_CMD create namespace "$NAMESPACE"
         print_success "Namespace created: $NAMESPACE"
     else
         print_status "Namespace already exists: $NAMESPACE"
@@ -141,15 +177,15 @@ show_status() {
     
     echo
     echo "Pods:"
-    kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
+    $KUBECTL_CMD get pods -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
     
     echo
     echo "Services:"
-    kubectl get svc -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
+    $KUBECTL_CMD get svc -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
     
     echo
     echo "PersistentVolumeClaims:"
-    kubectl get pvc -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
+    $KUBECTL_CMD get pvc -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
 }
 
 # Parse command line arguments
@@ -190,7 +226,15 @@ done
 # Main execution
 main() {
     print_status "Starting ModelExpress Helm deployment..."
+    print_status "Release: $RELEASE_NAME"
+    print_status "Namespace: $NAMESPACE"
+    if [[ -n "$VALUES_FILE" ]]; then
+        print_status "Values file: $VALUES_FILE"
+    else
+        print_status "Values file: Using default values"
+    fi
     
+    find_default_values
     check_prerequisites
     create_namespace
     deploy_chart
@@ -198,7 +242,7 @@ main() {
     if [ "$DRY_RUN" = false ]; then
         show_status
         print_success "Deployment completed!"
-        print_status "To access the service, run: kubectl port-forward -n $NAMESPACE svc/$RELEASE_NAME 8001:8001"
+        print_status "To access the service, run: $KUBECTL_CMD port-forward -n $NAMESPACE svc/$RELEASE_NAME 8001:8001"
     fi
 }
 
