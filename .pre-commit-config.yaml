@@ -43,6 +43,7 @@ repos:
             "--all-targets",
             "--all-features",
             "--fix",
+            "--allow-dirty",
             "--",
             "-D",
             "warnings",
