@@ -34,7 +34,7 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     }
 
     // Fall back to default location
-    let home = Utils::get_home_dir();
+    let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(constants::DEFAULT_HF_CACHE_PATH)
 }
 

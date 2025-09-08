@@ -22,7 +22,7 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        let home = Utils::get_home_dir();
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
         Self {
             local_path: PathBuf::from(home).join(constants::DEFAULT_CACHE_PATH),
             server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
@@ -131,10 +131,10 @@ impl CacheConfig {
 
     /// Auto-detect cache configuration
     pub fn auto_detect() -> Result<Self> {
-        let home = PathBuf::from(Utils::get_home_dir());
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
         let common_paths = vec![
-            home.join(constants::DEFAULT_CACHE_PATH),
-            home.join(constants::DEFAULT_HF_CACHE_PATH),
+            PathBuf::from(&home).join(constants::DEFAULT_CACHE_PATH),
+            PathBuf::from(&home).join(constants::DEFAULT_HF_CACHE_PATH),
             PathBuf::from("/cache"),
             PathBuf::from("/app/models"),
             PathBuf::from("./cache"),
@@ -187,7 +187,7 @@ impl CacheConfig {
 
     /// Get configuration file path
     fn get_config_path() -> Result<PathBuf> {
-        let home = Utils::get_home_dir();
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
 
         Ok(PathBuf::from(home).join(constants::DEFAULT_CONFIG_PATH))
     }
@@ -197,7 +197,7 @@ impl CacheConfig {
         let path_str = path.to_string_lossy();
 
         if let Some(stripped) = path_str.strip_prefix("~/") {
-            let home = Utils::get_home_dir();
+            let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
             Ok(PathBuf::from(home).join(stripped))
         } else {
             Ok(path.to_path_buf())
@@ -333,6 +333,7 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Utils;
     use tempfile::TempDir;
 
     #[test]
@@ -393,5 +394,33 @@ mod tests {
         assert_eq!(stats.format_total_size(), "5.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[0]), "2.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[1]), "3.00 MB");
+    }
+
+    #[test]
+    fn test_cache_config_default() {
+        let config = CacheConfig::default();
+
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
+        assert_eq!(
+            config.local_path,
+            PathBuf::from(&home).join(constants::DEFAULT_CACHE_PATH)
+        );
+        assert_eq!(
+            config.server_endpoint,
+            String::from("http://localhost:8001")
+        );
+        assert_eq!(config.timeout_secs, None);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_get_config_path() {
+        let config_path = CacheConfig::get_config_path().expect("Failed to get config path");
+
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
+        assert_eq!(
+            config_path,
+            PathBuf::from(&home).join(constants::DEFAULT_CONFIG_PATH)
+        );
     }
 }

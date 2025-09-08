@@ -53,6 +53,9 @@ pub enum Error {
 
     #[error("Transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
+
+    #[error("Generic error: {0}")]
+    Generic(String),
 }
 
 // Implement From traits for Box<Error> to work with the Result<T> type
@@ -76,10 +79,10 @@ pub struct Utils;
 
 impl Utils {
     /// Get home directory from environment variables
-    pub fn get_home_dir() -> String {
+    pub fn get_home_dir() -> std::result::Result<String, Box<Error>> {
         env::var("HOME")
             .or_else(|_| env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string())
+            .map_err(|e| Error::Generic(format!("Failed to get home directory: {e}")).into())
     }
 }
 
@@ -180,6 +183,7 @@ impl From<grpc::model::ModelStatusUpdate> for models::ModelStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn test_status_conversion_from_models_to_grpc() {
@@ -316,5 +320,20 @@ mod tests {
         assert!(!error_response.success);
         assert!(error_response.data.is_none());
         assert!(error_response.error.is_some());
+    }
+
+    #[test]
+    fn test_utils_get_home_dir() {
+        let home_dir = Utils::get_home_dir();
+
+        if let Ok(home_dir) = home_dir {
+            assert!(!home_dir.is_empty());
+            // Check against HOME or USERPROFILE
+            if let Ok(expected_home) = env::var("HOME") {
+                assert_eq!(home_dir, expected_home);
+            } else if let Ok(expected_home) = env::var("USERPROFILE") {
+                assert_eq!(home_dir, expected_home);
+            }
+        }
     }
 }

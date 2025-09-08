@@ -23,10 +23,9 @@ pub async fn download_model(
 ) -> Result<PathBuf> {
     let provider_impl = get_provider(provider);
     info!(
-        "Downloading model '{}' from {} into {:?}",
+        "Downloading model '{}' using provider: {}",
         model_name,
-        provider_impl.provider_name(),
-        cache_dir
+        provider_impl.provider_name()
     );
     provider_impl.download_model(model_name, cache_dir).await
 }
