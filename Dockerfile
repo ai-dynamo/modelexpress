@@ -37,13 +37,14 @@ COPY --from=builder /app/target/release/test_single_client .
 COPY --from=builder /app/target/release/fallback_test .
 
 # Expose the default port
-EXPOSE 8000
+EXPOSE 8001
 
 # Set default environment variables (can be overridden)
-ENV MODEL_EXPRESS_SERVER_PORT=8000
+ENV MODEL_EXPRESS_SERVER_PORT=8001
 ENV MODEL_EXPRESS_LOGGING_LEVEL=info
 ENV MODEL_EXPRESS_DATABASE_PATH=/app/models.db
 ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
+ENV HF_HUB_CACHE=/app/cache
 
 # Run the server by default
 CMD ["./modelexpress-server"]

@@ -17,41 +17,49 @@ spec:
       labels:
         app: model-express-server
     spec:
+      imagePullSecrets:
+        - name: ngc-secret
       containers:
-      - name: model-express-server
-        image: model-express-server:latest
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8001
-        env:
-        - name: MODEL_EXPRESS_SERVER_PORT
-          value: "8001"
-        - name: MODEL_EXPRESS_LOGGING_LEVEL
-          value: "info"
-        resources:
-          limits:
-            cpu: "500m"
-            memory: "256Mi"
-          requests:
-            cpu: "200m"
-            memory: "128Mi"
-        volumeMounts:
-        - name: model-cache
-          mountPath: /root
-        livenessProbe:
-          tcpSocket:
-            port: 8001
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        readinessProbe:
-          tcpSocket:
-            port: 8001
-          initialDelaySeconds: 5
-          periodSeconds: 10
+        - name: model-express-server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta:0.1.1rc1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MODEL_EXPRESS_SERVER_PORT
+              value: "8001"
+            - name: MODEL_EXPRESS_LOGGING_LEVEL
+              value: "info"
+            - name: MODEL_EXPRESS_CACHE_DIRECTORY
+              value: "/root"
+            - name: HF_HUB_CACHE
+              value: "/root"
+            - name: HOME
+              value: "/root"
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /root
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10
       volumes:
-      - name: model-cache
-        persistentVolumeClaim:
-          claimName: nnoble-pvc
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: nnoble-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -61,6 +69,17 @@ spec:
   selector:
     app: model-express-server
   ports:
-  - port: 8001
-    targetPort: 8001
+    - port: 8001
+      targetPort: 8001
   type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nnoble-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
