@@ -3,7 +3,7 @@
 
 use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
-use hf_hub::api::tokio::ApiBuilder;
+use hf_hub::{Cache, api::tokio::ApiBuilder};
 use std::env;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -216,6 +216,19 @@ impl ModelProviderTrait for HuggingFaceProvider {
         }
 
         Ok(())
+    }
+
+    /// Get the local path of a model if it exists
+    /// Returns the path if found, or an error if not found
+    async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
+        // Get cache directory and ensure it exists
+        let cache = Cache::new(cache_dir.clone());
+        let api = ApiBuilder::from_cache(cache).build()?;
+        let repo = api.model(model_name.to_string());
+        let info = repo.info().await
+            .map_err(|e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace: {e}. Is this a valid HuggingFace ID?"))?;
+
+        Ok(cache_dir.join(model_name).join(info.sha))
     }
 
     fn provider_name(&self) -> &'static str {
