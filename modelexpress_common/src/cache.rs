@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::constants;
+use crate::{Utils, constants};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -22,8 +22,9 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
         Self {
-            local_path: PathBuf::from("~/.model-express/cache"),
+            local_path: PathBuf::from(home).join(constants::DEFAULT_CACHE_PATH),
             server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
             timeout_secs: None,
         }
@@ -130,9 +131,10 @@ impl CacheConfig {
 
     /// Auto-detect cache configuration
     pub fn auto_detect() -> Result<Self> {
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
         let common_paths = vec![
-            PathBuf::from("~/.model-express/cache"),
-            PathBuf::from("~/.cache/huggingface/hub"),
+            PathBuf::from(&home).join(constants::DEFAULT_CACHE_PATH),
+            PathBuf::from(&home).join(constants::DEFAULT_HF_CACHE_PATH),
             PathBuf::from("/cache"),
             PathBuf::from("/app/models"),
             PathBuf::from("./cache"),
@@ -140,10 +142,9 @@ impl CacheConfig {
         ];
 
         for path in common_paths {
-            let expanded_path = Self::expand_path(&path)?;
-            if expanded_path.exists() && expanded_path.is_dir() {
+            if path.exists() && path.is_dir() {
                 return Ok(Self {
-                    local_path: expanded_path,
+                    local_path: path,
                     server_endpoint: Self::get_default_server_endpoint(),
                     timeout_secs: None,
                 });
@@ -185,27 +186,9 @@ impl CacheConfig {
 
     /// Get configuration file path
     fn get_config_path() -> Result<PathBuf> {
-        let home = env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .context("Could not determine home directory")?;
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
 
-        Ok(PathBuf::from(home)
-            .join(".model-express")
-            .join("config.yaml"))
-    }
-
-    /// Expand path with tilde and environment variables
-    fn expand_path(path: &Path) -> Result<PathBuf> {
-        let path_str = path.to_string_lossy();
-
-        if let Some(stripped) = path_str.strip_prefix("~/") {
-            let home = env::var("HOME")
-                .or_else(|_| env::var("USERPROFILE"))
-                .context("Could not determine home directory")?;
-            Ok(PathBuf::from(home).join(stripped))
-        } else {
-            Ok(path.to_path_buf())
-        }
+        Ok(PathBuf::from(home).join(constants::DEFAULT_CONFIG_PATH))
     }
 
     /// Convert a Hugging Face folder name back to the original model ID
@@ -360,6 +343,7 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Utils;
     use tempfile::TempDir;
 
     #[test]
@@ -420,6 +404,34 @@ mod tests {
         assert_eq!(stats.format_total_size(), "5.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[0]), "2.00 MB");
         assert_eq!(stats.format_model_size(&stats.models[1]), "3.00 MB");
+    }
+
+    #[test]
+    fn test_cache_config_default() {
+        let config = CacheConfig::default();
+
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
+        assert_eq!(
+            config.local_path,
+            PathBuf::from(&home).join(constants::DEFAULT_CACHE_PATH)
+        );
+        assert_eq!(
+            config.server_endpoint,
+            String::from("http://localhost:8001")
+        );
+        assert_eq!(config.timeout_secs, None);
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_get_config_path() {
+        let config_path = CacheConfig::get_config_path().expect("Failed to get config path");
+
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
+        assert_eq!(
+            config_path,
+            PathBuf::from(&home).join(constants::DEFAULT_CONFIG_PATH)
+        );
     }
 
     #[test]

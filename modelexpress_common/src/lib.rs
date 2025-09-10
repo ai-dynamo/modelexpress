@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use std::env;
 
 pub mod cache;
 pub mod client_config;
@@ -52,6 +53,9 @@ pub enum Error {
 
     #[error("Transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
+
+    #[error("Generic error: {0}")]
+    Generic(String),
 }
 
 // Implement From traits for Box<Error> to work with the Result<T> type
@@ -70,9 +74,25 @@ impl From<tonic::transport::Error> for Box<Error> {
 /// Common result type for the project
 pub type Result<T> = std::result::Result<T, Box<Error>>;
 
+/// Marker struct to use Utils methods
+pub struct Utils;
+
+impl Utils {
+    /// Get home directory from environment variables
+    pub fn get_home_dir() -> std::result::Result<String, Box<Error>> {
+        env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .map_err(|e| Error::Generic(format!("Failed to get home directory: {e}")).into())
+    }
+}
+
 /// Constants shared between client and server
 pub mod constants {
     use std::num::NonZeroU16;
+
+    pub const DEFAULT_CACHE_PATH: &str = ".model-express/cache";
+    pub const DEFAULT_HF_CACHE_PATH: &str = ".cache/huggingface/hub";
+    pub const DEFAULT_CONFIG_PATH: &str = ".model-express/config.yaml";
 
     pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -163,6 +183,7 @@ impl From<grpc::model::ModelStatusUpdate> for models::ModelStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[test]
     fn test_status_conversion_from_models_to_grpc() {
@@ -299,5 +320,20 @@ mod tests {
         assert!(!error_response.success);
         assert!(error_response.data.is_none());
         assert!(error_response.error.is_some());
+    }
+
+    #[test]
+    fn test_utils_get_home_dir() {
+        let home_dir = Utils::get_home_dir();
+
+        if let Ok(home_dir) = home_dir {
+            assert!(!home_dir.is_empty());
+            // Check against HOME or USERPROFILE
+            if let Ok(expected_home) = env::var("HOME") {
+                assert_eq!(home_dir, expected_home);
+            } else if let Ok(expected_home) = env::var("USERPROFILE") {
+                assert_eq!(home_dir, expected_home);
+            }
+        }
     }
 }
