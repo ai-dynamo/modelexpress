@@ -142,10 +142,9 @@ impl CacheConfig {
         ];
 
         for path in common_paths {
-            let expanded_path = Self::expand_path(&path)?;
-            if expanded_path.exists() && expanded_path.is_dir() {
+            if path.exists() && path.is_dir() {
                 return Ok(Self {
-                    local_path: expanded_path,
+                    local_path: path,
                     server_endpoint: Self::get_default_server_endpoint(),
                     timeout_secs: None,
                 });
@@ -190,18 +189,6 @@ impl CacheConfig {
         let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
 
         Ok(PathBuf::from(home).join(constants::DEFAULT_CONFIG_PATH))
-    }
-
-    /// Expand path with tilde and environment variables
-    fn expand_path(path: &Path) -> Result<PathBuf> {
-        let path_str = path.to_string_lossy();
-
-        if let Some(stripped) = path_str.strip_prefix("~/") {
-            let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
-            Ok(PathBuf::from(home).join(stripped))
-        } else {
-            Ok(path.to_path_buf())
-        }
     }
 
     /// Get cache statistics
