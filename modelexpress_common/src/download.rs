@@ -65,6 +65,14 @@ mod tests {
             }
         }
 
+        async fn get_model_path(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<PathBuf> {
+            if self.should_succeed {
+                Ok(self.return_path.clone())
+            } else {
+                Err(anyhow::anyhow!("Mock get_model_path failed"))
+            }
+        }
+
         fn provider_name(&self) -> &'static str {
             "Mock Provider"
         }
@@ -146,6 +154,14 @@ mod tests {
 
             async fn delete_model(&self, _model_name: &str) -> Result<()> {
                 Ok(())
+            }
+
+            async fn get_model_path(
+                &self,
+                _model_name: &str,
+                _cache_dir: PathBuf,
+            ) -> Result<PathBuf> {
+                Ok(PathBuf::from("/tmp"))
             }
 
             fn provider_name(&self) -> &'static str {
