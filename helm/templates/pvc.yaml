@@ -1,0 +1,17 @@
+{{- if and .Values.persistence .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "model-express.fullname" . }}-pvc
+  labels:
+    {{- include "model-express.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ (.Values.persistence.accessMode | default "ReadWriteOnce") | quote }}
+  {{- if and .Values.persistence .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | default "10Gi" }}
+{{- end }}

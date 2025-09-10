@@ -1,0 +1,106 @@
+# Production values for ModelExpress
+replicaCount: 3
+
+image:
+  repository: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta
+  pullPolicy: Always
+  tag: "0.1.1rc1"
+
+serviceAccount:
+  create: true
+  annotations: {}
+  automount: true
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8001"
+
+podLabels: {}
+
+service:
+  type: ClusterIP
+  port: 8001
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: model-express.yourdomain.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: model-express-tls
+      hosts:
+        - model-express.yourdomain.com
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 1000m
+    memory: 1Gi
+
+persistence:
+  enabled: true
+  storageClass: "fast-ssd"
+  accessMode: ReadWriteOnce
+  size: 100Gi
+  mountPath: /root
+
+env:
+  MODEL_EXPRESS_SERVER_PORT: "8001"
+  MODEL_EXPRESS_LOGGING_LEVEL: "info"
+  MODEL_EXPRESS_DATABASE_PATH: "/app/models.db"
+  MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
+
+livenessProbe:
+  enabled: true
+  tcpSocket:
+    port: 8001
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  tcpSocket:
+    port: 8001
+  initialDelaySeconds: 15
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+nodeSelector:
+  node-type: "compute"
+
+tolerations:
+  - key: "dedicated"
+    operator: "Equal"
+    value: "model-serving"
+    effect: "NoSchedule"
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - model-express
+          topologyKey: kubernetes.io/hostname
+
+extraEnv:
+  - name: MODEL_EXPRESS_ENVIRONMENT
+    value: "production"
+  - name: MODEL_EXPRESS_MAX_CONCURRENT_REQUESTS
+    value: "100"

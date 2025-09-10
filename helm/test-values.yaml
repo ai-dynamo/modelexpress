@@ -1,0 +1,73 @@
+# Test values for ModelExpress Helm chart validation
+replicaCount: 1
+
+image:
+  repository: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta
+  pullPolicy: IfNotPresent
+  tag: "0.1.1rc1"
+
+serviceAccount:
+  create: true
+  annotations: {}
+
+podAnnotations: {}
+
+podLabels: {}
+
+service:
+  type: ClusterIP
+  port: 8001
+
+ingress:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 1Gi
+  mountPath: /root
+
+env:
+  MODEL_EXPRESS_SERVER_PORT: "8001"
+  MODEL_EXPRESS_LOGGING_LEVEL: "debug"
+  MODEL_EXPRESS_DATABASE_PATH: "/app/models.db"
+  MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
+
+livenessProbe:
+  enabled: true
+  tcpSocket:
+    port: 8001
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  tcpSocket:
+    port: 8001
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+extraEnv: []
+
+args: []
+
+command: []
