@@ -51,11 +51,15 @@ spec:
               port: 8001
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             tcpSocket:
               port: 8001
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: model-cache
           persistentVolumeClaim:
@@ -77,6 +81,8 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: nnoble-pvc
+  labels:
+    app: model-express-server
 spec:
   accessModes:
     - ReadWriteOnce
