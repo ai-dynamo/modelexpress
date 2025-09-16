@@ -295,14 +295,14 @@ mod tests {
         std::fs::DirBuilder::new()
             .recursive(true)
             .create(path.join("abc1234"))
-            .unwrap();
+            .expect("Failed to create directory");
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         std::fs::DirBuilder::new()
             .recursive(true)
             .create(path.join("def5678"))
-            .unwrap();
+            .expect("Failed to create directory");
 
         let provider = HuggingFaceProvider;
         let result = provider
@@ -310,6 +310,9 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), path.join("def5678"));
+        assert_eq!(
+            result.expect("Failed to get model path"),
+            path.join("def5678")
+        );
     }
 }
