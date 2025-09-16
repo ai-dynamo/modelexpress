@@ -223,18 +223,25 @@ impl ModelProviderTrait for HuggingFaceProvider {
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
         // Get cache directory and ensure it exists
         let cache = Cache::new(cache_dir.clone());
+        let normalized_name = model_name.replace("/", "--");
 
         // TODO: need more investigation to know we really need this api call
         let api = ApiBuilder::from_cache(cache).build()?;
         let repo = api.model(model_name.to_string());
-        let info = repo.info().await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace: {e}. Is this a valid HuggingFace ID?"))?;
+        let info = repo.info().await.map_err(|e| {
+            anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace: {e}")
+        })?;
 
-        let normalized_model_name = model_name.replace("/", "--");
-        Ok(cache_dir
-            .join(format!["models--{normalized_model_name}"])
+        let model_path = cache_dir
+            .join(format!["models--{normalized_name}"])
             .join("snapshots")
-            .join(info.sha))
+            .join(info.sha);
+
+        if !model_path.exists() {
+            anyhow::bail!("Model '{model_name}' not found in cache");
+        }
+
+        Ok(model_path)
     }
 
     fn provider_name(&self) -> &'static str {
