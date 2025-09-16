@@ -3,8 +3,9 @@
 
 use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
-use hf_hub::{Cache, api::tokio::ApiBuilder};
+use hf_hub::api::tokio::ApiBuilder;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -218,30 +219,31 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(())
     }
 
-    /// Get the local path of a model if it exists
+    /// Get the full path to the latest model snapshot if it exists
     /// Returns the path if found, or an error if not found
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
-        // Get cache directory and ensure it exists
-        let cache = Cache::new(cache_dir.clone());
         let normalized_name = model_name.replace("/", "--");
-
-        // TODO: need more investigation to know we really need this api call
-        let api = ApiBuilder::from_cache(cache).build()?;
-        let repo = api.model(model_name.to_string());
-        let info = repo.info().await.map_err(|e| {
-            anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace: {e}")
-        })?;
-
-        let model_path = cache_dir
+        let path = cache_dir
             .join(format!["models--{normalized_name}"])
-            .join("snapshots")
-            .join(info.sha);
+            .join("snapshots");
 
-        if !model_path.exists() {
-            anyhow::bail!("Model '{model_name}' not found in cache");
+        if !path.exists() {
+            anyhow::bail!("Model snapshots for '{model_name}' not found in cache");
         }
 
-        Ok(model_path)
+        let mut files: Vec<fs::DirEntry> = fs::read_dir(path)?.filter_map(Result::ok).collect();
+        files.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.created().or_else(|_| m.modified()))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+        files.reverse(); // newest first
+
+        if files.is_empty() {
+            anyhow::bail!("Model snapshots for '{model_name}' is empty");
+        }
+
+        Ok(files[0].path()) // Return the path to the newest snapshot
     }
 
     fn provider_name(&self) -> &'static str {
@@ -253,6 +255,8 @@ impl ModelProviderTrait for HuggingFaceProvider {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use tokio::time::Duration;
 
     #[test]
     fn test_hugging_face_provider_name() {
@@ -275,5 +279,35 @@ mod tests {
         let result = provider.delete_model("nonexistent/model").await;
         // Should succeed (return Ok(())) even if model doesn't exist
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_model_path_trait() {
+        // Construct a temporary cache dir with a model snapshots
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let path = temp_dir
+            .path()
+            .join("models--test--model")
+            .join("snapshots");
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(path.join("abc1234"))
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(path.join("def5678"))
+            .unwrap();
+
+        let provider = HuggingFaceProvider;
+        let result = provider
+            .get_model_path("test/model", temp_dir.path().to_path_buf())
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), path.join("def5678"));
     }
 }
