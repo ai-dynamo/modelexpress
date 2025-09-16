@@ -120,7 +120,7 @@ impl Client {
         })
     }
 
-    /// TODO: change to using default client/server cache dirs
+    /// TODO: change to using the current client cache dir
     fn get_model_express_cache_dir() -> PathBuf {
         if let Ok(cache_path) = env::var("HF_HUB_CACHE") {
             return PathBuf::from(cache_path);
