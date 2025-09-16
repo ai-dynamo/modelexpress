@@ -77,7 +77,9 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         let repo = api.model(model_name.clone());
 
-        let info = repo.info().await.map_err(|e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"))?;
+        let info = repo.info().await.map_err(
+            |e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"),
+        )?;
         info!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {

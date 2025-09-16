@@ -22,6 +22,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::Channel;
+use tracing::debug;
 use tracing::info;
 #[cfg(test)]
 use tracing::warn;
@@ -135,16 +136,12 @@ impl Client {
 
     pub async fn get_model_path(&self, model_name: &str) -> anyhow::Result<PathBuf> {
         let cache_dir = Client::get_model_express_cache_dir();
-
-        info!("### CACHE DIR: {:?}", cache_dir);
-
         let model_path = HuggingFaceProvider
             .get_model_path(model_name, cache_dir)
             .await
             .map_err(|e| anyhow::anyhow!(format!("Failed to get model path: {e}")))?;
 
-        info!("### MODEL PATH: {:?}", model_path);
-
+        debug!("Found model path at {:?}", model_path);
         Ok(model_path)
     }
 
