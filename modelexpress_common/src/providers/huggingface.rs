@@ -5,8 +5,9 @@ use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
 use hf_hub::api::tokio::ApiBuilder;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
@@ -76,7 +77,9 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         let repo = api.model(model_name.clone());
 
-        let info = repo.info().await.map_err(|e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"))?;
+        let info = repo.info().await.map_err(
+            |e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"),
+        )?;
         info!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {
@@ -218,6 +221,54 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(())
     }
 
+    /// Get the full path to the latest model snapshot if it exists
+    /// Returns the path if found, or an error if not found
+    async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
+        let normalized_name = model_name.replace("/", "--");
+        let path = cache_dir
+            .join(format!["models--{normalized_name}"])
+            .join("snapshots");
+
+        if !path.exists() {
+            anyhow::bail!("Model snapshots for '{model_name}' not found in cache");
+        }
+
+        let mut files: Vec<fs::DirEntry> = fs::read_dir(path)?.filter_map(Result::ok).collect();
+        if files.is_empty() {
+            anyhow::bail!("Model snapshots for '{model_name}' is empty");
+        }
+
+        // A bit hacky way to figure out the latest snapshot
+        files.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.created().or_else(|_| m.modified()))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+        files.reverse();
+
+        // Check against the latest commit hash from HF
+        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let api = ApiBuilder::from_env().with_token(token).build()?;
+        let repo = api.model(model_name.to_string());
+        let info = repo.info().await.map_err(|e| {
+            anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace: {e}")
+        })?;
+
+        for file in &files {
+            if file.file_name().display().to_string() == info.sha {
+                return Ok(file.path());
+            }
+        }
+
+        warn!(
+            "Existing model snapshots do not match the latest commit hash '{0}'. \
+            Returning the best-effort, latest local model snapshot.",
+            info.sha
+        );
+
+        Ok(files[0].path())
+    }
+
     fn provider_name(&self) -> &'static str {
         "Hugging Face"
     }
@@ -227,6 +278,11 @@ impl ModelProviderTrait for HuggingFaceProvider {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use tokio::time::Duration;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_hugging_face_provider_name() {
@@ -249,5 +305,47 @@ mod tests {
         let result = provider.delete_model("nonexistent/model").await;
         // Should succeed (return Ok(())) even if model doesn't exist
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_model_path_trait() {
+        let server = MockServer::start().await;
+
+        // Return the desired sha we want get_model_path to pick
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "test/model",
+                "sha": "def5678",
+                "siblings": []
+            })))
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("HF_ENDPOINT", server.uri());
+        }
+
+        // Construct a temporary cache dir with a model snapshots
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let path = temp_dir
+            .path()
+            .join("models--test--model")
+            .join("snapshots");
+
+        std::fs::create_dir_all(path.join("abc1234")).expect("Failed to create directory");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::fs::create_dir_all(path.join("def5678")).expect("Failed to create directory");
+
+        let provider = HuggingFaceProvider;
+        let result = provider
+            .get_model_path("test/model", temp_dir.path().to_path_buf())
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            result.expect("Failed to get model path"),
+            path.join("def5678")
+        );
     }
 }
