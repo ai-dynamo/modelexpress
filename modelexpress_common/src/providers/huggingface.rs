@@ -262,7 +262,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         warn!(
             "Existing model snapshots do not match the latest commit hash '{0}'. \
-            Returning the best-effort, latest model snapshot.",
+            Returning the best-effort, latest local model snapshot.",
             info.sha
         );
 
