@@ -126,7 +126,7 @@ impl Client {
             return PathBuf::from(cache_path);
         }
 
-        if let Ok(cache_path) = env::var("MODEL_EXPRESS_PATH") {
+        if let Ok(cache_path) = env::var("MODEL_EXPRESS_CACHE_PATH") {
             return PathBuf::from(cache_path);
         }
         let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
