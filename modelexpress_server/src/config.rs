@@ -502,13 +502,8 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-              graceful_shutdown: true
-              shutdown_timeout_seconds: 60
             database:
               path: "./test.db"
-              wal_mode: false
-              pool_size: 5
-              connection_timeout_seconds: 15
             cache:
               eviction:
                 enabled: false
@@ -598,13 +593,8 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-              graceful_shutdown: true
-              shutdown_timeout_seconds: 30
             database:
               path: "./test.db"
-              wal_mode: true
-              pool_size: 10
-              connection_timeout_seconds: 30
             cache:
               eviction:
                 enabled: true
