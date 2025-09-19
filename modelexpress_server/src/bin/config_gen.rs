@@ -3,10 +3,10 @@
 
 use clap::Parser;
 use modelexpress_server::config::ServerConfig;
-use tracing::info;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(
