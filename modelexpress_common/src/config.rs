@@ -477,7 +477,7 @@ mod tests {
             endpoint: "http://localhost:9999"
             timeout_secs: not_a_number
             invalid_yaml_structure:
-            missing_indent
+                missing_indent
         "#;
 
         fs::write(&config_file, invalid_config).expect("Failed to write config file");
