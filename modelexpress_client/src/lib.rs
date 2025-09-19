@@ -3,8 +3,9 @@
 
 mod error;
 
+use modelexpress_common::providers::ModelProviderTrait;
 use modelexpress_common::{
-    Result as CommonResult,
+    Result as CommonResult, Utils,
     cache::{CacheConfig, CacheStats},
     client_config::ClientConfig as Config,
     constants, download,
@@ -14,10 +15,14 @@ use modelexpress_common::{
         model::{ModelDownloadRequest, model_service_client::ModelServiceClient},
     },
     models::{ModelStatus, Status},
+    providers::huggingface::HuggingFaceProvider,
 };
 use std::collections::HashMap;
+use std::env;
+use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::Channel;
+use tracing::debug;
 use tracing::info;
 #[cfg(test)]
 use tracing::warn;
@@ -113,6 +118,31 @@ impl Client {
         cache_config.clear_all().map_err(|e| {
             modelexpress_common::Error::Server(format!("Failed to clear cache: {e}")).into()
         })
+    }
+
+    /// TODO: change to using the current client cache dir
+    fn get_model_express_cache_dir() -> PathBuf {
+        if let Ok(cache_path) = env::var("HF_HUB_CACHE") {
+            return PathBuf::from(cache_path);
+        }
+
+        if let Ok(cache_path) = env::var("MODEL_EXPRESS_CACHE_PATH") {
+            return PathBuf::from(cache_path);
+        }
+        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
+
+        PathBuf::from(home).join(".cache/huggingface/hub")
+    }
+
+    pub async fn get_model_path(&self, model_name: &str) -> anyhow::Result<PathBuf> {
+        let cache_dir = Client::get_model_express_cache_dir();
+        let model_path = HuggingFaceProvider
+            .get_model_path(model_name, cache_dir)
+            .await
+            .map_err(|e| anyhow::anyhow!(format!("Failed to get model path: {e}")))?;
+
+        debug!("Found model path at {:?}", model_path);
+        Ok(model_path)
     }
 
     /// Pre-download model to cache
