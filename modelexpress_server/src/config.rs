@@ -486,10 +486,10 @@ mod tests {
         let duration_config: DurationConfig = serde_json::from_str(json).expect("Failed to parse");
         assert_eq!(duration_config.num_seconds(), 3600);
 
-        // Test serializing (it serializes as an object with the duration field)
+        // Test serializing (it should serialize as just the number)
         let duration_config = DurationConfig::hours(1);
         let serialized = serde_json::to_string(&duration_config).expect("Failed to serialize");
-        assert_eq!(serialized, r#"{"duration":3600}"#);
+        assert_eq!(serialized, r#"3600"#);
     }
 
     #[test]
