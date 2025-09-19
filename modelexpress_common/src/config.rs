@@ -29,9 +29,8 @@ pub fn parse_duration_string(value: &str) -> Result<Duration, String> {
 }
 
 /// A wrapper around chrono::Duration that can be deserialized from string or seconds
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct DurationConfig {
-    #[serde(with = "duration_serde")]
     duration: Duration,
 }
 
@@ -58,6 +57,16 @@ impl DurationConfig {
 impl fmt::Display for DurationConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}s", self.duration.num_seconds())
+    }
+}
+
+// Serialize as just the number of seconds (not as a struct)
+impl Serialize for DurationConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.duration.num_seconds().serialize(serializer)
     }
 }
 
@@ -103,19 +112,6 @@ impl<'de> Deserialize<'de> for DurationConfig {
         }
 
         deserializer.deserialize_any(DurationVisitor)
-    }
-}
-
-// Helper module for serializing Duration
-mod duration_serde {
-    use chrono::Duration;
-    use serde::{Serialize, Serializer};
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        duration.num_seconds().serialize(serializer)
     }
 }
 
@@ -238,6 +234,22 @@ where
     config.try_deserialize::<T>()
 }
 
+fn discover_default_config() -> Option<PathBuf> {
+    let default_configs = [
+        "model-express.yaml",
+        "model-express.yml",
+        "/etc/model-express/config.yaml",
+        "/etc/model-express/config.yml",
+    ];
+
+    for config_path in &default_configs {
+        if PathBuf::from(config_path).exists() {
+            return Some(PathBuf::from(config_path));
+        }
+    }
+    None
+}
+
 /// Load configuration with strict file parsing but with environment variable overrides.
 /// This is used internally by both strict validation and normal loading with fallbacks.
 fn load_config_with_env_strict<T>(
@@ -249,30 +261,24 @@ where
 {
     let mut builder = Config::builder();
 
-    // Add configuration file if specified or if default exists
+    // Only load config file if explicitly provided
     if let Some(config_path) = &config_file {
-        if config_path.exists() {
-            builder = builder.add_source(File::from(config_path.clone()));
-        } else {
+        if !config_path.exists() {
             return Err(ConfigError::Message(format!(
                 "Configuration file not found: {}",
                 config_path.display()
             )));
         }
+        builder = builder.add_source(File::from(config_path.clone()));
     } else {
-        // Try to load from default locations
-        let default_configs = [
-            "model-express.yaml",
-            "model-express.yml",
-            "/etc/model-express/config.yaml",
-            "/etc/model-express/config.yml",
-        ];
-
-        for config_path in &default_configs {
-            if PathBuf::from(config_path).exists() {
-                builder = builder.add_source(File::with_name(config_path).required(false));
-                break;
-            }
+        if let Some(default_path) = discover_default_config() {
+            println!("Using default config: {}", default_path.display());
+            builder = builder.add_source(File::from(default_path));
+        } else {
+            return Err(ConfigError::Message(format!(
+                "No configuration file specified and no default config found. \
+                 Please specify a config file with --config or create a default config."
+            )));
         }
     }
 
@@ -283,7 +289,6 @@ where
             .separator("_"),
     );
 
-    // Build and deserialize strictly
     let config = builder.build()?;
     config.try_deserialize::<T>()
 }
@@ -444,11 +449,11 @@ mod tests {
         let config_file = temp_dir.path().join("test_config.yaml");
 
         let valid_config = r#"
-endpoint: "http://localhost:9999"
-timeout_secs: 60
-max_retries: 5
-retry_delay_secs: 2
-"#;
+            endpoint: "http://localhost:9999"
+            timeout_secs: 60
+            max_retries: 5
+            retry_delay_secs: 2
+        "#;
 
         fs::write(&config_file, valid_config).expect("Failed to write config file");
 
@@ -469,11 +474,11 @@ retry_delay_secs: 2
         let config_file = temp_dir.path().join("invalid_config.yaml");
 
         let invalid_config = r#"
-endpoint: "http://localhost:9999"
-timeout_secs: not_a_number
-invalid_yaml_structure:
-  missing_indent
-"#;
+            endpoint: "http://localhost:9999"
+            timeout_secs: not_a_number
+            invalid_yaml_structure:
+            missing_indent
+        "#;
 
         fs::write(&config_file, invalid_config).expect("Failed to write config file");
 
@@ -488,9 +493,9 @@ invalid_yaml_structure:
         let config_file = temp_dir.path().join("wrong_type_config.yaml");
 
         let wrong_type_config = r#"
-endpoint: "http://localhost:9999"
-timeout_secs: "this_should_be_a_number"
-"#;
+            endpoint: "http://localhost:9999"
+            timeout_secs: "this_should_be_a_number"
+        "#;
 
         fs::write(&config_file, wrong_type_config).expect("Failed to write config file");
 
@@ -505,9 +510,9 @@ timeout_secs: "this_should_be_a_number"
         let config_file = temp_dir.path().join("test_config.yaml");
 
         let valid_config = r#"
-endpoint: "http://localhost:9999"
-timeout_secs: 60
-"#;
+            endpoint: "http://localhost:9999"
+            timeout_secs: 60
+        "#;
 
         fs::write(&config_file, valid_config).expect("Failed to write config file");
 

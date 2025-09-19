@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = if let Some(input_path) = &args.input {
         load_existing_config(input_path)?
     } else {
+        println!("Generating default configuration");
         ServerConfig::default()
     };
 
@@ -69,6 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+
+    println!("{}", "=".repeat(50));
+    println!("{content}");
+    println!("{}", "=".repeat(50));
 
     // Show differences if requested
     if args.show_diff {
