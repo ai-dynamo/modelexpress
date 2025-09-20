@@ -276,7 +276,8 @@ where
     } else {
         return Err(ConfigError::Message(
             "No configuration file specified and no default config found. \
-             Please specify a config file with --config or create a default config.".to_string()
+             Please specify a config file with --config or create a default config."
+                .to_string(),
         ));
     }
 
