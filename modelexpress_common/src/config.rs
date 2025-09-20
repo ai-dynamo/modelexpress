@@ -270,16 +270,14 @@ where
             )));
         }
         builder = builder.add_source(File::from(config_path.clone()));
+    } else if let Some(default_path) = discover_default_config() {
+        println!("Using default config: {}", default_path.display());
+        builder = builder.add_source(File::from(default_path));
     } else {
-        if let Some(default_path) = discover_default_config() {
-            println!("Using default config: {}", default_path.display());
-            builder = builder.add_source(File::from(default_path));
-        } else {
-            return Err(ConfigError::Message(format!(
-                "No configuration file specified and no default config found. \
-                 Please specify a config file with --config or create a default config."
-            )));
-        }
+        return Err(ConfigError::Message(
+            "No configuration file specified and no default config found. \
+             Please specify a config file with --config or create a default config.".to_string()
+        ));
     }
 
     // Add environment variables
