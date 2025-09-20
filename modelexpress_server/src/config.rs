@@ -486,10 +486,10 @@ mod tests {
         let duration_config: DurationConfig = serde_json::from_str(json).expect("Failed to parse");
         assert_eq!(duration_config.num_seconds(), 3600);
 
-        // Test serializing (it serializes as an object with the duration field)
+        // Test serializing (it should serialize as just the number)
         let duration_config = DurationConfig::hours(1);
         let serialized = serde_json::to_string(&duration_config).expect("Failed to serialize");
-        assert_eq!(serialized, r#"{"duration":3600}"#);
+        assert_eq!(serialized, r#"3600"#);
     }
 
     #[test]
@@ -502,13 +502,8 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-              graceful_shutdown: true
-              shutdown_timeout_seconds: 60
             database:
               path: "./test.db"
-              wal_mode: false
-              pool_size: 5
-              connection_timeout_seconds: 15
             cache:
               eviction:
                 enabled: false
@@ -598,13 +593,8 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-              graceful_shutdown: true
-              shutdown_timeout_seconds: 30
             database:
               path: "./test.db"
-              wal_mode: true
-              pool_size: 10
-              connection_timeout_seconds: 30
             cache:
               eviction:
                 enabled: true

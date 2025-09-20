@@ -6,6 +6,7 @@ use modelexpress_server::config::ServerConfig;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = if let Some(input_path) = &args.input {
         load_existing_config(input_path)?
     } else {
+        info!("Generating default configuration");
         ServerConfig::default()
     };
 
