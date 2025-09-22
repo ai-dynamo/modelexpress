@@ -428,7 +428,9 @@ mod tests {
             .await
             .expect("Failed to download model");
 
-        let files = fs::read_dir(result).unwrap().filter_map(Result::ok);
+        let files = fs::read_dir(result)
+            .expect("Failed to read directory")
+            .filter_map(Result::ok);
 
         for file in files {
             info!("File: {}", file.path().display());
