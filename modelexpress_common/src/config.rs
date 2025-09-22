@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tracing::Level;
+use tracing::{info, Level};
 
 /// Parse a duration string into a `chrono::Duration`.
 /// Supports formats like "2h", "30m", "45s", "1d", etc.
@@ -271,7 +271,7 @@ where
         }
         builder = builder.add_source(File::from(config_path.clone()));
     } else if let Some(default_path) = discover_default_config() {
-        println!("Using default config: {}", default_path.display());
+        info!("Using default config: {}", default_path.display());
         builder = builder.add_source(File::from(default_path));
     } else {
         return Err(ConfigError::Message(

@@ -143,10 +143,10 @@ cargo run --bin modelexpress-server -- --config model-express.yaml
 ```yaml
 server:
   host: 0.0.0.0
-  port: 8002
+  port: 8001
 
 database:
-  path: ./models2.db
+  path: ./models.db
 
 cache:
   eviction:
