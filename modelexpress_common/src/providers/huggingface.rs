@@ -50,6 +50,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         &self,
         model_name: &str,
         cache_dir: Option<PathBuf>,
+        ignore_weights: bool,
     ) -> Result<PathBuf> {
         info!("Downloading model from Hugging Face: {model_name}");
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
@@ -93,6 +94,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
             if HuggingFaceProvider::is_ignored(&sib.rfilename)
                 || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
             {
+                continue;
+            }
+
+            if ignore_weights && HuggingFaceProvider::is_weight_file(&sib.rfilename) {
                 continue;
             }
 

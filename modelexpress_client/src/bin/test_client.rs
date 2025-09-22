@@ -77,7 +77,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         info!("Client 1: Requesting model {model_name1}");
         let start = Instant::now();
         client1
-            .request_model(model_name1)
+            .request_model(model_name1, false)
             .await
             .expect("Client 1 failed to download model");
         info!("Client 1: Model downloaded in {:?}", start.elapsed());
@@ -93,7 +93,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         info!("Client 2: Requesting model {model_name2}");
         let start = Instant::now();
         client2
-            .request_model(model_name2)
+            .request_model(model_name2, false)
             .await
             .expect("Client 2 failed to download model");
         info!("Client 2: Model downloaded in {:?}", start.elapsed());
@@ -119,7 +119,7 @@ async fn run_provider_test(model_name: &str) -> Result<(), Box<dyn std::error::E
     let start = Instant::now();
 
     client
-        .request_model_with_provider(model_name, ModelProvider::HuggingFace)
+        .request_model_with_provider(model_name, ModelProvider::HuggingFace, false)
         .await
         .expect("Failed to download model with explicit Hugging Face provider");
 
@@ -141,7 +141,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
 
     // This should work via server since it's running
     client
-        .request_model_with_provider_and_fallback(model_name, ModelProvider::HuggingFace)
+        .request_model_with_provider_and_fallback(model_name, ModelProvider::HuggingFace, false)
         .await
         .expect("Failed to download model with fallback enabled");
 
@@ -154,7 +154,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
     info!("Testing direct download (bypassing server)...");
     let start_direct = Instant::now();
 
-    Client::download_model_directly(model_name, ModelProvider::HuggingFace)
+    Client::download_model_directly(model_name, ModelProvider::HuggingFace, false)
         .await
         .expect("Failed to download model directly");
 
@@ -168,6 +168,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         model_name,
         ModelProvider::HuggingFace,
         ClientConfig::default(),
+        false,
     )
     .await
     .expect("Failed to download model with smart fallback");

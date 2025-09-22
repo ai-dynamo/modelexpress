@@ -5,7 +5,7 @@ use crate::models::ModelProvider;
 use crate::providers::{HuggingFaceProvider, ModelProviderTrait};
 use anyhow::Result;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Provider factory to get the appropriate provider implementation
 #[must_use]
@@ -20,6 +20,7 @@ pub async fn download_model(
     model_name: &str,
     provider: ModelProvider,
     cache_dir: Option<PathBuf>,
+    ignore_weights: bool,
 ) -> Result<PathBuf> {
     let provider_impl = get_provider(provider);
     info!(
@@ -27,7 +28,14 @@ pub async fn download_model(
         model_name,
         provider_impl.provider_name()
     );
-    provider_impl.download_model(model_name, cache_dir).await
+
+    if ignore_weights {
+        warn!("`ignore_weights` is set to true. All the model weight files will be ignored!");
+    }
+
+    provider_impl
+        .download_model(model_name, cache_dir, ignore_weights)
+        .await
 }
 
 #[cfg(test)]
@@ -49,6 +57,7 @@ mod tests {
             &self,
             _model_name: &str,
             _cache_dir: Option<PathBuf>,
+            _ignore_weights: bool,
         ) -> Result<PathBuf> {
             if self.should_succeed {
                 Ok(self.return_path.clone())
@@ -101,7 +110,7 @@ mod tests {
         };
 
         let result = mock_provider
-            .download_model("test-model", Some(temp_dir.path().to_path_buf()))
+            .download_model("test-model", Some(temp_dir.path().to_path_buf()), false)
             .await;
         assert!(result.is_ok());
         assert_eq!(result.expect("Expected successful result"), temp_dir.path());
@@ -116,7 +125,7 @@ mod tests {
         };
 
         let result = mock_provider
-            .download_model("test-model", Some(temp_dir.path().to_path_buf()))
+            .download_model("test-model", Some(temp_dir.path().to_path_buf()), false)
             .await;
         assert!(result.is_err());
         assert!(
@@ -148,6 +157,7 @@ mod tests {
                 &self,
                 _model_name: &str,
                 _cache_dir: Option<PathBuf>,
+                _ignore_weights: bool,
             ) -> Result<PathBuf> {
                 Ok(PathBuf::from("/tmp"))
             }

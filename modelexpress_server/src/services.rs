@@ -124,6 +124,7 @@ impl ModelService for ModelServiceImpl {
             modelexpress_common::grpc::model::ModelProvider::try_from(model_request.provider)
                 .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
                 .into();
+        let ignore_weights = model_request.ignore_weights;
 
         // Spawn a task to handle the streaming download updates
         tokio::spawn(async move {
@@ -155,7 +156,7 @@ impl ModelService for ModelServiceImpl {
 
             // Start or monitor the download process
             let final_status = MODEL_TRACKER
-                .ensure_model_downloaded(&model_name, provider, &tx)
+                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
                 .await;
 
             // Send final status update
@@ -321,6 +322,7 @@ impl ModelDownloadTracker {
         model_name: &str,
         provider: ModelProvider,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
+        ignore_weights: bool,
     ) -> ModelStatus {
         // Atomically try to claim this model for download using compare-and-swap
         let status = match self.database.try_claim_for_download(model_name, provider) {
@@ -383,7 +385,14 @@ impl ModelDownloadTracker {
                 // Perform the download in the background
                 tokio::spawn(async move {
                     let cache_dir = get_server_cache_dir();
-                    match download::download_model(&model_name_owned, provider, cache_dir).await {
+                    match download::download_model(
+                        &model_name_owned,
+                        provider,
+                        cache_dir,
+                        ignore_weights,
+                    )
+                    .await
+                    {
                         Ok(_path) => {
                             // Download completed successfully
                             tracker.set_status_and_notify(
@@ -438,7 +447,14 @@ impl ModelDownloadTracker {
 
             tokio::spawn(async move {
                 let cache_dir = get_server_cache_dir();
-                match download::download_model(&model_name_owned, provider, cache_dir).await {
+                match download::download_model(
+                    &model_name_owned,
+                    provider,
+                    cache_dir,
+                    ignore_weights,
+                )
+                .await
+                {
                     Ok(_path) => {
                         // Download completed successfully
                         tracker.set_status_and_notify(
@@ -631,6 +647,7 @@ mod tests {
         let request = Request::new(ModelDownloadRequest {
             model_name: model_name.clone(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            ignore_weights: false,
         });
 
         let response = service.ensure_model_downloaded(request).await;
@@ -728,6 +745,7 @@ mod tests {
         let request = Request::new(ModelDownloadRequest {
             model_name: model_name.to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            ignore_weights: false,
         });
 
         let response = service.ensure_model_downloaded(request).await;
