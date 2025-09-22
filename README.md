@@ -128,15 +128,48 @@ Create a configuration file (supports YAML):
 ```bash
 # Generate a sample configuration file
 cargo run --bin config_gen -- --output model-express.yaml
-
-# Or use the provided sample
-cp model-express.yaml my-config.yaml
 ```
 
 Start the server with a configuration file:
 
 ```bash
-cargo run --bin modelexpress-server -- --config my-config.yaml
+cargo run --bin modelexpress-server -- --config model-express.yaml
+```
+
+#### Example Configuration Files
+
+**Basic Configuration (`model-express.yaml`):**
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8001
+
+database:
+  path: ./models.db
+
+cache:
+  eviction:
+    enabled: true
+    policy:
+      type: lru
+      unused_threshold: 60
+      max_models: null
+      min_free_space_bytes: null
+    check_interval: 360
+  directory: ./cache
+  max_size_bytes: null
+
+logging:
+  level: Info
+  format: Pretty
+  file: null
+  structured: false
+```
+
+**Running Commands:**
+```bash
+cargo run --bin modelexpress-server -- --config model-express.yaml
 ```
 
 ### Environment Variables
@@ -167,11 +200,12 @@ export MODEL_EXPRESS_LOGGING_FORMAT=json
 cargo run --bin modelexpress-server -- --port 8080 --log-level debug
 
 # With configuration file
-cargo run --bin modelexpress-server -- --config my-config.yaml --port 8080
+cargo run --bin modelexpress-server -- --config model-express.yaml --port 8080
 
 # Validate configuration
-cargo run --bin modelexpress-server -- --config my-config.yaml --validate-config
+cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
 ```
+
 
 ### Configuration Options
 
@@ -252,6 +286,9 @@ ModelExpress/
 ├── modelexpress_server/     # Main gRPC server
 ├── modelexpress_client/     # Client library
 ├── modelexpress_common/     # Shared code
+├── examples/                 # Example deployment with dynamo
+├── helm/                     # Helm chart for Kubernetes deployment
+├── docs/                     # Documentation and guides
 ├── workspace-tests/          # Integration tests
 ├── docker-compose.yml        # Docker configuration
 ├── Dockerfile                # Docker build file
