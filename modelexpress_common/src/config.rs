@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use tracing::{info, Level};
+use tracing::{Level, info};
 
 /// Parse a duration string into a `chrono::Duration`.
 /// Supports formats like "2h", "30m", "45s", "1d", etc.
