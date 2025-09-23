@@ -74,7 +74,7 @@ async fn run_model_test(model_name: &str) -> Result<(), Box<dyn std::error::Erro
     info!("Client: Requesting model {model_name}");
     let start = Instant::now();
 
-    match client.request_model(model_name.to_string()).await {
+    match client.request_model(model_name.to_string(), false).await {
         Ok(()) => {
             info!("Client: Model downloaded in {:?}", start.elapsed());
             info!("Client completed in {:?}", start_time.elapsed());
@@ -97,7 +97,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
 
     // This should work via server since it's running
     match client
-        .request_model_with_provider_and_fallback(model_name, ModelProvider::HuggingFace)
+        .request_model_with_provider_and_fallback(model_name, ModelProvider::HuggingFace, false)
         .await
     {
         Ok(()) => {
@@ -115,7 +115,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
     info!("Testing direct download (bypassing server)...");
     let start_direct = Instant::now();
 
-    match Client::download_model_directly(model_name, ModelProvider::HuggingFace).await {
+    match Client::download_model_directly(model_name, ModelProvider::HuggingFace, false).await {
         Ok(()) => {
             info!("Model downloaded directly in {:?}", start_direct.elapsed());
         }
@@ -132,6 +132,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         model_name,
         ModelProvider::HuggingFace,
         ClientConfig::default(),
+        false,
     )
     .await
     {

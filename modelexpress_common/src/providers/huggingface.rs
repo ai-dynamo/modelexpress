@@ -50,6 +50,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         &self,
         model_name: &str,
         cache_dir: Option<PathBuf>,
+        ignore_weights: bool,
     ) -> Result<PathBuf> {
         info!("Downloading model from Hugging Face: {model_name}");
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
@@ -67,7 +68,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         // CPUs by multiplexing the downloads.
         // However in data-center focused environments with model express
         // this may help saturate the bandwidth (>500MB/s) better.
-        let api = ApiBuilder::new()
+        let api = ApiBuilder::from_env()
             .with_progress(true)
             .with_token(token)
             .high()
@@ -93,6 +94,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
             if HuggingFaceProvider::is_ignored(&sib.rfilename)
                 || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
             {
+                continue;
+            }
+
+            if ignore_weights && HuggingFaceProvider::is_weight_file(&sib.rfilename) {
                 continue;
             }
 
@@ -284,6 +289,87 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Minimal mock of the Hugging Face Hub used by tests.
+    ///
+    /// This server stubs:
+    /// - the model info endpoint (`/api/models/<repo>`), returning a fixed `sha` and file list
+    /// - the file resolve endpoints (`/<repo>/resolve/<rev>/<filename>`) for each sibling
+    ///
+    /// The hf_hub client writes files into `cache_path` when the resolve endpoints return
+    /// successful responses with the headers it expects (ETag, commit, range). This allows
+    /// us to simulate a real model download without external network access.
+    struct MockHFServer {
+        /// WireMock instance; keeps the server alive for the lifetime of the test
+        _server: MockServer,
+        /// Temporary HF cache root that tests pass to `ApiBuilder::with_cache_dir`
+        pub cache_path: PathBuf,
+    }
+
+    impl MockHFServer {
+        /// Start a WireMock server and configure stubs compatible with hf_hub's download flow.
+        ///
+        /// Notes on headers and status codes expected by hf_hub:
+        /// - `etag`: used for dedup and cache validation
+        /// - `x-repo-commit`: identifies the snapshot commit (must match `info.sha`)
+        /// - Range download: GETs may be partial; we return 206 with `accept-ranges`,
+        ///   `content-length` and `content-range` to keep the client happy across versions.
+        async fn new() -> Self {
+            let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+            let server = MockServer::start().await;
+
+            // Return the desired sha we want get_model_path to pick
+            // Matches GET /api/models/test/model (and subpaths).
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "test/model",
+                    "sha": "def5678",
+                    "siblings": [
+                        {"rfilename": "config.json"},
+                        {"rfilename": "model.safetensors"},
+                        {"rfilename": "tokenizer.json"},
+                        {"rfilename": "README.md"},
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            // Mock resolved file contents so hf_hub can populate the cache
+            // Matches GET /test/model/resolve/<rev>/(config.json|tokenizer.json|README.md|model.safetensors)
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/test/model/resolve/(main|[^/]+)/(?:config\.json|tokenizer\.json|README\.md|model\.safetensors)$"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .insert_header("etag", "\"def5678\"")
+                        .insert_header("x-repo-commit", "def5678")
+                        .insert_header("accept-ranges", "bytes")
+                        .insert_header("content-length", "64")
+                        .insert_header("content-range", "bytes 0-63/64")
+                        .set_body_bytes(vec![0u8; 64]),
+                )
+                .mount(&server)
+                .await;
+
+            unsafe {
+                std::env::set_var("HF_ENDPOINT", server.uri());
+            }
+
+            Self {
+                _server: server,
+                cache_path: temp_dir.path().to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for MockHFServer {
+        /// Ensure the temporary cache path is removed even if a test fails.
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.cache_path).unwrap_or_else(|e| {
+                warn!("Failed to remove temporary cache path: {e}");
+            });
+        }
+    }
+
     #[test]
     fn test_hugging_face_provider_name() {
         let provider = HuggingFaceProvider;
@@ -309,27 +395,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_model_path_trait() {
-        let server = MockServer::start().await;
-
-        // Return the desired sha we want get_model_path to pick
-        Mock::given(method("GET"))
-            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "test/model",
-                "sha": "def5678",
-                "siblings": []
-            })))
-            .mount(&server)
-            .await;
-
-        unsafe {
-            std::env::set_var("HF_ENDPOINT", server.uri());
-        }
+        let mock_server = MockHFServer::new().await;
 
         // Construct a temporary cache dir with a model snapshots
-        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let path = temp_dir
-            .path()
+        let path = mock_server
+            .cache_path
             .join("models--test--model")
             .join("snapshots");
 
@@ -339,7 +409,7 @@ mod tests {
 
         let provider = HuggingFaceProvider;
         let result = provider
-            .get_model_path("test/model", temp_dir.path().to_path_buf())
+            .get_model_path("test/model", mock_server.cache_path.clone())
             .await;
 
         assert!(result.is_ok());
@@ -347,5 +417,24 @@ mod tests {
             result.expect("Failed to get model path"),
             path.join("def5678")
         );
+    }
+
+    #[tokio::test]
+    async fn test_download_ignore_weights() {
+        let mock_server = MockHFServer::new().await;
+        let provider = HuggingFaceProvider;
+        let result = provider
+            .download_model("test/model", Some(mock_server.cache_path.clone()), false)
+            .await
+            .expect("Failed to download model");
+
+        let files = fs::read_dir(result)
+            .expect("Failed to read directory")
+            .filter_map(Result::ok);
+
+        for file in files {
+            info!("File: {}", file.path().display());
+            assert!(!file.path().ends_with("safetensors"));
+        }
     }
 }

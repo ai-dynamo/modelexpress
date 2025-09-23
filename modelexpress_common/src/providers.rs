@@ -13,6 +13,7 @@ pub trait ModelProviderTrait: Send + Sync {
         &self,
         model_name: &str,
         cache_path: Option<PathBuf>,
+        ignore_weights: bool,
     ) -> Result<PathBuf>;
 
     /// Delete a model from the provider's cache
@@ -57,6 +58,18 @@ pub trait ModelProviderTrait: Send + Sync {
                 || ext.eq_ignore_ascii_case("tif")
         })
     }
+
+    /// Checks if a file is a model weight file
+    fn is_weight_file(filename: &str) -> bool
+    where
+        Self: Sized,
+    {
+        filename.ends_with(".bin")
+            || filename.ends_with(".safetensors")
+            || filename.ends_with(".h5")
+            || filename.ends_with(".msgpack")
+            || filename.ends_with(".ckpt.index")
+    }
 }
 
 pub mod huggingface;
@@ -91,5 +104,19 @@ mod tests {
 
         assert!(!HuggingFaceProvider::is_ignored("model.bin"));
         assert!(!HuggingFaceProvider::is_ignored("tokenizer.json"));
+        assert!(!HuggingFaceProvider::is_ignored("config.json"));
+    }
+
+    #[test]
+    fn test_is_weight_file() {
+        assert!(HuggingFaceProvider::is_weight_file("model.bin"));
+        assert!(HuggingFaceProvider::is_weight_file("model.safetensors"));
+        assert!(HuggingFaceProvider::is_weight_file("model.h5"));
+        assert!(HuggingFaceProvider::is_weight_file("model.msgpack"));
+        assert!(HuggingFaceProvider::is_weight_file("model.ckpt.index"));
+
+        assert!(!HuggingFaceProvider::is_weight_file("tokenizer.json"));
+        assert!(!HuggingFaceProvider::is_weight_file("config.json"));
+        assert!(!HuggingFaceProvider::is_weight_file("README.md"));
     }
 }

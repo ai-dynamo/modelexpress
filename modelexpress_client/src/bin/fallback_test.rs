@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_name,
         ModelProvider::HuggingFace,
         ClientConfig::default(),
+        false,
     )
     .await
     {

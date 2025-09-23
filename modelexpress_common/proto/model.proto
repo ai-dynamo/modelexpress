@@ -12,6 +12,7 @@ service ModelService {
 message ModelDownloadRequest {
   string model_name = 1;
   ModelProvider provider = 2;
+  bool ignore_weights = 3;
 }
 
 // Streaming status update for model download progress

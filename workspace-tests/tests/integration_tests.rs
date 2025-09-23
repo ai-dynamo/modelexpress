@@ -61,6 +61,7 @@ async fn test_integration_model_download_fallback() {
         "invalid-model-name-12345", // Use invalid model to test error handling
         ModelProvider::HuggingFace,
         config,
+        false,
     )
     .await;
 
@@ -76,6 +77,7 @@ async fn test_integration_direct_download_invalid_model() {
     let result = Client::download_model_directly(
         "definitely-not-a-real-model-name-12345",
         ModelProvider::HuggingFace,
+        false,
     )
     .await;
 
@@ -94,6 +96,7 @@ async fn test_integration_small_model_download() {
     let result = Client::download_model_directly(
         "prajjwal1/bert-tiny", // A very small BERT model for testing
         ModelProvider::HuggingFace,
+        false,
     )
     .await;
 

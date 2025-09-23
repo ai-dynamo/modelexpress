@@ -131,10 +131,17 @@ async fn download_model(
             debug!("Using smart fallback strategy");
             if let Some(cache_config) = cache_config {
                 let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
-                client.preload_model_to_cache(&model_name, provider).await
-            } else {
-                Client::request_model_with_smart_fallback(model_name.clone(), provider, config)
+                client
+                    .preload_model_to_cache(&model_name, provider, false)
                     .await
+            } else {
+                Client::request_model_with_smart_fallback(
+                    model_name.clone(),
+                    provider,
+                    config,
+                    false,
+                )
+                .await
             }
         }
         DownloadStrategy::ServerOnly => {
@@ -145,12 +152,12 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model_with_provider(&model_name, provider)
+                .request_model_with_provider(&model_name, provider, false)
                 .await
         }
         DownloadStrategy::Direct => {
             debug!("Using direct download strategy");
-            Client::download_model_directly(model_name.clone(), provider).await
+            Client::download_model_directly(model_name.clone(), provider, false).await
         }
     };
 
