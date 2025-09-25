@@ -20,7 +20,7 @@ RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin fallback_test
 
 # Create a minimal runtime image
-FROM debian:bookworm-slim 
+FROM nvcr.io/nvidia/base/ubuntu:jammy-20250619 
 
 WORKDIR /app
 
@@ -35,6 +35,9 @@ COPY --from=builder /app/target/release/model-express-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/test_single_client .
 COPY --from=builder /app/target/release/fallback_test .
+
+# Copy the Attribution files
+COPY ATTRIBUTIONS_Rust.md .
 
 # Expose the default port
 EXPOSE 8001
