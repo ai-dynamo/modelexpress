@@ -9,11 +9,17 @@ SPDX-License-Identifier: Apache-2.0
 
 # Dynamo Model Express
 
-Model Express is a Rust-based component meant to be placed next to existing model inference systems to speed up their startup times and improve overall performance.
+Model Express is a Rust-based model cache management service designed to be deployed as a sidecar alongside existing inference solutions such as NVIDIA Dynamo. Model Express accelerates overall inference performance by reducing the latency of artifact downloads and writes.
 
 ## Project Overview
 
-The current version of Model Express acts as a cache for HuggingFace, providing fast access to pre-trained models and reducing the need for repeated downloads across multiple servers. Future versions will expand support to additional model providers and include features like model versioning, advanced caching strategies, advanced networking using [NIXL](https://github.com/ai-dynamo/nixl), checkpoint storage, as well as a peer-to-peer model sharing system.
+It should be established that although Model Express is a component of the Dyanmo inference stack, Model Express can be deployed standalone to accelerate other inference solutions such as vLLM, Sglang, etc independent of Dynamo.
+
+The current version of Model Express acts as a cache for HuggingFace, providing fast access to pre-trained models and reducing the need for repeated downloads across multiple servers. Additionally, this service aids fault tolerance for inference solutions by providing managed model persistence, ensuring that models remain available even in the event of node failures or restarts.
+
+Model Express also shines in multi-node / multi-worker environments, where inference solutions may spawn multiple replicas that require model artifacts to be shared efficiently.
+
+Future versions will expand support to additional model providers (AWS, Azure, NFS, etc.) and include features like model versioning, advanced caching strategies, advanced networking using [NIXL](https://github.com/ai-dynamo/nixl), checkpoint storage, as well as a peer-to-peer model sharing system.
 
 ## Architecture
 
@@ -108,9 +114,40 @@ docker run -p 8000:8000 model-express
 
 ### Option 3: Kubernetes Deployment
 
+**Prerequisites:**
+- **Kubernetes Cluster**: With GPU support and `kubectl` configured to access your cluster
+- **HuggingFace Token**: Required for accessing HuggingFace models within your cluster via k8s secret as shown here:
+  ```bash
+  export HF_TOKEN=your_hf_token
+  kubectl create secret generic hf-token-secret \
+    --from-literal=HF_TOKEN=${HF_TOKEN} \
+    -n ${NAMESPACE}
+  ```
+- **Docker Registry**: Container registry accessible from your cluster (Docker Hub, private registry, or local registry)
+- **Model Express Image**: Built and pushed to your registry by building from root directory of repository
+  ```bash
+  # Build the Model Express image
+  docker build -t model-express:latest .
+  
+  # Tag for your registry
+  docker tag model-express:latest your-registry/model-express:latest
+  
+  # Push to your registry
+  docker push your-registry/model-express:latest
+  ```
+- **Update Image Reference**: Update the image reference in your deployment files to match your registry
+  ```yaml
+  # In k8s-deployment.yaml or agg.yaml, update:
+  image: your-registry/model-express:latest
+  ```
+
+
+Now to deploy Modelexpress in your cluster you can run:
 ```bash
 kubectl apply -f k8s-deployment.yaml
 ```
+
+Please follow the guide [here](https://github.com/ai-dynamo/modelexpress/tree/main/examples/aggregated_k8s) to learn more on how to launch modelexpress with dynamo on kubernetes.
 
 ## Configuration
 
