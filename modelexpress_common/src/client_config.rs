@@ -125,6 +125,7 @@ impl ClientConfig {
     }
 
     /// Validate the configuration
+    #[allow(clippy::collapsible_if)]
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate endpoint
         if self.connection.endpoint.is_empty() {

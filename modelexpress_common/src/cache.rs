@@ -164,6 +164,7 @@ impl CacheConfig {
     }
 
     /// Get cache path from command line arguments
+    #[allow(clippy::collapsible_if)]
     fn get_cache_path_from_args() -> Option<String> {
         let args: Vec<String> = env::args().collect();
 
