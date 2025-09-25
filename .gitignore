@@ -38,9 +38,6 @@
 *.swp
 *.swo
 
-# Docker and Kubernetes generated files
-.dockerignore
-
 # Logs
 *.log
 log/
