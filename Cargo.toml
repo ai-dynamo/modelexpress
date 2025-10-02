@@ -11,6 +11,16 @@ members = [
 ]
 resolver = "3"
 
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+description = "Model Express: High-performance model serving and management"
+authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
+license = "Apache-2.0"
+homepage = "https://github.com/ai-dynamo/modelexpress"
+repository = "https://github.com/ai-dynamo/modelexpress.git"
+keywords = ["llm", "inference", "nvidia"]
+
 [workspace.dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1"
@@ -24,6 +34,9 @@ hf-hub = { version = "0.4.3", default-features = false, features = [
     "rustls-tls",
 ] }
 jiff = { version = "0.2.15", features = ["serde"] }
+modelexpress-common = { path = "modelexpress_common", version = "0.2.0" }
+modelexpress-client = { path = "modelexpress_client", version = "0.2.0" }
+modelexpress-server = { path = "modelexpress_server", version = "0.2.0" }
 once_cell = "1.21.3"
 prost = "0.13"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
