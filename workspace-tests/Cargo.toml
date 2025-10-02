@@ -3,16 +3,20 @@
 
 [package]
 name = "model-express-workspace-tests"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
 description = "Tests for Model Express workspace"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
 publish = false
 
 [dependencies]
-modelexpress-client = { version = "0.1.0" , path = "../modelexpress_client" }
-modelexpress-common = { version = "0.1.0" , path = "../modelexpress_common" }
-modelexpress-server = { version = "0.1.0" , path = "../modelexpress_server" }
+modelexpress-client = { workspace = true }
+modelexpress-common = { workspace = true }
+modelexpress-server = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
