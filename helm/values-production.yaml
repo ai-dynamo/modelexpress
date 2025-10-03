@@ -29,14 +29,14 @@ ingress:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
   hosts:
-    - host: model-express.yourdomain.com
+    - host: modelexpress.yourdomain.com
       paths:
         - path: /
           pathType: Prefix
   tls:
-    - secretName: model-express-tls
+    - secretName: modelexpress-tls
       hosts:
-        - model-express.yourdomain.com
+        - modelexpress.yourdomain.com
 
 resources:
   limits:
@@ -96,7 +96,7 @@ affinity:
               - key: app.kubernetes.io/name
                 operator: In
                 values:
-                  - model-express
+                  - modelexpress
           topologyKey: kubernetes.io/hostname
 
 extraEnv:
