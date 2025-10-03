@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "model-express.fullname" . }}
+  name: {{ include "modelexpress.fullname" . }}
   labels:
-    {{- include "model-express.labels" . | nindent 4 }}
+    {{- include "modelexpress.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type | default "ClusterIP" }}
   ports:
@@ -12,4 +12,4 @@ spec:
       protocol: TCP
       name: http
   selector:
-    {{- include "model-express.selectorLabels" . | nindent 4 }}
+    {{- include "modelexpress.selectorLabels" . | nindent 4 }}
