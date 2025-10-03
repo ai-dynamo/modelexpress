@@ -1,7 +1,7 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "model-express.name" -}}
+{{- define "modelexpress.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
@@ -10,7 +10,7 @@ Create a default fully qualified app name.
 We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
 If release name contains chart name it will be used as a full name.
 */}}
-{{- define "model-express.fullname" -}}
+{{- define "modelexpress.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -26,16 +26,16 @@ If release name contains chart name it will be used as a full name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "model-express.chart" -}}
+{{- define "modelexpress.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "model-express.labels" -}}
-helm.sh/chart: {{ include "model-express.chart" . }}
-{{ include "model-express.selectorLabels" . }}
+{{- define "modelexpress.labels" -}}
+helm.sh/chart: {{ include "modelexpress.chart" . }}
+{{ include "modelexpress.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -45,17 +45,17 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "model-express.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "model-express.name" . }}
+{{- define "modelexpress.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "modelexpress.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
-{{- define "model-express.serviceAccountName" -}}
+{{- define "modelexpress.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "model-express.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "modelexpress.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}

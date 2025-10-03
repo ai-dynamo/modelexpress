@@ -2,9 +2,9 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "model-express.fullname" . }}
+  name: {{ include "modelexpress.fullname" . }}
   labels:
-    {{- include "model-express.labels" . | nindent 4 }}
+    {{- include "modelexpress.labels" . | nindent 4 }}
   {{- with .Values.ingress.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -35,7 +35,7 @@ spec:
             {{- end }}
             backend:
               service:
-                name: {{ include "model-express.fullname" $ }}
+                name: {{ include "modelexpress.fullname" $ }}
                 port:
                   number: {{ $.Values.service.port | default 8001 }}
           {{- end }}
