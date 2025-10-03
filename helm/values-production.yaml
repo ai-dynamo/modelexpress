@@ -2,9 +2,9 @@
 replicaCount: 3
 
 image:
-  repository: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta
+  repository: nvcr.io/nvidia/ai-dynamo/modelexpress-server
   pullPolicy: Always
-  tag: "0.1.1rc1"
+  tag: "0.2.0"
 
 serviceAccount:
   create: true
