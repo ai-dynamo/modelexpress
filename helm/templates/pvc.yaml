@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "model-express.fullname" . }}-pvc
+  name: {{ include "modelexpress.fullname" . }}-pvc
   labels:
-    {{- include "model-express.labels" . | nindent 4 }}
+    {{- include "modelexpress.labels" . | nindent 4 }}
 spec:
   accessModes:
     - {{ (.Values.persistence.accessMode | default "ReadWriteOnce") | quote }}
