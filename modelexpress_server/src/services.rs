@@ -268,8 +268,15 @@ impl ModelDownloadTracker {
                 provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             };
 
+            // Send updates to all waiting channels
+            // Spawn tasks to avoid blocking if channels are slow to receive
             for channel in channels {
-                let _ = channel.try_send(Ok(update.clone()));
+                let update_clone = update.clone();
+                let channel_clone = channel.clone();
+                tokio::spawn(async move {
+                    // Use send().await to ensure delivery, won't silently fail like try_send
+                    let _ = channel_clone.send(Ok(update_clone)).await;
+                });
             }
 
             // If the model is downloaded or errored, remove all waiting channels
