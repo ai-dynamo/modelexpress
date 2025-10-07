@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # ModelExpress Helm Chart
 
 This Helm chart deploys ModelExpress, a model serving and management platform, to Kubernetes.
