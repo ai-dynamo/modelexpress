@@ -46,7 +46,7 @@ model-express-cli [OPTIONS] <COMMAND>
 
 **Environment Variables:**
 - `MODEL_EXPRESS_ENDPOINT`: Set the default server endpoint
-- `MODEL_EXPRESS_CACHE_PATH`: Set the default model storage path
+- `MODEL_EXPRESS_CACHE_DIRECTORY`: Set the default model storage path
 
 ### Commands
 
