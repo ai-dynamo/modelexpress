@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Default values for ModelExpress Helm Chart
 # ModelExpress is a high-performance model serving and management platform for AI/ML models
 # This file contains the base configuration that can be overridden for different environments
