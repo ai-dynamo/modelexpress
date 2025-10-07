@@ -21,7 +21,7 @@ spec:
         - name: ngc-secret
       containers:
         - name: model-express-server
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server-beta:0.1.1rc1
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.2.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
