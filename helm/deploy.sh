@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Helm Chart Deployment Script
 # This script helps deploy ModelExpress using Helm
@@ -13,8 +15,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Default values
-RELEASE_NAME="model-express"
-NAMESPACE="model-express"
+RELEASE_NAME="modelexpress"
+NAMESPACE="modelexpress"
 VALUES_FILE=""
 DRY_RUN=false
 UPGRADE=false
@@ -42,8 +44,8 @@ show_usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-    -r, --release-name NAME    Release name (default: model-express)
-    -n, --namespace NAME       Kubernetes namespace (default: model-express)
+    -r, --release-name NAME    Release name (default: modelexpress)
+    -n, --namespace NAME       Kubernetes namespace (default: modelexpress)
     -f, --values FILE          Values file to use (e.g., values-production.yaml)
     -d, --dry-run              Perform a dry run
     -u, --upgrade              Upgrade existing release
@@ -63,7 +65,7 @@ Examples:
     $0 -f values-production.yaml
 
     # Deploy with custom release name and namespace
-    $0 -r my-model-express -n my-namespace
+    $0 -r my-modelexpress -n my-namespace
 
     # Perform a dry run
     $0 -d
@@ -177,15 +179,15 @@ show_status() {
     
     echo
     echo "Pods:"
-    $KUBECTL_CMD get pods -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
+    $KUBECTL_CMD get pods -n "$NAMESPACE" -l app.kubernetes.io/name=modelexpress
     
     echo
     echo "Services:"
-    $KUBECTL_CMD get svc -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
+    $KUBECTL_CMD get svc -n "$NAMESPACE" -l app.kubernetes.io/name=modelexpress
     
     echo
     echo "PersistentVolumeClaims:"
-    $KUBECTL_CMD get pvc -n "$NAMESPACE" -l app.kubernetes.io/name=model-express
+    $KUBECTL_CMD get pvc -n "$NAMESPACE" -l app.kubernetes.io/name=modelexpress
 }
 
 # Parse command line arguments

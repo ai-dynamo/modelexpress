@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # ModelExpress Helm Chart
 
 This Helm chart deploys ModelExpress, a model serving and management platform, to Kubernetes.
@@ -52,7 +57,7 @@ If you're using a custom values file, ensure it includes this configuration or t
 ### 3. Add the Helm repository (if using a repository)
 
 ```bash
-helm repo add model-express https://your-repo-url
+helm repo add modelexpress https://your-repo-url
 helm repo update
 ```
 
@@ -60,13 +65,13 @@ helm repo update
 
 ```bash
 # Install with default values
-helm install my-model-express ./helm
+helm install my-modelexpress ./helm
 
 # Install with custom values
-helm install my-model-express ./helm -f values.yaml
+helm install my-modelexpress ./helm -f values.yaml
 
 # Install in a specific namespace
-helm install my-model-express ./helm --namespace model-express --create-namespace
+helm install my-modelexpress ./helm --namespace modelexpress --create-namespace
 ```
 
 ## Configuration
@@ -75,8 +80,8 @@ helm install my-model-express ./helm --namespace model-express --create-namespac
 
 **CRITICAL:** The `values-production.yaml` file contains example values that **MUST** be overridden for your environment:
 
-- **Domain Names**: `model-express.yourdomain.com` is a placeholder - replace with your actual domain
-- **TLS Certificates**: The TLS configuration references `model-express-tls` secret - ensure this exists or update the configuration
+- **Domain Names**: `modelexpress.yourdomain.com` is a placeholder - replace with your actual domain
+- **TLS Certificates**: The TLS configuration references `modelexpress-tls` secret - ensure this exists or update the configuration
 - **Storage Classes**: `fast-ssd` storage class may not exist in your cluster - verify or change to an available storage class
 - **Node Selectors**: `node-type: "compute"` and tolerations may not match your cluster setup
 
@@ -86,7 +91,7 @@ helm install my-model-express ./helm --namespace model-express --create-namespac
 # Copy and customize production values
 cp helm/values-production.yaml helm/my-production-values.yaml
 # Edit my-production-values.yaml with your actual values
-helm install model-express ./helm -f helm/my-production-values.yaml
+helm install modelexpress ./helm -f helm/my-production-values.yaml
 ```
 
 The following table lists the configurable parameters of the ModelExpress chart and their default values.
@@ -137,7 +142,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 ### Basic Installation
 
 ```bash
-helm install model-express ./helm
+helm install modelexpress ./helm
 ```
 
 ### Custom Image Repository
@@ -145,14 +150,14 @@ helm install model-express ./helm
 ```yaml
 # values.yaml
 image:
-  repository: your-registry/model-express-server
+  repository: your-registry/modelexpress-server
   tag: v1.0.0
   pullPolicy: Always
 ```
 
 ### With Ingress
 
-**⚠️ Warning:** Replace `model-express.example.com` with your actual domain and ensure the TLS secret exists.
+**⚠️ Warning:** Replace `modelexpress.example.com` with your actual domain and ensure the TLS secret exists.
 
 ```yaml
 # values.yaml
@@ -163,14 +168,14 @@ ingress:
     kubernetes.io/ingress.class: nginx
     cert-manager.io/cluster-issuer: letsencrypt-prod
   hosts:
-    - host: model-express.example.com  # ← Replace with your actual domain
+    - host: modelexpress.example.com  # ← Replace with your actual domain
       paths:
         - path: /
           pathType: Prefix
   tls:
-    - secretName: model-express-tls  # ← Ensure this secret exists
+    - secretName: modelexpress-tls  # ← Ensure this secret exists
       hosts:
-        - model-express.example.com  # ← Replace with your actual domain
+        - modelexpress.example.com  # ← Replace with your actual domain
 ```
 
 ### With Custom Resources
@@ -207,20 +212,20 @@ extraEnv:
   - name: SECRET_VAR
     valueFrom:
       secretKeyRef:
-        name: model-express-secrets
+        name: modelexpress-secrets
         key: secret-key
 ```
 
 ## Upgrading
 
 ```bash
-helm upgrade my-model-express ./helm
+helm upgrade my-modelexpress ./helm
 ```
 
 ## Uninstalling
 
 ```bash
-helm uninstall my-model-express
+helm uninstall my-modelexpress
 ```
 
 ## Troubleshooting
@@ -228,25 +233,25 @@ helm uninstall my-model-express
 ### Check Pod Status
 
 ```bash
-kubectl get pods -l app.kubernetes.io/name=model-express
+kubectl get pods -l app.kubernetes.io/name=modelexpress
 ```
 
 ### Check Logs
 
 ```bash
-kubectl logs -l app.kubernetes.io/name=model-express
+kubectl logs -l app.kubernetes.io/name=modelexpress
 ```
 
 ### Check Service
 
 ```bash
-kubectl get svc -l app.kubernetes.io/name=model-express
+kubectl get svc -l app.kubernetes.io/name=modelexpress
 ```
 
 ### Port Forward for Local Access
 
 ```bash
-kubectl port-forward svc/my-model-express 8001:8001
+kubectl port-forward svc/my-modelexpress 8001:8001
 ```
 
 ### Image Pull Issues
@@ -277,7 +282,7 @@ If you encounter `ErrImagePull` or `ImagePullBackOff` errors:
 
 5. **Check pod events for detailed error messages:**
    ```bash
-   kubectl describe pod -l app.kubernetes.io/name=model-express -n your-namespace
+   kubectl describe pod -l app.kubernetes.io/name=modelexpress -n your-namespace
    ```
 
 ## Using the Official Image

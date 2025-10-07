@@ -1,14 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "model-express.fullname" . }}
+  name: {{ include "modelexpress.fullname" . }}
   labels:
-    {{- include "model-express.labels" . | nindent 4 }}
+    {{- include "modelexpress.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount | default 1 }}
   selector:
     matchLabels:
-      {{- include "model-express.selectorLabels" . | nindent 6 }}
+      {{- include "modelexpress.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       {{- with .Values.podAnnotations }}
@@ -16,7 +18,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "model-express.labels" . | nindent 8 }}
+        {{- include "modelexpress.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -25,7 +27,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "model-express.serviceAccountName" . }}
+      serviceAccountName: {{ include "modelexpress.serviceAccountName" . }}
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -101,7 +103,7 @@ spec:
         {{- if and .Values.persistence .Values.persistence.enabled }}
         - name: model-cache
           persistentVolumeClaim:
-            claimName: {{ include "model-express.fullname" . }}-pvc
+            claimName: {{ include "modelexpress.fullname" . }}-pvc
         {{- end }}
         {{- if .Values.extraVolumes }}
         {{- toYaml .Values.extraVolumes | nindent 8 }}
