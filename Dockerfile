@@ -14,7 +14,7 @@ COPY . .
 
 # Build all available binaries
 RUN cargo build --release --bin modelexpress-server && \
-    cargo build --release --bin model-express-cli && \
+    cargo build --release --bin modelexpress-cli && \
     cargo build --release --bin test_client && \
     cargo build --release --bin test_single_client && \
     cargo build --release --bin fallback_test
@@ -31,7 +31,7 @@ RUN apt-get update && \
 
 # Copy all built binaries
 COPY --from=builder /app/target/release/modelexpress-server .
-COPY --from=builder /app/target/release/model-express-cli .
+COPY --from=builder /app/target/release/modelexpress-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/test_single_client .
 COPY --from=builder /app/target/release/fallback_test .

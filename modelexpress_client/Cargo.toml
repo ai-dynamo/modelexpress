@@ -37,5 +37,5 @@ tempfile = "3.20"
 workspace = true
 
 [[bin]]
-name = "model-express-cli"
+name = "modelexpress-cli"
 path = "src/bin/cli.rs"
