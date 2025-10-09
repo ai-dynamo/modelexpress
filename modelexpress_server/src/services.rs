@@ -110,12 +110,8 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<ModelDownloadRequest>,
     ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+        info!("Starting model download stream");
         let model_request = request.into_inner();
-        info!(
-            "Starting model download stream for: {} from provider: {:?}",
-            model_request.model_name, model_request.provider
-        );
-
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let model_name = model_request.model_name.clone();
 
