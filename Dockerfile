@@ -20,7 +20,7 @@ RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin fallback_test
 
 # Create a minimal runtime image
-FROM nvcr.io/nvidia/base/ubuntu:jammy-20250619 
+FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 
 
 WORKDIR /app
 
