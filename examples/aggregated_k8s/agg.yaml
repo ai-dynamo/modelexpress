@@ -85,7 +85,7 @@ spec:
 
               echo "Waiting for server to be ready..."
               for i in {1..60}; do
-                if ./model-express-cli --endpoint http://localhost:8002 health > /dev/null 2>&1; then
+                if ./modelexpress-cli --endpoint http://localhost:8002 health > /dev/null 2>&1; then
                   echo "Server is ready!"
                   break
                 fi
@@ -97,7 +97,7 @@ spec:
               find $MODEL_CACHE_PATH -name "*.lock" -type f -delete 2>/dev/null || true
 
               echo "Downloading $MODEL_NAME model..."
-              ./model-express-cli --endpoint http://localhost:8002 --cache-path /root model download $MODEL_NAME
+              ./modelexpress-cli --endpoint http://localhost:8002 --cache-path /root model download $MODEL_NAME
 
               echo "Model download completed. Creating symlink for VLLM worker..."
               # Convert model name to cache directory format (e.g., "Qwen/Qwen3-0.6B" -> "models--Qwen--Qwen3-0.6B")
