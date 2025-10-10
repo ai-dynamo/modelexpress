@@ -7,7 +7,7 @@ use hf_hub::api::tokio::ApiBuilder;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
@@ -52,7 +52,6 @@ impl ModelProviderTrait for HuggingFaceProvider {
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
     ) -> Result<PathBuf> {
-        info!("Downloading model from Hugging Face: {model_name}");
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
 
         // Get cache directory and ensure it exists
@@ -81,7 +80,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let info = repo.info().await.map_err(
             |e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"),
         )?;
-        info!("Got model info: {info:?}");
+        debug!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {
             anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
