@@ -62,7 +62,7 @@ spec:
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: "/model/.model-express/cache"
             - name: MODEL_NAME
-              value: "Qwen/Qwen2.5-0.5B-Instruct"
+              value: "Qwen/Qwen3-0.6B"
             - name: MODEL_CACHE_PATH
               value: "/model/.model-express/cache"
             - name: HF_HUB_CACHE
@@ -147,7 +147,7 @@ spec:
         - name: DYN_SYSTEM_PORT
           value: "9090"
         - name: MODEL_NAME
-          value: "Qwen/Qwen2.5-0.5B-Instruct"
+          value: "Qwen/Qwen3-0.6B"
         - name: MODEL_CACHE_PATH
           value: "/model/.model-express/cache"
         - name: HF_HUB_CACHE
