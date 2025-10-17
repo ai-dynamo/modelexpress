@@ -74,6 +74,7 @@ spec:
             - |
               echo "Starting Model Express Server..."
               ./modelexpress-server &
+              
               SERVER_PID=$!
               echo "Server started with PID: $SERVER_PID"
 
@@ -173,12 +174,6 @@ spec:
             - -c
           args:
             - |
-              echo "=== VLLM Worker Startup Timing ==="
-              START_TIME=$(date +%s)
-              echo "Start time: $(date)"
-              
-              echo "Starting VLLM worker (model download will happen automatically)..."
-              VLLM_START=$(date +%s)
               python3 -m dynamo.vllm --model $MODEL_NAME --tensor-parallel-size 1 | tee /tmp/vllm.log
           resources:
             requests:
