@@ -58,7 +58,7 @@ spec:
             - name: MODEL_EXPRESS_LOGGING_LEVEL
               value: "info"
             - name: MODEL_EXPRESS_DATABASE_PATH
-              value: "/root/models.db"
+              value: "/model/models.db"
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: "/model/.model-express/cache"
             - name: MODEL_NAME
@@ -80,8 +80,8 @@ spec:
 
               echo "Setting up Model Express configuration..."
               mkdir -p $MODEL_CACHE_PATH
-              mkdir -p /root/.model-express
-              cat > /root/.model-express/config.yaml << EOF
+              mkdir -p /model/.model-express
+              cat > /model/.model-express/config.yaml << EOF
               local_path: $MODEL_CACHE_PATH
               server_endpoint: http://localhost:8000
               timeout_secs: null
@@ -101,14 +101,14 @@ spec:
               wait $SERVER_PID
       pvcs:
         name: model-cache-pvc
-        mountPoint: /root
+        mountPoint: /model
     Frontend:
       dynamoNamespace: vllm-agg
       componentType: frontend
       replicas: 1
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag # REPLACE WITH CORRECT IMAGE
       pvcs:
         name: model-cache-pvc
         mountPoint: /model
@@ -167,7 +167,7 @@ spec:
               port: 9090
             periodSeconds: 30
             failureThreshold: 240
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag #REPLACE WITH CORRECT IMAGE
           workingDir: /workspace/components/backends/vllm
           command:
             - /bin/sh
