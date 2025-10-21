@@ -21,6 +21,9 @@ kind: DynamoGraphDeployment
 metadata:
   name: vllm-agg
 spec:
+  pvcs:
+      - name: model-cache-pvc
+        create: false
   services:
     ModelExpress:
       envFromSecret: hf-token-secret
@@ -99,9 +102,9 @@ spec:
 
               echo "Server PID: $SERVER_PID"
               wait $SERVER_PID
-      pvcs:
-        name: model-cache-pvc
-        mountPoint: /model
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
     Frontend:
       dynamoNamespace: vllm-agg
       componentType: frontend
@@ -109,9 +112,9 @@ spec:
       extraPodSpec:
         mainContainer:
           image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag # REPLACE WITH CORRECT IMAGE
-      pvcs:
-        name: model-cache-pvc
-        mountPoint: /model
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
     VllmDecodeWorker:
       envFromSecret: hf-token-secret
       livenessProbe:
@@ -180,6 +183,6 @@ spec:
               ephemeral-storage: "50Gi"
             limits:
               ephemeral-storage: "50Gi"
-      pvcs:
-        name: model-cache-pvc
-        mountPoint: /model
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
