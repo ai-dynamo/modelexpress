@@ -11,10 +11,9 @@ spec:
     - ReadWriteMany
   resources:
     requests:
-      storage: 100Gi
+      storage: 500Gi
     limits:
-      storage: 100Gi
-  storageClassName: microk8s-hostpath
+      storage: 500Gi
 
 ---
 apiVersion: nvidia.com/v1alpha1
@@ -22,49 +21,55 @@ kind: DynamoGraphDeployment
 metadata:
   name: vllm-agg
 spec:
+  pvcs:
+      - name: model-cache-pvc
+        create: false
   services:
-    ModelExpressServer:
+    ModelExpress:
+      envFromSecret: hf-token-secret
       livenessProbe:
         tcpSocket:
-          port: 8002
+          port: 8000
         initialDelaySeconds: 30
         periodSeconds: 10
         timeoutSeconds: 5
         failureThreshold: 3
       readinessProbe:
         tcpSocket:
-          port: 8002
+          port: 8000
         initialDelaySeconds: 10
         periodSeconds: 5
         timeoutSeconds: 3
         failureThreshold: 3
       dynamoNamespace: vllm-agg
-      componentType: main
+      componentType: frontend
       replicas: 1
       resources:
         requests:
-          cpu: "500m"
-          memory: "256Mi"
+          cpu: "4"
+          memory: "16Gi"
         limits:
-          cpu: "500m"
-          memory: "256Mi"
+          cpu: "4"
+          memory: "16Gi"
       extraPodSpec:
         mainContainer:
-          image: model-express:latest
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.2.0
           imagePullPolicy: IfNotPresent
           env:
             - name: MODEL_EXPRESS_SERVER_PORT
-              value: "8002"
+              value: "8000"
             - name: MODEL_EXPRESS_LOGGING_LEVEL
               value: "info"
             - name: MODEL_EXPRESS_DATABASE_PATH
-              value: "/root/models.db"
+              value: "/model/models.db"
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
-              value: "/root/.model-express/cache"
+              value: "/model/.model-express/cache"
             - name: MODEL_NAME
               value: "Qwen/Qwen3-0.6B"
             - name: MODEL_CACHE_PATH
-              value: "/root/.model-express/cache"
+              value: "/model/.model-express/cache"
+            - name: HF_HUB_CACHE
+              value: "/model/.model-express/cache"
           command:
             - /bin/sh
             - -c
@@ -72,20 +77,22 @@ spec:
             - |
               echo "Starting Model Express Server..."
               ./modelexpress-server &
+              
               SERVER_PID=$!
               echo "Server started with PID: $SERVER_PID"
 
               echo "Setting up Model Express configuration..."
               mkdir -p $MODEL_CACHE_PATH
-              cat > /root/.model-express/config.yaml << EOF
+              mkdir -p /model/.model-express
+              cat > /model/.model-express/config.yaml << EOF
               local_path: $MODEL_CACHE_PATH
-              server_endpoint: http://localhost:8002
+              server_endpoint: http://localhost:8000
               timeout_secs: null
               EOF
 
               echo "Waiting for server to be ready..."
               for i in {1..60}; do
-                if ./model-express-cli --endpoint http://localhost:8002 health > /dev/null 2>&1; then
+                if ./model-express-cli --endpoint http://localhost:8000 health > /dev/null 2>&1; then
                   echo "Server is ready!"
                   break
                 fi
@@ -93,75 +100,21 @@ spec:
                 sleep 2
               done
 
-              echo "Cleaning up any stale lock files..."
-              find $MODEL_CACHE_PATH -name "*.lock" -type f -delete 2>/dev/null || true
-
-              echo "Downloading $MODEL_NAME model..."
-              ./model-express-cli --endpoint http://localhost:8002 --cache-path /root model download $MODEL_NAME
-
-              echo "Model download completed. Creating symlink for VLLM worker..."
-              # Convert model name to cache directory format (e.g., "Qwen/Qwen3-0.6B" -> "models--Qwen--Qwen3-0.6B")
-              MODEL_CACHE_DIR=$(echo $MODEL_NAME | sed 's/\//--/g')
-              MODEL_CACHE_DIR="models--$MODEL_CACHE_DIR"
-
-              # Find the latest snapshot and create a symlink
-              SNAPSHOT_DIR=$(find $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots -maxdepth 1 -type d -name "*" -not -name "snapshots" | head -1)
-              if [ -n "$SNAPSHOT_DIR" ]; then
-                cd $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots
-                ln -sf "$(basename $SNAPSHOT_DIR)" latest
-                echo "Created symlink: latest -> $(basename $SNAPSHOT_DIR)"
-                echo "Symlink target: $SNAPSHOT_DIR"
-                echo "Model cache directory: $MODEL_CACHE_DIR"
-              else
-                echo "Warning: No snapshot directory found for $MODEL_CACHE_DIR"
-              fi
-
               echo "Server PID: $SERVER_PID"
               wait $SERVER_PID
-      pvc:
-        name: model-cache-pvc
-        mountPoint: /root
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
     Frontend:
-      livenessProbe:
-        httpGet:
-          path: /health
-          port: 8000
-        initialDelaySeconds: 60
-        periodSeconds: 60
-        timeoutSeconds: 30
-        failureThreshold: 10
-      readinessProbe:
-        exec:
-          command:
-            - /bin/sh
-            - -c
-            - 'curl -s http://localhost:8000/health | jq -e ".status == \"healthy\""'
-        initialDelaySeconds: 60
-        periodSeconds: 60
-        timeoutSeconds: 30
-        failureThreshold: 10
       dynamoNamespace: vllm-agg
-      componentType: main
+      componentType: frontend
       replicas: 1
-      resources:
-        requests:
-          cpu: "1"
-          memory: "2Gi"
-        limits:
-          cpu: "1"
-          memory: "2Gi"
       extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvstaging/ai-dynamo/vllm-runtime:0.4.0
-          workingDir: /workspace/components/backends/vllm
-          command:
-            - /bin/sh
-            - -c
-          args:
-            - "python3 -m dynamo.frontend --http-port 8000"
-      pvc:
-        name: model-cache-pvc
-        mountPoint: /model
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag # REPLACE WITH CORRECT IMAGE
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
     VllmDecodeWorker:
       envFromSecret: hf-token-secret
       livenessProbe:
@@ -183,12 +136,12 @@ spec:
       replicas: 1
       resources:
         requests:
-          cpu: "10"
-          memory: "20Gi"
+          cpu: "4"
+          memory: "16Gi"
           gpu: "1"
         limits:
-          cpu: "10"
-          memory: "20Gi"
+          cpu: "4"
+          memory: "16Gi"
           gpu: "1"
       envs:
         - name: DYN_SYSTEM_ENABLED
@@ -201,38 +154,35 @@ spec:
           value: "Qwen/Qwen3-0.6B"
         - name: MODEL_CACHE_PATH
           value: "/model/.model-express/cache"
+        - name: HF_HUB_CACHE
+          value: "/model/.model-express/cache"
+        - name: MODEL_EXPRESS_URL
+          value: "http://vllm-agg-modelexpress:8000"
+        - name: VLLM_GPU_MEMORY_UTILIZATION
+          value: "0.95"
+        - name: VLLM_MAX_MODEL_LEN
+          value: "8192"
       extraPodSpec:
         mainContainer:
           startupProbe:
             httpGet:
               path: /health
               port: 9090
-            periodSeconds: 10
-            failureThreshold: 60
-          image: nvcr.io/nvstaging/ai-dynamo/vllm-runtime:0.4.0
+            periodSeconds: 30
+            failureThreshold: 240
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag #REPLACE WITH CORRECT IMAGE
           workingDir: /workspace/components/backends/vllm
           command:
             - /bin/sh
             - -c
           args:
             - |
-              echo "Waiting for model to be ready..."
-              # Convert model name to cache directory format (e.g., "Qwen/Qwen3-0.6B" -> "models--Qwen--Qwen3-0.6B")
-              MODEL_CACHE_DIR=$(echo $MODEL_NAME | sed 's/\//--/g')
-              MODEL_CACHE_DIR="models--$MODEL_CACHE_DIR"
-
-              for i in {1..120}; do
-                if [ -L "$MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest" ] && [ -d "$MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest" ]; then
-                  echo "Model is ready! Starting VLLM worker..."
-                  break
-                fi
-                echo "Waiting for model... ($i/120)"
-                sleep 5
-              done
-
-              echo "Model path: $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest/"
-              ls -la $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/
-              python3 -m dynamo.vllm --model $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest/ | tee /tmp/vllm.log
-      pvc:
-        name: model-cache-pvc
-        mountPoint: /model
+              python3 -m dynamo.vllm --model $MODEL_NAME --tensor-parallel-size 1 | tee /tmp/vllm.log
+          resources:
+            requests:
+              ephemeral-storage: "50Gi"
+            limits:
+              ephemeral-storage: "50Gi"
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
