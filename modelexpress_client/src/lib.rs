@@ -13,6 +13,7 @@ use modelexpress_common::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
         health::{HealthRequest, health_service_client::HealthServiceClient},
         model::{ModelDownloadRequest, model_service_client::ModelServiceClient},
+        transfer::{TransferRequest, transfer_service_client::TransferServiceClient},
     },
     models::{ModelStatus, Status},
     providers::huggingface::HuggingFaceProvider,
@@ -38,6 +39,7 @@ pub struct Client {
     health_client: HealthServiceClient<Channel>,
     api_client: ApiServiceClient<Channel>,
     model_client: ModelServiceClient<Channel>,
+    transfer_client: TransferServiceClient<Channel>,
     cache_config: Option<CacheConfig>,
 }
 
@@ -57,7 +59,8 @@ impl Client {
 
         let health_client = HealthServiceClient::new(channel.clone());
         let api_client = ApiServiceClient::new(channel.clone());
-        let model_client = ModelServiceClient::new(channel);
+        let model_client = ModelServiceClient::new(channel.clone());
+        let transfer_client = TransferServiceClient::new(channel);
 
         // Use the cache config from the client configuration
         let cache_config = Some(config.cache.clone());
@@ -66,6 +69,7 @@ impl Client {
             health_client,
             api_client,
             model_client,
+            transfer_client,
             cache_config,
         })
     }
@@ -172,6 +176,27 @@ impl Client {
                 Self::download_model_directly(model_name, provider, ignore_weights).await
             }
         }
+    }
+
+    /// [WIP] dummy Transfer service
+    pub async fn send_message(&mut self, message: &str) -> CommonResult<()> {
+        let request = tonic::Request::new(TransferRequest {
+            data: message.to_string(),
+        });
+
+        let response = self.transfer_client.send_message(request).await?;
+        let transfer_response = response.into_inner();
+
+        if !transfer_response.success {
+            return Err(modelexpress_common::Error::Server(
+                transfer_response
+                    .error
+                    .unwrap_or_else(|| "Unknown server error".to_string()),
+            )
+            .into());
+        }
+
+        Ok(())
     }
 
     /// Get the server health status

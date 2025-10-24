@@ -5,12 +5,13 @@ use clap::Parser;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer,
+    transfer::transfer_service_server::TransferServiceServer,
 };
 use modelexpress_server::{
     cache::CacheEvictionService,
     config::{ServerArgs, ServerConfig},
     database::ModelDatabase,
-    services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl},
+    services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl, TransferServiceImpl},
 };
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -89,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
     let model_service = ModelServiceImpl;
+    let transfer_service = TransferServiceImpl;
 
     // Setup graceful shutdown handler
     let shutdown_signal = async move {
@@ -110,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))
         .add_service(ModelServiceServer::new(model_service))
+        .add_service(TransferServiceServer::new(transfer_service))
         .serve_with_shutdown(addr, shutdown_signal)
         .await;
 

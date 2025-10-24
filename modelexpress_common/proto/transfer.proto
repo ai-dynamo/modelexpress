@@ -1,0 +1,23 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package model_express.transfer;
+
+// Transfer service for handling file transfers
+service TransferService {
+  // Send a message to the server
+  rpc SendMessage(TransferRequest) returns (TransferResponse);
+}
+
+// Request message for message transfer
+message TransferRequest {
+  string data = 1;
+}
+
+// Response message for message transfer
+message TransferResponse {
+  bool success = 1;
+  optional string error = 2;
+}

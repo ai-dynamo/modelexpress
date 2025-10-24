@@ -9,6 +9,7 @@ use modelexpress_common::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
         model::{ModelDownloadRequest, ModelStatusUpdate, model_service_server::ModelService},
+        transfer::{TransferRequest, TransferResponse, transfer_service_server::TransferService},
     },
     models::{ModelProvider, ModelStatus},
 };
@@ -176,6 +177,25 @@ impl ModelService for ModelServiceImpl {
     }
 }
 
+/// [WIP] dummy transfer service implementation
+#[derive(Debug, Default)]
+pub struct TransferServiceImpl;
+
+#[tonic::async_trait]
+impl TransferService for TransferServiceImpl {
+    async fn send_message(
+        &self,
+        request: Request<TransferRequest>,
+    ) -> Result<Response<TransferResponse>, Status> {
+        let transfer_request = request.into_inner();
+        info!("Received transfer request: {:?}", transfer_request);
+
+        Ok(Response::new(TransferResponse {
+            success: true,
+            error: None,
+        }))
+    }
+}
 /// Type alias for the complex waiting channels type
 type WaitingChannels =
     Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>>>>>;
