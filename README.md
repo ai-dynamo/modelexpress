@@ -13,7 +13,7 @@ Model Express is a Rust-based model cache management service designed to be depl
 
 ## Project Overview
 
-It should be established that although Model Express is a component of the Dyanmo inference stack, Model Express can be deployed standalone to accelerate other inference solutions such as vLLM, Sglang, etc. independent of Dynamo.
+It should be established that although Model Express is a component of the Dynamo inference stack, Model Express can be deployed standalone to accelerate other inference solutions such as vLLM, Sglang, etc. independent of Dynamo.
 
 The current version of Model Express acts as a cache for HuggingFace, providing fast access to pre-trained models and reducing the need for repeated downloads across multiple servers. Additionally, this service aids fault tolerance for inference solutions by providing managed model persistence, ensuring that models remain available even in the event of node failures or restarts.
 
