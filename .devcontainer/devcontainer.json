@@ -3,6 +3,8 @@
     "build": {
         "dockerfile": "Dockerfile"
     },
+    "remoteUser": "ubuntu", // Matches our container user
+    "updateRemoteUserUID": true, // Updates the UID of the remote user to match the host user, avoids permission errors
     "customizations": {
         "vscode": {
             "extensions": [
@@ -11,9 +13,7 @@
                 "fill-labs.dependi",
                 "vadimcn.vscode-lldb",
                 "ms-kubernetes-tools.vscode-kubernetes-tools",
-                "github.vscode-github-actions",
-                "GitHub.copilot",
-                "GitHub.copilot-chat"
+                "github.vscode-github-actions"
             ],
             "settings": {
                 "rust-analyzer.checkOnSave.command": "clippy",
@@ -27,7 +27,7 @@
                 "editor.codeActionsOnSave": {
                     "source.fixAll": "explicit"
                 },
-                "terminal.integrated.defaultProfile.linux": "zsh",
+                "terminal.integrated.defaultProfile.linux": "bash",
                 "files.watcherExclude": {
                     "**/target/**": true
                 }
@@ -43,7 +43,6 @@
             "onAutoForward": "notify"
         }
     },
-    "remoteUser": "vscode",
     "mounts": [
         "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
     ],

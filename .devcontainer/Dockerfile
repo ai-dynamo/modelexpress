@@ -54,19 +54,8 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
-# Create a non-root user
-ARG USERNAME=vscode
-ARG USER_UID=1234
-ARG USER_GID=$USER_UID
-
-RUN groupadd --gid "$USER_GID" "$USERNAME" \
-    && useradd --uid "$USER_UID" --gid "$USER_GID" -m "$USERNAME" \
-    && echo "$USERNAME" ALL=\(root\) NOPASSWD:ALL > "/etc/sudoers.d/$USERNAME" \
-    && chmod 0440 "/etc/sudoers.d/$USERNAME"
-
-USER vscode
+# Install Rust
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
-
 
 # Switch back to dialog for any ad-hoc use of apt-get
 ENV DEBIAN_FRONTEND=dialog
