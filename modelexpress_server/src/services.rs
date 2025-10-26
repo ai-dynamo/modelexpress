@@ -9,7 +9,11 @@ use modelexpress_common::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
         model::{ModelDownloadRequest, ModelStatusUpdate, model_service_server::ModelService},
-        transfer::{TransferRequest, TransferResponse, transfer_service_server::TransferService},
+        transfer::{
+            InitializeNixlRequest, InitializeNixlResponse, InitiateTransferRequest,
+            InitiateTransferResponse, NixlMetadataRequest, NixlMetadataResponse, TransferRequest,
+            TransferResponse, transfer_service_server::TransferService,
+        },
     },
     models::{ModelProvider, ModelStatus},
 };
@@ -21,6 +25,8 @@ use std::{
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
+
+use nixl_sys::Agent;
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
@@ -191,6 +197,83 @@ impl TransferService for TransferServiceImpl {
         info!("Received transfer request: {:?}", transfer_request);
 
         Ok(Response::new(TransferResponse {
+            success: true,
+            error: None,
+        }))
+    }
+
+    async fn initialize_nixl_agent(
+        &self,
+        request: Request<InitializeNixlRequest>,
+    ) -> Result<Response<InitializeNixlResponse>, Status> {
+        let initialize_nixl_request = request.into_inner();
+        info!(
+            "Received initialize nixl agent request: {:?}",
+            initialize_nixl_request
+        );
+
+        info!("NIXL Fixed Single Process Example");
+
+        // Create an agent
+        info!("Creating agent...");
+        let agent = Agent::new("modelexpress-server-agent")
+            .map_err(|e| Status::internal(format!("Failed to create agent: {e}")))?;
+
+        info!("Agent created: {}", agent.name());
+
+        // Get available plugins
+        let plugins = agent
+            .get_available_plugins()
+            .map_err(|e| Status::internal(format!("Failed to get available plugins: {e}")))?;
+
+        info!("Available plugins:");
+        for plugin in plugins.iter() {
+            info!("{}", plugin.unwrap_or_default());
+        }
+
+        // Create UCX backends
+        info!("Creating UCX backends...");
+        let (_, params) = agent
+            .get_plugin_params("UCX")
+            .map_err(|e| Status::internal(format!("Failed to get plugin params: {e}")))?;
+        let backend = agent
+            .create_backend("UCX", &params)
+            .map_err(|e| Status::internal(format!("Failed to create backend: {e}")))?;
+        info!("Created UCX backend");
+
+        Ok(Response::new(InitializeNixlResponse {
+            success: true,
+            error: None,
+        }))
+    }
+
+    async fn send_nixl_metadata(
+        &self,
+        request: Request<NixlMetadataRequest>,
+    ) -> Result<Response<NixlMetadataResponse>, Status> {
+        let send_nixl_metadata_request = request.into_inner();
+        info!(
+            "Received send nixl metadata request: {:?}",
+            send_nixl_metadata_request
+        );
+
+        Ok(Response::new(NixlMetadataResponse {
+            success: true,
+            error: None,
+        }))
+    }
+
+    async fn initiate_transfer(
+        &self,
+        request: Request<InitiateTransferRequest>,
+    ) -> Result<Response<InitiateTransferResponse>, Status> {
+        let initiate_transfer_request = request.into_inner();
+        info!(
+            "Received initiate transfer request: {:?}",
+            initiate_transfer_request
+        );
+
+        Ok(Response::new(InitiateTransferResponse {
             success: true,
             error: None,
         }))

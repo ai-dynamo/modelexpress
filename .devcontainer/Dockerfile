@@ -15,6 +15,9 @@ ARG NIXL_REF=0.6.0
 # Avoid warnings by switching to noninteractive
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Install uv package manager
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Configure apt and install packages
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -48,6 +51,7 @@ RUN apt-get update \
     tree \
     unzip \
     wget \
+    vim \
     # NIXL build dependencies
     autoconf \
     automake \
@@ -59,6 +63,8 @@ RUN apt-get update \
     net-tools \
     ninja-build \
     pybind11-dev \
+    clang \
+    libclang-dev \
     # Generate locale
     && locale-gen en_US.UTF-8 \
     # Clean up
@@ -156,8 +162,25 @@ ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
+##################################
+########## Rust Setup ############
+##################################
+
+# Rust environment setup
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.88.0
+
+# Define Rust target based on ARCH_ALT ARG
+ARG RUSTARCH=${ARCH_ALT}-unknown-linux-gnu
+
 # Install Rust
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+RUN wget --tries=3 --waitretry=5 "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init" && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${RUSTARCH} && \
+    rm rustup-init && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
 # Switch back to dialog for any ad-hoc use of apt-get
 ENV DEBIAN_FRONTEND=dialog

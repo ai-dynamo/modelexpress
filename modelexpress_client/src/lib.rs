@@ -13,7 +13,10 @@ use modelexpress_common::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
         health::{HealthRequest, health_service_client::HealthServiceClient},
         model::{ModelDownloadRequest, model_service_client::ModelServiceClient},
-        transfer::{TransferRequest, transfer_service_client::TransferServiceClient},
+        transfer::{
+            InitializeNixlRequest, InitiateTransferRequest, NixlMetadataRequest, TransferRequest,
+            transfer_service_client::TransferServiceClient,
+        },
     },
     models::{ModelStatus, Status},
     providers::huggingface::HuggingFaceProvider,
@@ -196,6 +199,52 @@ impl Client {
             .into());
         }
 
+        Ok(())
+    }
+
+    pub async fn initialize_nixl_agent(&mut self) -> CommonResult<()> {
+        info!("Creating NIXL request...");
+
+        let request = tonic::Request::new(InitializeNixlRequest {
+            agent_id: "mxclient-agent".to_string(),
+        });
+
+        info!("Sending NIXL request...");
+        let response = self.transfer_client.initialize_nixl_agent(request).await?;
+        info!("Received NIXL response...");
+        let initialize_nixl_response = response.into_inner();
+        info!("NIXL response: {:?}", initialize_nixl_response);
+        if !initialize_nixl_response.success {
+            return Err(modelexpress_common::Error::Server(
+                initialize_nixl_response
+                    .error
+                    .unwrap_or_else(|| "Unknown server error".to_string()),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub async fn send_nixl_metadata(&mut self, metadata: &str) -> CommonResult<()> {
+        let request = tonic::Request::new(NixlMetadataRequest {
+            metadata: metadata.to_string(),
+        });
+        let response = self.transfer_client.send_nixl_metadata(request).await?;
+        let nixl_metadata_response = response.into_inner();
+        info!("NIXL metadata response: {:?}", nixl_metadata_response);
+        Ok(())
+    }
+
+    pub async fn initiate_transfer(&mut self, transfer_id: &str) -> CommonResult<()> {
+        let request = tonic::Request::new(InitiateTransferRequest {
+            transfer_id: transfer_id.to_string(),
+        });
+        let response = self.transfer_client.initiate_transfer(request).await?;
+        let initiate_transfer_response = response.into_inner();
+        info!(
+            "Initiate transfer response: {:?}",
+            initiate_transfer_response
+        );
         Ok(())
     }
 

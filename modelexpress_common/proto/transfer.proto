@@ -9,6 +9,48 @@ package model_express.transfer;
 service TransferService {
   // Send a message to the server
   rpc SendMessage(TransferRequest) returns (TransferResponse);
+
+  // Start a new nixl agent for both client and server
+  rpc InitializeNixlAgent(InitializeNixlRequest) returns (InitializeNixlResponse);
+
+  // Send nixl metadata to the server
+  rpc SendNixlMetadata(NixlMetadataRequest) returns (NixlMetadataResponse);
+
+  // Initiate a transfer between the client and server
+  rpc InitiateTransfer(InitiateTransferRequest) returns (InitiateTransferResponse);
+}
+
+// Request message for nixl agent initialization
+message InitializeNixlRequest {
+  string agent_id = 1;
+}
+
+// Response message for nixl agent initialization
+message InitializeNixlResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+// Request message for nixl metadata transfer
+message NixlMetadataRequest {
+  string metadata = 1;
+}
+
+// Response message for nixl metadata transfer
+message NixlMetadataResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+// Request message for transfer initiation
+message InitiateTransferRequest {
+  string transfer_id = 1;
+}
+
+// Response message for transfer initiation
+message InitiateTransferResponse {
+  bool success = 1;
+  optional string error = 2;
 }
 
 // Request message for message transfer

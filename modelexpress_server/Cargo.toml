@@ -12,9 +12,9 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 
-
 [dependencies]
 modelexpress-common = { workspace = true }
+nixl-sys = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

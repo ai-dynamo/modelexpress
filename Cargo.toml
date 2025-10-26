@@ -7,7 +7,6 @@ members = [
     "modelexpress_server", # modelexpress-server
     "modelexpress_client", # modelexpress-client
     "modelexpress_common", # modelexpress-common
-    "workspace-tests",
 ]
 resolver = "3"
 
@@ -37,6 +36,7 @@ jiff = { version = "0.2.15", features = ["serde"] }
 modelexpress-common = { path = "modelexpress_common", version = "0.2.0" }
 modelexpress-client = { path = "modelexpress_client", version = "0.2.0" }
 modelexpress-server = { path = "modelexpress_server", version = "0.2.0" }
+nixl-sys = { version = "=0.6.0" }
 once_cell = "1.21.3"
 prost = "0.13"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
