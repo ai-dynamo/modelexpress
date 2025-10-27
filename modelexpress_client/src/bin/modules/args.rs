@@ -6,7 +6,7 @@ use modelexpress_client::ModelProvider;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "model-express-cli")]
+#[command(name = "modelexpress-cli")]
 #[command(about = "A CLI tool for interacting with ModelExpress server")]
 #[command(version)]
 pub struct Cli {
