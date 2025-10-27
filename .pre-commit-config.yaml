@@ -17,6 +17,7 @@ repos:
         args: ["--allow-multiple-documents"]
       - id: check-toml
       - id: check-json
+        exclude: .devcontainer
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=1000"]
