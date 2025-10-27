@@ -21,6 +21,7 @@ use modelexpress_common::{
     models::{ModelStatus, Status},
     providers::huggingface::HuggingFaceProvider,
 };
+
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;

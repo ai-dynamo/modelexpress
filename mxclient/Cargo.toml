@@ -1,0 +1,10 @@
+[package]
+name = "mxclient"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.39.0", features = ["full"] }
+modelexpress-client = { path = "/workspaces/modelexpress/modelexpress_client" }
+modelexpress-common = { path = "/workspaces/modelexpress/modelexpress_common" }
+nixl-sys = { version = "=0.6.0" }
