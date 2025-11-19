@@ -169,9 +169,10 @@ impl CacheConfig {
 
         for (i, arg) in args.iter().enumerate() {
             if arg == "--cache-path"
-                && let Some(next_arg) = args.get(i.saturating_add(1)) {
-                    return Some(next_arg.clone());
-                }
+                && let Some(next_arg) = args.get(i.saturating_add(1))
+            {
+                return Some(next_arg.clone());
+            }
         }
 
         None

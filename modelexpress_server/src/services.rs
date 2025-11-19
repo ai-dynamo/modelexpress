@@ -416,9 +416,10 @@ impl ModelDownloadTracker {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 if let Some(current_status) = self.get_status(model_name)
-                    && current_status != ModelStatus::DOWNLOADING {
-                        return current_status;
-                    }
+                    && current_status != ModelStatus::DOWNLOADING
+                {
+                    return current_status;
+                }
             }
         } else if status == ModelStatus::ERROR {
             // If the model is in ERROR status, try to retry the download
@@ -476,9 +477,10 @@ impl ModelDownloadTracker {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 if let Some(current_status) = self.get_status(model_name)
-                    && current_status != ModelStatus::DOWNLOADING {
-                        return current_status;
-                    }
+                    && current_status != ModelStatus::DOWNLOADING
+                {
+                    return current_status;
+                }
             }
         }
 
