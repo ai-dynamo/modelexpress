@@ -26,7 +26,7 @@ pub struct ModelDatabase {
 
 impl ModelDatabase {
     /// Helper method to acquire the database connection with proper poison recovery
-    fn acquire_connection(&self) -> SqliteResult<std::sync::MutexGuard<Connection>> {
+    fn acquire_connection(&self) -> SqliteResult<std::sync::MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| {
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
@@ -179,7 +179,7 @@ impl ModelDatabase {
         conn.execute(
             r"
             INSERT OR REPLACE INTO models (model_name, provider, status, created_at, last_used_at, message)
-            VALUES (?1, ?2, ?3, 
+            VALUES (?1, ?2, ?3,
                 COALESCE((SELECT created_at FROM models WHERE model_name = ?1), ?4),
                 ?4, ?5)
             ",
