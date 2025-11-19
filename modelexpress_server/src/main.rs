@@ -114,11 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     // Wait for cache service to complete if it was started
-    if let Some(handle) = cache_handle {
-        if let Err(e) = handle.await {
+    if let Some(handle) = cache_handle
+        && let Err(e) = handle.await {
             error!("Cache eviction service join error: {e}");
         }
-    }
 
     server_result?;
     info!("Server shutdown complete");

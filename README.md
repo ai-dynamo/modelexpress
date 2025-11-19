@@ -58,7 +58,7 @@ See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
 
 ## Prerequisites
 
-- **Rust**: Latest stable version (recommended: 1.88)
+- **Rust**: Latest stable version (recommended: 1.90)
 - **Cargo**: Rust's package manager (included with Rust)
 - **protoc**: The Protocol Buffers compiler is expected to be installed and usable
 - **Docker** (optional): For containerized deployment
@@ -128,10 +128,10 @@ docker run -p 8000:8000 model-express
   ```bash
   # Build the Model Express image
   docker build -t model-express:latest .
-  
+
   # Tag for your registry
   docker tag model-express:latest your-registry/model-express:latest
-  
+
   # Push to your registry
   docker push your-registry/model-express:latest
   ```
@@ -407,4 +407,4 @@ For issues and questions:
 
 ## Known Issues
 
-- Ocassionally the GRPC stream will not close automatically for larger models requested from Huggingface. It is suggested to call modelexpress asynchronously, and implement a check on the calling client side (either with modelexpress client or a file check) to verify when a model has completed downloading. Alternatively, a timeout could be used and inference backends like vLLM or SGlang will typically identify the model if it was downloaded into the cache. 
+- Ocassionally the GRPC stream will not close automatically for larger models requested from Huggingface. It is suggested to call modelexpress asynchronously, and implement a check on the calling client side (either with modelexpress client or a file check) to verify when a model has completed downloading. Alternatively, a timeout could be used and inference backends like vLLM or SGlang will typically identify the model if it was downloaded into the cache.

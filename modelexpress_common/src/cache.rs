@@ -168,11 +168,10 @@ impl CacheConfig {
         let args: Vec<String> = env::args().collect();
 
         for (i, arg) in args.iter().enumerate() {
-            if arg == "--cache-path" {
-                if let Some(next_arg) = args.get(i.saturating_add(1)) {
+            if arg == "--cache-path"
+                && let Some(next_arg) = args.get(i.saturating_add(1)) {
                     return Some(next_arg.clone());
                 }
-            }
         }
 
         None

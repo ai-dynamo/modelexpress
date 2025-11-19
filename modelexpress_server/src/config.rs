@@ -207,24 +207,22 @@ impl ServerConfig {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate database path parent directory exists
-        if let Some(parent) = self.database.path.parent() {
-            if !parent.exists() {
+        if let Some(parent) = self.database.path.parent()
+            && !parent.exists() {
                 return Err(ConfigError::Message(format!(
                     "Database directory does not exist: {}",
                     parent.display()
                 )));
             }
-        }
 
         // Validate cache directory
-        if let Some(parent) = self.cache.directory.parent() {
-            if !parent.exists() {
+        if let Some(parent) = self.cache.directory.parent()
+            && !parent.exists() {
                 return Err(ConfigError::Message(format!(
                     "Cache directory parent does not exist: {}",
                     parent.display()
                 )));
             }
-        }
 
         Ok(())
     }

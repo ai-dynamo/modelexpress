@@ -134,23 +134,21 @@ impl ClientConfig {
         }
 
         // Validate timeout
-        if let Some(timeout) = self.connection.timeout_secs {
-            if timeout == 0 {
+        if let Some(timeout) = self.connection.timeout_secs
+            && timeout == 0 {
                 return Err(ConfigError::Message(
                     "Timeout must be greater than 0".to_string(),
                 ));
             }
-        }
 
         // Validate cache path exists or can be created
-        if !self.cache.local_path.exists() {
-            if let Err(e) = std::fs::create_dir_all(&self.cache.local_path) {
+        if !self.cache.local_path.exists()
+            && let Err(e) = std::fs::create_dir_all(&self.cache.local_path) {
                 return Err(ConfigError::Message(format!(
                     "Cannot create cache directory {:?}: {}",
                     self.cache.local_path, e
                 )));
             }
-        }
 
         Ok(())
     }
