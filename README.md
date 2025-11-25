@@ -52,7 +52,7 @@ See [docs/CLI.md](docs/CLI.md) for detailed CLI documentation.
 
 ## Prerequisites
 
-- **Rust**: Latest stable version (recommended: 1.88)
+- **Rust**: Latest stable version (recommended: 1.90)
 - **Cargo**: Rust's package manager (included with Rust)
 - **protoc**: The Protocol Buffers compiler is expected to be installed and usable
 - **Docker** (optional): For containerized deployment
@@ -108,6 +108,35 @@ docker run -p 8000:8000 model-express
 
 ### Option 3: Kubernetes Deployment
 
+**Prerequisites:**
+- **Kubernetes Cluster**: With GPU support and `kubectl` configured to access your cluster
+- **HuggingFace Token**: Required for accessing HuggingFace models within your cluster via k8s secret as shown here:
+  ```bash
+  export HF_TOKEN=your_hf_token
+  kubectl create secret generic hf-token-secret \
+    --from-literal=HF_TOKEN=${HF_TOKEN} \
+    -n ${NAMESPACE}
+  ```
+- **Docker Registry**: Container registry accessible from your cluster (Docker Hub, private registry, or local registry)
+- **Model Express Image**: Built and pushed to your registry by building from root directory of repository
+  ```bash
+  # Build the Model Express image
+  docker build -t model-express:latest .
+
+  # Tag for your registry
+  docker tag model-express:latest your-registry/model-express:latest
+
+  # Push to your registry
+  docker push your-registry/model-express:latest
+  ```
+- **Update Image Reference**: Update the image reference in your deployment files to match your registry
+  ```yaml
+  # In k8s-deployment.yaml or agg.yaml, update:
+  image: your-registry/model-express:latest
+  ```
+
+
+Now to deploy Modelexpress in your cluster you can run:
 ```bash
 kubectl apply -f k8s-deployment.yaml
 ```
@@ -368,3 +397,6 @@ For issues and questions:
 - Basic model download and storage management.
 - Documentation for Kubernetes deployment and CLI usage.
 
+## Known Issues
+
+- Ocassionally the GRPC stream will not close automatically for larger models requested from Huggingface. It is suggested to call modelexpress asynchronously, and implement a check on the calling client side (either with modelexpress client or a file check) to verify when a model has completed downloading. Alternatively, a timeout could be used and inference backends like vLLM or SGlang will typically identify the model if it was downloaded into the cache.

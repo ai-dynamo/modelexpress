@@ -73,10 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Show differences if requested
-    if args.show_diff {
-        if let Some(input_path) = args.input.as_ref() {
-            show_configuration_diff(input_path, &content)?;
-        }
+    if args.show_diff
+        && let Some(input_path) = args.input.as_ref()
+    {
+        show_configuration_diff(input_path, &content)?;
     }
 
     // If dry run, just print the content

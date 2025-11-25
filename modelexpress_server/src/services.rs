@@ -110,12 +110,8 @@ impl ModelService for ModelServiceImpl {
         &self,
         request: Request<ModelDownloadRequest>,
     ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+        info!("Starting model download stream");
         let model_request = request.into_inner();
-        info!(
-            "Starting model download stream for: {} from provider: {:?}",
-            model_request.model_name, model_request.provider
-        );
-
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let model_name = model_request.model_name.clone();
 
@@ -419,10 +415,10 @@ impl ModelDownloadTracker {
             // Wait for completion by monitoring the status
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Some(current_status) = self.get_status(model_name) {
-                    if current_status != ModelStatus::DOWNLOADING {
-                        return current_status;
-                    }
+                if let Some(current_status) = self.get_status(model_name)
+                    && current_status != ModelStatus::DOWNLOADING
+                {
+                    return current_status;
                 }
             }
         } else if status == ModelStatus::ERROR {
@@ -480,10 +476,10 @@ impl ModelDownloadTracker {
             // Wait for completion by monitoring the status
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Some(current_status) = self.get_status(model_name) {
-                    if current_status != ModelStatus::DOWNLOADING {
-                        return current_status;
-                    }
+                if let Some(current_status) = self.get_status(model_name)
+                    && current_status != ModelStatus::DOWNLOADING
+                {
+                    return current_status;
                 }
             }
         }
