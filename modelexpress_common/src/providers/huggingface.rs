@@ -7,7 +7,7 @@ use hf_hub::api::tokio::ApiBuilder;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
@@ -42,6 +42,15 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
 /// Hugging Face model provider implementation
 pub struct HuggingFaceProvider;
 
+impl HuggingFaceProvider {
+    /// Determine whether the provided filename refers to a file that lives in a sub-directory.
+    /// Hugging Face repositories can contain nested folders, but those are never files
+    /// we use to run the model, so Model Express ignores them.
+    fn is_subdirectory_file(filename: &str) -> bool {
+        Path::new(filename).components().count() > 1
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelProviderTrait for HuggingFaceProvider {
     /// Attempt to download a model from Hugging Face
@@ -52,7 +61,6 @@ impl ModelProviderTrait for HuggingFaceProvider {
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
     ) -> Result<PathBuf> {
-        info!("Downloading model from Hugging Face: {model_name}");
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
 
         // Get cache directory and ensure it exists
@@ -81,7 +89,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let info = repo.info().await.map_err(
             |e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"),
         )?;
-        info!("Got model info: {info:?}");
+        debug!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {
             anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
@@ -91,6 +99,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let mut files_downloaded = false;
 
         for sib in info.siblings {
+            if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
+                continue;
+            }
+
             if HuggingFaceProvider::is_ignored(&sib.rfilename)
                 || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
             {
@@ -163,6 +175,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let mut deletion_errors = Vec::new();
 
         for sib in &info.siblings {
+            if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
+                continue;
+            }
+
             if HuggingFaceProvider::is_ignored(&sib.rfilename)
                 || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
             {
@@ -322,14 +338,15 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "id": "test/model",
-                    "sha": "def5678",
-                    "siblings": [
-                        {"rfilename": "config.json"},
-                        {"rfilename": "model.safetensors"},
-                        {"rfilename": "tokenizer.json"},
-                        {"rfilename": "README.md"},
-                    ]
+                     "id": "test/model",
+                     "sha": "def5678",
+                     "siblings": [
+                         {"rfilename": "config.json"},
+                         {"rfilename": "model.safetensors"},
+                         {"rfilename": "tokenizer.json"},
+                         {"rfilename": "README.md"},
+                         {"rfilename": "subdir/model.safetensors"}
+                     ]
                 })))
                 .mount(&server)
                 .await;
@@ -436,5 +453,21 @@ mod tests {
             info!("File: {}", file.path().display());
             assert!(!file.path().ends_with("safetensors"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_download_ignores_subdirectories() {
+        let mock_server = MockHFServer::new().await;
+        let provider = HuggingFaceProvider;
+
+        let result = provider
+            .download_model("test/model", Some(mock_server.cache_path.clone()), false)
+            .await
+            .expect("Failed to download model");
+
+        assert!(
+            !result.join("subdir").exists(),
+            "Expected files located in sub-directories to be ignored"
+        );
     }
 }
