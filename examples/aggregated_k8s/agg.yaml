@@ -8,20 +8,21 @@ metadata:
   name: model-cache-pvc
 spec:
   accessModes:
-    - ReadWriteMany
+    - ReadWriteOnce
   resources:
     requests:
       storage: 100Gi
     limits:
       storage: 100Gi
-  storageClassName: microk8s-hostpath
-
+  storageClassName: standard
 ---
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
   name: vllm-agg
 spec:
+  pvcs:
+    - name: model-cache-pvc
   services:
     ModelExpressServer:
       livenessProbe:
@@ -41,6 +42,9 @@ spec:
       dynamoNamespace: vllm-agg
       componentType: main
       replicas: 1
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /root
       resources:
         requests:
           cpu: "500m"
@@ -50,7 +54,7 @@ spec:
           memory: "256Mi"
       extraPodSpec:
         mainContainer:
-          image: model-express:latest
+          image: nvcr.io/ai-dynamo/modelexpress-server:0.2.1
           imagePullPolicy: IfNotPresent
           env:
             - name: MODEL_EXPRESS_SERVER_PORT
@@ -118,9 +122,6 @@ spec:
 
               echo "Server PID: $SERVER_PID"
               wait $SERVER_PID
-      pvc:
-        name: model-cache-pvc
-        mountPoint: /root
     Frontend:
       livenessProbe:
         httpGet:
@@ -143,25 +144,22 @@ spec:
       dynamoNamespace: vllm-agg
       componentType: main
       replicas: 1
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
       resources:
         requests:
           cpu: "1"
           memory: "2Gi"
         limits:
-          cpu: "1"
-          memory: "2Gi"
-      extraPodSpec:
         mainContainer:
-          image: nvcr.io/nvstaging/ai-dynamo/vllm-runtime:0.4.0
-          workingDir: /workspace/components/backends/vllm
+          image: nvcr.io/ai-dynamo/vllm-runtime:0.7.0
+          workingDir: /workspace/examples/backends/vllm
           command:
             - /bin/sh
             - -c
           args:
             - "python3 -m dynamo.frontend --http-port 8000"
-      pvc:
-        name: model-cache-pvc
-        mountPoint: /model
     VllmDecodeWorker:
       envFromSecret: hf-token-secret
       livenessProbe:
@@ -209,8 +207,8 @@ spec:
               port: 9090
             periodSeconds: 10
             failureThreshold: 60
-          image: nvcr.io/nvstaging/ai-dynamo/vllm-runtime:0.4.0
-          workingDir: /workspace/components/backends/vllm
+          image: nvcr.io/ai-dynamo/vllm-runtime:0.7.0
+          workingDir: /workspace/examples/backends/vllm
           command:
             - /bin/sh
             - -c
@@ -233,6 +231,6 @@ spec:
               echo "Model path: $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest/"
               ls -la $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/
               python3 -m dynamo.vllm --model $MODEL_CACHE_PATH/$MODEL_CACHE_DIR/snapshots/latest/ | tee /tmp/vllm.log
-      pvc:
-        name: model-cache-pvc
-        mountPoint: /model
+      volumeMounts:
+        - name: model-cache-pvc
+          mountPoint: /model
