@@ -16,7 +16,6 @@ COPY . .
 RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin model-express-cli && \
     cargo build --release --bin test_client && \
-    cargo build --release --bin test_single_client && \
     cargo build --release --bin fallback_test
 
 # Create a minimal runtime image
@@ -33,7 +32,6 @@ RUN apt-get update && \
 COPY --from=builder /app/target/release/modelexpress-server .
 COPY --from=builder /app/target/release/model-express-cli .
 COPY --from=builder /app/target/release/test_client .
-COPY --from=builder /app/target/release/test_single_client .
 COPY --from=builder /app/target/release/fallback_test .
 
 # Copy the Attribution files
