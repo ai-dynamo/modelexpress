@@ -42,6 +42,15 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
 /// Hugging Face model provider implementation
 pub struct HuggingFaceProvider;
 
+impl HuggingFaceProvider {
+    /// Determine whether the provided filename refers to a file that lives in a sub-directory.
+    /// Hugging Face repositories can contain nested folders, but those are never files
+    /// we use to run the model, so Model Express ignores them.
+    fn is_subdirectory_file(filename: &str) -> bool {
+        Path::new(filename).components().count() > 1
+    }
+}
+
 #[async_trait::async_trait]
 impl ModelProviderTrait for HuggingFaceProvider {
     /// Attempt to download a model from Hugging Face
@@ -90,6 +99,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let mut files_downloaded = false;
 
         for sib in info.siblings {
+            if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
+                continue;
+            }
+
             if HuggingFaceProvider::is_ignored(&sib.rfilename)
                 || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
             {
@@ -162,6 +175,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let mut deletion_errors = Vec::new();
 
         for sib in &info.siblings {
+            if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
+                continue;
+            }
+
             if HuggingFaceProvider::is_ignored(&sib.rfilename)
                 || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
             {
@@ -321,14 +338,15 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "id": "test/model",
-                    "sha": "def5678",
-                    "siblings": [
-                        {"rfilename": "config.json"},
-                        {"rfilename": "model.safetensors"},
-                        {"rfilename": "tokenizer.json"},
-                        {"rfilename": "README.md"},
-                    ]
+                     "id": "test/model",
+                     "sha": "def5678",
+                     "siblings": [
+                         {"rfilename": "config.json"},
+                         {"rfilename": "model.safetensors"},
+                         {"rfilename": "tokenizer.json"},
+                         {"rfilename": "README.md"},
+                         {"rfilename": "subdir/model.safetensors"}
+                     ]
                 })))
                 .mount(&server)
                 .await;
@@ -435,5 +453,21 @@ mod tests {
             info!("File: {}", file.path().display());
             assert!(!file.path().ends_with("safetensors"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_download_ignores_subdirectories() {
+        let mock_server = MockHFServer::new().await;
+        let provider = HuggingFaceProvider;
+
+        let result = provider
+            .download_model("test/model", Some(mock_server.cache_path.clone()), false)
+            .await
+            .expect("Failed to download model");
+
+        assert!(
+            !result.join("subdir").exists(),
+            "Expected files located in sub-directories to be ignored"
+        );
     }
 }

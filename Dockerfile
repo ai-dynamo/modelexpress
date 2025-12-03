@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-FROM rust:1.88 AS builder
+FROM rust:1.90 AS builder
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin fallback_test
 
 # Create a minimal runtime image
-FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 
+FROM nvcr.io/nvidia/base/ubuntu:noble-20250619
 
 WORKDIR /app
 

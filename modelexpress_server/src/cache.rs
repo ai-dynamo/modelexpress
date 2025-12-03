@@ -180,12 +180,12 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
         }
 
         // 3. Check disk space-based eviction (if configured and implemented)
-        if let Some(_min_free_space) = lru_config.min_free_space_bytes {
-            if let Some((_total_space, _free_space)) = Self::get_disk_space_info().await {
-                // This is where we would implement disk space checking
-                // For now, we'll log that it's not implemented
-                debug!("Disk space checking is not yet implemented");
-            }
+        if let Some(_min_free_space) = lru_config.min_free_space_bytes
+            && let Some((_total_space, _free_space)) = Self::get_disk_space_info().await
+        {
+            // This is where we would implement disk space checking
+            // For now, we'll log that it's not implemented
+            debug!("Disk space checking is not yet implemented");
         }
 
         debug!(
