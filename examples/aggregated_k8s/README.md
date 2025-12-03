@@ -1,6 +1,5 @@
 # Model Express with Aggregated Dynamo Inference on K8s
 
-
 ## Prerequisites
 
 1. **Install Dynamo Cloud on your Cluster**
@@ -10,18 +9,18 @@
 2. **Build and Push Model Express Image**
    - **IMPORTANT**: You must build the Model Express image and push it to a Docker registry that your Kubernetes cluster can access
    - The deployment expects the image to be available at `localhost:5000/model-express:latest` (for local development) or your registry URL
-   
+
    ```bash
    # Build the Model Express image
    docker build -t model-express:latest .
-   
+
    # Tag for your registry (replace with your registry)
    docker tag model-express:latest your-registry/model-express:latest
-   
+
    # Push to your registry
    docker push your-registry/model-express:latest
    ```
-   
+
    **Registry Options:**
    - **Docker Hub**: `docker tag model-express:latest yourusername/model-express:latest`
    - **Local Registry**: Use `localhost:5000/model-express:latest` (requires local registry setup)
@@ -30,10 +29,13 @@
    **Update Image Reference**
    - **CRITICAL**: Update the image reference in `agg.yaml` to match your registry
    - Find `spec.services.ModelExpressServer.extraPodSpec.mainContainer.image` in `agg.yaml` and change:
+
      ```yaml
      image: model-express:latest
      ```
+
      to your registry URL, for example:
+
      ```yaml
      image: yourusername/model-express:latest
      ```
@@ -43,14 +45,40 @@
    - `kubectl` configured to access your cluster
    - Docker registry accessible from your cluster
 
+4. **Storage Configuration**
+
+You may need to update the storageClassName in examples/aggregated_k8s/agg.yaml to match appropriate storageclass available in your cluster.
+
+First, find your storage class name:
+
+```bash
+kubectl get storageclass
+```
+
+Then, edit the examples/aggregated_k8s/agg.yaml file and update the spec field under persistentVolumeClaim as shown below:
+
+```yaml
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+    limits:
+      storage: 100Gi
+  storageClassName: "your-actual-storage-class"
+```
+
 ## Quick Start
 
 1. **Deploy the configuration:**
+
    ```bash
    kubectl apply -f agg.yaml
    ```
 
 2. **Monitor the deployment:**
+
    ```bash
    $ kubectl get po
 
@@ -67,11 +95,13 @@
 ## Monitoring the Deployment
 
 ### Monitor Model Express Server
+
 ```bash
 kubectl logs -f vllm-agg-modelexpressserver-544b666cbc-2ll6d
 ```
 
 Sample output:
+
 ```
 Starting Model Express Server...
 Server started with PID: 7
@@ -92,11 +122,13 @@ Model cache directory: models--Qwen--Qwen3-0.6B
 ```
 
 ### Monitor VLLM Worker
+
 ```bash
 kubectl logs -f vllm-agg-vllmdecodeworker-69dcddfc85-zcwd7
 ```
 
 Sample output:
+
 ```
 Waiting for model to be ready...
 Model is ready! Starting VLLM worker...
@@ -112,7 +144,7 @@ INFO 08-15 01:24:21 [__init__.py:235] Automatically detected platform cuda.
 The deployment includes:
 
 - **Model Express Server**: Downloads and serves models
-- **VLLM Worker**: Runs inference with GPU acceleration  
+- **VLLM Worker**: Runs inference with GPU acceleration
 - **Frontend**: Provides HTTP API endpoints
 - **Persistent Volume**: Shared storage for model cache
 
@@ -123,10 +155,10 @@ You can customize the deployment by modifying these environment variables in `ag
 - `MODEL_NAME`: The HuggingFace model to download (default: "Qwen/Qwen3-0.6B")
 - `MODEL_CACHE_PATH`: Path for model storage (default: "/root/.model-express/cache")
 
-
 ## Cleanup
 
 To remove the deployment:
+
 ```bash
 kubectl delete -f agg.yaml
 ```

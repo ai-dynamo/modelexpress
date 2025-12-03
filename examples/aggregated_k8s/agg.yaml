@@ -151,7 +151,6 @@ spec:
         requests:
           cpu: "1"
           memory: "2Gi"
-        limits:
         mainContainer:
           image: nvcr.io/ai-dynamo/vllm-runtime:0.7.0
           workingDir: /workspace/examples/backends/vllm
