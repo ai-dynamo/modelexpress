@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 #!/bin/bash
-# Bash completion script for model-express-cli
+# Bash completion script for modelexpress-cli
 # Source this file or add it to your .bashrc:
-#   source /path/to/model-express-cli-completion.bash
+#   source /path/to/modelexpress-cli-completion.bash
 
 _model_express_cli_completions() {
     local cur prev words cword
@@ -169,4 +169,4 @@ _model_express_cli_completions() {
     fi
 }
 
-complete -F _model_express_cli_completions model-express-cli
+complete -F _model_express_cli_completions modelexpress-cli
