@@ -2,15 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-/// Request model for client -> server communication
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Request {
-    pub id: String,
-    pub action: String,
-    pub payload: Option<HashMap<String, serde_json::Value>>,
-}
 
 /// Status model for server health checks
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +42,6 @@ pub struct ModelStatusResponse {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_model_status_serialization() {
@@ -76,27 +66,6 @@ mod tests {
     fn test_model_provider_default() {
         let provider = ModelProvider::default();
         assert_eq!(provider, ModelProvider::HuggingFace);
-    }
-
-    #[test]
-    fn test_request_serialization() {
-        let mut payload = HashMap::new();
-        payload.insert("key".to_string(), json!("value"));
-
-        let request = Request {
-            id: "test-id".to_string(),
-            action: "test-action".to_string(),
-            payload: Some(payload),
-        };
-
-        let serialized = serde_json::to_string(&request).expect("Failed to serialize Request");
-        let deserialized: Request =
-            serde_json::from_str(&serialized).expect("Failed to deserialize Request");
-
-        assert_eq!(request.id, deserialized.id);
-        assert_eq!(request.action, deserialized.action);
-        assert!(request.payload.is_some());
-        assert!(deserialized.payload.is_some());
     }
 
     #[test]

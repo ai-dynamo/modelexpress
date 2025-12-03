@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-mod error;
-
 use modelexpress_common::providers::ModelProviderTrait;
 use modelexpress_common::{
-    Result as CommonResult, Utils,
+    Result as CommonResult,
     cache::{CacheConfig, CacheStats},
     client_config::ClientConfig as Config,
     constants, download,
@@ -18,7 +16,6 @@ use modelexpress_common::{
     providers::huggingface::HuggingFaceProvider,
 };
 use std::collections::HashMap;
-use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::Channel;
@@ -29,7 +26,6 @@ use tracing::warn;
 use uuid::Uuid;
 
 // Re-export for public use
-pub use crate::error::ClientError;
 pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
 pub use modelexpress_common::models::ModelProvider;
 
@@ -120,22 +116,22 @@ impl Client {
         })
     }
 
-    /// TODO: change to using the current client cache dir
-    fn get_model_express_cache_dir() -> PathBuf {
-        if let Ok(cache_path) = env::var("HF_HUB_CACHE") {
-            return PathBuf::from(cache_path);
+    /// Get the cache directory path, using client's cache config if available,
+    /// otherwise discovering from environment variables and defaults.
+    fn get_cache_dir(&self) -> PathBuf {
+        // Use client's cache config if available
+        if let Some(cache_config) = &self.cache_config {
+            return cache_config.local_path.clone();
         }
 
-        if let Ok(cache_path) = env::var("MODEL_EXPRESS_CACHE_PATH") {
-            return PathBuf::from(cache_path);
-        }
-        let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
-
-        PathBuf::from(home).join(".cache/huggingface/hub")
+        // Fall back to discovery
+        CacheConfig::discover()
+            .map(|config| config.local_path)
+            .unwrap_or_else(|_| CacheConfig::default().local_path)
     }
 
     pub async fn get_model_path(&self, model_name: &str) -> anyhow::Result<PathBuf> {
-        let cache_dir = Client::get_model_express_cache_dir();
+        let cache_dir = self.get_cache_dir();
         let model_path = HuggingFaceProvider
             .get_model_path(model_name, cache_dir)
             .await
