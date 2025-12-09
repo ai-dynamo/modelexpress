@@ -119,6 +119,12 @@ impl Client {
     /// Get the cache directory path, using client's cache config if available,
     /// otherwise discovering from environment variables and defaults.
     fn get_cache_dir(&self) -> PathBuf {
+        // Check Hugging Face's HF_HUB_CACHE environment variable first,
+        // as it takes precedence, and isn't specific to our client.
+        use std::env;
+        if let Ok(cache_path) = env::var("HF_HUB_CACHE") {
+            return PathBuf::from(cache_path);
+        }
         // Use client's cache config if available
         if let Some(cache_config) = &self.cache_config {
             return cache_config.local_path.clone();
