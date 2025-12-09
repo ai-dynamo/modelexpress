@@ -21,17 +21,17 @@ A comprehensive command-line interface for interacting with ModelExpress server,
 Build the CLI from the ModelExpress workspace:
 
 ```bash
-cargo build --bin model-express-cli
+cargo build --bin modelexpress-cli
 ```
 
-The compiled binary will be available at `target/debug/model-express-cli` (or `target/release/model-express-cli` for release builds).
+The compiled binary will be available at `target/debug/modelexpress-cli` (or `target/release/modelexpress-cli` for release builds).
 
 ## Usage
 
 ### Global Options
 
 ```bash
-model-express-cli [OPTIONS] <COMMAND>
+modelexpress-cli [OPTIONS] <COMMAND>
 ```
 
 **Options:**
@@ -56,10 +56,10 @@ Check server health and status:
 
 ```bash
 # Basic health check
-model-express-cli health
+modelexpress-cli health
 
 # JSON output
-model-express-cli --format json health
+modelexpress-cli --format json health
 ```
 
 **Example output:**
@@ -76,54 +76,54 @@ Download and manage models with various strategies:
 
 ```bash
 # Download with smart fallback (tries server first, then direct)
-model-express-cli model download google-t5/t5-small
+modelexpress-cli model download google-t5/t5-small
 
 # Use specific provider and strategy
-model-express-cli model download google-t5/t5-small \
+modelexpress-cli model download google-t5/t5-small \
   --provider hugging-face \
   --strategy server-only
 
 # Direct download (bypass server)
-model-express-cli model download microsoft/DialoGPT-medium \
+modelexpress-cli model download microsoft/DialoGPT-medium \
   --strategy direct
 
 # Initialize model storage configuration
-model-express-cli model init
+modelexpress-cli model init
 
 # Initialize with custom settings
-model-express-cli model init \
+modelexpress-cli model init \
   --storage-path /path/to/your/models \
   --server-endpoint http://localhost:8001
 
 # List downloaded models
-model-express-cli model list
+modelexpress-cli model list
 
 # Show detailed model information
-model-express-cli model list --detailed
+modelexpress-cli model list --detailed
 
 # Check model storage status
-model-express-cli model status
+modelexpress-cli model status
 
 # Clear specific model from storage
-model-express-cli model clear google-t5/t5-small
+modelexpress-cli model clear google-t5/t5-small
 
 # Clear all models from storage (with confirmation)
-model-express-cli model clear-all
+modelexpress-cli model clear-all
 
 # Clear all models without confirmation
-model-express-cli model clear-all --yes
+modelexpress-cli model clear-all --yes
 
 # Validate model integrity
-model-express-cli model validate
+modelexpress-cli model validate
 
 # Validate specific model
-model-express-cli model validate google-t5/t5-small
+modelexpress-cli model validate google-t5/t5-small
 
 # Show model storage statistics
-model-express-cli model stats
+modelexpress-cli model stats
 
 # Show detailed storage statistics
-model-express-cli model stats --detailed
+modelexpress-cli model stats --detailed
 ```
 
 **Download Strategies:**
@@ -150,18 +150,18 @@ Send custom API requests:
 
 ```bash
 # Simple ping
-model-express-cli api send ping
+modelexpress-cli api send ping
 
 # Custom action with JSON payload
-model-express-cli api send my-action \
+modelexpress-cli api send my-action \
   --payload '{"key": "value", "number": 42}'
 
 # Read payload from file
-model-express-cli api send process-data \
+modelexpress-cli api send process-data \
   --payload-file data.json
 
 # Read payload from stdin
-echo '{"input": "data"}' | model-express-cli api send process \
+echo '{"input": "data"}' | modelexpress-cli api send process \
   --payload -
 ```
 
@@ -173,14 +173,14 @@ Colorized, structured output optimized for terminal viewing.
 #### JSON
 Compact JSON output suitable for scripting:
 ```bash
-model-express-cli --format json health
+modelexpress-cli --format json health
 # Output: {"version":"0.1.0","status":"ok","uptime":120}
 ```
 
 #### Pretty JSON
 Formatted JSON with indentation:
 ```bash
-model-express-cli --format json-pretty health
+modelexpress-cli --format json-pretty health
 # Output:
 # {
 #   "version": "0.1.0",
@@ -195,43 +195,43 @@ model-express-cli --format json-pretty health
 
 ```bash
 # Check if server is running
-model-express-cli health
+modelexpress-cli health
 
 # Initialize model storage
-model-express-cli model init
+modelexpress-cli model init
 
 # Download a model with automatic storage
-model-express-cli model download google-t5/t5-small
+modelexpress-cli model download google-t5/t5-small
 
 # Check model storage status
-model-express-cli model status
+modelexpress-cli model status
 
 # Test API connectivity
-model-express-cli api send ping
+modelexpress-cli api send ping
 ```
 
 ### Advanced Usage
 
 ```bash
 # Connect to remote server with custom timeout
-model-express-cli --endpoint https://my-server.com:8001 \
+modelexpress-cli --endpoint https://my-server.com:8001 \
   --timeout 60 \
   health
 
 # Download model with verbose logging
-model-express-cli -vv model download microsoft/DialoGPT-small \
+modelexpress-cli -vv model download microsoft/DialoGPT-small \
   --strategy server-only
 
 # Download model with custom storage path
-model-express-cli --cache-path /custom/storage/path \
+modelexpress-cli --cache-path /custom/storage/path \
   model download google-t5/t5-small
 
 # Send API request with file payload and JSON output
-model-express-cli --format json api send process-batch \
+modelexpress-cli --format json api send process-batch \
   --payload-file batch-data.json
 
 # Get model storage statistics in JSON format
-model-express-cli --format json model stats --detailed
+modelexpress-cli --format json model stats --detailed
 ```
 
 ### Error Handling
@@ -244,9 +244,9 @@ The CLI provides clear error messages and appropriate exit codes:
 
 ```bash
 # Handle connection errors gracefully
-if ! model-express-cli health >/dev/null 2>&1; then
+if ! modelexpress-cli health >/dev/null 2>&1; then
     echo "Server is not available, trying direct download..."
-    model-express-cli model download my-model --strategy direct
+    modelexpress-cli model download my-model --strategy direct
 fi
 ```
 
@@ -265,16 +265,16 @@ if [ -z "$MODEL_NAME" ]; then
 fi
 
 # Check server health first
-if model-express-cli --quiet health; then
+if modelexpress-cli --quiet health; then
     echo "Server is healthy, downloading via server..."
-    model-express-cli model download "$MODEL_NAME" --strategy smart-fallback
+    modelexpress-cli model download "$MODEL_NAME" --strategy smart-fallback
 else
     echo "Server unavailable, downloading directly..."
-    model-express-cli model download "$MODEL_NAME" --strategy direct
+    modelexpress-cli model download "$MODEL_NAME" --strategy direct
 fi
 
 # Check if model was stored successfully
-if model-express-cli --format json model validate "$MODEL_NAME" | jq -r '.exists' | grep -q true; then
+if modelexpress-cli --format json model validate "$MODEL_NAME" | jq -r '.exists' | grep -q true; then
     echo "Model '$MODEL_NAME' is now available in storage"
 else
     echo "Warning: Model may not be properly stored"
@@ -285,11 +285,11 @@ fi
 
 ```bash
 # Get server uptime in a script
-UPTIME=$(model-express-cli --format json health | jq -r '.uptime')
+UPTIME=$(modelexpress-cli --format json health | jq -r '.uptime')
 echo "Server has been running for $UPTIME seconds"
 
 # Check if server is healthy
-STATUS=$(model-express-cli --format json health | jq -r '.status')
+STATUS=$(modelexpress-cli --format json health | jq -r '.status')
 if [ "$STATUS" = "ok" ]; then
     echo "Server is healthy"
 else
@@ -298,12 +298,12 @@ else
 fi
 
 # Get model storage statistics
-TOTAL_MODELS=$(model-express-cli --format json model stats | jq -r '.total_models')
-TOTAL_SIZE=$(model-express-cli --format json model stats | jq -r '.total_size')
+TOTAL_MODELS=$(modelexpress-cli --format json model stats | jq -r '.total_models')
+TOTAL_SIZE=$(modelexpress-cli --format json model stats | jq -r '.total_size')
 echo "Storage contains $TOTAL_MODELS models using $TOTAL_SIZE"
 
 # Check if specific model is stored
-MODEL_EXISTS=$(model-express-cli --format json model validate "google-t5/t5-small" | jq -r '.exists')
+MODEL_EXISTS=$(modelexpress-cli --format json model validate "google-t5/t5-small" | jq -r '.exists')
 if [ "$MODEL_EXISTS" = "true" ]; then
     echo "Model is available in storage"
 else
@@ -311,7 +311,7 @@ else
 fi
 
 # List all stored model names
-model-express-cli --format json model list | jq -r '.models[].name'
+modelexpress-cli --format json model list | jq -r '.models[].name'
 ```
 
 ### CI/CD Integration
@@ -325,23 +325,23 @@ model-express-cli --format json model list | jq -r '.models[].name'
     sleep 5
 
     # Test health endpoint
-    ./target/release/model-express-cli health
+    ./target/release/modelexpress-cli health
 
     # Initialize model storage
-    ./target/release/model-express-cli model init
+    ./target/release/modelexpress-cli model init
 
     # Test model download
-    ./target/release/model-express-cli model download google-t5/t5-small \
+    ./target/release/modelexpress-cli model download google-t5/t5-small \
       --strategy server-only
 
     # Verify model was stored
-    ./target/release/model-express-cli model validate google-t5/t5-small
+    ./target/release/modelexpress-cli model validate google-t5/t5-small
 
     # Test API
-    ./target/release/model-express-cli api send ping
+    ./target/release/modelexpress-cli api send ping
 
     # Clean up storage
-    ./target/release/model-express-cli model clear-all --yes
+    ./target/release/modelexpress-cli model clear-all --yes
 ```
 
 ## Configuration
@@ -358,8 +358,8 @@ export MODEL_EXPRESS_ENDPOINT="https://my-server.com:8001"
 export MODEL_EXPRESS_CACHE_PATH="/path/to/storage"
 
 # Use the CLI without specifying endpoint or storage path
-model-express-cli health
-model-express-cli model status
+modelexpress-cli health
+modelexpress-cli model status
 ```
 
 ### Configuration File Support
@@ -369,7 +369,7 @@ While the CLI doesn't currently support configuration files, you can create wrap
 ```bash
 #!/bin/bash
 # modelexpress-prod
-exec model-express-cli --endpoint "https://prod-server.com:8001" "$@"
+exec modelexpress-cli --endpoint "https://prod-server.com:8001" "$@"
 ```
 
 ## Troubleshooting
@@ -378,7 +378,7 @@ exec model-express-cli --endpoint "https://prod-server.com:8001" "$@"
 
 ```bash
 # Test with verbose output
-model-express-cli -vv health
+modelexpress-cli -vv health
 
 # Check network connectivity
 curl -v http://localhost:8001/health 2>&1 | grep -i connect
@@ -388,31 +388,31 @@ curl -v http://localhost:8001/health 2>&1 | grep -i connect
 
 ```bash
 # Try direct download instead
-model-express-cli model download my-model --strategy direct
+modelexpress-cli model download my-model --strategy direct
 
 # Check model storage status without server connection
-model-express-cli model status
+modelexpress-cli model status
 ```
 
 ### Storage Issues
 
 ```bash
 # Validate model storage integrity
-model-express-cli model validate
+modelexpress-cli model validate
 
 # Check storage statistics to find problematic models
-model-express-cli model stats --detailed
+modelexpress-cli model stats --detailed
 
 # Clear corrupted model and re-download
-model-express-cli model clear problematic-model
-model-express-cli model download problematic-model
+modelexpress-cli model clear problematic-model
+modelexpress-cli model download problematic-model
 ```
 
 ### Debug Mode
 
 ```bash
 # Maximum verbosity for debugging
-model-express-cli -vvv model download my-model
+modelexpress-cli -vvv model download my-model
 ```
 
 ## Development
@@ -421,13 +421,13 @@ model-express-cli -vvv model download my-model
 
 ```bash
 # Debug build
-cargo build --bin model-express-cli
+cargo build --bin modelexpress-cli
 
 # Release build
-cargo build --release --bin model-express-cli
+cargo build --release --bin modelexpress-cli
 
 # Run tests
-cargo test --bin model-express-cli
+cargo test --bin modelexpress-cli
 ```
 
 ### Adding New Commands

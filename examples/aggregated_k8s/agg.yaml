@@ -92,7 +92,7 @@ spec:
 
               echo "Waiting for server to be ready..."
               for i in {1..60}; do
-                if ./model-express-cli --endpoint http://localhost:8000 health > /dev/null 2>&1; then
+                if ./modelexpress-cli --endpoint http://localhost:8002 health > /dev/null 2>&1; then
                   echo "Server is ready!"
                   break
                 fi
