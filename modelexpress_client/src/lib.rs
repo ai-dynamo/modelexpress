@@ -10,7 +10,9 @@ use modelexpress_common::{
     grpc::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
         health::{HealthRequest, health_service_client::HealthServiceClient},
-        model::{ModelDownloadRequest, model_service_client::ModelServiceClient},
+        model::{
+            ModelDownloadRequest, ModelFilesRequest, model_service_client::ModelServiceClient,
+        },
     },
     models::{ModelStatus, Status},
     providers::huggingface::HuggingFaceProvider,
@@ -18,6 +20,7 @@ use modelexpress_common::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tonic::transport::Channel;
 use tracing::debug;
 use tracing::info;
@@ -234,6 +237,7 @@ impl Client {
     /// Request a model from the server with a specific provider and automatic fallback
     /// This function will first try to use the server for streaming downloads.
     /// If the server is unavailable, it will fallback to downloading directly.
+    /// When shared_storage is disabled, files will be streamed from server to client.
     pub async fn request_model_with_provider_and_fallback(
         &mut self,
         model_name: impl Into<String>,
@@ -249,6 +253,22 @@ impl Client {
         {
             Ok(()) => {
                 info!("Model {} downloaded successfully via server", model_name);
+
+                // Check if we need to stream files from server (no shared storage)
+                let needs_streaming = self
+                    .cache_config
+                    .as_ref()
+                    .is_some_and(|c| !c.shared_storage);
+
+                if needs_streaming {
+                    info!(
+                        "Shared storage disabled, streaming files from server for model {}",
+                        model_name
+                    );
+                    self.stream_model_files_from_server(&model_name, provider)
+                        .await?;
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -279,6 +299,121 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Stream model files from the server to the local cache
+    /// This is used when shared storage is disabled
+    pub async fn stream_model_files_from_server(
+        &mut self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> CommonResult<()> {
+        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
+            modelexpress_common::Error::Server("Cache not configured".to_string())
+        })?;
+
+        let chunk_size = cache_config.transfer_chunk_size as u32;
+        let local_cache_path = cache_config.local_path.clone();
+
+        info!(
+            "Streaming model {} files to {:?} with chunk size {} bytes",
+            model_name, local_cache_path, chunk_size
+        );
+
+        let grpc_request = tonic::Request::new(ModelFilesRequest {
+            model_name: model_name.to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
+            chunk_size,
+        });
+
+        let mut stream = self
+            .model_client
+            .stream_model_files(grpc_request)
+            .await?
+            .into_inner();
+
+        // Create a normalized model directory path (similar to HuggingFace cache structure)
+        let normalized_name = model_name.replace('/', "--");
+        let model_dir = local_cache_path
+            .join(format!("models--{}", normalized_name))
+            .join("snapshots")
+            .join("streamed");
+
+        std::fs::create_dir_all(&model_dir).map_err(|e| {
+            modelexpress_common::Error::Server(format!("Failed to create model directory: {e}"))
+        })?;
+
+        let mut current_file: Option<(PathBuf, tokio::fs::File)> = None;
+        let mut files_received: u64 = 0;
+        let mut bytes_received: u64 = 0;
+
+        while let Some(chunk_result) = stream.message().await? {
+            let relative_path = PathBuf::from(&chunk_result.relative_path);
+            let file_path = model_dir.join(&relative_path);
+
+            // If this is a new file (different path or first chunk)
+            let need_new_file = current_file
+                .as_ref()
+                .is_none_or(|(path, _)| path != &file_path);
+
+            if need_new_file {
+                // Close previous file if any
+                if let Some((prev_path, file)) = current_file.take() {
+                    drop(file);
+                    debug!("Finished writing file: {:?}", prev_path);
+                }
+
+                // Ensure parent directory exists
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        modelexpress_common::Error::Server(format!(
+                            "Failed to create directory: {e}"
+                        ))
+                    })?;
+                }
+
+                // Create new file
+                let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
+                    modelexpress_common::Error::Server(format!(
+                        "Failed to create file {:?}: {e}",
+                        file_path
+                    ))
+                })?;
+
+                debug!(
+                    "Starting to receive file: {:?} ({} bytes)",
+                    relative_path, chunk_result.total_size
+                );
+                files_received = files_received.saturating_add(1);
+                current_file = Some((file_path.clone(), file));
+            }
+
+            // Write chunk to file
+            if let Some((_, ref mut file)) = current_file {
+                file.write_all(&chunk_result.data).await.map_err(|e| {
+                    modelexpress_common::Error::Server(format!("Failed to write to file: {e}"))
+                })?;
+                bytes_received = bytes_received.saturating_add(chunk_result.data.len() as u64);
+            }
+
+            // Check if we're done with all files
+            if chunk_result.is_last_file && chunk_result.is_last_chunk {
+                break;
+            }
+        }
+
+        // Ensure the last file is properly closed
+        if let Some((path, file)) = current_file.take() {
+            drop(file);
+            debug!("Finished writing final file: {:?}", path);
+        }
+
+        info!(
+            "Streaming complete: received {} files ({} bytes) for model {}",
+            files_received, bytes_received, model_name
+        );
+
+        Ok(())
     }
 
     /// Request a model from the server with a specific provider
@@ -478,6 +613,8 @@ mod tests {
             local_path: std::path::PathBuf::from("/test/path"),
             server_endpoint: "http://original-endpoint:1234".to_string(),
             timeout_secs: None,
+            shared_storage: true,
+            transfer_chunk_size: modelexpress_common::constants::DEFAULT_TRANSFER_CHUNK_SIZE,
         };
 
         // Simulate endpoint override

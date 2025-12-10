@@ -4,22 +4,29 @@
 use crate::database::ModelDatabase;
 use modelexpress_common::{
     cache::CacheConfig,
-    download,
+    constants, download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
-        model::{ModelDownloadRequest, ModelStatusUpdate, model_service_server::ModelService},
+        model::{
+            FileChunk, ModelDownloadRequest, ModelFileInfo, ModelFileList, ModelFilesRequest,
+            ModelStatusUpdate, model_service_server::ModelService,
+        },
     },
     models::{ModelProvider, ModelStatus},
+    providers::ModelProviderTrait,
+    providers::huggingface::HuggingFaceProvider,
 };
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::SystemTime,
 };
+use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
@@ -102,9 +109,33 @@ impl ApiService for ApiServiceImpl {
 #[derive(Debug, Default)]
 pub struct ModelServiceImpl;
 
+/// Helper function to collect all files in a model directory recursively
+fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(current_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    // Get relative path from base_path
+                    if let Ok(relative) = path.strip_prefix(base_path) {
+                        files.push((relative.to_path_buf(), metadata.len()));
+                    }
+                }
+            } else if path.is_dir() {
+                files.extend(collect_model_files(base_path, &path));
+            }
+        }
+    }
+
+    files
+}
+
 #[tonic::async_trait]
 impl ModelService for ModelServiceImpl {
     type EnsureModelDownloadedStream = ReceiverStream<Result<ModelStatusUpdate, Status>>;
+    type StreamModelFilesStream = ReceiverStream<Result<FileChunk, Status>>;
 
     async fn ensure_model_downloaded(
         &self,
@@ -173,6 +204,152 @@ impl ModelService for ModelServiceImpl {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn stream_model_files(
+        &self,
+        request: Request<ModelFilesRequest>,
+    ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+        let files_request = request.into_inner();
+        let model_name = files_request.model_name.clone();
+        let chunk_size = if files_request.chunk_size == 0 {
+            constants::DEFAULT_TRANSFER_CHUNK_SIZE
+        } else {
+            files_request.chunk_size as usize
+        };
+
+        info!(
+            "Starting file stream for model: {} with chunk size: {} bytes",
+            model_name, chunk_size
+        );
+
+        // Get the cache directory
+        let cache_dir = get_server_cache_dir()
+            .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
+
+        // Get the model path
+        let model_path = HuggingFaceProvider
+            .get_model_path(&model_name, cache_dir)
+            .await
+            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+
+        debug!("Model path resolved to: {:?}", model_path);
+
+        // Collect all files to stream
+        let files = collect_model_files(&model_path, &model_path);
+
+        if files.is_empty() {
+            return Err(Status::not_found("No files found in model directory"));
+        }
+
+        let total_files = files.len();
+        info!(
+            "Found {} files to stream for model {}",
+            total_files, model_name
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        // Spawn a task to stream files
+        tokio::spawn(async move {
+            for (file_idx, (relative_path, total_size)) in files.iter().enumerate() {
+                let file_path = model_path.join(relative_path);
+                let is_last_file = file_idx == total_files.saturating_sub(1);
+
+                debug!("Streaming file: {:?} ({} bytes)", relative_path, total_size);
+
+                // Open the file
+                let file = match tokio::fs::File::open(&file_path).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to open file {:?}: {}", file_path, e);
+                        let _ = tx
+                            .send(Err(Status::internal(format!("Failed to open file: {e}"))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let mut reader = tokio::io::BufReader::new(file);
+                let mut offset: u64 = 0;
+                let mut buffer = vec![0u8; chunk_size];
+
+                loop {
+                    let bytes_read = match reader.read(&mut buffer).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("Failed to read file {:?}: {}", file_path, e);
+                            let _ = tx
+                                .send(Err(Status::internal(format!("Failed to read file: {e}"))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let is_last_chunk = offset.saturating_add(bytes_read as u64) >= *total_size;
+
+                    let chunk = FileChunk {
+                        relative_path: relative_path.to_string_lossy().to_string(),
+                        data: buffer[..bytes_read].to_vec(),
+                        offset,
+                        total_size: *total_size,
+                        is_last_chunk,
+                        is_last_file: is_last_file && is_last_chunk,
+                    };
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        debug!("Client disconnected during file stream");
+                        return;
+                    }
+
+                    offset = offset.saturating_add(bytes_read as u64);
+                }
+            }
+
+            info!("File streaming completed for model");
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn list_model_files(
+        &self,
+        request: Request<ModelFilesRequest>,
+    ) -> Result<Response<ModelFileList>, Status> {
+        let files_request = request.into_inner();
+        let model_name = files_request.model_name.clone();
+
+        info!("Listing files for model: {}", model_name);
+
+        // Get the cache directory
+        let cache_dir = get_server_cache_dir()
+            .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
+
+        // Get the model path
+        let model_path = HuggingFaceProvider
+            .get_model_path(&model_name, cache_dir)
+            .await
+            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+
+        // Collect all files
+        let files = collect_model_files(&model_path, &model_path);
+
+        let file_infos: Vec<ModelFileInfo> = files
+            .iter()
+            .map(|(path, size)| ModelFileInfo {
+                relative_path: path.to_string_lossy().to_string(),
+                size: *size,
+            })
+            .collect();
+
+        let total_size: u64 = files.iter().map(|(_, size)| size).sum();
+
+        Ok(Response::new(ModelFileList {
+            model_name,
+            files: file_infos,
+            total_size,
+        }))
     }
 }
 
@@ -799,5 +976,98 @@ mod tests {
 
         // Cleanup
         tracker.delete_status(model_name);
+    }
+
+    #[test]
+    fn test_collect_model_files_empty_dir() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_collect_model_files_with_files() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create some test files
+        let file1_path = temp_dir.path().join("config.json");
+        std::fs::write(&file1_path, r#"{"test": "data"}"#).expect("Failed to write file1");
+
+        let file2_path = temp_dir.path().join("model.bin");
+        std::fs::write(&file2_path, vec![0u8; 100]).expect("Failed to write file2");
+
+        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+
+        assert_eq!(files.len(), 2);
+
+        // Check file sizes
+        let total_size: u64 = files.iter().map(|(_, size)| size).sum();
+        assert!(total_size > 0);
+
+        // Check that relative paths are correct
+        let paths: Vec<_> = files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert!(paths.contains(&"config.json".to_string()));
+        assert!(paths.contains(&"model.bin".to_string()));
+    }
+
+    #[test]
+    fn test_collect_model_files_nested() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create nested directory structure
+        let subdir = temp_dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("Failed to create subdir");
+
+        let file1_path = temp_dir.path().join("root_file.txt");
+        std::fs::write(&file1_path, "root content").expect("Failed to write file1");
+
+        let file2_path = subdir.join("nested_file.txt");
+        std::fs::write(&file2_path, "nested content").expect("Failed to write file2");
+
+        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+
+        assert_eq!(files.len(), 2);
+
+        // Check that nested path is correct
+        let paths: Vec<_> = files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert!(paths.iter().any(|p| p.contains("nested_file")));
+    }
+
+    #[tokio::test]
+    async fn test_list_model_files_not_found() {
+        let service = ModelServiceImpl;
+
+        let request = Request::new(ModelFilesRequest {
+            model_name: "non-existent-model-12345".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 0,
+        });
+
+        let result = service.list_model_files(request).await;
+        assert!(result.is_err());
+        let status = result.expect_err("Should return error");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_stream_model_files_not_found() {
+        let service = ModelServiceImpl;
+
+        let request = Request::new(ModelFilesRequest {
+            model_name: "non-existent-model-12345".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+        });
+
+        let result = service.stream_model_files(request).await;
+        assert!(result.is_err());
+        let status = result.expect_err("Should return error");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 }
