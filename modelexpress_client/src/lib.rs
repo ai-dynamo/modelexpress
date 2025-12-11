@@ -18,7 +18,7 @@ use modelexpress_common::{
     providers::huggingface::HuggingFaceProvider,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tonic::transport::Channel;
@@ -343,13 +343,58 @@ impl Client {
             modelexpress_common::Error::Server(format!("Failed to create model directory: {e}"))
         })?;
 
+        // Canonicalize model_dir once before the loop for efficiency and security
+        let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
+            modelexpress_common::Error::Server(format!(
+                "Failed to canonicalize model directory: {e}"
+            ))
+        })?;
+
         let mut current_file: Option<(PathBuf, tokio::fs::File)> = None;
         let mut files_received: u64 = 0;
         let mut bytes_received: u64 = 0;
 
         while let Some(chunk_result) = stream.message().await? {
             let relative_path = PathBuf::from(&chunk_result.relative_path);
+            
+            // Validate that the relative path does not contain any '..' components or is absolute
+            let is_safe = !relative_path.components().any(|c| {
+                matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+            });
+            
+            if !is_safe {
+                return Err(Box::new(modelexpress_common::Error::Server(format!(
+                    "Received potentially unsafe file path from server: {:?}",
+                    chunk_result.relative_path
+                ))));
+            }
+            
             let file_path = model_dir.join(&relative_path);
+            
+            // Verify that the resolved path is still within model_dir
+            // Create parent directory first if it doesn't exist to enable proper validation
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        modelexpress_common::Error::Server(format!(
+                            "Failed to create parent directory: {e}"
+                        ))
+                    })?;
+                }
+                
+                let canonical_parent = parent.canonicalize().map_err(|e| {
+                    modelexpress_common::Error::Server(format!(
+                        "Failed to canonicalize parent directory: {e}"
+                    ))
+                })?;
+                
+                if !canonical_parent.starts_with(&canonical_model_dir) {
+                    return Err(Box::new(modelexpress_common::Error::Server(format!(
+                        "Received file path that resolves outside model directory: {:?}",
+                        chunk_result.relative_path
+                    ))));
+                }
+            }
 
             // If this is a new file (different path or first chunk)
             let need_new_file = current_file
@@ -363,16 +408,7 @@ impl Client {
                     debug!("Finished writing file: {:?}", prev_path);
                 }
 
-                // Ensure parent directory exists
-                if let Some(parent) = file_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        modelexpress_common::Error::Server(format!(
-                            "Failed to create directory: {e}"
-                        ))
-                    })?;
-                }
-
-                // Create new file
+                // Create new file (parent directory was already created during validation)
                 let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
                     modelexpress_common::Error::Server(format!(
                         "Failed to create file {:?}: {e}",
