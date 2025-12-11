@@ -14,8 +14,6 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
-    providers::ModelProviderTrait,
-    providers::huggingface::HuggingFaceProvider,
 };
 use std::{
     collections::HashMap,
@@ -40,6 +38,23 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
         std::env::var("HF_HUB_CACHE")
             .ok()
             .map(std::path::PathBuf::from)
+    }
+}
+
+/// Convert gRPC provider to internal ModelProvider enum
+/// 
+/// Falls back to HuggingFace provider if the conversion fails or an invalid
+/// provider value is provided. A warning is logged when fallback occurs.
+fn convert_provider(grpc_provider: i32) -> ModelProvider {
+    match modelexpress_common::grpc::model::ModelProvider::try_from(grpc_provider) {
+        Ok(provider) => provider.into(),
+        Err(_) => {
+            tracing::warn!(
+                "Invalid provider value {}, falling back to HuggingFace",
+                grpc_provider
+            );
+            ModelProvider::HuggingFace
+        }
     }
 }
 
@@ -238,6 +253,9 @@ impl ModelService for ModelServiceImpl {
             files_request.chunk_size as usize
         };
 
+        // Convert gRPC provider to our enum
+        let provider = convert_provider(files_request.provider);
+
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
             model_name, chunk_size
@@ -247,8 +265,9 @@ impl ModelService for ModelServiceImpl {
         let cache_dir = get_server_cache_dir()
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
-        // Get the model path
-        let model_path = HuggingFaceProvider
+        // Get the model path using the provider from the request
+        let provider_impl = download::get_provider(provider);
+        let model_path = provider_impl
             .get_model_path(&model_name, cache_dir)
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
@@ -342,14 +361,18 @@ impl ModelService for ModelServiceImpl {
         let files_request = request.into_inner();
         let model_name = files_request.model_name.clone();
 
+        // Convert gRPC provider to our enum
+        let provider = convert_provider(files_request.provider);
+
         info!("Listing files for model: {}", model_name);
 
         // Get the cache directory
         let cache_dir = get_server_cache_dir()
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
-        // Get the model path
-        let model_path = HuggingFaceProvider
+        // Get the model path using the provider from the request
+        let provider_impl = download::get_provider(provider);
+        let model_path = provider_impl
             .get_model_path(&model_name, cache_dir)
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
