@@ -120,7 +120,27 @@ fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u
                 if let Ok(metadata) = std::fs::metadata(&path) {
                     // Get relative path from base_path
                     if let Ok(relative) = path.strip_prefix(base_path) {
-                        files.push((relative.to_path_buf(), metadata.len()));
+                        // Validate that the relative path does not contain any '..' components or is absolute
+                        let mut is_safe = true;
+                        for comp in relative.components() {
+                            use std::path::Component;
+                            match comp {
+                                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                                    is_safe = false;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if is_safe {
+                            files.push((relative.to_path_buf(), metadata.len()));
+                        } else {
+                            log::warn!(
+                                "Skipping potentially unsafe file path: {:?} (relative: {:?})",
+                                path,
+                                relative
+                            );
+                        }
                     }
                 }
             } else if path.is_dir() {
