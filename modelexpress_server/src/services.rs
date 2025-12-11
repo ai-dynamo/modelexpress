@@ -42,10 +42,20 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Convert gRPC provider to internal ModelProvider enum
+/// 
+/// Falls back to HuggingFace provider if the conversion fails or an invalid
+/// provider value is provided. A warning is logged when fallback occurs.
 fn convert_provider(grpc_provider: i32) -> ModelProvider {
-    modelexpress_common::grpc::model::ModelProvider::try_from(grpc_provider)
-        .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
-        .into()
+    match modelexpress_common::grpc::model::ModelProvider::try_from(grpc_provider) {
+        Ok(provider) => provider.into(),
+        Err(_) => {
+            tracing::warn!(
+                "Invalid provider value {}, falling back to HuggingFace",
+                grpc_provider
+            );
+            ModelProvider::HuggingFace
+        }
+    }
 }
 
 /// Health service implementation
