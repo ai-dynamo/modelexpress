@@ -42,7 +42,7 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Convert gRPC provider to internal ModelProvider enum
-/// 
+///
 /// Falls back to HuggingFace provider if the conversion fails or an invalid
 /// provider value is provided. A warning is logged when fallback occurs.
 fn convert_provider(grpc_provider: i32) -> ModelProvider {
@@ -140,7 +140,9 @@ fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u
                         for comp in relative.components() {
                             use std::path::Component;
                             match comp {
-                                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                                Component::ParentDir
+                                | Component::RootDir
+                                | Component::Prefix(_) => {
                                     is_safe = false;
                                     break;
                                 }

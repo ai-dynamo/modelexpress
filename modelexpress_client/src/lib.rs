@@ -358,21 +358,24 @@ impl Client {
 
         while let Some(chunk_result) = stream.message().await? {
             let relative_path = PathBuf::from(&chunk_result.relative_path);
-            
+
             // Validate that the relative path does not contain any '..' components or is absolute
             let is_safe = !relative_path.components().any(|c| {
-                matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+                matches!(
+                    c,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
             });
-            
+
             if !is_safe {
                 return Err(Box::new(modelexpress_common::Error::Server(format!(
                     "Received potentially unsafe file path from server: {:?}",
                     chunk_result.relative_path
                 ))));
             }
-            
+
             let file_path = model_dir.join(&relative_path);
-            
+
             // Verify that the resolved path is still within model_dir
             // Create parent directory first if it doesn't exist to enable proper validation
             if let Some(parent) = file_path.parent() {
@@ -383,13 +386,13 @@ impl Client {
                         ))
                     })?;
                 }
-                
+
                 let canonical_parent = parent.canonicalize().map_err(|e| {
                     modelexpress_common::Error::Server(format!(
                         "Failed to canonicalize parent directory: {e}"
                     ))
                 })?;
-                
+
                 if !canonical_parent.starts_with(&canonical_model_dir) {
                     return Err(Box::new(modelexpress_common::Error::Server(format!(
                         "Received file path that resolves outside model directory: {:?}",
