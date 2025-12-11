@@ -18,7 +18,7 @@ use modelexpress_common::{
     providers::huggingface::HuggingFaceProvider,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tonic::transport::Channel;
@@ -358,17 +358,9 @@ impl Client {
             let relative_path = PathBuf::from(&chunk_result.relative_path);
             
             // Validate that the relative path does not contain any '..' components or is absolute
-            let mut is_safe = true;
-            for comp in relative_path.components() {
-                use std::path::Component;
-                match comp {
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                        is_safe = false;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let is_safe = !relative_path.components().any(|c| {
+                matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+            });
             
             if !is_safe {
                 return Err(Box::new(modelexpress_common::Error::Server(format!(
@@ -380,7 +372,7 @@ impl Client {
             let file_path = model_dir.join(&relative_path);
             
             // Verify that the resolved path is still within model_dir
-            // For non-existent paths, create parent directory first to enable proper validation
+            // Create parent directory first if it doesn't exist to enable proper validation
             if let Some(parent) = file_path.parent() {
                 if !parent.exists() {
                     std::fs::create_dir_all(parent).map_err(|e| {
@@ -402,10 +394,6 @@ impl Client {
                         chunk_result.relative_path
                     ))));
                 }
-            } else {
-                return Err(Box::new(modelexpress_common::Error::Server(
-                    "File path has no parent directory".to_string()
-                )));
             }
 
             // If this is a new file (different path or first chunk)
