@@ -309,7 +309,9 @@ impl Client {
         provider: ModelProvider,
     ) -> CommonResult<()> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
+            modelexpress_common::Error::Server(
+                "Cache configuration is required for file streaming. Please ensure cache_config is set.".to_string()
+            )
         })?;
 
         let chunk_size = cache_config.transfer_chunk_size as u32;
