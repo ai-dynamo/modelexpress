@@ -135,7 +135,7 @@ fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u
                         if is_safe {
                             files.push((relative.to_path_buf(), metadata.len()));
                         } else {
-                            log::warn!(
+                            tracing::warn!(
                                 "Skipping potentially unsafe file path: {:?} (relative: {:?})",
                                 path,
                                 relative
@@ -272,6 +272,9 @@ impl ModelService for ModelServiceImpl {
 
         // Spawn a task to stream files
         tokio::spawn(async move {
+            // Allocate buffer once and reuse across all files
+            let mut buffer = vec![0u8; chunk_size];
+
             for (file_idx, (relative_path, total_size)) in files.iter().enumerate() {
                 let file_path = model_path.join(relative_path);
                 let is_last_file = file_idx == total_files.saturating_sub(1);
@@ -292,7 +295,6 @@ impl ModelService for ModelServiceImpl {
 
                 let mut reader = tokio::io::BufReader::new(file);
                 let mut offset: u64 = 0;
-                let mut buffer = vec![0u8; chunk_size];
 
                 loop {
                     let bytes_read = match reader.read(&mut buffer).await {
