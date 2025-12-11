@@ -349,7 +349,73 @@ impl Client {
 
         while let Some(chunk_result) = stream.message().await? {
             let relative_path = PathBuf::from(&chunk_result.relative_path);
+            
+            // Validate that the relative path does not contain any '..' components or is absolute
+            let mut is_safe = true;
+            for comp in relative_path.components() {
+                use std::path::Component;
+                match comp {
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                        is_safe = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            
+            if !is_safe {
+                return Err(Box::new(modelexpress_common::Error::Server(format!(
+                    "Received potentially unsafe file path from server: {:?}",
+                    chunk_result.relative_path
+                ))));
+            }
+            
             let file_path = model_dir.join(&relative_path);
+            
+            // Verify that the resolved path is still within model_dir
+            let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
+                modelexpress_common::Error::Server(format!(
+                    "Failed to canonicalize model directory: {e}"
+                ))
+            })?;
+            
+            let canonical_file_path = if file_path.exists() {
+                file_path.canonicalize().map_err(|e| {
+                    modelexpress_common::Error::Server(format!(
+                        "Failed to canonicalize file path: {e}"
+                    ))
+                })?
+            } else {
+                // For non-existent paths, check the parent directory
+                if let Some(parent) = file_path.parent() {
+                    let canonical_parent = if parent.exists() {
+                        parent.canonicalize().map_err(|e| {
+                            modelexpress_common::Error::Server(format!(
+                                "Failed to canonicalize parent directory: {e}"
+                            ))
+                        })?
+                    } else {
+                        // If parent doesn't exist yet, we'll validate after creation
+                        canonical_model_dir.clone()
+                    };
+                    canonical_parent.join(file_path.file_name().ok_or_else(|| {
+                        modelexpress_common::Error::Server(
+                            "File path has no file name component".to_string()
+                        )
+                    })?)
+                } else {
+                    return Err(Box::new(modelexpress_common::Error::Server(
+                        "File path has no parent directory".to_string()
+                    )));
+                }
+            };
+            
+            if !canonical_file_path.starts_with(&canonical_model_dir) {
+                return Err(Box::new(modelexpress_common::Error::Server(format!(
+                    "Received file path that resolves outside model directory: {:?}",
+                    chunk_result.relative_path
+                ))));
+            }
 
             // If this is a new file (different path or first chunk)
             let need_new_file = current_file
