@@ -343,6 +343,13 @@ impl Client {
             modelexpress_common::Error::Server(format!("Failed to create model directory: {e}"))
         })?;
 
+        // Canonicalize model_dir once before the loop for efficiency and security
+        let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
+            modelexpress_common::Error::Server(format!(
+                "Failed to canonicalize model directory: {e}"
+            ))
+        })?;
+
         let mut current_file: Option<(PathBuf, tokio::fs::File)> = None;
         let mut files_received: u64 = 0;
         let mut bytes_received: u64 = 0;
@@ -373,48 +380,32 @@ impl Client {
             let file_path = model_dir.join(&relative_path);
             
             // Verify that the resolved path is still within model_dir
-            let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
-                modelexpress_common::Error::Server(format!(
-                    "Failed to canonicalize model directory: {e}"
-                ))
-            })?;
-            
-            let canonical_file_path = if file_path.exists() {
-                file_path.canonicalize().map_err(|e| {
-                    modelexpress_common::Error::Server(format!(
-                        "Failed to canonicalize file path: {e}"
-                    ))
-                })?
-            } else {
-                // For non-existent paths, check the parent directory
-                if let Some(parent) = file_path.parent() {
-                    let canonical_parent = if parent.exists() {
-                        parent.canonicalize().map_err(|e| {
-                            modelexpress_common::Error::Server(format!(
-                                "Failed to canonicalize parent directory: {e}"
-                            ))
-                        })?
-                    } else {
-                        // If parent doesn't exist yet, we'll validate after creation
-                        canonical_model_dir.clone()
-                    };
-                    canonical_parent.join(file_path.file_name().ok_or_else(|| {
-                        modelexpress_common::Error::Server(
-                            "File path has no file name component".to_string()
-                        )
-                    })?)
-                } else {
-                    return Err(Box::new(modelexpress_common::Error::Server(
-                        "File path has no parent directory".to_string()
-                    )));
+            // For non-existent paths, create parent directory first to enable proper validation
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        modelexpress_common::Error::Server(format!(
+                            "Failed to create parent directory: {e}"
+                        ))
+                    })?;
                 }
-            };
-            
-            if !canonical_file_path.starts_with(&canonical_model_dir) {
-                return Err(Box::new(modelexpress_common::Error::Server(format!(
-                    "Received file path that resolves outside model directory: {:?}",
-                    chunk_result.relative_path
-                ))));
+                
+                let canonical_parent = parent.canonicalize().map_err(|e| {
+                    modelexpress_common::Error::Server(format!(
+                        "Failed to canonicalize parent directory: {e}"
+                    ))
+                })?;
+                
+                if !canonical_parent.starts_with(&canonical_model_dir) {
+                    return Err(Box::new(modelexpress_common::Error::Server(format!(
+                        "Received file path that resolves outside model directory: {:?}",
+                        chunk_result.relative_path
+                    ))));
+                }
+            } else {
+                return Err(Box::new(modelexpress_common::Error::Server(
+                    "File path has no parent directory".to_string()
+                )));
             }
 
             // If this is a new file (different path or first chunk)
@@ -429,16 +420,7 @@ impl Client {
                     debug!("Finished writing file: {:?}", prev_path);
                 }
 
-                // Ensure parent directory exists
-                if let Some(parent) = file_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        modelexpress_common::Error::Server(format!(
-                            "Failed to create directory: {e}"
-                        ))
-                    })?;
-                }
-
-                // Create new file
+                // Create new file (parent directory was already created during validation)
                 let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
                     modelexpress_common::Error::Server(format!(
                         "Failed to create file {:?}: {e}",
