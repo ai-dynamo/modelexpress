@@ -14,8 +14,6 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
-    providers::ModelProviderTrait,
-    providers::huggingface::HuggingFaceProvider,
 };
 use std::{
     collections::HashMap,
@@ -238,6 +236,12 @@ impl ModelService for ModelServiceImpl {
             files_request.chunk_size as usize
         };
 
+        // Convert gRPC provider to our enum
+        let provider: ModelProvider =
+            modelexpress_common::grpc::model::ModelProvider::try_from(files_request.provider)
+                .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
+                .into();
+
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
             model_name, chunk_size
@@ -247,8 +251,9 @@ impl ModelService for ModelServiceImpl {
         let cache_dir = get_server_cache_dir()
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
-        // Get the model path
-        let model_path = HuggingFaceProvider
+        // Get the model path using the provider from the request
+        let provider_impl = download::get_provider(provider);
+        let model_path = provider_impl
             .get_model_path(&model_name, cache_dir)
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
@@ -342,14 +347,21 @@ impl ModelService for ModelServiceImpl {
         let files_request = request.into_inner();
         let model_name = files_request.model_name.clone();
 
+        // Convert gRPC provider to our enum
+        let provider: ModelProvider =
+            modelexpress_common::grpc::model::ModelProvider::try_from(files_request.provider)
+                .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
+                .into();
+
         info!("Listing files for model: {}", model_name);
 
         // Get the cache directory
         let cache_dir = get_server_cache_dir()
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
-        // Get the model path
-        let model_path = HuggingFaceProvider
+        // Get the model path using the provider from the request
+        let provider_impl = download::get_provider(provider);
+        let model_path = provider_impl
             .get_model_path(&model_name, cache_dir)
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
