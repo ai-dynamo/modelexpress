@@ -41,6 +41,13 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Convert gRPC provider to internal ModelProvider enum
+fn convert_provider(grpc_provider: i32) -> ModelProvider {
+    modelexpress_common::grpc::model::ModelProvider::try_from(grpc_provider)
+        .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
+        .into()
+}
+
 /// Health service implementation
 #[derive(Debug, Default)]
 pub struct HealthServiceImpl;
@@ -237,10 +244,7 @@ impl ModelService for ModelServiceImpl {
         };
 
         // Convert gRPC provider to our enum
-        let provider: ModelProvider =
-            modelexpress_common::grpc::model::ModelProvider::try_from(files_request.provider)
-                .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
-                .into();
+        let provider = convert_provider(files_request.provider);
 
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
@@ -348,10 +352,7 @@ impl ModelService for ModelServiceImpl {
         let model_name = files_request.model_name.clone();
 
         // Convert gRPC provider to our enum
-        let provider: ModelProvider =
-            modelexpress_common::grpc::model::ModelProvider::try_from(files_request.provider)
-                .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
-                .into();
+        let provider = convert_provider(files_request.provider);
 
         info!("Listing files for model: {}", model_name);
 
