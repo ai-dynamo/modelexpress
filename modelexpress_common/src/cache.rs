@@ -18,6 +18,21 @@ pub struct CacheConfig {
     pub server_endpoint: String,
     /// Timeout for cache operations
     pub timeout_secs: Option<u64>,
+    /// Whether to use shared storage mode (client and server share a network drive)
+    /// When false, files will be streamed from server to client
+    #[serde(default = "default_shared_storage")]
+    pub shared_storage: bool,
+    /// Chunk size in bytes for file transfer streaming when shared_storage is false
+    #[serde(default = "default_transfer_chunk_size")]
+    pub transfer_chunk_size: usize,
+}
+
+fn default_shared_storage() -> bool {
+    constants::DEFAULT_SHARED_STORAGE
+}
+
+fn default_transfer_chunk_size() -> usize {
+    constants::DEFAULT_TRANSFER_CHUNK_SIZE
 }
 
 impl Default for CacheConfig {
@@ -27,6 +42,8 @@ impl Default for CacheConfig {
             local_path: PathBuf::from(home).join(constants::DEFAULT_CACHE_PATH),
             server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
             timeout_secs: None,
+            shared_storage: constants::DEFAULT_SHARED_STORAGE,
+            transfer_chunk_size: constants::DEFAULT_TRANSFER_CHUNK_SIZE,
         }
     }
 }
@@ -76,6 +93,8 @@ impl CacheConfig {
             local_path,
             server_endpoint: server_endpoint.unwrap_or_else(Self::get_default_server_endpoint),
             timeout_secs: None,
+            shared_storage: constants::DEFAULT_SHARED_STORAGE,
+            transfer_chunk_size: constants::DEFAULT_TRANSFER_CHUNK_SIZE,
         })
     }
 
@@ -91,6 +110,8 @@ impl CacheConfig {
             local_path,
             server_endpoint: Self::get_default_server_endpoint(),
             timeout_secs: None,
+            shared_storage: constants::DEFAULT_SHARED_STORAGE,
+            transfer_chunk_size: constants::DEFAULT_TRANSFER_CHUNK_SIZE,
         })
     }
 
@@ -147,6 +168,8 @@ impl CacheConfig {
                     local_path: path,
                     server_endpoint: Self::get_default_server_endpoint(),
                     timeout_secs: None,
+                    shared_storage: constants::DEFAULT_SHARED_STORAGE,
+                    transfer_chunk_size: constants::DEFAULT_TRANSFER_CHUNK_SIZE,
                 });
             }
         }
@@ -364,6 +387,8 @@ mod tests {
             local_path: temp_dir.path().join("cache"),
             server_endpoint: "http://localhost:8001".to_string(),
             timeout_secs: Some(30),
+            shared_storage: false,
+            transfer_chunk_size: 64 * 1024,
         };
 
         // Save config
@@ -380,6 +405,11 @@ mod tests {
             original_config.server_endpoint
         );
         assert_eq!(loaded_config.timeout_secs, original_config.timeout_secs);
+        assert_eq!(loaded_config.shared_storage, original_config.shared_storage);
+        assert_eq!(
+            loaded_config.transfer_chunk_size,
+            original_config.transfer_chunk_size
+        );
     }
 
     #[test]
@@ -420,6 +450,11 @@ mod tests {
             String::from("http://localhost:8001")
         );
         assert_eq!(config.timeout_secs, None);
+        assert!(config.shared_storage);
+        assert_eq!(
+            config.transfer_chunk_size,
+            constants::DEFAULT_TRANSFER_CHUNK_SIZE
+        );
     }
 
     #[test]

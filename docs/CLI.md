@@ -41,12 +41,16 @@ modelexpress-cli [OPTIONS] <COMMAND>
 - `-v, -vv, -vvv`: Verbose mode (info, debug, trace)
 - `-q, --quiet`: Quiet mode (suppress all output except errors)
 - `--cache-path <PATH>`: Model storage path override
+- `--no-shared-storage`: Disable shared storage mode (will transfer files from server to client)
+- `--transfer-chunk-size <SIZE>`: Chunk size in bytes for file transfer when shared storage is disabled (default: 32768)
 - `-h, --help`: Print help information
 - `-V, --version`: Print version
 
 **Environment Variables:**
 - `MODEL_EXPRESS_ENDPOINT`: Set the default server endpoint
 - `MODEL_EXPRESS_CACHE_DIRECTORY`: Set the default model storage path
+- `MODEL_EXPRESS_NO_SHARED_STORAGE`: Disable shared storage mode (set to 'true' to enable file transfers)
+- `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE`: Set the chunk size in bytes for file transfers
 
 ### Commands
 
@@ -86,6 +90,11 @@ modelexpress-cli model download google-t5/t5-small \
 # Direct download (bypass server)
 modelexpress-cli model download microsoft/DialoGPT-medium \
   --strategy direct
+
+# Download with file transfer when no shared storage exists
+modelexpress-cli model download google-t5/t5-small \
+  --no-shared-storage \
+  --transfer-chunk-size 65536
 
 # Initialize model storage configuration
 modelexpress-cli model init

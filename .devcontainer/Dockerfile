@@ -30,6 +30,7 @@ RUN apt-get update \
     libssl-dev \
     locales \
     lsb-release \
+    net-tools \
     openssh-client \
     pkg-config \
     postgresql-client \
@@ -49,13 +50,21 @@ RUN apt-get update \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
 
+RUN echo 'ubuntu:ubuntu' | chpasswd
+RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ubuntu
+
 # Set locale
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
 
+USER ubuntu
+
 # Install Rust
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+
+# Make git happy with codespaces mounted repos
+RUN git config --global --add safe.directory /workspaces/ModelExpress
 
 # Switch back to dialog for any ad-hoc use of apt-get
 ENV DEBIAN_FRONTEND=dialog

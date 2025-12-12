@@ -9,6 +9,12 @@ package model_express.model;
 service ModelService {
   // Ensure a model is downloaded and stream status updates until completion
   rpc EnsureModelDownloaded(ModelDownloadRequest) returns (stream ModelStatusUpdate);
+
+  // Stream model files from server to client (used when shared storage is disabled)
+  rpc StreamModelFiles(ModelFilesRequest) returns (stream FileChunk);
+
+  // Get list of files for a model (useful for resumable transfers)
+  rpc ListModelFiles(ModelFilesRequest) returns (ModelFileList);
 }
 
 // Request to ensure a model is downloaded
@@ -37,4 +43,50 @@ enum ModelStatus {
 // Enum representing model providers
 enum ModelProvider {
   HUGGING_FACE = 0;
+}
+
+// Request for streaming model files
+message ModelFilesRequest {
+  // The name of the model to stream
+  string model_name = 1;
+  // The provider of the model
+  ModelProvider provider = 2;
+  // Chunk size in bytes for streaming (0 = use server default)
+  uint32 chunk_size = 3;
+}
+
+// A chunk of file data for streaming transfers
+message FileChunk {
+  // Relative path of the file within the model directory
+  string relative_path = 1;
+  // The chunk data (binary content)
+  bytes data = 2;
+  // Offset in the file where this chunk starts
+  uint64 offset = 3;
+  // Total size of the file
+  uint64 total_size = 4;
+  // Whether this is the last chunk for this file
+  bool is_last_chunk = 5;
+  // Whether this is the last file in the model
+  bool is_last_file = 6;
+  // Commit hash of the model snapshot (populated in first chunk)
+  optional string commit_hash = 7;
+}
+
+// List of files in a model
+message ModelFileList {
+  // The name of the model
+  string model_name = 1;
+  // List of files
+  repeated ModelFileInfo files = 2;
+  // Total size of all files
+  uint64 total_size = 3;
+}
+
+// Information about a single file in the model
+message ModelFileInfo {
+  // Relative path of the file within the model directory
+  string relative_path = 1;
+  // Size of the file in bytes
+  uint64 size = 2;
 }
