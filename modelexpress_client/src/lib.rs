@@ -438,7 +438,7 @@ impl Client {
                 if let Some((prev_path, file)) = current_file.take() {
                     file.sync_all().await.map_err(|e| {
                         modelexpress_common::Error::Server(format!(
-                            "Failed to flush file {:?}: {e}",
+                            "Failed to sync file to disk {:?}: {e}",
                             prev_path
                         ))
                     })?;
@@ -479,7 +479,7 @@ impl Client {
         // Ensure the last file is properly closed
         if let Some((path, file)) = current_file.take() {
             file.sync_all().await.map_err(|e| {
-                modelexpress_common::Error::Server(format!("Failed to flush final file {:?}: {e}", path))
+                modelexpress_common::Error::Server(format!("Failed to sync final file to disk {:?}: {e}", path))
             })?;
             drop(file);
             debug!("Finished writing final file: {:?}", path);
