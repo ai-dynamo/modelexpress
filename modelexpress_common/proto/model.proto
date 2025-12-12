@@ -69,6 +69,8 @@ message FileChunk {
   bool is_last_chunk = 5;
   // Whether this is the last file in the model
   bool is_last_file = 6;
+  // Commit hash of the model snapshot (populated in first chunk)
+  optional string commit_hash = 7;
 }
 
 // List of files in a model

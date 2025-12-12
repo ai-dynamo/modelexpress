@@ -289,12 +289,19 @@ impl ModelService for ModelServiceImpl {
             total_files, model_name
         );
 
+        // Extract commit hash from model path (last component of path like .../snapshots/{commit_hash})
+        let commit_hash = model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(String::from);
+
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         // Spawn a task to stream files
         tokio::spawn(async move {
             // Allocate buffer once and reuse across all files
             let mut buffer = vec![0u8; chunk_size];
+            let mut is_first_chunk = true;
 
             for (file_idx, (relative_path, total_size)) in files.iter().enumerate() {
                 let file_path = model_path.join(relative_path);
@@ -339,6 +346,12 @@ impl ModelService for ModelServiceImpl {
                         total_size: *total_size,
                         is_last_chunk,
                         is_last_file: is_last_file && is_last_chunk,
+                        commit_hash: if is_first_chunk {
+                            is_first_chunk = false;
+                            commit_hash.clone()
+                        } else {
+                            None
+                        },
                     };
 
                     if tx.send(Ok(chunk)).await.is_err() {

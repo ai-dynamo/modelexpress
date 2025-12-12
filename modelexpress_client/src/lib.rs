@@ -336,27 +336,54 @@ impl Client {
 
         // Create a normalized model directory path (similar to HuggingFace cache structure)
         let normalized_name = model_name.replace('/', "--");
-        let model_dir = local_cache_path
+        let snapshots_dir = local_cache_path
             .join(format!("models--{}", normalized_name))
-            .join("snapshots")
-            .join("streamed");
+            .join("snapshots");
 
-        std::fs::create_dir_all(&model_dir).map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to create model directory: {e}"))
-        })?;
-
-        // Canonicalize model_dir once before the loop for efficiency and security
-        let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
-            modelexpress_common::Error::Server(format!(
-                "Failed to canonicalize model directory: {e}"
-            ))
-        })?;
+        // Model directory will be set after receiving the first chunk with commit hash
+        let mut model_dir: Option<PathBuf> = None;
+        let mut canonical_model_dir: Option<PathBuf> = None;
 
         let mut current_file: Option<(PathBuf, tokio::fs::File)> = None;
         let mut files_received: u64 = 0;
         let mut bytes_received: u64 = 0;
 
         while let Some(chunk_result) = stream.message().await? {
+            // Extract commit hash from first chunk and create model directory
+            if model_dir.is_none() {
+                let commit_hash = chunk_result.commit_hash.as_ref().ok_or_else(|| {
+                    modelexpress_common::Error::Server(
+                        "Server did not provide commit hash in first chunk".to_string(),
+                    )
+                })?;
+
+                let dir = snapshots_dir.join(commit_hash);
+                std::fs::create_dir_all(&dir).map_err(|e| {
+                    modelexpress_common::Error::Server(format!(
+                        "Failed to create model directory: {e}"
+                    ))
+                })?;
+
+                // Canonicalize model_dir once for efficiency and security
+                let canonical_dir = dir.canonicalize().map_err(|e| {
+                    modelexpress_common::Error::Server(format!(
+                        "Failed to canonicalize model directory: {e}"
+                    ))
+                })?;
+
+                model_dir = Some(dir);
+                canonical_model_dir = Some(canonical_dir);
+            }
+
+            let model_dir_ref = model_dir.as_ref().ok_or_else(|| {
+                modelexpress_common::Error::Server("Model directory not initialized".to_string())
+            })?;
+            let canonical_model_dir_ref = canonical_model_dir.as_ref().ok_or_else(|| {
+                modelexpress_common::Error::Server(
+                    "Canonical model directory not initialized".to_string(),
+                )
+            })?;
+
             let relative_path = PathBuf::from(&chunk_result.relative_path);
 
             // Validate that the relative path does not contain any '..' components or is absolute
@@ -374,7 +401,7 @@ impl Client {
                 ))));
             }
 
-            let file_path = model_dir.join(&relative_path);
+            let file_path = model_dir_ref.join(&relative_path);
 
             // Verify that the resolved path is still within model_dir
             // Create parent directory first if it doesn't exist to enable proper validation
@@ -393,7 +420,7 @@ impl Client {
                     ))
                 })?;
 
-                if !canonical_parent.starts_with(&canonical_model_dir) {
+                if !canonical_parent.starts_with(canonical_model_dir_ref) {
                     return Err(Box::new(modelexpress_common::Error::Server(format!(
                         "Received file path that resolves outside model directory: {:?}",
                         chunk_result.relative_path
