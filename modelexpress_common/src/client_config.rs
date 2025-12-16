@@ -48,6 +48,14 @@ pub struct ClientArgs {
     /// Retry delay in seconds
     #[arg(long, env = "MODEL_EXPRESS_RETRY_DELAY")]
     pub retry_delay: Option<u64>,
+
+    /// Disable shared storage mode (will transfer files from server to client)
+    #[arg(long, env = "MODEL_EXPRESS_NO_SHARED_STORAGE")]
+    pub no_shared_storage: bool,
+
+    /// Chunk size in bytes for file transfer when shared storage is disabled
+    #[arg(long, env = "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE")]
+    pub transfer_chunk_size: Option<usize>,
 }
 
 /// Complete client configuration
@@ -116,6 +124,15 @@ impl ClientConfig {
 
         if args.quiet {
             config.logging.quiet = true;
+        }
+
+        // Handle shared storage options
+        if args.no_shared_storage {
+            config.cache.shared_storage = false;
+        }
+
+        if let Some(chunk_size) = args.transfer_chunk_size {
+            config.cache.transfer_chunk_size = chunk_size;
         }
 
         // Validate configuration
@@ -199,6 +216,7 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants;
 
     #[test]
     fn test_client_config_default() {
@@ -240,5 +258,25 @@ mod tests {
         let config = ClientConfig::for_testing("http://test.com:8080");
         assert_eq!(config.grpc_endpoint(), "http://test.com:8080");
         assert_eq!(config.timeout_secs(), Some(30));
+    }
+
+    #[test]
+    fn test_client_config_shared_storage_defaults() {
+        let config = ClientConfig::default();
+        assert!(config.cache.shared_storage);
+        assert_eq!(
+            config.cache.transfer_chunk_size,
+            constants::DEFAULT_TRANSFER_CHUNK_SIZE
+        );
+    }
+
+    #[test]
+    fn test_client_config_shared_storage_override() {
+        let mut config = ClientConfig::default();
+        config.cache.shared_storage = false;
+        config.cache.transfer_chunk_size = 64 * 1024;
+
+        assert!(!config.cache.shared_storage);
+        assert_eq!(config.cache.transfer_chunk_size, 64 * 1024);
     }
 }

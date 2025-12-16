@@ -96,6 +96,12 @@ pub mod constants {
 
     pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+    /// Default setting for shared storage mode (true = client and server share a network drive)
+    pub const DEFAULT_SHARED_STORAGE: bool = true;
+
+    /// Default chunk size for file transfer streaming in bytes (32 KB)
+    pub const DEFAULT_TRANSFER_CHUNK_SIZE: usize = 32 * 1024;
 }
 
 // Conversion utilities between gRPC and legacy models
@@ -297,6 +303,7 @@ mod tests {
     fn test_constants() {
         assert_eq!(constants::DEFAULT_GRPC_PORT.get(), 8001);
         assert_eq!(constants::DEFAULT_TIMEOUT_SECS, 30);
+        assert_eq!(constants::DEFAULT_TRANSFER_CHUNK_SIZE, 32 * 1024);
     }
 
     #[test]

@@ -15,7 +15,7 @@ Model Express is a Rust-based model cache management service designed to be depl
 
 It should be established that although Model Express is a component of the Dynamo inference stack, Model Express can be deployed standalone to accelerate other inference solutions such as vLLM, Sglang, etc. independent of Dynamo.
 
-The current version of Model Express acts as a cache for HuggingFace, providing fast access to pre-trained models and reducing the need for repeated downloads across multiple servers. Additionally, this service aids fault tolerance for inference solutions by providing managed model persistence, ensuring that models remain available even in the event of node failures or restarts.
+The current version of Model Express acts as a cache for HuggingFace, providing fast access to pre-trained models and reducing the need for repeated downloads across multiple servers. Model Express supports two deployment modes: shared storage (where client and server share a network drive) and distributed mode (where model files are transferred over gRPC when shared storage is not available). This enables flexible deployment in various infrastructure setups, from high-performance shared filesystem environments to distributed cloud deployments.
 
 Model Express also shines in multi-node / multi-worker environments, where inference solutions may spawn multiple replicas that require model artifacts to be shared efficiently.
 
@@ -29,7 +29,7 @@ The project is organized as a Rust workspace with the following components:
 - **`modelexpress_client`**: Client library for interacting with the server
 - **`modelexpress_common`**: Shared code and constants between client and server
 
-The current diagram represents a high-level overview of the Model Express architecture. It will evolve with time as we add new features and components.
+The current diagram represents a high-level overview of the Model Express architecture in shared storage mode. In this mode, both the server and client share access to the same persistent volume for model storage. Model Express also supports a distributed mode where the client and server do not share storage; in this case, model files are transferred over gRPC streams from the server to the client. The architecture will evolve with time as we add new features and components.
 
 ```mermaid
 architecture-beta
