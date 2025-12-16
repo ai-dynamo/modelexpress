@@ -33,6 +33,8 @@ async fn main() {
         quiet: cli.quiet,
         max_retries: None,
         retry_delay: None,
+        no_shared_storage: false,
+        transfer_chunk_size: None,
     };
 
     // Load the configuration
