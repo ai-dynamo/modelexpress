@@ -330,7 +330,7 @@ modelexpress-cli --format json model list | jq -r '.models[].name'
 - name: Test ModelExpress server
   run: |
     # Start server in background
-    ./target/release/model-express-server &
+    ./target/release/modelexpress-server &
     sleep 5
 
     # Test health endpoint
@@ -364,7 +364,7 @@ Set default values using environment variables:
 export MODEL_EXPRESS_ENDPOINT="https://my-server.com:8001"
 
 # Set default cache path
-export MODEL_EXPRESS_CACHE_PATH="/path/to/storage"
+export MODEL_EXPRESS_CACHE_DIRECTORY="/path/to/storage"
 
 # Use the CLI without specifying endpoint or storage path
 modelexpress-cli health
