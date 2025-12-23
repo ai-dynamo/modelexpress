@@ -2,9 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::{Parser, Subcommand, ValueEnum};
-use modelexpress_client::ModelProvider;
+use modelexpress_client::{ClientArgs, ModelProvider};
 use std::path::PathBuf;
 
+/// CLI argument structure for the modelexpress-cli binary.
+///
+/// # Adding New Arguments
+///
+/// ## For shared client arguments (endpoint, timeout, cache settings, etc.):
+/// Add them to `ClientArgs` in `modelexpress_common/src/client_config.rs`.
+/// They will automatically be available here via the `#[command(flatten)]` directive.
+/// This ensures consistency across all client binaries and proper environment variable support.
+///
+/// ## For CLI-specific arguments (output format, verbosity, etc.):
+/// Add them directly to this struct below the `client_args` field.
+/// These are arguments that only make sense for this specific CLI tool.
+///
+/// # Short Flag Conflicts
+///
+/// The `-v` short flag is reserved for `verbose` in this struct.
+/// Do not add `-v` as a short flag in `ClientArgs` or it will cause a runtime panic.
 #[derive(Parser)]
 #[command(name = "modelexpress-cli")]
 #[command(about = "A CLI tool for interacting with ModelExpress server")]
@@ -13,34 +30,23 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Server endpoint (can also be set via MODEL_EXPRESS_ENDPOINT env var)
-    #[arg(
-        long,
-        short = 'e',
-        env = "MODEL_EXPRESS_ENDPOINT",
-        default_value = "http://localhost:8001"
-    )]
-    pub endpoint: String,
+    /// Shared client arguments (endpoint, timeout, cache path, etc.)
+    /// These come from `ClientArgs` in modelexpress_common/src/client_config.rs.
+    /// Add new shared arguments there, NOT here.
+    #[command(flatten)]
+    pub client_args: ClientArgs,
 
-    /// Request timeout in seconds
-    #[arg(long, short = 't', default_value = "30")]
-    pub timeout: u64,
-
-    /// Output format
+    // ==================== CLI-SPECIFIC ARGUMENTS ====================
+    // Add arguments below that are specific to this CLI tool only.
+    // For shared arguments (endpoint, cache, etc.), add them to ClientArgs instead.
+    /// Output format (CLI-specific, not in ClientArgs)
     #[arg(long, short = 'f', value_enum, default_value = "human")]
     pub format: OutputFormat,
 
     /// Verbose mode (-v for info, -vv for debug, -vvv for trace)
+    /// This uses -v short flag, so ClientArgs.log_level cannot use -v.
     #[arg(short = 'v', action = clap::ArgAction::Count)]
     pub verbose: u8,
-
-    /// Quiet mode (suppress all output except errors)
-    #[arg(long, short = 'q')]
-    pub quiet: bool,
-
-    /// Cache path override
-    #[arg(long, value_name = "PATH")]
-    pub cache_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -142,7 +148,7 @@ pub enum ApiCommands {
     },
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 pub enum OutputFormat {
     /// Human-readable output with colors
     Human,

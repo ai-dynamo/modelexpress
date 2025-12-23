@@ -34,6 +34,8 @@ The compiled binary will be available at `target/debug/modelexpress-cli` (or `ta
 modelexpress-cli [OPTIONS] <COMMAND>
 ```
 
+> **Note:** Global options must be placed **before** the subcommand (e.g., `modelexpress-cli --no-shared-storage model download ...`).
+
 **Options:**
 - `-e, --endpoint <ENDPOINT>`: Server endpoint (default: http://localhost:8001)
 - `-t, --timeout <TIMEOUT>`: Request timeout in seconds (default: 30)
@@ -92,9 +94,9 @@ modelexpress-cli model download microsoft/DialoGPT-medium \
   --strategy direct
 
 # Download with file transfer when no shared storage exists
-modelexpress-cli model download google-t5/t5-small \
-  --no-shared-storage \
-  --transfer-chunk-size 65536
+# Note: Global options must come before the subcommand
+modelexpress-cli --no-shared-storage --transfer-chunk-size 65536 \
+  model download google-t5/t5-small
 
 # Initialize model storage configuration
 modelexpress-cli model init
