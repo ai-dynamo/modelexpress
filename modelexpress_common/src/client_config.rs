@@ -26,7 +26,7 @@ pub struct ClientArgs {
     pub timeout: Option<u64>,
 
     /// Cache path override
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_PATH")]
+    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
     pub cache_path: Option<PathBuf>,
 
     /// Log level
