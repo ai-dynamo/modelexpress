@@ -119,12 +119,20 @@ async fn download_model(
 
     info!("Downloading model: {}", model_name);
 
-    // Get cache config if available
+    // Get cache config if available, applying settings from ClientConfig
     let cache_config = if let Some(path) = storage_path_override {
         Some(CacheConfig::from_path(path)?)
     } else {
         CacheConfig::discover().ok()
     };
+
+    // Apply shared_storage and transfer_chunk_size settings from ClientConfig
+    let cache_config = cache_config.map(|mut c| {
+        c.shared_storage = config.cache.shared_storage;
+        c.transfer_chunk_size = config.cache.transfer_chunk_size;
+        c.server_endpoint = config.connection.endpoint.clone();
+        c
+    });
 
     let result = match strategy {
         DownloadStrategy::SmartFallback => {
