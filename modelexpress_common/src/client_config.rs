@@ -9,8 +9,29 @@ use config::ConfigError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Command line arguments for the client
-#[derive(Parser, Debug)]
+/// Shared command line arguments for the ModelExpress client.
+///
+/// # Adding New Arguments
+///
+/// This struct is the **single source of truth** for client CLI arguments and environment
+/// variables. It is shared between:
+/// - The `modelexpress-cli` binary (via `#[command(flatten)]` in the `Cli` struct)
+/// - Any other client binaries that need these arguments
+/// - The `ClientConfig::load()` function which applies these values
+///
+/// When adding a new argument:
+/// 1. Add the field here with appropriate `#[arg(...)]` attributes
+/// 2. Include `env = "MODEL_EXPRESS_..."` for environment variable support
+/// 3. Update `ClientConfig::load()` to apply the new argument to the config
+/// 4. Add tests in the `tests` module below
+/// 5. Update CLI.md documentation if applicable
+///
+/// # Short Flags
+///
+/// Avoid using `-v` as a short flag here - it's reserved for the CLI's `--verbose` flag
+/// which uses `-v`, `-vv`, `-vvv` counting. The CLI embeds this struct via flatten,
+/// so short flag conflicts will cause runtime panics.
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct ClientArgs {
     /// Configuration file path
@@ -29,8 +50,8 @@ pub struct ClientArgs {
     #[arg(long, env = "MODEL_EXPRESS_CACHE_PATH")]
     pub cache_path: Option<PathBuf>,
 
-    /// Log level
-    #[arg(short = 'v', long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
+    /// Log level (no short flag to avoid conflict with CLI's -v/--verbose)
+    #[arg(long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
@@ -85,15 +106,27 @@ pub struct LoggingConfig {
 impl ClientConfig {
     /// Load configuration from multiple sources in order of precedence:
     /// 1. Command line arguments (highest priority)
-    /// 2. Environment variables
+    /// 2. Environment variables (handled by clap's `env` attribute on `ClientArgs`)
     /// 3. Configuration file
     /// 4. Default values (lowest priority)
+    ///
+    /// # Adding New Arguments
+    ///
+    /// When you add a new field to `ClientArgs`:
+    /// 1. Add the corresponding override logic below in the "Apply CLI argument overrides" section
+    /// 2. Map the `ClientArgs` field to the appropriate `ClientConfig` field
+    /// 3. Add a test in the `tests` module to verify the override works
     pub fn load(args: ClientArgs) -> Result<Self, ConfigError> {
         // Start with layered config loading (file + env + defaults)
         let mut config =
             load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?;
 
-        // Override with command line arguments
+        // ==================== APPLY CLI ARGUMENT OVERRIDES ====================
+        // When adding a new field to ClientArgs, add the override logic here.
+        // These overrides apply CLI arguments (which include env vars via clap)
+        // on top of the config file values.
+
+        // Connection settings
         if let Some(endpoint) = args.endpoint {
             config.connection.endpoint = endpoint;
         }
@@ -110,10 +143,20 @@ impl ClientConfig {
             config.connection.retry_delay_secs = Some(retry_delay);
         }
 
+        // Cache settings
         if let Some(cache_path) = args.cache_path {
             config.cache.local_path = cache_path;
         }
 
+        if args.no_shared_storage {
+            config.cache.shared_storage = false;
+        }
+
+        if let Some(chunk_size) = args.transfer_chunk_size {
+            config.cache.transfer_chunk_size = chunk_size;
+        }
+
+        // Logging settings
         if let Some(log_level) = args.log_level {
             config.logging.level = log_level;
         }
@@ -126,14 +169,7 @@ impl ClientConfig {
             config.logging.quiet = true;
         }
 
-        // Handle shared storage options
-        if args.no_shared_storage {
-            config.cache.shared_storage = false;
-        }
-
-        if let Some(chunk_size) = args.transfer_chunk_size {
-            config.cache.transfer_chunk_size = chunk_size;
-        }
+        // ==================== END CLI ARGUMENT OVERRIDES ====================
 
         // Validate configuration
         config.validate()?;
@@ -278,5 +314,90 @@ mod tests {
 
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 64 * 1024);
+    }
+
+    #[test]
+    fn test_client_args_parse_defaults() {
+        // Test that ClientArgs can be parsed with no arguments (uses defaults)
+        let args = ClientArgs::try_parse_from(["test"]).expect("Failed to parse empty args");
+
+        assert!(args.endpoint.is_none());
+        assert!(args.timeout.is_none());
+        assert!(args.cache_path.is_none());
+        assert!(!args.quiet);
+        assert!(!args.no_shared_storage);
+        assert!(args.transfer_chunk_size.is_none());
+    }
+
+    #[test]
+    fn test_client_args_parse_cli_flags() {
+        // Test parsing various CLI flags
+        let args = ClientArgs::try_parse_from([
+            "test",
+            "--endpoint",
+            "http://custom:9000",
+            "--timeout",
+            "60",
+            "--quiet",
+            "--no-shared-storage",
+            "--transfer-chunk-size",
+            "1048576",
+        ])
+        .expect("Failed to parse CLI args");
+
+        assert_eq!(args.endpoint, Some("http://custom:9000".to_string()));
+        assert_eq!(args.timeout, Some(60));
+        assert!(args.quiet);
+        assert!(args.no_shared_storage);
+        assert_eq!(args.transfer_chunk_size, Some(1048576));
+    }
+
+    #[test]
+    fn test_client_args_short_flags() {
+        // Test short flag variants (-e for endpoint, -t for timeout, -q for quiet)
+        let args =
+            ClientArgs::try_parse_from(["test", "-e", "http://short:8000", "-t", "45", "-q"])
+                .expect("Failed to parse short flags");
+
+        assert_eq!(args.endpoint, Some("http://short:8000".to_string()));
+        assert_eq!(args.timeout, Some(45));
+        assert!(args.quiet);
+    }
+
+    #[test]
+    fn test_client_args_log_level() {
+        // Test --log-level flag (no short flag to avoid conflict with CLI's -v)
+        let args = ClientArgs::try_parse_from(["test", "--log-level", "debug"])
+            .expect("Failed to parse log level");
+
+        assert_eq!(args.log_level, Some(LogLevel::Debug));
+    }
+
+    #[test]
+    fn test_client_config_load_applies_cli_args() {
+        // Test that ClientConfig::load() properly applies CLI arguments
+        let args = ClientArgs {
+            config: None,
+            endpoint: Some("http://cli-override:7777".to_string()),
+            timeout: Some(120),
+            cache_path: None,
+            log_level: None,
+            log_format: None,
+            quiet: true,
+            max_retries: Some(5),
+            retry_delay: Some(10),
+            no_shared_storage: true,
+            transfer_chunk_size: Some(2097152),
+        };
+
+        let config = ClientConfig::load(args).expect("Failed to load config");
+
+        assert_eq!(config.connection.endpoint, "http://cli-override:7777");
+        assert_eq!(config.connection.timeout_secs, Some(120));
+        assert!(config.logging.quiet);
+        assert_eq!(config.connection.max_retries, Some(5));
+        assert_eq!(config.connection.retry_delay_secs, Some(10));
+        assert!(!config.cache.shared_storage);
+        assert_eq!(config.cache.transfer_chunk_size, 2097152);
     }
 }
