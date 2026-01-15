@@ -151,6 +151,7 @@ impl Client {
     }
 
     /// Pre-download model to cache
+    /// When shared_storage is disabled, files will be streamed from server to client.
     pub async fn preload_model_to_cache(
         &mut self,
         model_name: &str,
@@ -166,6 +167,22 @@ impl Client {
         {
             Ok(()) => {
                 info!("Model {} pre-loaded successfully via server", model_name);
+
+                // Check if we need to stream files from server (no shared storage)
+                let needs_streaming = self
+                    .cache_config
+                    .as_ref()
+                    .is_some_and(|c| !c.shared_storage);
+
+                if needs_streaming {
+                    info!(
+                        "Shared storage disabled, streaming files from server for model {}",
+                        model_name
+                    );
+                    self.stream_model_files_from_server(model_name, provider)
+                        .await?;
+                }
+
                 Ok(())
             }
             Err(e) => {
