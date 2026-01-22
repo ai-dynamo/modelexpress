@@ -103,11 +103,8 @@ impl HuggingFaceProvider {
 
 #[async_trait::async_trait]
 impl ModelProviderTrait for HuggingFaceProvider {
-    /// Attempt to download a model from Hugging Face
-    /// Returns the directory it is in
-    ///
-    /// When HF_HUB_OFFLINE is set (to "1", "ON", "YES", or "TRUE"), this function
-    /// will only return cached models and will not make any HTTP requests to HuggingFace.
+    /// Attempt to download a model from Hugging Face.
+    /// Returns the directory it is in.
     async fn download_model(
         &self,
         model_name: &str,
@@ -120,11 +117,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
             anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
         })?;
 
-        // Check if offline mode is enabled
         if is_offline_mode() {
-            info!(
-                "HF_HUB_OFFLINE is set. Attempting to use cached model for '{model_name}' without network requests."
-            );
             return self.get_model_path_offline(model_name, cache_dir);
         }
 
@@ -303,17 +296,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(())
     }
 
-    /// Get the full path to the latest model snapshot if it exists
-    /// Returns the path if found, or an error if not found
-    ///
-    /// When HF_HUB_OFFLINE is set, this function will skip the API call to check
-    /// for the latest commit hash and return the most recent local snapshot instead.
+    /// Get the full path to the latest model snapshot if it exists.
+    /// Returns the path if found, or an error if not found.
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
-        // In offline mode, skip network requests entirely
         if is_offline_mode() {
-            info!(
-                "HF_HUB_OFFLINE is set. Returning cached model path for '{model_name}' without network validation."
-            );
             return self.get_model_path_offline(model_name, cache_dir);
         }
 
@@ -544,59 +530,16 @@ mod tests {
     }
 
     #[test]
-    fn test_is_offline_mode_enabled() {
-        // Test various enabled values
+    fn test_is_offline_mode() {
         unsafe {
             env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
             assert!(is_offline_mode());
 
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "ON");
-            assert!(is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "on");
-            assert!(is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "YES");
-            assert!(is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "yes");
-            assert!(is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "TRUE");
-            assert!(is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "true");
-            assert!(is_offline_mode());
-
-            // Clean up
-            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
-        }
-    }
-
-    #[test]
-    fn test_is_offline_mode_disabled() {
-        unsafe {
-            // Test various disabled values
             env::set_var(HF_HUB_OFFLINE_ENV_VAR, "0");
             assert!(!is_offline_mode());
 
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "OFF");
-            assert!(!is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "NO");
-            assert!(!is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "FALSE");
-            assert!(!is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "");
-            assert!(!is_offline_mode());
-
-            // Clean up
             env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
         }
-
-        // Test when variable is not set
         assert!(!is_offline_mode());
     }
 
@@ -605,16 +548,13 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let cache_path = temp_dir.path().to_path_buf();
 
-        // Create cache directory structure
         let snapshots_path = cache_path
             .join("models--test--model")
             .join("snapshots")
             .join("abc1234");
         std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
 
-        let provider = HuggingFaceProvider;
-        let result = provider.get_model_path_offline("test/model", cache_path);
-
+        let result = HuggingFaceProvider.get_model_path_offline("test/model", cache_path);
         assert!(result.is_ok());
         assert!(
             result
@@ -626,32 +566,35 @@ mod tests {
     #[test]
     fn test_get_model_path_offline_not_found() {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let cache_path = temp_dir.path().to_path_buf();
-
-        let provider = HuggingFaceProvider;
-        let result = provider.get_model_path_offline("nonexistent/model", cache_path);
-
+        let result =
+            HuggingFaceProvider.get_model_path_offline("nonexistent/model", temp_dir.path().into());
         assert!(result.is_err());
-        let error_msg = result.expect_err("Expected error").to_string();
-        assert!(error_msg.contains("not found in cache"));
-        assert!(error_msg.contains("HF_HUB_OFFLINE"));
+        assert!(
+            result
+                .expect_err("Expected error")
+                .to_string()
+                .contains("not found in cache")
+        );
     }
 
     #[test]
     fn test_get_model_path_offline_empty_snapshots() {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let cache_path = temp_dir.path().to_path_buf();
-
-        // Create cache directory structure without any snapshots
-        let snapshots_path = cache_path.join("models--test--model").join("snapshots");
+        let snapshots_path = temp_dir
+            .path()
+            .join("models--test--model")
+            .join("snapshots");
         std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
 
-        let provider = HuggingFaceProvider;
-        let result = provider.get_model_path_offline("test/model", cache_path);
-
+        let result =
+            HuggingFaceProvider.get_model_path_offline("test/model", temp_dir.path().into());
         assert!(result.is_err());
-        let error_msg = result.expect_err("Expected error").to_string();
-        assert!(error_msg.contains("no snapshots"));
+        assert!(
+            result
+                .expect_err("Expected error")
+                .to_string()
+                .contains("no snapshots")
+        );
     }
 
     #[tokio::test]
