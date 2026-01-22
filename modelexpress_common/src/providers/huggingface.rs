@@ -318,10 +318,15 @@ impl ModelProviderTrait for HuggingFaceProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::time::Duration;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Mutex to serialize access to HF_HUB_OFFLINE environment variable across tests.
+    /// This prevents race conditions when tests run in parallel.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Minimal mock of the Hugging Face Hub used by tests.
     ///
@@ -491,6 +496,7 @@ mod tests {
 
     #[test]
     fn test_is_offline_mode() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
         unsafe {
             env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
             assert!(is_offline_mode());
@@ -504,7 +510,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_download_model_offline_mode_with_cache() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let snapshots_path = temp_dir
             .path()
@@ -530,7 +538,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_download_model_offline_mode_without_cache() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
 
         unsafe {

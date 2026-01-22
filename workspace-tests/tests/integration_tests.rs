@@ -5,9 +5,14 @@
 
 use modelexpress_client::{Client, ClientConfig};
 use modelexpress_common::{constants, models::ModelProvider};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};
+
+/// Mutex to serialize access to HF_HUB_OFFLINE environment variable across tests.
+/// This prevents race conditions when tests run in parallel.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 #[ignore = "Ignore by default since it requires a running server"]
@@ -136,7 +141,9 @@ async fn test_integration_client_config_validation() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_integration_offline_mode_without_cache() {
+    let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
     // Test that HF_HUB_OFFLINE mode properly fails when model is not cached
     unsafe {
         std::env::set_var("HF_HUB_OFFLINE", "1");
@@ -163,7 +170,9 @@ async fn test_integration_offline_mode_without_cache() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_integration_offline_mode_with_cached_model() {
+    let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
     // Test that HF_HUB_OFFLINE mode returns cached models correctly
     // This test creates a mock cache structure and verifies offline mode uses it
     use modelexpress_common::download;
