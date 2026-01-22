@@ -153,12 +153,12 @@ async fn test_integration_offline_mode_without_cache() {
         std::env::remove_var("HF_HUB_OFFLINE");
     }
 
-    // Should fail with an error mentioning offline mode
+    // Should fail because model is not in cache
     assert!(result.is_err());
     let error_msg = result.expect_err("Expected error result").to_string();
     assert!(
-        error_msg.contains("HF_HUB_OFFLINE") || error_msg.contains("offline"),
-        "Error should mention offline mode: {error_msg}"
+        error_msg.contains("not found in cache"),
+        "Error should mention model not found: {error_msg}"
     );
 }
 
