@@ -134,3 +134,75 @@ async fn test_integration_client_config_validation() {
     let client_result = Client::new(invalid_config).await;
     assert!(client_result.is_err());
 }
+
+#[tokio::test]
+async fn test_integration_offline_mode_without_cache() {
+    // Test that HF_HUB_OFFLINE mode properly fails when model is not cached
+    unsafe {
+        std::env::set_var("HF_HUB_OFFLINE", "1");
+    }
+
+    let result = Client::download_model_directly(
+        "nonexistent-model-for-offline-test",
+        ModelProvider::HuggingFace,
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("HF_HUB_OFFLINE");
+    }
+
+    // Should fail with an error mentioning offline mode
+    assert!(result.is_err());
+    let error_msg = result.expect_err("Expected error result").to_string();
+    assert!(
+        error_msg.contains("HF_HUB_OFFLINE") || error_msg.contains("offline"),
+        "Error should mention offline mode: {error_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_integration_offline_mode_with_cached_model() {
+    // Test that HF_HUB_OFFLINE mode returns cached models correctly
+    // This test creates a mock cache structure and verifies offline mode uses it
+    use modelexpress_common::download;
+
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let cache_path = temp_dir.path().to_path_buf();
+
+    // Create a mock cache structure
+    let model_name = "test/offline-model";
+    let normalized_name = model_name.replace("/", "--");
+    let snapshot_path = cache_path
+        .join(format!("models--{normalized_name}"))
+        .join("snapshots")
+        .join("abc1234");
+    std::fs::create_dir_all(&snapshot_path).expect("Failed to create mock cache");
+
+    // Create a dummy config file in the snapshot
+    std::fs::write(snapshot_path.join("config.json"), "{}").expect("Failed to create config file");
+
+    unsafe {
+        std::env::set_var("HF_HUB_OFFLINE", "1");
+    }
+
+    // Use download::download_model directly with explicit cache_dir to avoid CacheConfig::discover
+    let result = download::download_model(
+        model_name,
+        ModelProvider::HuggingFace,
+        Some(cache_path),
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("HF_HUB_OFFLINE");
+    }
+
+    // Should succeed with cached model
+    assert!(
+        result.is_ok(),
+        "Expected offline mode to succeed with cached model: {result:?}"
+    );
+}
