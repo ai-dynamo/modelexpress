@@ -112,6 +112,7 @@ async fn main() {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::modules::args::{Cli, CliModelProvider};
     use clap::Parser;
