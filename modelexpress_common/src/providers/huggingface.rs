@@ -12,6 +12,15 @@ use tracing::{debug, info, warn};
 const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
 const MODEL_EXPRESS_CACHE_ENV_VAR: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
+const HF_HUB_OFFLINE_ENV_VAR: &str = "HF_HUB_OFFLINE";
+
+/// Check if offline mode is enabled via HF_HUB_OFFLINE environment variable.
+/// The variable is considered enabled if its value is one of: "1", "ON", "YES", "TRUE" (case-insensitive).
+fn is_offline_mode() -> bool {
+    env::var(HF_HUB_OFFLINE_ENV_VAR)
+        .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
+        .unwrap_or(false)
+}
 
 /// Get the cache directory for Hugging Face models
 /// Priority order:
@@ -53,21 +62,25 @@ impl HuggingFaceProvider {
 
 #[async_trait::async_trait]
 impl ModelProviderTrait for HuggingFaceProvider {
-    /// Attempt to download a model from Hugging Face
-    /// Returns the directory it is in
+    /// Attempt to download a model from Hugging Face.
+    /// Returns the directory it is in.
     async fn download_model(
         &self,
         model_name: &str,
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
     ) -> Result<PathBuf> {
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
-
-        // Get cache directory and ensure it exists
         let cache_dir = get_cache_dir(cache_dir);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
         })?;
+
+        if is_offline_mode() {
+            info!("HF_HUB_OFFLINE is set, using cached model for '{model_name}'");
+            return self.get_model_path(model_name, cache_dir).await;
+        }
+
+        let token = env::var(HF_TOKEN_ENV_VAR).ok();
 
         info!("Using cache directory: {:?}", cache_dir);
         // High CPU download
@@ -242,8 +255,8 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(())
     }
 
-    /// Get the full path to the latest model snapshot if it exists
-    /// Returns the path if found, or an error if not found
+    /// Get the full path to the latest model snapshot if it exists.
+    /// Returns the path if found, or an error if not found.
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
         let normalized_name = model_name.replace("/", "--");
         let path = cache_dir
@@ -259,13 +272,18 @@ impl ModelProviderTrait for HuggingFaceProvider {
             anyhow::bail!("Model snapshots for '{model_name}' is empty");
         }
 
-        // A bit hacky way to figure out the latest snapshot
+        // Sort by creation/modification time to get the most recent snapshot
         files.sort_by_key(|e| {
             e.metadata()
                 .and_then(|m| m.created().or_else(|_| m.modified()))
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
         });
         files.reverse();
+
+        // In offline mode, skip network validation and return the latest local snapshot
+        if is_offline_mode() {
+            return Ok(files[0].path());
+        }
 
         // Check against the latest commit hash from HF
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
@@ -300,10 +318,15 @@ impl ModelProviderTrait for HuggingFaceProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::time::Duration;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Mutex to serialize access to HF_HUB_OFFLINE environment variable across tests.
+    /// This prevents race conditions when tests run in parallel.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Minimal mock of the Hugging Face Hub used by tests.
     ///
@@ -468,6 +491,76 @@ mod tests {
         assert!(
             !result.join("subdir").exists(),
             "Expected files located in sub-directories to be ignored"
+        );
+    }
+
+    #[test]
+    fn test_is_offline_mode() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        unsafe {
+            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
+            assert!(is_offline_mode());
+
+            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "0");
+            assert!(!is_offline_mode());
+
+            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
+        }
+        assert!(!is_offline_mode());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_model_offline_mode_with_cache() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let snapshots_path = temp_dir
+            .path()
+            .join("models--test--model")
+            .join("snapshots")
+            .join("abc1234");
+        std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
+
+        unsafe {
+            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
+        }
+
+        let result = HuggingFaceProvider
+            .download_model("test/model", Some(temp_dir.path().into()), false)
+            .await;
+
+        unsafe {
+            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
+        }
+
+        assert!(result.is_ok());
+        assert!(result.expect("Expected path").ends_with("abc1234"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_model_offline_mode_without_cache() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+
+        unsafe {
+            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
+        }
+
+        let result = HuggingFaceProvider
+            .download_model("nonexistent/model", Some(temp_dir.path().into()), false)
+            .await;
+
+        unsafe {
+            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
+        }
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("Expected error")
+                .to_string()
+                .contains("not found in cache")
         );
     }
 }
