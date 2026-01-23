@@ -310,8 +310,20 @@ impl CacheConfig {
     /// Clear entire cache
     pub fn clear_all(&self) -> Result<()> {
         if self.local_path.exists() {
-            fs::remove_dir_all(&self.local_path)
-                .with_context(|| format!("Failed to clear cache: {:?}", self.local_path))?;
+            for entry in fs::read_dir(&self.local_path)
+                .with_context(|| format!("Failed to read cache directory: {:?}", self.local_path))?
+            {
+                let entry = entry
+                    .with_context(|| format!("Failed to read entry in: {:?}", self.local_path))?;
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                        .with_context(|| format!("Failed to remove directory: {:?}", path))?;
+                } else {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("Failed to remove file: {:?}", path))?;
+                }
+            }
             info!("Cleared entire cache");
         } else {
             warn!("Cache directory does not exist");
@@ -522,6 +534,95 @@ mod tests {
         assert_eq!(
             CacheConfig::folder_name_to_model_id("models--single"),
             "single"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_clear_all_removes_contents_but_keeps_directory() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+        fs::create_dir_all(&cache_path).expect("Failed to create cache directory");
+
+        // Create some test content
+        let model_dir = cache_path.join("models--test--model");
+        fs::create_dir_all(&model_dir).expect("Failed to create model directory");
+        fs::write(model_dir.join("config.json"), "{}").expect("Failed to write file");
+        fs::write(cache_path.join("test_file.txt"), "test").expect("Failed to write file");
+
+        let config = CacheConfig {
+            local_path: cache_path.clone(),
+            server_endpoint: "http://localhost:8001".to_string(),
+            timeout_secs: None,
+            shared_storage: false,
+            transfer_chunk_size: 64 * 1024,
+        };
+
+        // Clear cache
+        config.clear_all().expect("Failed to clear cache");
+
+        // Directory should still exist but be empty
+        assert!(cache_path.exists(), "Cache directory should still exist");
+        assert!(
+            fs::read_dir(&cache_path)
+                .expect("Failed to read dir")
+                .next()
+                .is_none(),
+            "Cache directory should be empty"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_clear_all_handles_nonexistent_directory() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("nonexistent_cache");
+
+        let config = CacheConfig {
+            local_path: cache_path.clone(),
+            server_endpoint: "http://localhost:8001".to_string(),
+            timeout_secs: None,
+            shared_storage: false,
+            transfer_chunk_size: 64 * 1024,
+        };
+
+        // Should succeed without error even if directory doesn't exist
+        config
+            .clear_all()
+            .with_context(|| format!("Failed to clear cache: {cache_path:?}"))
+            .expect("Failed to clear cache");
+        assert!(!cache_path.exists());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_clear_all_removes_nested_directories() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+        fs::create_dir_all(&cache_path).expect("Failed to create cache directory");
+
+        // Create nested structure
+        let deep_path = cache_path.join("a").join("b").join("c");
+        fs::create_dir_all(&deep_path).expect("Failed to create nested directories");
+        fs::write(deep_path.join("deep_file.txt"), "deep").expect("Failed to write file");
+
+        let config = CacheConfig {
+            local_path: cache_path.clone(),
+            server_endpoint: "http://localhost:8001".to_string(),
+            timeout_secs: None,
+            shared_storage: false,
+            transfer_chunk_size: 64 * 1024,
+        };
+
+        config.clear_all().expect("Failed to clear cache");
+
+        assert!(cache_path.exists(), "Cache directory should still exist");
+        assert!(
+            fs::read_dir(&cache_path)
+                .expect("Failed to read dir")
+                .next()
+                .is_none(),
+            "Cache directory should be empty after clearing nested content"
         );
     }
 }
