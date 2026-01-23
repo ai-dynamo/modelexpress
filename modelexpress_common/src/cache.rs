@@ -587,7 +587,10 @@ mod tests {
         };
 
         // Should succeed without error even if directory doesn't exist
-        config.clear_all().expect("clear_all should handle nonexistent directory");
+        config
+            .clear_all()
+            .with_context(|| format!("Failed to clear cache: {cache_path:?}"))
+            .expect("Failed to clear cache");
         assert!(!cache_path.exists());
     }
 
