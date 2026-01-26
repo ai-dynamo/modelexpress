@@ -52,6 +52,10 @@ spec:
           cpu: "4"
           memory: "16Gi"
       extraPodSpec:
+        securityContext:  # required to avoid permission issues in PVC
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
         mainContainer:
           image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.2.0
           imagePullPolicy: IfNotPresent
@@ -77,7 +81,7 @@ spec:
             - |
               echo "Starting Model Express Server..."
               ./modelexpress-server &
-              
+
               SERVER_PID=$!
               echo "Server started with PID: $SERVER_PID"
 
