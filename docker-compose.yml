@@ -9,8 +9,8 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8001:8001"
     environment:
-      - MODEL_EXPRESS_SERVER_PORT=8000
+      - MODEL_EXPRESS_SERVER_PORT=8001
       - MODEL_EXPRESS_LOG_LEVEL=info
     restart: unless-stopped
