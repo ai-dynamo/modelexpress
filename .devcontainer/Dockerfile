@@ -29,6 +29,8 @@ RUN apt-get update \
     libprotobuf-dev \
     libssl-dev \
     locales \
+    pipx \
+    python3 \
     lsb-release \
     net-tools \
     openssh-client \
@@ -62,6 +64,10 @@ USER ubuntu
 
 # Install Rust
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+
+# Install pre-commit via pipx
+RUN pipx install pre-commit
+ENV PATH="/home/ubuntu/.local/bin:${PATH}"
 
 # Make git happy with codespaces mounted repos
 RUN git config --global --add safe.directory /workspaces/ModelExpress
