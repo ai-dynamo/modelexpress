@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 [workspace]
@@ -52,6 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

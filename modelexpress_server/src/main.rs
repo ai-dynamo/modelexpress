@@ -1,19 +1,23 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Parser;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer,
+    p2p::p2p_service_server::P2pServiceServer,
 };
 use modelexpress_server::{
     cache::CacheEvictionService,
     config::{ServerArgs, ServerConfig},
     database::ModelDatabase,
+    p2p_service::P2pServiceImpl,
     services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl},
+    state::P2pStateManager,
 };
+use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 #[tokio::main]
@@ -90,6 +94,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_service = ApiServiceImpl;
     let model_service = ModelServiceImpl;
 
+    // Initialize P2P state manager with Redis (optional)
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let p2p_state = Arc::new(P2pStateManager::new(&redis_url));
+
+    // Try to connect to Redis (non-fatal if unavailable)
+    match p2p_state.connect().await {
+        Ok(()) => info!("P2P state manager connected to Redis"),
+        Err(e) => warn!("P2P state manager could not connect to Redis: {} - P2P features may be unavailable", e),
+    }
+
+    let p2p_service = P2pServiceImpl::new(p2p_state);
+
     // Setup graceful shutdown handler
     let shutdown_signal = async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -106,10 +122,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the gRPC server
     info!("Starting gRPC server on: {addr}");
+    // Set max message size to 100MB for large models like DeepSeek-V3
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
     let server_result = Server::builder()
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))
         .add_service(ModelServiceServer::new(model_service))
+        .add_service(
+            P2pServiceServer::new(p2p_service)
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+        )
         .serve_with_shutdown(addr, shutdown_signal)
         .await;
 
