@@ -1,0 +1,89 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package model_express.p2p;
+
+// P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
+// The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
+// Clients query for existing sources and publish their own metadata.
+service P2pService {
+  // Publish model metadata - called by client after loading model weights
+  rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
+  
+  // Query for existing source with the same model - called at client startup
+  rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+}
+
+// ============================================================================
+// Tensor Descriptors
+// ============================================================================
+
+message TensorDescriptor {
+  // Tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
+  string name = 1;
+  
+  // GPU memory address
+  uint64 addr = 2;
+  
+  // Size in bytes
+  uint64 size = 3;
+  
+  // GPU device ID (0-7 for 8-GPU setup)
+  uint32 device_id = 4;
+  
+  // Data type (e.g., "float16", "bfloat16")
+  string dtype = 5;
+}
+
+// ============================================================================
+// Worker Metadata
+// ============================================================================
+
+message WorkerMetadata {
+  // Worker rank (GPU index within the instance)
+  uint32 worker_rank = 1;
+  
+  // Serialized NIXL agent metadata for this worker
+  // Used by remote agents to establish RDMA connections
+  bytes nixl_metadata = 2;
+  
+  // Tensor descriptors for this worker's GPU
+  repeated TensorDescriptor tensors = 3;
+}
+
+// ============================================================================
+// Publish Metadata
+// ============================================================================
+
+message PublishMetadataRequest {
+  // Model identifier (e.g., "meta-llama/Llama-3.1-70B")
+  // This is the key used to look up existing sources
+  string model_name = 1;
+  
+  // Metadata for each GPU worker in this instance
+  repeated WorkerMetadata workers = 2;
+}
+
+message PublishMetadataResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============================================================================
+// Get Metadata
+// ============================================================================
+
+message GetMetadataRequest {
+  // Model name to look up
+  string model_name = 1;
+}
+
+message GetMetadataResponse {
+  // Whether a source was found for this model
+  bool found = 1;
+  
+  // Worker metadata from the source (if found)
+  repeated WorkerMetadata workers = 2;
+}
