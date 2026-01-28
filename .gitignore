@@ -49,3 +49,6 @@ logs/
 
 # Models database
 models.db
+
+# Python testing
+.venv/

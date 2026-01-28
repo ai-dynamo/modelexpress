@@ -213,6 +213,62 @@ jobs:
         files: lcov.info
         fail_ci_if_error: false
 
+  sidecar-test:
+    name: Sidecar Python Tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install sidecar dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e "sidecar[dev]"
+
+    - name: Run sidecar unit tests (no MinIO)
+      run: |
+        cd sidecar
+        pytest tests/test_api.py -v
+
+    - name: Start MinIO for integration tests
+      run: |
+        docker run -d --name minio \
+          -p 9000:9000 -p 9001:9001 \
+          -e MINIO_ROOT_USER=minioadmin \
+          -e MINIO_ROOT_PASSWORD=minioadmin \
+          minio/minio:latest server /data --console-address ":9001"
+        # Wait for MinIO to be ready
+        sleep 5
+        # Create test bucket and upload test data
+        docker run --rm --network host --entrypoint /bin/sh minio/mc -c "
+          mc alias set myminio http://localhost:9000 minioadmin minioadmin &&
+          mc mb myminio/models --ignore-existing &&
+          echo '{\"model_type\": \"test\"}' > /tmp/config.json &&
+          mc cp /tmp/config.json myminio/models/test-model/config.json
+        "
+
+    - name: Run sidecar integration tests with MinIO
+      env:
+        AWS_ACCESS_KEY_ID: minioadmin
+        AWS_SECRET_ACCESS_KEY: minioadmin
+        AWS_ENDPOINT_URL: http://localhost:9000
+        AWS_REGION: us-east-1
+      run: |
+        cd sidecar
+        pytest tests/ -v
+
+    - name: Stop MinIO
+      if: always()
+      run: |
+        docker stop minio || true
+        docker rm minio || true
+
   docker-build:
     name: Docker Build
     runs-on: ubuntu-latest
