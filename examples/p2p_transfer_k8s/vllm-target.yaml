@@ -72,6 +72,16 @@ spec:
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
               value: "0"
+            # OPTIMIZATION: Pipelined transfers - concurrent RDMA batches
+            # Enables multiple in-flight transfers for better bandwidth utilization
+            - name: MX_PIPELINE_ENABLED
+              value: "1"
+            # Number of concurrent transfer batches (default: 8)
+            - name: MX_PIPELINE_BATCH_SIZE
+              value: "8"
+            # Polling interval in ms for transfer status checks (default: 1)
+            - name: MX_PIPELINE_POLL_INTERVAL_MS
+              value: "1"
             # Logging (set to DEBUG for troubleshooting)
             - name: NIXL_LOG_LEVEL
               value: "INFO"

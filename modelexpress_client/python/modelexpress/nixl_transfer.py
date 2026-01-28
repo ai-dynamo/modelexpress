@@ -9,12 +9,32 @@ operations including agent creation, tensor registration, and RDMA transfers.
 
 Each vLLM worker creates its own NixlTransferManager instance to manage
 a single NIXL agent for that worker's GPU.
+
+OPTIMIZATION: Pipelined Transfers
+---------------------------------
+Based on https://le.qun.ch/en/blog/2025/09/07/rl-weight-transfer/ and
+https://research.perplexity.ai/articles/weight-transfer-for-rl-post-training-in-under-2-seconds
+
+The pipelined approach splits transfers into batches that can execute concurrently:
+- Multiple in-flight RDMA transfers (configurable batch size)
+- Non-blocking status checks using polling
+- CUDA events to track GPU-side completion
+- Overlapping transfer preparation with execution
+
+Environment Variables:
+- MX_PIPELINE_ENABLED: Enable pipelined transfers (default: 1)
+- MX_PIPELINE_BATCH_SIZE: Number of concurrent transfers (default: 8)
+- MX_PIPELINE_POLL_INTERVAL_MS: Polling interval in ms (default: 1)
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import torch
@@ -22,6 +42,77 @@ import torch
 from .types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
+
+
+class TransferState(Enum):
+    """State of a transfer task in the pipeline."""
+    PENDING = "pending"           # Not started
+    PREPARING = "preparing"       # Building descriptors
+    SUBMITTED = "submitted"       # RDMA submitted, waiting
+    COMPLETED = "completed"       # Transfer done
+    FAILED = "failed"             # Transfer failed
+
+
+@dataclass
+class TransferTask:
+    """
+    Represents a single transfer task in the pipeline.
+    
+    Each task handles a batch of tensors/regions to transfer.
+    Tasks flow through states: PENDING -> PREPARING -> SUBMITTED -> COMPLETED
+    """
+    task_id: int
+    remote_descs: list[tuple[int, int, int]]  # (addr, size, device_id)
+    local_descs: list  # Either tensors or (addr, size, device_id) tuples
+    use_raw_descriptors: bool
+    
+    # State tracking
+    state: TransferState = TransferState.PENDING
+    handle: Any = None
+    start_time: float = 0.0
+    end_time: float = 0.0
+    
+    # Size tracking
+    total_bytes: int = 0
+    tensor_count: int = 0
+    
+    # Error info
+    error: str | None = None
+    
+    def __post_init__(self):
+        self.total_bytes = sum(d[1] for d in self.remote_descs)
+        self.tensor_count = len(self.remote_descs)
+
+
+class PipelineStats:
+    """Statistics for pipelined transfers."""
+    
+    def __init__(self):
+        self.total_tasks = 0
+        self.completed_tasks = 0
+        self.failed_tasks = 0
+        self.total_bytes = 0
+        self.total_time = 0.0
+        self.max_concurrent = 0
+        self.poll_count = 0
+        
+    def log_summary(self, device_id: int):
+        """Log pipeline performance summary."""
+        if self.total_time > 0:
+            bandwidth_gbps = (self.total_bytes * 8) / (self.total_time * 1e9)
+        else:
+            bandwidth_gbps = 0
+            
+        logger.info(
+            f"[Worker {device_id}] [Pipeline Stats] "
+            f"Tasks: {self.completed_tasks}/{self.total_tasks} completed, "
+            f"{self.failed_tasks} failed | "
+            f"Data: {self.total_bytes / 1e9:.2f} GB | "
+            f"Time: {self.total_time:.3f}s | "
+            f"Bandwidth: {bandwidth_gbps:.1f} Gbps | "
+            f"Max concurrent: {self.max_concurrent} | "
+            f"Polls: {self.poll_count}"
+        )
 
 NIXL_AVAILABLE = False
 NixlAgent = None
@@ -61,6 +152,8 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        self._registered_regions: list[tuple[int, int]] | None = None
+        self._current_remote_agent: str = ""  # For pipelined transfers
 
     @property
     def nixl_metadata(self) -> bytes:
@@ -232,6 +325,7 @@ class NixlTransferManager:
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
         coalesce_transfers: bool = True,
+        use_pipeline: bool | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -241,12 +335,27 @@ class NixlTransferManager:
             source_tensors: Tensor descriptors from the source
             timeout_seconds: Maximum time to wait for transfer (None for no timeout)
             coalesce_transfers: If True, coalesce contiguous memory regions (optimization)
+            use_pipeline: If True, use pipelined transfers. Default from MX_PIPELINE_ENABLED env.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        
+        # Check if pipelining is enabled (default: enabled)
+        if use_pipeline is None:
+            use_pipeline = os.environ.get("MX_PIPELINE_ENABLED", "1") == "1"
+        
+        if use_pipeline:
+            logger.info(f"[Worker {self._device_id}] Using pipelined transfers (MX_PIPELINE_ENABLED=1)")
+            return self.receive_from_source_pipelined(
+                source_metadata=source_metadata,
+                source_tensors=source_tensors,
+                timeout_seconds=timeout_seconds,
+            )
+        
+        logger.info(f"[Worker {self._device_id}] Using sequential transfers (MX_PIPELINE_ENABLED=0)")
 
         start_time = time.perf_counter()
         torch.cuda.set_device(self._device_id)
@@ -532,6 +641,308 @@ class NixlTransferManager:
             )
         
         return coalesced_remote, coalesced_local, coalesced_count
+
+    def receive_from_source_pipelined(
+        self,
+        source_metadata: bytes,
+        source_tensors: list[TensorDescriptor],
+        timeout_seconds: float | None = None,
+        batch_size: int | None = None,
+        poll_interval_ms: float | None = None,
+    ) -> tuple[int, int, float]:
+        """
+        Receive weights from a remote source using pipelined RDMA transfers.
+        
+        This implementation splits transfers into batches that can execute concurrently,
+        with non-blocking status checks. This is based on the optimization strategies from:
+        - https://le.qun.ch/en/blog/2025/09/07/rl-weight-transfer/
+        - https://research.perplexity.ai/articles/weight-transfer-for-rl-post-training-in-under-2-seconds
+        
+        Pipeline stages:
+        1. PENDING: Task created, waiting to start
+        2. PREPARING: Building transfer descriptors
+        3. SUBMITTED: RDMA transfer in flight
+        4. COMPLETED: Transfer finished
+        
+        Args:
+            source_metadata: NIXL metadata from the source agent
+            source_tensors: Tensor descriptors from the source
+            timeout_seconds: Maximum time to wait for all transfers
+            batch_size: Number of concurrent transfers (default from MX_PIPELINE_BATCH_SIZE)
+            poll_interval_ms: Polling interval in ms (default from MX_PIPELINE_POLL_INTERVAL_MS)
+        
+        Returns:
+            Tuple of (total_bytes, total_tensors, duration)
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        
+        # Configuration from environment or parameters
+        batch_size = batch_size or int(os.environ.get("MX_PIPELINE_BATCH_SIZE", "8"))
+        poll_interval_ms = poll_interval_ms or float(os.environ.get("MX_PIPELINE_POLL_INTERVAL_MS", "1"))
+        poll_interval = poll_interval_ms / 1000.0
+        
+        start_time = time.perf_counter()
+        torch.cuda.set_device(self._device_id)
+        
+        # Add remote agent
+        remote_agent_name = self._agent.add_remote_agent(source_metadata)
+        logger.info(f"[Pipeline] Added remote agent {remote_agent_name}")
+        
+        # Build matched tensor pairs
+        is_region_transfer = (
+            len(source_tensors) > 0 and 
+            source_tensors[0].name.startswith("__region_")
+        )
+        
+        if is_region_transfer:
+            # Region-based transfer
+            if self._registered_regions is None:
+                raise RuntimeError("Region transfer mismatch: target must also use MX_CONTIGUOUS_REG=1")
+            
+            matched_pairs = []
+            matched_count = min(len(source_tensors), len(self._registered_regions))
+            
+            for i in range(matched_count):
+                src_region = source_tensors[i]
+                local_addr, local_size = self._registered_regions[i]
+                matched_pairs.append((
+                    (src_region.addr, src_region.size, src_region.device_id),
+                    (local_addr, local_size, self._device_id),
+                    True  # use_raw_descriptors
+                ))
+            
+            logger.info(f"[Pipeline] Region-based: {matched_count} regions")
+            
+        else:
+            # Tensor-based transfer - match by name
+            matched_pairs = []
+            
+            for src_tensor in source_tensors:
+                if src_tensor.name not in self._tensors:
+                    continue
+                local_tensor = self._tensors[src_tensor.name]
+                matched_pairs.append((
+                    (src_tensor.addr, src_tensor.size, src_tensor.device_id),
+                    local_tensor,
+                    False  # use tensor objects
+                ))
+            
+            if not matched_pairs:
+                logger.warning("[Pipeline] No matching tensors found")
+                return 0, 0, 0.0
+            
+            logger.info(f"[Pipeline] Tensor-based: {len(matched_pairs)} matched")
+        
+        # Create transfer tasks - split into batches
+        tasks = self._create_transfer_tasks(matched_pairs, batch_size)
+        stats = PipelineStats()
+        stats.total_tasks = len(tasks)
+        
+        logger.info(
+            f"[Pipeline] Created {len(tasks)} tasks from {len(matched_pairs)} transfers "
+            f"(batch_size={batch_size}, poll_interval={poll_interval_ms}ms)"
+        )
+        
+        # Pipeline queues
+        pending: deque[TransferTask] = deque(tasks)
+        in_flight: list[TransferTask] = []
+        completed: list[TransferTask] = []
+        failed: list[TransferTask] = []
+        
+        # Prep descriptors (can be reused)
+        all_remote_descs = [p[0] for p in matched_pairs]
+        all_local_descs = [p[1] for p in matched_pairs]
+        use_raw = matched_pairs[0][2] if matched_pairs else True
+        
+        # Store remote agent name for task submission
+        self._current_remote_agent = remote_agent_name
+        
+        logger.info(f"[Pipeline] Ready to transfer {len(all_remote_descs)} items")
+        
+        # Main pipeline loop
+        timeout_start = time.perf_counter()
+        
+        while pending or in_flight:
+            # Check timeout
+            if timeout_seconds is not None:
+                if time.perf_counter() - timeout_start >= timeout_seconds:
+                    # Clean up in-flight transfers
+                    for task in in_flight:
+                        if task.handle is not None:
+                            try:
+                                self._agent.release_xfer_handle(task.handle)
+                            except Exception:
+                                pass
+                    raise TimeoutError(f"Pipeline timed out after {timeout_seconds}s")
+            
+            # Submit new tasks up to batch_size
+            while pending and len(in_flight) < batch_size:
+                task = pending.popleft()
+                self._submit_task(task)
+                in_flight.append(task)
+                stats.max_concurrent = max(stats.max_concurrent, len(in_flight))
+            
+            # Poll in-flight tasks for completion
+            stats.poll_count += 1
+            still_in_flight = []
+            
+            for task in in_flight:
+                if task.state == TransferState.SUBMITTED:
+                    try:
+                        status = self._agent.check_xfer_state(task.handle)
+                        
+                        if status in ("DONE", "SUCCESS"):
+                            task.state = TransferState.COMPLETED
+                            task.end_time = time.perf_counter()
+                            self._agent.release_xfer_handle(task.handle)
+                            completed.append(task)
+                            stats.completed_tasks += 1
+                            stats.total_bytes += task.total_bytes
+                            
+                        elif status in ("ERR", "ERROR", "FAIL"):
+                            task.state = TransferState.FAILED
+                            task.error = f"Transfer failed with status {status}"
+                            task.end_time = time.perf_counter()
+                            self._agent.release_xfer_handle(task.handle)
+                            failed.append(task)
+                            stats.failed_tasks += 1
+                            logger.warning(f"[Pipeline] Task {task.task_id} failed: {status}")
+                            
+                        else:
+                            # Still in progress
+                            still_in_flight.append(task)
+                            
+                    except Exception as e:
+                        task.state = TransferState.FAILED
+                        task.error = str(e)
+                        task.end_time = time.perf_counter()
+                        failed.append(task)
+                        stats.failed_tasks += 1
+                        logger.warning(f"[Pipeline] Task {task.task_id} exception: {e}")
+                else:
+                    still_in_flight.append(task)
+            
+            in_flight = still_in_flight
+            
+            # Brief sleep to avoid busy-spinning
+            if in_flight:
+                time.sleep(poll_interval)
+        
+        # CRITICAL: Synchronize CUDA to ensure RDMA writes are visible
+        torch.cuda.synchronize(self._device_id)
+        
+        duration = time.perf_counter() - start_time
+        stats.total_time = duration
+        
+        # Log summary
+        stats.log_summary(self._device_id)
+        
+        total_bytes = sum(t.total_bytes for t in completed)
+        total_tensors = sum(t.tensor_count for t in completed)
+        
+        if failed:
+            logger.error(f"[Pipeline] {len(failed)} tasks failed!")
+            for task in failed[:3]:  # Log first 3 failures
+                logger.error(f"[Pipeline]   Task {task.task_id}: {task.error}")
+        
+        return total_bytes, total_tensors, duration
+    
+    def _create_transfer_tasks(
+        self,
+        matched_pairs: list[tuple],
+        batch_size: int,
+    ) -> list[TransferTask]:
+        """
+        Create transfer tasks by batching matched pairs.
+        
+        Each task handles a subset of the transfers, allowing concurrent execution.
+        """
+        tasks = []
+        
+        # Calculate how many items per batch
+        # For optimal pipelining, we want multiple batches
+        total_items = len(matched_pairs)
+        items_per_batch = max(1, total_items // batch_size)
+        
+        # If we have fewer items than batch_size, just use single-item batches
+        if total_items <= batch_size:
+            items_per_batch = 1
+        
+        task_id = 0
+        for i in range(0, total_items, items_per_batch):
+            batch = matched_pairs[i:i + items_per_batch]
+            
+            remote_descs = [p[0] for p in batch]
+            local_descs = [p[1] for p in batch]
+            use_raw = batch[0][2] if batch else True
+            
+            # For tensor objects, convert to raw descriptors
+            if not use_raw:
+                local_descs = [
+                    (t.data_ptr(), t.numel() * t.element_size(), self._device_id)
+                    for t in local_descs
+                ]
+                use_raw = True
+            
+            task = TransferTask(
+                task_id=task_id,
+                remote_descs=remote_descs,
+                local_descs=local_descs,
+                use_raw_descriptors=use_raw,
+            )
+            tasks.append(task)
+            task_id += 1
+        
+        return tasks
+    
+    def _submit_task(self, task: TransferTask) -> None:
+        """
+        Submit a transfer task for execution.
+        
+        This prepares and submits the RDMA transfer for this task's batch.
+        Uses the remote agent name stored during receive_from_source_pipelined.
+        """
+        task.state = TransferState.PREPARING
+        task.start_time = time.perf_counter()
+        
+        try:
+            batch_size = len(task.remote_descs)
+            
+            # Prepare descriptors for this specific batch
+            batch_src_prepped = self._agent.prep_xfer_dlist(
+                agent_name=self._current_remote_agent,
+                xfer_list=task.remote_descs,
+                mem_type="cuda",
+                backends=["UCX"],
+            )
+            
+            batch_dst_prepped = self._agent.prep_xfer_dlist(
+                agent_name="",
+                xfer_list=task.local_descs,
+                mem_type="cuda",
+                backends=["UCX"],
+            )
+            
+            indices = list(range(batch_size))
+            
+            # Submit transfer
+            task.handle = self._agent.make_prepped_xfer(
+                operation="READ",
+                local_xfer_side=batch_dst_prepped,
+                local_indices=indices,
+                remote_xfer_side=batch_src_prepped,
+                remote_indices=indices,
+                backends=["UCX"],
+            )
+            self._agent.transfer(task.handle)
+            task.state = TransferState.SUBMITTED
+            
+        except Exception as e:
+            task.state = TransferState.FAILED
+            task.error = str(e)
+            task.end_time = time.perf_counter()
+            logger.error(f"[Pipeline] Failed to submit task {task.task_id}: {e}")
 
     def shutdown(self) -> None:
         """Clean up NIXL resources."""
