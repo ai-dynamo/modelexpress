@@ -43,6 +43,7 @@ enum ModelStatus {
 // Enum representing model providers
 enum ModelProvider {
   HUGGING_FACE = 0;
+  MODEL_STREAMER = 1;
 }
 
 // Request for streaming model files
