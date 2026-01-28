@@ -77,8 +77,10 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 
 pub mod huggingface;
+pub mod model_streamer;
 
 pub use huggingface::HuggingFaceProvider;
+pub use model_streamer::ModelStreamerProvider;
 
 #[cfg(test)]
 mod tests {

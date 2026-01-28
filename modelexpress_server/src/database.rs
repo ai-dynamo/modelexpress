@@ -107,6 +107,7 @@ impl ModelDatabase {
 
             let provider = match provider_str.as_str() {
                 "HuggingFace" => ModelProvider::HuggingFace,
+                "ModelStreamer" => ModelProvider::ModelStreamer,
                 _ => ModelProvider::HuggingFace, // Default fallback
             };
 
@@ -167,6 +168,7 @@ impl ModelDatabase {
 
         let provider_str = match provider {
             ModelProvider::HuggingFace => "HuggingFace",
+            ModelProvider::ModelStreamer => "ModelStreamer",
         };
 
         let status_str = match status {
@@ -237,6 +239,7 @@ impl ModelDatabase {
 
             let provider = match provider_str.as_str() {
                 "HuggingFace" => ModelProvider::HuggingFace,
+                "ModelStreamer" => ModelProvider::ModelStreamer,
                 _ => ModelProvider::HuggingFace,
             };
 
@@ -328,6 +331,7 @@ impl ModelDatabase {
 
         let provider_str = match provider {
             ModelProvider::HuggingFace => "HuggingFace",
+            ModelProvider::ModelStreamer => "ModelStreamer",
         };
 
         // Use INSERT OR IGNORE to atomically create the record only if it doesn't exist

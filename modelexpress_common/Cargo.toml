@@ -28,6 +28,8 @@ chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 jiff = { workspace = true }
+reqwest = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 mockall = "0.13"

@@ -23,10 +23,24 @@ FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS runtime
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies including Python for the sidecar
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates libssl-dev gpgv && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gpgv \
+        libssl-dev \
+        python3 \
+        python3-pip \
+        python3-venv && \
     rm -rf /var/lib/apt/lists/*
+
+# Create Python virtual environment and install sidecar dependencies
+COPY sidecar/requirements.txt /app/sidecar/
+RUN python3 -m venv /app/venv && \
+    /app/venv/bin/pip install --no-cache-dir -r /app/sidecar/requirements.txt
+
+# Copy sidecar source code
+COPY sidecar/src /app/sidecar/src
 
 # Copy all built binaries
 COPY --from=builder /app/target/release/modelexpress-server .
@@ -37,15 +51,23 @@ COPY --from=builder /app/target/release/fallback_test .
 # Copy the Attribution files
 COPY ATTRIBUTIONS_Rust.md .
 
-# Expose the default port
+# Copy the entrypoint script
+COPY entrypoint.sh .
+RUN chmod +x /app/entrypoint.sh
+
+# Expose the default ports (gRPC server and sidecar)
 EXPOSE 8001
+EXPOSE 8002
 
 # Set default environment variables (can be overridden)
 ENV MODEL_EXPRESS_SERVER_PORT=8001
+ENV MODEL_EXPRESS_SIDECAR_PORT=8002
+ENV MODEL_EXPRESS_SIDECAR_ENDPOINT=http://127.0.0.1:8002
 ENV MODEL_EXPRESS_LOG_LEVEL=info
 ENV MODEL_EXPRESS_DATABASE_PATH=/app/models.db
 ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
 ENV HF_HUB_CACHE=/app/cache
+ENV PYTHONPATH=/app/sidecar/src
 
-# Run the server by default
-CMD ["./modelexpress-server"]
+# Run both services via entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]

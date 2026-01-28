@@ -51,3 +51,6 @@ logs/
 models.db
 **/__pycache__/
 docs/FEEDBACK.md
+
+# Python testing
+.venv/

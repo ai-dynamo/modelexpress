@@ -50,9 +50,11 @@ tonic-build = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+urlencoding = "2.1"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

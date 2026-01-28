@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: modelexpress-sidecar
+Version: 0.1.0
+Summary: Model Streamer sidecar for ModelExpress
+Author-email: "NVIDIA Inc." <sw-dl-dynamo@nvidia.com>
+License: Apache-2.0
+Keywords: model-streamer,s3,gcs,ml,inference
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.104.0
+Requires-Dist: uvicorn>=0.24.0
+Requires-Dist: pydantic>=2.0
+Requires-Dist: runai-model-streamer>=0.8.0
+Requires-Dist: runai-model-streamer-s3>=0.8.0
+Requires-Dist: boto3>=1.28.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21; extra == "dev"
+Requires-Dist: httpx>=0.25.0; extra == "dev"
