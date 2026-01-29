@@ -4,7 +4,11 @@
 pub mod cache;
 pub mod config;
 pub mod database;
+pub mod k8s_types;
+pub mod metadata_backend;
+pub mod p2p_service;
 pub mod services;
+pub mod state;
 
 // Re-export for testing
 pub use cache::*;
