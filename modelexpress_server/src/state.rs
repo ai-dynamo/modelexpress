@@ -1,0 +1,239 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! State management for P2P model metadata.
+//!
+//! This module provides the `P2pStateManager` which wraps a metadata backend
+//! (Redis or Kubernetes CRD) for storing model metadata.
+//!
+//! For new code, prefer using `metadata_backend` directly. This module exists
+//! for backwards compatibility with existing code.
+
+use crate::metadata_backend::{
+    create_backend, BackendConfig, MetadataBackend, MetadataResult,
+};
+use modelexpress_common::grpc::p2p::WorkerMetadata;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracing::info;
+
+// Re-export types for backwards compatibility
+pub use crate::metadata_backend::{
+    ModelMetadataRecord, TensorRecord, WorkerRecord,
+};
+
+/// State manager that handles P2P metadata operations.
+///
+/// This is a wrapper around the metadata backend abstraction that provides
+/// a simpler API for common operations. It automatically selects the backend
+/// based on environment variables (MX_METADATA_BACKEND).
+#[derive(Clone)]
+pub struct P2pStateManager {
+    backend: Arc<RwLock<Option<Arc<dyn MetadataBackend>>>>,
+    config: BackendConfig,
+}
+
+impl P2pStateManager {
+    /// Create a new state manager with default configuration from environment
+    pub fn new(redis_url: &str) -> Self {
+        // Check if we should use Kubernetes backend
+        let config = if std::env::var("MX_METADATA_BACKEND")
+            .map(|v| v.to_lowercase())
+            .map(|v| v == "kubernetes" || v == "k8s" || v == "crd")
+            .unwrap_or(false)
+        {
+            BackendConfig::from_env()
+        } else {
+            BackendConfig::Redis {
+                url: redis_url.to_string(),
+            }
+        };
+
+        Self {
+            backend: Arc::new(RwLock::new(None)),
+            config,
+        }
+    }
+
+    /// Create a new state manager with explicit backend configuration
+    pub fn with_config(config: BackendConfig) -> Self {
+        Self {
+            backend: Arc::new(RwLock::new(None)),
+            config,
+        }
+    }
+
+    /// Initialize the backend connection
+    pub async fn connect(&self) -> MetadataResult<()> {
+        let backend = create_backend(self.config.clone()).await?;
+
+        let mut guard = self.backend.write().await;
+        *guard = Some(backend);
+
+        info!("P2pStateManager connected with {:?}", self.config);
+        Ok(())
+    }
+
+    /// Get the backend, connecting if necessary
+    async fn get_backend(&self) -> MetadataResult<Arc<dyn MetadataBackend>> {
+        let guard = self.backend.read().await;
+        if let Some(backend) = guard.as_ref() {
+            return Ok(backend.clone());
+        }
+        drop(guard);
+
+        // Need to connect
+        self.connect().await?;
+
+        let guard = self.backend.read().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Backend not available".into())
+    }
+
+    // ========================================================================
+    // Model Metadata Management
+    // ========================================================================
+
+    /// Publish metadata for a model
+    /// NOTE: This MERGES workers with existing data, allowing incremental publishing
+    /// from multiple workers in a distributed system.
+    pub async fn publish_metadata(
+        &self,
+        model_name: &str,
+        workers: Vec<WorkerMetadata>,
+    ) -> MetadataResult<()> {
+        let backend = self.get_backend().await?;
+        backend.publish_metadata(model_name, workers).await
+    }
+
+    /// Get metadata for a model
+    pub async fn get_metadata(
+        &self,
+        model_name: &str,
+    ) -> MetadataResult<Option<ModelMetadataRecord>> {
+        let backend = self.get_backend().await?;
+        backend.get_metadata(model_name).await
+    }
+
+    /// Remove metadata for a model (cleanup)
+    pub async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
+        let backend = self.get_backend().await?;
+        backend.remove_metadata(model_name).await
+    }
+
+    /// List all registered model names
+    pub async fn list_models(&self) -> MetadataResult<Vec<String>> {
+        let backend = self.get_backend().await?;
+        backend.list_models().await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use modelexpress_common::grpc::p2p::TensorDescriptor;
+
+    #[test]
+    fn test_tensor_record_conversion() {
+        let desc = TensorDescriptor {
+            name: "model.layers.0.weight".to_string(),
+            addr: 0x7f0000000000,
+            size: 1024 * 1024 * 1024,
+            device_id: 0,
+            dtype: "bfloat16".to_string(),
+        };
+
+        let record = TensorRecord::from(desc.clone());
+        assert_eq!(record.name, "model.layers.0.weight");
+        assert_eq!(record.size, 1024 * 1024 * 1024);
+
+        let back: TensorDescriptor = record.into();
+        assert_eq!(back.name, desc.name);
+        assert_eq!(back.addr, desc.addr);
+    }
+
+    #[test]
+    fn test_worker_record_conversion() {
+        let meta = WorkerMetadata {
+            worker_rank: 3,
+            nixl_metadata: vec![1, 2, 3, 4, 5],
+            tensors: vec![TensorDescriptor {
+                name: "test.weight".to_string(),
+                addr: 0x1000,
+                size: 4096,
+                device_id: 3,
+                dtype: "float16".to_string(),
+            }],
+        };
+
+        let record = WorkerRecord::from(meta.clone());
+        assert_eq!(record.worker_rank, 3);
+        assert_eq!(record.nixl_metadata, vec![1, 2, 3, 4, 5]);
+        assert_eq!(record.tensors.len(), 1);
+
+        let back: WorkerMetadata = record.into();
+        assert_eq!(back.worker_rank, meta.worker_rank);
+        assert_eq!(back.nixl_metadata, meta.nixl_metadata);
+    }
+
+    #[test]
+    fn test_model_record_creation() {
+        let record = ModelMetadataRecord {
+            model_name: "meta-llama/Llama-3.1-70B".to_string(),
+            workers: vec![
+                WorkerRecord {
+                    worker_rank: 0,
+                    nixl_metadata: vec![10, 20, 30],
+                    tensors: vec![TensorRecord {
+                        name: "layer.0.weight".to_string(),
+                        addr: 0x7f00_0000_0000,
+                        size: 1_000_000,
+                        device_id: 0,
+                        dtype: "bfloat16".to_string(),
+                    }],
+                },
+                WorkerRecord {
+                    worker_rank: 1,
+                    nixl_metadata: vec![40, 50, 60],
+                    tensors: vec![TensorRecord {
+                        name: "layer.0.weight".to_string(),
+                        addr: 0x7f00_0000_0000,
+                        size: 1_000_000,
+                        device_id: 1,
+                        dtype: "bfloat16".to_string(),
+                    }],
+                },
+            ],
+            published_at: 1234567890,
+        };
+
+        assert_eq!(record.model_name, "meta-llama/Llama-3.1-70B");
+        assert_eq!(record.workers.len(), 2);
+        assert_eq!(record.workers[0].worker_rank, 0);
+        assert_eq!(record.workers[1].worker_rank, 1);
+    }
+
+    #[test]
+    fn test_backend_config_from_env() {
+        // SAFETY: Test runs in isolation, no concurrent access to env vars
+        unsafe {
+            // Test default (Redis)
+            std::env::remove_var("MX_METADATA_BACKEND");
+            let config = BackendConfig::from_env();
+            assert!(matches!(config, BackendConfig::Redis { .. }));
+
+            // Test Kubernetes
+            std::env::set_var("MX_METADATA_BACKEND", "kubernetes");
+            std::env::set_var("MX_METADATA_NAMESPACE", "test-ns");
+            let config = BackendConfig::from_env();
+            assert!(matches!(config, BackendConfig::Kubernetes { namespace } if namespace == "test-ns"));
+
+            // Cleanup
+            std::env::remove_var("MX_METADATA_BACKEND");
+            std::env::remove_var("MX_METADATA_NAMESPACE");
+        }
+    }
+}
