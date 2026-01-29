@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # vLLM Source Instance - loads real model weights and serves them to target via P2P
+# Uses Kubernetes CRD backend for metadata (default)
+# For Redis backend, use vllm-source-redis.yaml instead
+#
 # - vLLM exposes weights via ZMQ (one socket per TP rank)
 # - ModelExpress client handles NIXL transfers and server communication
 apiVersion: v1
@@ -35,9 +38,11 @@ spec:
       labels:
         app: mx-source
     spec:
+      # ServiceAccount with permissions to access ModelMetadata CRDs
+      serviceAccountName: modelexpress
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:k8s-backend
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work.
           securityContext:
@@ -68,6 +73,10 @@ spec:
               value: "1"
             - name: MX_EXPECTED_WORKERS
               value: "8"
+            # Metadata backend: "kubernetes" (default) or "redis"
+            # Uses native K8s CRDs - no Redis dependency
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
@@ -102,7 +111,35 @@ spec:
                   name: hf-token-secret
                   key: HF_TOKEN
           command: ["/bin/bash", "-c"]
-          args: ["set -ex; (sleep 5; while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done; sleep 30; curl -sf -X POST http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' -d '{\"model\":\"'\"$MODEL_NAME\"'\",\"prompt\":\"1+1=\",\"max_tokens\":3}' || true; python3 -c 'import redis,json,uuid,os; h=os.environ.get(\"MX_REDIS_HOST\",\"modelexpress-server\"); m=os.environ.get(\"MODEL_NAME\",\"x\"); s=str(uuid.uuid4()); c=redis.Redis(host=h,port=6379,decode_responses=True); [c.setex(\"mx:nixl_ready:\"+m+\":worker:\"+str(w),14400,json.dumps({\"session_id\":s,\"nixl_ready\":True,\"stability_verified\":True})) or print(\"Published\",w) for w in range(8)]') & exec python3 -m vllm.entrypoints.openai.api_server --model $MODEL_NAME --load-format mx-source --tensor-parallel-size 8 --enable-expert-parallel"]
+          args:
+            - |
+              set -ex
+              # Background task: wait for health, warmup, then publish NIXL ready signal
+              (
+                sleep 5
+                while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done
+                sleep 30
+                # Warmup inference
+                curl -sf -X POST http://127.0.0.1:8000/v1/completions \
+                  -H 'Content-Type: application/json' \
+                  -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
+                # Publish ready signal via metadata backend (CRD or Redis)
+                python3 -c '
+              from modelexpress.metadata_client import get_backend
+              import os
+              backend = get_backend()
+              model = os.environ.get("MODEL_NAME", "unknown")
+              workers = int(os.environ.get("MX_EXPECTED_WORKERS", "8"))
+              for w in range(workers):
+                  backend.publish_ready(model, w)
+                  print(f"Published ready for worker {w}")
+              '
+              ) &
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --model $MODEL_NAME \
+                --load-format mx-source \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"

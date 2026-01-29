@@ -27,12 +27,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-# Redis client for source-target coordination
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
+# Metadata backend for source-target coordination (Redis or K8s CRD)
+from .metadata_client import get_backend, MetadataBackend
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -78,7 +74,11 @@ def _safe_checksum(tensor: torch.Tensor) -> str:
 
 class SourceReadyCoordinator:
     """
-    Redis-based coordination to prevent stale metadata issues.
+    Coordination to prevent stale metadata issues.
+    
+    Supports multiple backends via MX_METADATA_BACKEND:
+    - "redis" (default): Redis-based coordination
+    - "kubernetes", "k8s", "crd": Kubernetes CRD-based coordination
     
     Source publishes a "ready" flag with session_id after:
     - Warmup complete
@@ -90,6 +90,7 @@ class SourceReadyCoordinator:
     
     # Class-level session ID (unique per process lifetime)
     _session_id: str | None = None
+    _backend: MetadataBackend | None = None
     
     @classmethod
     def get_session_id(cls) -> str:
@@ -98,23 +99,12 @@ class SourceReadyCoordinator:
             cls._session_id = str(uuid.uuid4())
         return cls._session_id
     
-    @staticmethod
-    def _get_redis_client() -> "redis.Redis | None":
-        """Get Redis client from environment."""
-        if not REDIS_AVAILABLE:
-            _log("Redis client not available, skipping coordination", "WARNING")
-            return None
-        
-        redis_host = os.environ.get("MX_REDIS_HOST", "modelexpress-server")
-        redis_port = int(os.environ.get("MX_REDIS_PORT", "6379"))
-        
-        try:
-            client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
-            client.ping()
-            return client
-        except Exception as e:
-            _log(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}", "WARNING")
-            return None
+    @classmethod
+    def _get_backend(cls) -> MetadataBackend:
+        """Get the metadata backend (lazy initialization)."""
+        if cls._backend is None:
+            cls._backend = get_backend()
+        return cls._backend
     
     @classmethod
     def publish_source_ready(
@@ -124,31 +114,25 @@ class SourceReadyCoordinator:
         metadata_hash: str,
     ) -> bool:
         """
-        Publish source ready flag to Redis.
+        Publish source ready flag.
         Called after warmup and metadata publishing is complete.
         """
-        client = cls._get_redis_client()
-        if client is None:
-            return False
-        
         session_id = cls.get_session_id()
-        key = f"mx:ready:{model_name}:worker:{worker_id}"
+        backend = cls._get_backend()
         
-        ready_info = {
-            "session_id": session_id,
-            "timestamp": time.time(),
-            "metadata_hash": metadata_hash,
-            "ready": True,
-        }
+        success = backend.publish_ready_signal(
+            model_name=model_name,
+            worker_id=worker_id,
+            session_id=session_id,
+            metadata_hash=metadata_hash,
+        )
         
-        try:
-            # Set with 2 hour TTL (matches warmup timeout)
-            client.setex(key, 7200, json.dumps(ready_info))
-            _log(f"[Worker {worker_id}] Published ready flag to Redis: session={session_id[:8]}...", "INFO")
-            return True
-        except Exception as e:
-            _log(f"[Worker {worker_id}] Failed to publish ready flag: {e}", "WARNING")
-            return False
+        if success:
+            _log(f"[Worker {worker_id}] Published ready flag: session={session_id[:8]}...", "INFO")
+        else:
+            _log(f"[Worker {worker_id}] Failed to publish ready flag", "WARNING")
+        
+        return success
     
     @classmethod
     def wait_for_source_ready(
@@ -164,40 +148,27 @@ class SourceReadyCoordinator:
         Returns:
             (success, session_id, metadata_hash)
         """
-        client = cls._get_redis_client()
-        if client is None:
-            _log(f"[Worker {worker_id}] Redis not available, proceeding without coordination", "WARNING")
-            return True, None, None
+        backend = cls._get_backend()
         
-        key = f"mx:nixl_ready:{model_name}:worker:{worker_id}"
-        start_time = time.time()
+        _log(f"[Worker {worker_id}] Waiting for source ready signal...", "INFO")
         
-        _log(f"[Worker {worker_id}] Waiting for NIXL ready flag at {key}...", "INFO")
+        success, session_id, metadata_hash = backend.wait_for_ready(
+            model_name=model_name,
+            worker_id=worker_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+        )
         
-        while time.time() - start_time < timeout_seconds:
-            try:
-                data = client.get(key)
-                if data:
-                    ready_info = json.loads(data)
-                    if ready_info.get("nixl_ready") and ready_info.get("stability_verified"):
-                        session_id = ready_info.get("session_id")
-                        metadata_hash = ready_info.get("metadata_hash")
-                        _log(
-                            f"[Worker {worker_id}] Source ready! session={session_id[:8] if session_id else 'N/A'}..., "
-                            f"hash={metadata_hash[:8] if metadata_hash else 'N/A'}...",
-                            "INFO"
-                        )
-                        return True, session_id, metadata_hash
-            except Exception as e:
-                _log(f"[Worker {worker_id}] Error checking ready flag: {e}", "WARNING")
-            
-            time.sleep(poll_interval)
-            elapsed = int(time.time() - start_time)
-            if elapsed % 60 == 0:
-                _log(f"[Worker {worker_id}] Still waiting for source ready ({elapsed}s/{timeout_seconds}s)...", "INFO")
+        if success:
+            _log(
+                f"[Worker {worker_id}] Source ready! session={session_id[:8] if session_id else 'N/A'}..., "
+                f"hash={metadata_hash[:8] if metadata_hash else 'N/A'}...",
+                "INFO"
+            )
+        else:
+            _log(f"[Worker {worker_id}] Timeout waiting for source ready after {timeout_seconds}s", "ERROR")
         
-        _log(f"[Worker {worker_id}] Timeout waiting for source ready after {timeout_seconds}s", "ERROR")
-        return False, None, None
+        return success, session_id, metadata_hash
     
     @classmethod
     def check_session_changed(
@@ -215,26 +186,16 @@ class SourceReadyCoordinator:
         if cached_session_id is None:
             return False, None
         
-        client = cls._get_redis_client()
-        if client is None:
-            return False, None
+        backend = cls._get_backend()
+        info = backend.get_ready_signal(model_name, worker_id)
         
-        key = f"mx:nixl_ready:{model_name}:worker:{worker_id}"
-        
-        try:
-            data = client.get(key)
-            if data:
-                ready_info = json.loads(data)
-                current_session = ready_info.get("session_id")
-                if current_session and current_session != cached_session_id:
-                    _log(
-                        f"[Worker {worker_id}] Source restarted! "
-                        f"cached={cached_session_id[:8]}... != current={current_session[:8]}...",
-                        "WARNING"
-                    )
-                    return True, current_session
-        except Exception as e:
-            _log(f"[Worker {worker_id}] Error checking session: {e}", "WARNING")
+        if info and info.session_id and info.session_id != cached_session_id:
+            _log(
+                f"[Worker {worker_id}] Source restarted! "
+                f"cached={cached_session_id[:8]}... != current={info.session_id[:8]}...",
+                "WARNING"
+            )
+            return True, info.session_id
         
         return False, cached_session_id
 
