@@ -4,8 +4,7 @@
 use clap::Parser;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
-    model::model_service_server::ModelServiceServer,
-    p2p::p2p_service_server::P2pServiceServer,
+    model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
 };
 use modelexpress_server::{
     cache::CacheEvictionService,
@@ -95,13 +94,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_service = ModelServiceImpl;
 
     // Initialize P2P state manager with Redis (optional)
-    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let p2p_state = Arc::new(P2pStateManager::new(&redis_url));
 
     // Try to connect to Redis (non-fatal if unavailable)
     match p2p_state.connect().await {
         Ok(()) => info!("P2P state manager connected to Redis"),
-        Err(e) => warn!("P2P state manager could not connect to Redis: {} - P2P features may be unavailable", e),
+        Err(e) => warn!(
+            "P2P state manager could not connect to Redis: {} - P2P features may be unavailable",
+            e
+        ),
     }
 
     let p2p_service = P2pServiceImpl::new(p2p_state);
