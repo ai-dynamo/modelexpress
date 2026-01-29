@@ -26,9 +26,15 @@ mod keys {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorRecord {
     pub name: String,
-    #[serde(serialize_with = "serialize_u64_as_string", deserialize_with = "deserialize_u64_from_string_or_number")]
+    #[serde(
+        serialize_with = "serialize_u64_as_string",
+        deserialize_with = "deserialize_u64_from_string_or_number"
+    )]
     pub addr: u64,
-    #[serde(serialize_with = "serialize_u64_as_string", deserialize_with = "deserialize_u64_from_string_or_number")]
+    #[serde(
+        serialize_with = "serialize_u64_as_string",
+        deserialize_with = "deserialize_u64_from_string_or_number"
+    )]
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
@@ -46,27 +52,27 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::de::{self, Visitor};
-    
+
     struct U64Visitor;
-    
+
     impl<'de> Visitor<'de> for U64Visitor {
         type Value = u64;
-        
+
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("a u64 as string or number")
         }
-        
+
         fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
             Ok(value)
         }
-        
+
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
         where
             E: de::Error,
         {
             u64::try_from(value).map_err(|_| E::custom("negative value"))
         }
-        
+
         fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
         where
             E: de::Error,
@@ -74,7 +80,7 @@ where
             // Handle floats from cjson (the problematic case)
             Ok(value as u64)
         }
-        
+
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
         where
             E: de::Error,
@@ -82,7 +88,7 @@ where
             value.parse::<u64>().map_err(de::Error::custom)
         }
     }
-    
+
     deserializer.deserialize_any(U64Visitor)
 }
 
