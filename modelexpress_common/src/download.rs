@@ -2,16 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ModelProvider;
-use crate::providers::{HuggingFaceProvider, ModelProviderTrait};
+use crate::providers::{HuggingFaceProvider, ModelProviderTrait, ModelStreamerProvider};
 use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
 /// Provider factory to get the appropriate provider implementation
+///
+/// # Panics
+///
+/// Panics if the ModelStreamer provider fails to initialize (e.g., invalid configuration).
+/// This is intentional as it indicates a configuration error that should be fixed.
 #[must_use]
 pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
     match provider {
         ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
+        ModelProvider::ModelStreamer => {
+            match ModelStreamerProvider::from_env() {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    // Log the error and panic - this is a configuration error
+                    tracing::error!("Failed to initialize ModelStreamer provider: {}", e);
+                    panic!("Failed to initialize ModelStreamer provider: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -96,9 +111,15 @@ mod tests {
     }
 
     #[test]
-    fn test_get_provider() {
+    fn test_get_provider_huggingface() {
         let provider = get_provider(ModelProvider::HuggingFace);
         assert_eq!(provider.provider_name(), "Hugging Face");
+    }
+
+    #[test]
+    fn test_get_provider_model_streamer() {
+        let provider = get_provider(ModelProvider::ModelStreamer);
+        assert_eq!(provider.provider_name(), "Model Streamer");
     }
 
     #[tokio::test]

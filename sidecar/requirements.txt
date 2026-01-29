@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Core dependencies
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0
+
+# Model Streamer
+runai-model-streamer>=0.8.0
+runai-model-streamer-s3>=0.8.0
+
+# S3/Cloud SDK
+boto3>=1.28.0
+
+# Development dependencies
+pytest>=7.0
+pytest-asyncio>=0.21
+httpx>=0.25.0
