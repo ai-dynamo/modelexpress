@@ -34,6 +34,7 @@ from . import p2p_pb2_grpc
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
+from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
@@ -248,13 +249,14 @@ class SourceReadyCoordinator:
         return False, cached_session_id
 
 
+@register_model_loader("mx-source")
 class MxSourceModelLoader(DefaultModelLoader):
     """
     Model loader for ModelExpress SOURCE instances.
-    
+
     Loads weights from disk normally, but registers raw tensors with NIXL
     BEFORE process_weights_after_loading() transforms FP8 scales.
-    
+
     Flow:
         1. initialize_model() - Create model structure
         2. load_weights() - Load raw weights from disk
@@ -595,13 +597,14 @@ class MxSourceModelLoader(DefaultModelLoader):
         return self._raw_tensors
 
 
+@register_model_loader("mx-target")
 class MxTargetModelLoader(DummyModelLoader):
     """
     Model loader for ModelExpress TARGET instances.
-    
+
     Initializes dummy weights, receives raw tensors via RDMA,
     THEN runs process_weights_after_loading() to transform FP8 scales.
-    
+
     Flow:
         1. initialize_model() - Create model structure
         2. load_weights() - Create dummy weights (with weight_scale_inv)
