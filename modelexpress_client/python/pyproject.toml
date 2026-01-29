@@ -42,6 +42,19 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
+# Kubernetes backend for CRD-based metadata (alternative to Redis)
+kubernetes = [
+    "kubernetes>=28.0.0",
+]
+# Redis backend for coordination (default)
+redis = [
+    "redis>=5.0.0",
+]
+# All optional features
+all = [
+    "kubernetes>=28.0.0",
+    "redis>=5.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/modelexpress"

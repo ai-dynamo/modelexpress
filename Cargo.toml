@@ -54,6 +54,12 @@ uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
+# Kubernetes client (kube-rs) for CRD-based metadata backend
+kube = { version = "0.98", features = ["client", "runtime", "derive", "rustls-tls"], default-features = false }
+k8s-openapi = { version = "0.24", features = ["v1_31"] }
+schemars = "0.8"
+base64 = "0.22"
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 #pedantic = { level = "deny", priority = -1 }
