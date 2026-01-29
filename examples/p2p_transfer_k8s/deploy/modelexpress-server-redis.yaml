@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress Server deployment with Redis sidecar for P2P transfer coordination
+# This is the legacy/alternative backend. For Kubernetes-native deployments,
+# use modelexpress-server.yaml (CRD backend) instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: grpc
+    - port: 6379
+      targetPort: 6379
+      name: redis
+  selector:
+    app: modelexpress-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      # Native sidecar: Redis starts first and stays running
+      initContainers:
+        - name: redis
+          image: redis:7-alpine
+          restartPolicy: Always
+          ports:
+            - containerPort: 6379
+          resources:
+            limits:
+              cpu: "1"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          startupProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            periodSeconds: 10
+
+      containers:
+        - name: modelexpress-server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          env:
+            # Use Redis backend
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            # Redis connection URL (sidecar runs on localhost)
+            - name: REDIS_URL
+              value: "redis://localhost:6379"
+          resources:
+            requests:
+              cpu: 4
+              memory: 8Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
