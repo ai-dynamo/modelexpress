@@ -8,7 +8,7 @@ import warnings
 
 from . import p2p_pb2 as p2p__pb2
 
-GRPC_GENERATED_VERSION = '1.76.0'
+GRPC_GENERATED_VERSION = '1.66.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -21,7 +21,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in p2p_pb2_grpc.py depends on'
+        + f' but the generated code in p2p_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -31,7 +31,7 @@ if _version_not_supported:
 class P2pServiceStub(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
     The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-    Sidecars query for existing sources and publish their own metadata.
+    Clients query for existing sources and publish their own metadata.
     """
 
     def __init__(self, channel):
@@ -55,18 +55,18 @@ class P2pServiceStub(object):
 class P2pServiceServicer(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
     The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-    Sidecars query for existing sources and publish their own metadata.
+    Clients query for existing sources and publish their own metadata.
     """
 
     def PublishMetadata(self, request, context):
-        """Publish model metadata - called by sidecar after loading model weights
+        """Publish model metadata - called by client after loading model weights
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetMetadata(self, request, context):
-        """Query for existing source with the same model - called at sidecar startup
+        """Query for existing source with the same model - called at client startup
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -96,7 +96,7 @@ def add_P2pServiceServicer_to_server(servicer, server):
 class P2pService(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
     The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-    Sidecars query for existing sources and publish their own metadata.
+    Clients query for existing sources and publish their own metadata.
     """
 
     @staticmethod
