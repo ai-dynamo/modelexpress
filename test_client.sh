@@ -58,7 +58,7 @@ setup_test_env() {
     mkdir -p "$TEST_CACHE_PATH"
 
     # Set environment variables
-    export MODEL_EXPRESS_CACHE_PATH="$TEST_CACHE_PATH"
+    export MODEL_EXPRESS_CACHE_DIRECTORY="$TEST_CACHE_PATH"
     export MODEL_EXPRESS_SERVER_ENDPOINT="$SERVER_ENDPOINT"
     export RUST_LOG=info
 
@@ -192,7 +192,7 @@ test_cache_discovery() {
 
     # Test environment variable discovery
     print_status "Testing environment variable discovery..."
-    MODEL_EXPRESS_CACHE_PATH="$TEST_CACHE_PATH" cargo run --bin cache_cli list || {
+    MODEL_EXPRESS_CACHE_DIRECTORY="$TEST_CACHE_PATH" cargo run --bin cache_cli list || {
         print_error "Environment variable discovery failed"
         return 1
     }
