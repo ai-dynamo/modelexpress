@@ -35,7 +35,11 @@ pub trait ModelProviderTrait: Send + Sync {
         Self: Sized,
     {
         const DEFAULT_IGNORED: [&str; 1] = ["README.md"];
-        filename.starts_with('.') || DEFAULT_IGNORED.contains(&filename)
+        let name = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename);
+        name.starts_with('.') || DEFAULT_IGNORED.contains(&name)
     }
 
     /// Check if a file is an image file that should be ignored
@@ -104,8 +108,13 @@ mod tests {
         assert!(HuggingFaceProvider::is_ignored(".gitkeep"));
         assert!(HuggingFaceProvider::is_ignored(".hidden"));
 
+        // Dotfiles in subdirectories
+        assert!(HuggingFaceProvider::is_ignored("subdir/.gitkeep"));
+        assert!(HuggingFaceProvider::is_ignored("a/b/.hidden"));
+
         // Explicit files
         assert!(HuggingFaceProvider::is_ignored("README.md"));
+        assert!(HuggingFaceProvider::is_ignored("subdir/README.md"));
 
         // (Not Ignored) Regular files
         assert!(!HuggingFaceProvider::is_ignored("model.bin"));
