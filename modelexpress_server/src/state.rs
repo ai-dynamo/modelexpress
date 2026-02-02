@@ -18,6 +18,7 @@ use tracing::{debug, info};
 mod keys {
     pub const MODEL_PREFIX: &str = "mx:model:";
     pub const MODELS_SET: &str = "mx:models";
+    pub const READY_PREFIX: &str = "mx:nixl_ready:";
 }
 
 /// Serializable version of TensorDescriptor for Redis storage
@@ -154,6 +155,16 @@ pub struct ModelMetadataRecord {
     pub model_name: String,
     pub workers: Vec<WorkerRecord>,
     pub published_at: i64,
+}
+
+/// Ready flag stored in Redis for coordination
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyRecord {
+    pub session_id: String,
+    pub metadata_hash: String,
+    pub nixl_ready: bool,
+    pub stability_verified: bool,
+    pub timestamp: f64,
 }
 
 /// State manager that handles Redis operations for P2P metadata
@@ -344,6 +355,77 @@ impl P2pStateManager {
         let mut conn = self.get_conn().await?;
         let models: Vec<String> = conn.smembers(keys::MODELS_SET).await?;
         Ok(models)
+    }
+
+    // ========================================================================
+    // Ready Flag Management (coordination between source and target)
+    // ========================================================================
+
+    /// Publish ready flag for a worker
+    pub async fn publish_ready(
+        &self,
+        model_name: &str,
+        worker_id: u32,
+        session_id: &str,
+        metadata_hash: &str,
+        nixl_ready: bool,
+        stability_verified: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.get_conn().await?;
+        let key = format!("{}{}:worker:{}", keys::READY_PREFIX, model_name, worker_id);
+
+        let record = ReadyRecord {
+            session_id: session_id.to_string(),
+            metadata_hash: metadata_hash.to_string(),
+            nixl_ready,
+            stability_verified,
+            timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+        };
+
+        let json = serde_json::to_string(&record)?;
+
+        // Set with 2 hour TTL (matches warmup timeout)
+        conn.set_ex::<_, _, ()>(&key, &json, 7200).await?;
+
+        info!(
+            "Published ready flag for model '{}' worker {}: nixl_ready={}, stability_verified={}, session={}",
+            model_name,
+            worker_id,
+            nixl_ready,
+            stability_verified,
+            &session_id[..8.min(session_id.len())]
+        );
+        Ok(())
+    }
+
+    /// Get ready status for a worker
+    pub async fn get_ready(
+        &self,
+        model_name: &str,
+        worker_id: u32,
+    ) -> Result<Option<ReadyRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.get_conn().await?;
+        let key = format!("{}{}:worker:{}", keys::READY_PREFIX, model_name, worker_id);
+
+        let json: Option<String> = conn.get(&key).await?;
+
+        match json {
+            Some(data) => {
+                let record: ReadyRecord = serde_json::from_str(&data)?;
+                debug!(
+                    "Retrieved ready flag for model '{}' worker {}: nixl_ready={}, stability_verified={}",
+                    model_name, worker_id, record.nixl_ready, record.stability_verified
+                );
+                Ok(Some(record))
+            }
+            None => {
+                debug!(
+                    "No ready flag found for model '{}' worker {}",
+                    model_name, worker_id
+                );
+                Ok(None)
+            }
+        }
     }
 }
 

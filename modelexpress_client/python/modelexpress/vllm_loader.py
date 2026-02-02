@@ -27,12 +27,10 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-# Redis client for source-target coordination
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
+# gRPC imports for coordination
+import grpc
+from . import p2p_pb2
+from . import p2p_pb2_grpc
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -78,7 +76,10 @@ def _safe_checksum(tensor: torch.Tensor) -> str:
 
 class SourceReadyCoordinator:
     """
-    Redis-based coordination to prevent stale metadata issues.
+    gRPC-based coordination to prevent stale metadata issues.
+    
+    All coordination goes through the ModelExpress server via gRPC,
+    eliminating the need for direct Redis access from workers.
     
     Source publishes a "ready" flag with session_id after:
     - Warmup complete
@@ -99,21 +100,19 @@ class SourceReadyCoordinator:
         return cls._session_id
     
     @staticmethod
-    def _get_redis_client() -> "redis.Redis | None":
-        """Get Redis client from environment."""
-        if not REDIS_AVAILABLE:
-            _log("Redis client not available, skipping coordination", "WARNING")
-            return None
-        
-        redis_host = os.environ.get("MX_REDIS_HOST", "modelexpress-server")
-        redis_port = int(os.environ.get("MX_REDIS_PORT", "6379"))
+    def _get_grpc_stub() -> p2p_pb2_grpc.P2pServiceStub | None:
+        """Get gRPC stub for ModelExpress server."""
+        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
         
         try:
-            client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
-            client.ping()
-            return client
+            options = [
+                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                ('grpc.max_send_message_length', 100 * 1024 * 1024),
+            ]
+            channel = grpc.insecure_channel(server_address, options=options)
+            return p2p_pb2_grpc.P2pServiceStub(channel)
         except Exception as e:
-            _log(f"Failed to connect to Redis at {redis_host}:{redis_port}: {e}", "WARNING")
+            _log(f"Failed to connect to MX server at {server_address}: {e}", "WARNING")
             return None
     
     @classmethod
@@ -122,32 +121,38 @@ class SourceReadyCoordinator:
         model_name: str,
         worker_id: int,
         metadata_hash: str,
+        nixl_ready: bool = True,
+        stability_verified: bool = True,
     ) -> bool:
         """
-        Publish source ready flag to Redis.
+        Publish source ready flag via gRPC.
         Called after warmup and metadata publishing is complete.
         """
-        client = cls._get_redis_client()
-        if client is None:
+        stub = cls._get_grpc_stub()
+        if stub is None:
             return False
         
         session_id = cls.get_session_id()
-        key = f"mx:ready:{model_name}:worker:{worker_id}"
-        
-        ready_info = {
-            "session_id": session_id,
-            "timestamp": time.time(),
-            "metadata_hash": metadata_hash,
-            "ready": True,
-        }
         
         try:
-            # Set with 2 hour TTL (matches warmup timeout)
-            client.setex(key, 7200, json.dumps(ready_info))
-            _log(f"[Worker {worker_id}] Published ready flag to Redis: session={session_id[:8]}...", "INFO")
-            return True
+            request = p2p_pb2.PublishReadyRequest(
+                model_name=model_name,
+                worker_id=worker_id,
+                session_id=session_id,
+                metadata_hash=metadata_hash,
+                nixl_ready=nixl_ready,
+                stability_verified=stability_verified,
+            )
+            response = stub.PublishReady(request)
+            
+            if response.success:
+                _log(f"[Worker {worker_id}] Published ready flag via gRPC: session={session_id[:8]}...", "INFO")
+                return True
+            else:
+                _log(f"[Worker {worker_id}] Failed to publish ready flag: {response.message}", "WARNING")
+                return False
         except Exception as e:
-            _log(f"[Worker {worker_id}] Failed to publish ready flag: {e}", "WARNING")
+            _log(f"[Worker {worker_id}] gRPC error publishing ready flag: {e}", "WARNING")
             return False
     
     @classmethod
@@ -159,35 +164,37 @@ class SourceReadyCoordinator:
         poll_interval: int = 10,
     ) -> tuple[bool, str | None, str | None]:
         """
-        Wait for source ready flag.
+        Wait for source ready flag via gRPC.
         
         Returns:
             (success, session_id, metadata_hash)
         """
-        client = cls._get_redis_client()
-        if client is None:
-            _log(f"[Worker {worker_id}] Redis not available, proceeding without coordination", "WARNING")
+        stub = cls._get_grpc_stub()
+        if stub is None:
+            _log(f"[Worker {worker_id}] gRPC not available, proceeding without coordination", "WARNING")
             return True, None, None
         
-        key = f"mx:nixl_ready:{model_name}:worker:{worker_id}"
         start_time = time.time()
         
-        _log(f"[Worker {worker_id}] Waiting for NIXL ready flag at {key}...", "INFO")
+        _log(f"[Worker {worker_id}] Waiting for NIXL ready flag via gRPC...", "INFO")
         
         while time.time() - start_time < timeout_seconds:
             try:
-                data = client.get(key)
-                if data:
-                    ready_info = json.loads(data)
-                    if ready_info.get("nixl_ready") and ready_info.get("stability_verified"):
-                        session_id = ready_info.get("session_id")
-                        metadata_hash = ready_info.get("metadata_hash")
-                        _log(
-                            f"[Worker {worker_id}] Source ready! session={session_id[:8] if session_id else 'N/A'}..., "
-                            f"hash={metadata_hash[:8] if metadata_hash else 'N/A'}...",
-                            "INFO"
-                        )
-                        return True, session_id, metadata_hash
+                request = p2p_pb2.GetReadyRequest(
+                    model_name=model_name,
+                    worker_id=worker_id,
+                )
+                response = stub.GetReady(request)
+                
+                if response.found and response.ready:
+                    session_id = response.session_id
+                    metadata_hash = response.metadata_hash
+                    _log(
+                        f"[Worker {worker_id}] Source ready! session={session_id[:8] if session_id else 'N/A'}..., "
+                        f"hash={metadata_hash[:8] if metadata_hash else 'N/A'}...",
+                        "INFO"
+                    )
+                    return True, session_id, metadata_hash
             except Exception as e:
                 _log(f"[Worker {worker_id}] Error checking ready flag: {e}", "WARNING")
             
@@ -207,7 +214,7 @@ class SourceReadyCoordinator:
         cached_session_id: str | None,
     ) -> tuple[bool, str | None]:
         """
-        Check if source session changed (indicates restart).
+        Check if source session changed (indicates restart) via gRPC.
         
         Returns:
             (changed, new_session_id)
@@ -215,17 +222,19 @@ class SourceReadyCoordinator:
         if cached_session_id is None:
             return False, None
         
-        client = cls._get_redis_client()
-        if client is None:
+        stub = cls._get_grpc_stub()
+        if stub is None:
             return False, None
         
-        key = f"mx:nixl_ready:{model_name}:worker:{worker_id}"
-        
         try:
-            data = client.get(key)
-            if data:
-                ready_info = json.loads(data)
-                current_session = ready_info.get("session_id")
+            request = p2p_pb2.GetReadyRequest(
+                model_name=model_name,
+                worker_id=worker_id,
+            )
+            response = stub.GetReady(request)
+            
+            if response.found:
+                current_session = response.session_id
                 if current_session and current_session != cached_session_id:
                     _log(
                         f"[Worker {worker_id}] Source restarted! "

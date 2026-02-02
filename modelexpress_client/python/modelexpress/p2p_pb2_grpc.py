@@ -6,7 +6,7 @@
 import grpc
 import warnings
 
-from . import p2p_pb2 as p2p__pb2
+import p2p_pb2 as p2p__pb2
 
 GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
@@ -31,7 +31,7 @@ if _version_not_supported:
 class P2pServiceStub(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
     The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-    Sidecars query for existing sources and publish their own metadata.
+    Clients query for existing sources and publish their own metadata.
     """
 
     def __init__(self, channel):
@@ -50,23 +50,47 @@ class P2pServiceStub(object):
                 request_serializer=p2p__pb2.GetMetadataRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetMetadataResponse.FromString,
                 _registered_method=True)
+        self.PublishReady = channel.unary_unary(
+                '/model_express.p2p.P2pService/PublishReady',
+                request_serializer=p2p__pb2.PublishReadyRequest.SerializeToString,
+                response_deserializer=p2p__pb2.PublishReadyResponse.FromString,
+                _registered_method=True)
+        self.GetReady = channel.unary_unary(
+                '/model_express.p2p.P2pService/GetReady',
+                request_serializer=p2p__pb2.GetReadyRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetReadyResponse.FromString,
+                _registered_method=True)
 
 
 class P2pServiceServicer(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
     The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-    Sidecars query for existing sources and publish their own metadata.
+    Clients query for existing sources and publish their own metadata.
     """
 
     def PublishMetadata(self, request, context):
-        """Publish model metadata - called by sidecar after loading model weights
+        """Publish model metadata - called by client after loading model weights
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetMetadata(self, request, context):
-        """Query for existing source with the same model - called at sidecar startup
+        """Query for existing source with the same model - called at client startup
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PublishReady(self, request, context):
+        """Publish ready flag - called by source after NIXL registration and warmup
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetReady(self, request, context):
+        """Get ready status - called by target to check if source is ready
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -85,6 +109,16 @@ def add_P2pServiceServicer_to_server(servicer, server):
                     request_deserializer=p2p__pb2.GetMetadataRequest.FromString,
                     response_serializer=p2p__pb2.GetMetadataResponse.SerializeToString,
             ),
+            'PublishReady': grpc.unary_unary_rpc_method_handler(
+                    servicer.PublishReady,
+                    request_deserializer=p2p__pb2.PublishReadyRequest.FromString,
+                    response_serializer=p2p__pb2.PublishReadyResponse.SerializeToString,
+            ),
+            'GetReady': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetReady,
+                    request_deserializer=p2p__pb2.GetReadyRequest.FromString,
+                    response_serializer=p2p__pb2.GetReadyResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'model_express.p2p.P2pService', rpc_method_handlers)
@@ -96,7 +130,7 @@ def add_P2pServiceServicer_to_server(servicer, server):
 class P2pService(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
     The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-    Sidecars query for existing sources and publish their own metadata.
+    Clients query for existing sources and publish their own metadata.
     """
 
     @staticmethod
@@ -143,6 +177,60 @@ class P2pService(object):
             '/model_express.p2p.P2pService/GetMetadata',
             p2p__pb2.GetMetadataRequest.SerializeToString,
             p2p__pb2.GetMetadataResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PublishReady(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/PublishReady',
+            p2p__pb2.PublishReadyRequest.SerializeToString,
+            p2p__pb2.PublishReadyResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetReady(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/GetReady',
+            p2p__pb2.GetReadyRequest.SerializeToString,
+            p2p__pb2.GetReadyResponse.FromString,
             options,
             channel_credentials,
             insecure,
