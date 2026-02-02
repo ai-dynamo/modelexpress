@@ -180,10 +180,16 @@ mod tests {
             // Note: is_ignored and is_image are not implemented, so they use defaults
         }
 
-        // Test default is_ignored behavior
+        // Test default is_ignored behavior - dotfiles
         assert!(DefaultProvider::is_ignored(".gitattributes"));
         assert!(DefaultProvider::is_ignored(".gitignore"));
+        assert!(DefaultProvider::is_ignored(".gitkeep"));
+        assert!(DefaultProvider::is_ignored(".hidden"));
+
+        // Test default is_ignored behavior - explicit files
         assert!(DefaultProvider::is_ignored("README.md"));
+
+        // Test default is_ignored behavior - regular files
         assert!(!DefaultProvider::is_ignored("LICENSE"));
         assert!(!DefaultProvider::is_ignored("model.bin"));
         assert!(!DefaultProvider::is_ignored("config.json"));
