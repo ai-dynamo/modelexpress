@@ -3,7 +3,7 @@
 
 use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
-use hf_hub::api::tokio::ApiBuilder;
+use hf_hub::api::tokio::{ApiBuilder, ApiError};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,7 +134,9 @@ impl ModelProviderTrait for HuggingFaceProvider {
                 Err(e) => {
                     // HTTP 416 (Range Not Satisfiable) occurs for empty files (0 bytes)
                     // since range requests are invalid on empty content. Skip gracefully.
-                    if e.to_string().contains("416") {
+                    if let ApiError::RequestError(req_err) = &e
+                        && req_err.status().is_some_and(|s| s.as_u16() == 416)
+                    {
                         warn!(
                             "Skipping empty file '{}' from model '{}': {}",
                             sib.rfilename, model_name, e
@@ -504,7 +506,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_download_ignores_dotfiles() {
+        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
         // Create a mock server with dotfiles in siblings list but NO endpoint for them.
         // If the code tries to download a dotfile, it will fail since there's no mock.
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
