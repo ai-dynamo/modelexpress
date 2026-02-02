@@ -132,6 +132,15 @@ impl ModelProviderTrait for HuggingFaceProvider {
                     files_downloaded = true;
                 }
                 Err(e) => {
+                    // HTTP 416 (Range Not Satisfiable) occurs for empty files (0 bytes)
+                    // since range requests are invalid on empty content. Skip gracefully.
+                    if e.to_string().contains("416") {
+                        warn!(
+                            "Skipping empty file '{}' from model '{}': {}",
+                            sib.rfilename, model_name, e
+                        );
+                        continue;
+                    }
                     return Err(anyhow::anyhow!(
                         "Failed to download file '{sib}' from model '{model_name}': {e}",
                         sib = sib.rfilename,
@@ -491,6 +500,60 @@ mod tests {
         assert!(
             !result.join("subdir").exists(),
             "Expected files located in sub-directories to be ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_ignores_dotfiles() {
+        // Create a mock server with dotfiles in siblings list but NO endpoint for them.
+        // If the code tries to download a dotfile, it will fail since there's no mock.
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                 "id": "test/model",
+                 "sha": "def5678",
+                 "siblings": [
+                     {"rfilename": "config.json"},
+                     {"rfilename": ".gitkeep"},
+                     {"rfilename": ".gitignore"},
+                     {"rfilename": ".hidden"}
+                 ]
+            })))
+            .mount(&server)
+            .await;
+
+        // Only mock config.json
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/test/model/resolve/(main|[^/]+)/config\.json$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("etag", "\"def5678\"")
+                    .insert_header("x-repo-commit", "def5678")
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("content-length", "64")
+                    .insert_header("content-range", "bytes 0-63/64")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("HF_ENDPOINT", server.uri());
+        }
+
+        let provider = HuggingFaceProvider;
+        let result = provider
+            .download_model("test/model", Some(temp_dir.path().to_path_buf()), false)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Download should succeed with dotfiles ignored"
         );
     }
 
