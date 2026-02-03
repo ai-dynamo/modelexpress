@@ -87,8 +87,8 @@ spec:
               
               # Install modelexpress package from the TRT-LLM branch
               echo "Installing modelexpress..."
-              # Upgrade protobuf first - required for generated pb2 files (gencode 6.x)
-              pip install --quiet --upgrade "protobuf>=6.31"
+              # Upgrade protobuf and grpcio for generated pb2 files compatibility
+              pip install --quiet --upgrade "protobuf>=6.31" "grpcio>=1.76.0"
               pip install --quiet "git+https://github.com/ai-dynamo/modelexpress.git@kavink/p2p_nixl_transfers_trtllm#subdirectory=modelexpress_client/python"
               
               # Install nixl for RDMA transfers
