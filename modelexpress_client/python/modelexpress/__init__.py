@@ -6,22 +6,38 @@ ModelExpress - High-performance GPU-to-GPU model weight transfers.
 
 This package provides:
 - NIXL-based RDMA transfers for GPU tensors
-- vLLM worker extension for serving model weights
-- Custom model loaders for FP8 model support (DeepSeek-V3, etc.)
+- vLLM custom model loaders for FP8 model support (DeepSeek-V3, etc.)
+- TensorRT-LLM checkpoint transfer and engine building
 
-Quick Start:
-    # For FP8 models (DeepSeek-V3), use custom loaders:
+Quick Start (vLLM):
     from modelexpress import register_modelexpress_loaders
     register_modelexpress_loaders()
 
     # Source: vllm serve model --load-format mx-source
     # Target: vllm serve model --load-format mx-target
+
+Quick Start (TRT-LLM):
+    from modelexpress import MxTrtllmSourcePublisher, MxTrtllmTargetLoader
+    
+    # Source: Publish checkpoint for P2P transfer
+    publisher = MxTrtllmSourcePublisher(checkpoint_dir, model_name, mx_server)
+    publisher.initialize()
+    
+    # Target: Receive checkpoint and build engine
+    loader = MxTrtllmTargetLoader(model_name, mx_server, output_dir)
+    engine_dir = loader.load()
 """
 
 import logging
 
 _logger = logging.getLogger(__name__)
 _loaders_registered = False
+
+from .trtllm_loader import (
+    MxTrtllmSourcePublisher,
+    MxTrtllmTargetLoader,
+    create_trtllm_from_mx,
+)
 
 
 def register_modelexpress_loaders():
@@ -51,4 +67,8 @@ from .client import MxClient  # noqa: F401
 __all__ = [
     "MxClient",
     "register_modelexpress_loaders",
+    # TRT-LLM integration
+    "MxTrtllmSourcePublisher",
+    "MxTrtllmTargetLoader",
+    "create_trtllm_from_mx",
 ]
