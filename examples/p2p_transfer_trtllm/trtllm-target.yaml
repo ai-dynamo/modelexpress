@@ -1,0 +1,187 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TRT-LLM Target Instance - receives checkpoint via P2P and builds engine
+# - Queries ModelExpress server for source metadata
+# - Receives checkpoint weights via NIXL RDMA
+# - Builds TensorRT-LLM engine
+# - Starts inference server
+apiVersion: v1
+kind: Service
+metadata:
+  name: trtllm-target
+  labels:
+    app: trtllm-target
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: trtllm-target
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target
+  labels:
+    app: trtllm-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target
+  template:
+    metadata:
+      labels:
+        app: trtllm-target
+    spec:
+      containers:
+        - name: trtllm-target
+          image: nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3
+          imagePullPolicy: Always
+          # Needed for GPUDirect RDMA to work
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            # Model configuration
+            - name: MODEL_NAME
+              value: "qwen-0.5b"
+            - name: OUTPUT_DIR
+              value: "/tmp/mx_trtllm"
+            # ModelExpress server address
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            # TRT-LLM build configuration
+            - name: TRTLLM_MAX_BATCH_SIZE
+              value: "8"
+            - name: TRTLLM_MAX_INPUT_LEN
+              value: "2048"
+            - name: TRTLLM_MAX_SEQ_LEN
+              value: "4096"
+            # Logging
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            # UCX transport settings for GPUDirect RDMA
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+              
+              # Install modelexpress package
+              echo "Installing modelexpress..."
+              pip install --quiet /opt/modelexpress/modelexpress_client/python/ || \
+                pip install --quiet git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python
+              
+              # Install nixl for RDMA transfers
+              pip install --quiet "nixl[cu12]" || echo "NIXL install failed, continuing..."
+              
+              python3 -c "
+              import os
+              import logging
+              
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+              logger = logging.getLogger(__name__)
+              
+              # Import ModelExpress TRT-LLM loader
+              from modelexpress import MxTrtllmTargetLoader
+              
+              model_name = os.environ.get("MODEL_NAME", "unknown")
+              mx_server = os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001")
+              output_dir = os.environ.get("OUTPUT_DIR", "/tmp/mx_trtllm")
+              
+              # Build configuration from environment
+              build_config = {
+                  "gemm_plugin": "auto",
+                  "max_batch_size": os.environ.get("TRTLLM_MAX_BATCH_SIZE", "8"),
+                  "max_input_len": os.environ.get("TRTLLM_MAX_INPUT_LEN", "2048"),
+                  "max_seq_len": os.environ.get("TRTLLM_MAX_SEQ_LEN", "4096"),
+              }
+              
+              logger.info(f"Starting TRT-LLM target loader")
+              logger.info(f"  Model: {model_name}")
+              logger.info(f"  MX Server: {mx_server}")
+              logger.info(f"  Output: {output_dir}")
+              logger.info(f"  Build config: {build_config}")
+              
+              # Initialize loader
+              loader = MxTrtllmTargetLoader(
+                  model_name=model_name,
+                  mx_server=mx_server,
+                  output_dir=output_dir,
+                  build_config=build_config,
+              )
+              
+              # Receive checkpoint via P2P and build engine
+              logger.info("Receiving checkpoint via P2P transfer...")
+              engine_dir = loader.load(skip_build=False)
+              
+              stats = loader.get_transfer_stats()
+              logger.info(f"Transfer complete:")
+              logger.info(f"  Total: {stats.get('total_bytes', 0) / 1e9:.2f} GB")
+              logger.info(f"  Time: {stats.get('total_time', 0):.2f}s")
+              logger.info(f"  Bandwidth: {stats.get('bandwidth_gbps', 0):.1f} Gbps")
+              logger.info(f"  Engine: {engine_dir}")
+              
+              # Start TRT-LLM inference server
+              logger.info("Starting TRT-LLM inference server...")
+              
+              from tensorrt_llm import LLM, SamplingParams
+              
+              llm = LLM(model=engine_dir)
+              
+              # Test inference
+              output = llm.generate("Hello, my name is", SamplingParams(max_tokens=50))
+              logger.info(f"Test inference: {output}")
+              
+              # Keep running for inference requests
+              # In production, you would start an HTTP server here
+              import time
+              logger.info('TRT-LLM target ready for inference')
+              while True:
+                  time.sleep(3600)
+              "
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "32Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 500Gi
+      # Schedule on different node than source
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: trtllm-source
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

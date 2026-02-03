@@ -1,0 +1,185 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Job to convert HuggingFace model to TRT-LLM checkpoint format
+# This creates the safetensors checkpoint files needed for P2P transfer
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trtllm-checkpoint-convert
+  labels:
+    app: trtllm-checkpoint-convert
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: converter
+          image: nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: OUTPUT_DIR
+              value: "/models/qwen-0.5b/trtllm-checkpoint"
+            - name: TP_SIZE
+              value: "1"
+            - name: DTYPE
+              value: "float16"
+            - name: HF_HUB_CACHE
+              value: "/models/hf-cache"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+                  optional: true
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+              
+              echo "=== TRT-LLM Checkpoint Conversion ==="
+              echo "Model: $MODEL_NAME"
+              echo "Output: $OUTPUT_DIR"
+              echo "TP Size: $TP_SIZE"
+              echo "Dtype: $DTYPE"
+              
+              # Create output directory
+              mkdir -p "$OUTPUT_DIR"
+              
+              # Download model if not cached
+              echo "Downloading model from HuggingFace..."
+              python3 -c "
+              from huggingface_hub import snapshot_download
+              import os
+              snapshot_download(
+                  '${MODEL_NAME}',
+                  token=os.environ.get('HF_TOKEN'),
+                  local_dir='/tmp/hf_model'
+              )
+              print('Download complete')
+              "
+              
+              # Convert to TRT-LLM checkpoint format
+              echo "Converting to TRT-LLM checkpoint format..."
+              
+              # Use TRT-LLM's Python API for conversion
+              python3 << 'CONVERT_EOF'
+              import os
+              import sys
+              
+              model_dir = "/tmp/hf_model"
+              output_dir = os.environ.get("OUTPUT_DIR", "/models/checkpoint")
+              dtype = os.environ.get("DTYPE", "float16")
+              tp_size = int(os.environ.get("TP_SIZE", "1"))
+              
+              print(f"Converting {model_dir} to TRT-LLM checkpoint")
+              print(f"  Output: {output_dir}")
+              print(f"  Dtype: {dtype}")
+              print(f"  TP Size: {tp_size}")
+              
+              try:
+                  # Try using the high-level API
+                  from tensorrt_llm.models import LLaMAForCausalLM
+                  from tensorrt_llm.mapping import Mapping
+                  
+                  mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=0)
+                  
+                  # Load and convert
+                  model = LLaMAForCausalLM.from_hugging_face(
+                      model_dir,
+                      dtype=dtype,
+                      mapping=mapping,
+                  )
+                  
+                  # Save checkpoint
+                  model.save_checkpoint(output_dir, save_config=True)
+                  print("Conversion complete using LLaMAForCausalLM")
+                  
+              except Exception as e:
+                  print(f"LLaMA conversion failed: {e}")
+                  print("Trying Qwen conversion...")
+                  
+                  try:
+                      from tensorrt_llm.models import QWenForCausalLM
+                      
+                      model = QWenForCausalLM.from_hugging_face(
+                          model_dir,
+                          dtype=dtype,
+                          mapping=Mapping(world_size=tp_size, tp_size=tp_size, rank=0),
+                      )
+                      model.save_checkpoint(output_dir, save_config=True)
+                      print("Conversion complete using QWenForCausalLM")
+                      
+                  except Exception as e2:
+                      print(f"Qwen conversion also failed: {e2}")
+                      print("Trying generic conversion via CLI...")
+                      
+                      import subprocess
+                      result = subprocess.run([
+                          "python3", "-m", "tensorrt_llm.commands.convert",
+                          "--model_dir", model_dir,
+                          "--output_dir", output_dir,
+                          "--dtype", dtype,
+                          "--tp_size", str(tp_size),
+                      ], capture_output=True, text=True)
+                      
+                      if result.returncode != 0:
+                          print(f"CLI conversion failed: {result.stderr}")
+                          sys.exit(1)
+                      print("Conversion complete using CLI")
+              
+              CONVERT_EOF
+              
+              echo "=== Conversion Complete ==="
+              echo "Checkpoint saved to: $OUTPUT_DIR"
+              ls -la "$OUTPUT_DIR"
+              
+              # Verify checkpoint
+              echo "=== Verifying checkpoint ==="
+              python3 -c "
+              import json
+              import os
+              
+              output_dir = os.environ['OUTPUT_DIR']
+              config_path = os.path.join(output_dir, 'config.json')
+              
+              with open(config_path) as f:
+                  config = json.load(f)
+              
+              print(f'Architecture: {config.get(\"architecture\", \"unknown\")}')
+              print(f'Dtype: {config.get(\"dtype\", \"unknown\")}')
+              print(f'World size: {config.get(\"mapping\", {}).get(\"world_size\", 1)}')
+              print(f'TP size: {config.get(\"mapping\", {}).get(\"tp_size\", 1)}')
+              
+              # Check safetensors files
+              world_size = config.get('mapping', {}).get('world_size', 1)
+              for rank in range(world_size):
+                  weights_path = os.path.join(output_dir, f'rank{rank}.safetensors')
+                  if os.path.exists(weights_path):
+                      size_gb = os.path.getsize(weights_path) / 1e9
+                      print(f'rank{rank}.safetensors: {size_gb:.2f} GB')
+                  else:
+                      print(f'WARNING: rank{rank}.safetensors not found!')
+              
+              print('Checkpoint verification complete!')
+              "
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
