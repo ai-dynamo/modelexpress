@@ -67,9 +67,9 @@ spec:
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "WARN"
-            # UCX transport settings for GPUDirect RDMA
+            # UCX transport settings - include tcp fallback for cross-node
             - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,cuda_copy"
+              value: "rc_x,rc,dc_x,dc,tcp,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
