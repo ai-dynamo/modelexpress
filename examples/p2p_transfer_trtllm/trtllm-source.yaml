@@ -67,13 +67,22 @@ spec:
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "WARN"
-            # UCX transport settings - include tcp fallback for cross-node
+            # UCX transport settings for GPUDirect RDMA (same as vLLM)
             - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,tcp,cuda_copy"
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
+            # Pod network info for NIXL
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
