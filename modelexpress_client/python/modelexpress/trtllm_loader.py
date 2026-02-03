@@ -292,17 +292,10 @@ class MxTrtllmSourcePublisher:
                 tensors=tensor_protos,
             ))
         
-        # Include config and engine info in model_config field
-        config_with_engine = {
-            **self.config,
-            "_mx_has_engine": self._engine_bytes is not None,
-            "_mx_engine_size": len(self._engine_bytes) if self._engine_bytes else 0,
-        }
-        
+        # Note: model_config is not in the proto - target reads config from checkpoint
         request = p2p_pb2.PublishMetadataRequest(
             model_name=self.model_name,
             workers=workers,
-            model_config=json.dumps(config_with_engine),
         )
         
         response = stub.PublishMetadata(request)
@@ -405,37 +398,27 @@ class MxTrtllmTargetLoader:
         
         # 2. Save config (remove internal _mx_ fields)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        clean_config = {k: v for k, v in self.config.items() if not k.startswith("_mx_")}
-        config_path = self.checkpoint_dir / "config.json"
-        with open(config_path, "w") as f:
-            json.dump(clean_config, f, indent=2)
-        logger.info(f"Saved config to {config_path}")
         
-        # 3. Check if source has pre-built engine
-        has_engine = self.config.get("_mx_has_engine", False)
-        engine_size = self.config.get("_mx_engine_size", 0)
-        
-        if has_engine and engine_size > 0:
-            logger.info(f"Source has pre-built engine ({engine_size / 1e6:.1f} MB)")
-            logger.info("Will receive engine directly - no local build needed!")
-        
-        # 4. Receive weights via NIXL
+        # 3. Receive weights via NIXL
         self._receive_checkpoint(source_meta)
+        
+        # 4. Read config from transferred checkpoint
+        config_path = self.checkpoint_dir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                self.config = json.load(f)
+            logger.info(f"Loaded config from checkpoint: {list(self.config.keys())}")
+        else:
+            logger.warning("No config.json in checkpoint, using empty config")
         
         if skip_build:
             logger.info(f"Checkpoint saved to {self.checkpoint_dir}")
             return str(self.checkpoint_dir)
         
-        # 5. Build engine if source didn't provide one
-        if has_engine:
-            # Engine was transferred with weights - just return engine dir
-            logger.info(f"Using transferred engine at {self.engine_dir}")
-            return str(self.engine_dir)
-        else:
-            # Need to build locally
-            engine_path = self._build_engine()
-            logger.info(f"Engine built at {engine_path}")
-            return engine_path
+        # 5. Build engine locally
+        engine_path = self._build_engine()
+        logger.info(f"Engine built at {engine_path}")
+        return engine_path
     
     def _query_source(self, timeout: int = 3600):
         """Query ModelExpress server for source metadata."""
@@ -462,15 +445,8 @@ class MxTrtllmTargetLoader:
                 
                 if response.found and len(response.workers) > 0:
                     logger.info(f"Found source with {len(response.workers)} workers")
-                    
-                    # Parse config from response
-                    if response.model_config:
-                        self.config = json.loads(response.model_config)
-                        logger.info(f"Received config: {list(self.config.keys())}")
-                    else:
-                        logger.warning("No config in response, using empty config")
-                        self.config = {}
-                    
+                    # Config will be read from the transferred checkpoint
+                    self.config = {}
                     channel.close()
                     return response
                 
