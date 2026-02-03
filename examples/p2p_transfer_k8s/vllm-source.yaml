@@ -60,7 +60,7 @@ spec:
             - name: MX_REGISTER_LOADERS
               value: "1"
             # Server address for metadata publishing
-            - name: MX_SERVER_ADDRESS
+            - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
             # OPTIMIZATION: Synchronized publish - wait for all workers before publishing
             # This reduces the staggered window and allows targets to start simultaneously
@@ -102,7 +102,41 @@ spec:
                   name: hf-token-secret
                   key: HF_TOKEN
           command: ["/bin/bash", "-c"]
-          args: ["set -ex; (sleep 5; while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done; sleep 30; curl -sf -X POST http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' -d '{\"model\":\"'\"$MODEL_NAME\"'\",\"prompt\":\"1+1=\",\"max_tokens\":3}' || true; python3 -c 'import redis,json,uuid,os; h=os.environ.get(\"MX_REDIS_HOST\",\"modelexpress-server\"); m=os.environ.get(\"MODEL_NAME\",\"x\"); s=str(uuid.uuid4()); c=redis.Redis(host=h,port=6379,decode_responses=True); [c.setex(\"mx:nixl_ready:\"+m+\":worker:\"+str(w),14400,json.dumps({\"session_id\":s,\"nixl_ready\":True,\"stability_verified\":True})) or print(\"Published\",w) for w in range(8)]') & exec python3 -m vllm.entrypoints.openai.api_server --model $MODEL_NAME --load-format mx-source --tensor-parallel-size 8 --enable-expert-parallel"]
+          args:
+            - |
+              set -ex
+              # Background task: Wait for health check, then publish NIXL ready flag
+              (
+                sleep 5
+                while ! curl -sf http://127.0.0.1:8000/health; do
+                  sleep 5
+                done
+                # Grace period for system stabilization
+                sleep 30
+                # Test inference to verify stability
+                curl -sf -X POST http://127.0.0.1:8000/v1/completions \
+                  -H 'Content-Type: application/json' \
+                  -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
+                # Publish NIXL ready flag to Redis
+                python3 -c '
+              import redis, json, uuid, os
+              host = os.environ.get("MX_REDIS_HOST", "modelexpress-server")
+              model = os.environ.get("MODEL_NAME", "unknown")
+              session = str(uuid.uuid4())
+              client = redis.Redis(host=host, port=6379, decode_responses=True)
+              for worker in range(8):
+                  key = f"mx:nixl_ready:{model}:worker:{worker}"
+                  value = json.dumps({"session_id": session, "nixl_ready": True, "stability_verified": True})
+                  client.setex(key, 14400, value)
+                  print(f"Published ready flag for worker {worker}")
+              '
+              ) &
+              # Start vLLM server
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --model $MODEL_NAME \
+                --load-format mx-source \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"
@@ -125,6 +159,6 @@ spec:
             sizeLimit: 64Gi
         - name: model-cache
           persistentVolumeClaim:
-            claimName: deepseek-v3-block
+            claimName: model-cache
       imagePullSecrets:
         - name: nvcr-imagepullsecret

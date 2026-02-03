@@ -60,7 +60,7 @@ spec:
             - name: MX_REGISTER_LOADERS
               value: "1"
             # Server address for finding source (no http:// prefix)
-            - name: MX_SERVER_ADDRESS
+            - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
             # OPTIMIZATION: Synchronized start - wait for all workers before transferring
             # This maximizes RDMA parallelism by ensuring all workers start simultaneously

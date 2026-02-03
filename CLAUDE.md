@@ -147,7 +147,6 @@ modelexpress/
 │       ├── vllm-target.yaml  # Target Kubernetes deployment
 │       └── modelexpress-server.yaml
 └── docs/
-    ├── CONTEXT.md            # Detailed engineering context
     ├── OPTIMIZATION_PLAN.md  # Performance optimization roadmap
     └── CONTIGUOUS_CONTEXT.md # Contiguous region debugging context
 ```
@@ -214,20 +213,20 @@ Rust gRPC service implementation:
 ### Building Docker Image
 
 ```bash
-cd /home/kavink/work/gitlab/modelexpress
+cd path/to/modelexpress
 
 # Build client image
 docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
-  -t nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:YOUR_TAG .
+  -t nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG .
 
-docker push nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:YOUR_TAG
+docker push nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG
 ```
 
 ### Deploying to Kubernetes
 
 ```bash
 # Namespace
-NAMESPACE=kavin
+NAMESPACE=<your-namespace>
 
 # 1. Flush Redis (clear stale metadata)
 microk8s kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
@@ -268,7 +267,7 @@ microk8s kubectl -n kavin exec deploy/mx-target -- curl -s http://localhost:8000
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target loaders with vLLM |
-| `MX_SERVER_ADDRESS` | `modelexpress-server:8001` | gRPC server address |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_REDIS_HOST` | `modelexpress-server` | Redis host for coordination |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
@@ -399,7 +398,6 @@ See `docs/OPTIMIZATION_PLAN.md` for detailed analysis:
 
 | Document | Purpose |
 |----------|---------|
-| `docs/CONTEXT.md` | Detailed engineering context, debugging commands |
 | `docs/OPTIMIZATION_PLAN.md` | Performance analysis and optimization roadmap |
 | `docs/CONTIGUOUS_CONTEXT.md` | Contiguous region debugging history |
 | `docs/CLI.md` | CLI tool documentation |

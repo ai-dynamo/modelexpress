@@ -57,9 +57,11 @@ spec:
               
               # Download model files (weights, config, tokenizer)
               python3 -c "
+              import os
               from huggingface_hub import snapshot_download
               snapshot_download(
                   '${MODEL_NAME}',
+                  token=os.environ.get('HF_TOKEN'),
               )
               print('Download complete')
               "
