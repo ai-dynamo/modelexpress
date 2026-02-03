@@ -110,11 +110,11 @@ spec:
                   "max_seq_len": os.environ.get("TRTLLM_MAX_SEQ_LEN", "4096"),
               }
               
-              logger.info(f"Starting TRT-LLM target loader")
-              logger.info(f"  Model: {model_name}")
-              logger.info(f"  MX Server: {mx_server}")
-              logger.info(f"  Output: {output_dir}")
-              logger.info(f"  Build config: {build_config}")
+              logger.info('Starting TRT-LLM target loader')
+              logger.info('  Model: %s' % model_name)
+              logger.info('  MX Server: %s' % mx_server)
+              logger.info('  Output: %s' % output_dir)
+              logger.info('  Build config: %s' % build_config)
               
               # Initialize loader
               loader = MxTrtllmTargetLoader(
@@ -129,27 +129,19 @@ spec:
               engine_dir = loader.load(skip_build=False)
               
               stats = loader.get_transfer_stats()
-              logger.info(f"Transfer complete:")
-              logger.info(f"  Total: {stats.get('total_bytes', 0) / 1e9:.2f} GB")
-              logger.info(f"  Time: {stats.get('total_time', 0):.2f}s")
-              logger.info(f"  Bandwidth: {stats.get('bandwidth_gbps', 0):.1f} Gbps")
-              logger.info(f"  Engine: {engine_dir}")
+              total_gb = stats.get('total_bytes', 0) / 1e9
+              total_time = stats.get('total_time', 0)
+              bandwidth = stats.get('bandwidth_gbps', 0)
+              logger.info('Transfer complete:')
+              logger.info('  Total: %.2f GB' % total_gb)
+              logger.info('  Time: %.2f s' % total_time)
+              logger.info('  Bandwidth: %.1f Gbps' % bandwidth)
+              logger.info('  Engine: %s' % engine_dir)
               
-              # Start TRT-LLM inference server
-              logger.info("Starting TRT-LLM inference server...")
+              logger.info('TRT-LLM target ready - checkpoint received')
               
-              from tensorrt_llm import LLM, SamplingParams
-              
-              llm = LLM(model=engine_dir)
-              
-              # Test inference
-              output = llm.generate("Hello, my name is", SamplingParams(max_tokens=50))
-              logger.info(f"Test inference: {output}")
-              
-              # Keep running for inference requests
-              # In production, you would start an HTTP server here
+              # Keep running
               import time
-              logger.info('TRT-LLM target ready for inference')
               while True:
                   time.sleep(3600)
               "
