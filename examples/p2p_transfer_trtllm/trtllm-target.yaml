@@ -167,7 +167,9 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 500Gi
-      # For testing: removed anti-affinity to test on same node first
-      # TODO: restore anti-affinity when cross-node RDMA is configured
+      # Force same-node scheduling to test if issue is network-related
+      # Remove this nodeSelector after confirming NIXL works locally
+      nodeSelector:
+        kubernetes.io/hostname: computeinstance-e00zsd3z7ftxk1nt8e
       imagePullSecrets:
         - name: nvcr-imagepullsecret
