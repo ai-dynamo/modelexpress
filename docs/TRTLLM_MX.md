@@ -1450,6 +1450,72 @@ For DeepSeek-V3 with TP=8:
 
 ---
 
+## 12. POC Results and Validated Design
+
+### 12.1 Successful End-to-End Test
+
+We have successfully demonstrated P2P weight transfer + TRT-LLM inference with **Llama 70B Instruct** (TP=8):
+
+| Metric | Value |
+|--------|-------|
+| **Total Transfer Size** | 170.54 GB |
+| **Transfer Bandwidth** | 112.3 Gbps |
+| **Transfer Time** | ~12s (per-rank: 1.5s @ 112 Gbps each) |
+| **Weight Reconstruction** | 723 tensors → 141.11 GB |
+| **Model Load Time** | 117.8s (TRT-LLM PyTorch backend) |
+| **Inference TPS** | 15.9 tokens/sec |
+
+### 12.2 Key Design Decisions from POC
+
+1. **HuggingFace Mode over Checkpoint Mode**: The TRT-LLM PyTorch backend (v0.17+) can load HuggingFace models directly, eliminating the need for checkpoint conversion. This is the recommended approach.
+
+2. **Shape Preservation**: The proto definition was extended to include tensor shapes (`repeated int64 shape`), which is critical for proper weight reconstruction on the target.
+
+3. **Full Weight Reconstruction**: The target reconstructs full HuggingFace weights from TP-sharded transfers by concatenating shards based on naming patterns (q_proj, k_proj → concat on last dim; o_proj, down_proj → concat on first dim).
+
+4. **CPU Copy for CUDA Context Safety**: Received GPU tensors are immediately copied to CPU before storing, preventing issues when CUDA contexts change between ranks.
+
+### 12.3 Workflow (Validated)
+
+```
+Source Node (8 GPUs)                           Target Node (8 GPUs)
+┌─────────────────────────┐                   ┌─────────────────────────┐
+│ 1. Load HF model        │                   │ 1. Query MX server      │
+│    (Llama 70B)          │                   │                         │
+│                         │                   │ 2. Allocate GPU tensors │
+│ 2. Shard for TP=8       │                   │    with correct shapes  │
+│    (per-rank weights)   │                   │                         │
+│                         │                   │                         │
+│ 3. Register with NIXL   │                   │ 3. Receive via RDMA     │
+│    (8 NIXL agents)      │  ════════════════>│    (8 NIXL agents)      │
+│                         │    112 Gbps       │                         │
+│ 4. Publish to MX server │                   │ 4. Copy to CPU          │
+│    (tensor metadata +   │                   │    (avoid CUDA issues)  │
+│     shapes)             │                   │                         │
+│                         │                   │ 5. Reconstruct full     │
+│ 5. Serve weights        │                   │    HF weights           │
+│    (keep running)       │                   │                         │
+│                         │                   │ 6. Save model.safetensors│
+│                         │                   │                         │
+│                         │                   │ 7. TRT-LLM inference    │
+│                         │                   │    (PyTorch backend)    │
+└─────────────────────────┘                   └─────────────────────────┘
+```
+
+### 12.4 Files Implemented
+
+| File | Purpose |
+|------|---------|
+| `trtllm_loader.py` | Source publisher and target loader classes |
+| `p2p.proto` | Extended with `shape` field for tensor dimensions |
+| `state.rs` | Server-side tensor metadata storage |
+| `trtllm-source.yaml` | K8s deployment for source |
+| `trtllm-target-inference.yaml` | K8s pod with init container (P2P) + main (inference) |
+
+For detailed POC documentation, see [POC_TRTLLM.md](./POC_TRTLLM.md).
+
+---
+
 ## References
 
 1. [TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/)
@@ -1457,3 +1523,4 @@ For DeepSeek-V3 with TP=8:
 3. [TensorRT IRefitter API](https://docs.nvidia.com/deeplearning/tensorrt/api/c_api/classnvinfer1_1_1_i_refitter.html)
 4. [NIXL Documentation](https://github.com/NVIDIA/nixl)
 5. [Triton TensorRT-LLM Backend](https://github.com/triton-inference-server/tensorrtllm_backend)
+6. [TRT-LLM DeepSeek-R1 Blog](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html)
