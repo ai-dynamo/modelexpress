@@ -27,9 +27,9 @@ The POC demonstrates successful **P2P GPU-to-GPU model weight transfer** for Ten
 
 ### Key Achievement
 
-| Model | Transfer Size | Bandwidth | Inference |
-|-------|--------------|-----------|-----------|
-| Llama 70B (TP=8) | 170.54 GB | 112.3 Gbps | 15.9 TPS |
+| Model | Transfer Size | Transfer Time | Bandwidth | Inference |
+|-------|--------------|---------------|-----------|-----------|
+| Llama 70B (TP=8) | 170.54 GB | **~12 seconds** | 112.3 Gbps | 15.9 TPS |
 
 This is a **10-20x speedup** over traditional NVMe-based model loading for large models.
 
@@ -53,6 +53,7 @@ NIXL Version: 0.8.0
 | Phase | Metric | Value |
 |-------|--------|-------|
 | **P2P Transfer** | Total size | 170.54 GB |
+| | **Total transfer time** | **~12 seconds** |
 | | Per-rank transfer | ~21 GB |
 | | Per-rank time | 1.5s |
 | | Bandwidth | 112.3 Gbps |
