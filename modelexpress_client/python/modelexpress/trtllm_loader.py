@@ -934,8 +934,12 @@ class MxTrtllmTargetLoader:
         weights = {}
         
         with torch.cuda.device(device_id):
-            for t in tensor_protos:
+            for i, t in enumerate(tensor_protos):
                 dtype = self._parse_dtype(t.dtype)
+                
+                # Debug: Log first few tensors to verify shape is being received
+                if i < 3:
+                    logger.info(f"  Tensor {t.name}: shape={list(t.shape) if t.shape else 'NONE'}, size={t.size}")
                 
                 # Use shape if available, otherwise fall back to flat tensor
                 if t.shape and len(t.shape) > 0:
@@ -945,6 +949,7 @@ class MxTrtllmTargetLoader:
                     elem_size = self._dtype_size(dtype)
                     numel = t.size // elem_size
                     shape = (numel,)
+                    logger.warning(f"  Tensor {t.name} has no shape, using flat: {shape}")
                 
                 weights[t.name] = torch.empty(
                     shape, dtype=dtype, device=f"cuda:{device_id}"
