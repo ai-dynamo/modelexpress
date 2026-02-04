@@ -12,8 +12,8 @@ spec:
   restartPolicy: Never
   containers:
     - name: inference
-      # TRT-LLM image with PyTorch backend
-      image: nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3
+      # TRT-LLM release container with full PyTorch backend support
+      image: nvcr.io/nvidia/tensorrt-llm/release:0.21.0
       imagePullPolicy: Always
       securityContext:
         capabilities:
@@ -39,75 +39,81 @@ spec:
           # Check TRT-LLM version
           python3 -c "import tensorrt_llm; print(f'TRT-LLM version: {tensorrt_llm.__version__}')"
           
-          # Quick inference test with TRT-LLM PyTorch backend
-          python3 << 'INFERENCE_EOF'
+          # Write inference script to file (avoids MPI/heredoc issues)
+          cat > /tmp/inference_test.py << 'SCRIPT_EOF'
           import os
           import time
           
-          model_path = os.environ.get("MODEL_PATH", "/models")
-          print(f"Loading model from: {model_path}")
+          def main():
+              model_path = os.environ.get("MODEL_PATH", "/models")
+              print(f"Loading model from: {model_path}")
           
-          try:
-              from tensorrt_llm import LLM, SamplingParams
-              
-              print("Initializing TRT-LLM with PyTorch backend...")
-              t0 = time.time()
-              
-              # Use PyTorch backend for HuggingFace models
-              llm = LLM(
-                  model=model_path,
-                  tensor_parallel_size=8,
-                  # Use PyTorch backend (no engine build needed)
-                  # backend="pytorch",  # May need different flag depending on TRT-LLM version
-              )
-              
-              load_time = time.time() - t0
-              print(f"Model loaded in {load_time:.1f}s")
-              
-              # Test generation
-              prompts = ["Hello, I am"]
-              sampling_params = SamplingParams(temperature=0.7, max_tokens=50)
-              
-              print("Running inference...")
-              t0 = time.time()
-              outputs = llm.generate(prompts, sampling_params)
-              gen_time = time.time() - t0
-              
-              for output in outputs:
-                  print(f"Prompt: {output.prompt}")
-                  print(f"Generated: {output.outputs[0].text}")
-                  tokens = len(output.outputs[0].token_ids)
-                  print(f"Tokens: {tokens}, Time: {gen_time:.2f}s, TPS: {tokens/gen_time:.1f}")
-              
-              print("Inference test PASSED!")
-              
-          except Exception as e:
-              print(f"Error: {e}")
-              import traceback
-              traceback.print_exc()
-              
-              # Fallback: Try with transformers
-              print("\nFallback: Testing with transformers...")
               try:
-                  from transformers import AutoModelForCausalLM, AutoTokenizer
-                  import torch
+                  from tensorrt_llm import LLM, SamplingParams
                   
-                  tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-                  model = AutoModelForCausalLM.from_pretrained(
-                      model_path,
-                      torch_dtype=torch.bfloat16,
-                      device_map="auto",
-                      trust_remote_code=True,
+                  print("Initializing TRT-LLM with PyTorch backend...")
+                  print("This uses the new PyTorch workflow - no engine build needed!")
+                  t0 = time.time()
+                  
+                  # Use PyTorch backend for HuggingFace models (TRT-LLM 0.17+)
+                  llm = LLM(
+                      model=model_path,
+                      tensor_parallel_size=8,
+                      dtype="bfloat16",
                   )
                   
-                  inputs = tokenizer("Hello, I am", return_tensors="pt").to("cuda")
-                  outputs = model.generate(**inputs, max_new_tokens=20)
-                  print(f"Generated: {tokenizer.decode(outputs[0])}")
-                  print("Transformers inference PASSED!")
-              except Exception as e2:
-                  print(f"Transformers fallback also failed: {e2}")
+                  load_time = time.time() - t0
+                  print(f"Model loaded in {load_time:.1f}s")
+                  
+                  # Test generation
+                  prompts = ["Hello, I am a large language model"]
+                  sampling_params = SamplingParams(temperature=0.7, max_tokens=50)
+                  
+                  print("Running inference...")
+                  t0 = time.time()
+                  outputs = llm.generate(prompts, sampling_params)
+                  gen_time = time.time() - t0
+                  
+                  for output in outputs:
+                      print(f"Prompt: {output.prompt}")
+                      print(f"Generated: {output.outputs[0].text}")
+                      tokens = len(output.outputs[0].token_ids)
+                      print(f"Tokens: {tokens}, Time: {gen_time:.2f}s, TPS: {tokens/gen_time:.1f}")
+                  
+                  print("\n=== TRT-LLM PYTORCH BACKEND INFERENCE PASSED! ===")
+                  
+              except Exception as e:
+                  print(f"TRT-LLM Error: {e}")
+                  import traceback
+                  traceback.print_exc()
+                  
+                  # Fallback: Try with transformers
+                  print("\nFallback: Testing with transformers...")
+                  try:
+                      from transformers import AutoModelForCausalLM, AutoTokenizer
+                      import torch
+                      
+                      tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                      model = AutoModelForCausalLM.from_pretrained(
+                          model_path,
+                          torch_dtype=torch.bfloat16,
+                          device_map="auto",
+                          trust_remote_code=True,
+                      )
+                      
+                      inputs = tokenizer("Hello, I am", return_tensors="pt").to("cuda")
+                      outputs = model.generate(**inputs, max_new_tokens=20)
+                      print(f"Generated: {tokenizer.decode(outputs[0])}")
+                      print("Transformers inference PASSED!")
+                  except Exception as e2:
+                      print(f"Transformers fallback also failed: {e2}")
           
-          INFERENCE_EOF
+          if __name__ == '__main__':
+              main()
+          SCRIPT_EOF
+          
+          # Run the inference script
+          python3 /tmp/inference_test.py
           
           echo "=== Test Complete ==="
       resources:

@@ -1,0 +1,250 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TRT-LLM Target with Inference - receives weights via P2P and runs inference
+# Uses init container with working NIXL to receive, then TRT-LLM for inference
+# NO PVC attached - weights come entirely from P2P transfer!
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trtllm-target-inference
+  labels:
+    app: trtllm-target-inference
+spec:
+  restartPolicy: Never
+  
+  # Init container: Receive weights via P2P using working NIXL image
+  initContainers:
+    - name: p2p-receiver
+      # This image has working NIXL 0.8.0 with UCX
+      image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+      imagePullPolicy: Always
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      env:
+        - name: MODEL_NAME
+          value: "deepseek-v3"
+        - name: OUTPUT_DIR
+          value: "/shared/mx_trtllm"
+        - name: TP_SIZE
+          value: "8"
+        - name: MX_SERVER_ADDRESS
+          value: "modelexpress-server:8001"
+        - name: UCX_TLS
+          value: "rc_x,rc,dc_x,dc,cuda_copy"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+          
+          echo "=== P2P Receiver Init Container ==="
+          echo "Receiving weights for model: $MODEL_NAME"
+          
+          # Download trtllm_loader from GitHub since it's not in this image
+          DEST="/usr/local/lib/python3.12/dist-packages/modelexpress"
+          curl -sL https://raw.githubusercontent.com/ai-dynamo/modelexpress/kavink/p2p_nixl_transfers_trtllm/modelexpress_client/python/modelexpress/trtllm_loader.py -o "${DEST}/trtllm_loader.py"
+          echo "from .trtllm_loader import MxTrtllmSourcePublisher, MxTrtllmTargetLoader" >> "${DEST}/__init__.py"
+          
+          python3 << 'SCRIPT_EOF'
+          import os
+          import sys
+          import time
+          import logging
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          from modelexpress.trtllm_loader import MxTrtllmTargetLoader
+          
+          model_name = os.environ.get("MODEL_NAME", "deepseek-v3")
+          mx_server = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
+          output_dir = os.environ.get("OUTPUT_DIR", "/shared/mx_trtllm")
+          tp_size = int(os.environ.get("TP_SIZE", "8"))
+          
+          logger.info("=" * 60)
+          logger.info("P2P WEIGHT RECEIVER")
+          logger.info("=" * 60)
+          logger.info(f"Model: {model_name}")
+          logger.info(f"MX Server: {mx_server}")
+          logger.info(f"Output: {output_dir}")
+          logger.info(f"TP Size: {tp_size}")
+          
+          loader = MxTrtllmTargetLoader(
+              model_name=model_name,
+              mx_server=mx_server,
+              output_dir=output_dir,
+              tp_size=tp_size,
+          )
+          
+          t0 = time.time()
+          model_path = loader.load(use_pytorch_backend=True)
+          transfer_time = time.time() - t0
+          
+          stats = loader.get_transfer_stats()
+          logger.info("=" * 60)
+          logger.info("P2P TRANSFER COMPLETE")
+          logger.info("=" * 60)
+          logger.info(f"Total: {stats.get('total_bytes', 0) / 1e9:.2f} GB")
+          logger.info(f"Time: {transfer_time:.2f}s")
+          logger.info(f"Bandwidth: {stats.get('bandwidth_gbps', 0):.1f} Gbps")
+          logger.info(f"Saved to: {model_path}")
+          
+          # List received files
+          for f in os.listdir(model_path):
+              fpath = os.path.join(model_path, f)
+              size = os.path.getsize(fpath) / 1e9
+              logger.info(f"  {f}: {size:.2f} GB")
+          
+          SCRIPT_EOF
+          
+          echo "=== P2P Receiver Complete ==="
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+          rdma/ib: "8"
+        requests:
+          nvidia.com/gpu: "8"
+          rdma/ib: "8"
+          memory: "200Gi"
+          cpu: "16"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: shared
+          mountPath: /shared
+  
+  # Main container: Run TRT-LLM inference on received weights
+  containers:
+    - name: trtllm-inference
+      image: nvcr.io/nvidia/tensorrt-llm/release:0.21.0
+      imagePullPolicy: Always
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+      env:
+        - name: MODEL_PATH
+          value: "/shared/mx_trtllm/checkpoint"
+        - name: TP_SIZE
+          value: "8"
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+          
+          echo "=== TRT-LLM Inference on P2P Received Weights ==="
+          echo "Model path: $MODEL_PATH"
+          
+          # Check TRT-LLM version
+          python3 -c "import tensorrt_llm; print(f'TRT-LLM version: {tensorrt_llm.__version__}')"
+          
+          # List received weights
+          echo "Received weights:"
+          ls -la $MODEL_PATH/
+          
+          # Write inference script
+          cat > /tmp/inference.py << 'SCRIPT_EOF'
+          import os
+          import time
+          import logging
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+          logger = logging.getLogger(__name__)
+          
+          def main():
+              model_path = os.environ.get("MODEL_PATH", "/shared/mx_trtllm/checkpoint")
+              tp_size = int(os.environ.get("TP_SIZE", "8"))
+              
+              logger.info("=" * 60)
+              logger.info("TRT-LLM INFERENCE ON P2P RECEIVED WEIGHTS")
+              logger.info("=" * 60)
+              logger.info(f"Model path: {model_path}")
+              logger.info(f"TP size: {tp_size}")
+              
+              # List files
+              logger.info("Files in model path:")
+              total_size = 0
+              for f in os.listdir(model_path):
+                  fpath = os.path.join(model_path, f)
+                  size = os.path.getsize(fpath) / 1e9
+                  total_size += size
+                  logger.info(f"  {f}: {size:.2f} GB")
+              logger.info(f"Total: {total_size:.2f} GB")
+              
+              from tensorrt_llm import LLM, SamplingParams
+              
+              logger.info("")
+              logger.info("Initializing TRT-LLM with PyTorch backend...")
+              t0 = time.time()
+              
+              llm = LLM(
+                  model=model_path,
+                  tensor_parallel_size=tp_size,
+                  dtype="bfloat16",
+              )
+              
+              load_time = time.time() - t0
+              logger.info(f"Model loaded in {load_time:.1f}s")
+              
+              # Test generation
+              prompts = ["Hello, I am a large language model trained by"]
+              sampling_params = SamplingParams(temperature=0.7, max_tokens=50)
+              
+              logger.info("Running inference...")
+              t0 = time.time()
+              outputs = llm.generate(prompts, sampling_params)
+              gen_time = time.time() - t0
+              
+              for output in outputs:
+                  logger.info(f"Prompt: {output.prompt}")
+                  logger.info(f"Generated: {output.outputs[0].text}")
+                  tokens = len(output.outputs[0].token_ids)
+                  logger.info(f"Tokens: {tokens}, Time: {gen_time:.2f}s, TPS: {tokens/gen_time:.1f}")
+              
+              logger.info("")
+              logger.info("=" * 60)
+              logger.info("SUCCESS! P2P TRANSFER + TRT-LLM INFERENCE COMPLETE!")
+              logger.info("=" * 60)
+          
+          if __name__ == '__main__':
+              main()
+          SCRIPT_EOF
+          
+          python3 /tmp/inference.py
+          
+          echo "=== Test Complete ==="
+      resources:
+        limits:
+          nvidia.com/gpu: "8"
+        requests:
+          nvidia.com/gpu: "8"
+          memory: "200Gi"
+          cpu: "16"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: shared
+          mountPath: /shared
+
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
+    - name: shared
+      emptyDir:
+        sizeLimit: 500Gi
+  imagePullSecrets:
+    - name: nvcr-imagepullsecret
