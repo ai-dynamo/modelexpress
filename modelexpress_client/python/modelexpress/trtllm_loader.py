@@ -852,12 +852,15 @@ class MxTrtllmTargetLoader:
         raise TimeoutError(f"Source not found for {self.model_name} after {timeout}s")
     
     def _receive_checkpoint(self, source_meta) -> None:
-        """Receive checkpoint weights via NIXL."""
+        """Receive checkpoint weights via NIXL and reconstruct full HF format."""
         from .nixl_transfer import NixlTransferManager
         from .types import TensorDescriptor
         
         total_bytes = 0
         total_time = 0
+        
+        # Collect all weights from all ranks for reconstruction
+        all_rank_weights: dict[int, dict[str, torch.Tensor]] = {}
         
         for worker in source_meta.workers:
             rank = worker.worker_rank
@@ -909,11 +912,18 @@ class MxTrtllmTargetLoader:
                 f"in {transfer_time:.2f}s ({bandwidth:.1f} Gbps)"
             )
             
-            # Save weights to safetensors
-            self._save_weights(weights, rank)
+            # Store weights for reconstruction
+            all_rank_weights[rank] = weights
             
             # Cleanup NIXL
             nixl_manager.shutdown()
+        
+        # Reconstruct full HuggingFace weights from shards
+        logger.info(f"Reconstructing full weights from {len(all_rank_weights)} ranks...")
+        full_weights = self._reconstruct_full_weights(all_rank_weights)
+        
+        # Save as HuggingFace format
+        self._save_hf_format(full_weights)
         
         # Store transfer stats
         self.transfer_stats = {
@@ -926,6 +936,87 @@ class MxTrtllmTargetLoader:
             f"Transfer complete: {total_bytes / 1e9:.2f} GB total "
             f"in {total_time:.2f}s ({self.transfer_stats['bandwidth_gbps']:.1f} Gbps)"
         )
+    
+    def _reconstruct_full_weights(
+        self, all_rank_weights: dict[int, dict[str, torch.Tensor]]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Reconstruct full HuggingFace weights from TP-sharded weights.
+        
+        Reverses the sharding done by _shard_tensor_for_rank on the source.
+        """
+        if len(all_rank_weights) == 1:
+            # No TP, just return the single rank's weights
+            return list(all_rank_weights.values())[0]
+        
+        # Get all tensor names from rank 0
+        rank0_weights = all_rank_weights[0]
+        full_weights = {}
+        
+        # Patterns for identifying how tensors were sharded
+        col_parallel_patterns = [
+            "q_proj", "k_proj", "v_proj", "gate_proj", "up_proj",
+            "qkv_proj", "gate_up_proj", "query_key_value",
+        ]
+        row_parallel_patterns = [
+            "o_proj", "down_proj", "out_proj", "dense",
+        ]
+        
+        for name in rank0_weights.keys():
+            # Collect this tensor from all ranks
+            shards = []
+            for rank in sorted(all_rank_weights.keys()):
+                if name in all_rank_weights[rank]:
+                    shards.append(all_rank_weights[rank][name].cpu())
+            
+            if len(shards) == 1:
+                # Not sharded
+                full_weights[name] = shards[0]
+                continue
+            
+            # Determine how to concatenate based on sharding pattern
+            concat_dim = None
+            for pattern in col_parallel_patterns:
+                if pattern in name.lower():
+                    concat_dim = -1  # Was sharded on last dim, concat on last dim
+                    break
+            
+            if concat_dim is None:
+                for pattern in row_parallel_patterns:
+                    if pattern in name.lower():
+                        concat_dim = 0  # Was sharded on first dim, concat on first dim
+                        break
+            
+            if concat_dim is not None:
+                # Concatenate shards
+                full_weights[name] = torch.cat(shards, dim=concat_dim)
+            else:
+                # Not a sharded tensor (e.g., embed_tokens, layer_norm)
+                # All ranks have the same tensor, just use rank 0's
+                full_weights[name] = shards[0]
+        
+        total_size = sum(t.numel() * t.element_size() for t in full_weights.values())
+        logger.info(f"Reconstructed {len(full_weights)} full tensors ({total_size / 1e9:.2f} GB)")
+        
+        return full_weights
+    
+    def _save_hf_format(self, weights: dict[str, torch.Tensor]) -> None:
+        """Save weights in HuggingFace safetensors format."""
+        try:
+            from safetensors.torch import save_file
+        except ImportError:
+            raise ImportError("safetensors required. Install with: pip install safetensors")
+        
+        # Save as single model.safetensors file
+        weights_path = self.checkpoint_dir / "model.safetensors"
+        save_file(weights, str(weights_path))
+        
+        total_size = sum(t.numel() * t.element_size() for t in weights.values())
+        logger.info(f"Saved HuggingFace format weights to {weights_path} ({total_size / 1e9:.2f} GB)")
+        
+        # Free memory
+        del weights
+        torch.cuda.empty_cache()
     
     def _allocate_tensors(
         self, tensor_protos, device_id: int
