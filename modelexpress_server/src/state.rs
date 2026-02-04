@@ -333,6 +333,30 @@ impl P2pStateManager {
         }
     }
 
+    /// Remove metadata for a model (cleanup)
+    pub async fn remove_metadata(
+        &self,
+        model_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.get_conn().await?;
+        let key = format!("{}{}", keys::MODEL_PREFIX, model_name);
+
+        conn.del::<_, ()>(&key).await?;
+        conn.srem::<_, _, ()>(keys::MODELS_SET, model_name).await?;
+
+        info!("Removed metadata for model '{}'", model_name);
+        Ok(())
+    }
+
+    /// List all registered model names
+    pub async fn list_models(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.get_conn().await?;
+        let models: Vec<String> = conn.smembers(keys::MODELS_SET).await?;
+        Ok(models)
+    }
+
     // ========================================================================
     // Ready Flag Management (coordination between source and target)
     // ========================================================================

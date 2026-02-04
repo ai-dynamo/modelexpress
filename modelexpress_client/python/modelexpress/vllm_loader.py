@@ -57,34 +57,9 @@ logger = logging.getLogger("modelexpress.vllm_loader")
 logger.setLevel(logging.DEBUG)
 
 def _log(msg: str, level: str = "INFO") -> None:
-    """Log using the logger module."""
-    if level == "DEBUG":
-        logger.debug(msg)
-    elif level == "WARNING":
-        logger.warning(msg)
-    elif level == "ERROR":
-        logger.error(msg)
-    else:
-        logger.info(msg)
-
-
-def _parse_server_address(address: str) -> str:
-    """
-    Parse server address, stripping http:// or https:// prefix if present.
-    
-    gRPC doesn't use URL schemes, so we need to strip them.
-    
-    Args:
-        address: Server address, possibly with http:// prefix
-        
-    Returns:
-        Clean server address without URL scheme
-    """
-    if address.startswith("http://"):
-        return address[7:]
-    elif address.startswith("https://"):
-        return address[8:]
-    return address
+    """Force log to stdout for k8s visibility."""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] {level} vllm_loader: {msg}", flush=True)
 
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
@@ -127,9 +102,7 @@ class SourceReadyCoordinator:
     @staticmethod
     def _get_grpc_stub() -> p2p_pb2_grpc.P2pServiceStub | None:
         """Get gRPC stub for ModelExpress server."""
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
+        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
         
         try:
             options = [
@@ -472,9 +445,11 @@ class MxSourceModelLoader(DefaultModelLoader):
         # This uses the server's Redis to coordinate
         _log(f"[Worker {device_id}] Using server-based barrier (fallback)", "DEBUG")
         
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
+        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
+        if server_address.startswith("http://"):
+            server_address = server_address[7:]
+        elif server_address.startswith("https://"):
+            server_address = server_address[8:]
         model_name = os.environ.get("MODEL_NAME", "unknown")
         
         try:
@@ -518,9 +493,13 @@ class MxSourceModelLoader(DefaultModelLoader):
         self, tensors: dict[str, torch.Tensor], device_id: int
     ) -> None:
         """Publish tensor metadata to ModelExpress server for targets to discover."""
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
+        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
+        # Strip http:// prefix if present (gRPC doesn't use it)
+        if server_address.startswith("http://"):
+            server_address = server_address[7:]
+        elif server_address.startswith("https://"):
+            server_address = server_address[8:]
+            
         model_name = os.environ.get("MODEL_NAME", "unknown")
         
         _log(f"[Worker {device_id}] _publish_metadata_to_server() called", "DEBUG")
@@ -691,9 +670,13 @@ class MxTargetModelLoader(DummyModelLoader):
             t0 = _time.perf_counter()
             _log("[TIMING] Processing weights (FP8 transformation)...", "INFO")
             process_weights_after_loading(model, model_config, target_device)
-            
+            _log(f"[TIMING] Weight processing complete in {_time.perf_counter() - t0:.2f}s", "INFO")
+
         total_time = _time.perf_counter() - load_start
-        _log(f"MxTargetModelLoader.load_model() complete in {total_time:.2f}s", "INFO")
+        _log("=" * 60, "INFO")
+        _log(f"[TIMING] MxTargetModelLoader.load_model() COMPLETE", "INFO")
+        _log(f"[TIMING] Total load time: {total_time:.2f}s", "INFO")
+        _log("=" * 60, "INFO")
         return model.eval()
 
     def _receive_raw_tensors(
@@ -717,9 +700,12 @@ class MxTargetModelLoader(DummyModelLoader):
             return
 
         # Get source info from environment
-        mx_server_url = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
+        mx_server_url = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
+        # Strip http:// prefix if present (gRPC doesn't use it)
+        if mx_server_url.startswith("http://"):
+            mx_server_url = mx_server_url[7:]
+        elif mx_server_url.startswith("https://"):
+            mx_server_url = mx_server_url[8:]
         model_name = os.environ.get("MODEL_NAME", "")
 
         _log(f"Server URL: {mx_server_url}, Model: {model_name}", "DEBUG")

@@ -19,12 +19,6 @@ use tonic::transport::Server;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-/// Constants for server configuration
-mod constants {
-    /// Maximum gRPC message size (100MB for large models like DeepSeek-V3)
-    pub const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -131,14 +125,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the gRPC server
     info!("Starting gRPC server on: {addr}");
+    // Set max message size to 100MB for large models like DeepSeek-V3
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
     let server_result = Server::builder()
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))
         .add_service(ModelServiceServer::new(model_service))
         .add_service(
             P2pServiceServer::new(p2p_service)
-                .max_decoding_message_size(constants::MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(constants::MAX_MESSAGE_SIZE),
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE),
         )
         .serve_with_shutdown(addr, shutdown_signal)
         .await;

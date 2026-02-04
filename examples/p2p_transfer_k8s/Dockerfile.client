@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM vllm/vllm-openai:v0.12.0 AS builder
+
+# Install Python dependencies for gRPC and Redis coordination
+RUN pip install grpcio grpcio-tools protobuf redis
+
+# Copy ModelExpress proto files
+COPY modelexpress_common/proto /opt/modelexpress/proto
+
+# Copy ModelExpress Python client
+COPY modelexpress_client/python/modelexpress /opt/modelexpress/client/modelexpress
+COPY modelexpress_client/python/generate_proto.sh /opt/modelexpress/client/
+COPY modelexpress_client/python/pyproject.toml /opt/modelexpress/client/
+
+# Generate Python proto files
+WORKDIR /opt/modelexpress/client
+RUN chmod +x generate_proto.sh && \
+    PROTO_DIR=/opt/modelexpress/proto && \
+    OUT_DIR=/opt/modelexpress/client/modelexpress && \
+    python3 -m grpc_tools.protoc \
+        -I"$PROTO_DIR" \
+        --python_out="$OUT_DIR" \
+        --grpc_python_out="$OUT_DIR" \
+        "$PROTO_DIR/p2p.proto" && \
+    sed -i 's/^import p2p_pb2/from . import p2p_pb2/' "$OUT_DIR/p2p_pb2_grpc.py"
+
+# Install the ModelExpress client package
+# NOTE: Use regular install (not -e) to avoid editable install precedence issues
+# First remove any existing modelexpress to ensure clean install
+RUN pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf /usr/local/lib/python3.12/dist-packages/modelexpress* && \
+    pip install .
+
+# Patch vLLM's model loader __init__.py to include ModelExpress loaders
+# This ensures the loaders are available in ALL processes (including workers)
+RUN LOADER_INIT="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/__init__.py" && \
+    echo '' >> $LOADER_INIT && \
+    echo '# ModelExpress custom loaders for FP8 models (DeepSeek-V3, etc.)' >> $LOADER_INIT && \
+    echo 'import os as _os' >> $LOADER_INIT && \
+    echo 'if _os.environ.get("MX_REGISTER_LOADERS", "0") == "1":' >> $LOADER_INIT && \
+    echo '    try:' >> $LOADER_INIT && \
+    echo '        from modelexpress.vllm_loader import MxSourceModelLoader, MxTargetModelLoader' >> $LOADER_INIT && \
+    echo '        _LOAD_FORMAT_TO_MODEL_LOADER["mx-source"] = MxSourceModelLoader' >> $LOADER_INIT && \
+    echo '        _LOAD_FORMAT_TO_MODEL_LOADER["mx-target"] = MxTargetModelLoader' >> $LOADER_INIT && \
+    echo '    except ImportError:' >> $LOADER_INIT && \
+    echo '        pass' >> $LOADER_INIT
+
+# Back to default workdir
+WORKDIR /workspace

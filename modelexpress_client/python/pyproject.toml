@@ -31,6 +31,7 @@ dependencies = [
     "nixl[cu12]",
     "numpy>=1.24.0",
     "protobuf>=4.25.0",
+    "pydantic>=2.0.0",
     "pyzmq>=25.0.0",
     "torch>=2.6.0",
 ]
