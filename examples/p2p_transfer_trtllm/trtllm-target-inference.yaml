@@ -147,6 +147,23 @@ spec:
           echo "=== TRT-LLM Inference on P2P Received Weights ==="
           echo "Model path: $MODEL_PATH"
           
+          # Download config.json from HuggingFace (required for TRT-LLM)
+          if [ ! -f "$MODEL_PATH/config.json" ]; then
+              echo "Downloading DeepSeek-V3 config.json from HuggingFace..."
+              pip install --quiet huggingface_hub
+              python3 -c "
+          from huggingface_hub import hf_hub_download
+          import os
+          model_path = os.environ.get('MODEL_PATH', '/shared/mx_trtllm/checkpoint')
+          config_file = hf_hub_download(
+              repo_id='deepseek-ai/DeepSeek-V3',
+              filename='config.json',
+              local_dir=model_path,
+          )
+          print(f'Downloaded config.json to {config_file}')
+          "
+          fi
+          
           # Check TRT-LLM version
           python3 -c "import tensorrt_llm; print(f'TRT-LLM version: {tensorrt_llm.__version__}')"
           
