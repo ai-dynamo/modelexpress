@@ -39,7 +39,8 @@ spec:
     spec:
       containers:
         - name: trtllm-target
-          image: nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3
+          # Custom image with NIXL + TRT-LLM + ModelExpress pre-installed
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:v0.1.0
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work
           securityContext:
@@ -88,15 +89,7 @@ spec:
             - |
               set -ex
               
-              # Install modelexpress package from the TRT-LLM branch
-              echo "Installing modelexpress..."
-              # Upgrade protobuf and grpcio for generated pb2 files compatibility
-              pip install --quiet --upgrade "protobuf>=6.31" "grpcio>=1.76.0"
-              pip install --quiet "git+https://github.com/ai-dynamo/modelexpress.git@kavink/p2p_nixl_transfers_trtllm#subdirectory=modelexpress_client/python"
-              
-              # Install nixl for RDMA transfers
-              pip install --quiet "nixl[cu12]" || echo "NIXL install failed, continuing..."
-              
+              # Packages are pre-installed in the image (NIXL, TRT-LLM, ModelExpress)
               # Write Python script to file to avoid quote escaping issues
               cat > /tmp/run_target.py << 'PYTHON_SCRIPT'
               import os
