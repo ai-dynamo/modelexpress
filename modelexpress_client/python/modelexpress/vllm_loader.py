@@ -135,6 +135,23 @@ def _safe_checksum(tensor: torch.Tensor) -> str:
         return f"err:{e}"
 
 
+def _get_expected_workers() -> int:
+    """Get expected worker count from env var or auto-detect from TP world size."""
+    env_workers = os.environ.get("MX_EXPECTED_WORKERS")
+    if env_workers:
+        return int(env_workers)
+
+    # Auto-detect from vLLM tensor parallel world size
+    try:
+        from vllm.distributed import get_tensor_model_parallel_world_size
+        world_size = get_tensor_model_parallel_world_size()
+        _log(f"Auto-detected expected workers from TP world size: {world_size}", "DEBUG")
+        return world_size
+    except (ImportError, RuntimeError) as e:
+        _log(f"Could not get TP world size: {e}, defaulting to 1", "DEBUG")
+        return 1
+
+
 class SourceReadyCoordinator:
     """
     gRPC-based coordination to prevent stale metadata issues.
@@ -467,7 +484,7 @@ class MxSourceModelLoader(DefaultModelLoader):
         # This ensures all source workers publish at approximately the same time,
         # reducing the staggered window and allowing target sync start to be more effective
         sync_publish = os.environ.get("MX_SYNC_PUBLISH", "0") == "1"
-        expected_workers = int(os.environ.get("MX_EXPECTED_WORKERS", "8"))
+        expected_workers = _get_expected_workers()
 
         if sync_publish:
             _log(f"[Worker {device_id}] Synchronized publish enabled, signaling ready...", "INFO")
@@ -901,10 +918,10 @@ class MxTargetModelLoader(DummyModelLoader):
         wait_start = _time.perf_counter()
 
         # OPTIMIZATION: Synchronized start - wait for ALL source workers before transferring
-        # This ensures all 8 target workers start their transfers simultaneously,
+        # This ensures all target workers start their transfers simultaneously,
         # maximizing RDMA parallelism and achieving closer to theoretical bandwidth
         sync_start = os.environ.get("MX_SYNC_START", "1") == "1"
-        expected_workers = int(os.environ.get("MX_EXPECTED_WORKERS", "8"))
+        expected_workers = _get_expected_workers()
 
         if sync_start:
             _log(f"[Worker {device_id}] [TIMING] Synchronized start enabled, waiting for all {expected_workers} source workers", "INFO")
