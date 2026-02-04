@@ -161,10 +161,10 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              rdma/ib: "8"
             requests:
               nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              rdma/ib: "8"
               memory: "32Gi"
               cpu: "8"
           volumeMounts:
