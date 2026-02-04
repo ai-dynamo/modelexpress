@@ -912,8 +912,15 @@ class MxTrtllmTargetLoader:
                 f"in {transfer_time:.2f}s ({bandwidth:.1f} Gbps)"
             )
             
-            # Store weights for reconstruction
-            all_rank_weights[rank] = weights
+            # Copy weights to CPU immediately to avoid GPU memory issues
+            # when switching between CUDA devices
+            cpu_weights = {k: v.cpu() for k, v in weights.items()}
+            all_rank_weights[rank] = cpu_weights
+            logger.info(f"  Copied {len(cpu_weights)} tensors to CPU")
+            
+            # Free GPU memory
+            del weights
+            torch.cuda.empty_cache()
             
             # Cleanup NIXL
             nixl_manager.shutdown()
@@ -973,11 +980,11 @@ class MxTrtllmTargetLoader:
         ]
         
         for name in rank0_weights.keys():
-            # Collect this tensor from all ranks
+            # Collect this tensor from all ranks (already on CPU)
             shards = []
             for rank in sorted(all_rank_weights.keys()):
                 if name in all_rank_weights[rank]:
-                    shards.append(all_rank_weights[rank][name].cpu())
+                    shards.append(all_rank_weights[rank][name])
             
             if len(shards) == 1:
                 # Not sharded
