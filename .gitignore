@@ -49,3 +49,7 @@ logs/
 
 # Models database
 models.db
+
+# Local documentation (not for repo)
+docs/TRTLLM_MX.md
+docs/CONTEXT.md
