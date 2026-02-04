@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TRT-LLM image with NIXL for P2P weight transfers
+# Base: Triton + TRT-LLM with proper UCX/NIXL from source
+
+FROM nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3 AS builder
+
+# Install build dependencies for UCX and NIXL
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    autoconf \
+    automake \
+    libtool \
+    git \
+    libibverbs-dev \
+    librdmacm-dev \
+    libnuma-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python build dependencies
+RUN pip install --quiet meson ninja pybind11 tomlkit
+
+# Build UCX 1.20.x from source with CUDA and verbs support
+WORKDIR /tmp
+RUN git clone --depth 1 --branch v1.20.x https://github.com/openucx/ucx.git && \
+    cd ucx && \
+    ./autogen.sh && \
+    ./contrib/configure-release-mt \
+        --enable-shared \
+        --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-cma \
+        --enable-devel-headers \
+        --with-cuda=/usr/local/cuda \
+        --with-verbs \
+        --with-dm \
+        --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+# Build NIXL from source
+WORKDIR /tmp
+RUN git clone --depth 1 https://github.com/ai-dynamo/nixl.git && \
+    cd nixl && \
+    pip install tomlkit && \
+    pip install . && \
+    meson setup build -Ducx_path=/usr/local && \
+    ninja -C build && \
+    ninja -C build install && \
+    pip install build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl && \
+    ldconfig
+
+# Install Python dependencies for gRPC
+RUN pip install --quiet grpcio grpcio-tools protobuf
+
+# Copy ModelExpress proto files
+COPY modelexpress_common/proto /opt/modelexpress/proto
+
+# Copy ModelExpress Python client
+COPY modelexpress_client/python/modelexpress /opt/modelexpress/client/modelexpress
+COPY modelexpress_client/python/pyproject.toml /opt/modelexpress/client/
+
+# Generate Python proto files
+WORKDIR /opt/modelexpress/client
+RUN python3 -m grpc_tools.protoc \
+        -I/opt/modelexpress/proto \
+        --python_out=/opt/modelexpress/client/modelexpress \
+        --grpc_python_out=/opt/modelexpress/client/modelexpress \
+        /opt/modelexpress/proto/p2p.proto && \
+    sed -i 's/^import p2p_pb2/from . import p2p_pb2/' /opt/modelexpress/client/modelexpress/p2p_pb2_grpc.py
+
+# Install the ModelExpress client package
+RUN pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf /usr/local/lib/python3.12/dist-packages/modelexpress* && \
+    pip install .
+
+# Clean up build artifacts
+RUN rm -rf /tmp/ucx /tmp/nixl
+
+# Back to default workdir
+WORKDIR /workspace
+
+# Verify NIXL installation
+RUN python3 -c "import nixl; agent = nixl.nixl_agent('test'); print('NIXL OK')"

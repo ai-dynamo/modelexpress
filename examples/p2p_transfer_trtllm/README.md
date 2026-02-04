@@ -29,6 +29,41 @@ Source Node                                    Target Node
 3. **TRT-LLM checkpoint** prepared on a shared PVC or source node
 4. **RDMA resources** configured (`rdma/ib` resource)
 
+## Building the Docker Image
+
+The TRT-LLM P2P client requires a custom Docker image with NIXL built from source for proper UCX/RDMA integration. The base Triton image's libraries conflict with pip-installed NIXL wheels, so we build NIXL from source.
+
+### Build the Image
+
+From the repository root:
+
+```bash
+docker build \
+    -t modelexpress-trtllm-client:latest \
+    -f examples/p2p_transfer_trtllm/Dockerfile.trtllm \
+    .
+```
+
+### Push to Registry (optional)
+
+```bash
+# Tag for your registry
+docker tag modelexpress-trtllm-client:latest your-registry/modelexpress-trtllm-client:latest
+
+# Push
+docker push your-registry/modelexpress-trtllm-client:latest
+```
+
+### Update Kubernetes YAMLs
+
+After building, update `trtllm-source.yaml` and `trtllm-target.yaml` to use your image:
+
+```yaml
+image: your-registry/modelexpress-trtllm-client:latest
+```
+
+**Note**: The current YAMLs use `nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3` and install packages at runtime. Using a pre-built image with NIXL from source eliminates the library conflicts and speeds up pod startup.
+
 ## Preparing a TRT-LLM Checkpoint
 
 First, convert a HuggingFace model to TRT-LLM checkpoint format:
