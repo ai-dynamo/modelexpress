@@ -649,9 +649,12 @@ class MxTrtllmTargetLoader:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self._receive_checkpoint(source_meta)
             
-            # Read config from transferred checkpoint
+            # Save config from source metadata for TRT-LLM
             config_path = self.checkpoint_dir / "config.json"
-            if config_path.exists():
+            if self.config and not config_path.exists():
+                # Create config.json from source metadata
+                self._save_checkpoint_config()
+            elif config_path.exists():
                 with open(config_path) as f:
                     self.config = json.load(f)
                 logger.info(f"Loaded config from checkpoint")
@@ -781,6 +784,30 @@ class MxTrtllmTargetLoader:
             json.dump(hf_config, f, indent=2)
         
         logger.info(f"Saved HF config to {config_path}")
+    
+    def _save_checkpoint_config(self) -> None:
+        """Save config.json for TRT-LLM checkpoint format."""
+        # For HuggingFace source mode, create a HuggingFace-compatible config
+        # that TRT-LLM's PyTorch backend can understand
+        config = {
+            "architectures": [self.config.get("architecture", "LlamaForCausalLM")],
+            "model_type": self.config.get("architecture", "llama"),
+            "hidden_size": self.config.get("hidden_size", 4096),
+            "num_hidden_layers": self.config.get("num_layers", 32),
+            "torch_dtype": self.config.get("dtype", "bfloat16"),
+            # Include mapping info for TRT-LLM
+            "tensor_parallel_size": self.config.get("mapping", {}).get("tp_size", self.tp_size),
+        }
+        
+        # If source was HuggingFace, get the original path for reference
+        if self.config.get("_hf_model_path"):
+            config["_source_model"] = self.config.get("_hf_model_path")
+        
+        config_path = self.checkpoint_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        
+        logger.info(f"Saved checkpoint config to {config_path}")
     
     def _query_source(self, timeout: int = 3600):
         """Query ModelExpress server for source metadata."""
