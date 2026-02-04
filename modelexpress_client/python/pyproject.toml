@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "modelexpress"
@@ -39,6 +39,14 @@ dev = [
     "grpcio-tools>=1.60.0,<=1.66.2",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.12.0",
+]
+gms = [
+    "pydantic>=2.0.0",
+    "cuda-python>=12.0.0",
+    "pynvml>=11.5.0",
+    "vllm>=0.6.0",
+    "gpu-memory-service @ git+https://github.com/ai-dynamo/dynamo.git#subdirectory=lib/gpu_memory_service",
 ]
 # All optional features (none currently needed — client uses gRPC only)
 all = []
@@ -48,9 +56,11 @@ Homepage = "https://github.com/ai-dynamo/modelexpress"
 Repository = "https://github.com/ai-dynamo/modelexpress.git"
 Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["modelexpress*"]
+[tool.hatch.metadata]
+allow-direct-references = true
 
-[tool.setuptools.package-data]
-modelexpress = ["py.typed"]
+[tool.hatch.build.targets.wheel]
+packages = ["modelexpress"]
+
+[tool.hatch.build.targets.sdist]
+include = ["modelexpress"]

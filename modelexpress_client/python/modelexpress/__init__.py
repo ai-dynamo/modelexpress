@@ -6,6 +6,7 @@ ModelExpress - High-performance GPU-to-GPU model weight transfers.
 
 This package provides:
 - NIXL-based RDMA transfers for GPU tensors
+- GMS-based local weight sharing via GPU Memory Service
 - vLLM worker extension for serving model weights
 - Custom model loaders for FP8 model support (DeepSeek-V3, etc.)
 
@@ -16,6 +17,13 @@ Quick Start:
 
     # Source: vllm serve model --load-format mx-source
     # Target: vllm serve model --load-format mx-target
+
+    # For GMS-based local sharing:
+    from modelexpress import register_gms_loader
+    register_gms_loader()
+
+    # Sidecar: python -m modelexpress.gms_sidecar --model <model> --device 0
+    # vLLM:    vllm serve <model> --load-format gms
 """
 
 import logging
@@ -48,7 +56,26 @@ def register_modelexpress_loaders():
 
 from .client import MxClient  # noqa: F401
 
+def register_gms_loader():
+    """
+    Register GMS loader with vLLM.
+
+    Call this function before creating an LLM instance to enable:
+        --load-format mx-gms-source  (for sidecar - loads from disk, writes to GMS)
+
+    Note: vLLM engines use --load-format gms (from gpu_memory_service) to read.
+    """
+    from .gms_loader import MxGmsSourceLoader
+    from vllm.model_executor.model_loader import register_model_loader
+
+    register_model_loader("mx-gms-source")(MxGmsSourceLoader)
+
+    import logging
+    logging.getLogger("modelexpress").info("ModelExpress GMS loader registered: mx-gms-source")
+
+
 __all__ = [
     "MxClient",
     "register_modelexpress_loaders",
+    "register_gms_loader",
 ]
