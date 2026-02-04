@@ -106,8 +106,8 @@ spec:
             - |
               set -ex
               
-              # MX_REGISTER_LOADERS=1 is set in env, which triggers sitecustomize.py
-              # to register ModelExpress loaders in ALL Python processes (including workers)
+              # MX_REGISTER_LOADERS=1 triggers the Dockerfile patch in vLLM's model loader
+              # __init__.py to register ModelExpress loaders (mx-source, mx-target)
               
               # Start vLLM with mx-target loader
               # mx-target: Creates dummy weights, receives RAW tensors via RDMA,
