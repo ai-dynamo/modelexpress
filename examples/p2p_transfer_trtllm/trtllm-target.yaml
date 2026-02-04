@@ -167,9 +167,5 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 500Gi
-      # Force same-node scheduling to test if issue is network-related
-      # Remove this nodeSelector after confirming NIXL works locally
-      nodeSelector:
-        kubernetes.io/hostname: computeinstance-e00zsd3z7ftxk1nt8e
       imagePullSecrets:
         - name: nvcr-imagepullsecret
