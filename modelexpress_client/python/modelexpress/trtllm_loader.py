@@ -182,6 +182,8 @@ class MxTrtllmSourcePublisher:
     
     def _initialize_huggingface_mode(self) -> None:
         """Load HuggingFace model directly to GPU (like vLLM P2P)."""
+        from .nixl_transfer import NixlTransferManager
+        
         logger.info(f"HuggingFace mode: Loading {self.hf_model_path} with TP={self.tp_size}")
         
         # Store HF config for metadata
