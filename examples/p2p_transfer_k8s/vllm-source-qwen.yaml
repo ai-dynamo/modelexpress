@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Quick test: vLLM Source with Qwen 0.5B (TP=1)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-source-qwen
+  labels:
+    app: mx-source-qwen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-source-qwen
+  template:
+    metadata:
+      labels:
+        app: mx-source-qwen
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            - name: VLLM_RPC_TIMEOUT
+              value: "600000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MX_ZMQ_ADDRESS
+              value: "ipc:///tmp/mx/vllm.sock"
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MX_REGISTER_LOADERS
+              value: "1"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_SYNC_PUBLISH
+              value: "1"
+            - name: MX_EXPECTED_WORKERS
+              value: "1"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+                  optional: true
+          command: ["/bin/bash", "-c"]
+          args: ["set -ex; (sleep 5; while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done; sleep 10; curl -sf -X POST http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' -d '{\"model\":\"'\"$MODEL_NAME\"'\",\"prompt\":\"1+1=\",\"max_tokens\":3}' || true; python3 -c 'import redis,json,uuid,os; h=os.environ.get(\"MX_REDIS_HOST\",\"modelexpress-server\"); m=os.environ.get(\"MODEL_NAME\",\"x\"); s=str(uuid.uuid4()); c=redis.Redis(host=h,port=6379,decode_responses=True); [c.setex(\"mx:nixl_ready:\"+m+\":worker:\"+str(w),14400,json.dumps({\"session_id\":s,\"nixl_ready\":True,\"stability_verified\":True})) or print(\"Published\",w) for w in range(1)]') & exec python3 -m vllm.entrypoints.openai.api_server --model $MODEL_NAME --load-format mx-source --tensor-parallel-size 1"]
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "8"
+              memory: "32Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

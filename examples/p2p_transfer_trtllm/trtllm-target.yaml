@@ -39,8 +39,8 @@ spec:
     spec:
       containers:
         - name: trtllm-target
-          # Custom image with NIXL + TRT-LLM + ModelExpress pre-installed
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:v0.1.0
+          # Use same working image as vLLM P2P (has NIXL 0.8.0 with working UCX)
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work
           securityContext:
@@ -89,7 +89,13 @@ spec:
             - |
               set -ex
               
-              # Packages are pre-installed in the image (NIXL, TRT-LLM, ModelExpress)
+              # Copy trtllm_loader.py from mounted ConfigMap to modelexpress package
+              DEST="/usr/local/lib/python3.12/dist-packages/modelexpress"
+              cp /opt/trtllm-code/trtllm_loader.py "${DEST}/trtllm_loader.py"
+              
+              # Update __init__.py to export trtllm classes
+              echo "from .trtllm_loader import MxTrtllmSourcePublisher, MxTrtllmTargetLoader" >> "${DEST}/__init__.py"
+              
               # Write Python script to file to avoid quote escaping issues
               cat > /tmp/run_target.py << 'PYTHON_SCRIPT'
               import os
@@ -124,7 +130,9 @@ spec:
               )
               
               logger.info("Receiving checkpoint via P2P transfer...")
-              engine_dir = loader.load(skip_build=False)
+              # skip_build=True since vLLM image doesn't have trtllm-build
+              # For production, use an image with TRT-LLM installed
+              engine_dir = loader.load(skip_build=True)
               
               stats = loader.get_transfer_stats()
               logger.info(f"Transfer complete: {stats.get('total_bytes', 0) / 1e9:.2f} GB")
@@ -151,6 +159,8 @@ spec:
               mountPath: /dev/shm
             - name: tmp
               mountPath: /tmp
+            - name: trtllm-code
+              mountPath: /opt/trtllm-code
 
       volumes:
         - name: shm
@@ -160,5 +170,8 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 500Gi
+        - name: trtllm-code
+          configMap:
+            name: trtllm-loader-code
       imagePullSecrets:
         - name: nvcr-imagepullsecret
