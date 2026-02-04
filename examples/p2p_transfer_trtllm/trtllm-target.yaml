@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# TRT-LLM Target Instance - receives checkpoint via P2P and builds engine
+# TRT-LLM Target Instance - HuggingFace mode for P2P transfer
 # - Queries ModelExpress server for source metadata
-# - Receives checkpoint weights via NIXL RDMA
-# - Builds TensorRT-LLM engine
-# - Starts inference server
+# - Receives HuggingFace weights via NIXL RDMA
+# - Saves in HF format for TRT-LLM PyTorch backend (no engine build needed!)
 apiVersion: v1
 kind: Service
 metadata:
@@ -48,21 +47,16 @@ spec:
               add:
                 - IPC_LOCK
           env:
-            # Model configuration
+            # Model configuration - HuggingFace mode for DeepSeek-V3
             - name: MODEL_NAME
-              value: "qwen-0.5b"
+              value: "deepseek-v3"
             - name: OUTPUT_DIR
               value: "/tmp/mx_trtllm"
+            - name: TP_SIZE
+              value: "8"
             # ModelExpress server address
             - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
-            # TRT-LLM build configuration
-            - name: TRTLLM_MAX_BATCH_SIZE
-              value: "8"
-            - name: TRTLLM_MAX_INPUT_LEN
-              value: "2048"
-            - name: TRTLLM_MAX_SEQ_LEN
-              value: "4096"
             # Logging
             - name: NIXL_LOG_LEVEL
               value: "INFO"
@@ -106,38 +100,33 @@ spec:
               
               from modelexpress import MxTrtllmTargetLoader
               
-              model_name = os.environ.get("MODEL_NAME", "unknown")
+              model_name = os.environ.get("MODEL_NAME", "qwen-0.5b")
               mx_server = os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001")
               output_dir = os.environ.get("OUTPUT_DIR", "/tmp/mx_trtllm")
+              tp_size = int(os.environ.get("TP_SIZE", "1"))
               
-              build_config = {
-                  "gemm_plugin": "auto",
-                  "max_batch_size": os.environ.get("TRTLLM_MAX_BATCH_SIZE", "8"),
-                  "max_input_len": os.environ.get("TRTLLM_MAX_INPUT_LEN", "2048"),
-                  "max_seq_len": os.environ.get("TRTLLM_MAX_SEQ_LEN", "4096"),
-              }
-              
-              logger.info("Starting TRT-LLM target loader")
+              logger.info("Starting TRT-LLM target loader (HuggingFace mode)")
               logger.info(f"  Model: {model_name}")
               logger.info(f"  MX Server: {mx_server}")
               logger.info(f"  Output: {output_dir}")
+              logger.info(f"  TP Size: {tp_size}")
               
               loader = MxTrtllmTargetLoader(
                   model_name=model_name,
                   mx_server=mx_server,
                   output_dir=output_dir,
-                  build_config=build_config,
+                  tp_size=tp_size,
               )
               
-              logger.info("Receiving checkpoint via P2P transfer...")
-              # skip_build=True since vLLM image doesn't have trtllm-build
-              # For production, use an image with TRT-LLM installed
-              engine_dir = loader.load(skip_build=True)
+              logger.info("Receiving HuggingFace weights via P2P transfer...")
+              # use_pytorch_backend=True for HuggingFace mode - no engine build needed!
+              model_path = loader.load(use_pytorch_backend=True)
               
               stats = loader.get_transfer_stats()
               logger.info(f"Transfer complete: {stats.get('total_bytes', 0) / 1e9:.2f} GB")
-              logger.info(f"Engine: {engine_dir}")
-              logger.info("TRT-LLM target ready - checkpoint received")
+              logger.info(f"Bandwidth: {stats.get('bandwidth_gbps', 0):.1f} Gbps")
+              logger.info(f"Model saved to: {model_path}")
+              logger.info("TRT-LLM target ready - use with: LLM(model=path, backend='pytorch')")
               
               import time
               while True:
@@ -147,13 +136,13 @@ spec:
               python3 /tmp/run_target.py
           resources:
             limits:
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "8"
               rdma/ib: "8"
             requests:
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "8"
               rdma/ib: "8"
-              memory: "32Gi"
-              cpu: "8"
+              memory: "200Gi"
+              cpu: "16"
           volumeMounts:
             - name: shm
               mountPath: /dev/shm

@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# TRT-LLM Source Instance - builds engine and publishes for P2P transfer
-# - Builds TRT-LLM engine from checkpoint (one-time, cached)
-# - Loads weights to GPU memory
+# TRT-LLM Source Instance - HuggingFace mode for P2P transfer
+# - Loads HuggingFace model directly to GPU (no checkpoint conversion needed!)
 # - Registers with NIXL for RDMA access
 # - Publishes metadata to ModelExpress server
-# - Targets receive weights and can run immediately (no build needed)
+# - Targets receive weights for TRT-LLM PyTorch backend (no engine build needed)
 apiVersion: v1
 kind: Service
 metadata:
@@ -49,17 +48,15 @@ spec:
               add:
                 - IPC_LOCK
           env:
-            # Model configuration
+            # Model configuration - HuggingFace mode for DeepSeek-V3
             - name: MODEL_NAME
-              value: "qwen-0.5b"
-            - name: CHECKPOINT_DIR
-              value: "/models/qwen-0.5b/trtllm-checkpoint"
-            - name: ENGINE_DIR
-              value: "/models/qwen-0.5b/trtllm-engine"
-            # Set to "1" to build engine on source (recommended)
-            # Targets will receive engine + weights, no local build needed
-            - name: BUILD_ENGINE
-              value: "1"
+              value: "deepseek-v3"
+            - name: HF_MODEL_PATH
+              value: "/models"
+            - name: TP_SIZE
+              value: "8"
+            - name: DTYPE
+              value: "bfloat16"
             # ModelExpress server address
             - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
@@ -113,39 +110,39 @@ spec:
               # Import ModelExpress TRT-LLM loader
               from modelexpress import MxTrtllmSourcePublisher
               
-              checkpoint_dir = os.environ.get('CHECKPOINT_DIR', '/models/checkpoint')
-              engine_dir = os.environ.get('ENGINE_DIR', '/models/engine')
-              model_name = os.environ.get('MODEL_NAME', 'unknown')
+              hf_model_path = os.environ.get('HF_MODEL_PATH', '/models/Qwen/Qwen2.5-0.5B')
+              model_name = os.environ.get('MODEL_NAME', 'qwen-0.5b')
               mx_server = os.environ.get('MODEL_EXPRESS_URL', 'modelexpress-server:8001')
-              build_engine = os.environ.get('BUILD_ENGINE', '1') == '1'
+              tp_size = int(os.environ.get('TP_SIZE', '1'))
+              dtype = os.environ.get('DTYPE', 'bfloat16')
               
-              logger.info('Starting TRT-LLM source publisher')
-              logger.info(f'  Checkpoint: {checkpoint_dir}')
-              logger.info(f'  Engine: {engine_dir}')
-              logger.info(f'  Model: {model_name}')
+              logger.info('Starting TRT-LLM source publisher (HuggingFace mode)')
+              logger.info(f'  HF Model Path: {hf_model_path}')
+              logger.info(f'  Model Name: {model_name}')
               logger.info(f'  MX Server: {mx_server}')
-              logger.info(f'  Build engine: {build_engine}')
+              logger.info(f'  TP Size: {tp_size}')
+              logger.info(f'  Dtype: {dtype}')
               
-              # Check if engine already exists (skip rebuild)
+              # Check model exists
               import os.path
-              engine_exists = os.path.exists(engine_dir) and any(
-                  f.endswith('.engine') for f in os.listdir(engine_dir)
-              ) if os.path.exists(engine_dir) else False
+              if not os.path.exists(hf_model_path):
+                  logger.error(f'Model not found at {hf_model_path}')
+                  logger.info('Available in /models:')
+                  for f in os.listdir('/models'):
+                      logger.info(f'  {f}')
+                  raise FileNotFoundError(f'Model not found: {hf_model_path}')
               
-              if engine_exists:
-                  logger.info(f'Found existing engine at {engine_dir}')
-              
-              # Initialize publisher - builds engine if needed, then loads weights
+              # Initialize publisher with HuggingFace mode
               publisher = MxTrtllmSourcePublisher(
-                  checkpoint_dir=checkpoint_dir,
                   model_name=model_name,
                   mx_server=mx_server,
-                  engine_dir=engine_dir if build_engine else None,
+                  hf_model_path=hf_model_path,
+                  tp_size=tp_size,
+                  dtype=dtype,
               )
               
               try:
-                  # build_if_needed=True will build engine if it doesn't exist
-                  publisher.initialize(build_if_needed=build_engine)
+                  publisher.initialize()
                   logger.info('Source publisher ready - serving weights via P2P')
                   
                   # Keep running to serve weights
@@ -159,13 +156,13 @@ spec:
               "
           resources:
             limits:
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "8"
               rdma/ib: "8"
             requests:
-              nvidia.com/gpu: "1"
+              nvidia.com/gpu: "8"
               rdma/ib: "8"
-              memory: "32Gi"
-              cpu: "8"
+              memory: "200Gi"
+              cpu: "16"
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
