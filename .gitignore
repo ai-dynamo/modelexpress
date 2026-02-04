@@ -52,3 +52,7 @@ models.db
 **/__pycache__/
 docs/FEEDBACK.md
 docs/optimization-comparison.md
+
+# Local documentation (not for repo)
+docs/TRTLLM_MX.md
+docs/CONTEXT.md
