@@ -39,6 +39,8 @@ pub struct TensorRecord {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub shape: Vec<i64>,
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -101,6 +103,7 @@ impl From<TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+            shape: desc.shape,
         }
     }
 }
@@ -113,6 +116,7 @@ impl From<TensorRecord> for TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            shape: record.shape,
         }
     }
 }
