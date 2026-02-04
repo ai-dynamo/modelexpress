@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Quick test: vLLM Target with Qwen 0.5B (TP=1)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-target-qwen
+  labels:
+    app: mx-target-qwen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-target-qwen
+  template:
+    metadata:
+      labels:
+        app: mx-target-qwen
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            - name: VLLM_RPC_TIMEOUT
+              value: "600000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MX_REGISTER_LOADERS
+              value: "1"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_EXPECTED_WORKERS
+              value: "1"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+              echo "Waiting for vLLM to be ready..."
+              python3 -c '
+              import time
+              import urllib.request
+              while True:
+                  try:
+                      urllib.request.urlopen("http://localhost:8000/health", timeout=3)
+                      break
+                  except Exception:
+                      time.sleep(3)
+              ' &
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --model $MODEL_NAME \
+                --load-format mx-target \
+                --tensor-parallel-size 1
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "8"
+              memory: "32Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
