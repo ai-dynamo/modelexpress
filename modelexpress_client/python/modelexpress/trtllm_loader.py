@@ -945,13 +945,23 @@ class MxTrtllmTargetLoader:
         
         Reverses the sharding done by _shard_tensor_for_rank on the source.
         """
+        # Debug: Log what we have
+        logger.info(f"Reconstruction: {len(all_rank_weights)} ranks")
+        for rank, weights in all_rank_weights.items():
+            logger.info(f"  Rank {rank}: {len(weights)} tensors")
+        
         if len(all_rank_weights) == 1:
             # No TP, just return the single rank's weights
             return list(all_rank_weights.values())[0]
         
-        # Get all tensor names from rank 0
-        rank0_weights = all_rank_weights[0]
+        # Get all tensor names from rank 0 (or first available rank)
+        first_rank = min(all_rank_weights.keys())
+        rank0_weights = all_rank_weights[first_rank]
         full_weights = {}
+        
+        if len(rank0_weights) == 0:
+            logger.error("Rank 0 weights are empty!")
+            return {}
         
         # Patterns for identifying how tensors were sharded
         col_parallel_patterns = [
