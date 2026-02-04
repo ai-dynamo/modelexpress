@@ -1,0 +1,236 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Job to convert DeepSeek-V3 to TRT-LLM checkpoint format with TP=8
+# This creates the safetensors checkpoint files needed for P2P transfer
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: trtllm-checkpoint-convert-dsv3
+  labels:
+    app: trtllm-checkpoint-convert-dsv3
+spec:
+  ttlSecondsAfterFinished: 86400  # Keep for 24 hours
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: converter
+          image: nvcr.io/nvidia/tritonserver:24.12-trtllm-python-py3
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MODEL_DIR
+              value: "/models/models--deepseek-ai--DeepSeek-V3/snapshots"
+            - name: OUTPUT_DIR
+              value: "/models/deepseek-v3-trtllm-checkpoint"
+            - name: TP_SIZE
+              value: "8"
+            - name: DTYPE
+              value: "bfloat16"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+                  optional: true
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+              
+              echo "=== TRT-LLM Checkpoint Conversion for DeepSeek-V3 ==="
+              echo "Model: $MODEL_NAME"
+              echo "Model Dir: $MODEL_DIR"
+              echo "Output: $OUTPUT_DIR"
+              echo "TP Size: $TP_SIZE"
+              echo "Dtype: $DTYPE"
+              
+              # Find model directory - HuggingFace cache format
+              if [ -d "$MODEL_DIR" ]; then
+                  echo "Using local model at $MODEL_DIR"
+              else
+                  # Try HuggingFace cache format
+                  HF_CACHE_DIR="/models/models--deepseek-ai--DeepSeek-V3/snapshots"
+                  if [ -d "$HF_CACHE_DIR" ]; then
+                      # Get the first snapshot (there should be only one)
+                      SNAPSHOT=$(ls "$HF_CACHE_DIR" | head -1)
+                      MODEL_DIR="$HF_CACHE_DIR/$SNAPSHOT"
+                      echo "Found HF cache model at $MODEL_DIR"
+                  else
+                      echo "ERROR: Model directory not found"
+                      echo "Tried: $MODEL_DIR"
+                      echo "Tried: $HF_CACHE_DIR"
+                      echo "Available in /models:"
+                      ls -la /models/
+                      exit 1
+                  fi
+              fi
+              
+              ls -la "$MODEL_DIR" | head -20
+              
+              # Create output directory
+              mkdir -p "$OUTPUT_DIR"
+              
+              # Convert to TRT-LLM checkpoint format
+              echo "Converting to TRT-LLM checkpoint format..."
+              
+              # DeepSeek-V3 requires special handling due to MoE architecture
+              python3 << 'CONVERT_EOF'
+              import os
+              import sys
+              import json
+              
+              model_dir = os.environ.get("MODEL_DIR", "/models/deepseek-ai/DeepSeek-V3")
+              output_dir = os.environ.get("OUTPUT_DIR", "/models/checkpoint")
+              dtype = os.environ.get("DTYPE", "bfloat16")
+              tp_size = int(os.environ.get("TP_SIZE", "8"))
+              
+              print(f"Converting {model_dir} to TRT-LLM checkpoint")
+              print(f"  Output: {output_dir}")
+              print(f"  Dtype: {dtype}")
+              print(f"  TP Size: {tp_size}")
+              
+              # Check for existing config
+              hf_config_path = os.path.join(model_dir, "config.json")
+              if os.path.exists(hf_config_path):
+                  with open(hf_config_path) as f:
+                      hf_config = json.load(f)
+                  print(f"HF Config: {hf_config.get('model_type', 'unknown')} architecture")
+                  print(f"  Hidden size: {hf_config.get('hidden_size', 'unknown')}")
+                  print(f"  Num layers: {hf_config.get('num_hidden_layers', 'unknown')}")
+              
+              try:
+                  # DeepSeek-V3 uses MoE - try the DeepSeek-specific conversion
+                  print("Attempting DeepSeek-V3 conversion...")
+                  
+                  # TRT-LLM may have DeepSeek-specific support
+                  try:
+                      from tensorrt_llm.models import DeepseekForCausalLM
+                      from tensorrt_llm.mapping import Mapping
+                      
+                      # Convert for each rank
+                      for rank in range(tp_size):
+                          print(f"Converting rank {rank}/{tp_size}...")
+                          mapping = Mapping(world_size=tp_size, tp_size=tp_size, rank=rank)
+                          
+                          model = DeepseekForCausalLM.from_hugging_face(
+                              model_dir,
+                              dtype=dtype,
+                              mapping=mapping,
+                          )
+                          
+                          model.save_checkpoint(output_dir, save_config=(rank == 0))
+                          print(f"Rank {rank} saved")
+                          del model
+                          
+                      print("Conversion complete using DeepseekForCausalLM")
+                      
+                  except ImportError:
+                      print("DeepseekForCausalLM not available, trying CLI...")
+                      raise
+                      
+              except Exception as e:
+                  print(f"Python API conversion failed: {e}")
+                  print("Trying TRT-LLM CLI conversion...")
+                  
+                  import subprocess
+                  
+                  # Try the convert_checkpoint.py script
+                  cmd = [
+                      "python3", "/opt/tritonserver/backends/tensorrtllm/convert_checkpoint.py",
+                      "--model_dir", model_dir,
+                      "--output_dir", output_dir,
+                      "--dtype", dtype,
+                      "--tp_size", str(tp_size),
+                  ]
+                  
+                  print(f"Running: {' '.join(cmd)}")
+                  result = subprocess.run(cmd, capture_output=True, text=True)
+                  
+                  if result.returncode != 0:
+                      print(f"Stdout: {result.stdout}")
+                      print(f"Stderr: {result.stderr}")
+                      
+                      # Try alternative path
+                      alt_cmd = [
+                          "python3", "-m", "tensorrt_llm.commands.convert_checkpoint",
+                          "--model_dir", model_dir,
+                          "--output_dir", output_dir,
+                          "--dtype", dtype,
+                          "--tp_size", str(tp_size),
+                      ]
+                      
+                      print(f"Trying alternative: {' '.join(alt_cmd)}")
+                      result = subprocess.run(alt_cmd, capture_output=True, text=True)
+                      
+                      if result.returncode != 0:
+                          print(f"Alternative also failed:")
+                          print(f"Stdout: {result.stdout}")
+                          print(f"Stderr: {result.stderr}")
+                          sys.exit(1)
+                  
+                  print("Conversion complete using CLI")
+              
+              CONVERT_EOF
+              
+              echo "=== Conversion Complete ==="
+              echo "Checkpoint saved to: $OUTPUT_DIR"
+              ls -la "$OUTPUT_DIR"
+              
+              # Verify checkpoint
+              echo "=== Verifying checkpoint ==="
+              python3 -c "
+              import json
+              import os
+              
+              output_dir = os.environ['OUTPUT_DIR']
+              config_path = os.path.join(output_dir, 'config.json')
+              
+              if not os.path.exists(config_path):
+                  print('WARNING: config.json not found!')
+                  exit(0)
+              
+              with open(config_path) as f:
+                  config = json.load(f)
+              
+              print(f'Architecture: {config.get(\"architecture\", \"unknown\")}')
+              print(f'Dtype: {config.get(\"dtype\", \"unknown\")}')
+              print(f'World size: {config.get(\"mapping\", {}).get(\"world_size\", 1)}')
+              print(f'TP size: {config.get(\"mapping\", {}).get(\"tp_size\", 1)}')
+              
+              # Check safetensors files
+              world_size = config.get('mapping', {}).get('world_size', 1)
+              total_size = 0
+              for rank in range(world_size):
+                  weights_path = os.path.join(output_dir, f'rank{rank}.safetensors')
+                  if os.path.exists(weights_path):
+                      size_gb = os.path.getsize(weights_path) / 1e9
+                      total_size += size_gb
+                      print(f'rank{rank}.safetensors: {size_gb:.2f} GB')
+                  else:
+                      print(f'WARNING: rank{rank}.safetensors not found!')
+              
+              print(f'Total checkpoint size: {total_size:.2f} GB')
+              print('Checkpoint verification complete!')
+              "
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "500Gi"
+              cpu: "32"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: deepseek-v3-block
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
