@@ -48,9 +48,9 @@ spec:
               add:
                 - IPC_LOCK
           env:
-            # Model configuration - HuggingFace mode for DeepSeek-V3
+            # Model configuration - HuggingFace mode for Llama 70B Instruct
             - name: MODEL_NAME
-              value: "deepseek-v3"
+              value: "llama-70b-instruct"
             - name: HF_MODEL_PATH
               value: "/models"
             - name: TP_SIZE

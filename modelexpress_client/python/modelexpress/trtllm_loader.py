@@ -490,6 +490,7 @@ class MxTrtllmSourcePublisher:
                     size=tensor.numel() * tensor.element_size(),
                     device_id=rank,
                     dtype=str(tensor.dtype),
+                    shape=list(tensor.shape),  # Preserve tensor shape for reconstruction
                 ))
             
             workers.append(p2p_pb2.WorkerMetadata(
@@ -935,12 +936,18 @@ class MxTrtllmTargetLoader:
         with torch.cuda.device(device_id):
             for t in tensor_protos:
                 dtype = self._parse_dtype(t.dtype)
-                elem_size = self._dtype_size(dtype)
-                numel = t.size // elem_size
                 
-                # Create flat tensor (TRT-LLM handles reshaping)
+                # Use shape if available, otherwise fall back to flat tensor
+                if t.shape and len(t.shape) > 0:
+                    shape = tuple(t.shape)
+                else:
+                    # Legacy fallback for protos without shape
+                    elem_size = self._dtype_size(dtype)
+                    numel = t.size // elem_size
+                    shape = (numel,)
+                
                 weights[t.name] = torch.empty(
-                    numel, dtype=dtype, device=f"cuda:{device_id}"
+                    shape, dtype=dtype, device=f"cuda:{device_id}"
                 )
         
         return weights

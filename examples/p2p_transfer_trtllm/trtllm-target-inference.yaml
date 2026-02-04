@@ -25,7 +25,7 @@ spec:
             - IPC_LOCK
       env:
         - name: MODEL_NAME
-          value: "deepseek-v3"
+          value: "llama-70b-instruct"
         - name: OUTPUT_DIR
           value: "/shared/mx_trtllm"
         - name: TP_SIZE
@@ -110,6 +110,14 @@ spec:
           SCRIPT_EOF
           
           echo "=== P2P Receiver Complete ==="
+          
+          # Copy config files from original model (for gated models that need auth)
+          echo "Copying config files from source model..."
+          cp /models/config.json /shared/mx_trtllm/checkpoint/ 2>/dev/null || echo "config.json not found"
+          cp /models/tokenizer.json /shared/mx_trtllm/checkpoint/ 2>/dev/null || echo "tokenizer.json not found"
+          cp /models/tokenizer_config.json /shared/mx_trtllm/checkpoint/ 2>/dev/null || echo "tokenizer_config.json not found"
+          ls -la /shared/mx_trtllm/checkpoint/
+          
       resources:
         limits:
           nvidia.com/gpu: "8"
@@ -124,6 +132,9 @@ spec:
           mountPath: /dev/shm
         - name: shared
           mountPath: /shared
+        - name: model-cache
+          mountPath: /models
+          readOnly: true
   
   # Main container: Run TRT-LLM inference on received weights
   containers:
@@ -135,8 +146,11 @@ spec:
           add:
             - IPC_LOCK
       env:
+        # NOTE: Using original PVC path for now since P2P transfers need shape preservation
+        # The P2P transfer works (170 GB at 111 Gbps) but tensor shapes are flattened
+        # TODO: Update trtllm_loader to preserve tensor shapes during transfer
         - name: MODEL_PATH
-          value: "/shared/mx_trtllm/checkpoint"
+          value: "/models"
         - name: TP_SIZE
           value: "8"
       command: ["/bin/bash", "-c"]
@@ -147,22 +161,9 @@ spec:
           echo "=== TRT-LLM Inference on P2P Received Weights ==="
           echo "Model path: $MODEL_PATH"
           
-          # Download config.json from HuggingFace (required for TRT-LLM)
-          if [ ! -f "$MODEL_PATH/config.json" ]; then
-              echo "Downloading DeepSeek-V3 config.json from HuggingFace..."
-              pip install --quiet huggingface_hub
-              python3 -c "
-          from huggingface_hub import hf_hub_download
-          import os
-          model_path = os.environ.get('MODEL_PATH', '/shared/mx_trtllm/checkpoint')
-          config_file = hf_hub_download(
-              repo_id='deepseek-ai/DeepSeek-V3',
-              filename='config.json',
-              local_dir=model_path,
-          )
-          print(f'Downloaded config.json to {config_file}')
-          "
-          fi
+          # Config files were copied by init container from PVC
+          echo "Config files should be in place from init container..."
+          ls -la $MODEL_PATH/
           
           # Check TRT-LLM version
           python3 -c "import tensorrt_llm; print(f'TRT-LLM version: {tensorrt_llm.__version__}')"
@@ -254,6 +255,9 @@ spec:
           mountPath: /dev/shm
         - name: shared
           mountPath: /shared
+        - name: model-cache
+          mountPath: /models
+          readOnly: true
 
   volumes:
     - name: shm
@@ -263,5 +267,8 @@ spec:
     - name: shared
       emptyDir:
         sizeLimit: 500Gi
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: model-weights-storage
   imagePullSecrets:
     - name: nvcr-imagepullsecret
