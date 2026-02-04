@@ -506,7 +506,7 @@ class MxTrtllmTargetLoader:
                 source_metadata=worker.nixl_metadata,
                 source_tensors=source_tensors,
                 timeout_seconds=600,  # 10 minute timeout per rank
-                coalesce_transfers=True,
+                coalesce_transfers=False,  # Disabled for cross-node RDMA compatibility
             )
             transfer_time = time.perf_counter() - t0
             

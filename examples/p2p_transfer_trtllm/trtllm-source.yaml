@@ -40,8 +40,8 @@ spec:
     spec:
       containers:
         - name: trtllm-source
-          # Custom image with NIXL + TRT-LLM + ModelExpress pre-installed
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:v0.1.0
+          # Use same working image as vLLM P2P (has NIXL 0.8.0 with working UCX)
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work
           securityContext:
@@ -95,7 +95,13 @@ spec:
             - |
               set -ex
               
-              # Packages are pre-installed in the image (NIXL, TRT-LLM, ModelExpress)
+              # Copy trtllm_loader.py from mounted ConfigMap to modelexpress package
+              DEST="/usr/local/lib/python3.12/dist-packages/modelexpress"
+              cp /opt/trtllm-code/trtllm_loader.py "${DEST}/trtllm_loader.py"
+              
+              # Update __init__.py to export trtllm classes
+              echo "from .trtllm_loader import MxTrtllmSourcePublisher, MxTrtllmTargetLoader" >> "${DEST}/__init__.py"
+              
               python3 -c "
               import os
               import time
@@ -165,6 +171,8 @@ spec:
               mountPath: /dev/shm
             - name: model-cache
               mountPath: /models
+            - name: trtllm-code
+              mountPath: /opt/trtllm-code
 
       volumes:
         - name: shm
@@ -174,5 +182,8 @@ spec:
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-weights-storage
+        - name: trtllm-code
+          configMap:
+            name: trtllm-loader-code
       imagePullSecrets:
         - name: nvcr-imagepullsecret
