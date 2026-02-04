@@ -52,9 +52,10 @@ spec:
           echo "=== P2P Receiver Init Container ==="
           echo "Receiving weights for model: $MODEL_NAME"
           
-          # Download trtllm_loader from GitHub since it's not in this image
+          # Download trtllm_loader and updated p2p_pb2 from GitHub since it's not in this image
           DEST="/usr/local/lib/python3.12/dist-packages/modelexpress"
           curl -sL https://raw.githubusercontent.com/ai-dynamo/modelexpress/kavink/p2p_nixl_transfers_trtllm/modelexpress_client/python/modelexpress/trtllm_loader.py -o "${DEST}/trtllm_loader.py"
+          curl -sL https://raw.githubusercontent.com/ai-dynamo/modelexpress/kavink/p2p_nixl_transfers_trtllm/modelexpress_client/python/modelexpress/p2p_pb2.py -o "${DEST}/p2p_pb2.py"
           echo "from .trtllm_loader import MxTrtllmSourcePublisher, MxTrtllmTargetLoader" >> "${DEST}/__init__.py"
           
           python3 << 'SCRIPT_EOF'
@@ -146,11 +147,9 @@ spec:
           add:
             - IPC_LOCK
       env:
-        # NOTE: Using original PVC path for now since P2P transfers need shape preservation
-        # The P2P transfer works (170 GB at 111 Gbps) but tensor shapes are flattened
-        # TODO: Update trtllm_loader to preserve tensor shapes during transfer
+        # P2P transferred weights with proper tensor shapes
         - name: MODEL_PATH
-          value: "/models"
+          value: "/shared/mx_trtllm/checkpoint"
         - name: TP_SIZE
           value: "8"
       command: ["/bin/bash", "-c"]

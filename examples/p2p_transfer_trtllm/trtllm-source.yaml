@@ -92,9 +92,10 @@ spec:
             - |
               set -ex
               
-              # Copy trtllm_loader.py from mounted ConfigMap to modelexpress package
+              # Copy trtllm_loader.py and updated p2p_pb2.py from ConfigMap
               DEST="/usr/local/lib/python3.12/dist-packages/modelexpress"
               cp /opt/trtllm-code/trtllm_loader.py "${DEST}/trtllm_loader.py"
+              cp /opt/trtllm-code/p2p_pb2.py "${DEST}/p2p_pb2.py"
               
               # Update __init__.py to export trtllm classes
               echo "from .trtllm_loader import MxTrtllmSourcePublisher, MxTrtllmTargetLoader" >> "${DEST}/__init__.py"
