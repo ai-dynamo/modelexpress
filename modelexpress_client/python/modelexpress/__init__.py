@@ -43,7 +43,7 @@ def register_modelexpress_loaders():
     from . import vllm_loader  # noqa: F401
 
     _loaders_registered = True
-    _logger.info("ModelExpress loaders registered: mx-source, mx-target")
+    _logger.debug("ModelExpress loaders registered: mx-source, mx-target")
 
 
 __all__ = [
