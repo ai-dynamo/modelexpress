@@ -58,69 +58,9 @@ logger = logging.getLogger("modelexpress.vllm_loader")
 logger.setLevel(logging.DEBUG)
 
 def _log(msg: str, level: str = "INFO") -> None:
-<<<<<<< HEAD
     """Force log to stdout for k8s visibility."""
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {level} vllm_loader: {msg}", flush=True)
-||||||| parent of 2a691a6 (add publish_ready function)
-    """Log using the logger module."""
-    if level == "DEBUG":
-        logger.debug(msg)
-    elif level == "WARNING":
-        logger.warning(msg)
-    elif level == "ERROR":
-        logger.error(msg)
-    else:
-        logger.info(msg)
-
-
-def _parse_server_address(address: str) -> str:
-    """
-    Parse server address, stripping http:// or https:// prefix if present.
-    
-    gRPC doesn't use URL schemes, so we need to strip them.
-    
-    Args:
-        address: Server address, possibly with http:// prefix
-        
-    Returns:
-        Clean server address without URL scheme
-    """
-    if address.startswith("http://"):
-        return address[7:]
-    elif address.startswith("https://"):
-        return address[8:]
-    return address
-=======
-    """Log using the logger module."""
-    if level == "DEBUG":
-        logger.debug(msg)
-    elif level == "WARNING":
-        logger.warning(msg)
-    elif level == "ERROR":
-        logger.error(msg)
-    else:
-        logger.info(msg)
-
-
-def _parse_server_address(address: str) -> str:
-    """
-    Parse server address, stripping http:// or https:// prefix if present.
-
-    gRPC doesn't use URL schemes, so we need to strip them.
-
-    Args:
-        address: Server address, possibly with http:// prefix
-
-    Returns:
-        Clean server address without URL scheme
-    """
-    if address.startswith("http://"):
-        return address[7:]
-    elif address.startswith("https://"):
-        return address[8:]
-    return address
->>>>>>> 2a691a6 (add publish_ready function)
 
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
@@ -145,11 +85,29 @@ def _get_expected_workers() -> int:
     try:
         from vllm.distributed import get_tensor_model_parallel_world_size
         world_size = get_tensor_model_parallel_world_size()
-        _log(f"Auto-detected expected workers from TP world size: {world_size}", "DEBUG")
+        logger.debug(f"Auto-detected expected workers from TP world size: {world_size}")
         return world_size
     except (ImportError, RuntimeError) as e:
-        _log(f"Could not get TP world size: {e}, defaulting to 1", "DEBUG")
+        logger.debug(f"Could not get TP world size: {e}, defaulting to 1")
         return 1
+
+
+def _get_worker_rank(device: torch.device) -> int:
+    """Get the TP rank of this worker."""
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+        rank = get_tensor_model_parallel_rank()
+        logger.debug(f"Got TP rank from vllm.distributed: {rank}")
+        return rank
+    except (ImportError, RuntimeError) as e:
+        logger.debug(f"Could not get TP rank from vllm.distributed: {e}")
+
+    # Fallback to device index
+    if hasattr(device, "index") and device.index is not None:
+        logger.debug(f"Using device.index as rank: {device.index}")
+        return device.index
+
+    return 0
 
 
 class SourceReadyCoordinator:
@@ -180,20 +138,8 @@ class SourceReadyCoordinator:
     @staticmethod
     def _get_grpc_stub() -> p2p_pb2_grpc.P2pServiceStub | None:
         """Get gRPC stub for ModelExpress server."""
-<<<<<<< HEAD
         server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
-        
-||||||| parent of 2a691a6 (add publish_ready function)
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
-        
-=======
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
 
->>>>>>> 2a691a6 (add publish_ready function)
         try:
             options = [
                 ('grpc.max_receive_message_length', 100 * 1024 * 1024),
@@ -433,7 +379,7 @@ class MxSourceModelLoader(DefaultModelLoader):
                 raw_tensors[name] = param.data
 
         self._raw_tensors = raw_tensors
-        device_id = self._get_worker_rank(device)
+        device_id = _get_worker_rank(device)
 
         total_size = sum(t.numel() * t.element_size() for t in raw_tensors.values())
         scale_count = sum(1 for n in raw_tensors if "scale_inv" in n.lower())
@@ -493,24 +439,6 @@ class MxSourceModelLoader(DefaultModelLoader):
         _log(f"[Worker {device_id}] Publishing metadata to ModelExpress server...", "INFO")
         self._publish_metadata_to_server(raw_tensors, device_id)
 
-    def _get_worker_rank(self, device: torch.device) -> int:
-        """Get the TP rank of this worker."""
-        try:
-            from vllm.distributed import get_tensor_model_parallel_rank
-            rank = get_tensor_model_parallel_rank()
-            _log(f"Got TP rank from vllm.distributed: {rank}", "DEBUG")
-            return rank
-        except (ImportError, RuntimeError) as e:
-            _log(f"Could not get TP rank from vllm.distributed: {e}", "DEBUG")
-
-        # Fallback to device index
-        if hasattr(device, "index") and device.index is not None:
-            _log(f"Using device.index as rank: {device.index}", "DEBUG")
-            return device.index
-
-        _log("Defaulting to rank 0", "DEBUG")
-        return 0
-
     def _wait_for_all_workers_ready(self, device_id: int, expected_workers: int) -> None:
         """
         Wait for all source workers to be ready before publishing.
@@ -535,24 +463,12 @@ class MxSourceModelLoader(DefaultModelLoader):
         # Fallback: Signal readiness to server and poll until all workers ready
         # This uses the server's Redis to coordinate
         _log(f"[Worker {device_id}] Using server-based barrier (fallback)", "DEBUG")
-<<<<<<< HEAD
-        
+
         server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
         if server_address.startswith("http://"):
             server_address = server_address[7:]
         elif server_address.startswith("https://"):
             server_address = server_address[8:]
-||||||| parent of 2a691a6 (add publish_ready function)
-        
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
-=======
-
-        server_address = _parse_server_address(
-            os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        )
->>>>>>> 2a691a6 (add publish_ready function)
         model_name = os.environ.get("MODEL_NAME", "unknown")
 
         try:
@@ -602,7 +518,7 @@ class MxSourceModelLoader(DefaultModelLoader):
             server_address = server_address[7:]
         elif server_address.startswith("https://"):
             server_address = server_address[8:]
-            
+
         model_name = os.environ.get("MODEL_NAME", "unknown")
 
         _log(f"[Worker {device_id}] _publish_metadata_to_server() called", "DEBUG")
@@ -673,8 +589,7 @@ class MxSourceModelLoader(DefaultModelLoader):
             if response.success:
                 _log(f"[Worker {device_id}] SUCCESS: Published metadata to server {server_address}", "INFO")
 
-                # Publish ready flag immediately for testing
-                # In production, this should be done by an external script after warmup
+                # Publish ready flag
                 session_id = SourceReadyCoordinator.get_session_id()
                 metadata_hash = hashlib.md5(
                     ",".join(sorted(tensors.keys())).encode()
@@ -691,9 +606,9 @@ class MxSourceModelLoader(DefaultModelLoader):
                 ready_response = stub.PublishReady(ready_request)
 
                 if ready_response.success:
-                    _log(f"[Worker {device_id}] SUCCESS: Published ready flag (session={session_id[:8]}...)", "INFO")
+                    logger.info(f"[Worker {device_id}] SUCCESS: Published ready flag (session={session_id[:8]}...)")
                 else:
-                    _log(f"[Worker {device_id}] WARNING: Failed to publish ready flag: {ready_response.message}", "WARNING")
+                    logger.warning(f"[Worker {device_id}] WARNING: Failed to publish ready flag: {ready_response.message}")
             else:
                 _log(f"[Worker {device_id}] FAILED: Server returned error: {response.message}", "ERROR")
 
@@ -792,14 +707,8 @@ class MxTargetModelLoader(DummyModelLoader):
             t0 = _time.perf_counter()
             _log("[TIMING] Processing weights (FP8 transformation)...", "INFO")
             process_weights_after_loading(model, model_config, target_device)
-<<<<<<< HEAD
             _log(f"[TIMING] Weight processing complete in {_time.perf_counter() - t0:.2f}s", "INFO")
 
-||||||| parent of 2a691a6 (add publish_ready function)
-            
-=======
-
->>>>>>> 2a691a6 (add publish_ready function)
         total_time = _time.perf_counter() - load_start
         _log("=" * 60, "INFO")
         _log(f"[TIMING] MxTargetModelLoader.load_model() COMPLETE", "INFO")
@@ -849,7 +758,7 @@ class MxTargetModelLoader(DummyModelLoader):
             if param.is_cuda:
                 target_tensors[name] = param.data
 
-        device_id = self._get_worker_rank(device)
+        device_id = _get_worker_rank(device)
         scale_count = sum(1 for n in target_tensors if "scale_inv" in n.lower())
         total_size = sum(t.numel() * t.element_size() for t in target_tensors.values())
         _log(f"[Worker {device_id}] [TIMING] Collected {len(target_tensors)} tensors in {_time.perf_counter() - t0:.3f}s", "DEBUG")
@@ -1136,24 +1045,6 @@ class MxTargetModelLoader(DummyModelLoader):
             _log(f"[Worker {device_id}] EXCEPTION receiving weights: {e}", "ERROR")
             _log(f"[Worker {device_id}] Traceback: {traceback.format_exc()}", "ERROR")
             raise
-
-    def _get_worker_rank(self, device: torch.device) -> int:
-        """Get the TP rank of this worker."""
-        try:
-            from vllm.distributed import get_tensor_model_parallel_rank
-            rank = get_tensor_model_parallel_rank()
-            _log(f"Got TP rank from vllm.distributed: {rank}", "DEBUG")
-            return rank
-        except (ImportError, RuntimeError) as e:
-            _log(f"Could not get TP rank from vllm.distributed: {e}", "DEBUG")
-
-        # Fallback to device index
-        if hasattr(device, "index") and device.index is not None:
-            _log(f"Using device.index as rank: {device.index}", "DEBUG")
-            return device.index
-
-        _log("Defaulting to rank 0", "DEBUG")
-        return 0
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
