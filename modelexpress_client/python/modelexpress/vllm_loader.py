@@ -27,10 +27,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-# gRPC imports for coordination
-import grpc
-from . import p2p_pb2
-from . import p2p_pb2_grpc
+from .client import MxClient  # All gRPC communication goes through MxClient
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -76,10 +73,10 @@ def _safe_checksum(tensor: torch.Tensor) -> str:
 
 class SourceReadyCoordinator:
     """
-    gRPC-based coordination to prevent stale metadata issues.
+    Coordination layer to prevent stale metadata issues.
     
-    All coordination goes through the ModelExpress server via gRPC,
-    eliminating the need for direct Redis access from workers.
+    All coordination goes through the ModelExpress server via gRPC
+    (using :class:`MxClient`).  Workers never access Redis directly.
     
     Source publishes a "ready" flag with session_id after:
     - Warmup complete
@@ -91,6 +88,8 @@ class SourceReadyCoordinator:
     
     # Class-level session ID (unique per process lifetime)
     _session_id: str | None = None
+    # Shared MxClient instance (lazily created)
+    _client: MxClient | None = None
     
     @classmethod
     def get_session_id(cls) -> str:
@@ -99,21 +98,16 @@ class SourceReadyCoordinator:
             cls._session_id = str(uuid.uuid4())
         return cls._session_id
     
-    @staticmethod
-    def _get_grpc_stub() -> p2p_pb2_grpc.P2pServiceStub | None:
-        """Get gRPC stub for ModelExpress server."""
-        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
-        
-        try:
-            options = [
-                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
-                ('grpc.max_send_message_length', 100 * 1024 * 1024),
-            ]
-            channel = grpc.insecure_channel(server_address, options=options)
-            return p2p_pb2_grpc.P2pServiceStub(channel)
-        except Exception as e:
-            _log(f"Failed to connect to MX server at {server_address}: {e}", "WARNING")
-            return None
+    @classmethod
+    def _get_client(cls) -> MxClient | None:
+        """Return a shared MxClient, creating it on first call."""
+        if cls._client is None:
+            try:
+                cls._client = MxClient()
+            except Exception as e:
+                _log(f"Failed to create MxClient: {e}", "WARNING")
+                return None
+        return cls._client
     
     @classmethod
     def publish_source_ready(
@@ -125,17 +119,17 @@ class SourceReadyCoordinator:
         stability_verified: bool = True,
     ) -> bool:
         """
-        Publish source ready flag via gRPC.
+        Publish source ready flag via the MX server.
         Called after warmup and metadata publishing is complete.
         """
-        stub = cls._get_grpc_stub()
-        if stub is None:
+        client = cls._get_client()
+        if client is None:
             return False
         
         session_id = cls.get_session_id()
         
         try:
-            request = p2p_pb2.PublishReadyRequest(
+            success = client.publish_ready(
                 model_name=model_name,
                 worker_id=worker_id,
                 session_id=session_id,
@@ -143,16 +137,11 @@ class SourceReadyCoordinator:
                 nixl_ready=nixl_ready,
                 stability_verified=stability_verified,
             )
-            response = stub.PublishReady(request)
-            
-            if response.success:
-                _log(f"[Worker {worker_id}] Published ready flag via gRPC: session={session_id[:8]}...", "INFO")
-                return True
-            else:
-                _log(f"[Worker {worker_id}] Failed to publish ready flag: {response.message}", "WARNING")
-                return False
+            if success:
+                _log(f"[Worker {worker_id}] Published ready flag: session={session_id[:8]}...", "INFO")
+            return success
         except Exception as e:
-            _log(f"[Worker {worker_id}] gRPC error publishing ready flag: {e}", "WARNING")
+            _log(f"[Worker {worker_id}] Error publishing ready flag: {e}", "WARNING")
             return False
     
     @classmethod
@@ -164,27 +153,22 @@ class SourceReadyCoordinator:
         poll_interval: int = 10,
     ) -> tuple[bool, str | None, str | None]:
         """
-        Wait for source ready flag via gRPC.
+        Wait for source ready flag via the MX server.
         
         Returns:
             (success, session_id, metadata_hash)
         """
-        stub = cls._get_grpc_stub()
-        if stub is None:
-            _log(f"[Worker {worker_id}] gRPC not available, proceeding without coordination", "WARNING")
+        client = cls._get_client()
+        if client is None:
+            _log(f"[Worker {worker_id}] MxClient not available, proceeding without coordination", "WARNING")
             return True, None, None
         
         start_time = time.time()
-        
-        _log(f"[Worker {worker_id}] Waiting for NIXL ready flag via gRPC...", "INFO")
+        _log(f"[Worker {worker_id}] Waiting for NIXL ready flag...", "INFO")
         
         while time.time() - start_time < timeout_seconds:
             try:
-                request = p2p_pb2.GetReadyRequest(
-                    model_name=model_name,
-                    worker_id=worker_id,
-                )
-                response = stub.GetReady(request)
+                response = client.get_ready(model_name, worker_id)
                 
                 if response.found and response.ready:
                     session_id = response.session_id
@@ -214,7 +198,7 @@ class SourceReadyCoordinator:
         cached_session_id: str | None,
     ) -> tuple[bool, str | None]:
         """
-        Check if source session changed (indicates restart) via gRPC.
+        Check if source session changed (indicates restart).
         
         Returns:
             (changed, new_session_id)
@@ -222,16 +206,12 @@ class SourceReadyCoordinator:
         if cached_session_id is None:
             return False, None
         
-        stub = cls._get_grpc_stub()
-        if stub is None:
+        client = cls._get_client()
+        if client is None:
             return False, None
         
         try:
-            request = p2p_pb2.GetReadyRequest(
-                model_name=model_name,
-                worker_id=worker_id,
-            )
-            response = stub.GetReady(request)
+            response = client.get_ready(model_name, worker_id)
             
             if response.found:
                 current_session = response.session_id
@@ -424,8 +404,8 @@ class MxSourceModelLoader(DefaultModelLoader):
         """
         Wait for all source workers to be ready before publishing.
         
-        Uses vLLM's distributed barrier if available, otherwise uses
-        a simple polling mechanism via the ModelExpress server.
+        Uses vLLM's distributed barrier if available, otherwise polls
+        the ModelExpress server via MxClient.
         """
         try:
             # Try to use vLLM's distributed barrier (most efficient)
@@ -441,41 +421,22 @@ class MxSourceModelLoader(DefaultModelLoader):
         except (ImportError, RuntimeError) as e:
             _log(f"[Worker {device_id}] torch.distributed barrier not available: {e}", "DEBUG")
         
-        # Fallback: Signal readiness to server and poll until all workers ready
-        # This uses the server's Redis to coordinate
-        _log(f"[Worker {device_id}] Using server-based barrier (fallback)", "DEBUG")
-        
-        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
-        if server_address.startswith("http://"):
-            server_address = server_address[7:]
-        elif server_address.startswith("https://"):
-            server_address = server_address[8:]
+        # Fallback: Poll the MX server via gRPC until all workers ready
+        _log(f"[Worker {device_id}] Using MX server barrier (fallback)", "DEBUG")
         model_name = os.environ.get("MODEL_NAME", "unknown")
         
         try:
-            import grpc
-            from . import p2p_pb2, p2p_pb2_grpc
+            client = MxClient()
             
-            options = [
-                ('grpc.max_send_message_length', 10 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 10 * 1024 * 1024),
-            ]
-            channel = grpc.insecure_channel(server_address, options=options)
-            stub = p2p_pb2_grpc.P2pServiceStub(channel)
-            
-            # Poll until all workers have published (including us in a moment)
-            # We check how many workers are already registered
             max_wait = 300  # 5 minute max wait for other workers
             waited = 0
             poll_interval = 2
             
             while waited < max_wait:
-                request = p2p_pb2.GetMetadataRequest(model_name=model_name)
-                response = stub.GetMetadata(request)
+                response = client.get_metadata(model_name)
                 
                 if response.found:
                     ready_count = len([w for w in response.workers if len(w.tensors) > 0])
-                    # We haven't published yet, so we expect (expected_workers - 1) others
                     if ready_count >= expected_workers - 1:
                         _log(f"[Worker {device_id}] All other workers ready ({ready_count}/{expected_workers-1}), proceeding", "INFO")
                         break
@@ -484,7 +445,7 @@ class MxSourceModelLoader(DefaultModelLoader):
                 time.sleep(poll_interval)
                 waited += poll_interval
             
-            channel.close()
+            client.close()
             
         except Exception as e:
             _log(f"[Worker {device_id}] Server barrier failed: {e}, proceeding anyway", "WARNING")
@@ -493,34 +454,22 @@ class MxSourceModelLoader(DefaultModelLoader):
         self, tensors: dict[str, torch.Tensor], device_id: int
     ) -> None:
         """Publish tensor metadata to ModelExpress server for targets to discover."""
-        server_address = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
-        # Strip http:// prefix if present (gRPC doesn't use it)
-        if server_address.startswith("http://"):
-            server_address = server_address[7:]
-        elif server_address.startswith("https://"):
-            server_address = server_address[8:]
-            
+        from . import p2p_pb2
+
         model_name = os.environ.get("MODEL_NAME", "unknown")
         
-        _log(f"[Worker {device_id}] _publish_metadata_to_server() called", "DEBUG")
-        _log(f"[Worker {device_id}] Server address: {server_address}, Model: {model_name}", "DEBUG")
-        _log(f"[Worker {device_id}] Publishing {len(tensors)} tensors", "DEBUG")
+        _log(f"[Worker {device_id}] Publishing {len(tensors)} tensors for model '{model_name}'", "INFO")
         
         try:
-            import grpc
-            from . import p2p_pb2, p2p_pb2_grpc
-            
             # Check if contiguous region registration is enabled
             use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
             
             if use_contiguous and self._nixl_manager is not None:
-                # Publish REGION descriptors (what we actually registered)
-                # Target will receive these and match regions by index
                 region_descriptors = self._nixl_manager.get_registered_descriptors()
                 tensor_protos = []
                 for desc in region_descriptors:
                     tensor_protos.append(p2p_pb2.TensorDescriptor(
-                        name=desc.name,  # __region_0__, __region_1__, etc.
+                        name=desc.name,
                         addr=desc.addr,
                         size=desc.size,
                         device_id=desc.device_id,
@@ -528,7 +477,6 @@ class MxSourceModelLoader(DefaultModelLoader):
                     ))
                 _log(f"[Worker {device_id}] Built {len(tensor_protos)} REGION descriptors (MX_CONTIGUOUS_REG=1)", "INFO")
             else:
-                # Build tensor descriptors from individual tensors (baseline)
                 tensor_protos = []
                 for name, t in tensors.items():
                     tensor_protos.append(p2p_pb2.TensorDescriptor(
@@ -538,46 +486,24 @@ class MxSourceModelLoader(DefaultModelLoader):
                         device_id=device_id,
                         dtype=str(t.dtype),
                     ))
-                _log(f"[Worker {device_id}] Built {len(tensor_protos)} tensor descriptors", "DEBUG")
             
-            # Get NIXL metadata
             nixl_metadata = self._nixl_manager.nixl_metadata if self._nixl_manager else b""
-            _log(f"[Worker {device_id}] NIXL metadata size: {len(nixl_metadata)} bytes", "DEBUG")
             
-            # Build worker metadata
             worker = p2p_pb2.WorkerMetadata(
                 worker_rank=device_id,
                 nixl_metadata=nixl_metadata,
                 tensors=tensor_protos,
             )
             
-            # Publish to server
-            options = [
-                ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
-            ]
-            _log(f"[Worker {device_id}] Connecting to gRPC server at {server_address}...", "DEBUG")
-            channel = grpc.insecure_channel(server_address, options=options)
-            stub = p2p_pb2_grpc.P2pServiceStub(channel)
+            client = MxClient()
+            success = client.publish_metadata(model_name, [worker])
             
-            request = p2p_pb2.PublishMetadataRequest(
-                model_name=model_name,
-                workers=[worker],  # repeated field
-            )
-            _log(f"[Worker {device_id}] Sending PublishMetadataRequest...", "DEBUG")
-            response = stub.PublishMetadata(request)
-            
-            if response.success:
-                _log(f"[Worker {device_id}] SUCCESS: Published metadata to server {server_address}", "INFO")
-                # NOTE: NIXL ready flag is published by source entrypoint AFTER:
-                # 1. vLLM health check passes
-                # 2. 30s grace period
-                # 3. Successful test inference proves stability
+            if success:
+                _log(f"[Worker {device_id}] Published metadata to MX server", "INFO")
             else:
-                _log(f"[Worker {device_id}] FAILED: Server returned error: {response.message}", "ERROR")
+                _log(f"[Worker {device_id}] FAILED to publish metadata", "ERROR")
             
-            channel.close()
-            _log(f"[Worker {device_id}] gRPC channel closed", "DEBUG")
+            client.close()
             
         except Exception as e:
             import traceback
@@ -700,15 +626,9 @@ class MxTargetModelLoader(DummyModelLoader):
             return
 
         # Get source info from environment
-        mx_server_url = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
-        # Strip http:// prefix if present (gRPC doesn't use it)
-        if mx_server_url.startswith("http://"):
-            mx_server_url = mx_server_url[7:]
-        elif mx_server_url.startswith("https://"):
-            mx_server_url = mx_server_url[8:]
         model_name = os.environ.get("MODEL_NAME", "")
 
-        _log(f"Server URL: {mx_server_url}, Model: {model_name}", "DEBUG")
+        _log(f"Model: {model_name}", "DEBUG")
 
         if not model_name:
             _log("MODEL_NAME not set, skipping transfer", "WARNING")
@@ -782,7 +702,7 @@ class MxTargetModelLoader(DummyModelLoader):
         
         _log(f"[Worker {device_id}] Source NIXL ready (stability verified), proceeding with transfer", "INFO")
         
-        # Connect to ModelExpress server and find source via gRPC
+        # Connect to ModelExpress server and find source via MxClient
         # Retry with backoff - source takes 20-30 min to load DeepSeek-V3
         max_wait_time = 3600  # 1 hour max wait
         retry_interval = 30  # 30 seconds between retries
@@ -799,27 +719,15 @@ class MxTargetModelLoader(DummyModelLoader):
             _log(f"[Worker {device_id}] [TIMING] Synchronized start enabled, waiting for all {expected_workers} source workers", "INFO")
         
         try:
-            import grpc
-            from . import p2p_pb2, p2p_pb2_grpc
-
-            options = [
-                ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
-            ]
-            _log(f"[Worker {device_id}] Connecting to gRPC server at {mx_server_url}...", "DEBUG")
-            channel = grpc.insecure_channel(mx_server_url, options=options)
-            stub = p2p_pb2_grpc.P2pServiceStub(channel)
-            _log(f"[Worker {device_id}] gRPC channel created", "DEBUG")
+            mx_client = MxClient()
 
             response = None
             source_worker = None
             all_workers_ready = False
             
             while total_waited < max_wait_time:
-                # Query for source
                 _log(f"[Worker {device_id}] Querying for source model: {model_name}...", "DEBUG")
-                request = p2p_pb2.GetMetadataRequest(model_name=model_name)
-                response = stub.GetMetadata(request)
+                response = mx_client.get_metadata(model_name)
 
                 if response.found and len(response.workers) > 0:
                     available_ranks = sorted([w.worker_rank for w in response.workers])
@@ -853,13 +761,13 @@ class MxTargetModelLoader(DummyModelLoader):
                 
                 time.sleep(retry_interval)
                 total_waited += retry_interval
-                if total_waited % 60 == 0:  # Log every 60s instead of every retry
+                if total_waited % 60 == 0:
                     _log(f"[Worker {device_id}] Waited {total_waited}s for source rank {device_id} (max {max_wait_time}s)...", "INFO")
 
             if not source_worker:
                 available_ranks = [w.worker_rank for w in response.workers] if response and response.workers else []
                 _log(f"[Worker {device_id}] ERROR: No source worker found for rank {device_id} after {total_waited}s. Available: {available_ranks}", "ERROR")
-                channel.close()
+                mx_client.close()
                 return
 
             wait_time = _time.perf_counter() - wait_start
@@ -950,9 +858,8 @@ class MxTargetModelLoader(DummyModelLoader):
                             )
                             cached_session_id = new_session_id
                             
-                            # Re-fetch metadata from gRPC server
-                            request = p2p_pb2.GetMetadataRequest(model_name=model_name)
-                            response = stub.GetMetadata(request)
+                            # Re-fetch metadata from MX server
+                            response = mx_client.get_metadata(model_name)
                             
                             # Find updated source worker
                             for w in response.workers:
@@ -989,8 +896,7 @@ class MxTargetModelLoader(DummyModelLoader):
                             f"Transfer failed after {transfer_retries} attempts: {transfer_err}"
                         )
 
-            channel.close()
-            _log(f"[Worker {device_id}] gRPC channel closed", "DEBUG")
+            mx_client.close()
             
             # Final timing summary
             total_receive_time = _time.perf_counter() - receive_start
