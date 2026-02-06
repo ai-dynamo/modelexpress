@@ -49,3 +49,5 @@ logs/
 
 # Models database
 models.db
+**/__pycache__/
+docs/FEEDBACK.md

@@ -1,0 +1,172 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# vLLM Target Instance - starts with dummy weights, receives real weights from source via P2P
+# - vLLM exposes weights via ZMQ (one socket per TP rank)
+# - ModelExpress client handles NIXL transfers and server communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-target
+  labels:
+    app: mx-target
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-target
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-target
+  labels:
+    app: mx-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-target
+  template:
+    metadata:
+      labels:
+        app: mx-target
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          imagePullPolicy: Always
+          # Needed for GPUDirect RDMA to work.
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            # Increase startup timeout to allow warmup to complete (2 hours)
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MX_ZMQ_ADDRESS
+              value: "ipc:///tmp/mx/vllm.sock"
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Register ModelExpress custom loaders for FP8 support
+            - name: MX_REGISTER_LOADERS
+              value: "1"
+            # Server address for finding source (no http:// prefix)
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            # OPTIMIZATION: Synchronized start - wait for all workers before transferring
+            # This maximizes RDMA parallelism by ensuring all workers start simultaneously
+            - name: MX_SYNC_START
+              value: "1"
+            - name: MX_EXPECTED_WORKERS
+              value: "8"
+            # Baseline: individual tensor registration (stable and tested)
+            # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            # Logging (set to DEBUG for troubleshooting)
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            # UCX transport settings for GPUDirect RDMA
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -ex
+              
+              # MX_REGISTER_LOADERS=1 triggers loader registration via the Dockerfile
+              # __init__.py patch. Replaced in PR #140 by @register_model_loader
+              # decorators + --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
+              
+              # Start vLLM with mx-target loader
+              # mx-target: Creates dummy weights, receives RAW tensors via RDMA,
+              # THEN runs FP8 processing (identical to source)
+              # This ensures weight_scale_inv is transferred BEFORE being processed
+              python3 -m vllm.entrypoints.openai.api_server \
+                --model ${MODEL_NAME} \
+                --load-format mx-target \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel &
+              VLLM_PID=$!
+              
+              # Wait for vLLM to be ready
+              echo "Waiting for vLLM to be ready..."
+              python3 -c '
+              import time
+              import urllib.request
+              while True:
+                  try:
+                      urllib.request.urlopen("http://localhost:8000/health", timeout=3)
+                      break
+                  except Exception:
+                      time.sleep(3)
+              '
+              echo "vLLM is ready - weights transferred and processed"
+              
+              # Keep the container running (vLLM handles everything now)
+              wait $VLLM_PID
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 50Gi
+      # Pod anti-affinity to schedule on different node than source
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-source
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
