@@ -46,6 +46,9 @@ def register_modelexpress_loaders():
     _logger.debug("ModelExpress loaders registered: mx-source, mx-target")
 
 
+from .client import MxClient  # noqa: F401
+
 __all__ = [
+    "MxClient",
     "register_modelexpress_loaders",
 ]

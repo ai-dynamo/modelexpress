@@ -37,6 +37,148 @@ logging.basicConfig(
 )
 logger = logging.getLogger("modelexpress.client")
 
+
+def _parse_server_address(address: str) -> str:
+    """Strip http:// or https:// prefix from server address for gRPC."""
+    if address.startswith("http://"):
+        return address[7:]
+    elif address.startswith("https://"):
+        return address[8:]
+    return address
+
+
+def _get_server_url(explicit_url: str | None = None) -> str:
+    """
+    Resolve the ModelExpress server URL.
+
+    Priority:
+    1. Explicit ``server_url`` argument
+    2. ``MODEL_EXPRESS_URL`` env var (Dynamo-consistent)
+    3. ``MX_SERVER_ADDRESS`` env var (backward compat)
+    4. Default ``localhost:8001``
+    """
+    if explicit_url:
+        return _parse_server_address(explicit_url)
+    url = os.environ.get(
+        "MODEL_EXPRESS_URL",
+        os.environ.get("MX_SERVER_ADDRESS", "localhost:8001"),
+    )
+    return _parse_server_address(url)
+
+
+class MxClient:
+    """
+    Lightweight gRPC client for ModelExpress server communication.
+
+    Provides typed methods for every P2P RPC (``PublishMetadata``,
+    ``GetMetadata``, ``PublishReady``, ``GetReady``) so that callers
+    (loaders, coordinators) never need to create gRPC channels or
+    stubs directly.
+
+    The connection is created lazily on first use.
+
+    Args:
+        server_url: Explicit server address (``host:port``).  When
+            *None* the address is resolved via ``MODEL_EXPRESS_URL``
+            or ``MX_SERVER_ADDRESS`` env vars, falling back to
+            ``localhost:8001``.
+        max_message_size: Max send/receive message size in bytes.
+    """
+
+    def __init__(
+        self,
+        server_url: str | None = None,
+        max_message_size: int = 100 * 1024 * 1024,  # 100 MB
+    ):
+        self.server_url = _get_server_url(server_url)
+        self._max_message_size = max_message_size
+        self._channel: grpc.Channel | None = None
+        self._stub: p2p_pb2_grpc.P2pServiceStub | None = None
+
+    # -- connection management ------------------------------------------------
+
+    @property
+    def stub(self) -> p2p_pb2_grpc.P2pServiceStub:
+        """Return (and lazily create) the gRPC stub."""
+        if self._channel is None:
+            options = [
+                ("grpc.max_send_message_length", self._max_message_size),
+                ("grpc.max_receive_message_length", self._max_message_size),
+            ]
+            self._channel = grpc.insecure_channel(self.server_url, options=options)
+            self._stub = p2p_pb2_grpc.P2pServiceStub(self._channel)
+            logger.debug("MxClient connected to %s", self.server_url)
+        return self._stub
+
+    def close(self) -> None:
+        """Close the underlying gRPC channel."""
+        if self._channel is not None:
+            self._channel.close()
+            self._channel = None
+            self._stub = None
+
+    # -- RPC wrappers ---------------------------------------------------------
+
+    def publish_metadata(
+        self,
+        model_name: str,
+        workers: list[p2p_pb2.WorkerMetadata],
+    ) -> bool:
+        """Publish worker metadata so targets can discover this source.
+
+        Returns *True* on success.
+        """
+        request = p2p_pb2.PublishMetadataRequest(
+            model_name=model_name,
+            workers=workers,
+        )
+        response = self.stub.PublishMetadata(request)
+        if not response.success:
+            logger.error("PublishMetadata failed: %s", response.message)
+        return response.success
+
+    def get_metadata(
+        self, model_name: str
+    ) -> p2p_pb2.GetMetadataResponse:
+        """Query for existing source metadata for *model_name*."""
+        request = p2p_pb2.GetMetadataRequest(model_name=model_name)
+        return self.stub.GetMetadata(request)
+
+    def publish_ready(
+        self,
+        model_name: str,
+        worker_id: int,
+        session_id: str,
+        metadata_hash: str,
+        nixl_ready: bool = True,
+        stability_verified: bool = True,
+    ) -> bool:
+        """Publish a source-ready flag.  Returns *True* on success."""
+        request = p2p_pb2.PublishReadyRequest(
+            model_name=model_name,
+            worker_id=worker_id,
+            session_id=session_id,
+            metadata_hash=metadata_hash,
+            nixl_ready=nixl_ready,
+            stability_verified=stability_verified,
+        )
+        response = self.stub.PublishReady(request)
+        if not response.success:
+            logger.error("PublishReady failed: %s", response.message)
+            return False
+        return True
+
+    def get_ready(
+        self, model_name: str, worker_id: int
+    ) -> p2p_pb2.GetReadyResponse:
+        """Check whether the source is ready for *model_name* / *worker_id*."""
+        request = p2p_pb2.GetReadyRequest(
+            model_name=model_name,
+            worker_id=worker_id,
+        )
+        return self.stub.GetReady(request)
+
+
 ZMQ_AVAILABLE = False
 zmq = None
 try:
