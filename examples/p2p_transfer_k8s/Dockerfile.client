@@ -11,13 +11,11 @@ COPY modelexpress_common/proto /opt/modelexpress/proto
 
 # Copy ModelExpress Python client
 COPY modelexpress_client/python/modelexpress /opt/modelexpress/client/modelexpress
-COPY modelexpress_client/python/generate_proto.sh /opt/modelexpress/client/
 COPY modelexpress_client/python/pyproject.toml /opt/modelexpress/client/
 
-# Generate Python proto files
+# Generate Python proto files from .proto definition
 WORKDIR /opt/modelexpress/client
-RUN chmod +x generate_proto.sh && \
-    PROTO_DIR=/opt/modelexpress/proto && \
+RUN PROTO_DIR=/opt/modelexpress/proto && \
     OUT_DIR=/opt/modelexpress/client/modelexpress && \
     python3 -m grpc_tools.protoc \
         -I"$PROTO_DIR" \
