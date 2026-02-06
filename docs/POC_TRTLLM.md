@@ -121,10 +121,93 @@ itinerary, but I can't buy tickets or book hotels..."
 | Decision | Rationale |
 |----------|-----------|
 | **HuggingFace mode (not checkpoint)** | TRT-LLM PyTorch backend loads HF directly; no conversion needed |
-| **Init container for P2P** | Separates NIXL environment from TRT-LLM runtime |
+| **Init container for P2P** | Separates NIXL environment from TRT-LLM runtime (see 3.4) |
+| **Transfer TP shards (not full model)** | 8 parallel RDMA streams = 8x bandwidth (see 3.5) |
 | **Full weight reconstruction** | TRT-LLM expects full HF format, not TP-sharded weights |
 | **CPU copy after receive** | Prevents CUDA context issues when switching devices |
 | **Shape in proto** | Required for proper tensor allocation on target |
+| **Copy config from PVC** | Gated models (Llama) require HF auth; PVC copy avoids this (see 3.6) |
+
+### 3.4 Why Two Containers (Init + Main)
+
+The target uses two containers rather than one because they have different requirements:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Kubernetes Pod                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Init Container: p2p-receiver                                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Image: modelexpress-p2p-client:v0.1.0-baseline (vLLM-based, has NIXL) │ │
+│  │ Needs: NIXL 0.8.0, UCX backend, grpcio, trtllm_loader.py             │ │
+│  │ Does: P2P transfer → save safetensors to shared volume                │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                           │ /shared/ volume                                  │
+│                           ▼                                                  │
+│  Main Container: trtllm-inference                                            │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ Image: nvcr.io/nvidia/tensorrt-llm/release:0.21.0 (official)          │ │
+│  │ Needs: TRT-LLM 0.21.0, PyTorch 2.8, MPI                              │ │
+│  │ Does: Standard LLM(model=path) — no custom loader needed              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why not one container?**
+- The official TRT-LLM image doesn't have NIXL, and adding it risks library conflicts
+- Separate images allow independent versioning
+- Init container logs cleanly show transfer; main container logs show inference
+- If P2P fails, main container never starts (clean failure semantics)
+
+**Future**: A custom combined image with both NIXL and TRT-LLM would eliminate the disk round-trip between containers.
+
+### 3.5 Why Transfer TP Shards (Not Full Model)
+
+We transfer TP-sharded weights to maximize aggregate bandwidth:
+
+```
+Single stream (full model):  170 GB / 112 Gbps  = ~12s (1 IB link)
+8 parallel streams (shards):  21 GB / 112 Gbps  = ~1.5s each (8 IB links)
+```
+
+| Approach | Per-Link Data | Links | Effective BW | Transfer Time |
+|----------|---------------|-------|--------------|---------------|
+| Full model | 170 GB | 1 | 112 Gbps | ~12s |
+| TP shards | 21 GB each | 8 | 8 x 112 = 896 Gbps | **~1.5s** |
+
+Each GPU has its own InfiniBand connection, so 8 parallel transfers don't compete.
+
+**The trade-off**: We gain 8x transfer speed but need reconstruction on the target (~5s to concatenate shards back to full HF format). Net benefit is still significant.
+
+**Why reconstruct?** TRT-LLM's PyTorch backend expects full HuggingFace format and does its own sharding internally via `LLM(model=path, tensor_parallel_size=8)`. So the flow is:
+
+```
+Source: Full HF → Shard (for parallel transfer) → 8 RDMA streams
+Target: Receive 8 shards → Reconstruct full HF → TRT-LLM re-shards internally
+```
+
+This "double sharding" would be eliminated if TRT-LLM supported pre-sharded weight injection (see Section 6.4).
+
+### 3.6 Why Config Files Come from PVC (Not P2P)
+
+Config files (`config.json`, `tokenizer.json`, `tokenizer_config.json`) are copied from the source PVC rather than transferred via P2P because:
+
+1. **Size**: Config files total ~17 MB vs 141 GB for weights. NIXL/RDMA overhead isn't justified.
+2. **Gated models**: Llama models require HuggingFace authentication for downloads. The target doesn't have HF_TOKEN configured.
+3. **Proto limitation**: Current proto only handles GPU tensor metadata, not arbitrary file transfer.
+4. **Simplicity**: `cp /models/config.json /shared/` is trivial and reliable.
+
+**Future improvement**: Add config transfer to the gRPC proto so targets don't need PVC access:
+
+```protobuf
+message PublishMetadataRequest {
+  string model_name = 1;
+  repeated WorkerMetadata workers = 2;
+  bytes model_config = 3;      // NEW: HF config.json
+  bytes tokenizer_config = 4;  // NEW: tokenizer files
+}
+```
 
 ### 3.3 Component Responsibilities
 
@@ -463,15 +546,109 @@ itinerary, but I can't buy tickets or book hotels..."
 | **Multi-source** | Single source only | Fan-out from multiple sources |
 | **Engine reload** | Full model reload | IRefitter hot reload |
 
-### 6.3 TRT-LLM Upstream Changes Needed
+### 6.3 Current Data Flow (POC) vs Ideal
 
-| Change | Priority | Complexity |
-|--------|----------|------------|
-| Custom ModelLoader registration | High | Medium |
-| Direct weight injection API | High | High |
-| NIXL integration in weight pipeline | Medium | Medium |
-| IRefitter GPU-to-GPU support | Medium | Medium |
-| Built-in metadata coordination | Low | Low |
+```
+CURRENT POC:
+Source GPU ──RDMA──► Target GPU ──cpu()──► CPU RAM ──save──► Disk ──load──► CPU ──cuda()──► GPU
+                                          │                                 │
+                                          └──── ~35 seconds overhead ───────┘
+
+IDEAL (GPU-to-GPU, no round-trip):
+Source GPU ──RDMA──► Target GPU ──inject──► TRT-LLM Model (zero overhead)
+
+IDEAL (GPU-to-CPU option):
+Source GPU ──RDMA──► Target CPU ──inject──► TRT-LLM CPU offload mode
+```
+
+### 6.4 TRT-LLM Upstream Changes Needed
+
+To achieve vLLM-like integration (no CPU/disk round-trip) and support GPU-to-CPU transfers:
+
+#### 1. Custom Model Loader Plugin System (P0)
+
+TRT-LLM needs a registration mechanism for custom weight loaders, equivalent to vLLM's `--load-format`:
+
+```python
+# vLLM has this today:
+@register_model_loader("mx-target")
+class MxTargetModelLoader(BaseModelLoader):
+    def load_weights(self, model, ...):
+        weights = nixl_receive(...)  # Custom P2P logic
+
+# TRT-LLM needs equivalent:
+@register_trtllm_loader("mx-p2p")
+class MxP2PLoader:
+    def load_weights(self, model_config):
+        weights = nixl_receive(...)
+        return weights
+```
+
+**Why needed**: TRT-LLM currently only loads from disk (HuggingFace dir or TRT engine). Without a plugin system, we cannot inject P2P logic into TRT-LLM's startup, forcing the init container workaround that adds ~35s disk I/O overhead.
+
+#### 2. Pre-Loaded Weights Injection API (P0)
+
+Accept already-loaded GPU tensors instead of file paths:
+
+```python
+# Current TRT-LLM API:
+llm = LLM(model="/path/to/hf_model")  # Must be a file path
+
+# Needed API:
+llm = LLM(preloaded_weights=gpu_tensor_dict)  # Accept GPU tensors directly
+```
+
+**Why needed**: After P2P transfer, weights are already in GPU memory. The current API forces GPU->CPU->Disk->CPU->GPU (141 GB disk write + read = ~35s wasted).
+
+#### 3. Per-Rank Sharded Weight Loading (P1)
+
+Accept TP-sharded weights directly without re-sharding:
+
+```python
+# Current: Load full weights → TRT-LLM re-shards
+llm = LLM(model=path, tensor_parallel_size=8)
+
+# Needed: Accept pre-sharded weights
+llm = LLM(sharded_weights={0: w_gpu0, 1: w_gpu1, ...}, tensor_parallel_size=8)
+```
+
+**Why needed**: P2P already transfers 8 shards in parallel. Currently we reconstruct full weights (~5s), then TRT-LLM re-shards. Direct shard injection eliminates both steps.
+
+#### 4. Weight Loading Lifecycle Hooks (P1)
+
+Callbacks at key points in model initialization:
+
+```python
+class TrtllmLoadHooks:
+    def before_load(self, model_config):
+        self.nixl_manager = NixlTransferManager(...)
+    
+    def load_tensor(self, name, shape, dtype) -> torch.Tensor:
+        return self.nixl_manager.receive_tensor(name)
+    
+    def after_load(self, model):
+        self.nixl_manager.shutdown()
+```
+
+**Why needed**: Enables streaming weight loading (overlap transfer with model graph construction). Provides a clean extension point without modifying TRT-LLM source.
+
+#### 5. CPU Memory Target Support (P2)
+
+Option to receive weights to CPU memory for memory-constrained or CPU-offload scenarios:
+
+```python
+llm = LLM(preloaded_weights=cpu_weights, device_map="auto")
+```
+
+**Why needed**: Supports heterogeneous environments, CPU offloading strategies, and allows caching in CPU memory for faster subsequent loads.
+
+| Change | Priority | Complexity | Time Saved |
+|--------|----------|------------|------------|
+| Custom ModelLoader plugin | P0 | Medium | ~35s (disk I/O) |
+| Pre-loaded weights API | P0 | Medium | ~35s (disk I/O) |
+| Per-rank shard loading | P1 | Low | ~5s (reconstruction) |
+| Lifecycle hooks | P1 | Medium | ~3s (overlap) |
+| CPU target support | P2 | Low | Enables new use cases |
 
 ---
 
