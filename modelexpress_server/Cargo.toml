@@ -35,6 +35,8 @@ toml = "0.9"
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+redis = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.20"

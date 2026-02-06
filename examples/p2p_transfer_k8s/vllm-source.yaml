@@ -1,0 +1,180 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# vLLM Source Instance - loads real model weights and serves them to target via P2P
+# - vLLM exposes weights via ZMQ (one socket per TP rank)
+# - ModelExpress client handles NIXL transfers and server communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-source
+  labels:
+    app: mx-source
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-source
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-source
+  labels:
+    app: mx-source
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-source
+  template:
+    metadata:
+      labels:
+        app: mx-source
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          imagePullPolicy: Always
+          # Needed for GPUDirect RDMA to work.
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            # Increase startup timeout to allow DeepGemm warmup to complete (2 hours)
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MX_ZMQ_ADDRESS
+              value: "ipc:///tmp/mx/vllm.sock"
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Register ModelExpress custom loaders for FP8 support
+            - name: MX_REGISTER_LOADERS
+              value: "1"
+            # Server address for metadata publishing
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            # OPTIMIZATION: Synchronized publish - wait for all workers before publishing
+            # This reduces the staggered window and allows targets to start simultaneously
+            - name: MX_SYNC_PUBLISH
+              value: "1"
+            - name: MX_EXPECTED_WORKERS
+              value: "8"
+            # Baseline: individual tensor registration (stable and tested)
+            # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            # Logging (set to DEBUG for troubleshooting)
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            # UCX transport settings for GPUDirect RDMA
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+
+              # Background task: wait for vLLM health, run stability check,
+              # then publish NIXL ready flag via MX server gRPC
+              (
+                sleep 5
+                while ! curl -sf http://127.0.0.1:8000/health; do
+                  sleep 5
+                done
+
+                # Grace period for system stabilization
+                sleep 30
+
+                # Stability check: run a test inference
+                curl -sf -X POST http://127.0.0.1:8000/v1/completions \
+                  -H 'Content-Type: application/json' \
+                  -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
+
+                # Publish ready flag for all workers via MxClient
+                python3 -c "
+              from modelexpress.client import MxClient
+              import uuid, os
+
+              client = MxClient()
+              session = str(uuid.uuid4())
+              model = os.environ.get('MODEL_NAME', 'unknown')
+              workers = int(os.environ.get('MX_EXPECTED_WORKERS', '8'))
+
+              for w in range(workers):
+                  client.publish_ready(
+                      model_name=model,
+                      worker_id=w,
+                      session_id=session,
+                      metadata_hash='na',
+                      nixl_ready=True,
+                      stability_verified=True,
+                  )
+                  print(f'Published ready for worker {w}')
+
+              client.close()
+              "
+              ) &
+
+              # Start vLLM with mx-source loader
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --model $MODEL_NAME \
+                --load-format mx-source \
+                --tensor-parallel-size 8 \
+                --enable-expert-parallel
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
