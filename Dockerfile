@@ -25,7 +25,7 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates libssl-dev && \
+    apt-get install -y --no-install-recommends ca-certificates libssl-dev gpgv && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy all built binaries
