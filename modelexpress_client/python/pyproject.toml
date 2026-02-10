@@ -30,14 +30,16 @@ dependencies = [
     "grpcio>=1.60.0",
     "nixl[cu12]",
     "numpy>=1.24.0",
-    "protobuf>=4.25.0",
+    "protobuf>=5.27.0,<6.0.0",  # protobuf 5.x compatibility
     "pydantic>=2.0.0",
+    "pyzmq>=25.0.0",
     "torch>=2.6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "grpcio-tools>=1.60.0",
+    # Use grpcio-tools<=1.66.2 for protobuf 5.x, >=1.67.0 for protobuf 6.x
+    "grpcio-tools>=1.60.0,<=1.66.2",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
@@ -53,4 +55,3 @@ include = ["modelexpress*"]
 
 [tool.setuptools.package-data]
 modelexpress = ["py.typed"]
-

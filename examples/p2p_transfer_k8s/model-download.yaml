@@ -54,7 +54,7 @@ spec:
             - |
               set -ex
               pip install huggingface_hub
-              
+
               # Download model files (weights, config, tokenizer)
               # HF_TOKEN is passed explicitly for gated models (e.g., Llama)
               python3 -c "

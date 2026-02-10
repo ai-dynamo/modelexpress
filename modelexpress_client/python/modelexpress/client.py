@@ -164,8 +164,9 @@ class MxClient:
         )
         response = self.stub.PublishReady(request)
         if not response.success:
-            logger.warning("PublishReady failed: %s", response.message)
-        return response.success
+            logger.error("PublishReady failed: %s", response.message)
+            return False
+        return True
 
     def get_ready(
         self, model_name: str, worker_id: int
