@@ -131,7 +131,96 @@ message TensorDescriptor {
 
 ---
 
-## Proposed: Kubernetes CRD Alternative
+## Layered Architecture (Recommended)
+
+The recommended production architecture uses a layered approach: an **in-memory cache** for fast reads, with optional **write-through persistence** to Redis or Kubernetes CRDs for high availability.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ MX Server                                                             │
+│                                                                       │
+│  gRPC Request                                                         │
+│       │                                                               │
+│       ▼                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │              In-Memory Cache (always present)                    │ │
+│  │  HashMap<String, ModelMetadataRecord> behind RwLock              │ │
+│  │  - Nanosecond reads (no network hop)                            │ │
+│  │  - Atomic merge for concurrent workers                          │ │
+│  │  - Ready flags stored here (always ephemeral)                   │ │
+│  └────────────────────────┬────────────────────────────────────────┘ │
+│                           │ write-through (if configured)            │
+│                           ▼                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │              Persistent Backend (optional)                       │ │
+│  │                                                                  │ │
+│  │  Redis:      mx:model:{name} → JSON (Lua atomic merge)          │ │
+│  │  Kubernetes: ModelMetadata CRD + ConfigMap (tensor descriptors)  │ │
+│  │                                                                  │ │
+│  │  On startup: hydrates in-memory cache from persistent backend    │ │
+│  │  On write:   write-through (best-effort, warns on failure)       │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Backend Modes
+
+Configured via `MX_METADATA_BACKEND` environment variable:
+
+| Mode | Env Value | In-Memory | Persistent | Use Case |
+|------|-----------|-----------|------------|----------|
+| **Standalone** | `memory` (default) | Primary | None | Dev, testing, single-server |
+| **Redis HA** | `redis` | Cache | Redis write-through | Production with Redis sidecar |
+| **K8s Native** | `kubernetes` | Cache | CRD write-through | K8s-native deployments |
+| **Redis Only** | `redis-only` | None | Redis direct | Legacy / backward compat |
+| **K8s Only** | `kubernetes-only` | None | CRD direct | Minimal memory footprint |
+
+### Startup Hydration
+
+When using a layered mode (`redis` or `kubernetes`), the server hydrates the in-memory cache from the persistent backend on startup:
+
+1. Server starts, connects to persistent backend
+2. Lists all model names from persistent store
+3. Loads each model's metadata into in-memory cache
+4. Subsequent reads hit only the cache (no backend round-trip)
+
+This means the server recovers its state after a restart **without** requiring sources to re-publish.
+
+### Ready Coordination
+
+Ready flags (`PublishReady` / `GetReady`) are **always stored in-memory** regardless of backend mode. This is because:
+
+- Ready flags are tied to running GPU processes (ephemeral by nature)
+- GPU memory addresses become invalid after source pod restart
+- Sub-millisecond latency is important for coordination polling
+- No benefit from persisting stale ready state
+
+### Implementation
+
+```rust
+// Backend trait (all backends implement this)
+#[async_trait]
+pub trait MetadataBackend: Send + Sync {
+    async fn connect(&self) -> MetadataResult<()>;
+    async fn publish_metadata(&self, model_name: &str, workers: Vec<WorkerMetadata>) -> MetadataResult<()>;
+    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>>;
+    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()>;
+    async fn list_models(&self) -> MetadataResult<Vec<String>>;
+}
+
+// Layered backend (in-memory + optional persistent)
+pub struct LayeredBackend {
+    cache: InMemoryBackend,                        // Always present
+    persistent: Option<Arc<dyn MetadataBackend>>,  // Redis or K8s
+}
+```
+
+---
+
+## Kubernetes CRD Alternative
 
 ### Design Goals
 

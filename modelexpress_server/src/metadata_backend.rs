@@ -4,14 +4,21 @@
 //! Metadata backend abstraction for P2P model metadata.
 //!
 //! Supports multiple backends:
-//! - Redis: Original implementation, stores JSON in Redis keys
-//! - Kubernetes: Uses CRDs and ConfigMaps for native K8s integration
+//! - **Memory**: In-memory cache, zero dependencies, lowest latency (default)
+//! - **Redis**: Persistent storage via Redis keys + atomic Lua merge
+//! - **Kubernetes**: CRDs and ConfigMaps for native K8s integration
+//! - **Layered**: In-memory cache + write-through to Redis or Kubernetes for HA
+//!
+//! The layered backend is the recommended production configuration:
+//! all reads hit the in-memory cache while writes are persisted for redundancy.
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use std::sync::Arc;
 
 pub mod kubernetes;
+pub mod layered;
+pub mod memory;
 pub mod redis;
 
 /// Result type for metadata operations
@@ -120,44 +127,83 @@ pub trait MetadataBackend: Send + Sync {
 /// Configuration for metadata backends
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
-    /// Redis backend configuration
+    /// In-memory only (default) — zero dependencies, data lost on restart
+    Memory,
+    /// Redis backend — persistent, supports HA
     Redis { url: String },
-    /// Kubernetes backend configuration
+    /// Kubernetes CRD backend — native K8s integration
     Kubernetes { namespace: String },
+    /// Layered: in-memory cache + Redis persistence for HA
+    LayeredRedis { url: String },
+    /// Layered: in-memory cache + Kubernetes CRD persistence for HA
+    LayeredKubernetes { namespace: String },
 }
 
 impl BackendConfig {
-    /// Create backend from environment variables
-    /// Uses MX_METADATA_BACKEND to select backend type
+    /// Create backend from environment variables.
+    ///
+    /// `MX_METADATA_BACKEND` selects the backend type:
+    /// - `memory` (default): in-memory only, zero dependencies
+    /// - `redis`: Redis with in-memory cache (layered)
+    /// - `kubernetes` | `k8s` | `crd`: K8s CRD with in-memory cache (layered)
+    /// - `redis-only`: Redis without in-memory cache (legacy)
+    /// - `kubernetes-only`: K8s CRD without in-memory cache
     pub fn from_env() -> Self {
         let backend_type =
-            std::env::var("MX_METADATA_BACKEND").unwrap_or_else(|_| "redis".to_string());
+            std::env::var("MX_METADATA_BACKEND").unwrap_or_else(|_| "memory".to_string());
 
         match backend_type.to_lowercase().as_str() {
+            "redis" => {
+                let url = Self::redis_url_from_env();
+                Self::LayeredRedis { url }
+            }
+            "redis-only" => {
+                let url = Self::redis_url_from_env();
+                Self::Redis { url }
+            }
             "kubernetes" | "k8s" | "crd" => {
-                let namespace = std::env::var("MX_METADATA_NAMESPACE")
-                    .or_else(|_| std::env::var("POD_NAMESPACE"))
-                    .unwrap_or_else(|_| "default".to_string());
+                let namespace = Self::k8s_namespace_from_env();
+                Self::LayeredKubernetes { namespace }
+            }
+            "kubernetes-only" | "k8s-only" | "crd-only" => {
+                let namespace = Self::k8s_namespace_from_env();
                 Self::Kubernetes { namespace }
             }
-            _ => {
-                let redis_host = std::env::var("MX_REDIS_HOST")
-                    .or_else(|_| std::env::var("REDIS_HOST"))
-                    .unwrap_or_else(|_| "localhost".to_string());
-                let redis_port = std::env::var("MX_REDIS_PORT")
-                    .or_else(|_| std::env::var("REDIS_PORT"))
-                    .unwrap_or_else(|_| "6379".to_string());
-                Self::Redis {
-                    url: format!("redis://{}:{}", redis_host, redis_port),
-                }
-            }
+            _ => Self::Memory,
         }
+    }
+
+    fn redis_url_from_env() -> String {
+        if let Ok(url) = std::env::var("REDIS_URL") {
+            return url;
+        }
+        let host = std::env::var("MX_REDIS_HOST")
+            .or_else(|_| std::env::var("REDIS_HOST"))
+            .unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("MX_REDIS_PORT")
+            .or_else(|_| std::env::var("REDIS_PORT"))
+            .unwrap_or_else(|_| "6379".to_string());
+        format!("redis://{}:{}", host, port)
+    }
+
+    fn k8s_namespace_from_env() -> String {
+        std::env::var("MX_METADATA_NAMESPACE")
+            .or_else(|_| std::env::var("POD_NAMESPACE"))
+            .unwrap_or_else(|_| "default".to_string())
     }
 }
 
-/// Create a backend from configuration
+/// Create a backend from configuration.
+///
+/// For layered configurations, this creates an in-memory cache that
+/// writes through to the persistent backend and hydrates on startup.
 pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn MetadataBackend>> {
     match config {
+        BackendConfig::Memory => {
+            let backend = layered::LayeredBackend::memory_only();
+            backend.connect().await?;
+            Ok(Arc::new(backend))
+        }
         BackendConfig::Redis { url } => {
             let backend = redis::RedisBackend::new(&url);
             backend.connect().await?;
@@ -165,6 +211,22 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesBackend::new(&namespace).await?;
+            backend.connect().await?;
+            Ok(Arc::new(backend))
+        }
+        BackendConfig::LayeredRedis { url } => {
+            let persistent = redis::RedisBackend::new(&url);
+            persistent.connect().await?;
+            let backend =
+                layered::LayeredBackend::with_persistent(Arc::new(persistent));
+            backend.connect().await?;
+            Ok(Arc::new(backend))
+        }
+        BackendConfig::LayeredKubernetes { namespace } => {
+            let persistent = kubernetes::KubernetesBackend::new(&namespace).await?;
+            persistent.connect().await?;
+            let backend =
+                layered::LayeredBackend::with_persistent(Arc::new(persistent));
             backend.connect().await?;
             Ok(Arc::new(backend))
         }
