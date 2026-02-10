@@ -107,163 +107,6 @@ def _get_worker_rank(device: torch.device) -> int:
     return 0
 
 
-class SourceReadyCoordinator:
-    """
-    Coordination layer to prevent stale metadata issues.
-
-    All coordination goes through the ModelExpress server via gRPC
-    (using :class:`MxClient`).  Workers never access Redis directly.
-
-    Source publishes a "ready" flag with session_id after:
-    - Warmup complete
-    - NIXL registered
-    - Metadata published
-
-    Target waits for this flag and detects restarts via session_id change.
-    """
-
-    # Class-level session ID (unique per process lifetime)
-    _session_id: str | None = None
-    # Shared MxClient instance (lazily created)
-    _client: MxClient | None = None
-
-    @classmethod
-    def get_session_id(cls) -> str:
-        """Get or create session ID for this process."""
-        if cls._session_id is None:
-            cls._session_id = str(uuid.uuid4())
-        return cls._session_id
-
-    @classmethod
-    def _get_client(cls) -> MxClient | None:
-        """Return a shared MxClient, creating it on first call."""
-        if cls._client is None:
-            try:
-                cls._client = MxClient()
-            except Exception as e:
-                _log(f"Failed to create MxClient: {e}", "WARNING")
-                return None
-        return cls._client
-
-    @classmethod
-    def publish_source_ready(
-        cls,
-        model_name: str,
-        worker_id: int,
-        metadata_hash: str,
-        nixl_ready: bool = True,
-        stability_verified: bool = True,
-    ) -> bool:
-        """
-        Publish source ready flag via the MX server.
-        Called after warmup and metadata publishing is complete.
-        """
-        client = cls._get_client()
-        if client is None:
-            return False
-
-        session_id = cls.get_session_id()
-
-        try:
-            success = client.publish_ready(
-                model_name=model_name,
-                worker_id=worker_id,
-                session_id=session_id,
-                metadata_hash=metadata_hash,
-                nixl_ready=nixl_ready,
-                stability_verified=stability_verified,
-            )
-            if success:
-                _log(f"[Worker {worker_id}] Published ready flag: session={session_id[:8]}...", "INFO")
-            return success
-        except Exception as e:
-            _log(f"[Worker {worker_id}] Error publishing ready flag: {e}", "WARNING")
-            return False
-
-    @classmethod
-    def wait_for_source_ready(
-        cls,
-        model_name: str,
-        worker_id: int,
-        timeout_seconds: int = 7200,
-        poll_interval: int = 10,
-    ) -> tuple[bool, str | None, str | None]:
-        """
-        Wait for source ready flag via the MX server.
-
-        Returns:
-            (success, session_id, metadata_hash)
-        """
-        client = cls._get_client()
-        if client is None:
-            _log(f"[Worker {worker_id}] MxClient not available, proceeding without coordination", "WARNING")
-            return True, None, None
-
-        start_time = time.time()
-        _log(f"[Worker {worker_id}] Waiting for NIXL ready flag...", "INFO")
-
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = client.get_ready(model_name, worker_id)
-
-                if response.found and response.ready:
-                    session_id = response.session_id
-                    metadata_hash = response.metadata_hash
-                    _log(
-                        f"[Worker {worker_id}] Source ready! session={session_id[:8] if session_id else 'N/A'}..., "
-                        f"hash={metadata_hash[:8] if metadata_hash else 'N/A'}...",
-                        "INFO"
-                    )
-                    return True, session_id, metadata_hash
-            except Exception as e:
-                _log(f"[Worker {worker_id}] Error checking ready flag: {e}", "WARNING")
-
-            time.sleep(poll_interval)
-            elapsed = int(time.time() - start_time)
-            if elapsed % 60 == 0:
-                _log(f"[Worker {worker_id}] Still waiting for source ready ({elapsed}s/{timeout_seconds}s)...", "INFO")
-
-        _log(f"[Worker {worker_id}] Timeout waiting for source ready after {timeout_seconds}s", "ERROR")
-        return False, None, None
-
-    @classmethod
-    def check_session_changed(
-        cls,
-        model_name: str,
-        worker_id: int,
-        cached_session_id: str | None,
-    ) -> tuple[bool, str | None]:
-        """
-        Check if source session changed (indicates restart).
-
-        Returns:
-            (changed, new_session_id)
-        """
-        if cached_session_id is None:
-            return False, None
-
-        client = cls._get_client()
-        if client is None:
-            return False, None
-
-        try:
-            response = client.get_ready(model_name, worker_id)
-
-            if response.found:
-                current_session = response.session_id
-                if current_session and current_session != cached_session_id:
-                    _log(
-                        f"[Worker {worker_id}] Source restarted! "
-                        f"cached={cached_session_id[:8]}... != current={current_session[:8]}...",
-                        "WARNING"
-                    )
-                    return True, current_session
-        except Exception as e:
-            _log(f"[Worker {worker_id}] Error checking session: {e}", "WARNING")
-
-        return False, cached_session_id
-
-
 @register_model_loader("mx-source")
 class MxSourceModelLoader(DefaultModelLoader):
     """
@@ -294,6 +137,7 @@ class MxSourceModelLoader(DefaultModelLoader):
         super().__init__(modified_config)
         self._nixl_manager: NixlTransferManager | None = None
         self._raw_tensors: dict[str, torch.Tensor] = {}
+        self._mx_client = MxClient()
         _log("MxSourceModelLoader initialized successfully", "DEBUG")
 
     def load_model(
@@ -318,7 +162,7 @@ class MxSourceModelLoader(DefaultModelLoader):
                 )
                 _log("Model structure initialized", "INFO")
 
-            _log("Loading weights from disk (this may take 20-30 min for DeepSeek-V3)...", "INFO")
+            _log("Loading weights from disk...", "INFO")
             self.load_weights(model, model_config)
             _log("Weights loaded from disk!", "INFO")
 
@@ -445,14 +289,12 @@ class MxSourceModelLoader(DefaultModelLoader):
         model_name = os.environ.get("MODEL_NAME", "unknown")
 
         try:
-            client = MxClient()
-
             max_wait = 300  # 5 minute max wait for other workers
             waited = 0
             poll_interval = 2
 
             while waited < max_wait:
-                response = client.get_metadata(model_name)
+                response = self._mx_client.get_metadata(model_name)
 
                 if response.found:
                     ready_count = len([w for w in response.workers if len(w.tensors) > 0])
@@ -463,8 +305,6 @@ class MxSourceModelLoader(DefaultModelLoader):
 
                 time.sleep(poll_interval)
                 waited += poll_interval
-
-            client.close()
 
         except Exception as e:
             _log(f"[Worker {device_id}] Server barrier failed: {e}, proceeding anyway", "WARNING")
@@ -514,30 +354,26 @@ class MxSourceModelLoader(DefaultModelLoader):
                 tensors=tensor_protos,
             )
 
-            client = MxClient()
-            success = client.publish_metadata(model_name, [worker])
+            success = self._mx_client.publish_metadata(model_name, [worker])
 
             if success:
                 _log(f"[Worker {device_id}] Published metadata to MX server", "INFO")
 
                 # Publish ready flag
-                session_id = SourceReadyCoordinator.get_session_id()
                 metadata_hash = hashlib.md5(
                     ",".join(sorted(tensors.keys())).encode()
                 ).hexdigest()
 
-                client.publish_ready(
+                self._mx_client.publish_ready(
                     model_name=model_name,
                     worker_id=device_id,
-                    session_id=session_id,
+                    session_id=self._mx_client.session_id,
                     metadata_hash=metadata_hash,
                     nixl_ready=True,
                     stability_verified=True,
                 )
             else:
                 _log(f"[Worker {device_id}] FAILED to publish metadata", "ERROR")
-
-            client.close()
 
         except Exception as e:
             import traceback
@@ -583,6 +419,7 @@ class MxTargetModelLoader(DummyModelLoader):
         super().__init__(modified_config)
         self._nixl_manager: NixlTransferManager | None = None
         self._transfer_timeout: float = 300.0  # 5 minute timeout
+        self._mx_client = MxClient()
         _log("MxTargetModelLoader initialized successfully", "DEBUG")
 
     def load_model(
@@ -724,7 +561,7 @@ class MxTargetModelLoader(DummyModelLoader):
         # 2. 30s grace period for system stabilization
         # 3. Successful test inference proves stability
         _log(f"[Worker {device_id}] Waiting for source NIXL ready (includes stability verification)...", "INFO")
-        source_ready, cached_session_id, cached_metadata_hash = SourceReadyCoordinator.wait_for_source_ready(
+        source_ready, cached_session_id, cached_metadata_hash = self._mx_client.wait_for_ready(
             model_name=model_name,
             worker_id=device_id,
             timeout_seconds=7200,  # 2 hour timeout (matches source warmup)
@@ -754,15 +591,13 @@ class MxTargetModelLoader(DummyModelLoader):
             _log(f"[Worker {device_id}] [TIMING] Synchronized start enabled, waiting for all {expected_workers} source workers", "INFO")
 
         try:
-            mx_client = MxClient()
-
             response = None
             source_worker = None
             all_workers_ready = False
 
             while total_waited < max_wait_time:
                 _log(f"[Worker {device_id}] Querying for source model: {model_name}...", "DEBUG")
-                response = mx_client.get_metadata(model_name)
+                response = self._mx_client.get_metadata(model_name)
 
                 if response.found and len(response.workers) > 0:
                     available_ranks = sorted([w.worker_rank for w in response.workers])
@@ -802,7 +637,6 @@ class MxTargetModelLoader(DummyModelLoader):
             if not source_worker:
                 available_ranks = [w.worker_rank for w in response.workers] if response and response.workers else []
                 _log(f"[Worker {device_id}] ERROR: No source worker found for rank {device_id} after {total_waited}s. Available: {available_ranks}", "ERROR")
-                mx_client.close()
                 return
 
             wait_time = _time.perf_counter() - wait_start
@@ -880,7 +714,7 @@ class MxTargetModelLoader(DummyModelLoader):
                         )
 
                         # Check if source restarted (stale metadata issue)
-                        session_changed, new_session_id = SourceReadyCoordinator.check_session_changed(
+                        session_changed, new_session_id = self._mx_client.check_session_changed(
                             model_name=model_name,
                             worker_id=device_id,
                             cached_session_id=cached_session_id,
@@ -894,7 +728,7 @@ class MxTargetModelLoader(DummyModelLoader):
                             cached_session_id = new_session_id
 
                             # Re-fetch metadata from MX server
-                            response = mx_client.get_metadata(model_name)
+                            response = self._mx_client.get_metadata(model_name)
 
                             # Find updated source worker
                             for w in response.workers:
@@ -930,8 +764,6 @@ class MxTargetModelLoader(DummyModelLoader):
                         raise RuntimeError(
                             f"Transfer failed after {transfer_retries} attempts: {transfer_err}"
                         )
-
-            mx_client.close()
 
             # Final timing summary
             total_receive_time = _time.perf_counter() - receive_start
