@@ -23,7 +23,7 @@ This file provides context for AI assistants (Claude, Cursor, Copilot) working o
 
 ## Architecture
 
-```
+```text
    Node A (Source)                           Node B (Target)
    +---------------------------+             +---------------------------+
    | vLLM + MxSourceModelLoader|             | vLLM + MxTargetModelLoader|
@@ -123,7 +123,7 @@ UCX_LOG_LEVEL: "WARN"         # DEBUG for troubleshooting
 
 ## Repository Structure
 
-```
+```text
 modelexpress/
 ├── CLAUDE.md                 # THIS FILE (project root) - AI assistant context
 ├── modelexpress_server/      # Rust gRPC server
@@ -301,7 +301,7 @@ If we transfer AFTER processing, source has `weight_scale` but target expects `w
 
 Transfer RAW tensors BEFORE `process_weights_after_loading()` runs:
 
-```
+```text
 Source:                              Target:
 ┌─────────────────────┐              ┌─────────────────────┐
 │ Load weight_scale_inv│              │ Dummy weight_scale_inv│

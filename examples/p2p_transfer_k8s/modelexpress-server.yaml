@@ -37,6 +37,7 @@ spec:
         app: modelexpress-server
     spec:
       # Native sidecar: Redis starts first and stays running
+      # Requires Kubernetes >= 1.29 (SidecarContainers feature gate)
       initContainers:
         - name: redis
           image: redis:7-alpine
@@ -56,6 +57,8 @@ spec:
             initialDelaySeconds: 1
             periodSeconds: 1
             failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
           livenessProbe:
             tcpSocket:
               port: 6379
@@ -64,6 +67,8 @@ spec:
       containers:
         - name: modelexpress-server
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:server-u64fix-1768535139
+          securityContext:
+            allowPrivilegeEscalation: false
           ports:
             - containerPort: 8001
           env:

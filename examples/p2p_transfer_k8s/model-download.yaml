@@ -39,6 +39,8 @@ spec:
       containers:
         - name: downloader
           image: python:3.11-slim
+          securityContext:
+            allowPrivilegeEscalation: false
           env:
             - name: HF_HUB_CACHE
               value: /models

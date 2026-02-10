@@ -469,7 +469,7 @@ class MxTargetModelLoader(DummyModelLoader):
 
         total_time = time.perf_counter() - load_start
         _log("=" * 60, "INFO")
-        _log(f"[TIMING] MxTargetModelLoader.load_model() COMPLETE", "INFO")
+        _log("[TIMING] MxTargetModelLoader.load_model() COMPLETE", "INFO")
         _log(f"[TIMING] Total load time: {total_time:.2f}s", "INFO")
         _log("=" * 60, "INFO")
         return model.eval()
@@ -553,7 +553,7 @@ class MxTargetModelLoader(DummyModelLoader):
         # 2. 30s grace period for system stabilization
         # 3. Successful test inference proves stability
         _log(f"[Worker {device_id}] Waiting for source NIXL ready (includes stability verification)...", "INFO")
-        source_ready, cached_session_id, cached_metadata_hash = self._mx_client.wait_for_ready(
+        source_ready, cached_session_id, _cached_metadata_hash = self._mx_client.wait_for_ready(
             model_name=model_name,
             worker_id=device_id,
             timeout_seconds=7200,  # 2 hour timeout (matches source warmup)
@@ -780,17 +780,10 @@ class MxTargetModelLoader(DummyModelLoader):
         return self._nixl_manager
 
 
-# Global storage for raw tensor metadata (used by source loader)
-# This allows the existing client to access pre-processing metadata
+# Global storage for raw tensor metadata, keyed by device_id.
+# Required because vLLM's loader API doesn't expose loader instances after
+# load_model() returns. Source loaders store state here so the MxClient
+# (running in the same worker process) can access NIXL managers and tensors.
+# Each device_id maps to exactly one loader, so there are no concurrent writers.
 _raw_tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, "NixlTransferManager"] = {}
-
-
-def get_raw_tensor_registry(device_id: int) -> dict[str, torch.Tensor] | None:
-    """Get raw tensor registry for a device (used by client to publish pre-processing metadata)."""
-    return _raw_tensor_registry.get(device_id)
-
-
-def get_nixl_manager(device_id: int) -> "NixlTransferManager | None":
-    """Get NIXL manager for a device."""
-    return _nixl_managers.get(device_id)

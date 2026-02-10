@@ -125,7 +125,7 @@ class MxClient:
             model_name=model_name,
             workers=workers,
         )
-        response = self.stub.PublishMetadata(request)
+        response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:
             logger.error("PublishMetadata failed: %s", response.message)
         return response.success
@@ -135,7 +135,7 @@ class MxClient:
     ) -> p2p_pb2.GetMetadataResponse:
         """Query for existing source metadata for *model_name*."""
         request = p2p_pb2.GetMetadataRequest(model_name=model_name)
-        return self.stub.GetMetadata(request)
+        return self.stub.GetMetadata(request, timeout=30)
 
     def publish_ready(
         self,
@@ -155,7 +155,7 @@ class MxClient:
             nixl_ready=nixl_ready,
             stability_verified=stability_verified,
         )
-        response = self.stub.PublishReady(request)
+        response = self.stub.PublishReady(request, timeout=30)
         if not response.success:
             logger.error("PublishReady failed: %s", response.message)
             return False
@@ -169,7 +169,7 @@ class MxClient:
             model_name=model_name,
             worker_id=worker_id,
         )
-        return self.stub.GetReady(request)
+        return self.stub.GetReady(request, timeout=30)
 
     # -- coordination helpers -------------------------------------------------
 

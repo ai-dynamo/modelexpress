@@ -40,6 +40,8 @@ spec:
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work.
+          # Running as root is required by the vLLM base image for
+          # CUDA driver access and RDMA memory pinning (IPC_LOCK).
           securityContext:
             capabilities:
               add:
