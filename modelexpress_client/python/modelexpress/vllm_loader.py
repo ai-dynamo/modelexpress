@@ -755,7 +755,7 @@ class MxTargetModelLoader(DummyModelLoader):
                         _log(f"[Worker {device_id}] Transfer failed after {transfer_retries} attempts: {transfer_err}", "ERROR")
                         raise RuntimeError(
                             f"Transfer failed after {transfer_retries} attempts: {transfer_err}"
-                        )
+                        ) from transfer_err
 
             # Final timing summary
             total_receive_time = time.perf_counter() - receive_start

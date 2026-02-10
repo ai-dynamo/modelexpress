@@ -248,31 +248,3 @@ class MxClient:
             logger.warning("[Worker %d] Error checking session: %s", worker_id, e)
 
         return False, cached_session_id
-
-
-ZMQ_AVAILABLE = False
-zmq = None
-try:
-    import zmq
-    ZMQ_AVAILABLE = True
-except ImportError:
-    logger.warning("ZMQ is not available - cannot connect to vLLM workers")
-
-
-@dataclass
-class TransferStats:
-    """Statistics for a transfer operation."""
-    total_bytes: int = 0
-    total_tensors: int = 0
-    start_time: float = 0.0
-    end_time: float = 0.0
-
-    @property
-    def duration(self) -> float:
-        return self.end_time - self.start_time
-
-    @property
-    def bandwidth_gbps(self) -> float:
-        if self.duration > 0:
-            return (self.total_bytes * 8) / (self.duration * 1e9)
-        return 0.0

@@ -32,7 +32,6 @@ dependencies = [
     "numpy>=1.24.0",
     "protobuf>=5.27.0,<6.0.0",  # protobuf 5.x compatibility
     "pydantic>=2.0.0",
-    "pyzmq>=25.0.0",
     "torch>=2.6.0",
 ]
 

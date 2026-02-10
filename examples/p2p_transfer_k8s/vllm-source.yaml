@@ -47,15 +47,8 @@ spec:
               add:
                 - IPC_LOCK
           env:
-            - name: VLLM_SERVER_DEV_MODE
-              value: "1"
-            # Increase startup timeout to allow DeepGemm warmup to complete (2 hours)
-            - name: VLLM_RPC_TIMEOUT
-              value: "7200000"
             - name: HF_HUB_CACHE
               value: "/models"
-            - name: MX_ZMQ_ADDRESS
-              value: "ipc:///tmp/mx/vllm.sock"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
             # Register ModelExpress custom loaders for FP8 support
@@ -68,8 +61,6 @@ spec:
             # This reduces the staggered window and allows targets to start simultaneously
             - name: MX_SYNC_PUBLISH
               value: "1"
-            - name: MX_EXPECTED_WORKERS
-              value: "8"
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
@@ -78,7 +69,7 @@ spec:
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
-              value: "WARN"
+              value: "INFO"
             # UCX transport settings for GPUDirect RDMA
             - name: UCX_TLS
               value: "rc_x,rc,dc_x,dc,cuda_copy"
