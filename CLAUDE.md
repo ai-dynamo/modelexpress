@@ -162,7 +162,6 @@ Contains custom vLLM model loaders:
 
 - **`MxSourceModelLoader`**: Loads weights from disk, registers with NIXL, publishes metadata
 - **`MxTargetModelLoader`**: Creates dummy weights, receives via RDMA, applies FP8 processing
-- **`SourceReadyCoordinator`**: gRPC-based coordination for source-target synchronization (via MxClient)
 
 ```python
 class MxSourceModelLoader(DefaultModelLoader):
