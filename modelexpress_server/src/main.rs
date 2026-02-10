@@ -19,6 +19,10 @@ use tonic::transport::Server;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
+/// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
+/// Each worker can have thousands of tensor descriptors with NIXL metadata.
+const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
@@ -125,8 +129,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the gRPC server
     info!("Starting gRPC server on: {addr}");
-    // Set max message size to 100MB for large models like DeepSeek-V3
-    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
     let server_result = Server::builder()
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))

@@ -5,38 +5,30 @@ This example demonstrates how to set up ModelExpress for P2P GPU weight transfer
 ## Architecture
 
 ```
-Node A (Source - first to start)              Node B (Target - starts later)
+Node A (Source)                               Node B (Target)
 +----------------------------------+          +----------------------------------+
-| vLLM Container                   |          | vLLM Container                   |
-| - Loads real model weights       |          | - Starts with dummy weights      |
-| - Exposes weights via ZMQ        |          | - Exposes buffers via ZMQ        |
-| - MX_ZMQ_ADDRESS=ipc:///tmp/mx/  |          | - MX_ZMQ_ADDRESS=ipc:///tmp/mx/  |
-+----------------------------------+          +----------------------------------+
-        |  ZMQ (IPC sockets)                          |  ZMQ (IPC sockets)
-        v                                             v
-+----------------------------------+          +----------------------------------+
-| Client Container                 |          | Client Container                 |
-| - Creates NIXL agents (1 per GPU)|          | - Creates NIXL agents (1 per GPU)|
-| - Queries server: no source found|   RDMA  | - Queries server: finds source A |
-| - Becomes source, publishes meta |<========>| - Receives weights via NIXL      |
-+----------------------------------+  NIXL   | - Also publishes metadata        |
+| vLLM + MxSourceModelLoader       |          | vLLM + MxTargetModelLoader       |
+| - Loads weights from disk        |          | - Starts with dummy weights      |
+| - Registers tensors with NIXL    |          | - Waits for source ready flag    |
+| - Publishes metadata via MxClient|   RDMA   | - Receives weights via NIXL      |
+| - Publishes ready flag           |=========>| - Runs FP8 processing            |
++----------------------------------+  NIXL    | - Serves inference               |
         |                                     +----------------------------------+
         |                                             |
         v                                             v
 +--------------------------------------------------------------------+
-|                    ModelExpress Server (CPU)                        |
-|   - Stores model metadata (NIXL metadata + tensor descriptors)      |
-|   - Keyed by model name                                            |
-|   - Redis backend for persistence                                  |
+|                    ModelExpress Server (gRPC + Redis)               |
+|   - PublishMetadata / GetMetadata: tensor metadata coordination     |
+|   - PublishReady / GetReady: source readiness coordination         |
 +--------------------------------------------------------------------+
 ```
 
 ### Key Design Points
 
-1. **Client Container**: NIXL transfer logic runs in a separate client container, not in vLLM
-2. **Symmetric Clients**: Both source and target run identical client code; role is determined dynamically
-3. **ZMQ Communication**: vLLM exposes weights via ZMQ IPC sockets (one per TP rank)
-4. **Tensor Parallelism**: Full TP > 1 support with rank-matched transfers
+1. **Custom vLLM Loaders**: NIXL transfer logic runs inside vLLM via `--load-format mx-source` / `--load-format mx-target`
+2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly)
+3. **FP8 Support**: Raw tensors (including `weight_scale_inv`) transfer BEFORE FP8 processing
+4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU)
 
 ## Prerequisites
 

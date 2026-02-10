@@ -236,8 +236,16 @@ impl P2pStateManager {
         let new_workers_json = serde_json::to_string(&new_workers)?;
         let timestamp = chrono::Utc::now().timestamp();
 
-        // Lua script for atomic read-modify-write merge
-        // This runs atomically in Redis, preventing race conditions
+        // Lua script for atomic read-modify-write merge of worker metadata.
+        //
+        // WHY LUA? In a TP=8 setup, 8 GPU workers publish metadata concurrently.
+        // Without atomicity, two workers could read the same state, each add their
+        // own entry, and one overwrites the other (lost update). The Lua script
+        // runs as a single atomic operation in Redis, so the read-merge-write
+        // sequence is never interleaved with another worker's publish.
+        //
+        // The script: 1) reads existing workers, 2) merges new workers by rank
+        // (update if rank exists, append if new), 3) sorts by rank, 4) writes back.
         let script = redis::Script::new(
             r#"
             local key = KEYS[1]
@@ -333,7 +341,9 @@ impl P2pStateManager {
         }
     }
 
-    /// Remove metadata for a model (cleanup)
+    /// Remove metadata for a model (cleanup).
+    /// Currently unused - reserved for future admin/cleanup endpoints.
+    #[allow(dead_code)]
     pub async fn remove_metadata(
         &self,
         model_name: &str,
@@ -348,7 +358,9 @@ impl P2pStateManager {
         Ok(())
     }
 
-    /// List all registered model names
+    /// List all registered model names.
+    /// Currently unused - reserved for future admin/list endpoints.
+    #[allow(dead_code)]
     pub async fn list_models(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {

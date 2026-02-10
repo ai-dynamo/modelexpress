@@ -54,12 +54,15 @@ spec:
             - |
               set -ex
               pip install huggingface_hub
-              
+
               # Download model files (weights, config, tokenizer)
+              # HF_TOKEN is passed explicitly for gated models (e.g., Llama)
               python3 -c "
+              import os
               from huggingface_hub import snapshot_download
               snapshot_download(
                   '${MODEL_NAME}',
+                  token=os.environ.get('HF_TOKEN'),
               )
               print('Download complete')
               "

@@ -60,7 +60,7 @@ spec:
             - name: MX_REGISTER_LOADERS
               value: "1"
             # Server address for finding source (no http:// prefix)
-            - name: MX_SERVER_ADDRESS
+            - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
             # OPTIMIZATION: Synchronized start - wait for all workers before transferring
             # This maximizes RDMA parallelism by ensuring all workers start simultaneously
@@ -105,10 +105,11 @@ spec:
           args:
             - |
               set -ex
-              
-              # MX_REGISTER_LOADERS=1 is set in env, which triggers sitecustomize.py
-              # to register ModelExpress loaders in ALL Python processes (including workers)
-              
+
+              # MX_REGISTER_LOADERS=1 triggers loader registration via the Dockerfile
+              # __init__.py patch. Replaced in PR #140 by @register_model_loader
+              # decorators + --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
+
               # Start vLLM with mx-target loader
               # mx-target: Creates dummy weights, receives RAW tensors via RDMA,
               # THEN runs FP8 processing (identical to source)
@@ -119,7 +120,7 @@ spec:
                 --tensor-parallel-size 8 \
                 --enable-expert-parallel &
               VLLM_PID=$!
-              
+
               # Wait for vLLM to be ready
               echo "Waiting for vLLM to be ready..."
               python3 -c '
@@ -133,7 +134,7 @@ spec:
                       time.sleep(3)
               '
               echo "vLLM is ready - weights transferred and processed"
-              
+
               # Keep the container running (vLLM handles everything now)
               wait $VLLM_PID
           resources:

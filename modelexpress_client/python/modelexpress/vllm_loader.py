@@ -745,7 +745,7 @@ class MxTargetModelLoader(DummyModelLoader):
         wait_start = _time.perf_counter()
 
         # OPTIMIZATION: Synchronized start - wait for ALL source workers before transferring
-        # This ensures all target workers start their transfers simultaneously,
+        # This ensures all expected target workers start their transfers simultaneously,
         # maximizing RDMA parallelism and achieving closer to theoretical bandwidth
         sync_start = os.environ.get("MX_SYNC_START", "1") == "1"
         expected_workers = _get_expected_workers()

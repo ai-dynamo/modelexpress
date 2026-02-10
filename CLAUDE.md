@@ -8,7 +8,7 @@ This file provides context for AI assistants (Claude, Cursor, Copilot) working o
 
 ### Key Value Proposition
 
-- **Speed**: Transfer 681GB (DeepSeek-V3) in ~40-80 seconds vs. ~25 minutes from NVMe storage
+- **Speed**: Transfer 681GB (DeepSeek-V3) in ~15 seconds vs. ~25 minutes from NVMe storage
 - **Efficiency**: GPU-to-GPU transfers via GPUDirect RDMA bypass CPU entirely (zero-copy)
 - **Scalability**: Coordinate transfers across multiple vLLM instances in a cluster
 
@@ -16,8 +16,8 @@ This file provides context for AI assistants (Claude, Cursor, Copilot) working o
 
 | Model | Status | Transfer Time | Notes |
 |-------|--------|---------------|-------|
-| DeepSeek-V3 (671B, FP8) | Working | 40-80s | 681GB across 8 GPUs |
-| Llama 3.3 70B | Working | ~5s | 140GB across 4-8 GPUs |
+| DeepSeek-V3 (671B, FP8) | Working | ~15s | 681GB across 8 GPUs @ ~112 Gbps per link |
+| Llama 3.3 70B | Working | ~5s | 140GB across 8 GPUs @ ~112 Gbps |
 
 ---
 
@@ -125,7 +125,7 @@ UCX_LOG_LEVEL: "WARN"         # DEBUG for troubleshooting
 
 ```
 modelexpress/
-├── CLAUDE.md                 # THIS FILE - AI assistant context
+├── CLAUDE.md                 # THIS FILE (project root) - AI assistant context
 ├── modelexpress_server/      # Rust gRPC server
 │   └── src/
 │       ├── main.rs
@@ -162,7 +162,7 @@ Contains custom vLLM model loaders:
 
 - **`MxSourceModelLoader`**: Loads weights from disk, registers with NIXL, publishes metadata
 - **`MxTargetModelLoader`**: Creates dummy weights, receives via RDMA, applies FP8 processing
-- **`SourceReadyCoordinator`**: Redis-based coordination for source-target synchronization
+- **`SourceReadyCoordinator`**: gRPC-based coordination for source-target synchronization (via MxClient)
 
 ```python
 class MxSourceModelLoader(DefaultModelLoader):
@@ -214,20 +214,20 @@ Rust gRPC service implementation:
 ### Building Docker Image
 
 ```bash
-cd /home/kavink/work/gitlab/modelexpress
+cd path/to/modelexpress
 
 # Build client image
 docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
-  -t nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:YOUR_TAG .
+  -t nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG .
 
-docker push nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:YOUR_TAG
+docker push nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG
 ```
 
 ### Deploying to Kubernetes
 
 ```bash
 # Namespace
-NAMESPACE=kavin
+NAMESPACE=<your-namespace>
 
 # 1. Flush Redis (clear stale metadata)
 microk8s kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
@@ -247,14 +247,14 @@ watch microk8s kubectl -n $NAMESPACE get pods -l 'app in (mx-source, mx-target)'
 
 ```bash
 # Stream logs
-microk8s kubectl -n kavin logs -f deploy/mx-source
-microk8s kubectl -n kavin logs -f deploy/mx-target
+kubectl -n $NAMESPACE logs -f deploy/mx-source
+kubectl -n $NAMESPACE logs -f deploy/mx-target
 
 # Check Redis state
-microk8s kubectl -n kavin exec deploy/modelexpress-server -c redis -- redis-cli KEYS '*'
+kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS '*'
 
 # Test inference
-microk8s kubectl -n kavin exec deploy/mx-target -- curl -s http://localhost:8000/v1/completions \
+kubectl -n $NAMESPACE exec deploy/mx-target -- curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "deepseek-ai/DeepSeek-V3", "prompt": "Hello", "max_tokens": 10}'
 ```
@@ -268,8 +268,7 @@ microk8s kubectl -n kavin exec deploy/mx-target -- curl -s http://localhost:8000
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target loaders with vLLM |
-| `MX_SERVER_ADDRESS` | `modelexpress-server:8001` | gRPC server address |
-| `MX_REDIS_HOST` | `modelexpress-server` | Redis host for coordination |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (also reads `MX_SERVER_ADDRESS` for compat) |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
@@ -380,7 +379,7 @@ DeepSeek-V3 takes ~40 minutes to fully warm up (loading + DeepGemm + CUDA graphs
 |--------|-------|
 | Model | DeepSeek-V3 (671B, FP8) |
 | Total Data | 681 GB (8 workers × 85 GB) |
-| Transfer Time | 40-80 seconds (baseline) |
+| Transfer Time | ~15 seconds (8 parallel RDMA streams @ 112 Gbps each) |
 | Per-Worker Speed | 60-112 Gbps |
 | Theoretical Max | 400 Gbps per NIC |
 
