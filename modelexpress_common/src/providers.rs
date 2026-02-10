@@ -29,13 +29,17 @@ pub trait ModelProviderTrait: Send + Sync {
 
     /// Check if a file should be ignored during download
     /// This allows each provider to specify which files to skip
-    /// Default implementation ignores common repository metadata files
+    /// Default implementation ignores dotfiles and common repository metadata files
     fn is_ignored(filename: &str) -> bool
     where
         Self: Sized,
     {
-        const DEFAULT_IGNORED: [&str; 3] = [".gitattributes", ".gitignore", "README.md"];
-        DEFAULT_IGNORED.contains(&filename)
+        const DEFAULT_IGNORED: [&str; 1] = ["README.md"];
+        let name = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename);
+        name.starts_with('.') || DEFAULT_IGNORED.contains(&name)
     }
 
     /// Check if a file is an image file that should be ignored
@@ -98,10 +102,21 @@ mod tests {
 
     #[test]
     fn test_ignored_files() {
+        // Dotfiles
         assert!(HuggingFaceProvider::is_ignored(".gitattributes"));
         assert!(HuggingFaceProvider::is_ignored(".gitignore"));
-        assert!(HuggingFaceProvider::is_ignored("README.md"));
+        assert!(HuggingFaceProvider::is_ignored(".gitkeep"));
+        assert!(HuggingFaceProvider::is_ignored(".hidden"));
 
+        // Dotfiles in subdirectories
+        assert!(HuggingFaceProvider::is_ignored("subdir/.gitkeep"));
+        assert!(HuggingFaceProvider::is_ignored("a/b/.hidden"));
+
+        // Explicit files
+        assert!(HuggingFaceProvider::is_ignored("README.md"));
+        assert!(HuggingFaceProvider::is_ignored("subdir/README.md"));
+
+        // (Not Ignored) Regular files
         assert!(!HuggingFaceProvider::is_ignored("model.bin"));
         assert!(!HuggingFaceProvider::is_ignored("tokenizer.json"));
         assert!(!HuggingFaceProvider::is_ignored("config.json"));
