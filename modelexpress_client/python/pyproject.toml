@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modelexpress"
+version = "0.2.2"
+description = "Python client for ModelExpress P2P GPU transfer service"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "NVIDIA Corporation", email = "sw-dl-dynamo@nvidia.com"}
+]
+keywords = ["llm", "gpu", "transfer", "rdma", "nixl", "vllm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "grpcio>=1.66.2",
+    "nixl[cu12]",
+    "numpy>=1.24.0",
+    "protobuf>=5.27.0,<6.0.0",  # protobuf 5.x compatibility
+    "pydantic>=2.0.0",
+    "torch>=2.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # Use grpcio-tools<=1.66.2 for protobuf 5.x, >=1.67.0 for protobuf 6.x
+    "grpcio-tools>=1.60.0,<=1.66.2",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ai-dynamo/modelexpress"
+Repository = "https://github.com/ai-dynamo/modelexpress.git"
+Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["modelexpress*"]
+
+[tool.setuptools.package-data]
+modelexpress = ["py.typed"]

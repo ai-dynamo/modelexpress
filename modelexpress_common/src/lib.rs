@@ -26,6 +26,9 @@ pub mod grpc {
     pub mod model {
         tonic::include_proto!("model_express.model");
     }
+    pub mod p2p {
+        tonic::include_proto!("model_express.p2p");
+    }
 }
 
 /// Defines the shared response format between server and client (legacy HTTP)
