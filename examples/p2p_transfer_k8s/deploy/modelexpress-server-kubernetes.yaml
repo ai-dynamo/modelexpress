@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# ModelExpress Server with Redis backend (optional).
-# Use when you want metadata to persist across server restarts.
-# Deploy redis-standalone.yaml first, or use the Redis sidecar below.
+# ModelExpress Server with Kubernetes CRD backend (optional).
+# Use when you want metadata to persist across server restarts via K8s CRDs.
+#
+# Prerequisites:
+#   - kubectl apply -f crd-modelmetadata.yaml
+#   - kubectl apply -f rbac-modelmetadata.yaml -n <namespace>
 apiVersion: v1
 kind: Service
 metadata:
@@ -16,9 +19,6 @@ spec:
     - port: 8001
       targetPort: 8001
       name: grpc
-    - port: 6379
-      targetPort: 6379
-      name: redis
   selector:
     app: modelexpress-server
 ---
@@ -38,31 +38,7 @@ spec:
       labels:
         app: modelexpress-server
     spec:
-      # Native sidecar: Redis starts first and stays running
-      initContainers:
-        - name: redis
-          image: redis:7-alpine
-          restartPolicy: Always
-          ports:
-            - containerPort: 6379
-          resources:
-            limits:
-              cpu: "1"
-              memory: 4Gi
-            requests:
-              cpu: 500m
-              memory: 2Gi
-          startupProbe:
-            tcpSocket:
-              port: 6379
-            initialDelaySeconds: 1
-            periodSeconds: 1
-            failureThreshold: 30
-          livenessProbe:
-            tcpSocket:
-              port: 6379
-            periodSeconds: 10
-
+      serviceAccountName: modelexpress
       containers:
         - name: modelexpress-server
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
@@ -70,12 +46,12 @@ spec:
           ports:
             - containerPort: 8001
           env:
-            # Use Redis backend
             - name: MX_METADATA_BACKEND
-              value: "redis"
-            # Redis connection URL (sidecar runs on localhost)
-            - name: REDIS_URL
-              value: "redis://localhost:6379"
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             requests:
               cpu: 4

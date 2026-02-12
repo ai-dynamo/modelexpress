@@ -1,12 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# ModelExpress Server deployment with Kubernetes CRD backend (default)
-# For Redis backend, use modelexpress-server-redis.yaml instead
-#
-# Prerequisites:
-#   - Apply CRD: kubectl apply -f crd-modelmetadata.yaml
-#   - Apply RBAC: kubectl apply -f rbac-modelmetadata.yaml
+# ModelExpress Server (default) — in-memory metadata backend.
+# No Redis or CRD required. Ready flags (PublishReady/GetReady) are always in-memory.
+# For persistence, use modelexpress-server-redis.yaml or modelexpress-server-kubernetes.yaml.
 apiVersion: v1
 kind: Service
 metadata:
@@ -38,8 +35,6 @@ spec:
       labels:
         app: modelexpress-server
     spec:
-      # ServiceAccount with permissions to manage ModelMetadata CRDs and ConfigMaps
-      serviceAccountName: modelexpress
       containers:
         - name: modelexpress-server
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
@@ -47,14 +42,8 @@ spec:
           ports:
             - containerPort: 8001
           env:
-            # Use Kubernetes CRD backend (no Redis required)
             - name: MX_METADATA_BACKEND
-              value: "kubernetes"
-            # Namespace for ModelMetadata CRDs (defaults to pod's namespace)
-            - name: MX_METADATA_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+              value: "memory"
           resources:
             requests:
               cpu: 4
