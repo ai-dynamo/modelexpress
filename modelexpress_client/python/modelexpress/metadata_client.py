@@ -7,10 +7,12 @@ Metadata client abstraction for ModelExpress P2P transfers.
 Supports multiple backends:
 - Redis: Original implementation, stores JSON in Redis keys
 - Kubernetes: Uses CRDs and ConfigMaps for native K8s integration
+- grpc / memory: Uses ModelExpress server gRPC (PublishReady/GetReady)
 
 The backend is selected via the MX_METADATA_BACKEND environment variable:
 - "redis" (default): Use Redis backend
 - "kubernetes", "k8s", "crd": Use Kubernetes CRD backend
+- "memory", "grpc": Use gRPC to ModelExpress server (for in-memory server)
 """
 
 from __future__ import annotations
@@ -39,6 +41,23 @@ class WorkerReadyInfo:
 
 class MetadataBackend(ABC):
     """Abstract base class for metadata backends."""
+
+    def publish_ready(
+        self,
+        model_name: str,
+        worker_id: int,
+        session_id: str | None = None,
+        metadata_hash: str = "",
+    ) -> bool:
+        """Convenience: publish ready with auto-generated session_id if needed."""
+        if session_id is None:
+            session_id = str(__import__("uuid").uuid4())
+        return self.publish_ready_signal(
+            model_name=model_name,
+            worker_id=worker_id,
+            session_id=session_id,
+            metadata_hash=metadata_hash or None,
+        )
     
     @abstractmethod
     def publish_ready_signal(
@@ -212,6 +231,72 @@ class RedisBackend(MetadataBackend):
             f"after {timeout_seconds}s"
         )
         return False, None, None
+
+
+class GrpcBackend(MetadataBackend):
+    """gRPC-based backend: uses ModelExpress server (PublishReady/GetReady).
+    
+    Use with MX_METADATA_BACKEND=memory or grpc when the server uses in-memory backend.
+    """
+    
+    def __init__(self):
+        self._client = None
+    
+    def _get_client(self):
+        if self._client is not None:
+            return self._client
+        from .client import MxClient
+        url = os.environ.get("MX_SERVER_ADDRESS", os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001"))
+        self._client = MxClient(url)
+        return self._client
+    
+    def publish_ready_signal(
+        self,
+        model_name: str,
+        worker_id: int,
+        session_id: str,
+        metadata_hash: str | None = None,
+    ) -> bool:
+        client = self._get_client()
+        return client.publish_ready(
+            model_name=model_name,
+            worker_id=worker_id,
+            session_id=session_id,
+            metadata_hash=metadata_hash or "",
+        )
+    
+    def get_ready_signal(
+        self,
+        model_name: str,
+        worker_id: int,
+    ) -> WorkerReadyInfo | None:
+        try:
+            response = self._get_client().get_ready(model_name, worker_id)
+            if response.found and response.ready:
+                return WorkerReadyInfo(
+                    session_id=response.session_id,
+                    nixl_ready=True,
+                    stability_verified=response.stability_verified,
+                    metadata_hash=response.metadata_hash or None,
+                    timestamp=None,
+                )
+        except Exception as e:
+            logger.debug("GetReady failed: %s", e)
+        return None
+    
+    def wait_for_ready(
+        self,
+        model_name: str,
+        worker_id: int,
+        timeout_seconds: int = 7200,
+        poll_interval: int = 10,
+    ) -> tuple[bool, str | None, str | None]:
+        return self._get_client().wait_for_ready(
+            model_name=model_name,
+            worker_id=worker_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+        )
 
 
 class KubernetesBackend(MetadataBackend):
@@ -440,13 +525,16 @@ def get_metadata_backend() -> MetadataBackend:
     Get the appropriate metadata backend based on configuration.
     
     Returns:
-        MetadataBackend instance (Redis or Kubernetes)
+        MetadataBackend instance (Redis, Kubernetes, or Grpc)
     """
     backend_type = os.environ.get("MX_METADATA_BACKEND", "redis").lower()
     
     if backend_type in ("kubernetes", "k8s", "crd"):
         logger.info("Using Kubernetes CRD metadata backend")
         return KubernetesBackend()
+    elif backend_type in ("memory", "grpc"):
+        logger.info("Using gRPC metadata backend (ModelExpress server)")
+        return GrpcBackend()
     else:
         logger.info("Using Redis metadata backend")
         return RedisBackend()
