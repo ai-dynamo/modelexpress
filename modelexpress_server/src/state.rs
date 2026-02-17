@@ -193,7 +193,11 @@ impl P2pStateManager {
             "get_ready '{}' worker {}: {}",
             model_name,
             worker_id,
-            if result.is_some() { "found" } else { "not found" }
+            if result.is_some() {
+                "found"
+            } else {
+                "not found"
+            }
         );
         Ok(result)
     }

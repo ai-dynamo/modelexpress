@@ -217,16 +217,14 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
         BackendConfig::LayeredRedis { url } => {
             let persistent = redis::RedisBackend::new(&url);
             persistent.connect().await?;
-            let backend =
-                layered::LayeredBackend::with_persistent(Arc::new(persistent));
+            let backend = layered::LayeredBackend::with_persistent(Arc::new(persistent));
             backend.connect().await?;
             Ok(Arc::new(backend))
         }
         BackendConfig::LayeredKubernetes { namespace } => {
             let persistent = kubernetes::KubernetesBackend::new(&namespace).await?;
             persistent.connect().await?;
-            let backend =
-                layered::LayeredBackend::with_persistent(Arc::new(persistent));
+            let backend = layered::LayeredBackend::with_persistent(Arc::new(persistent));
             backend.connect().await?;
             Ok(Arc::new(backend))
         }

@@ -51,8 +51,7 @@ impl MetadataBackend for InMemoryBackend {
         model_name: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()> {
-        let new_workers: Vec<WorkerRecord> =
-            workers.into_iter().map(WorkerRecord::from).collect();
+        let new_workers: Vec<WorkerRecord> = workers.into_iter().map(WorkerRecord::from).collect();
         let total_tensors: usize = new_workers.iter().map(|w| w.tensors.len()).sum();
         let timestamp = chrono::Utc::now().timestamp();
 
@@ -98,7 +97,11 @@ impl MetadataBackend for InMemoryBackend {
         debug!(
             "get_metadata '{}': {}",
             model_name,
-            if result.is_some() { "found" } else { "not found" }
+            if result.is_some() {
+                "found"
+            } else {
+                "not found"
+            }
         );
         Ok(result)
     }
@@ -117,6 +120,7 @@ impl MetadataBackend for InMemoryBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use modelexpress_common::grpc::p2p::TensorDescriptor;
@@ -183,11 +187,7 @@ mod tests {
             .await
             .unwrap();
 
-        let record = backend
-            .get_metadata("test-model")
-            .await
-            .unwrap()
-            .unwrap();
+        let record = backend.get_metadata("test-model").await.unwrap().unwrap();
         assert_eq!(record.workers.len(), 2);
         assert_eq!(record.workers[0].worker_rank, 0);
         assert_eq!(record.workers[1].worker_rank, 1);

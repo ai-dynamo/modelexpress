@@ -156,8 +156,7 @@ pub struct TensorDescriptorJson {
 pub fn sanitize_model_name(model_name: &str) -> String {
     model_name
         .to_lowercase()
-        .replace('/', "-")
-        .replace('_', "-")
+        .replace(['/', '_'], "-")
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
         .collect::<String>()

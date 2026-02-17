@@ -13,9 +13,7 @@
 //! On startup, the in-memory cache is hydrated from the persistent backend
 //! so the server recovers state without sources needing to re-publish.
 
-use super::{
-    memory::InMemoryBackend, MetadataBackend, MetadataResult, ModelMetadataRecord,
-};
+use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, memory::InMemoryBackend};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use std::sync::Arc;
@@ -61,7 +59,7 @@ impl LayeredBackend {
             return Ok(());
         }
 
-        let mut hydrated = 0;
+        let mut hydrated: usize = 0;
         for model_name in &models {
             if let Some(record) = persistent.get_metadata(model_name).await? {
                 // Re-publish into in-memory cache
@@ -70,10 +68,8 @@ impl LayeredBackend {
                     .into_iter()
                     .map(WorkerMetadata::from)
                     .collect();
-                self.cache
-                    .publish_metadata(model_name, workers)
-                    .await?;
-                hydrated += 1;
+                self.cache.publish_metadata(model_name, workers).await?;
+                hydrated = hydrated.saturating_add(1);
             }
         }
 
@@ -122,13 +118,13 @@ impl MetadataBackend for LayeredBackend {
             .await?;
 
         // Write-through to persistent backend (best-effort)
-        if let Some(persistent) = &self.persistent {
-            if let Err(e) = persistent.publish_metadata(model_name, workers).await {
-                warn!(
-                    "Failed to write-through to persistent backend for '{}': {} - data is in cache only",
-                    model_name, e
-                );
-            }
+        if let Some(persistent) = &self.persistent
+            && let Err(e) = persistent.publish_metadata(model_name, workers).await
+        {
+            warn!(
+                "Failed to write-through to persistent backend for '{}': {} - data is in cache only",
+                model_name, e
+            );
         }
 
         Ok(())
@@ -142,13 +138,13 @@ impl MetadataBackend for LayeredBackend {
     async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
         self.cache.remove_metadata(model_name).await?;
 
-        if let Some(persistent) = &self.persistent {
-            if let Err(e) = persistent.remove_metadata(model_name).await {
-                warn!(
-                    "Failed to remove '{}' from persistent backend: {}",
-                    model_name, e
-                );
-            }
+        if let Some(persistent) = &self.persistent
+            && let Err(e) = persistent.remove_metadata(model_name).await
+        {
+            warn!(
+                "Failed to remove '{}' from persistent backend: {}",
+                model_name, e
+            );
         }
 
         Ok(())
@@ -161,6 +157,7 @@ impl MetadataBackend for LayeredBackend {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -175,10 +172,7 @@ mod tests {
             tensors: vec![],
         }];
 
-        backend
-            .publish_metadata("test", workers)
-            .await
-            .unwrap();
+        backend.publish_metadata("test", workers).await.unwrap();
 
         let result = backend.get_metadata("test").await.unwrap();
         assert!(result.is_some());
