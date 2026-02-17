@@ -169,7 +169,15 @@ impl BackendConfig {
                 let namespace = Self::k8s_namespace_from_env();
                 Self::Kubernetes { namespace }
             }
-            _ => Self::Memory,
+            "memory" | "" => Self::Memory,
+            other => {
+                tracing::warn!(
+                    "Unrecognized MX_METADATA_BACKEND value '{}', defaulting to in-memory. \
+                     Valid values: memory, redis, kubernetes",
+                    other
+                );
+                Self::Memory
+            }
         }
     }
 

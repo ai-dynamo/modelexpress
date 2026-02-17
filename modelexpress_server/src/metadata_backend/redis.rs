@@ -207,7 +207,24 @@ impl MetadataBackend for RedisBackend {
         let mut guard = self.redis.write().await;
         *guard = Some(conn);
 
-        info!("Connected to Redis at {}", self.redis_url);
+        // Redact credentials from URL before logging (e.g., redis://user:pass@host → redis://user:***@host)
+        let safe_url = if self.redis_url.contains('@') {
+            // Has credentials — redact password between : and @
+            if let Some(at_pos) = self.redis_url.rfind('@') {
+                let prefix = &self.redis_url[..at_pos];
+                let suffix = &self.redis_url[at_pos..];
+                if let Some(colon_pos) = prefix.rfind(':') {
+                    format!("{}:***{}", &prefix[..colon_pos], suffix)
+                } else {
+                    self.redis_url.clone()
+                }
+            } else {
+                self.redis_url.clone()
+            }
+        } else {
+            self.redis_url.clone()
+        };
+        info!("Connected to Redis at {}", safe_url);
         Ok(())
     }
 

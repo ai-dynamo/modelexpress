@@ -561,8 +561,10 @@ class MxTargetModelLoader(DummyModelLoader):
         )
 
         if not source_ready:
-            _log(f"[Worker {device_id}] ERROR: Source NIXL never became ready, cannot proceed", "ERROR")
-            return
+            raise RuntimeError(
+                f"[Worker {device_id}] Source NIXL never became ready after 2h timeout. "
+                "Cannot proceed — model would serve with dummy/random weights."
+            )
 
         _log(f"[Worker {device_id}] Source NIXL ready (stability verified), proceeding with transfer", "INFO")
 
