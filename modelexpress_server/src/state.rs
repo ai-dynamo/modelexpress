@@ -293,17 +293,22 @@ mod tests {
     fn test_backend_config_from_env() {
         // SAFETY: Test runs in isolation, no concurrent access to env vars
         unsafe {
-            // Test default (Redis)
+            // Test default (Memory)
             std::env::remove_var("MX_METADATA_BACKEND");
             let config = BackendConfig::from_env();
-            assert!(matches!(config, BackendConfig::Redis { .. }));
+            assert!(matches!(config, BackendConfig::Memory));
+
+            // Test Redis
+            std::env::set_var("MX_METADATA_BACKEND", "redis");
+            let config = BackendConfig::from_env();
+            assert!(matches!(config, BackendConfig::LayeredRedis { .. }));
 
             // Test Kubernetes
             std::env::set_var("MX_METADATA_BACKEND", "kubernetes");
             std::env::set_var("MX_METADATA_NAMESPACE", "test-ns");
             let config = BackendConfig::from_env();
             assert!(
-                matches!(config, BackendConfig::Kubernetes { namespace } if namespace == "test-ns")
+                matches!(config, BackendConfig::LayeredKubernetes { namespace } if namespace == "test-ns")
             );
 
             // Cleanup

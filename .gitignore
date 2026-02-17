@@ -51,3 +51,4 @@ logs/
 models.db
 **/__pycache__/
 docs/FEEDBACK.md
+docs/optimization-comparison.md
