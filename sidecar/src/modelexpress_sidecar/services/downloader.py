@@ -7,7 +7,7 @@ import asyncio
 import logging
 import os
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -21,6 +21,9 @@ from modelexpress_sidecar.api.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Cache subdirectory name used by the sidecar
+CACHE_SUBDIR = "model-streamer"
+
 # Weight file extensions to filter when ignore_weights is True
 WEIGHT_EXTENSIONS = {".bin", ".safetensors", ".h5", ".msgpack", ".ckpt"}
 
@@ -28,7 +31,10 @@ WEIGHT_EXTENSIONS = {".bin", ".safetensors", ".h5", ".msgpack", ".ckpt"}
 IGNORED_FILES = {".gitattributes", ".gitignore", "README.md"}
 
 # Image file extensions to ignore
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tiff", ".tif"}
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp",
+    ".svg", ".ico", ".bmp", ".tiff", ".tif",
+}
 
 
 def is_weight_file(filename: str) -> bool:
@@ -76,9 +82,7 @@ class ModelDownloader:
         elif parsed.scheme in ("s3+http", "s3+https"):
             # For MinIO: s3+http://endpoint:port/bucket/path
             # The netloc is the endpoint, first path component is bucket
-            parts = parsed.path.lstrip("/").split("/", 1)
-            bucket = parts[0]
-            path = parts[1] if len(parts) > 1 else ""
+            bucket, _, path = parsed.path.lstrip("/").partition("/")
             return "s3", bucket, path
         else:
             raise ValueError(f"Unsupported URI scheme: {parsed.scheme}")
@@ -87,7 +91,20 @@ class ModelDownloader:
         """Get the local cache path for a model."""
         scheme, bucket, path = self._parse_model_uri(model_path)
         cache_base = Path(cache_dir) if cache_dir else self.default_cache_dir
-        return cache_base / "model-streamer" / scheme / bucket / path
+        return cache_base / CACHE_SUBDIR / scheme / bucket / path
+
+    def _resolve_model_id(self, model_id: str, cache_dir: Optional[str]) -> Path:
+        """Convert a model_id (e.g. s3/bucket/path) to a local cache path."""
+        parts = model_id.split("/", 2)
+        if len(parts) < 2:
+            raise FileNotFoundError(f"Invalid model_id format: {model_id}")
+
+        scheme = parts[0]
+        bucket = parts[1]
+        path = parts[2] if len(parts) > 2 else ""
+
+        cache_base = Path(cache_dir) if cache_dir else self.default_cache_dir
+        return cache_base / CACHE_SUBDIR / scheme / bucket / path
 
     def _setup_credentials(
         self,
@@ -274,7 +291,7 @@ class ModelDownloader:
                 key = obj["Key"]
                 # Get relative path from prefix
                 rel_path = key[len(prefix):].lstrip("/") if key.startswith(prefix) else key
-                filename = os.path.basename(rel_path)
+                filename = PurePosixPath(rel_path).name
 
                 # Skip ignored files
                 if is_ignored_file(filename):
@@ -307,18 +324,7 @@ class ModelDownloader:
         cache_dir: Optional[str],
     ) -> GetModelResponse:
         """Get information about a cached model."""
-        # Convert model_id back to a path
-        # model_id format: s3/bucket/path or gs/bucket/path
-        parts = model_id.split("/", 2)
-        if len(parts) < 2:
-            raise FileNotFoundError(f"Invalid model_id format: {model_id}")
-
-        scheme = parts[0]
-        bucket = parts[1]
-        path = parts[2] if len(parts) > 2 else ""
-
-        cache_base = Path(cache_dir) if cache_dir else self.default_cache_dir
-        local_path = cache_base / "model-streamer" / scheme / bucket / path
+        local_path = self._resolve_model_id(model_id, cache_dir)
 
         if not local_path.exists():
             raise FileNotFoundError(f"Model not found at {local_path}")
@@ -341,17 +347,7 @@ class ModelDownloader:
 
     async def delete_model(self, model_id: str, cache_dir: Optional[str] = None) -> DeleteResponse:
         """Delete a model from the local cache."""
-        # Convert model_id back to a path
-        parts = model_id.split("/", 2)
-        if len(parts) < 2:
-            raise FileNotFoundError(f"Invalid model_id format: {model_id}")
-
-        scheme = parts[0]
-        bucket = parts[1]
-        path = parts[2] if len(parts) > 2 else ""
-
-        cache_base = Path(cache_dir) if cache_dir else self.default_cache_dir
-        local_path = cache_base / "model-streamer" / scheme / bucket / path
+        local_path = self._resolve_model_id(model_id, cache_dir)
 
         if not local_path.exists():
             raise FileNotFoundError(f"Model not found at {local_path}")
