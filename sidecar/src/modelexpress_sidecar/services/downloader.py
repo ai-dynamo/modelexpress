@@ -215,7 +215,8 @@ class ModelDownloader:
             # For now, we'll use boto3 for actual file downloads
             # Model Streamer is better suited for streaming to GPU
             # In phase 2, we can use Model Streamer's streaming capabilities
-            downloaded_files = await self._download_with_boto3(
+            downloaded_files = await asyncio.to_thread(
+                self._download_with_boto3,
                 model_path=model_path,
                 local_path=local_path,
                 ignore_weights=ignore_weights,
@@ -223,7 +224,8 @@ class ModelDownloader:
 
         except ImportError:
             logger.warning("Model Streamer not available, falling back to boto3")
-            downloaded_files = await self._download_with_boto3(
+            downloaded_files = await asyncio.to_thread(
+                self._download_with_boto3,
                 model_path=model_path,
                 local_path=local_path,
                 ignore_weights=ignore_weights,
@@ -231,7 +233,7 @@ class ModelDownloader:
 
         return downloaded_files
 
-    async def _download_with_boto3(
+    def _download_with_boto3(
         self,
         model_path: str,
         local_path: Path,
