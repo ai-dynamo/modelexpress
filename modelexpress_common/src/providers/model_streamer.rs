@@ -164,6 +164,24 @@ impl ModelStreamerProvider {
             .replace("gs://", "gs/")
     }
 
+    /// Weight file extensions, matching the Python sidecar's WEIGHT_EXTENSIONS.
+    const WEIGHT_EXTENSIONS: &'static [&'static str] =
+        &[".bin", ".safetensors", ".h5", ".msgpack", ".ckpt"];
+
+    /// Files that should be ignored during download, matching the Python sidecar's IGNORED_FILES.
+    const IGNORED_FILES: &'static [&'static str] = &[".gitattributes", ".gitignore", "README.md"];
+
+    /// Check if a file is a model weight file.
+    fn is_weight_file(filename: &str) -> bool {
+        let lower = filename.to_lowercase();
+        Self::WEIGHT_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+    }
+
+    /// Check if a file should be ignored.
+    fn is_ignored(filename: &str) -> bool {
+        Self::IGNORED_FILES.iter().any(|name| filename == *name)
+    }
+
     /// Build S3 credentials payload for the request
     fn build_s3_credentials(&self) -> Option<S3CredentialsPayload> {
         if self.s3_credentials.access_key_id.is_some()
