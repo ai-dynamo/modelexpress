@@ -182,11 +182,13 @@ class ModelDownloader:
                     ignore_weights=ignore_weights,
                 )
 
-                # Calculate total size
+                # Filter to files that actually exist on disk
+                downloaded_files = [
+                    f for f in downloaded_files if (local_path / f).exists()
+                ]
+
                 total_size = sum(
-                    (local_path / f).stat().st_size
-                    for f in downloaded_files
-                    if (local_path / f).exists()
+                    (local_path / f).stat().st_size for f in downloaded_files
                 )
 
                 logger.info(
