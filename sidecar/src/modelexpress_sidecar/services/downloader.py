@@ -339,7 +339,7 @@ class ModelDownloader:
             total_size=total_size,
         )
 
-    async def delete_model(self, model_id: str) -> DeleteResponse:
+    async def delete_model(self, model_id: str, cache_dir: Optional[str] = None) -> DeleteResponse:
         """Delete a model from the local cache."""
         # Convert model_id back to a path
         parts = model_id.split("/", 2)
@@ -350,7 +350,8 @@ class ModelDownloader:
         bucket = parts[1]
         path = parts[2] if len(parts) > 2 else ""
 
-        local_path = self.default_cache_dir / "model-streamer" / scheme / bucket / path
+        cache_base = Path(cache_dir) if cache_dir else self.default_cache_dir
+        local_path = cache_base / "model-streamer" / scheme / bucket / path
 
         if not local_path.exists():
             raise FileNotFoundError(f"Model not found at {local_path}")

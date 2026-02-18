@@ -69,14 +69,17 @@ async def get_model(
 
 
 @router.delete("/models/{model_id:path}", response_model=DeleteResponse)
-async def delete_model(model_id: str) -> DeleteResponse:
+async def delete_model(
+    model_id: str,
+    cache_dir: str = Query(None, description="Cache directory to search"),
+) -> DeleteResponse:
     """Delete a model from the local cache."""
     # URL decode the model_id
     model_id = unquote(model_id)
     logger.info("Deleting model: %s", model_id)
 
     try:
-        result = await downloader.delete_model(model_id)
+        result = await downloader.delete_model(model_id, cache_dir)
         return result
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
