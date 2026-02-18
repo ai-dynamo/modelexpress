@@ -3,6 +3,7 @@
 
 """Model Streamer integration for downloading models from S3/GCS."""
 
+import asyncio
 import logging
 import os
 import shutil
@@ -53,6 +54,7 @@ class ModelDownloader:
         self.default_cache_dir = Path(
             os.environ.get("MODEL_EXPRESS_CACHE_DIRECTORY", "/app/cache")
         )
+        self._credentials_lock = asyncio.Lock()
 
     def _parse_model_uri(self, model_path: str) -> tuple[str, str, str]:
         """
@@ -139,56 +141,58 @@ class ModelDownloader:
         """
         logger.info("Starting download of model: %s", model_path)
 
-        # Set up credentials
-        original_env = self._setup_credentials(s3_credentials, gcs_credentials)
+        # Hold the lock while credentials are in the environment so
+        # concurrent requests don't overwrite each other's values.
+        async with self._credentials_lock:
+            original_env = self._setup_credentials(s3_credentials, gcs_credentials)
 
-        try:
-            # Parse the model URI
-            scheme, bucket, path = self._parse_model_uri(model_path)
-            logger.info("Parsed URI - scheme: %s, bucket: %s, path: %s", scheme, bucket, path)
+            try:
+                # Parse the model URI
+                scheme, bucket, path = self._parse_model_uri(model_path)
+                logger.info("Parsed URI - scheme: %s, bucket: %s, path: %s", scheme, bucket, path)
 
-            # Determine local cache path
-            local_path = self._get_cache_path(model_path, cache_dir)
-            local_path.mkdir(parents=True, exist_ok=True)
-            logger.info("Local cache path: %s", local_path)
+                # Determine local cache path
+                local_path = self._get_cache_path(model_path, cache_dir)
+                local_path.mkdir(parents=True, exist_ok=True)
+                logger.info("Local cache path: %s", local_path)
 
-            # Download using Model Streamer
-            downloaded_files = await self._download_with_model_streamer(
-                model_path=model_path,
-                local_path=local_path,
-                ignore_weights=ignore_weights,
-            )
+                # Download using Model Streamer
+                downloaded_files = await self._download_with_model_streamer(
+                    model_path=model_path,
+                    local_path=local_path,
+                    ignore_weights=ignore_weights,
+                )
 
-            # Calculate total size
-            total_size = sum(
-                (local_path / f).stat().st_size
-                for f in downloaded_files
-                if (local_path / f).exists()
-            )
+                # Calculate total size
+                total_size = sum(
+                    (local_path / f).stat().st_size
+                    for f in downloaded_files
+                    if (local_path / f).exists()
+                )
 
-            logger.info(
-                "Successfully downloaded %d files (%d bytes) to %s",
-                len(downloaded_files),
-                total_size,
-                local_path,
-            )
+                logger.info(
+                    "Successfully downloaded %d files (%d bytes) to %s",
+                    len(downloaded_files),
+                    total_size,
+                    local_path,
+                )
 
-            return DownloadResponse(
-                success=True,
-                local_path=str(local_path),
-                files=downloaded_files,
-                total_size=total_size,
-            )
+                return DownloadResponse(
+                    success=True,
+                    local_path=str(local_path),
+                    files=downloaded_files,
+                    total_size=total_size,
+                )
 
-        except Exception as e:
-            logger.exception("Failed to download model %s", model_path)
-            return DownloadResponse(
-                success=False,
-                error=str(e),
-                error_code="DOWNLOAD_ERROR",
-            )
-        finally:
-            self._restore_credentials(original_env)
+            except Exception as e:
+                logger.exception("Failed to download model %s", model_path)
+                return DownloadResponse(
+                    success=False,
+                    error=str(e),
+                    error_code="DOWNLOAD_ERROR",
+                )
+            finally:
+                self._restore_credentials(original_env)
 
     async def _download_with_model_streamer(
         self,
