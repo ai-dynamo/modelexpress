@@ -142,12 +142,26 @@ impl ModelStreamerProvider {
 
     /// Encode a model URI as a path-safe identifier
     /// E.g., "s3://bucket/path/to/model" -> "s3/bucket/path/to/model"
+    ///
+    /// For s3+http/s3+https URIs (MinIO), the endpoint is stripped and the
+    /// scheme is normalized to "s3" so the cache path matches the Python
+    /// sidecar layout: s3+http://endpoint:port/bucket/path -> s3/bucket/path
     fn encode_model_id(model_path: &str) -> String {
+        // s3+http://endpoint:port/bucket/path -> strip endpoint, keep bucket/path
+        if let Some(rest) = model_path
+            .strip_prefix("s3+http://")
+            .or_else(|| model_path.strip_prefix("s3+https://"))
+        {
+            // rest = "endpoint:port/bucket/path" - skip the endpoint (first segment)
+            if let Some(pos) = rest.find('/') {
+                return format!("s3/{}", &rest[pos + 1..]);
+            }
+            return "s3/".to_string();
+        }
+
         model_path
             .replace("s3://", "s3/")
             .replace("gs://", "gs/")
-            .replace("s3+http://", "s3-http/")
-            .replace("s3+https://", "s3-https/")
     }
 
     /// Build S3 credentials payload for the request
@@ -415,7 +429,11 @@ mod tests {
         );
         assert_eq!(
             ModelStreamerProvider::encode_model_id("s3+http://minio:9000/bucket/model"),
-            "s3-http/minio:9000/bucket/model"
+            "s3/bucket/model"
+        );
+        assert_eq!(
+            ModelStreamerProvider::encode_model_id("s3+https://minio:9000/bucket/path/to/model"),
+            "s3/bucket/path/to/model"
         );
     }
 
