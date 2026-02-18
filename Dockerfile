@@ -34,13 +34,11 @@ RUN apt-get update && \
         python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
-# Create Python virtual environment and install sidecar dependencies
-COPY sidecar/requirements.txt /app/sidecar/
-RUN python3 -m venv /app/venv && \
-    /app/venv/bin/pip install --no-cache-dir -r /app/sidecar/requirements.txt
-
-# Copy sidecar source code
+# Create Python virtual environment and install sidecar package
+COPY sidecar/pyproject.toml /app/sidecar/
 COPY sidecar/src /app/sidecar/src
+RUN python3 -m venv /app/venv && \
+    /app/venv/bin/pip install --no-cache-dir /app/sidecar
 
 # Copy all built binaries
 COPY --from=builder /app/target/release/modelexpress-server .
