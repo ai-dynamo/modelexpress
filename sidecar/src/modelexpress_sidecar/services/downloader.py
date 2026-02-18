@@ -33,6 +33,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".
 
 def is_weight_file(filename: str) -> bool:
     """Check if a file is a model weight file."""
+    filename = filename.lower()
     return any(filename.endswith(ext) for ext in WEIGHT_EXTENSIONS)
 
 
@@ -43,7 +44,8 @@ def is_ignored_file(filename: str) -> bool:
 
 def is_image_file(filename: str) -> bool:
     """Check if a file is an image."""
-    return any(filename.lower().endswith(ext) for ext in IMAGE_EXTENSIONS)
+    filename = filename.lower()
+    return any(filename.endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 
 class ModelDownloader:
