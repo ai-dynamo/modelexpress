@@ -52,5 +52,9 @@ models.db
 **/__pycache__/
 docs/FEEDBACK.md
 
-# Python testing
+# Python
 .venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
