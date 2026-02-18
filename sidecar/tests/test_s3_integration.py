@@ -62,7 +62,7 @@ async def test_download_from_minio(client: AsyncClient):
                     "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
                     "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
                     "region": os.environ.get("AWS_REGION", "us-east-1"),
-                    "endpoint_url": endpoint,
+                    "endpoint": endpoint,
                 },
             },
         )
@@ -91,7 +91,7 @@ async def test_get_downloaded_model(client: AsyncClient):
                     "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
                     "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
                     "region": os.environ.get("AWS_REGION", "us-east-1"),
-                    "endpoint_url": endpoint,
+                    "endpoint": endpoint,
                 },
             },
         )
@@ -142,7 +142,7 @@ async def test_download_nonexistent_bucket(client: AsyncClient):
                     "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin"),
                     "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin"),
                     "region": os.environ.get("AWS_REGION", "us-east-1"),
-                    "endpoint_url": endpoint,
+                    "endpoint": endpoint,
                 },
             },
         )
