@@ -296,30 +296,52 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_config_from_env() {
-        // SAFETY: Test runs in isolation, no concurrent access to env vars
-        unsafe {
-            // Test default (Memory)
-            std::env::remove_var("MX_METADATA_BACKEND");
-            let config = BackendConfig::from_env();
-            assert!(matches!(config, BackendConfig::Memory));
+    fn test_backend_config_parsing() {
+        let default_redis = "redis://localhost:6379";
+        let default_ns = "default";
 
-            // Test Redis
-            std::env::set_var("MX_METADATA_BACKEND", "redis");
-            let config = BackendConfig::from_env();
-            assert!(matches!(config, BackendConfig::LayeredRedis { .. }));
+        // Memory (default)
+        let config = BackendConfig::from_type_str("memory", default_redis, default_ns);
+        assert!(matches!(config, BackendConfig::Memory));
 
-            // Test Kubernetes
-            std::env::set_var("MX_METADATA_BACKEND", "kubernetes");
-            std::env::set_var("MX_METADATA_NAMESPACE", "test-ns");
-            let config = BackendConfig::from_env();
-            assert!(
-                matches!(config, BackendConfig::LayeredKubernetes { namespace } if namespace == "test-ns")
-            );
+        // Empty string also defaults to memory
+        let config = BackendConfig::from_type_str("", default_redis, default_ns);
+        assert!(matches!(config, BackendConfig::Memory));
 
-            // Cleanup
-            std::env::remove_var("MX_METADATA_BACKEND");
-            std::env::remove_var("MX_METADATA_NAMESPACE");
-        }
+        // Redis (layered)
+        let config = BackendConfig::from_type_str("redis", "redis://myhost:6379", default_ns);
+        assert!(
+            matches!(config, BackendConfig::LayeredRedis { url } if url == "redis://myhost:6379")
+        );
+
+        // Redis-only
+        let config = BackendConfig::from_type_str("redis-only", "redis://myhost:6379", default_ns);
+        assert!(
+            matches!(config, BackendConfig::Redis { url } if url == "redis://myhost:6379")
+        );
+
+        // Kubernetes (layered)
+        let config = BackendConfig::from_type_str("kubernetes", default_redis, "prod-ns");
+        assert!(
+            matches!(config, BackendConfig::LayeredKubernetes { namespace } if namespace == "prod-ns")
+        );
+
+        // K8s aliases
+        let config = BackendConfig::from_type_str("k8s", default_redis, "test-ns");
+        assert!(matches!(config, BackendConfig::LayeredKubernetes { .. }));
+        let config = BackendConfig::from_type_str("crd", default_redis, "test-ns");
+        assert!(matches!(config, BackendConfig::LayeredKubernetes { .. }));
+
+        // Kubernetes-only
+        let config = BackendConfig::from_type_str("kubernetes-only", default_redis, "ns");
+        assert!(matches!(config, BackendConfig::Kubernetes { .. }));
+
+        // Unknown falls back to memory
+        let config = BackendConfig::from_type_str("bogus", default_redis, default_ns);
+        assert!(matches!(config, BackendConfig::Memory));
+
+        // Case insensitive
+        let config = BackendConfig::from_type_str("REDIS", default_redis, default_ns);
+        assert!(matches!(config, BackendConfig::LayeredRedis { .. }));
     }
 }

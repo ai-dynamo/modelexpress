@@ -180,4 +180,61 @@ mod tests {
         );
         assert_eq!(sanitize_model_name("simple-model"), "simple-model");
     }
+
+    #[test]
+    fn test_sanitize_model_name_special_chars() {
+        assert_eq!(sanitize_model_name("Llama@3.1+8B"), "llama3.18b");
+        assert_eq!(sanitize_model_name("model with spaces"), "modelwithspaces");
+        assert_eq!(sanitize_model_name("org_name/model_v2"), "org-name-model-v2");
+    }
+
+    #[test]
+    fn test_sanitize_model_name_edge_cases() {
+        assert_eq!(sanitize_model_name(""), "");
+        assert_eq!(sanitize_model_name("///"), "");
+        assert_eq!(sanitize_model_name("---"), "");
+        assert_eq!(sanitize_model_name("-model-"), "model");
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_roundtrip() {
+        let original = TensorDescriptorJson {
+            name: "model.layers.0.weight".to_string(),
+            addr: "139948187451390".to_string(),
+            size: "134217728".to_string(),
+            device_id: 0,
+            dtype: "bfloat16".to_string(),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.addr, original.addr);
+        assert_eq!(parsed.size, original.size);
+        assert_eq!(parsed.device_id, original.device_id);
+        assert_eq!(parsed.dtype, original.dtype);
+
+        let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
+        assert_eq!(addr, 139948187451390);
+        let size: u64 = parsed.size.parse().expect("size should parse as u64");
+        assert_eq!(size, 134217728);
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_large_values() {
+        let desc = TensorDescriptorJson {
+            name: "test".to_string(),
+            addr: u64::MAX.to_string(),
+            size: u64::MAX.to_string(),
+            device_id: 7,
+            dtype: "float16".to_string(),
+        };
+
+        let json = serde_json::to_string(&desc).expect("serialize");
+        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
+
+        let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
+        assert_eq!(addr, u64::MAX);
+    }
 }

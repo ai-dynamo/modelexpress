@@ -161,21 +161,112 @@ impl MetadataBackend for LayeredBackend {
 mod tests {
     use super::*;
 
+    fn test_workers(rank: u32) -> Vec<WorkerMetadata> {
+        vec![WorkerMetadata {
+            worker_rank: rank,
+            nixl_metadata: vec![1, 2, 3],
+            tensors: vec![],
+        }]
+    }
+
     #[tokio::test]
     async fn test_memory_only() {
         let backend = LayeredBackend::memory_only();
         backend.connect().await.unwrap();
 
-        let workers = vec![WorkerMetadata {
-            worker_rank: 0,
-            nixl_metadata: vec![1],
-            tensors: vec![],
-        }];
-
-        backend.publish_metadata("test", workers).await.unwrap();
+        backend
+            .publish_metadata("test", test_workers(0))
+            .await
+            .unwrap();
 
         let result = backend.get_metadata("test").await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().workers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_write_through() {
+        let persistent = Arc::new(InMemoryBackend::new());
+        persistent.connect().await.unwrap();
+
+        let backend = LayeredBackend::with_persistent(persistent.clone());
+        backend.connect().await.unwrap();
+
+        backend
+            .publish_metadata("model-a", test_workers(0))
+            .await
+            .unwrap();
+
+        // Both cache and persistent should have the data
+        let from_cache = backend.get_metadata("model-a").await.unwrap();
+        assert!(from_cache.is_some(), "cache should have the data");
+
+        let from_persistent = persistent.get_metadata("model-a").await.unwrap();
+        assert!(from_persistent.is_some(), "persistent backend should have the data");
+        assert_eq!(from_persistent.unwrap().workers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_hydration_on_connect() {
+        // Pre-populate a persistent backend
+        let persistent = Arc::new(InMemoryBackend::new());
+        persistent.connect().await.unwrap();
+        persistent
+            .publish_metadata("existing-model", test_workers(0))
+            .await
+            .unwrap();
+
+        // Create a NEW layered backend pointing to the same persistent store
+        let backend = LayeredBackend::with_persistent(persistent.clone());
+        backend.connect().await.unwrap(); // should hydrate
+
+        // Cache should have the data from persistent without re-publishing
+        let result = backend.get_metadata("existing-model").await.unwrap();
+        assert!(result.is_some(), "cache should be hydrated from persistent");
+        assert_eq!(result.unwrap().workers[0].worker_rank, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hydration_multiple_models() {
+        let persistent = Arc::new(InMemoryBackend::new());
+        persistent.connect().await.unwrap();
+        persistent
+            .publish_metadata("model-1", test_workers(0))
+            .await
+            .unwrap();
+        persistent
+            .publish_metadata("model-2", test_workers(1))
+            .await
+            .unwrap();
+
+        let backend = LayeredBackend::with_persistent(persistent);
+        backend.connect().await.unwrap();
+
+        let models = backend.list_models().await.unwrap();
+        assert_eq!(models.len(), 2);
+
+        let m1 = backend.get_metadata("model-1").await.unwrap().unwrap();
+        assert_eq!(m1.workers[0].worker_rank, 0);
+        let m2 = backend.get_metadata("model-2").await.unwrap().unwrap();
+        assert_eq!(m2.workers[0].worker_rank, 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_propagates_to_persistent() {
+        let persistent = Arc::new(InMemoryBackend::new());
+        persistent.connect().await.unwrap();
+
+        let backend = LayeredBackend::with_persistent(persistent.clone());
+        backend.connect().await.unwrap();
+
+        backend
+            .publish_metadata("to-delete", test_workers(0))
+            .await
+            .unwrap();
+
+        backend.remove_metadata("to-delete").await.unwrap();
+
+        assert!(backend.get_metadata("to-delete").await.unwrap().is_none());
+        assert!(persistent.get_metadata("to-delete").await.unwrap().is_none());
     }
 }

@@ -151,24 +151,26 @@ impl BackendConfig {
     pub fn from_env() -> Self {
         let backend_type =
             std::env::var("MX_METADATA_BACKEND").unwrap_or_else(|_| "memory".to_string());
+        let redis_url = Self::redis_url_from_env();
+        let k8s_namespace = Self::k8s_namespace_from_env();
+        Self::from_type_str(&backend_type, &redis_url, &k8s_namespace)
+    }
 
+    /// Parse a backend type string into a config. Testable without env vars.
+    pub fn from_type_str(backend_type: &str, redis_url: &str, k8s_namespace: &str) -> Self {
         match backend_type.to_lowercase().as_str() {
-            "redis" => {
-                let url = Self::redis_url_from_env();
-                Self::LayeredRedis { url }
-            }
-            "redis-only" => {
-                let url = Self::redis_url_from_env();
-                Self::Redis { url }
-            }
-            "kubernetes" | "k8s" | "crd" => {
-                let namespace = Self::k8s_namespace_from_env();
-                Self::LayeredKubernetes { namespace }
-            }
-            "kubernetes-only" | "k8s-only" | "crd-only" => {
-                let namespace = Self::k8s_namespace_from_env();
-                Self::Kubernetes { namespace }
-            }
+            "redis" => Self::LayeredRedis {
+                url: redis_url.to_string(),
+            },
+            "redis-only" => Self::Redis {
+                url: redis_url.to_string(),
+            },
+            "kubernetes" | "k8s" | "crd" => Self::LayeredKubernetes {
+                namespace: k8s_namespace.to_string(),
+            },
+            "kubernetes-only" | "k8s-only" | "crd-only" => Self::Kubernetes {
+                namespace: k8s_namespace.to_string(),
+            },
             "memory" | "" => Self::Memory,
             other => {
                 tracing::warn!(
