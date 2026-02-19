@@ -23,20 +23,18 @@ This file provides context for AI assistants (Claude, Cursor, Copilot) working o
 
 ## Architecture
 
-```text
-   Node A (Source)                           Node B (Target)
-   +---------------------------+             +---------------------------+
-   | vLLM + MxSourceModelLoader|             | vLLM + MxTargetModelLoader|
-   | - Load weights from disk  |             | - Create dummy weights    |
-   | - Register with NIXL      | === RDMA ==>| - Receive via RDMA        |
-   | - Publish to server       |             | - Run FP8 processing      |
-   +-------------+-------------+             +-------------+-------------+
-                 |                                         |
-                 v                                         v
-   +---------------------------------------------------------------+
-   |                    ModelExpress Server (Rust)                  |
-   |              Redis: model_name -> worker metadata              |
-   +---------------------------------------------------------------+
+```mermaid
+graph TD
+    subgraph "Node A (Source)"
+        A[vLLM + MxSourceModelLoader<br/>- Load weights from disk<br/>- Register with NIXL<br/>- Publish to server]
+    end
+    subgraph "Node B (Target)"
+        B[vLLM + MxTargetModelLoader<br/>- Create dummy weights<br/>- Receive via RDMA<br/>- Run FP8 processing]
+    end
+    A -- "RDMA" --> B
+    A --> S
+    B --> S
+    S[ModelExpress Server - Rust<br/>Redis: model_name -> worker metadata]
 ```
 
 ### Components
@@ -208,6 +206,89 @@ Rust gRPC service implementation:
 
 ---
 
+## Build and Development Commands
+
+```bash
+# Build the project
+cargo build
+
+# Build in release mode
+cargo build --release
+
+# Run the server
+cargo run --bin modelexpress-server
+
+# Run tests
+cargo test
+
+# Run integration tests (starts server, runs test client)
+./run_integration_tests.sh
+
+# Run a specific test client
+cargo run --bin test_client -- --test-model "google-t5/t5-small"
+
+# Run clippy (required before submitting code)
+cargo clippy
+
+# Generate sample configuration file
+cargo run --bin config_gen -- --output model-express.yaml
+```
+
+---
+
+## Coding Standards
+
+- `unwrap()` is **strictly forbidden** except in benchmarks. `expect()` is allowed in tests. Always handle errors with `match`, `?`, or custom error types.
+- All cargo dependencies go in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively.
+- `cargo clippy` must pass with no warnings.
+- No emojis in code or comments.
+- Do not create markdown files to document code changes or decisions.
+- Do not over-comment code. Removing code is fine without adding comments to explain why.
+
+---
+
+## Adding CLI Arguments
+
+Client CLI arguments are defined in a shared struct to avoid duplication:
+
+1. **Add to `ClientArgs`** in `modelexpress_common/src/client_config.rs`:
+   - This is the single source of truth for shared arguments
+   - Use `#[arg(long, env = "MODEL_EXPRESS_...")]` for environment variable support
+   - Do NOT use `-v` short flag (reserved for CLI's verbose)
+
+2. **Update `ClientConfig::load()`** in the same file:
+   - Add override logic in the "APPLY CLI ARGUMENT OVERRIDES" section
+
+3. **Do NOT duplicate in `Cli`** (`modelexpress_client/src/bin/modules/args.rs`):
+   - `Cli` embeds `ClientArgs` via `#[command(flatten)]`
+   - Only add CLI-specific arguments there (e.g., `--format`, `--verbose`)
+
+4. **Add tests** in the `tests` module of `client_config.rs`
+
+---
+
+## Pre-commit Hooks
+
+This repository uses pre-commit hooks to enforce code quality. Run pre-commit after every code change, even before creating commits:
+
+```bash
+# Run all pre-commit hooks on staged files
+pre-commit run
+
+# Run on all files (recommended after significant changes)
+pre-commit run --all-files
+```
+
+The hooks include:
+- `cargo fmt` - Code formatting
+- `cargo clippy` - Linting with auto-fix
+- `cargo check` - Compilation check
+- File hygiene checks (trailing whitespace, end-of-file, YAML/TOML/JSON validation, etc.)
+
+Running pre-commit hooks early and often catches issues before they accumulate. Do not wait until commit time to discover problems.
+
+---
+
 ## Common Development Tasks
 
 ### Building Docker Image
@@ -291,31 +372,33 @@ kubectl -n $NAMESPACE exec deploy/mx-target -- curl -s http://localhost:8000/v1/
 ### The Problem
 
 DeepSeek-V3 uses FP8 quantization with scale factors. vLLM's `process_weights_after_loading()`:
-1. Renames `weight_scale_inv` → `weight_scale`
+1. Renames `weight_scale_inv` -> `weight_scale`
 2. Transforms the scale data format
 3. Deletes the original `weight_scale_inv` parameter
 
-If we transfer AFTER processing, source has `weight_scale` but target expects `weight_scale_inv` → **mismatch!**
+If we transfer AFTER processing, source has `weight_scale` but target expects `weight_scale_inv` -> mismatch.
 
 ### The Solution
 
 Transfer RAW tensors BEFORE `process_weights_after_loading()` runs:
 
-```text
-Source:                              Target:
-┌─────────────────────┐              ┌─────────────────────┐
-│ Load weight_scale_inv│              │ Dummy weight_scale_inv│
-│ from safetensors    │              │                     │
-├─────────────────────┤              ├─────────────────────┤
-│ Register raw tensors│───RDMA──────>│ Receive raw tensors │
-│ with NIXL           │              │ into dummy memory   │
-├─────────────────────┤              ├─────────────────────┤
-│ process_weights:    │              │ process_weights:    │
-│ scale_inv → scale   │              │ scale_inv → scale   │
-│ (identical)         │              │ (identical)         │
-└─────────────────────┘              └─────────────────────┘
-         ↓                                    ↓
-   Identical weights!                  Identical weights!
+```mermaid
+graph TD
+    subgraph Source
+        S1[Load weight_scale_inv<br/>from safetensors]
+        S2[Register raw tensors<br/>with NIXL]
+        S3[process_weights:<br/>scale_inv -> scale]
+        S4[Identical weights]
+        S1 --> S2 --> S3 --> S4
+    end
+    subgraph Target
+        T1[Dummy weight_scale_inv]
+        T2[Receive raw tensors<br/>into dummy memory]
+        T3[process_weights:<br/>scale_inv -> scale]
+        T4[Identical weights]
+        T1 --> T2 --> T3 --> T4
+    end
+    S2 -- "RDMA" --> T2
 ```
 
 ---
@@ -377,7 +460,7 @@ DeepSeek-V3 takes ~40 minutes to fully warm up (loading + DeepGemm + CUDA graphs
 | Metric | Value |
 |--------|-------|
 | Model | DeepSeek-V3 (671B, FP8) |
-| Total Data | 681 GB (8 workers × 85 GB) |
+| Total Data | 681 GB (8 workers x 85 GB) |
 | Transfer Time | ~15 seconds (8 parallel RDMA streams @ 112 Gbps each) |
 | Per-Worker Speed | 60-112 Gbps |
 | Theoretical Max | 400 Gbps per NIC |
@@ -413,4 +496,13 @@ See `docs/OPTIMIZATION_PLAN.md` for detailed analysis:
 4. **Use baseline mode**: `MX_CONTIGUOUS_REG=0` until contiguous is fixed
 5. **Long startup times are normal**: DeepSeek-V3 takes ~40 min to warm up
 6. **UCX errors need DEBUG logging**: Set `UCX_LOG_LEVEL=DEBUG` for diagnostics
-7. **NIXL agents must match ranks**: Source rank 0 → Target rank 0
+7. **NIXL agents must match ranks**: Source rank 0 -> Target rank 0
+
+---
+
+## AI Agent Instructions
+
+When introducing new patterns, conventions, or architectural decisions that affect how code should be written, update ALL AI agent instruction files:
+- `CLAUDE.md` (Claude Code)
+- `.github/copilot-instructions.md` (GitHub Copilot)
+- `.cursor/rules/rust.mdc` (Cursor)
