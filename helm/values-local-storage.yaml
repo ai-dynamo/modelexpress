@@ -67,6 +67,8 @@ env:
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   # Note: HOME is set to /root so HuggingFace cache uses /root/.cache/huggingface
   HOME: "/root"
+  # Disable Redis - use a port that will get immediate connection refused
+  REDIS_URL: "redis://127.0.0.1:1"
 
 livenessProbe:
   enabled: true

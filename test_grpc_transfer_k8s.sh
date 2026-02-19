@@ -122,9 +122,10 @@ check_prerequisites() {
     # Install kind if not available
     if ! command -v kind &> /dev/null; then
         log_info "Installing kind..."
-        curl -Lo /tmp/kind "https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64" 2>/dev/null
-        chmod +x /tmp/kind
-        sudo mv /tmp/kind /usr/local/bin/kind
+        mkdir -p "$HOME/.local/bin"
+        curl -Lo "$HOME/.local/bin/kind" "https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64" 2>/dev/null
+        chmod +x "$HOME/.local/bin/kind"
+        export PATH="$HOME/.local/bin:$PATH"
         log_success "kind installed"
     fi
 
