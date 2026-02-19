@@ -99,6 +99,8 @@ cleanup() {
     fi
 }
 
+trap cleanup EXIT
+
 check_prerequisites() {
     log_info "Checking prerequisites..."
 
@@ -359,8 +361,6 @@ log_info "gRPC File Transfer Kubernetes Test"
 log_info "Mode: $TEST_MODE"
 log_info "Model: $TEST_MODEL"
 echo ""
-
-trap cleanup EXIT
 
 check_prerequisites
 build_and_load_image
