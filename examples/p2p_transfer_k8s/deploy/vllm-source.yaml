@@ -84,7 +84,7 @@ spec:
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
-              value: "WARN"
+              value: "INFO"
             # UCX transport settings for GPUDirect RDMA
             - name: UCX_TLS
               value: "rc_x,rc,dc_x,dc,cuda_copy"
