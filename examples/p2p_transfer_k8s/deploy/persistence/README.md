@@ -8,19 +8,19 @@ enable **write-through persistence** to Redis or Kubernetes CRDs.
 
 ```
 ┌────────────────────────────────────────────────────┐
-│                ModelExpress Server                  │
+│                ModelExpress Server                 │
 │                                                    │
 │  ┌──────────────────────────────────────────────┐  │
 │  │         In-Memory Cache (always on)          │  │
-│  │    Fast reads/writes via RwLock<HashMap>      │  │
+│  │    Fast reads/writes via RwLock<HashMap>     │  │
 │  └───────────────────┬──────────────────────────┘  │
-│                      │ write-through (optional)     │
-│            ┌─────────┴──────────┐                   │
-│            ▼                    ▼                    │
-│  ┌──────────────────┐ ┌────────────────────┐        │
-│  │  Redis Backend   │ │ Kubernetes CRD     │        │
-│  │  (HA, fast)      │ │ Backend (native)   │        │
-│  └──────────────────┘ └────────────────────┘        │
+│                      │ write-through (optional)    │
+│            ┌─────────┴──────────┐                  │
+│            ▼                    ▼                  │
+│  ┌──────────────────┐ ┌────────────────────┐       │
+│  │  Redis Backend   │ │ Kubernetes CRD     │       │
+│  │  (HA, fast)      │ │ Backend (native)   │       │    
+│  └──────────────────┘ └────────────────────┘       │
 └────────────────────────────────────────────────────┘
 ```
 
