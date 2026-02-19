@@ -1,5 +1,5 @@
 <!--
-SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
 
@@ -109,7 +109,7 @@ docker-compose up --build
 
 # Or build and run manually
 docker build -t model-express .
-docker run -p 8000:8000 model-express
+docker run -p 8001:8001 model-express
 ```
 
 ### Option 3: Kubernetes Deployment

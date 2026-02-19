@@ -1,13 +1,6 @@
----
-description: Rust writing rules.
-globs:
-  - "**/*.rs"
-alwaysApply: true
----
-
 # ModelExpress - AI Assistant Context
 
-This file provides context for AI assistants working on the ModelExpress codebase. It summarizes the project architecture, key concepts, and common development patterns.
+This file provides context for AI assistants (Claude, Cursor, Copilot) working on the ModelExpress codebase. It summarizes the project architecture, key concepts, and common development patterns.
 
 ## Project Overview
 
@@ -130,6 +123,7 @@ UCX_LOG_LEVEL: "WARN"         # DEBUG for troubleshooting
 
 ```text
 modelexpress/
+├── CLAUDE.md                 # THIS FILE (project root) - AI assistant context
 ├── modelexpress_server/      # Rust gRPC server
 │   └── src/
 │       ├── main.rs
@@ -170,14 +164,14 @@ Contains custom vLLM model loaders:
 ```python
 class MxSourceModelLoader(DefaultModelLoader):
     """Loads model from disk and publishes for RDMA transfer."""
-
+    
     def load_model(self, vllm_config, model_config):
         model = initialize_model(...)
         self.load_weights(model, model_config)  # Load from disk
-
+        
         # CRITICAL: Register BEFORE FP8 processing
         self._register_raw_tensors(model, device)
-
+        
         process_weights_after_loading(...)  # FP8 transform
         return model.eval()
 ```
@@ -194,10 +188,10 @@ Contains `NixlTransferManager`:
 ```python
 class NixlTransferManager:
     """Manages NIXL agent and RDMA transfers for a single GPU worker."""
-
+    
     def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
         """Register tensors with NIXL for RDMA access."""
-
+        
     def receive_from_source(self, source_tensors, source_metadata, ...):
         """Execute RDMA transfer from source to local tensors."""
 ```
@@ -496,7 +490,7 @@ See `docs/OPTIMIZATION_PLAN.md` for detailed analysis:
 
 ## Tips for AI Assistants
 
-1. **Always read before editing**: Read files to understand context before making changes
+1. **Always read before editing**: Use the Read tool to understand context
 2. **Check pod status first**: Many issues are caused by pod restarts
 3. **Flush Redis on redeploy**: Stale metadata causes transfer failures
 4. **Use baseline mode**: `MX_CONTIGUOUS_REG=0` until contiguous is fixed

@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM vllm/vllm-openai:v0.12.0
+
+# Copy and install ModelExpress Python client
+# Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;
+# regenerate them with grpcio-tools when p2p.proto changes.
+COPY modelexpress_client/python /opt/modelexpress/client
+WORKDIR /opt/modelexpress/client
+RUN pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
+    pip install .
+
+# Patch vLLM's model loader __init__.py to include ModelExpress loaders
+# This ensures the loaders are available in ALL processes (including workers)
+RUN LOADER_INIT="$(python3 -c 'import site; print(site.getsitepackages()[0])')/vllm/model_executor/model_loader/__init__.py" && \
+    echo '' >> $LOADER_INIT && \
+    echo '# ModelExpress custom loaders for FP8 models (DeepSeek-V3, etc.)' >> $LOADER_INIT && \
+    echo 'import os as _os' >> $LOADER_INIT && \
+    echo 'if _os.environ.get("MX_REGISTER_LOADERS", "0") == "1":' >> $LOADER_INIT && \
+    echo '    try:' >> $LOADER_INIT && \
+    echo '        from modelexpress.vllm_loader import MxSourceModelLoader, MxTargetModelLoader' >> $LOADER_INIT && \
+    echo '        _LOAD_FORMAT_TO_MODEL_LOADER["mx-source"] = MxSourceModelLoader' >> $LOADER_INIT && \
+    echo '        _LOAD_FORMAT_TO_MODEL_LOADER["mx-target"] = MxTargetModelLoader' >> $LOADER_INIT && \
+    echo '    except ImportError:' >> $LOADER_INIT && \
+    echo '        pass' >> $LOADER_INIT
+
+# Back to default workdir
+WORKDIR /workspace

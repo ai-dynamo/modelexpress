@@ -21,7 +21,7 @@ serviceAccount:
   create: true
   annotations: {}
   name: ""
-  automount: true
+  automount: false
 
 podAnnotations: {}
 
@@ -59,9 +59,11 @@ resources:
   limits:
     cpu: 500m
     memory: 256Mi
+    ephemeral-storage: 1Gi
   requests:
     cpu: 200m
     memory: 128Mi
+    ephemeral-storage: 256Mi
 
 persistence:
   enabled: true

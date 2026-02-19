@@ -52,6 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
