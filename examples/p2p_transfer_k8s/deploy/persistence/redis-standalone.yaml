@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Standalone Redis with PVC for persistence testing
-# Data survives pod restarts and MX server restarts
+# Standalone Redis with PVC for persistence testing.
+# Data survives pod restarts and MX server restarts.
+# NOTE: This deploys Redis without authentication (no --requirepass).
+# For production, add --requirepass with a K8s Secret reference.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
