@@ -234,6 +234,30 @@ jobs:
         timeout 30 bash -c 'until curl -s http://localhost:8001/health; do sleep 1; done' || echo "Health check failed (expected for gRPC)"
         docker stop test-server || true
 
+  k8s-grpc-test:
+    name: Kubernetes gRPC Transfer Test
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Install Helm
+      run: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: Run gRPC transfer K8s test
+      run: |
+        chmod +x test_grpc_transfer_k8s.sh
+        ./test_grpc_transfer_k8s.sh
+
   benchmark:
     name: Performance Benchmarks
     runs-on: ubuntu-latest
@@ -263,7 +287,7 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [test, integration-test, security-audit, docker-build]
+    needs: [test, integration-test, security-audit, docker-build, k8s-grpc-test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
@@ -306,7 +330,7 @@ jobs:
   notify:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [test, integration-test, security-audit, docker-build]
+    needs: [test, integration-test, security-audit, docker-build, k8s-grpc-test]
     if: failure()
 
     steps:
