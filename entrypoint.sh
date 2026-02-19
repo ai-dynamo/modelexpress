@@ -48,6 +48,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Start the main server (blocking)
+# Start the main server. Run it in the background and wait so the shell stays
+# alive to handle signals and the cleanup trap can fire to kill the sidecar.
 echo "Starting ModelExpress server..."
-exec /app/modelexpress-server "$@"
+/app/modelexpress-server "$@" &
+SERVER_PID=$!
+wait $SERVER_PID

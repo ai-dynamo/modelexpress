@@ -148,6 +148,6 @@ async def test_download_nonexistent_bucket(client: AsyncClient):
         )
         assert response.status_code == 200
         data = response.json()
-        # Download may succeed but return empty files, or fail entirely
-        # depending on S3 behavior with non-existent prefixes
-        assert "success" in data
+        # A non-existent bucket should always fail with boto3
+        assert data["success"] is False
+        assert "error" in data

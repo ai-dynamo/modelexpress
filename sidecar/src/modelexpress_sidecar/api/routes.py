@@ -58,8 +58,8 @@ async def get_model(
     try:
         result = await downloader.get_model(model_id, cache_dir)
         return result
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found") from err
     except Exception as e:
         logger.exception("Failed to get model: %s", model_id)
         return GetModelResponse(
@@ -81,8 +81,8 @@ async def delete_model(
     try:
         result = await downloader.delete_model(model_id, cache_dir)
         return result
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    except FileNotFoundError as err:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found") from err
     except Exception as e:
         logger.exception("Failed to delete model: %s", model_id)
         return DeleteResponse(

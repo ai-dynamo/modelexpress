@@ -5,6 +5,7 @@ use crate::config::{GcsCredentials, S3Credentials, SidecarConfig};
 use crate::providers::ModelProviderTrait;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -20,7 +21,7 @@ pub struct ModelStreamerProvider {
 }
 
 /// Request to download a model from the sidecar
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct DownloadRequest {
     model_path: String,
     cache_dir: String,
@@ -29,8 +30,27 @@ struct DownloadRequest {
     gcs_credentials: Option<GcsCredentialsPayload>,
 }
 
+/// Redact credential fields so secrets are never leaked in logs or debug output.
+impl fmt::Debug for DownloadRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DownloadRequest")
+            .field("model_path", &self.model_path)
+            .field("cache_dir", &self.cache_dir)
+            .field("ignore_weights", &self.ignore_weights)
+            .field(
+                "s3_credentials",
+                &self.s3_credentials.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "gcs_credentials",
+                &self.gcs_credentials.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
 /// S3 credentials payload for sidecar requests
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct S3CredentialsPayload {
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
@@ -39,7 +59,7 @@ struct S3CredentialsPayload {
 }
 
 /// GCS credentials payload for sidecar requests
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct GcsCredentialsPayload {
     credentials_file: Option<String>,
     credentials_json: Option<String>,
@@ -154,32 +174,12 @@ impl ModelStreamerProvider {
         {
             // rest = "endpoint:port/bucket/path" - skip the endpoint (first segment)
             if let Some(pos) = rest.find('/') {
-                return format!("s3/{}", &rest[pos + 1..]);
+                return format!("s3/{}", &rest[pos.saturating_add(1)..]);
             }
             return "s3/".to_string();
         }
 
-        model_path
-            .replace("s3://", "s3/")
-            .replace("gs://", "gs/")
-    }
-
-    /// Weight file extensions, matching the Python sidecar's WEIGHT_EXTENSIONS.
-    const WEIGHT_EXTENSIONS: &'static [&'static str] =
-        &[".bin", ".safetensors", ".h5", ".msgpack", ".ckpt"];
-
-    /// Files that should be ignored during download, matching the Python sidecar's IGNORED_FILES.
-    const IGNORED_FILES: &'static [&'static str] = &[".gitattributes", ".gitignore", "README.md"];
-
-    /// Check if a file is a model weight file.
-    fn is_weight_file(filename: &str) -> bool {
-        let lower = filename.to_lowercase();
-        Self::WEIGHT_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-    }
-
-    /// Check if a file should be ignored.
-    fn is_ignored(filename: &str) -> bool {
-        Self::IGNORED_FILES.iter().any(|name| filename == *name)
+        model_path.replace("s3://", "s3/").replace("gs://", "gs/")
     }
 
     /// Build S3 credentials payload for the request
@@ -509,19 +509,5 @@ mod tests {
             creds.credentials_file,
             Some("/path/to/creds.json".to_string())
         );
-    }
-
-    #[test]
-    fn test_is_weight_file() {
-        assert!(ModelStreamerProvider::is_weight_file("model.safetensors"));
-        assert!(ModelStreamerProvider::is_weight_file("weights.bin"));
-        assert!(!ModelStreamerProvider::is_weight_file("config.json"));
-    }
-
-    #[test]
-    fn test_is_ignored() {
-        assert!(ModelStreamerProvider::is_ignored("README.md"));
-        assert!(ModelStreamerProvider::is_ignored(".gitignore"));
-        assert!(!ModelStreamerProvider::is_ignored("model.safetensors"));
     }
 }

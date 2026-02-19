@@ -418,7 +418,7 @@ impl SidecarConfig {
 }
 
 /// S3 credentials configuration for Model Streamer
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct S3Credentials {
     /// AWS access key ID
     pub access_key_id: Option<String>,
@@ -431,6 +431,24 @@ pub struct S3Credentials {
 
     /// Custom S3 endpoint (for MinIO or other S3-compatible storage)
     pub endpoint: Option<String>,
+}
+
+/// Redact secret fields so credentials are never leaked in logs or debug output.
+impl fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl S3Credentials {
@@ -454,13 +472,26 @@ impl S3Credentials {
 }
 
 /// GCS credentials configuration for Model Streamer
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct GcsCredentials {
     /// Path to GCS credentials JSON file
     pub credentials_file: Option<String>,
 
     /// Base64-encoded credentials JSON (alternative to file)
     pub credentials_json: Option<String>,
+}
+
+/// Redact secret fields so credentials are never leaked in logs or debug output.
+impl fmt::Debug for GcsCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsCredentials")
+            .field("credentials_file", &self.credentials_file)
+            .field(
+                "credentials_json",
+                &self.credentials_json.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl GcsCredentials {

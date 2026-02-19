@@ -104,7 +104,13 @@ class ModelDownloader:
         path = parts[2] if len(parts) > 2 else ""
 
         cache_base = Path(cache_dir) if cache_dir else self.default_cache_dir
-        return cache_base / CACHE_SUBDIR / scheme / bucket / path
+        resolved = (cache_base / CACHE_SUBDIR / scheme / bucket / path).resolve()
+
+        # Prevent path traversal (e.g. model_id = "../../etc/passwd")
+        if not str(resolved).startswith(str((cache_base / CACHE_SUBDIR).resolve())):
+            raise ValueError(f"Invalid model_id: path escapes cache directory")
+
+        return resolved
 
     def _setup_credentials(
         self,
