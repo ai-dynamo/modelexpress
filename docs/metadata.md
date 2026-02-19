@@ -239,7 +239,7 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: deepseek-ai-deepseek-v3  # Sanitized model name
-  namespace: kavin
+  namespace: default  # Change to your target namespace
   labels:
     modelexpress.nvidia.com/model: deepseek-ai/DeepSeek-V3
   ownerReferences:
@@ -281,7 +281,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: deepseek-ai-deepseek-v3-tensors-worker-0
-  namespace: kavin
+  namespace: default  # Change to your target namespace
   labels:
     modelexpress.nvidia.com/model: deepseek-ai/DeepSeek-V3
     modelexpress.nvidia.com/worker: "0"
@@ -508,10 +508,88 @@ class MetadataClient:
 ```yaml
 # Environment variables
 MX_METADATA_BACKEND: "kubernetes"  # or "redis" (default)
-MX_METADATA_NAMESPACE: "kavin"     # For CRD backend
+MX_METADATA_NAMESPACE: "default"   # For CRD backend — change to your namespace
 MX_REDIS_HOST: "modelexpress-server"  # For Redis backend
 MX_REDIS_PORT: "6379"
 ```
+
+---
+
+## Debugging the metadata feature
+
+Use this checklist to confirm that metadata and ready coordination still work end-to-end (gRPC or K8s backend).
+
+### Prerequisites
+
+| Component | Check |
+|-----------|--------|
+| **Client backend** | `MX_METADATA_BACKEND` is `grpc` or `memory` (or unset) so the client talks to the ModelExpress server. For K8s-native, use `kubernetes` / `k8s` / `crd`. |
+| **Server address** | Clients reach the server: `MX_SERVER_ADDRESS` or `MODEL_EXPRESS_URL` (default `modelexpress-server:8001`). |
+| **Server backend** | Server `MX_METADATA_BACKEND` (or equivalent) set to `memory`, `redis`, or `kubernetes` as intended. Ready is always in-memory on the server. |
+| **Namespace (K8s backend)** | `MX_METADATA_NAMESPACE` or `POD_NAMESPACE` set where the ModelMetadata CRs live. |
+
+### 1. Verify server is reachable
+
+From a pod that can reach the server (or with port-forward):
+
+```bash
+# Health (if your server exposes it on the same port)
+grpcurl -plaintext <server_host>:8001 list
+
+# P2P gRPC: check that metadata for a model is absent (before source publishes) or present (after)
+grpcurl -plaintext -d '{"model_name":"Qwen/Qwen2.5-0.5B"}' <server_host>:8001 model_express.p2p.P2pService/GetMetadata
+
+# After source is ready, check ready flag for worker 0
+grpcurl -plaintext -d '{"model_name":"Qwen/Qwen2.5-0.5B","worker_id":0}' <server_host>:8001 model_express.p2p.P2pService/GetReady
+```
+
+If using **Kubernetes backend**, also inspect CRs:
+
+```bash
+kubectl get modelmetadatas -n <namespace>
+kubectl get modelmetadata <sanitized-model-name> -n <namespace> -o yaml
+```
+
+### 2. Verify source path
+
+Source must: (1) publish metadata, (2) run warmup, (3) publish ready.
+
+- **Logs**: In the **source** pod logs, look for:
+  - Success from publishing metadata (e.g. `publish_metadata` success or no exception after `_publish_metadata_to_server`).
+  - Success from publishing ready (e.g. after warmup, `PublishReady` or ready-signal success).
+- **Server state**: After source is up, call `GetMetadata` and `GetReady` as above; `found: true` and `ready: true` (with `worker_id` matching) mean the server has metadata and ready.
+
+### 3. Verify target path
+
+Target must: (1) wait for ready, (2) get metadata, (3) run RDMA transfer.
+
+- **Logs**: In the **target** pod logs, look for:
+  - `modelexpress.vllm_loader` messages: `MxTargetModelLoader.load_model() STARTING`, then `[TIMING] ... Receiving raw tensors via RDMA`, then `Source NIXL ready` or `ALL ... source workers are ready`, then `RDMA TRANSFER COMPLETE` / `Bandwidth: ... Gbps`.
+  - If you see `Waiting for source` or repeated GetReady polling with no success, the target is blocked on ready (source not ready or server not returning ready).
+  - If you see `get_metadata` returning no workers or an error, the server has no metadata for that model (or wrong model name).
+- **Quick log grep** (see also `docs/troubleshooting_p2p_target_logs.md`):
+  ```bash
+  kubectl logs -n <namespace> -l app=mx-target 2>&1 | grep -iE "modelexpress|TIMING|wait_for_ready|get_metadata|NIXL|Source.*ready"
+  ```
+
+### 4. Common failures
+
+| Symptom | Likely cause |
+|--------|----------------|
+| Target never sees "Source NIXL ready" / "ALL source workers ready" | Source has not published ready yet; or client backend is not gRPC so target is not polling the server; or server not reachable / wrong port. |
+| GetMetadata returns `found: false` | Source has not published metadata; or wrong `model_name` (e.g. casing, slash); or server backend misconfigured / not persisting. |
+| GetReady returns `found: false` or `ready: false` | Source has not called PublishReady yet (still loading or warming up); or ready stored only in-memory and server was restarted. |
+| K8s: CR or ConfigMaps missing | Source failed to create/patch ModelMetadata or ConfigMaps (check source logs and RBAC). |
+| "NIXL not available" on target | NIXL not installed or not loadable in the target image; metadata/ready can still work, but RDMA transfer will not. |
+
+### 5. End-to-end sanity check
+
+1. Start server (e.g. in-memory backend).
+2. Start source with `--load-format mx-source`, wait until vLLM is healthy and warmup completes.
+3. Check server: `GetMetadata(model_name)` has workers, `GetReady(model_name, 0)` is ready.
+4. Start target with `--load-format mx-target`.
+5. In target logs, confirm: `wait_for_ready` succeeds, `get_metadata` returns workers, then RDMA/TIMING lines.
+6. Run an inference request against the target to confirm full path.
 
 ---
 

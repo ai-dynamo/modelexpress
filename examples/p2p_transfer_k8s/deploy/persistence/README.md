@@ -7,21 +7,21 @@ enable **write-through persistence** to Redis or Kubernetes CRDs.
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                 ModelExpress Server                    │
-│                                                       │
-│   ┌─────────────────────────────────────────────┐    │
-│   │          In-Memory Cache (always on)         │    │
-│   │   Fast reads/writes via RwLock<HashMap>      │    │
-│   └────────────────────┬────────────────────────┘    │
-│                        │ write-through (optional)     │
-│              ┌─────────┴──────────┐                  │
-│              ▼                    ▼                   │
-│   ┌──────────────────┐ ┌────────────────────┐        │
-│   │   Redis Backend  │ │ Kubernetes CRD     │        │
-│   │   (HA, fast)     │ │ Backend (native)   │        │
-│   └──────────────────┘ └────────────────────┘        │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────┐
+│                ModelExpress Server                  │
+│                                                    │
+│  ┌──────────────────────────────────────────────┐  │
+│  │         In-Memory Cache (always on)          │  │
+│  │    Fast reads/writes via RwLock<HashMap>      │  │
+│  └───────────────────┬──────────────────────────┘  │
+│                      │ write-through (optional)     │
+│            ┌─────────┴──────────┐                   │
+│            ▼                    ▼                    │
+│  ┌──────────────────┐ ┌────────────────────┐        │
+│  │  Redis Backend   │ │ Kubernetes CRD     │        │
+│  │  (HA, fast)      │ │ Backend (native)   │        │
+│  └──────────────────┘ └────────────────────┘        │
+└────────────────────────────────────────────────────┘
 ```
 
 On startup, the server **hydrates** the in-memory cache from the persistent backend,

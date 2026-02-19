@@ -356,10 +356,13 @@ impl MetadataBackend for KubernetesBackend {
         // Reconstruct workers from status + ConfigMaps
         let mut workers = Vec::new();
         for worker_status in status.workers {
-            // Decode NIXL metadata
+            // Decode NIXL metadata — propagate error instead of silently returning empty
             let nixl_metadata = BASE64
                 .decode(&worker_status.nixl_metadata)
-                .unwrap_or_default();
+                .map_err(|e| format!(
+                    "Failed to decode NIXL metadata for worker {}: {}",
+                    worker_status.worker_rank, e
+                ))?;
 
             // Read tensors from ConfigMap
             let tensors = if let Some(cm_name) = &worker_status.tensor_config_map {

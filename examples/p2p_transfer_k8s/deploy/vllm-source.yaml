@@ -73,11 +73,9 @@ spec:
               value: "1"
             - name: MX_EXPECTED_WORKERS
               value: "8"
-            # Metadata backend: "kubernetes" (default) or "redis"
-            # Metadata backend: "grpc" (default), "redis", or "kubernetes"
-            # For persistence options, see persistence/ folder
-            # - name: MX_METADATA_BACKEND
-            #   value: "grpc"
+            # Client always uses gRPC to the MX server.
+            # Server-side persistence (Redis/CRD) is configured on the server only.
+            # See persistence/ folder for server backend options.
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
@@ -124,15 +122,17 @@ spec:
                 curl -sf -X POST http://127.0.0.1:8000/v1/completions \
                   -H 'Content-Type: application/json' \
                   -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
-                # Publish ready signal via metadata backend (CRD or Redis)
+                # Publish ready signal via gRPC to MX server
                 python3 -c '
-              from modelexpress.metadata_client import get_backend
-              import os
-              backend = get_backend()
+              from modelexpress.client import MxClient
+              import os, uuid
+              server = os.environ.get("MX_SERVER_ADDRESS", "modelexpress-server:8001")
+              client = MxClient(server)
               model = os.environ.get("MODEL_NAME", "unknown")
+              session_id = str(uuid.uuid4())
               workers = int(os.environ.get("MX_EXPECTED_WORKERS", "8"))
               for w in range(workers):
-                  backend.publish_ready(model, w)
+                  client.publish_ready(model_name=model, worker_id=w, session_id=session_id, metadata_hash="")
                   print(f"Published ready for worker {w}")
               '
               ) &

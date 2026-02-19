@@ -73,10 +73,9 @@ spec:
               value: "1"
             - name: MX_EXPECTED_WORKERS
               value: "8"
-            # Metadata backend: "grpc" (default), "redis", or "kubernetes"
-            # For persistence options, see persistence/ folder
-            # - name: MX_METADATA_BACKEND
-            #   value: "grpc"
+            # Client always uses gRPC to the MX server.
+            # Server-side persistence (Redis/CRD) is configured on the server only.
+            # See persistence/ folder for server backend options.
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
@@ -85,7 +84,7 @@ spec:
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
-              value: "WARN"
+              value: "INFO"
             # UCX transport settings for GPUDirect RDMA
             - name: UCX_TLS
               value: "rc_x,rc,dc_x,dc,cuda_copy"
