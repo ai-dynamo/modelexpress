@@ -17,7 +17,7 @@ RELEASE_NAME="modelexpress-test"
 NAMESPACE="modelexpress-test"
 IMAGE_NAME="modelexpress"
 IMAGE_TAG="test"
-TEST_MODEL="google-t5/t5-small"
+TEST_MODEL="hf-internal-testing/tiny-random-gpt2"
 TIMEOUT_SECONDS=600
 CLEANUP=true
 TEST_MODE="all"  # "cli", "env", or "all"
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --no-cleanup    Don't cleanup resources after test"
-            echo "  --model NAME    Model to use for testing (default: google-t5/t5-small)"
+            echo "  --model NAME    Model to use for testing (default: hf-internal-testing/tiny-random-gpt2)"
             echo "  --timeout SECS  Timeout in seconds (default: 600)"
             echo "  --mode MODE     Test mode: 'cli', 'env', or 'all' (default: all)"
             echo "  -h, --help      Show this help message"
@@ -259,11 +259,11 @@ EOF
     local deadline=$((SECONDS + TIMEOUT_SECONDS))
     local job_result=""
     while [ $SECONDS -lt $deadline ]; do
-        local status
-        status=$(kubectl get job/grpc-transfer-test-cli -n "$NAMESPACE" \
-            -o jsonpath='{.status.conditions[0].type}' 2>/dev/null || true)
-        if [ "$status" = "Complete" ]; then job_result="complete"; break; fi
-        if [ "$status" = "Failed" ]; then job_result="failed"; break; fi
+        local conditions
+        conditions=$(kubectl get job/grpc-transfer-test-cli -n "$NAMESPACE" \
+            -o jsonpath='{.status.conditions[*].type}' 2>/dev/null || true)
+        if echo "$conditions" | grep -qw "Complete"; then job_result="complete"; break; fi
+        if echo "$conditions" | grep -qw "Failed"; then job_result="failed"; break; fi
         sleep 5
     done
     if [ "$job_result" = "complete" ]; then
@@ -357,11 +357,11 @@ EOF
     local deadline=$((SECONDS + TIMEOUT_SECONDS))
     local job_result=""
     while [ $SECONDS -lt $deadline ]; do
-        local status
-        status=$(kubectl get job/grpc-transfer-test-env -n "$NAMESPACE" \
-            -o jsonpath='{.status.conditions[0].type}' 2>/dev/null || true)
-        if [ "$status" = "Complete" ]; then job_result="complete"; break; fi
-        if [ "$status" = "Failed" ]; then job_result="failed"; break; fi
+        local conditions
+        conditions=$(kubectl get job/grpc-transfer-test-env -n "$NAMESPACE" \
+            -o jsonpath='{.status.conditions[*].type}' 2>/dev/null || true)
+        if echo "$conditions" | grep -qw "Complete"; then job_result="complete"; break; fi
+        if echo "$conditions" | grep -qw "Failed"; then job_result="failed"; break; fi
         sleep 5
     done
     if [ "$job_result" = "complete" ]; then
