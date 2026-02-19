@@ -255,7 +255,17 @@ spec:
 EOF
 
     log_info "Waiting for CLI flags test job to complete..."
-    if kubectl wait --for=condition=complete job/grpc-transfer-test-cli -n "$NAMESPACE" --timeout="${TIMEOUT_SECONDS}s" 2>/dev/null; then
+    local deadline=$((SECONDS + TIMEOUT_SECONDS))
+    local job_result=""
+    while [ $SECONDS -lt $deadline ]; do
+        local status
+        status=$(kubectl get job/grpc-transfer-test-cli -n "$NAMESPACE" \
+            -o jsonpath='{.status.conditions[0].type}' 2>/dev/null || true)
+        if [ "$status" = "Complete" ]; then job_result="complete"; break; fi
+        if [ "$status" = "Failed" ]; then job_result="failed"; break; fi
+        sleep 5
+    done
+    if [ "$job_result" = "complete" ]; then
         log_info "Job output:"
         kubectl logs job/grpc-transfer-test-cli -n "$NAMESPACE" | tail -20
         log_success "CLI flags test PASSED"
@@ -343,7 +353,17 @@ spec:
 EOF
 
     log_info "Waiting for environment variables test job to complete..."
-    if kubectl wait --for=condition=complete job/grpc-transfer-test-env -n "$NAMESPACE" --timeout="${TIMEOUT_SECONDS}s" 2>/dev/null; then
+    local deadline=$((SECONDS + TIMEOUT_SECONDS))
+    local job_result=""
+    while [ $SECONDS -lt $deadline ]; do
+        local status
+        status=$(kubectl get job/grpc-transfer-test-env -n "$NAMESPACE" \
+            -o jsonpath='{.status.conditions[0].type}' 2>/dev/null || true)
+        if [ "$status" = "Complete" ]; then job_result="complete"; break; fi
+        if [ "$status" = "Failed" ]; then job_result="failed"; break; fi
+        sleep 5
+    done
+    if [ "$job_result" = "complete" ]; then
         log_info "Job output:"
         kubectl logs job/grpc-transfer-test-env -n "$NAMESPACE" | tail -20
         log_success "Environment variables test PASSED"
