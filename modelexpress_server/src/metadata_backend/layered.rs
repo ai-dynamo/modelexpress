@@ -202,7 +202,10 @@ mod tests {
         assert!(from_cache.is_some(), "cache should have the data");
 
         let from_persistent = persistent.get_metadata("model-a").await.unwrap();
-        assert!(from_persistent.is_some(), "persistent backend should have the data");
+        assert!(
+            from_persistent.is_some(),
+            "persistent backend should have the data"
+        );
         assert_eq!(from_persistent.unwrap().workers.len(), 1);
     }
 
@@ -267,6 +270,12 @@ mod tests {
         backend.remove_metadata("to-delete").await.unwrap();
 
         assert!(backend.get_metadata("to-delete").await.unwrap().is_none());
-        assert!(persistent.get_metadata("to-delete").await.unwrap().is_none());
+        assert!(
+            persistent
+                .get_metadata("to-delete")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

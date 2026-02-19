@@ -316,9 +316,7 @@ mod tests {
 
         // Redis-only
         let config = BackendConfig::from_type_str("redis-only", "redis://myhost:6379", default_ns);
-        assert!(
-            matches!(config, BackendConfig::Redis { url } if url == "redis://myhost:6379")
-        );
+        assert!(matches!(config, BackendConfig::Redis { url } if url == "redis://myhost:6379"));
 
         // Kubernetes (layered)
         let config = BackendConfig::from_type_str("kubernetes", default_redis, "prod-ns");

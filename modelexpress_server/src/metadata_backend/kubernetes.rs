@@ -90,14 +90,16 @@ impl KubernetesBackend {
         );
 
         let owner_references = match (owner_name, owner_uid) {
-            (Some(name), Some(uid)) => Some(vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                api_version: "modelexpress.nvidia.com/v1alpha1".to_string(),
-                kind: "ModelMetadata".to_string(),
-                name: name.to_string(),
-                uid: uid.to_string(),
-                controller: Some(true),
-                block_owner_deletion: Some(true),
-            }]),
+            (Some(name), Some(uid)) => Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "modelexpress.nvidia.com/v1alpha1".to_string(),
+                    kind: "ModelMetadata".to_string(),
+                    name: name.to_string(),
+                    uid: uid.to_string(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                },
+            ]),
             _ => None,
         };
 
@@ -231,7 +233,10 @@ impl MetadataBackend for KubernetesBackend {
                     info!("Created ModelMetadata CR '{}'", cr_name);
                 }
                 Err(kube::Error::Api(err)) if err.code == 409 => {
-                    debug!("ModelMetadata CR '{}' already exists, proceeding to update", cr_name);
+                    debug!(
+                        "ModelMetadata CR '{}' already exists, proceeding to update",
+                        cr_name
+                    );
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -247,8 +252,11 @@ impl MetadataBackend for KubernetesBackend {
         for worker in &worker_records {
             let cm_name = self
                 .upsert_tensor_configmap(
-                    model_name, worker.worker_rank, &worker.tensors,
-                    owner_name, owner_uid,
+                    model_name,
+                    worker.worker_rank,
+                    &worker.tensors,
+                    owner_name,
+                    owner_uid,
                 )
                 .await?;
 
@@ -314,8 +322,16 @@ impl MetadataBackend for KubernetesBackend {
             {
                 Ok(_) => break,
                 Err(kube::Error::Api(err)) if err.code == 409 && attempt < max_retries - 1 => {
-                    debug!("Conflict updating status for '{}', retrying ({}/{})", cr_name, attempt + 1, max_retries);
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    debug!(
+                        "Conflict updating status for '{}', retrying ({}/{})",
+                        cr_name,
+                        attempt + 1,
+                        max_retries
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -357,12 +373,12 @@ impl MetadataBackend for KubernetesBackend {
         let mut workers = Vec::new();
         for worker_status in status.workers {
             // Decode NIXL metadata — propagate error instead of silently returning empty
-            let nixl_metadata = BASE64
-                .decode(&worker_status.nixl_metadata)
-                .map_err(|e| format!(
+            let nixl_metadata = BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
+                format!(
                     "Failed to decode NIXL metadata for worker {}: {}",
                     worker_status.worker_rank, e
-                ))?;
+                )
+            })?;
 
             // Read tensors from ConfigMap
             let tensors = if let Some(cm_name) = &worker_status.tensor_config_map {

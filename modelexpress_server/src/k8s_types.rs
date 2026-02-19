@@ -185,7 +185,10 @@ mod tests {
     fn test_sanitize_model_name_special_chars() {
         assert_eq!(sanitize_model_name("Llama@3.1+8B"), "llama3.18b");
         assert_eq!(sanitize_model_name("model with spaces"), "modelwithspaces");
-        assert_eq!(sanitize_model_name("org_name/model_v2"), "org-name-model-v2");
+        assert_eq!(
+            sanitize_model_name("org_name/model_v2"),
+            "org-name-model-v2"
+        );
     }
 
     #[test]
