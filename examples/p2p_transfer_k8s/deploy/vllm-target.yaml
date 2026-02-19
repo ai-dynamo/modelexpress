@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # vLLM Target Instance - starts with dummy weights, receives real weights from source via P2P
-# Uses Kubernetes CRD backend for metadata (default)
-# For Redis backend, use vllm-target-redis.yaml instead
+# Uses gRPC backend for metadata (default — talks to ModelExpress server)
+# For Redis or CRD backends, see persistence/ folder
 #
 # - vLLM exposes weights via ZMQ (one socket per TP rank)
 # - ModelExpress client handles NIXL transfers and server communication
@@ -73,13 +73,10 @@ spec:
               value: "1"
             - name: MX_EXPECTED_WORKERS
               value: "8"
-            # Metadata backend: "redis" (default) or "kubernetes" (CRD-based)
-            # Set to "kubernetes" to use native K8s CRDs instead of Redis
-            - name: MX_METADATA_BACKEND
-              value: "redis"
-            # Redis backend configuration
-            - name: MX_REDIS_HOST
-              value: "modelexpress-server"
+            # Metadata backend: "grpc" (default), "redis", or "kubernetes"
+            # For persistence options, see persistence/ folder
+            # - name: MX_METADATA_BACKEND
+            #   value: "grpc"
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG

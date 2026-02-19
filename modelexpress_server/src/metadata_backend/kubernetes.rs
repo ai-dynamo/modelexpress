@@ -48,12 +48,16 @@ impl KubernetesBackend {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    /// Create or update a ConfigMap with tensor descriptors for a worker
+    /// Create or update a ConfigMap with tensor descriptors for a worker.
+    /// If `owner_uid` and `owner_name` are provided, sets ownerReferences
+    /// so K8s garbage-collects ConfigMaps when the parent CR is deleted.
     async fn upsert_tensor_configmap(
         &self,
         model_name: &str,
         worker_rank: u32,
         tensors: &[TensorRecord],
+        owner_name: Option<&str>,
+        owner_uid: Option<&str>,
     ) -> MetadataResult<String> {
         let cr_name = sanitize_model_name(model_name);
         let cm_name = format!("{}-tensors-worker-{}", cr_name, worker_rank);
@@ -85,11 +89,24 @@ impl KubernetesBackend {
             worker_rank.to_string(),
         );
 
+        let owner_references = match (owner_name, owner_uid) {
+            (Some(name), Some(uid)) => Some(vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "modelexpress.nvidia.com/v1alpha1".to_string(),
+                kind: "ModelMetadata".to_string(),
+                name: name.to_string(),
+                uid: uid.to_string(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]),
+            _ => None,
+        };
+
         let cm = ConfigMap {
             metadata: kube::api::ObjectMeta {
                 name: Some(cm_name.clone()),
                 namespace: Some(self.namespace.clone()),
                 labels: Some(labels),
+                owner_references,
                 ..Default::default()
             },
             data: Some(data),
@@ -133,14 +150,22 @@ impl KubernetesBackend {
 
         let tensors = tensor_descs
             .into_iter()
-            .map(|t| TensorRecord {
-                name: t.name,
-                addr: t.addr.parse().unwrap_or(0),
-                size: t.size.parse().unwrap_or(0),
-                device_id: t.device_id,
-                dtype: t.dtype,
+            .map(|t| {
+                let addr = t.addr.parse::<u64>().map_err(|e| {
+                    format!("Invalid tensor addr '{}' for '{}': {}", t.addr, t.name, e)
+                })?;
+                let size = t.size.parse::<u64>().map_err(|e| {
+                    format!("Invalid tensor size '{}' for '{}': {}", t.size, t.name, e)
+                })?;
+                Ok(TensorRecord {
+                    name: t.name,
+                    addr,
+                    size,
+                    device_id: t.device_id,
+                    dtype: t.dtype,
+                })
             })
-            .collect();
+            .collect::<MetadataResult<Vec<_>>>()?;
 
         Ok(tensors)
     }
@@ -193,21 +218,38 @@ impl MetadataBackend for KubernetesBackend {
                 },
                 spec: ModelMetadataSpec {
                     model_name: model_name.to_string(),
-                    expected_workers: 8, // Default
+                    expected_workers: std::env::var("MX_EXPECTED_WORKERS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(worker_records.len() as i32),
                 },
                 status: None,
             };
 
-            api.create(&PostParams::default(), &new_cr).await?;
-            info!("Created ModelMetadata CR '{}'", cr_name);
+            match api.create(&PostParams::default(), &new_cr).await {
+                Ok(_) => {
+                    info!("Created ModelMetadata CR '{}'", cr_name);
+                }
+                Err(kube::Error::Api(err)) if err.code == 409 => {
+                    debug!("ModelMetadata CR '{}' already exists, proceeding to update", cr_name);
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
+
+        // Get CR UID for ownerReferences on ConfigMaps
+        let cr = api.get(&cr_name).await?;
+        let owner_uid = cr.metadata.uid.as_deref();
+        let owner_name = cr.metadata.name.as_deref();
 
         // Build worker status updates and create ConfigMaps
         let mut worker_statuses = Vec::new();
         for worker in &worker_records {
-            // Create/update tensor ConfigMap
             let cm_name = self
-                .upsert_tensor_configmap(model_name, worker.worker_rank, &worker.tensors)
+                .upsert_tensor_configmap(
+                    model_name, worker.worker_rank, &worker.tensors,
+                    owner_name, owner_uid,
+                )
                 .await?;
 
             worker_statuses.push(WorkerStatus {
@@ -222,52 +264,63 @@ impl MetadataBackend for KubernetesBackend {
             });
         }
 
-        // Merge with existing workers in status
-        let current = api.get(&cr_name).await?;
-        let mut all_workers: Vec<WorkerStatus> =
-            current.status.map(|s| s.workers).unwrap_or_default();
+        // Merge with existing workers in status (retry on conflict)
+        let max_retries = 5;
+        for attempt in 0..max_retries {
+            let current = api.get(&cr_name).await?;
+            let mut all_workers: Vec<WorkerStatus> =
+                current.status.map(|s| s.workers).unwrap_or_default();
 
-        // Merge: update existing or add new
-        for new_worker in worker_statuses {
-            if let Some(existing) = all_workers
-                .iter_mut()
-                .find(|w| w.worker_rank == new_worker.worker_rank)
-            {
-                *existing = new_worker;
+            for new_worker in &worker_statuses {
+                if let Some(existing) = all_workers
+                    .iter_mut()
+                    .find(|w| w.worker_rank == new_worker.worker_rank)
+                {
+                    *existing = new_worker.clone();
+                } else {
+                    all_workers.push(new_worker.clone());
+                }
+            }
+
+            all_workers.sort_by_key(|w| w.worker_rank);
+
+            let phase = if all_workers.is_empty() {
+                ModelMetadataPhase::Pending
+            } else if all_workers.iter().all(|w| w.ready && w.stability_verified) {
+                ModelMetadataPhase::Ready
+            } else if all_workers.iter().any(|w| w.ready) {
+                ModelMetadataPhase::Initializing
             } else {
-                all_workers.push(new_worker);
+                ModelMetadataPhase::Pending
+            };
+
+            let resource_version = current.metadata.resource_version.unwrap_or_default();
+            let status_patch = json!({
+                "metadata": { "resourceVersion": resource_version },
+                "status": {
+                    "phase": phase.to_string(),
+                    "workers": all_workers,
+                    "publishedAt": now
+                }
+            });
+
+            match api
+                .patch_status(
+                    &cr_name,
+                    &PatchParams::apply("modelexpress"),
+                    &Patch::Merge(&status_patch),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(kube::Error::Api(err)) if err.code == 409 && attempt < max_retries - 1 => {
+                    debug!("Conflict updating status for '{}', retrying ({}/{})", cr_name, attempt + 1, max_retries);
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
             }
         }
-
-        // Sort by worker_rank
-        all_workers.sort_by_key(|w| w.worker_rank);
-
-        // Determine phase
-        let phase = if all_workers.is_empty() {
-            ModelMetadataPhase::Pending
-        } else if all_workers.iter().all(|w| w.ready && w.stability_verified) {
-            ModelMetadataPhase::Ready
-        } else if all_workers.iter().any(|w| w.ready) {
-            ModelMetadataPhase::Initializing
-        } else {
-            ModelMetadataPhase::Pending
-        };
-
-        // Patch the status
-        let status_patch = json!({
-            "status": {
-                "phase": phase.to_string(),
-                "workers": all_workers,
-                "publishedAt": now
-            }
-        });
-
-        api.patch_status(
-            &cr_name,
-            &PatchParams::apply("modelexpress"),
-            &Patch::Merge(&status_patch),
-        )
-        .await?;
 
         let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
@@ -351,7 +404,7 @@ impl MetadataBackend for KubernetesBackend {
     async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
         let cr_name = sanitize_model_name(model_name);
 
-        // Delete the CR (ConfigMaps will be orphaned, could add owner references)
+        // Delete the CR (ConfigMaps are garbage-collected via ownerReferences)
         let api = self.model_metadata_api();
         match api
             .delete(&cr_name, &kube::api::DeleteParams::default())

@@ -91,22 +91,28 @@ impl P2pStateManager {
         Ok(())
     }
 
-    /// Get the backend, connecting if necessary
+    /// Get the backend, connecting if necessary.
+    /// Uses double-checked locking to prevent duplicate backend creation
+    /// when multiple callers race on first access.
     async fn get_backend(&self) -> MetadataResult<Arc<dyn MetadataBackend>> {
-        let guard = self.backend.read().await;
+        // Fast path: read lock
+        {
+            let guard = self.backend.read().await;
+            if let Some(backend) = guard.as_ref() {
+                return Ok(backend.clone());
+            }
+        }
+
+        // Slow path: write lock with double-check
+        let mut guard = self.backend.write().await;
         if let Some(backend) = guard.as_ref() {
             return Ok(backend.clone());
         }
-        drop(guard);
 
-        // Need to connect
-        self.connect().await?;
-
-        let guard = self.backend.read().await;
-        guard
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "Backend not available".into())
+        let backend = create_backend(self.config.clone()).await?;
+        info!("P2pStateManager connected with {:?}", self.config);
+        *guard = Some(backend.clone());
+        Ok(backend)
     }
 
     // ========================================================================

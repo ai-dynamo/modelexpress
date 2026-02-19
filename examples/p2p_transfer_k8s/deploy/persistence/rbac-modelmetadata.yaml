@@ -8,7 +8,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: modelexpress
-  namespace: kavin
+  namespace: default  # Change to your target namespace
   labels:
     app.kubernetes.io/name: modelexpress
 ---
@@ -16,7 +16,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: modelexpress-metadata
-  namespace: kavin
+  namespace: default  # Change to your target namespace
   labels:
     app.kubernetes.io/name: modelexpress
 rules:
@@ -42,7 +42,10 @@ rules:
       - get
       - update
       - patch
-  # ConfigMaps for tensor descriptors
+  # ConfigMaps for tensor descriptors.
+  # NOTE: This grants access to ALL ConfigMaps in the namespace. K8s RBAC does not
+  # support label-based resource filtering. In shared namespaces, consider using a
+  # dedicated namespace for ModelExpress workloads.
   - apiGroups:
       - ""
     resources:
@@ -60,7 +63,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: modelexpress-metadata
-  namespace: kavin
+  namespace: default  # Change to your target namespace
   labels:
     app.kubernetes.io/name: modelexpress
 roleRef:
@@ -70,7 +73,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: modelexpress
-    namespace: kavin
+    namespace: default  # Change to your target namespace
 ---
 # ClusterRole for CRD management (cluster-admin typically handles this)
 # Only needed if server creates/manages the CRD itself

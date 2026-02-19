@@ -12,7 +12,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: csi-mounted-fs-path-sc
+  # storageClassName: default  # Uncomment and set for your cluster if needed
   resources:
     requests:
       storage: 1Gi

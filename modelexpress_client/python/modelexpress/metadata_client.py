@@ -10,21 +10,20 @@ Supports multiple backends:
 - grpc / memory: Uses ModelExpress server gRPC (PublishReady/GetReady)
 
 The backend is selected via the MX_METADATA_BACKEND environment variable:
-- "redis" (default): Use Redis backend
+- "grpc", "memory" (default): Use gRPC to ModelExpress server (for in-memory server)
+- "redis": Use Redis backend
 - "kubernetes", "k8s", "crd": Use Kubernetes CRD backend
-- "memory", "grpc": Use gRPC to ModelExpress server (for in-memory server)
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
 
 logger = logging.getLogger("modelexpress.metadata_client")
 
@@ -34,7 +33,6 @@ class WorkerReadyInfo:
     """Information about worker readiness."""
     session_id: str | None
     nixl_ready: bool
-    stability_verified: bool
     metadata_hash: str | None = None
     timestamp: float | None = None
 
@@ -146,7 +144,6 @@ class RedisBackend(MetadataBackend):
             "timestamp": time.time(),
             "metadata_hash": metadata_hash,
             "nixl_ready": True,
-            "stability_verified": True,
         }
         
         try:
@@ -176,7 +173,6 @@ class RedisBackend(MetadataBackend):
                 return WorkerReadyInfo(
                     session_id=info.get("session_id"),
                     nixl_ready=info.get("nixl_ready", False),
-                    stability_verified=info.get("stability_verified", False),
                     metadata_hash=info.get("metadata_hash"),
                     timestamp=info.get("timestamp"),
                 )
@@ -194,8 +190,8 @@ class RedisBackend(MetadataBackend):
     ) -> tuple[bool, str | None, str | None]:
         client = self._get_client()
         if client is None:
-            logger.warning(f"[Worker {worker_id}] Redis not available, proceeding without coordination")
-            return True, None, None
+            logger.error(f"[Worker {worker_id}] Redis not available — cannot verify source readiness")
+            return False, None, None
         
         key = f"mx:nixl_ready:{model_name}:worker:{worker_id}"
         start_time = time.time()
@@ -207,7 +203,7 @@ class RedisBackend(MetadataBackend):
                 data = client.get(key)
                 if data:
                     ready_info = json.loads(data)
-                    if ready_info.get("nixl_ready") and ready_info.get("stability_verified"):
+                    if ready_info.get("nixl_ready"):
                         session_id = ready_info.get("session_id")
                         metadata_hash = ready_info.get("metadata_hash")
                         logger.info(
@@ -276,7 +272,6 @@ class GrpcBackend(MetadataBackend):
                 return WorkerReadyInfo(
                     session_id=response.session_id,
                     nixl_ready=True,
-                    stability_verified=response.stability_verified,
                     metadata_hash=response.metadata_hash or None,
                     timestamp=None,
                 )
@@ -331,13 +326,13 @@ class KubernetesBackend(MetadataBackend):
     
     @staticmethod
     def _sanitize_model_name(model_name: str) -> str:
-        """Convert model name to valid K8s resource name."""
-        return (
-            model_name.lower()
-            .replace("/", "-")
-            .replace("_", "-")
-            .strip("-")
-        )
+        """Convert model name to valid K8s resource name.
+
+        Must match the Rust implementation in k8s_types.rs::sanitize_model_name.
+        """
+        name = model_name.lower().replace("/", "-").replace("_", "-")
+        name = re.sub(r"[^a-z0-9\-.]", "", name)
+        return name.strip("-")
     
     def publish_ready_signal(
         self,
@@ -351,61 +346,67 @@ class KubernetesBackend(MetadataBackend):
             return False
         
         cr_name = self._sanitize_model_name(model_name)
+        max_retries = 5
         
-        try:
-            # Get current CR
-            cr = api.get_namespaced_custom_object(
-                group="modelexpress.nvidia.com",
-                version="v1alpha1",
-                namespace=self._namespace,
-                plural="modelmetadatas",
-                name=cr_name,
-            )
-            
-            # Update worker status
-            workers = cr.get("status", {}).get("workers", [])
-            
-            # Find and update or add worker
-            found = False
-            for worker in workers:
-                if worker.get("workerRank") == worker_id:
-                    worker["ready"] = True
-                    worker["stabilityVerified"] = True
-                    worker["sessionId"] = session_id
-                    found = True
-                    break
-            
-            if not found:
-                workers.append({
-                    "workerRank": worker_id,
-                    "ready": True,
-                    "stabilityVerified": True,
-                    "sessionId": session_id,
-                })
-            
-            # Patch status
-            patch = {
-                "status": {
-                    "workers": workers,
-                    "phase": "Ready" if all(w.get("stabilityVerified") for w in workers) else "Initializing",
+        for attempt in range(max_retries):
+            try:
+                cr = api.get_namespaced_custom_object(
+                    group="modelexpress.nvidia.com",
+                    version="v1alpha1",
+                    namespace=self._namespace,
+                    plural="modelmetadatas",
+                    name=cr_name,
+                )
+                
+                resource_version = cr.get("metadata", {}).get("resourceVersion")
+                workers = cr.get("status", {}).get("workers", [])
+                
+                found = False
+                for worker in workers:
+                    if worker.get("workerRank") == worker_id:
+                        worker["ready"] = True
+                        worker["stabilityVerified"] = True
+                        worker["sessionId"] = session_id
+                        found = True
+                        break
+                
+                if not found:
+                    workers.append({
+                        "workerRank": worker_id,
+                        "ready": True,
+                        "stabilityVerified": True,
+                        "sessionId": session_id,
+                    })
+                
+                patch = {
+                    "metadata": {"resourceVersion": resource_version},
+                    "status": {
+                        "workers": workers,
+                        "phase": "Ready" if all(w.get("stabilityVerified") for w in workers) else "Initializing",
+                    }
                 }
-            }
-            
-            api.patch_namespaced_custom_object_status(
-                group="modelexpress.nvidia.com",
-                version="v1alpha1",
-                namespace=self._namespace,
-                plural="modelmetadatas",
-                name=cr_name,
-                body=patch,
-            )
-            
-            logger.info(f"[Worker {worker_id}] Published ready flag to K8s CRD")
-            return True
-            
-        except Exception as e:
-            logger.warning(f"[Worker {worker_id}] Failed to publish ready flag to K8s: {e}")
-            return False
+                
+                api.patch_namespaced_custom_object_status(
+                    group="modelexpress.nvidia.com",
+                    version="v1alpha1",
+                    namespace=self._namespace,
+                    plural="modelmetadatas",
+                    name=cr_name,
+                    body=patch,
+                )
+                
+                logger.info(f"[Worker {worker_id}] Published ready flag to K8s CRD")
+                return True
+                
+            except Exception as e:
+                if "409" in str(e) and attempt < max_retries - 1:
+                    logger.debug(f"[Worker {worker_id}] Conflict on CRD update, retrying ({attempt + 1}/{max_retries})")
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                logger.warning(f"[Worker {worker_id}] Failed to publish ready flag to K8s: {e}")
+                return False
+        
+        return False
     
     def get_ready_signal(
         self,
@@ -433,7 +434,6 @@ class KubernetesBackend(MetadataBackend):
                     return WorkerReadyInfo(
                         session_id=worker.get("sessionId"),
                         nixl_ready=worker.get("ready", False),
-                        stability_verified=worker.get("stabilityVerified", False),
                     )
             
         except Exception as e:
@@ -450,10 +450,10 @@ class KubernetesBackend(MetadataBackend):
     ) -> tuple[bool, str | None, str | None]:
         api = self._get_api()
         if api is None:
-            logger.warning(
-                f"[Worker {worker_id}] K8s client not available, proceeding without coordination"
+            logger.error(
+                f"[Worker {worker_id}] K8s client not available — cannot verify source readiness"
             )
-            return True, None, None
+            return False, None, None
         
         cr_name = self._sanitize_model_name(model_name)
         start_time = time.time()
@@ -483,7 +483,7 @@ class KubernetesBackend(MetadataBackend):
                 
                 for worker in workers:
                     if worker.get("workerRank") == worker_id:
-                        if worker.get("ready") and worker.get("stabilityVerified"):
+                        if worker.get("ready"):
                             session_id = worker.get("sessionId")
                             logger.info(
                                 f"[Worker {worker_id}] Source ready (K8s watch)! "
@@ -498,7 +498,7 @@ class KubernetesBackend(MetadataBackend):
         # Fallback to polling
         while time.time() - start_time < timeout_seconds:
             info = self.get_ready_signal(model_name, worker_id)
-            if info and info.nixl_ready and info.stability_verified:
+            if info and info.nixl_ready:
                 logger.info(
                     f"[Worker {worker_id}] Source ready (K8s poll)! "
                     f"session={info.session_id[:8] if info.session_id else 'N/A'}..."
@@ -527,17 +527,17 @@ def get_metadata_backend() -> MetadataBackend:
     Returns:
         MetadataBackend instance (Redis, Kubernetes, or Grpc)
     """
-    backend_type = os.environ.get("MX_METADATA_BACKEND", "redis").lower()
+    backend_type = os.environ.get("MX_METADATA_BACKEND", "grpc").lower()
     
     if backend_type in ("kubernetes", "k8s", "crd"):
         logger.info("Using Kubernetes CRD metadata backend")
         return KubernetesBackend()
-    elif backend_type in ("memory", "grpc"):
-        logger.info("Using gRPC metadata backend (ModelExpress server)")
-        return GrpcBackend()
-    else:
+    elif backend_type == "redis":
         logger.info("Using Redis metadata backend")
         return RedisBackend()
+    else:
+        logger.info("Using gRPC metadata backend (ModelExpress server)")
+        return GrpcBackend()
 
 
 # Singleton instance
