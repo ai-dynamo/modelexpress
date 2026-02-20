@@ -273,7 +273,7 @@ impl MetadataBackend for KubernetesBackend {
         }
 
         // Merge with existing workers in status (retry on conflict)
-        let max_retries = 5;
+        let max_retries: u32 = 5;
         for attempt in 0..max_retries {
             let current = api.get(&cr_name).await?;
             let mut all_workers: Vec<WorkerStatus> =
@@ -321,15 +321,17 @@ impl MetadataBackend for KubernetesBackend {
                 .await
             {
                 Ok(_) => break,
-                Err(kube::Error::Api(err)) if err.code == 409 && attempt < max_retries - 1 => {
+                Err(kube::Error::Api(err))
+                    if err.code == 409 && attempt < max_retries.saturating_sub(1) =>
+                {
                     debug!(
                         "Conflict updating status for '{}', retrying ({}/{})",
                         cr_name,
-                        attempt + 1,
+                        attempt.saturating_add(1),
                         max_retries
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(
-                        100 * (attempt as u64 + 1),
+                        100_u64.saturating_mul(u64::from(attempt).saturating_add(1)),
                     ))
                     .await;
                     continue;

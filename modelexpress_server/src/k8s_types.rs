@@ -165,6 +165,7 @@ pub fn sanitize_model_name(model_name: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
