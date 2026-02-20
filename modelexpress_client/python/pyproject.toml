@@ -42,6 +42,8 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
+# All optional features (none currently needed — client uses gRPC only)
+all = []
 
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/modelexpress"

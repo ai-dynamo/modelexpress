@@ -192,7 +192,7 @@ impl P2pService for P2pServiceImpl {
                     req.model_name,
                     req.worker_id,
                     ready,
-                    &record.session_id[..8.min(record.session_id.len())]
+                    record.session_id.chars().take(8).collect::<String>()
                 );
 
                 Ok(Response::new(GetReadyResponse {

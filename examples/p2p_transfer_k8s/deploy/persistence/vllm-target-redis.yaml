@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # vLLM Target Instance - starts with dummy weights, receives real weights from source via P2P
+# Uses Redis backend for metadata (legacy/alternative)
+# For Kubernetes-native deployments, use vllm-target.yaml (CRD backend) instead
+#
 # - vLLM exposes weights via ZMQ (one socket per TP rank)
 # - ModelExpress client handles NIXL transfers and server communication
 apiVersion: v1
@@ -37,30 +40,43 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:k8s-backend
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work.
-          # Running as root is required by the vLLM base image for
-          # CUDA driver access and RDMA memory pinning (IPC_LOCK).
           securityContext:
             capabilities:
               add:
                 - IPC_LOCK
           env:
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            # Increase startup timeout to allow warmup to complete (2 hours)
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
             - name: HF_HUB_CACHE
               value: "/models"
+            - name: MX_ZMQ_ADDRESS
+              value: "ipc:///tmp/mx/vllm.sock"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
             # Register ModelExpress custom loaders for FP8 support
             - name: MX_REGISTER_LOADERS
               value: "1"
             # Server address for finding source (no http:// prefix)
-            - name: MODEL_EXPRESS_URL
+            - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
             # OPTIMIZATION: Synchronized start - wait for all workers before transferring
             # This maximizes RDMA parallelism by ensuring all workers start simultaneously
             - name: MX_SYNC_START
               value: "1"
+            - name: MX_EXPECTED_WORKERS
+              value: "8"
+            # Metadata backend: Redis
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            # Redis backend configuration
+            - name: MX_REDIS_HOST
+              value: "modelexpress-server"
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
@@ -98,11 +114,10 @@ spec:
           args:
             - |
               set -ex
-
-              # MX_REGISTER_LOADERS=1 triggers loader registration via the Dockerfile
-              # __init__.py patch. Replaced in PR #140 by @register_model_loader
-              # decorators + --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
-
+              
+              # MX_REGISTER_LOADERS=1 is set in env, which triggers sitecustomize.py
+              # to register ModelExpress loaders in ALL Python processes (including workers)
+              
               # Start vLLM with mx-target loader
               # mx-target: Creates dummy weights, receives RAW tensors via RDMA,
               # THEN runs FP8 processing (identical to source)
@@ -113,7 +128,7 @@ spec:
                 --tensor-parallel-size 8 \
                 --enable-expert-parallel &
               VLLM_PID=$!
-
+              
               # Wait for vLLM to be ready
               echo "Waiting for vLLM to be ready..."
               python3 -c '
@@ -127,7 +142,7 @@ spec:
                       time.sleep(3)
               '
               echo "vLLM is ready - weights transferred and processed"
-
+              
               # Keep the container running (vLLM handles everything now)
               wait $VLLM_PID
           resources:
