@@ -37,7 +37,7 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.2.1-stale-fix
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work.
           securityContext:
@@ -71,7 +71,7 @@ spec:
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
-              value: "0"
+              value: "1"
             # Logging (set to DEBUG for troubleshooting)
             - name: NIXL_LOG_LEVEL
               value: "INFO"
@@ -84,6 +84,15 @@ spec:
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
+            # Enable GPUDirect RDMA for zero-copy GPU-to-GPU transfers
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            # Increase max atomic operations for better bandwidth
+            - name: UCX_RC_MAX_RD_ATOMIC
+              value: "16"
+            # Enable NIC binding based on GPU-NIC topology
+            - name: MX_NIC_BINDING
+              value: "1"
             - name: POD_IP
               valueFrom:
                 fieldRef:

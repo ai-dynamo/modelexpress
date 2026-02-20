@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -42,6 +43,21 @@ import torch
 from .types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
+
+
+def _timing_print(msg: str) -> None:
+    """
+    Print timing info with maximum visibility for k8s logs.
+    Uses stderr and explicit flush to ensure capture from worker processes.
+    """
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    log_msg = f"[MX-TIMING] [{timestamp}] {msg}"
+    # Write to stderr - more reliably captured by container runtimes
+    sys.stderr.write(log_msg + "\n")
+    sys.stderr.flush()
+    # Also write to stdout
+    sys.stdout.write(log_msg + "\n")
+    sys.stdout.flush()
 
 
 class TransferState(Enum):
@@ -103,7 +119,7 @@ class PipelineStats:
         else:
             bandwidth_gbps = 0
             
-        logger.info(
+        summary_msg = (
             f"[Worker {device_id}] [Pipeline Stats] "
             f"Tasks: {self.completed_tasks}/{self.total_tasks} completed, "
             f"{self.failed_tasks} failed | "
@@ -113,6 +129,10 @@ class PipelineStats:
             f"Max concurrent: {self.max_concurrent} | "
             f"Polls: {self.poll_count}"
         )
+        logger.info(summary_msg)
+        
+        # EXPLICIT TIMING OUTPUT - guaranteed to be captured
+        _timing_print(f"Worker {device_id}: PIPELINE - {self.total_bytes/1e9:.2f} GB in {self.total_time:.3f}s = {bandwidth_gbps:.1f} Gbps ({self.completed_tasks} tasks, max_concurrent={self.max_concurrent})")
 
 NIXL_AVAILABLE = False
 NixlAgent = None
@@ -166,7 +186,7 @@ class NixlTransferManager:
         return self._tensor_descriptors
 
     def initialize(self) -> None:
-        """Initialize the NIXL agent."""
+        """Initialize the NIXL agent with optimal NIC binding for GPUDirect RDMA."""
         if not NIXL_AVAILABLE:
             raise RuntimeError("NIXL is not available")
 
@@ -174,10 +194,36 @@ class NixlTransferManager:
             return
 
         torch.cuda.set_device(self._device_id)
+        
+        # OPTIMIZATION: Bind each GPU worker to its optimal NIC based on PCIe topology
+        # This mapping is based on nvidia-smi topo -m showing PIX (direct PCIe) connections:
+        # GPU0-3 are on NUMA 0, GPU4-7 are on NUMA 1
+        # GPU0->NIC4(mlx5_4), GPU1->NIC5(mlx5_5), GPU2->NIC6(mlx5_6), GPU3->NIC7(mlx5_7)
+        # GPU4->NIC0(mlx5_0), GPU5->NIC1(mlx5_1), GPU6->NIC2(mlx5_2), GPU7->NIC3(mlx5_3)
+        gpu_to_nic = {
+            0: "mlx5_4", 1: "mlx5_5", 2: "mlx5_6", 3: "mlx5_7",
+            4: "mlx5_0", 5: "mlx5_1", 6: "mlx5_2", 7: "mlx5_3",
+        }
+        
+        # Set UCX environment variables for optimal RDMA performance
+        nic_device = gpu_to_nic.get(self._device_id, f"mlx5_{self._device_id}")
+        
+        # Check if binding is enabled (can be disabled for debugging)
+        if os.environ.get("MX_NIC_BINDING", "1") == "1":
+            os.environ["UCX_NET_DEVICES"] = f"{nic_device}:1"
+            _timing_print(f"Worker {self._device_id}: NIC binding GPU{self._device_id} -> {nic_device}")
+        
+        # Enable GPUDirect RDMA for zero-copy GPU-to-GPU transfers
+        if os.environ.get("UCX_IB_GPU_DIRECT_RDMA") is None:
+            os.environ["UCX_IB_GPU_DIRECT_RDMA"] = "yes"
+        
+        # Optimize for large transfers
+        if os.environ.get("UCX_RC_MAX_RD_ATOMIC") is None:
+            os.environ["UCX_RC_MAX_RD_ATOMIC"] = "16"
 
         config = nixl_agent_config(backends=["UCX"]) if nixl_agent_config else None
         self._agent = NixlAgent(self._agent_name, config)
-        logger.info(f"NIXL agent '{self._agent_name}' created on device {self._device_id}")
+        logger.info(f"NIXL agent '{self._agent_name}' created on device {self._device_id} with NIC {nic_device}")
 
     def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
         """
@@ -288,6 +334,10 @@ class NixlTransferManager:
         Sorts tensors by address and merges adjacent ones into larger regions.
         This reduces the number of NIXL registrations significantly.
         
+        CRITICAL: After finding regions, we sort by size (descending) to ensure
+        deterministic ordering across source and target. Without this, regions
+        would be ordered by local memory addresses which differ between nodes.
+        
         Args:
             descriptors: List of tensor descriptors
             
@@ -316,6 +366,18 @@ class NixlTransferManager:
         
         # Don't forget the last region
         regions.append((current_start, current_end - current_start))
+        
+        # CRITICAL: Sort regions by size (descending) for deterministic ordering
+        # across different nodes. Without this, regions are ordered by local
+        # memory addresses which differ between source and target.
+        # Sort by (-size, original_index) to be stable and deterministic.
+        indexed_regions = [(size, i, addr) for i, (addr, size) in enumerate(regions)]
+        indexed_regions.sort(key=lambda x: (-x[0], x[1]))  # Descending size, then original index
+        
+        # Rebuild regions in deterministic order
+        regions = [(addr, size) for size, _, addr in indexed_regions]
+        
+        logger.info(f"[Contiguous Registration] Sorted {len(regions)} regions by size (deterministic ordering)")
         
         return regions
 
@@ -682,6 +744,9 @@ class NixlTransferManager:
         poll_interval_ms = poll_interval_ms or float(os.environ.get("MX_PIPELINE_POLL_INTERVAL_MS", "1"))
         poll_interval = poll_interval_ms / 1000.0
         
+        # EXPLICIT TIMING OUTPUT at start
+        _timing_print(f"Worker {self._device_id}: PIPELINED TRANSFER START - batch_size={batch_size}, poll_interval={poll_interval_ms}ms")
+        
         start_time = time.perf_counter()
         torch.cuda.set_device(self._device_id)
         
@@ -845,6 +910,10 @@ class NixlTransferManager:
             logger.error(f"[Pipeline] {len(failed)} tasks failed!")
             for task in failed[:3]:  # Log first 3 failures
                 logger.error(f"[Pipeline]   Task {task.task_id}: {task.error}")
+        
+        # EXPLICIT TIMING OUTPUT at function return
+        bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0
+        _timing_print(f"Worker {self._device_id}: PIPELINED TRANSFER DONE - {total_bytes/1e9:.2f} GB, {total_tensors} tensors, {duration:.3f}s, {bandwidth_gbps:.1f} Gbps")
         
         return total_bytes, total_tensors, duration
     

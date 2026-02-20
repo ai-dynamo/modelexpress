@@ -59,9 +59,29 @@ logger = logging.getLogger("modelexpress.vllm_loader")
 logger.setLevel(logging.DEBUG)
 
 def _log(msg: str, level: str = "INFO") -> None:
-    """Force log to stdout for k8s visibility."""
+    """Force log to stdout/stderr for k8s visibility."""
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {level} vllm_loader: {msg}", flush=True)
+    log_msg = f"[{timestamp}] {level} vllm_loader: {msg}"
+    # Write to both stdout and stderr to maximize capture in k8s
+    print(log_msg, flush=True)
+    # Also write to stderr which is more reliably captured by containers
+    sys.stderr.write(log_msg + "\n")
+    sys.stderr.flush()
+
+
+def _timing_print(msg: str) -> None:
+    """
+    Print timing info with maximum visibility for k8s logs.
+    Uses stderr and explicit flush to ensure capture from worker processes.
+    """
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    log_msg = f"[MX-TIMING] [{timestamp}] {msg}"
+    # Write to stderr - more reliably captured by container runtimes
+    sys.stderr.write(log_msg + "\n")
+    sys.stderr.flush()
+    # Also write to stdout
+    sys.stdout.write(log_msg + "\n")
+    sys.stdout.flush()
 
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
@@ -480,6 +500,45 @@ class MxSourceModelLoader(DefaultModelLoader):
         except Exception as e:
             _log(f"[Worker {device_id}] Server barrier failed: {e}, proceeding anyway", "WARNING")
 
+    def _clear_stale_nixl_flags(self, model_name: str, device_id: int) -> None:
+        """
+        Clear stale NIXL ready flags from Redis before publishing new metadata.
+        
+        This prevents the race condition where:
+        1. Source crashes mid-operation
+        2. Source restarts and publishes new metadata with new NIXL agents
+        3. Target still sees old NIXL ready flags pointing to dead agents
+        4. Target gets NIXL_ERR_REMOTE_DISCONNECT
+        
+        By clearing the flags BEFORE publishing, we ensure targets wait for
+        the new source to become fully ready.
+        """
+        if not REDIS_AVAILABLE:
+            return
+        
+        try:
+            redis_host = os.environ.get("MX_REDIS_HOST", "modelexpress-server")
+            redis_port = int(os.environ.get("MX_REDIS_PORT", "6379"))
+            client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+            
+            # Clear NIXL ready flag for this worker
+            key = f"mx:nixl_ready:{model_name}:worker:{device_id}"
+            deleted = client.delete(key)
+            if deleted:
+                _log(f"[Worker {device_id}] Cleared stale NIXL ready flag: {key}", "INFO")
+            
+            # If we're worker 0, also clear the model metadata to force full refresh
+            # This ensures all workers get fresh metadata after a restart
+            if device_id == 0:
+                model_key = f"mx:model:{model_name}"
+                if client.exists(model_key):
+                    client.delete(model_key)
+                    _log(f"[Worker {device_id}] Cleared stale model metadata: {model_key}", "INFO")
+            
+            client.close()
+        except Exception as e:
+            _log(f"[Worker {device_id}] Failed to clear stale flags (non-fatal): {e}", "WARNING")
+
     def _publish_metadata_to_server(
         self, tensors: dict[str, torch.Tensor], device_id: int
     ) -> None:
@@ -496,6 +555,10 @@ class MxSourceModelLoader(DefaultModelLoader):
         _log(f"[Worker {device_id}] _publish_metadata_to_server() called", "DEBUG")
         _log(f"[Worker {device_id}] Server address: {server_address}, Model: {model_name}", "DEBUG")
         _log(f"[Worker {device_id}] Publishing {len(tensors)} tensors", "DEBUG")
+        
+        # CRITICAL: Clear stale NIXL ready flags before publishing new metadata
+        # This prevents targets from using old metadata after source restarts
+        self._clear_stale_nixl_flags(model_name, device_id)
         
         try:
             import grpc
@@ -906,6 +969,9 @@ class MxTargetModelLoader(DummyModelLoader):
                     _log(f"[Worker {device_id}] [TIMING]   Bandwidth: {bandwidth_gbps:.1f} Gbps", "INFO")
                     _log("=" * 60, "INFO")
                     
+                    # EXPLICIT TIMING OUTPUT - guaranteed to be captured
+                    _timing_print(f"Worker {device_id}: RDMA COMPLETE - {bytes_transferred/1e9:.2f} GB in {transfer_time:.3f}s = {bandwidth_gbps:.1f} Gbps")
+                    
                     # Sync CUDA to ensure transfer is visible
                     torch.cuda.synchronize()
                     _log(f"[Worker {device_id}] CUDA synchronized", "DEBUG")
@@ -921,11 +987,49 @@ class MxTargetModelLoader(DummyModelLoader):
                     break  # Success
                 except Exception as transfer_err:
                     if attempt < transfer_retries - 1:
+                        error_str = str(transfer_err)
+                        is_disconnect = "REMOTE_DISCONNECT" in error_str or "NIXL_ERR_REMOTE_DISCONNECT" in error_str
+                        
                         _log(
                             f"[Worker {device_id}] Transfer attempt {attempt + 1} failed: {transfer_err}, "
                             f"retrying in {transfer_retry_delay}s...",
                             "WARNING"
                         )
+                        
+                        # For REMOTE_DISCONNECT errors, check if NIXL ready flag was cleared
+                        # This indicates source restarted and we should wait for new metadata
+                        if is_disconnect:
+                            _log(f"[Worker {device_id}] REMOTE_DISCONNECT detected, checking if source restarted...", "INFO")
+                            # Check if NIXL ready flag still exists
+                            nixl_ready_exists = self._check_nixl_ready_exists(model_name, device_id)
+                            if not nixl_ready_exists:
+                                _log(f"[Worker {device_id}] NIXL ready flag cleared - source is restarting, waiting...", "WARNING")
+                                # Wait for source to become ready again
+                                source_ready, new_session_id, _ = SourceReadyCoordinator.wait_for_source_ready(
+                                    model_name=model_name,
+                                    worker_id=device_id,
+                                    timeout_seconds=3600,  # 1 hour for restart
+                                    poll_interval=10,
+                                )
+                                if source_ready:
+                                    cached_session_id = new_session_id
+                                    # Must re-fetch metadata after source restart
+                                    request = p2p_pb2.GetMetadataRequest(model_name=model_name)
+                                    response = stub.GetMetadata(request)
+                                    for w in response.workers:
+                                        if w.worker_rank == device_id and len(w.tensors) > 0:
+                                            source_worker = w
+                                            break
+                                    if source_worker:
+                                        source_tensors = [
+                                            TensorDescriptor(
+                                                name=t.name, addr=t.addr, size=t.size,
+                                                device_id=t.device_id, dtype=t.dtype,
+                                            )
+                                            for t in source_worker.tensors
+                                        ]
+                                        _log(f"[Worker {device_id}] Refreshed metadata after source restart: {len(source_tensors)} tensors", "INFO")
+                                continue  # Skip the normal session check and retry immediately
                         
                         # Check if source restarted (stale metadata issue)
                         session_changed, new_session_id = SourceReadyCoordinator.check_session_changed(
@@ -993,6 +1097,9 @@ class MxTargetModelLoader(DummyModelLoader):
             _log(f"[Worker {device_id}] [TIMING]   Wait for source: {wait_time:.2f}s", "INFO")
             _log(f"[Worker {device_id}] [TIMING]   RDMA transfer: {transfer_time:.3f}s", "INFO")
             _log("=" * 60, "INFO")
+            
+            # EXPLICIT TIMING OUTPUT - guaranteed to be captured
+            _timing_print(f"Worker {device_id}: SUMMARY - Total={total_receive_time:.2f}s, NIXL_init={nixl_init_time:.3f}s, Reg={reg_time:.3f}s, Wait={wait_time:.2f}s, RDMA={transfer_time:.3f}s")
 
         except Exception as e:
             import traceback
@@ -1017,6 +1124,29 @@ class MxTargetModelLoader(DummyModelLoader):
         
         _log("Defaulting to rank 0", "DEBUG")
         return 0
+
+    def _check_nixl_ready_exists(self, model_name: str, worker_id: int) -> bool:
+        """
+        Check if NIXL ready flag exists in Redis.
+        
+        If the flag was cleared, it indicates source is restarting and we
+        should wait for it to become ready again.
+        """
+        if not REDIS_AVAILABLE:
+            return True  # Assume exists if we can't check
+        
+        try:
+            redis_host = os.environ.get("MX_REDIS_HOST", "modelexpress-server")
+            redis_port = int(os.environ.get("MX_REDIS_PORT", "6379"))
+            client = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+            
+            key = f"mx:nixl_ready:{model_name}:worker:{worker_id}"
+            exists = client.exists(key)
+            client.close()
+            return bool(exists)
+        except Exception as e:
+            _log(f"[Worker {worker_id}] Error checking NIXL ready flag: {e}", "WARNING")
+            return True  # Assume exists on error
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
