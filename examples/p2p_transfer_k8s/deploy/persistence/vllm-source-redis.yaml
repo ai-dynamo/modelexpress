@@ -114,29 +114,17 @@ spec:
           args:
             - |
               set -ex
-              # Background task: wait for health, warmup, then publish NIXL ready signal
+              # Background task: warmup inference to pre-warm CUDA graphs.
+              # Ready signal is published by the source loader internally
+              # (vllm_loader.py line 355) immediately after metadata — no need to wait for warmup.
               (
                 sleep 5
                 while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done
                 sleep 30
-                # Warmup inference
+                # Warmup inference (pre-warms CUDA graphs, not required for P2P transfer)
                 curl -sf -X POST http://127.0.0.1:8000/v1/completions \
                   -H 'Content-Type: application/json' \
                   -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
-                # Publish ready signal via Redis
-                python3 -c '
-              import redis, json, uuid, os
-              host = os.environ.get("MX_REDIS_HOST", "modelexpress-server")
-              model = os.environ.get("MODEL_NAME", "unknown")
-              session_id = str(uuid.uuid4())
-              client = redis.Redis(host=host, port=6379, decode_responses=True)
-              workers = int(os.environ.get("MX_EXPECTED_WORKERS", "8"))
-              for w in range(workers):
-                  key = f"mx:nixl_ready:{model}:worker:{w}"
-                  value = json.dumps({"session_id": session_id, "nixl_ready": True, "stability_verified": True})
-                  client.setex(key, 14400, value)
-                  print(f"Published ready for worker {w}")
-              '
               ) &
               exec python3 -m vllm.entrypoints.openai.api_server \
                 --model $MODEL_NAME \
