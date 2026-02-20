@@ -181,20 +181,24 @@ impl RedisBackend {
 
     /// Get a Redis connection, reconnecting if necessary
     async fn get_conn(&self) -> MetadataResult<ConnectionManager> {
-        let guard = self.redis.read().await;
+        // Fast path: read lock
+        {
+            let guard = self.redis.read().await;
+            if let Some(conn) = guard.as_ref() {
+                return Ok(conn.clone());
+            }
+        }
+
+        // Slow path: write lock with double-check
+        let mut guard = self.redis.write().await;
         if let Some(conn) = guard.as_ref() {
             return Ok(conn.clone());
         }
-        drop(guard);
 
-        // Need to reconnect
-        self.connect().await?;
-
-        let guard = self.redis.read().await;
-        guard
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "Redis connection not available".into())
+        let client = redis::Client::open(self.redis_url.as_str())?;
+        let conn = ConnectionManager::new(client).await?;
+        *guard = Some(conn.clone());
+        Ok(conn)
     }
 }
 
