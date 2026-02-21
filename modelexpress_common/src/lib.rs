@@ -132,6 +132,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
     fn from(provider: models::ModelProvider) -> Self {
         match provider {
             models::ModelProvider::HuggingFace => grpc::model::ModelProvider::HuggingFace,
+            models::ModelProvider::ModelStreamer => grpc::model::ModelProvider::ModelStreamer,
         }
     }
 }
@@ -140,6 +141,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
     fn from(provider: grpc::model::ModelProvider) -> Self {
         match provider {
             grpc::model::ModelProvider::HuggingFace => models::ModelProvider::HuggingFace,
+            grpc::model::ModelProvider::ModelStreamer => models::ModelProvider::ModelStreamer,
         }
     }
 }
@@ -231,6 +233,12 @@ mod tests {
         let back_to_model: models::ModelProvider = grpc_provider.into();
 
         assert_eq!(model_provider, back_to_model);
+
+        let ms_provider = models::ModelProvider::ModelStreamer;
+        let grpc_ms_provider: grpc::model::ModelProvider = ms_provider.into();
+        let back_to_ms: models::ModelProvider = grpc_ms_provider.into();
+
+        assert_eq!(ms_provider, back_to_ms);
     }
 
     #[test]

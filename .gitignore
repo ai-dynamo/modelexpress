@@ -51,4 +51,10 @@ logs/
 models.db
 **/__pycache__/
 docs/FEEDBACK.md
-docs/optimization-comparison.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
