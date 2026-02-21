@@ -45,16 +45,12 @@ from .types import TensorDescriptor
 if TYPE_CHECKING:
     from .nixl_transfer import NixlTransferManager
 
-# Configure logging to stdout for visibility in k8s logs
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    stream=sys.stdout,
-)
 logger = logging.getLogger("modelexpress.vllm_loader")
 logger.setLevel(logging.DEBUG)
-
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(handler)
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
@@ -102,7 +98,7 @@ def _get_worker_rank(device: torch.device) -> int:
 
     return 0
 
-# TODO: Clean up logging and timing
+
 @register_model_loader("mx-source")
 class MxSourceModelLoader(DefaultModelLoader):
     """
@@ -133,6 +129,7 @@ class MxSourceModelLoader(DefaultModelLoader):
         self._nixl_manager: NixlTransferManager | None = None
         self._raw_tensors: dict[str, torch.Tensor] = {}
         self._mx_client = MxClient()
+        logger.debug("MxSourceModelLoader initialized successfully")
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig
@@ -367,6 +364,7 @@ class MxSourceModelLoader(DefaultModelLoader):
             import traceback
             logger.error(f"[Worker {device_id}] EXCEPTION publishing metadata: {e}")
             logger.error(f"[Worker {device_id}] Traceback: {traceback.format_exc()}")
+            raise
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
@@ -407,6 +405,7 @@ class MxTargetModelLoader(DummyModelLoader):
         self._nixl_manager: NixlTransferManager | None = None
         self._transfer_timeout: float = 300.0  # 5 minute timeout
         self._mx_client = MxClient()
+        logger.debug("MxTargetModelLoader initialized successfully")
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig
@@ -424,39 +423,31 @@ class MxTargetModelLoader(DummyModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                init_model_start = time.perf_counter()
+                init_start = time.perf_counter()
                 logger.info("[TIMING] Initializing model structure...")
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config
                 )
-                logger.info(f"[TIMING] Model structure initialized in {time.perf_counter() - init_model_start:.2f}s")
+                logger.info(f"[TIMING] Model structure initialized in {time.perf_counter() - init_start:.2f}s")
 
-            create_weights_start = time.perf_counter()
+            dummy_start = time.perf_counter()
             logger.info("[TIMING] Creating dummy weights...")
             self.load_weights(model, model_config)
-            logger.info(f"[TIMING] Dummy weights created in {time.perf_counter() - create_weights_start:.2f}s")
+            logger.info(f"[TIMING] Dummy weights created in {time.perf_counter() - dummy_start:.2f}s")
 
-            # HOOK: Receive RAW tensors via RDMA before processing
-            receive_tensors_start = time.perf_counter()
-            logger.info("=" * 60)
-            logger.info("[TIMING] === HOOK: Receiving raw tensors via RDMA ===")
-            logger.info("=" * 60)
+            rdma_start = time.perf_counter()
+            logger.info("[TIMING] Receiving raw tensors via RDMA...")
             self._receive_raw_tensors(model, target_device)
-            rdma_time = time.perf_counter() - receive_tensors_start
-            logger.info(f"[TIMING] === RDMA reception complete in {rdma_time:.2f}s ===")
+            rdma_time = time.perf_counter() - rdma_start
+            logger.info(f"[TIMING] RDMA reception complete in {rdma_time:.2f}s")
 
-            # Now run FP8 processing (transforms weight_scale_inv -> weight_scale)
-            # This will produce IDENTICAL results to source since we have same raw data
-            process_weights_start = time.perf_counter()
+            process_start = time.perf_counter()
             logger.info("[TIMING] Processing weights (FP8 transformation)...")
             process_weights_after_loading(model, model_config, target_device)
-            logger.info(f"[TIMING] Weight processing complete in {time.perf_counter() - process_weights_start:.2f}s")
+            logger.info(f"[TIMING] Weight processing complete in {time.perf_counter() - process_start:.2f}s")
 
         total_time = time.perf_counter() - load_start
-        logger.info("=" * 60)
-        logger.info("[TIMING] MxTargetModelLoader.load_model() COMPLETE")
-        logger.info(f"[TIMING] Total load time: {total_time:.2f}s")
-        logger.info("=" * 60)
+        logger.info(f"[TIMING] MxTargetModelLoader.load_model() complete in {total_time:.2f}s")
         return model.eval()
 
     def _receive_raw_tensors(
@@ -469,6 +460,7 @@ class MxTargetModelLoader(DummyModelLoader):
         We receive them into our dummy tensors, then let vLLM process them.
         """
         receive_start = time.perf_counter()
+        logger.debug("_receive_raw_tensors() called")
 
         if not is_nixl_available():
             logger.warning("NIXL not available, skipping RDMA transfer")
@@ -477,12 +469,14 @@ class MxTargetModelLoader(DummyModelLoader):
         # Get source info from environment
         model_name = os.environ.get("MODEL_NAME", "")
 
+        logger.debug(f"Model: {model_name}")
+
         if not model_name:
             logger.warning("MODEL_NAME not set, skipping transfer")
             return
 
         # Collect target tensors (these have dummy data)
-        collect_tensors_start = time.perf_counter()
+        collect_start = time.perf_counter()
         target_tensors: dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
             if param.is_cuda:
@@ -491,7 +485,7 @@ class MxTargetModelLoader(DummyModelLoader):
         device_id = _get_worker_rank(device)
         scale_count = sum(1 for n in target_tensors if "scale_inv" in n.lower())
         total_size = sum(t.numel() * t.element_size() for t in target_tensors.values())
-        logger.debug(f"[Worker {device_id}] [TIMING] Collected {len(target_tensors)} tensors in {time.perf_counter() - collect_tensors_start:.3f}s")
+        logger.debug(f"[Worker {device_id}] [TIMING] Collected {len(target_tensors)} tensors in {time.perf_counter() - collect_start:.3f}s")
 
         logger.info(
             f"[Worker {device_id}] Target has {len(target_tensors)} tensors "
@@ -511,7 +505,7 @@ class MxTargetModelLoader(DummyModelLoader):
             logger.debug(f"[Worker {device_id}]   '{name}': shape={t.shape}, dtype={t.dtype}, checksum={checksum}")
 
         # Initialize NIXL manager
-        init_nixl_manager_start = time.perf_counter()
+        nixl_start = time.perf_counter()
         agent_name = f"mx-target-worker{device_id}-{uuid.uuid4().hex[:8]}"
         logger.debug(f"[Worker {device_id}] [TIMING] Initializing NIXL manager with agent_name={agent_name}")
         self._nixl_manager = NixlTransferManager(
@@ -519,13 +513,13 @@ class MxTargetModelLoader(DummyModelLoader):
             device_id=device_id,
         )
         self._nixl_manager.initialize()
-        nixl_init_time = time.perf_counter() - init_nixl_manager_start
+        nixl_init_time = time.perf_counter() - nixl_start
         logger.info(f"[Worker {device_id}] [TIMING] NIXL manager initialized in {nixl_init_time:.3f}s")
 
-        register_tensors_start = time.perf_counter()
+        reg_start = time.perf_counter()
         logger.debug(f"[Worker {device_id}] [TIMING] Registering target tensors with NIXL...")
         self._nixl_manager.register_tensors(target_tensors)
-        reg_time = time.perf_counter() - register_tensors_start
+        reg_time = time.perf_counter() - reg_start
         logger.info(f"[Worker {device_id}] [TIMING] Target tensors registered in {reg_time:.3f}s")
 
         # COORDINATION: Wait for NIXL ready flag before initiating transfer
@@ -542,12 +536,13 @@ class MxTargetModelLoader(DummyModelLoader):
         )
 
         if not source_ready:
-            logger.error(f"[Worker {device_id}] Source NIXL never became ready, cannot proceed")
-            return
+            raise RuntimeError(
+                f"[Worker {device_id}] Source NIXL never became ready after 2h timeout. "
+                "Cannot proceed — model would serve with dummy/random weights."
+            )
 
         logger.info(f"[Worker {device_id}] Source NIXL ready (stability verified), proceeding with transfer")
 
-        # TODO: Define constants in a separate location
         # Connect to ModelExpress server and find source via MxClient
         # Retry with backoff - source takes 20-30 min to load DeepSeek-V3
         max_wait_time = 3600  # 1 hour max wait
@@ -610,7 +605,7 @@ class MxTargetModelLoader(DummyModelLoader):
 
             if not source_worker:
                 available_ranks = [w.worker_rank for w in response.workers] if response and response.workers else []
-                logger.error(f"[Worker {device_id}] No source worker found for rank {device_id} after {total_waited}s. Available: {available_ranks}")
+                logger.error(f"[Worker {device_id}] ERROR: No source worker found for rank {device_id} after {total_waited}s. Available: {available_ranks}")
                 return
 
             wait_time = time.perf_counter() - wait_start
@@ -655,7 +650,6 @@ class MxTargetModelLoader(DummyModelLoader):
                     transfer_time = time.perf_counter() - transfer_start
 
                     bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
-                    logger.info("=" * 60)
                     logger.info(
                         f"[Worker {device_id}] [TIMING] RDMA TRANSFER COMPLETE:"
                     )
@@ -663,7 +657,6 @@ class MxTargetModelLoader(DummyModelLoader):
                     logger.info(f"[Worker {device_id}] [TIMING]   Data: {bytes_transferred / 1e9:.2f} GB")
                     logger.info(f"[Worker {device_id}] [TIMING]   Time: {transfer_time:.3f}s")
                     logger.info(f"[Worker {device_id}] [TIMING]   Bandwidth: {bandwidth_gbps:.1f} Gbps")
-                    logger.info("=" * 60)
 
                     # Sync CUDA to ensure transfer is visible
                     torch.cuda.synchronize()
@@ -736,14 +729,12 @@ class MxTargetModelLoader(DummyModelLoader):
 
             # Final timing summary
             total_receive_time = time.perf_counter() - receive_start
-            logger.info("=" * 60)
             logger.info(f"[Worker {device_id}] [TIMING] _receive_raw_tensors SUMMARY:")
             logger.info(f"[Worker {device_id}] [TIMING]   Total time: {total_receive_time:.2f}s")
             logger.info(f"[Worker {device_id}] [TIMING]   NIXL init: {nixl_init_time:.3f}s")
             logger.info(f"[Worker {device_id}] [TIMING]   Tensor reg: {reg_time:.3f}s")
             logger.info(f"[Worker {device_id}] [TIMING]   Wait for source: {wait_time:.2f}s")
             logger.info(f"[Worker {device_id}] [TIMING]   RDMA transfer: {transfer_time:.3f}s")
-            logger.info("=" * 60)
 
         except Exception as e:
             import traceback
