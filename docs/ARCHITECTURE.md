@@ -406,11 +406,11 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 | Module | Purpose |
 |--------|---------|
-| `__init__.py` | Package init, auto-registers `mx-source`/`mx-target` loaders with vLLM when `MX_REGISTER_LOADERS=1` |
+| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register `mx-source`/`mx-target` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client with session management, ready polling |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `vllm_loader.py` | `MxSourceModelLoader`, `MxTargetModelLoader` - custom vLLM model loaders |
-| `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class |
+| `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
 
@@ -424,6 +424,8 @@ gRPC client wrapping the P2P service stubs:
 | `get_metadata(model_name)` | Query for existing source metadata |
 | `publish_ready(model_name, worker_id, ...)` | Signal NIXL readiness |
 | `wait_for_ready(model_name, worker_id, ...)` | Poll until source is ready (with timeout) |
+| `check_session_changed(model_name, worker_id, cached_session_id)` | Detect source restarts via session ID change |
+| `close()` | Close the underlying gRPC channel |
 
 ### NixlTransferManager
 
@@ -431,11 +433,11 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 | Method | Purpose |
 |--------|---------|
-| `__init__(worker_rank, device)` | Create NIXL agent with UCX backend |
+| `__init__(agent_name, device_id)` | Create NIXL agent with UCX backend |
 | `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata |
-| `register_contiguous_regions(tensors)` | Coalesce adjacent tensors for reduced registration overhead |
-| `receive_from_source(src_tensors, src_metadata, dst_tensors)` | Execute RDMA read transfer |
-| `destroy()` | Clean up NIXL agent |
+| `get_registered_descriptors()` | Return region descriptors (`MX_CONTIGUOUS_REG=1`) or tensor descriptors |
+| `receive_from_source(source_metadata, source_tensors, ...)` | Execute RDMA read transfer with optional coalescing |
+| `shutdown()` | Clean up NIXL agent and resources |
 
 ### vLLM Loaders
 
@@ -446,11 +448,15 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 4. Run `process_weights_after_loading()` (FP8 transform)
 5. Signal readiness after warmup
 
-**MxTargetModelLoader** (extends `DefaultModelLoader`):
+**MxTargetModelLoader** (extends `DummyModelLoader`):
 1. Create dummy tensors matching source layout
 2. Wait for source readiness (via `MxClient.wait_for_ready()`)
-3. Receive weights via RDMA transfer
+3. Receive weights via RDMA transfer (with transfer-time coalescing of contiguous regions)
 4. Run `process_weights_after_loading()` (same FP8 transform)
+
+Both loaders require the `MODEL_NAME` environment variable to identify the model for coordination.
+
+Module-level globals `_raw_tensor_registry` and `_nixl_managers` in `vllm_loader.py` bridge loaders and clients - vLLM's loader API doesn't expose loader instances after `load_model()` returns, so source loaders store state in these dicts (keyed by device ID) for the MxClient to access.
 
 ## NIXL Integration
 
@@ -544,8 +550,10 @@ graph TD
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MODEL_NAME` | (none) | Model identifier for P2P coordination (e.g., `deepseek-ai/DeepSeek-V3`) |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target loaders with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |

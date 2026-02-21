@@ -14,6 +14,7 @@ For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). 
 - **Rust**: Latest stable version (recommended: 1.90+)
 - **Cargo**: Rust's package manager (included with Rust)
 - **protoc**: Protocol Buffers compiler
+- **Python 3.10+** (optional): For the P2P client library
 - **Docker** (optional): For containerized deployment
 - **Redis** (optional): For P2P metadata coordination
 - **pre-commit**: For automated code quality checks
@@ -34,6 +35,9 @@ cargo build
 
 # Run tests
 cargo test
+
+# (Optional) Install the Python P2P client for development
+pip install -e modelexpress_client/python[dev]
 ```
 
 ### DevContainer
@@ -62,6 +66,8 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `cargo run --bin test_client -- --test-model "google-t5/t5-small"` | Run test client |
 | `cargo run --bin fallback_test` | Run fallback tests |
 | `./run_integration_tests.sh` | Integration tests (starts server) |
+| `pytest modelexpress_client/python/tests/` | Run Python client tests |
+| `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
 | `pre-commit run` | Run hooks on staged files |
 | `pre-commit run --all-files` | Run hooks on all files |
 
