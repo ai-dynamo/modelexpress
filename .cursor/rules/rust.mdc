@@ -1,514 +1,110 @@
 ---
-description: Rust writing rules.
-globs:
-  - "**/*.rs"
+description: ModelExpress project rules and coding standards
 alwaysApply: true
 ---
 
-# ModelExpress - AI Assistant Context
-
-This file provides context for AI assistants working on the ModelExpress codebase. It summarizes the project architecture, key concepts, and common development patterns.
-
-## Project Overview
-
-**ModelExpress** enables high-performance GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand. Instead of each vLLM instance loading weights from storage, one "source" instance loads the model and transfers weights directly to "target" instances via GPU memory.
-
-### Key Value Proposition
-
-- **Speed**: Transfer 681GB (DeepSeek-V3) in ~15 seconds vs. ~25 minutes from NVMe storage
-- **Efficiency**: GPU-to-GPU transfers via GPUDirect RDMA bypass CPU entirely (zero-copy)
-- **Scalability**: Coordinate transfers across multiple vLLM instances in a cluster
-
-### Current Status
-
-| Model | Status | Transfer Time | Notes |
-|-------|--------|---------------|-------|
-| DeepSeek-V3 (671B, FP8) | Working | ~15s | 681GB across 8 GPUs @ ~112 Gbps per link |
-| Llama 3.3 70B | Working | ~5s | 140GB across 8 GPUs @ ~112 Gbps |
-
----
-
-## Architecture
-
-```mermaid
-graph TD
-    subgraph "Node A (Source)"
-        A[vLLM + MxSourceModelLoader<br/>- Load weights from disk<br/>- Register with NIXL<br/>- Publish to server]
-    end
-    subgraph "Node B (Target)"
-        B[vLLM + MxTargetModelLoader<br/>- Create dummy weights<br/>- Receive via RDMA<br/>- Run FP8 processing]
-    end
-    A -- "RDMA" --> B
-    A --> S
-    B --> S
-    S[ModelExpress Server - Rust<br/>Redis: model_name -> worker metadata]
-```
-
-### Components
-
-| Component | Language | Location | Purpose |
-|-----------|----------|----------|---------|
-| ModelExpress Server | Rust | `modelexpress_server/` | gRPC coordinator, stores metadata in Redis |
-| Python Client | Python | `modelexpress_client/python/` | vLLM loaders, NIXL transfer manager |
-| Rust Client | Rust | `modelexpress_client/src/` | CLI tools, test utilities |
-| Common | Rust | `modelexpress_common/` | Protobuf definitions, shared types |
-
----
-
-## NIXL Integration
-
-### What is NIXL?
-
-NIXL (NVIDIA Interconnect eXchange Library) is a library for zero-copy GPU-to-GPU RDMA transfers. It sits on top of UCX (Unified Communication X) and provides:
-
-- **Agent-based architecture**: Each GPU worker creates a NIXL agent
-- **Memory registration**: GPU memory must be registered for RDMA access
-- **Transfer descriptors**: NIXL uses descriptors to track source/destination addresses
-- **Backend support**: UCX for InfiniBand RDMA, GDS for storage, etc.
-
-### How ModelExpress Uses NIXL
-
-```python
-# 1. Create NIXL agent (one per GPU worker)
-from nixl._api import nixl_agent, nixl_agent_config
-
-config = nixl_agent_config(backends=["UCX"])
-agent = nixl_agent("worker-0", config)
-
-# 2. Register GPU tensors for RDMA access
-tensors = [(tensor.data_ptr(), tensor.numel() * tensor.element_size(), device_id, "cuda")]
-agent.register_memory(tensors, "VRAM")
-
-# 3. Get metadata for remote agent connection
-metadata = agent.get_local_md()  # Share this with target
-
-# 4. On target: connect to source and transfer
-agent.add_remote_agent("source-worker-0", source_metadata)
-
-# Prepare transfer descriptors
-src_descs = agent.prep_xfer_dlist("source-worker-0", source_tensors, "cuda", ["UCX"])
-dst_descs = agent.prep_xfer_dlist("", local_tensors, "cuda", ["UCX"])
-
-# Execute RDMA read
-handle = agent.make_prepped_xfer("READ", dst_descs, indices, src_descs, indices, ["UCX"])
-agent.transfer(handle)
-
-# Wait for completion
-while agent.check_xfer_state(handle) not in ("DONE", "SUCCESS"):
-    time.sleep(0.001)
-agent.release_xfer_handle(handle)
-```
-
-### Key NIXL Concepts
-
-| Concept | Description |
-|---------|-------------|
-| **Agent** | NIXL instance managing one GPU's memory registrations and transfers |
-| **Memory Registration** | Must register GPU memory before RDMA access; generates rkeys |
-| **Metadata** | Serialized agent info (address, rkeys) shared between source/target |
-| **Transfer Descriptor** | Prepared list of (addr, size, device) for efficient bulk transfer |
-| **rkey** | Remote key - RDMA authorization token for remote memory access |
-
-### NIXL/UCX Environment Variables
-
-```yaml
-# Transport layers
-UCX_TLS: "rc_x,rc,dc_x,dc,cuda_copy"  # InfiniBand + CUDA copy
-
-# Zero-copy RDMA
-UCX_RNDV_SCHEME: "get_zcopy"  # Use RDMA read for zero-copy
-UCX_RNDV_THRESH: "0"          # Force rendezvous for all messages
-
-# Logging
-NIXL_LOG_LEVEL: "INFO"        # DEBUG for troubleshooting
-UCX_LOG_LEVEL: "WARN"         # DEBUG for troubleshooting
-```
-
----
-
-## Repository Structure
-
-```text
-modelexpress/
-├── modelexpress_server/      # Rust gRPC server
-│   └── src/
-│       ├── main.rs
-│       ├── p2p_service.rs    # PublishMetadata, GetMetadata RPCs
-│       └── state.rs          # Redis-backed storage
-├── modelexpress_client/
-│   └── python/
-│       └── modelexpress/
-│           ├── vllm_loader.py    # MxSourceModelLoader, MxTargetModelLoader
-│           ├── nixl_transfer.py  # NixlTransferManager
-│           ├── types.py          # TensorDescriptor, WorkerMetadata
-│           └── p2p_pb2*.py       # Generated gRPC stubs
-├── modelexpress_common/
-│   └── proto/
-│       └── p2p.proto         # Protobuf service definitions
-├── examples/
-│   └── p2p_transfer_k8s/
-│       ├── vllm-source.yaml  # Source Kubernetes deployment
-│       ├── vllm-target.yaml  # Target Kubernetes deployment
-│       └── modelexpress-server.yaml
-└── docs/
-    ├── CONTEXT.md            # Detailed engineering context
-    ├── OPTIMIZATION_PLAN.md  # Performance optimization roadmap
-    └── CONTIGUOUS_CONTEXT.md # Contiguous region debugging context
-```
-
----
-
-## Key Files
-
-### `modelexpress_client/python/modelexpress/vllm_loader.py`
-
-Contains custom vLLM model loaders:
-
-- **`MxSourceModelLoader`**: Loads weights from disk, registers with NIXL, publishes metadata
-- **`MxTargetModelLoader`**: Creates dummy weights, receives via RDMA, applies FP8 processing
-
-```python
-class MxSourceModelLoader(DefaultModelLoader):
-    """Loads model from disk and publishes for RDMA transfer."""
-
-    def load_model(self, vllm_config, model_config):
-        model = initialize_model(...)
-        self.load_weights(model, model_config)  # Load from disk
-
-        # CRITICAL: Register BEFORE FP8 processing
-        self._register_raw_tensors(model, device)
-
-        process_weights_after_loading(...)  # FP8 transform
-        return model.eval()
-```
-
-### `modelexpress_client/python/modelexpress/nixl_transfer.py`
-
-Contains `NixlTransferManager`:
-
-- **Agent lifecycle**: Create, initialize, destroy NIXL agents
-- **Memory registration**: Register tensors or contiguous regions
-- **Transfer execution**: Prepare descriptors, execute RDMA, wait for completion
-- **Contiguous regions**: Coalesce adjacent tensors for reduced overhead
-
-```python
-class NixlTransferManager:
-    """Manages NIXL agent and RDMA transfers for a single GPU worker."""
-
-    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
-        """Register tensors with NIXL for RDMA access."""
-
-    def receive_from_source(self, source_tensors, source_metadata, ...):
-        """Execute RDMA transfer from source to local tensors."""
-```
-
-### `modelexpress_server/src/p2p_service.rs`
-
-Rust gRPC service implementation:
-
-- **`PublishMetadata`**: Source workers publish NIXL metadata + tensor descriptors
-- **`GetMetadata`**: Target workers query for source with matching model name
-- **Worker merging**: Server merges workers by rank (critical for multi-GPU)
-
----
-
-## Build and Development Commands
-
-```bash
-# Build the project
-cargo build
-
-# Build in release mode
-cargo build --release
-
-# Run the server
-cargo run --bin modelexpress-server
-
-# Run tests
-cargo test
-
-# Run integration tests (starts server, runs test client)
-./run_integration_tests.sh
-
-# Run a specific test client
-cargo run --bin test_client -- --test-model "google-t5/t5-small"
-
-# Run clippy (required before submitting code)
-cargo clippy
-
-# Generate sample configuration file
-cargo run --bin config_gen -- --output model-express.yaml
-```
-
----
+# ModelExpress
+
+Rust-based model cache management service and GPU-to-GPU weight transfer system using NVIDIA NIXL over RDMA.
+
+**Reference documentation:**
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Project structure, crate catalog, gRPC services, server internals, Python client, NIXL integration
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) - Configuration reference, Docker, Kubernetes, Helm, P2P transfer setup, debugging
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) - Development setup, available commands, pre-commit hooks, environment variables, DCO
+- [`docs/CLI.md`](docs/CLI.md) - CLI tool usage, commands, output formats, integration examples
 
 ## Coding Standards
 
 - `unwrap()` is **strictly forbidden** except in benchmarks. `expect()` is allowed in tests. Always handle errors with `match`, `?`, or custom error types.
-- All cargo dependencies go in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively.
+- All cargo dependencies go in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively. Never edit `Cargo.toml` or `Cargo.lock` by hand to add or update dependencies - use `cargo add` so you always get the latest version.
+- Python dependencies go in `pyproject.toml`. Never edit dependency files by hand - use `uv add` so you always get the latest version.
 - `cargo clippy` must pass with no warnings.
 - No emojis in code or comments.
 - Do not create markdown files to document code changes or decisions.
 - Do not over-comment code. Removing code is fine without adding comments to explain why.
+- Use mermaid diagrams instead of ASCII art in markdown files.
+- Prefer established crates over hand-rolled implementations. Check existing workspace dependencies before adding new ones.
 
----
+## Build and Test Commands
+
+```bash
+cargo build                          # Build
+cargo build --release                # Release build
+cargo test                           # Run all tests
+cargo clippy                         # Lint (must pass, no warnings)
+cargo run --bin modelexpress-server  # Run server
+cargo run --bin config_gen -- --output model-express.yaml  # Generate config
+cargo run --bin test_client -- --test-model "google-t5/t5-small"  # Test client
+cargo run --bin fallback_test        # Fallback test
+cargo bench                          # Criterion benchmarks
+./run_integration_tests.sh           # Integration tests (starts server)
+```
+
+## Pre-commit Hooks
+
+Run pre-commit after every code change, even before creating commits:
+
+```bash
+pre-commit run              # Staged files only
+pre-commit run --all-files  # All files (recommended after significant changes)
+```
+
+Hooks: `cargo fmt`, `cargo clippy` (--fix), `cargo check`, trailing whitespace, end-of-file, YAML/TOML/JSON validation, merge conflict detection, large file check.
 
 ## Adding CLI Arguments
 
 Client CLI arguments are defined in a shared struct to avoid duplication:
 
-1. **Add to `ClientArgs`** in `modelexpress_common/src/client_config.rs`:
-   - This is the single source of truth for shared arguments
+1. **Add to `ClientArgs`** in `modelexpress_common/src/client_config.rs`
+   - Single source of truth for shared arguments
    - Use `#[arg(long, env = "MODEL_EXPRESS_...")]` for environment variable support
    - Do NOT use `-v` short flag (reserved for CLI's verbose)
 
-2. **Update `ClientConfig::load()`** in the same file:
+2. **Update `ClientConfig::load()`** in the same file
    - Add override logic in the "APPLY CLI ARGUMENT OVERRIDES" section
 
-3. **Do NOT duplicate in `Cli`** (`modelexpress_client/src/bin/modules/args.rs`):
+3. **Do NOT duplicate in `Cli`** (`modelexpress_client/src/bin/modules/args.rs`)
    - `Cli` embeds `ClientArgs` via `#[command(flatten)]`
    - Only add CLI-specific arguments there (e.g., `--format`, `--verbose`)
 
 4. **Add tests** in the `tests` module of `client_config.rs`
 
----
-
-## Pre-commit Hooks
-
-This repository uses pre-commit hooks to enforce code quality. Run pre-commit after every code change, even before creating commits:
-
-```bash
-# Run all pre-commit hooks on staged files
-pre-commit run
-
-# Run on all files (recommended after significant changes)
-pre-commit run --all-files
-```
-
-The hooks include:
-- `cargo fmt` - Code formatting
-- `cargo clippy` - Linting with auto-fix
-- `cargo check` - Compilation check
-- File hygiene checks (trailing whitespace, end-of-file, YAML/TOML/JSON validation, etc.)
-
-Running pre-commit hooks early and often catches issues before they accumulate. Do not wait until commit time to discover problems.
-
----
-
-## Common Development Tasks
-
-### Building Docker Image
-
-```bash
-cd path/to/modelexpress
-
-# Build client image
-docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
-  -t nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG .
-
-docker push nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG
-```
-
-### Deploying to Kubernetes
-
-```bash
-# Namespace
-NAMESPACE=<your-namespace>
-
-# 1. Flush Redis (clear stale metadata)
-microk8s kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
-
-# 2. Delete existing deployments
-microk8s kubectl -n $NAMESPACE delete deployment mx-source mx-target
-
-# 3. Deploy fresh
-microk8s kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/vllm-source.yaml
-microk8s kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/vllm-target.yaml
-
-# 4. Monitor
-watch microk8s kubectl -n $NAMESPACE get pods -l 'app in (mx-source, mx-target)'
-```
-
-### Debugging
-
-```bash
-# Stream logs
-kubectl -n $NAMESPACE logs -f deploy/mx-source
-kubectl -n $NAMESPACE logs -f deploy/mx-target
-
-# Check Redis state
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS '*'
-
-# Test inference
-kubectl -n $NAMESPACE exec deploy/mx-target -- curl -s http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "deepseek-ai/DeepSeek-V3", "prompt": "Hello", "max_tokens": 10}'
-```
-
----
-
-## Environment Variables
-
-### ModelExpress Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target loaders with vLLM |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (also reads `MX_SERVER_ADDRESS` for compat) |
-| `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
-| `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
-| `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
-
-### UCX/NIXL Tuning
-
-| Variable | Recommended | Description |
-|----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand |
-| `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
-| `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
-| `NIXL_LOG_LEVEL` | `INFO` | NIXL logging (DEBUG for troubleshooting) |
-| `UCX_LOG_LEVEL` | `WARN` | UCX logging (DEBUG for troubleshooting) |
-
----
-
-## FP8 Model Handling (DeepSeek-V3)
-
-### The Problem
-
-DeepSeek-V3 uses FP8 quantization with scale factors. vLLM's `process_weights_after_loading()`:
-1. Renames `weight_scale_inv` -> `weight_scale`
-2. Transforms the scale data format
-3. Deletes the original `weight_scale_inv` parameter
-
-If we transfer AFTER processing, source has `weight_scale` but target expects `weight_scale_inv` -> mismatch.
-
-### The Solution
-
-Transfer RAW tensors BEFORE `process_weights_after_loading()` runs:
-
-```mermaid
-graph TD
-    subgraph Source
-        S1[Load weight_scale_inv<br/>from safetensors]
-        S2[Register raw tensors<br/>with NIXL]
-        S3[process_weights:<br/>scale_inv -> scale]
-        S4[Identical weights]
-        S1 --> S2 --> S3 --> S4
-    end
-    subgraph Target
-        T1[Dummy weight_scale_inv]
-        T2[Receive raw tensors<br/>into dummy memory]
-        T3[process_weights:<br/>scale_inv -> scale]
-        T4[Identical weights]
-        T1 --> T2 --> T3 --> T4
-    end
-    S2 -- "RDMA" --> T2
-```
-
----
-
-## Known Issues
-
-### Issue 1: NIXL_ERR_REMOTE_DISCONNECT
-
-**Symptom**: Target fails with `Remote access error on mlx5_X:1/IB`
-
-**Common Causes**:
-- Source crashed/restarted during transfer (stale rkeys)
-- UCX transport misconfiguration
-- Premature target connection attempts during source warmup
-
-**Solutions**:
-- Use robust NIXL ready coordination (implemented in vllm-source.yaml)
-- Check source pod for restarts
-- Enable UCX_LOG_LEVEL=DEBUG for diagnostics
-
-### Issue 2: Contiguous Region Failures
-
-**Status**: BLOCKED - See `docs/CONTIGUOUS_CONTEXT.md`
-
-When `MX_CONTIGUOUS_REG=1`, transfers fail with Remote access error even when source is stable. The issue is fundamental to how contiguous regions are registered vs accessed.
-
-**Current Workaround**: Use baseline mode (`MX_CONTIGUOUS_REG=0`)
-
-### Issue 3: Long Source Warmup
-
-DeepSeek-V3 takes ~40 minutes to fully warm up (loading + DeepGemm + CUDA graphs). Target must wait via Redis coordination.
-
----
-
-## Coordination Protocol
-
-### Redis Keys
-
-| Key Pattern | Purpose |
-|-------------|---------|
-| `mx:nixl_ready:{model}:worker:{id}` | Source stability signal (published after warmup) |
-| `mx:model:{model}` | Model metadata (via gRPC, not directly in Redis) |
-
-### Flow
-
-1. **Source starts**: Loads weights, registers with NIXL, publishes metadata to gRPC server
-2. **Source warmup**: DeepGemm compilation, CUDA graph capture (~13 min)
-3. **Source publishes NIXL ready**: Background script waits for health + test inference, then publishes Redis flag
-4. **Target waits**: Polls Redis for `mx:nixl_ready` flag
-5. **Target transfers**: Executes RDMA reads from source
-6. **Target warmup**: Same DeepGemm + CUDA graph as source
-
----
-
-## Performance
-
-### Current Numbers
-
-| Metric | Value |
-|--------|-------|
-| Model | DeepSeek-V3 (671B, FP8) |
-| Total Data | 681 GB (8 workers x 85 GB) |
-| Transfer Time | ~15 seconds (8 parallel RDMA streams @ 112 Gbps each) |
-| Per-Worker Speed | 60-112 Gbps |
-| Theoretical Max | 400 Gbps per NIC |
-
-### Optimization Opportunities
-
-See `docs/OPTIMIZATION_PLAN.md` for detailed analysis:
-
-1. **Contiguous regions** (`MX_CONTIGUOUS_REG=1`): BLOCKED - needs investigation
-2. **Warm source pool**: Keep source always running
-3. **Kernel caching**: Cache DeepGemm compiled kernels
-4. **Multi-rail RDMA**: `UCX_IB_NUM_PATHS=2` if dual NICs available
-
----
-
-## Related Documentation
-
-| Document | Purpose |
-|----------|---------|
-| `docs/CONTEXT.md` | Detailed engineering context, debugging commands |
-| `docs/OPTIMIZATION_PLAN.md` | Performance analysis and optimization roadmap |
-| `docs/CONTIGUOUS_CONTEXT.md` | Contiguous region debugging history |
-| `docs/CLI.md` | CLI tool documentation |
-| `docs/QUICK_START.md` | Getting started guide |
-
----
-
-## Tips for AI Assistants
-
-1. **Always read before editing**: Read files to understand context before making changes
-2. **Check pod status first**: Many issues are caused by pod restarts
-3. **Flush Redis on redeploy**: Stale metadata causes transfer failures
-4. **Use baseline mode**: `MX_CONTIGUOUS_REG=0` until contiguous is fixed
-5. **Long startup times are normal**: DeepSeek-V3 takes ~40 min to warm up
-6. **UCX errors need DEBUG logging**: Set `UCX_LOG_LEVEL=DEBUG` for diagnostics
-7. **NIXL agents must match ranks**: Source rank 0 -> Target rank 0
-
----
-
-## AI Agent Instructions
-
-When introducing new patterns, conventions, or architectural decisions that affect how code should be written, update ALL AI agent instruction files:
-- `CLAUDE.md` (Claude Code)
-- `.github/copilot-instructions.md` (GitHub Copilot)
-- `.cursor/rules/rust.mdc` (Cursor)
+## Adding gRPC Services
+
+1. Define the service in a `.proto` file under `modelexpress_common/proto/`
+2. Add the proto file to `modelexpress_common/build.rs` compile list
+3. Add the generated module to `modelexpress_common/src/lib.rs` under `pub mod grpc`
+4. Implement the service trait in `modelexpress_server/src/` (new file or existing)
+5. Register the service in `modelexpress_server/src/main.rs` during server startup
+
+## Git Workflow
+
+Feature branches use `<username>/feature-name` format, forked from `main`.
+
+## Tips
+
+- Read files to understand context before making changes.
+- Do not implement changes eagerly. When discussing a problem or new feature, investigate thoroughly first, report findings, propose changes, and ask if they are acceptable before writing code.
+- Flush Redis on redeploy: stale metadata causes P2P transfer failures.
+- Use baseline mode (`MX_CONTIGUOUS_REG=0`) until contiguous region transfers are fixed.
+- Long startup times are normal: DeepSeek-V3 takes ~40 min to warm up.
+- Set `UCX_LOG_LEVEL=DEBUG` for NIXL/RDMA diagnostics.
+- NIXL agents must match ranks: source rank 0 -> target rank 0.
+
+## Documentation Updates
+
+When making changes, update the appropriate documentation files:
+
+| Change type | Files to update |
+|---|---|
+| Architecture, components, NIXL, gRPC services | `docs/ARCHITECTURE.md` |
+| Coding standards, build commands, new patterns | `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/rust.mdc` |
+| CLI arguments or commands | `docs/CLI.md` + all 3 agent files (Adding CLI Arguments section) |
+| Configuration, environment variables | `docs/DEPLOYMENT.md` |
+| Deployment (Docker, K8s, Helm, P2P) | `docs/DEPLOYMENT.md` |
+| Known issues, FP8 handling | `docs/ARCHITECTURE.md` |
+| Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |
+| Contribution process, DCO | `CONTRIBUTING.md` |
+| New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
+
+**A feature is not complete until documentation is updated.**
