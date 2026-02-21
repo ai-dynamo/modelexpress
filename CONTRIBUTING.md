@@ -160,7 +160,7 @@ Contributions that fix documentation errors or that make small changes to existi
 Contributions intended to add significant new functionality must follow a more collaborative path. Before submitting a large PR, submit a GitHub issue describing the proposed change so the ModelExpress team can provide feedback:
 
 - A design for your change will be agreed upon to ensure consistency with ModelExpress's architecture.
-- The Dynamo project is spread across multiple repositories. The team will provide guidance about how and where your enhancement should be implemented.
+- The ModelExpress project is spread across multiple repositories. The team will provide guidance about how and where your enhancement should be implemented.
 - Testing is critical. Plan on spending significant time on creating tests. The team will help design testing compatible with existing infrastructure.
 - User-visible features need documentation.
 

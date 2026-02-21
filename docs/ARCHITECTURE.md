@@ -167,7 +167,9 @@ ModelExpress/
 │       └── agg.yaml
 │
 ├── docs/
-│   └── CLI.md                          # CLI tool documentation
+│   ├── ARCHITECTURE.md                 # Architecture reference
+│   ├── CLI.md                          # CLI tool documentation
+│   └── DEPLOYMENT.md                   # Deployment and configuration guide
 │
 ├── .devcontainer/
 │   ├── devcontainer.json               # VSCode config: rust-analyzer, port 8001
@@ -267,6 +269,7 @@ cache:
       type: lru
       unused_threshold: "7d"
       max_models: null
+      min_free_space_bytes: null
     check_interval: "1h"
 logging:
   level: info             # MODEL_EXPRESS_LOG_LEVEL
