@@ -1,26 +1,21 @@
 # P2P GPU Transfer Example
 
-This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between vLLM instances on Kubernetes.
+This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between vLLM instances on Kubernetes. For the broader deployment guide and environment variable reference, see [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md). For NIXL architecture details, see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ## Architecture
 
-```
-Node A (Source)                               Node B (Target)
-+----------------------------------+          +----------------------------------+
-| vLLM + MxSourceModelLoader       |          | vLLM + MxTargetModelLoader       |
-| - Loads weights from disk        |          | - Starts with dummy weights      |
-| - Registers tensors with NIXL    |          | - Waits for source ready flag    |
-| - Publishes metadata via MxClient|   RDMA   | - Receives weights via NIXL      |
-| - Publishes ready flag           |=========>| - Runs FP8 processing            |
-+----------------------------------+  NIXL    | - Serves inference               |
-        |                                     +----------------------------------+
-        |                                             |
-        v                                             v
-+--------------------------------------------------------------------+
-|                    ModelExpress Server (gRPC + Redis)               |
-|   - PublishMetadata / GetMetadata: tensor metadata coordination     |
-|   - PublishReady / GetReady: source readiness coordination         |
-+--------------------------------------------------------------------+
+```mermaid
+graph TD
+    subgraph "Node A - Source"
+        A[vLLM + MxSourceModelLoader<br/>- Loads weights from disk<br/>- Registers tensors with NIXL<br/>- Publishes metadata via MxClient<br/>- Publishes ready flag]
+    end
+    subgraph "Node B - Target"
+        B[vLLM + MxTargetModelLoader<br/>- Starts with dummy weights<br/>- Waits for source ready flag<br/>- Receives weights via NIXL<br/>- Runs FP8 processing<br/>- Serves inference]
+    end
+    A -- "RDMA via NIXL" --> B
+    A --> S
+    B --> S
+    S[ModelExpress Server - gRPC + Redis<br/>PublishMetadata / GetMetadata<br/>PublishReady / GetReady]
 ```
 
 ### Key Design Points
