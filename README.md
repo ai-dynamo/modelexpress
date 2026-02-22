@@ -105,11 +105,11 @@ docker run -p 8001:8001 model-express
 kubectl apply -f k8s-deployment.yaml
 ```
 
-For Helm-based deployment, see [`helm/README.md`](helm/README.md).
+Helm-based deployment details are in [`helm/README.md`](helm/README.md).
 
 For launching ModelExpress with Dynamo on Kubernetes, see the [aggregated K8s example](examples/aggregated_k8s/).
 
-For GPU-to-GPU P2P weight transfers, see the [P2P transfer example](examples/p2p_transfer_k8s/).
+GPU-to-GPU P2P weight transfer instructions are in the [P2P transfer example](examples/p2p_transfer_k8s/).
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full deployment guide covering configuration, Docker, Kubernetes, Helm, and P2P transfer setup.
 

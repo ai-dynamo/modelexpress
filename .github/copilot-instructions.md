@@ -83,7 +83,7 @@ Feature branches use `<username>/feature-name` format, forked from `main`.
 
 ## Tips
 
-- Read files to understand context before making changes.
+- Always read files to understand context before making changes.
 - Do not implement changes eagerly. When discussing a problem or new feature, investigate thoroughly first, report findings, propose changes, and ask if they are acceptable before writing code.
 - Flush Redis on redeploy: stale metadata causes P2P transfer failures.
 - Use baseline mode (`MX_CONTIGUOUS_REG=0`) until contiguous region transfers are fixed.
@@ -107,4 +107,4 @@ When making changes, update the appropriate documentation files:
 | Contribution process, DCO | `CONTRIBUTING.md` |
 | New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
 
-**A feature is not complete until documentation is updated.**
+**A feature is incomplete until documentation is updated.**

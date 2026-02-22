@@ -102,4 +102,4 @@ When making changes, update the appropriate documentation files:
 | Contribution process, DCO | `CONTRIBUTING.md` |
 | New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
 
-**A feature is not complete until documentation is updated.**
+**A feature is incomplete until documentation is updated.**
