@@ -1,0 +1,127 @@
+# Phase 3 Source: Running TRT-LLM model publishes its GPU params for P2P transfer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-source
+  labels:
+    app: trtllm-source
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-source
+  template:
+    metadata:
+      labels:
+        app: trtllm-source
+    spec:
+      containers:
+        - name: source
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph3
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging, torch
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+              logger = logging.getLogger("trtllm-live-source")
+
+              model_name = os.environ["MODEL_NAME"]
+              mx_server = os.environ["MODEL_EXPRESS_URL"]
+
+              # Load model directly via TRT-LLM's model classes (not LLM wrapper).
+              # This gives us direct access to model.named_parameters() for NIXL.
+              logger.info("Loading TRT-LLM model directly: %s", model_name)
+              from tensorrt_llm._torch.model_config import ModelConfig
+              from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+              from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+              # Resolve HF model to local path
+              from huggingface_hub import snapshot_download
+              local_path = snapshot_download(model_name, cache_dir=os.environ.get("HF_HUB_CACHE", "/models"))
+              logger.info("Model resolved to: %s", local_path)
+
+              t0 = time.perf_counter()
+              config = ModelConfig.from_pretrained(local_path)
+
+              # Create model and load weights (like ModelLoader.load() does)
+              with MetaInitMode():
+                  model = AutoModelForCausalLM.from_config(config)
+              model._apply(lambda t: torch.empty_like(t, device='cuda') if t.device == torch.device('meta') else t)
+              model.to("cuda")
+
+              # Load weights from HF checkpoint
+              from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
+              from tensorrt_llm._torch.models.checkpoints.hf.config_loader import HfConfigLoader
+              from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
+              from tensorrt_llm.mapping import Mapping
+
+              mapping = Mapping(world_size=1, tp_size=1, rank=0)
+              ckpt_loader = HfCheckpointLoader()
+              weights = ckpt_loader.load_weights(local_path, mapping=mapping)
+              weight_mapper = ckpt_loader.get_initialized_weight_mapper(model, config)
+              model.load_weights(weights, weight_mapper=weight_mapper)
+
+              load_time = time.perf_counter() - t0
+              params = list(model.named_parameters())
+              total_bytes = sum(p.numel() * p.element_size() for _, p in params)
+              logger.info("Model loaded: %d params (%.2f GB) in %.2fs", len(params), total_bytes/1e9, load_time)
+
+              # Publish model params via NIXL
+              logger.info("Publishing model params for P2P transfer...")
+              from modelexpress.trtllm_live_transfer import MxLiveSource
+              source = MxLiveSource(model, model_name, mx_server)
+              source.publish()
+              logger.info("Live source ready — serving model params via NIXL")
+
+              # Keep running (model params stay in GPU memory)
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Phase 3: TRT-LLM with live GPU-to-GPU P2P weight transfer via NIXL
+#
+# Uses TRT-LLM NGC release base (has MPI, HPC-X/UCX, system NIXL).
+# Overlays 3 small patches for LoadFormat.PRESHARDED support.
+#
+# Build from modelexpress repo root:
+#   docker build -t modelexpress-trtllm-client:ph3 \
+#       -f examples/p2p_transfer_trtllm/Dockerfile.ph3 .
+
+FROM nvcr.io/nvidia/tensorrt-llm/release:1.2.0rc6
+
+USER root
+
+# Use system NIXL (ships with NGC image at /opt/nvidia/nvda_nixl/).
+# pip install --no-deps gets the Python wrapper only; the native libs
+# come from the system install. This avoids UCX conflicts with HPC-X.
+RUN pip install --no-cache-dir --no-deps nixl && \
+    SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    ln -sf /opt/nvidia/nvda_nixl/lib/python3/dist-packages/nixl_cu13 \
+           "$SITE/nixl_cu13" && \
+    echo "/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu" > /etc/ld.so.conf.d/nixl-system.conf && \
+    ldconfig
+
+# Install gRPC for ModelExpress client
+RUN pip install --no-cache-dir grpcio grpcio-tools protobuf
+
+# Copy and install ModelExpress client
+COPY modelexpress_common/proto /opt/modelexpress/proto
+COPY modelexpress_client/python/modelexpress /opt/modelexpress/client/modelexpress
+COPY modelexpress_client/python/pyproject.toml /opt/modelexpress/client/
+
+WORKDIR /opt/modelexpress/client
+RUN python3 -m grpc_tools.protoc \
+        -I/opt/modelexpress/proto \
+        --python_out=/opt/modelexpress/client/modelexpress \
+        --grpc_python_out=/opt/modelexpress/client/modelexpress \
+        /opt/modelexpress/proto/p2p.proto && \
+    sed -i 's/^import p2p_pb2/from . import p2p_pb2/' \
+        /opt/modelexpress/client/modelexpress/p2p_pb2_grpc.py && \
+    pip install --no-deps .
+
+# Apply TRT-LLM patches for LoadFormat.PRESHARDED support (~30 lines changed)
+# These enable: (1) PRESHARDED enum, (2) model ref in load_weights, (3) empty dict handling
+COPY trtllm_patches/llm_args.py /usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm_args.py
+COPY trtllm_patches/model_loader.py /usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/pyexecutor/model_loader.py
+COPY trtllm_patches/linear.py /usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/modules/linear.py
+
+# Verify non-GPU imports (TRT-LLM requires libcuda.so, so skip at build time)
+WORKDIR /workspace
+RUN python3 -c "from modelexpress.client import MxClient; print('MxClient OK')" && \
+    python3 -c "from modelexpress.nixl_transfer import is_nixl_available; print(f'NIXL available: {is_nixl_available()}')" && \
+    python3 -c "import ast; ast.parse(open('/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm_args.py').read()); print('llm_args.py patch: syntax OK')" && \
+    grep -q "PRESHARDED" /usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/llm_args.py && \
+    echo "PRESHARDED enum found in llm_args.py"

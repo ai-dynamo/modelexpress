@@ -122,6 +122,8 @@ class MxTrtllmSourcePublisher:
         engine_dir: str | None = None,
         hf_model_path: str | None = None,
         tp_size: int = 1,
+        ep_size: int = 1,
+        num_experts: int = 0,
         dtype: str = "bfloat16",
     ):
         self.model_name = model_name
@@ -130,6 +132,8 @@ class MxTrtllmSourcePublisher:
         self.engine_dir = Path(engine_dir) if engine_dir else None
         self.hf_model_path = Path(hf_model_path) if hf_model_path else None
         self.tp_size = tp_size
+        self.ep_size = ep_size
+        self.num_experts = num_experts
         self.dtype = dtype
         self.config: dict = {}
         self.nixl_managers: dict[int, NixlTransferManager] = {}
@@ -191,96 +195,141 @@ class MxTrtllmSourcePublisher:
         if hf_config_path.exists():
             with open(hf_config_path) as f:
                 hf_config = json.load(f)
+
+            if self.num_experts == 0:
+                self.num_experts = hf_config.get("n_routed_experts", hf_config.get("num_local_experts", 0))
+
             self.config = {
                 "architecture": hf_config.get("model_type", "unknown"),
                 "hidden_size": hf_config.get("hidden_size"),
                 "num_layers": hf_config.get("num_hidden_layers"),
+                "num_experts": self.num_experts,
+                "ep_size": self.ep_size,
                 "dtype": self.dtype,
                 "mapping": {
-                    "world_size": self.tp_size,
+                    "world_size": self.tp_size * self.ep_size,
                     "tp_size": self.tp_size,
+                    "ep_size": self.ep_size,
                     "pp_size": 1,
                 },
                 "_hf_model_path": str(self.hf_model_path),
                 "_mode": "huggingface",
             }
-            logger.info(f"Model: {self.config['architecture']}, hidden_size={self.config['hidden_size']}")
+            logger.info(
+                "Model: %s, hidden_size=%s, num_experts=%d, ep_size=%d",
+                self.config["architecture"], self.config["hidden_size"],
+                self.num_experts, self.ep_size,
+            )
         
-        # Load model weights for each rank
+        # Load model weights for each rank.
+        # With EP, total ranks = tp_size * ep_size. Each EP rank gets a subset of experts.
+        # With pure EP (tp_size=1), rank == ep_rank and device_id == ep_rank.
+        total_ranks = self.tp_size * self.ep_size if self.ep_size > 1 else self.tp_size
         total_bytes = 0
-        
-        for rank in range(self.tp_size):
-            logger.info(f"Loading rank {rank}/{self.tp_size} weights to GPU...")
-            
-            # Load HuggingFace weights and shard for this rank
-            weights = self._load_hf_weights_for_rank(rank)
+
+        for rank in range(total_ranks):
+            ep_rank = rank // self.tp_size if self.ep_size > 1 else 0
+            tp_rank = rank % self.tp_size if self.tp_size > 1 else 0
+            device_id = rank % torch.cuda.device_count()
+
+            logger.info(
+                "Loading rank %d/%d (tp=%d, ep=%d) to GPU %d...",
+                rank, total_ranks, tp_rank, ep_rank, device_id,
+            )
+
+            weights = self._load_hf_weights_for_rank(
+                rank, tp_rank=tp_rank, ep_rank=ep_rank
+            )
             self.weights[rank] = weights
-            
+
             rank_bytes = sum(t.numel() * t.element_size() for t in weights.values())
             total_bytes += rank_bytes
-            logger.info(f"Rank {rank}: {len(weights)} tensors, {rank_bytes / 1e9:.2f} GB")
-            
-            # Initialize NIXL manager
+            logger.info("Rank %d: %d tensors, %.2f GB", rank, len(weights), rank_bytes / 1e9)
+
             import uuid
             agent_name = f"trtllm-hf-source-rank{rank}-{uuid.uuid4().hex[:8]}"
             nixl_manager = NixlTransferManager(
                 agent_name=agent_name,
-                device_id=rank
+                device_id=device_id,
             )
             nixl_manager.initialize()
             nixl_manager.register_tensors(weights)
             self.nixl_managers[rank] = nixl_manager
-            logger.info(f"Rank {rank}: Registered with NIXL")
-        
-        logger.info(f"HuggingFace mode: {total_bytes / 1e9:.2f} GB across {self.tp_size} ranks")
+            logger.info("Rank %d: Registered with NIXL", rank)
+
+        logger.info("HuggingFace mode: %.2f GB across %d ranks", total_bytes / 1e9, total_ranks)
     
-    def _load_hf_weights_for_rank(self, rank: int) -> dict[str, torch.Tensor]:
+    def _load_hf_weights_for_rank(
+        self, rank: int, tp_rank: int = 0, ep_rank: int = 0
+    ) -> dict[str, torch.Tensor]:
         """
-        Load HuggingFace model weights for a specific TP rank.
-        
-        For TP > 1, this shards the weights appropriately.
-        For TP = 1, loads all weights to the single GPU.
+        Load HuggingFace model weights for a specific rank.
+
+        Handles both TP sharding and MoE expert-parallel partitioning.
+        For EP: filters expert weights to only include this rank's assigned experts.
+        For TP: shards attention/MLP weights along appropriate dimensions.
         """
         try:
             import safetensors.torch
         except ImportError:
             raise ImportError("safetensors required. Install with: pip install safetensors")
-        
+
         weights: dict[str, torch.Tensor] = {}
-        
-        # Find all safetensors files in the model directory
+
         safetensor_files = list(self.hf_model_path.glob("*.safetensors"))
         if not safetensor_files:
             raise FileNotFoundError(f"No safetensors files found in {self.hf_model_path}")
-        
-        logger.info(f"Found {len(safetensor_files)} safetensors files")
-        
-        # For TP=1, load all weights to GPU
-        # For TP>1, we need to shard (this is model-specific)
-        device = f"cuda:{rank}"
-        
+
+        logger.info("Found %d safetensors files", len(safetensor_files))
+
+        device_id = rank % torch.cuda.device_count()
+        device = f"cuda:{device_id}"
+
         dtype_map = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
         }
         target_dtype = dtype_map.get(self.dtype, torch.bfloat16)
-        
+
+        # Compute which experts belong to this EP rank
+        assigned_experts: set[int] | None = None
+        if self.ep_size > 1 and self.num_experts > 0:
+            experts_per_rank = self.num_experts // self.ep_size
+            start = ep_rank * experts_per_rank
+            assigned_experts = set(range(start, start + experts_per_rank))
+            logger.info(
+                "EP rank %d: assigned experts %d-%d (%d of %d)",
+                ep_rank, start, start + experts_per_rank - 1,
+                experts_per_rank, self.num_experts,
+            )
+
+        import re
+
         for sf_path in safetensor_files:
             file_weights = safetensors.torch.load_file(str(sf_path), device=device)
-            
+
             for name, tensor in file_weights.items():
-                # Optionally convert dtype
                 if tensor.dtype != target_dtype and tensor.dtype in [torch.float32, torch.float16, torch.bfloat16]:
                     tensor = tensor.to(target_dtype)
-                
-                # For TP > 1, shard appropriate dimensions
+
+                # MoE expert filtering: skip experts not assigned to this EP rank
+                if assigned_experts is not None:
+                    expert_match = re.search(r"\.experts\.(\d+)\.", name)
+                    if expert_match:
+                        expert_idx = int(expert_match.group(1))
+                        if expert_idx not in assigned_experts:
+                            continue
+
+                # TP sharding for non-expert weights (attention, etc.)
                 if self.tp_size > 1:
-                    tensor = self._shard_tensor_for_rank(name, tensor, rank)
-                
+                    # Don't TP-shard individual expert weights (they're EP-partitioned)
+                    if ".experts." not in name:
+                        tensor = self._shard_tensor_for_rank(name, tensor, tp_rank)
+
                 if tensor is not None:
                     weights[name] = tensor
-        
+
         return weights
     
     def _shard_tensor_for_rank(
