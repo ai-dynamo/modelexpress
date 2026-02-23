@@ -1,0 +1,121 @@
+# Phase 3 target: Qwen 0.5B TP=1 for quick local testing
+# Uses MxLiveCheckpointLoader for direct GPU-to-GPU weight transfer
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target-qwen
+  namespace: kavin
+  labels:
+    app: trtllm-target-qwen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target-qwen
+  template:
+    metadata:
+      labels:
+        app: trtllm-target-qwen
+    spec:
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph3-test
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: MX_TRANSFER_LOG_DIR
+              value: "/tmp/mx_logs"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              cat > /tmp/target.py << 'PYEOF'
+              import os, glob
+
+              def main():
+                  model_name = os.environ["MODEL_NAME"]
+                  print(f"Phase 3 target: receiving {model_name} via RDMA...")
+
+                  from modelexpress.trtllm_live_transfer import MxLiveCheckpointLoader
+                  from tensorrt_llm import LLM
+                  from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+                  loader = MxLiveCheckpointLoader()
+                  llm = LLM(
+                      model=model_name,
+                      checkpoint_loader=loader,
+                      load_format=LoadFormat.PRESHARDED,
+                      tensor_parallel_size=1,
+                  )
+
+                  log_dir = os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs")
+                  for log_file in sorted(glob.glob(f"{log_dir}/rank*.log")):
+                      print(f"\n=== {log_file} ===")
+                      with open(log_file) as f:
+                          for line in f:
+                              print(line.rstrip())
+
+                  from tensorrt_llm import SamplingParams
+                  output = llm.generate(
+                      ["Hello, I am a large language model"],
+                      sampling_params=SamplingParams(max_tokens=30, temperature=0.7),
+                  )
+                  print(f"\nInference output: {output[0].outputs[0].text}")
+                  print(f"\nSUCCESS: {model_name} Phase 3 live P2P transfer validated!")
+
+                  import time
+                  while True:
+                      time.sleep(3600)
+
+              if __name__ == "__main__":
+                  main()
+              PYEOF
+              exec python3 /tmp/target.py
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: trtllm-source-qwen
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

@@ -1,0 +1,128 @@
+# TRT-LLM Target: Llama 70B (TP=8) — custom checkpoint loader, no PVC, no disk I/O
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target-70b
+  labels:
+    app: trtllm-target-70b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target-70b
+  template:
+    metadata:
+      labels:
+        app: trtllm-target-70b
+    spec:
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph2
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "meta-llama/Llama-3.1-70B-Instruct"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+              logger = logging.getLogger("trtllm-target-70b")
+
+              model_name = os.environ["MODEL_NAME"]
+
+              # ============================================================
+              # Phase 2: PRESHARDED + model ref (TP=8, zero-disk)
+              #
+              # Each MPI worker receives ONLY its matching source rank's shard
+              # (21 GB instead of 141 GB). PRESHARDED skips TP re-slicing.
+              # No disk I/O, no PVC needed.
+              # ============================================================
+
+              logger.info("Registering MxCheckpointLoader...")
+              from modelexpress.trtllm_checkpoint_loader import _register_loader
+              MxCheckpointLoader = _register_loader()
+              loader = MxCheckpointLoader()
+
+              logger.info("Creating TRT-LLM LLM (Llama 70B, TP=8, PRESHARDED)...")
+              from tensorrt_llm import LLM, SamplingParams
+              from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+              t0 = time.perf_counter()
+              llm = LLM(
+                  model=model_name,
+                  checkpoint_loader=loader,
+                  load_format=LoadFormat.PRESHARDED,
+                  tensor_parallel_size=8,
+              )
+              load_time = time.perf_counter() - t0
+              logger.info(f"Model loaded in {load_time:.2f}s")
+
+              logger.info("Running inference test...")
+              prompts = ["Hello, I am a large language model trained by"]
+              params = SamplingParams(max_tokens=50, temperature=0.7)
+              outputs = llm.generate(prompts, params)
+
+              for output in outputs:
+                  text = output.outputs[0].text
+                  logger.info(f"Generated: {text}")
+
+              logger.info("=" * 60)
+              logger.info(f"SUCCESS: Llama 70B Phase 2 (PRESHARDED, zero-disk)!")
+              logger.info(f"Total load time: {load_time:.2f}s")
+              logger.info("=" * 60)
+
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp-storage
+              mountPath: /tmp
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: tmp-storage
+          emptyDir:
+            sizeLimit: 200Gi
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: trtllm-source-70b
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

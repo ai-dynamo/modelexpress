@@ -1,0 +1,125 @@
+# Phase 3 Target: Llama 70B (TP=8) — receives weights directly into model params via NIXL RDMA
+# No disk I/O, no CPU round-trip, no format conversion, no fusing.
+# Each MPI worker matches source params by rank+name and receives via direct RDMA.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target-70b
+  labels:
+    app: trtllm-target-70b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target-70b
+  template:
+    metadata:
+      labels:
+        app: trtllm-target-70b
+    spec:
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph3
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "meta-llama/Llama-3.1-70B-Instruct"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+              logger = logging.getLogger("trtllm-target-70b-ph3")
+
+              model_name = os.environ["MODEL_NAME"]
+
+              logger.info("Creating MxLiveCheckpointLoader (Phase 3 — direct param injection)...")
+              from modelexpress.trtllm_live_transfer import MxLiveCheckpointLoader
+              loader = MxLiveCheckpointLoader()
+
+              logger.info("Creating TRT-LLM LLM (Llama 70B, TP=8, PRESHARDED + live P2P)...")
+              from tensorrt_llm import LLM, SamplingParams
+              from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+              t0 = time.perf_counter()
+              llm = LLM(
+                  model=model_name,
+                  checkpoint_loader=loader,
+                  load_format=LoadFormat.PRESHARDED,
+                  tensor_parallel_size=8,
+              )
+              load_time = time.perf_counter() - t0
+              logger.info("Model loaded in %.2fs", load_time)
+
+              logger.info("Running inference test...")
+              prompts = ["Hello, I am a large language model trained by"]
+              params = SamplingParams(max_tokens=50, temperature=0.7)
+              outputs = llm.generate(prompts, params)
+
+              for output in outputs:
+                  text = output.outputs[0].text
+                  logger.info("Generated: %s", text)
+
+              logger.info("=" * 60)
+              logger.info("SUCCESS: Llama 70B Phase 3 (live model P2P, direct GPU injection, TP=8)!")
+              logger.info("Total load time: %.2fs", load_time)
+              logger.info("=" * 60)
+
+              # Print per-rank transfer logs (written by MPI workers to files)
+              import glob
+              log_dir = os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs")
+              for log_file in sorted(glob.glob(f"{log_dir}/rank*.log")):
+                  logger.info("--- %s ---", os.path.basename(log_file))
+                  with open(log_file) as f:
+                      for line in f:
+                          print(line.rstrip())
+
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: trtllm-source-70b
+              topologyKey: kubernetes.io/hostname
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

@@ -1,0 +1,104 @@
+# TRT-LLM Source: Loads HF model, publishes weights + config via MX server
+# Phase 1 test: Qwen 0.5B (TP=1) for fast iteration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-source
+  labels:
+    app: trtllm-source
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-source
+  template:
+    metadata:
+      labels:
+        app: trtllm-source
+    spec:
+      containers:
+        - name: source
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph2
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+
+              from modelexpress.trtllm_loader import MxTrtllmSourcePublisher
+
+              model_name = os.environ["MODEL_NAME"]
+              mx_server = os.environ["MODEL_EXPRESS_URL"]
+              hf_cache = os.environ.get("HF_HUB_CACHE", "/models")
+
+              # Download model first
+              print(f"Downloading {model_name}...")
+              from huggingface_hub import snapshot_download
+              local_path = snapshot_download(model_name, cache_dir=hf_cache)
+              print(f"Model downloaded to {local_path}")
+
+              # Publish weights + config via MX server
+              publisher = MxTrtllmSourcePublisher(
+                  model_name=model_name,
+                  mx_server=mx_server,
+                  hf_model_path=local_path,
+                  tp_size=1,
+                  dtype="bfloat16",
+              )
+              publisher.initialize()
+              print("Source ready — serving weights via NIXL")
+
+              # Keep alive
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

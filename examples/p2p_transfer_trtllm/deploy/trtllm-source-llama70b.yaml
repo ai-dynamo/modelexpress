@@ -1,0 +1,100 @@
+# TRT-LLM Source: Llama 70B (TP=8) — publishes weights + config via MX server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-source-70b
+  labels:
+    app: trtllm-source-70b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-source-70b
+  template:
+    metadata:
+      labels:
+        app: trtllm-source-70b
+    spec:
+      containers:
+        - name: source
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph2
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "meta-llama/Llama-3.1-70B-Instruct"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+
+              from modelexpress.trtllm_loader import MxTrtllmSourcePublisher
+
+              model_name = os.environ["MODEL_NAME"]
+              mx_server = os.environ["MODEL_EXPRESS_URL"]
+              hf_cache = os.environ.get("HF_HUB_CACHE", "/models")
+
+              print(f"Downloading {model_name}...")
+              from huggingface_hub import snapshot_download
+              local_path = snapshot_download(model_name, cache_dir=hf_cache)
+              print(f"Model at {local_path}")
+
+              publisher = MxTrtllmSourcePublisher(
+                  model_name=model_name,
+                  mx_server=mx_server,
+                  hf_model_path=local_path,
+                  tp_size=8,
+                  dtype="bfloat16",
+              )
+              publisher.initialize()
+              print("Source ready — serving 70B weights via NIXL")
+
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

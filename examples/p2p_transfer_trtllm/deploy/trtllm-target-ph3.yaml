@@ -1,0 +1,108 @@
+# Phase 3 Target: Receives weights directly into model params via NIXL RDMA
+# No disk I/O, no CPU round-trip, no format conversion, no fusing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target
+  labels:
+    app: trtllm-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target
+  template:
+    metadata:
+      labels:
+        app: trtllm-target
+    spec:
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph3
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+              logger = logging.getLogger("trtllm-live-target")
+
+              model_name = os.environ["MODEL_NAME"]
+
+              # Phase 3: Live model P2P transfer
+              # Source publishes TRT-LLM-format params from its running model.
+              # Target creates model (empty params), NIXL writes directly into them.
+              # No HF format, no mapper fusing, no CPU round-trip.
+
+              logger.info("Creating MxLiveCheckpointLoader...")
+              from modelexpress.trtllm_live_transfer import MxLiveCheckpointLoader
+              loader = MxLiveCheckpointLoader()
+
+              logger.info("Creating TRT-LLM LLM (Phase 3 — live P2P)...")
+              from tensorrt_llm import LLM, SamplingParams
+              from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+              t0 = time.perf_counter()
+              llm = LLM(
+                  model=model_name,
+                  checkpoint_loader=loader,
+                  load_format=LoadFormat.PRESHARDED,
+                  tensor_parallel_size=1,
+              )
+              load_time = time.perf_counter() - t0
+              logger.info("Model loaded in %.2fs", load_time)
+
+              # Inference test
+              logger.info("Running inference...")
+              outputs = llm.generate(
+                  ["Hello, I am a large language model"],
+                  SamplingParams(max_tokens=50, temperature=0.7),
+              )
+              for o in outputs:
+                  logger.info("Generated: %s", o.outputs[0].text)
+
+              logger.info("=" * 60)
+              logger.info("SUCCESS: Phase 3 (live model P2P, direct GPU injection)!")
+              logger.info("Total load time: %.2fs", load_time)
+              logger.info("=" * 60)
+
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

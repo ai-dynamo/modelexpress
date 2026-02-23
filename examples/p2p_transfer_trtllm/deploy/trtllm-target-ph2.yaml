@@ -1,0 +1,112 @@
+# TRT-LLM Target: Phase 2 — PRESHARDED + model ref (zero-disk, zero-copy for vanilla modules)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target
+  labels:
+    app: trtllm-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target
+  template:
+    metadata:
+      labels:
+        app: trtllm-target
+    spec:
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph2
+          imagePullPolicy: Always
+          env:
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, time, logging
+              logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+              logger = logging.getLogger("trtllm-target-ph2")
+
+              model_name = os.environ["MODEL_NAME"]
+
+              # ============================================================
+              # Phase 2: PRESHARDED + model reference
+              #
+              # - LoadFormat.PRESHARDED: skips TP slicing in load_weight_shard()
+              # - model passed to load_weights(): keeps tensors on GPU
+              # - copy_weight() pointer swap: zero-copy for vanilla modules
+              # - Fused modules (qkv, gate_up): still need cat + copy
+              # ============================================================
+
+              logger.info("Registering MxCheckpointLoader...")
+              from modelexpress.trtllm_checkpoint_loader import _register_loader
+              MxCheckpointLoader = _register_loader()
+              loader = MxCheckpointLoader()
+
+              logger.info("Creating TRT-LLM LLM with PRESHARDED + model ref...")
+              from tensorrt_llm import LLM, SamplingParams
+              from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+              t0 = time.perf_counter()
+              llm = LLM(
+                  model=model_name,
+                  checkpoint_loader=loader,
+                  load_format=LoadFormat.PRESHARDED,
+                  tensor_parallel_size=1,
+              )
+              load_time = time.perf_counter() - t0
+              logger.info(f"Model loaded in {load_time:.2f}s")
+
+              logger.info("Running inference test...")
+              prompts = ["Hello, I am a large language model"]
+              params = SamplingParams(max_tokens=50, temperature=0.7)
+              outputs = llm.generate(prompts, params)
+
+              for output in outputs:
+                  text = output.outputs[0].text
+                  logger.info(f"Generated: {text}")
+
+              logger.info("=" * 60)
+              logger.info(f"SUCCESS: Phase 2 (PRESHARDED + model ref)!")
+              logger.info(f"Total load time: {load_time:.2f}s")
+              logger.info("=" * 60)
+
+              while True:
+                  time.sleep(3600)
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
