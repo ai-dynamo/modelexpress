@@ -219,7 +219,7 @@ See [`../examples/aggregated_k8s/README.md`](../examples/aggregated_k8s/README.m
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA. One "source" vLLM instance loads model weights from disk and transfers them directly to "target" instances via GPU memory.
+ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA. Use `--load-format mx`, which auto-detects whether to load from disk or receive via RDMA.
 
 ### P2P Environment Variables
 
@@ -229,7 +229,7 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for P2P state storage |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target loaders with vLLM |
+| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
@@ -254,20 +254,19 @@ vLLM instances must use the custom worker class for loader registration in spawn
 
 ### P2P Kubernetes Deployment
 
+Deploy multiple identical instances - the first one loads from disk and subsequent ones receive via RDMA:
+
 ```bash
 NAMESPACE=my-namespace
 
 # Deploy server + Redis
 kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/modelexpress-server.yaml
 
-# Deploy source vLLM instance (loads real weights)
-kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/vllm-source.yaml
-
-# Deploy target vLLM instance (receives via RDMA)
-kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/vllm-target.yaml
+# Deploy vLLM instances with mx loader
+kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/vllm.yaml
 
 # Monitor
-watch kubectl -n $NAMESPACE get pods -l 'app in (mx-source, mx-target)'
+watch kubectl -n $NAMESPACE get pods -l app=mx-vllm
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
@@ -278,9 +277,8 @@ See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/READ
 # Stream server logs
 kubectl -n $NAMESPACE logs -f deploy/modelexpress-server
 
-# Stream source/target logs
-kubectl -n $NAMESPACE logs -f deploy/mx-source
-kubectl -n $NAMESPACE logs -f deploy/mx-target
+# Stream vLLM instance logs
+kubectl -n $NAMESPACE logs -f deploy/mx-vllm
 
 # Check Redis state (P2P metadata)
 kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS '*'
@@ -288,8 +286,8 @@ kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS
 # Flush Redis (clear stale metadata - do this on redeploy)
 kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
 
-# Test inference on target
-kubectl -n $NAMESPACE exec deploy/mx-target -- curl -s http://localhost:8000/v1/completions \
+# Test inference
+kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "deepseek-ai/DeepSeek-V3", "prompt": "Hello", "max_tokens": 10}'
 ```

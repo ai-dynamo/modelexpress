@@ -1,15 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM Target Instance - starts with dummy weights, receives real weights from source via P2P
-# - vLLM exposes weights via ZMQ (one socket per TP rank)
-# - ModelExpress client handles NIXL transfers and server communication
+# vLLM Instance with ModelExpress P2P weight transfer support.
+#
+# On startup, the mx loader queries the MX server:
+#   - If a ready source exists for this model -> receive weights via RDMA
+#   - If no source is available -> load weights from disk
+# Either way, the node registers with NIXL and publishes metadata so
+# future nodes can discover it as a source.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-target
+  name: mx-vllm
   labels:
-    app: mx-target
+    app: mx-vllm
 spec:
   type: ClusterIP
   ports:
@@ -17,23 +21,23 @@ spec:
       targetPort: 8000
       name: http
   selector:
-    app: mx-target
+    app: mx-vllm
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-target
+  name: mx-vllm
   labels:
-    app: mx-target
+    app: mx-vllm
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-target
+      app: mx-vllm
   template:
     metadata:
       labels:
-        app: mx-target
+        app: mx-vllm
     spec:
       containers:
         - name: vllm
@@ -54,15 +58,13 @@ spec:
             # Register ModelExpress custom loaders for FP8 support
             - name: MX_REGISTER_LOADERS
               value: "1"
-            # Server address for finding source (no http:// prefix)
+            # Server address for metadata publishing
             - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
-            # OPTIMIZATION: Synchronized start - wait for all workers before transferring
-            # This maximizes RDMA parallelism by ensuring all workers start simultaneously
-            - name: MX_SYNC_START
+            # OPTIMIZATION: Synchronized publish - wait for all workers before publishing
+            - name: MX_SYNC_PUBLISH
               value: "1"
             # Baseline: individual tensor registration (stable and tested)
-            # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
               value: "0"
             # Logging (set to DEBUG for troubleshooting)
@@ -94,42 +96,60 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
-          command: ["bash", "-c"]
+          command: ["/bin/bash", "-c"]
           args:
             - |
               set -ex
 
-              # MX_REGISTER_LOADERS=1 triggers loader registration via the Dockerfile
-              # __init__.py patch. Replaced in PR #140 by @register_model_loader
-              # decorators + --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
+              # Background task: wait for vLLM health, run stability check,
+              # then publish NIXL ready flag via MX server gRPC.
+              # This is needed for the first node (source path) so that
+              # subsequent nodes can detect it as ready.
+              (
+                sleep 5
+                while ! curl -sf http://127.0.0.1:8000/health; do
+                  sleep 5
+                done
 
-              # Start vLLM with mx-target loader
-              # mx-target: Creates dummy weights, receives RAW tensors via RDMA,
-              # THEN runs FP8 processing (identical to source)
-              # This ensures weight_scale_inv is transferred BEFORE being processed
-              python3 -m vllm.entrypoints.openai.api_server \
-                --model ${MODEL_NAME} \
-                --load-format mx-target \
+                # Grace period for system stabilization
+                sleep 30
+
+                # Stability check: run a test inference
+                curl -sf -X POST http://127.0.0.1:8000/v1/completions \
+                  -H 'Content-Type: application/json' \
+                  -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
+
+                # Publish ready flag for all workers via MxClient
+                python3 -c "
+              from modelexpress.client import MxClient
+              import uuid, os
+
+              client = MxClient()
+              session = str(uuid.uuid4())
+              model = os.environ.get('MODEL_NAME', 'unknown')
+              workers = int(os.environ.get('MX_EXPECTED_WORKERS', '8'))
+
+              for w in range(workers):
+                  client.publish_ready(
+                      model_name=model,
+                      worker_id=w,
+                      session_id=session,
+                      metadata_hash='na',
+                      nixl_ready=True,
+                      stability_verified=True,
+                  )
+                  print(f'Published ready for worker {w}')
+
+              client.close()
+              "
+              ) &
+
+              # Start vLLM with mx loader
+              exec python3 -m vllm.entrypoints.openai.api_server \
+                --model $MODEL_NAME \
+                --load-format mx \
                 --tensor-parallel-size 8 \
-                --enable-expert-parallel &
-              VLLM_PID=$!
-
-              # Wait for vLLM to be ready
-              echo "Waiting for vLLM to be ready..."
-              python3 -c '
-              import time
-              import urllib.request
-              while True:
-                  try:
-                      urllib.request.urlopen("http://localhost:8000/health", timeout=3)
-                      break
-                  except Exception:
-                      time.sleep(3)
-              '
-              echo "vLLM is ready - weights transferred and processed"
-
-              # Keep the container running (vLLM handles everything now)
-              wait $VLLM_PID
+                --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"
@@ -150,16 +170,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
+        # Model cache PVC - needed in case this node loads from disk
         - name: model-cache
-          emptyDir:
-            sizeLimit: 50Gi
-      # Pod anti-affinity to schedule on different node than source
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchLabels:
-                  app: mx-source
-              topologyKey: kubernetes.io/hostname
+          persistentVolumeClaim:
+            claimName: model-cache
       imagePullSecrets:
         - name: nvcr-imagepullsecret

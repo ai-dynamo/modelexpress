@@ -33,11 +33,11 @@ graph TD
     end
 
     subgraph "P2P Transfer Mode"
-        subgraph "Node A - Source"
-            A[vLLM + MxSourceModelLoader]
+        subgraph "Node A"
+            A[vLLM + MxModelLoader]
         end
-        subgraph "Node B - Target"
-            B[vLLM + MxTargetModelLoader]
+        subgraph "Node B"
+            B[vLLM + MxModelLoader]
         end
         A -->|gRPC metadata| S2[ModelExpress Server]
         B -->|gRPC metadata| S2
@@ -108,7 +108,7 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
-│       ├── vllm_loader.py              # MxSourceModelLoader, MxTargetModelLoader
+│       ├── vllm_loader.py              # MxModelLoader
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
@@ -158,8 +158,7 @@ ModelExpress/
 │   ├── p2p_transfer_k8s/               # GPU-to-GPU weight transfer example
 │   │   ├── README.md
 │   │   ├── Dockerfile.client           # vLLM + ModelExpress integration
-│   │   ├── vllm-source.yaml
-│   │   ├── vllm-target.yaml
+│   │   ├── vllm.yaml
 │   │   ├── modelexpress-server.yaml    # gRPC server + Redis sidecar
 │   │   └── model-download.yaml
 │   └── aggregated_k8s/                 # Dynamo integration example
@@ -406,10 +405,10 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 | Module | Purpose |
 |--------|---------|
-| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register `mx-source`/`mx-target` loaders with vLLM |
+| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
 | `client.py` | `MxClient` - gRPC client with session management, ready polling |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
-| `vllm_loader.py` | `MxSourceModelLoader`, `MxTargetModelLoader` - custom vLLM model loaders |
+| `vllm_loader.py` | `MxModelLoader` - custom vLLM model loader |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
@@ -439,22 +438,17 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `receive_from_source(source_metadata, source_tensors, ...)` | Execute RDMA read transfer with optional coalescing |
 | `shutdown()` | Clean up NIXL agent and resources |
 
-### vLLM Loaders
+### vLLM Loader
 
-**MxSourceModelLoader** (extends `DefaultModelLoader`):
-1. Load weights from disk
-2. Register raw tensors with NIXL (BEFORE FP8 processing)
-3. Publish metadata to ModelExpress server
+**MxModelLoader** (extends `BaseModelLoader`):
+1. Query MX server to detect whether a ready source exists for this model/rank
+2. If source found: create dummy tensors, receive via RDMA, register + publish
+3. If no source: load weights from disk, register + publish
 4. Run `process_weights_after_loading()` (FP8 transform)
-5. Signal readiness after warmup
 
-**MxTargetModelLoader** (extends `DummyModelLoader`):
-1. Create dummy tensors matching source layout
-2. Wait for source readiness (via `MxClient.wait_for_ready()`)
-3. Receive weights via RDMA transfer (with transfer-time coalescing of contiguous regions)
-4. Run `process_weights_after_loading()` (same FP8 transform)
+Detection is a one-shot check with no retry loop. If the source is still warming up, this node loads from disk and becomes a source itself. Both paths register with NIXL and publish metadata, so future nodes can discover this one.
 
-Both loaders require the `MODEL_NAME` environment variable to identify the model for coordination.
+The loader requires the `MODEL_NAME` environment variable to identify the model for coordination. Shared helpers (`_collect_cuda_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
 
 Module-level globals `_raw_tensor_registry` and `_nixl_managers` in `vllm_loader.py` bridge loaders and clients - vLLM's loader API doesn't expose loader instances after `load_model()` returns, so source loaders store state in these dicts (keyed by device ID) for the MxClient to access.
 
@@ -551,7 +545,7 @@ graph TD
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_NAME` | (none) | Model identifier for P2P coordination (e.g., `deepseek-ai/DeepSeek-V3`) |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target loaders with vLLM |
+| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
