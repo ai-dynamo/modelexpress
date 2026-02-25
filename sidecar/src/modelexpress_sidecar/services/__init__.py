@@ -1,15 +1,4 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-.dockerignore
-.git/
-Dockerfile
-
-# Build artifacts
-target/
-
-# Python virtual environments
-.venv/
-venv/
-__pycache__/
-*.pyc
+"""Services module for the ModelExpress sidecar."""

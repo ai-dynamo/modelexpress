@@ -28,6 +28,8 @@ pub enum ModelProvider {
     /// Hugging Face model hub
     #[default]
     HuggingFace,
+    /// Model Streamer (S3/GCS/MinIO storage)
+    ModelStreamer,
 }
 
 /// Response for model status request
@@ -60,6 +62,13 @@ mod tests {
         let deserialized: ModelProvider =
             serde_json::from_str(&serialized).expect("Failed to deserialize ModelProvider");
         assert_eq!(provider, deserialized);
+
+        let provider_ms = ModelProvider::ModelStreamer;
+        let serialized_ms =
+            serde_json::to_string(&provider_ms).expect("Failed to serialize ModelStreamer");
+        let deserialized_ms: ModelProvider =
+            serde_json::from_str(&serialized_ms).expect("Failed to deserialize ModelStreamer");
+        assert_eq!(provider_ms, deserialized_ms);
     }
 
     #[test]

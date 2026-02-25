@@ -370,6 +370,142 @@ impl ConnectionConfig {
     }
 }
 
+/// Configuration for the Model Streamer sidecar
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarConfig {
+    /// The sidecar REST API endpoint
+    pub endpoint: String,
+
+    /// Timeout in seconds for sidecar requests
+    pub timeout_secs: u64,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:8002".to_string(),
+            timeout_secs: 300,
+        }
+    }
+}
+
+impl SidecarConfig {
+    /// Load sidecar configuration from environment variables
+    pub fn from_env() -> Self {
+        let endpoint = std::env::var("MODEL_EXPRESS_SIDECAR_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:8002".to_string());
+
+        let timeout_secs = std::env::var("MODEL_EXPRESS_SIDECAR_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
+        Self {
+            endpoint,
+            timeout_secs,
+        }
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = timeout_secs;
+        self
+    }
+}
+
+/// S3 credentials configuration for Model Streamer
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct S3Credentials {
+    /// AWS access key ID
+    pub access_key_id: Option<String>,
+
+    /// AWS secret access key
+    pub secret_access_key: Option<String>,
+
+    /// AWS region
+    pub region: Option<String>,
+
+    /// Custom S3 endpoint (for MinIO or other S3-compatible storage)
+    pub endpoint: Option<String>,
+}
+
+/// Redact secret fields so credentials are never leaked in logs or debug output.
+impl fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+impl S3Credentials {
+    /// Load S3 credentials from environment variables
+    pub fn from_env() -> Self {
+        Self {
+            access_key_id: std::env::var("MODEL_EXPRESS_S3_ACCESS_KEY_ID")
+                .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
+                .ok(),
+            secret_access_key: std::env::var("MODEL_EXPRESS_S3_SECRET_ACCESS_KEY")
+                .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
+                .ok(),
+            region: std::env::var("MODEL_EXPRESS_S3_REGION")
+                .or_else(|_| std::env::var("AWS_REGION"))
+                .ok(),
+            endpoint: std::env::var("MODEL_EXPRESS_S3_ENDPOINT")
+                .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+                .ok(),
+        }
+    }
+}
+
+/// GCS credentials configuration for Model Streamer
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct GcsCredentials {
+    /// Path to GCS credentials JSON file
+    pub credentials_file: Option<String>,
+
+    /// Base64-encoded credentials JSON (alternative to file)
+    pub credentials_json: Option<String>,
+}
+
+/// Redact secret fields so credentials are never leaked in logs or debug output.
+impl fmt::Debug for GcsCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GcsCredentials")
+            .field("credentials_file", &self.credentials_file)
+            .field(
+                "credentials_json",
+                &self.credentials_json.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl GcsCredentials {
+    /// Load GCS credentials from environment variables
+    pub fn from_env() -> Self {
+        Self {
+            credentials_file: std::env::var("MODEL_EXPRESS_GCS_CREDENTIALS_FILE")
+                .or_else(|_| std::env::var("GOOGLE_APPLICATION_CREDENTIALS"))
+                .ok(),
+            credentials_json: std::env::var("MODEL_EXPRESS_GCS_CREDENTIALS_JSON").ok(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +664,38 @@ mod tests {
 
         assert_eq!(strict_config.endpoint, validate_config.endpoint);
         assert_eq!(strict_config.timeout_secs, validate_config.timeout_secs);
+    }
+
+    #[test]
+    fn test_sidecar_config_default() {
+        let config = SidecarConfig::default();
+        assert_eq!(config.endpoint, "http://127.0.0.1:8002");
+        assert_eq!(config.timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_sidecar_config_builder() {
+        let config = SidecarConfig::default()
+            .with_endpoint("http://custom:9000")
+            .with_timeout(600);
+
+        assert_eq!(config.endpoint, "http://custom:9000");
+        assert_eq!(config.timeout_secs, 600);
+    }
+
+    #[test]
+    fn test_s3_credentials_default() {
+        let creds = S3Credentials::default();
+        assert!(creds.access_key_id.is_none());
+        assert!(creds.secret_access_key.is_none());
+        assert!(creds.region.is_none());
+        assert!(creds.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_gcs_credentials_default() {
+        let creds = GcsCredentials::default();
+        assert!(creds.credentials_file.is_none());
+        assert!(creds.credentials_json.is_none());
     }
 }
