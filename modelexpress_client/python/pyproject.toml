@@ -7,14 +7,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelexpress"
-version = "0.2.2"
+version = "0.3.0"
 description = "Python client for ModelExpress P2P GPU transfer service"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-authors = [
-    {name = "NVIDIA Corporation", email = "sw-dl-dynamo@nvidia.com"}
-]
+authors = [{ name = "NVIDIA Corporation", email = "sw-dl-dynamo@nvidia.com" }]
 keywords = ["llm", "gpu", "transfer", "rdma", "nixl", "vllm"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -30,7 +28,7 @@ dependencies = [
     "grpcio>=1.66.2",
     "nixl[cu12]",
     "numpy>=1.24.0",
-    "protobuf>=5.27.0,<6.0.0",  # protobuf 5.x compatibility
+    "protobuf>=5.27.0,<6.0.0", # protobuf 5.x compatibility
     "pydantic>=2.0.0",
     "torch>=2.6.0",
 ]
