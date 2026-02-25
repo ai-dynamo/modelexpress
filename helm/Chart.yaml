@@ -5,8 +5,8 @@ apiVersion: v2
 name: modelexpress
 description: A Helm chart for ModelExpress - a AI model cache management service
 type: application
-version: 0.2.2
-appVersion: "0.2.2"
+version: 0.3.0
+appVersion: "0.3.0"
 keywords:
   - model-serving
   - ai
