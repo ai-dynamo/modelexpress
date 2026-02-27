@@ -44,16 +44,12 @@ from .types import TensorDescriptor
 if TYPE_CHECKING:
     from .nixl_transfer import NixlTransferManager
 
-# Configure logging to stdout for visibility in k8s logs
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    stream=sys.stdout,
-)
 logger = logging.getLogger("modelexpress.vllm_loader")
 logger.setLevel(logging.DEBUG)
-
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(handler)
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
@@ -230,6 +226,7 @@ def _publish_metadata_and_ready(
         import traceback
         logger.error(f"[Worker {device_id}] EXCEPTION publishing metadata: {e}")
         logger.error(f"[Worker {device_id}] Traceback: {traceback.format_exc()}")
+        raise
 
 
 @register_model_loader("mx")
@@ -256,6 +253,7 @@ class MxModelLoader(BaseModelLoader):
         self._nixl_manager: NixlTransferManager | None = None
         self._raw_tensors: dict[str, torch.Tensor] = {}
         self._mx_client = MxClient()
+        logger.debug("MxModelLoader initialized successfully")
 
         # Build internal loaders for the two weight-loading strategies.
         # We only use their load_weights() methods - everything else is ours.
@@ -620,6 +618,7 @@ class MxModelLoader(BaseModelLoader):
     def raw_tensors(self) -> dict[str, torch.Tensor]:
         """Access the raw tensor registry."""
         return self._raw_tensors
+
 
 
 # Global storage for raw tensor metadata, keyed by device_id.

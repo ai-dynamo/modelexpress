@@ -43,7 +43,7 @@ kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<your-toke
 ### 2. Deploy ModelExpress Server
 
 ```bash
-kubectl apply -f modelexpress-server.yaml
+kubectl apply -f deploy/modelexpress-server.yaml
 ```
 
 ### 3. Deploy vLLM Instances
@@ -51,7 +51,7 @@ kubectl apply -f modelexpress-server.yaml
 Deploy identical instances - the first loads from disk, subsequent ones receive via RDMA:
 
 ```bash
-kubectl apply -f vllm.yaml
+kubectl apply -f deploy/vllm.yaml
 # Scale up for more replicas
 kubectl scale deployment/mx-vllm --replicas=2
 ```

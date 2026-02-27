@@ -7,7 +7,7 @@
 #   1. Adjust storageClassName to match your cluster's RWX-capable storage class
 #   2. kubectl apply -f model-download.yaml
 #   3. Wait for job to complete: kubectl wait --for=condition=complete job/model-download --timeout=1h
-#   4. Deploy vllm-source.yaml and vllm-target.yaml
+#   4. Deploy deploy/vllm.yaml
 
 ---
 apiVersion: v1

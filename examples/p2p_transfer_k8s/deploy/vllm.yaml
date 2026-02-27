@@ -39,31 +39,43 @@ spec:
       labels:
         app: mx-vllm
     spec:
+      # ServiceAccount with permissions to access ModelMetadata CRDs
+      serviceAccountName: modelexpress
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-p2p-client:v0.1.0-baseline
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:k8s-backend
           imagePullPolicy: Always
           # Needed for GPUDirect RDMA to work.
-          # Running as root is required by the vLLM base image for
-          # CUDA driver access and RDMA memory pinning (IPC_LOCK).
           securityContext:
             capabilities:
               add:
                 - IPC_LOCK
           env:
+            - name: VLLM_SERVER_DEV_MODE
+              value: "1"
+            # Increase startup timeout to allow DeepGemm warmup to complete (2 hours)
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
             - name: HF_HUB_CACHE
               value: "/models"
+            - name: MX_ZMQ_ADDRESS
+              value: "ipc:///tmp/mx/vllm.sock"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
             # Register ModelExpress custom loaders for FP8 support
             - name: MX_REGISTER_LOADERS
               value: "1"
             # Server address for metadata publishing
-            - name: MODEL_EXPRESS_URL
+            - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
             # OPTIMIZATION: Synchronized publish - wait for all workers before publishing
             - name: MX_SYNC_PUBLISH
               value: "1"
+            - name: MX_EXPECTED_WORKERS
+              value: "8"
+            # Client always uses gRPC to the MX server.
+            # Server-side persistence (Redis/CRD) is configured on the server only.
+            # See persistence/ folder for server backend options.
             # Baseline: individual tensor registration (stable and tested)
             - name: MX_CONTIGUOUS_REG
               value: "0"
@@ -107,41 +119,12 @@ spec:
               # subsequent nodes can detect it as ready.
               (
                 sleep 5
-                while ! curl -sf http://127.0.0.1:8000/health; do
-                  sleep 5
-                done
-
-                # Grace period for system stabilization
+                while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done
                 sleep 30
-
-                # Stability check: run a test inference
+                # Warmup inference (pre-warms CUDA graphs, not required for P2P transfer)
                 curl -sf -X POST http://127.0.0.1:8000/v1/completions \
                   -H 'Content-Type: application/json' \
                   -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
-
-                # Publish ready flag for all workers via MxClient
-                python3 -c "
-              from modelexpress.client import MxClient
-              import uuid, os
-
-              client = MxClient()
-              session = str(uuid.uuid4())
-              model = os.environ.get('MODEL_NAME', 'unknown')
-              workers = int(os.environ.get('MX_EXPECTED_WORKERS', '8'))
-
-              for w in range(workers):
-                  client.publish_ready(
-                      model_name=model,
-                      worker_id=w,
-                      session_id=session,
-                      metadata_hash='na',
-                      nixl_ready=True,
-                      stability_verified=True,
-                  )
-                  print(f'Published ready for worker {w}')
-
-              client.close()
-              "
               ) &
 
               # Start vLLM with mx loader
@@ -173,6 +156,6 @@ spec:
         # Model cache PVC - needed in case this node loads from disk
         - name: model-cache
           persistentVolumeClaim:
-            claimName: model-cache
+            claimName: deepseek-v3-block
       imagePullSecrets:
         - name: nvcr-imagepullsecret
