@@ -3,7 +3,9 @@
 
 use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
+use hf_hub::Cache;
 use hf_hub::api::tokio::{ApiBuilder, ApiError};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -176,12 +178,13 @@ impl ModelProviderTrait for HuggingFaceProvider {
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
         let api = ApiBuilder::from_env()
             .with_token(token)
-            .with_cache_dir(cache_dir)
+            .with_cache_dir(cache_dir.clone())
             .build()
             .context("Failed to create Hugging Face API client")?;
         let model_name = model_name.to_string();
 
         let repo = api.model(model_name.clone());
+        let cache_repo = Cache::new(cache_dir).model(model_name.clone());
 
         let info = match repo.info().await {
             Ok(info) => info,
@@ -199,7 +202,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         let mut files_deleted: u32 = 0;
         let mut deletion_errors = Vec::new();
-        let mut model_dir: Option<PathBuf> = None;
+        let mut model_dirs: HashSet<PathBuf> = HashSet::new();
 
         for sib in &info.siblings {
             if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
@@ -212,16 +215,16 @@ impl ModelProviderTrait for HuggingFaceProvider {
                 continue;
             }
 
-            // Try to get the file path from cache first
-            if let Ok(cached_path) = repo.get(&sib.rfilename).await {
-                if model_dir.is_none() {
-                    model_dir = cached_path.parent().map(Path::to_path_buf);
-                }
+            // Cache-only lookup: avoid network fetch during deletion.
+            if let Some(cached_path) = cache_repo.get(&sib.rfilename) {
                 // Delete the cached file
                 match std::fs::remove_file(&cached_path) {
                     Ok(_) => {
                         files_deleted = files_deleted.saturating_add(1);
                         info!("Deleted cached file: {}", cached_path.display());
+                        if let Some(model_dir) = cached_path.parent() {
+                            model_dirs.insert(model_dir.to_path_buf());
+                        }
                     }
                     Err(e) => {
                         let error_msg =
@@ -233,16 +236,17 @@ impl ModelProviderTrait for HuggingFaceProvider {
         }
 
         // Try to remove the empty model directory if all files were deleted
-        if files_deleted > 0
-            && deletion_errors.is_empty()
-            && let Some(model_dir) = model_dir
-            && let Ok(mut entries) = std::fs::read_dir(&model_dir)
-            && entries.next().is_none()
-        {
-            if let Err(e) = std::fs::remove_dir(&model_dir) {
-                info!("Could not remove empty model directory: {e}");
-            } else {
-                info!("Removed empty model directory: {}", model_dir.display());
+        if files_deleted > 0 && deletion_errors.is_empty() {
+            for model_dir in model_dirs {
+                if let Ok(mut entries) = std::fs::read_dir(&model_dir)
+                    && entries.next().is_none()
+                {
+                    if let Err(e) = std::fs::remove_dir(&model_dir) {
+                        info!("Could not remove empty model directory: {e}");
+                    } else {
+                        info!("Removed empty model directory: {}", model_dir.display());
+                    }
+                }
             }
         }
 
@@ -519,6 +523,77 @@ mod tests {
         );
 
         drop(mock_server);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_delete_model_does_not_download_uncached_files() {
+        let _guard = acquire_env_mutex();
+        let temp_cache = TempDir::new().expect("Failed to create temporary cache directory");
+        let server = MockServer::start().await;
+        let provider = HuggingFaceProvider;
+        let model_name = "modelexpress-tests/delete-no-download";
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/api/models/modelexpress-tests/delete-no-download(?:/.*)?$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": model_name,
+                "sha": "def5678",
+                "siblings": [
+                    {"rfilename": "config.json"}
+                ]
+            })))
+            .expect(1)
+            .named("delete_model should query repo info exactly once")
+            .mount(&server)
+            .await;
+
+        // Deleting uncached files must not trigger any remote resolve/download requests.
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/modelexpress-tests/delete-no-download/resolve/(main|[^/]+)/config\.json$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("etag", "\"def5678\"")
+                    .insert_header("x-repo-commit", "def5678")
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("content-length", "64")
+                    .insert_header("content-range", "bytes 0-63/64")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .expect(0)
+            .named("delete_model should not call Hugging Face resolve endpoint")
+            .mount(&server)
+            .await;
+
+        let old_cache = env::var_os(MODEL_EXPRESS_CACHE_ENV_VAR);
+        let old_endpoint = env::var_os("HF_ENDPOINT");
+
+        unsafe {
+            env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache.path());
+            env::set_var("HF_ENDPOINT", server.uri());
+        }
+
+        let result = provider.delete_model(model_name, None).await;
+
+        unsafe {
+            if let Some(value) = old_cache {
+                env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, value);
+            } else {
+                env::remove_var(MODEL_EXPRESS_CACHE_ENV_VAR);
+            }
+
+            if let Some(value) = old_endpoint {
+                env::set_var("HF_ENDPOINT", value);
+            } else {
+                env::remove_var("HF_ENDPOINT");
+            }
+        }
+
+        assert!(result.is_ok(), "Delete should succeed when cache is empty");
     }
 
     #[tokio::test]
