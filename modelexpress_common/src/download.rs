@@ -66,7 +66,7 @@ mod tests {
             }
         }
 
-        async fn delete_model(&self, _model_name: &str) -> Result<()> {
+        async fn delete_model(&self, _model_name: &str, _cache_dir: Option<PathBuf>) -> Result<()> {
             if self.should_succeed {
                 Ok(())
             } else {
@@ -162,7 +162,11 @@ mod tests {
                 Ok(PathBuf::from("/tmp"))
             }
 
-            async fn delete_model(&self, _model_name: &str) -> Result<()> {
+            async fn delete_model(
+                &self,
+                _model_name: &str,
+                _cache_dir: Option<PathBuf>,
+            ) -> Result<()> {
                 Ok(())
             }
 
