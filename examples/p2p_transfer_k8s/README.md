@@ -1,31 +1,26 @@
 # P2P GPU Transfer Example
 
-This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between vLLM instances on Kubernetes.
+This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between vLLM instances on Kubernetes. For the broader deployment guide and environment variable reference, see [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md). For NIXL architecture details, see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ## Architecture
 
-```
-Node A (Source)                               Node B (Target)
-+----------------------------------+          +----------------------------------+
-| vLLM + MxSourceModelLoader       |          | vLLM + MxTargetModelLoader       |
-| - Loads weights from disk        |          | - Starts with dummy weights      |
-| - Registers tensors with NIXL    |          | - Waits for source ready flag    |
-| - Publishes metadata via MxClient|   RDMA   | - Receives weights via NIXL      |
-| - Publishes ready flag           |=========>| - Runs FP8 processing            |
-+----------------------------------+  NIXL    | - Serves inference               |
-        |                                     +----------------------------------+
-        |                                             |
-        v                                             v
-+--------------------------------------------------------------------+
-|                    ModelExpress Server (gRPC + Redis)               |
-|   - PublishMetadata / GetMetadata: tensor metadata coordination     |
-|   - PublishReady / GetReady: source readiness coordination         |
-+--------------------------------------------------------------------+
+```mermaid
+graph TD
+    subgraph "Node A"
+        A[vLLM + MxModelLoader<br/>- Loads weights from disk<br/>- Registers tensors with NIXL<br/>- Publishes metadata via MxClient<br/>- Publishes ready flag]
+    end
+    subgraph "Node B"
+        B[vLLM + MxModelLoader<br/>- Detects source via MX server<br/>- Receives weights via NIXL<br/>- Runs FP8 processing<br/>- Serves inference]
+    end
+    A -- "RDMA via NIXL" --> B
+    A --> S
+    B --> S
+    S[ModelExpress Server - gRPC + Redis<br/>PublishMetadata / GetMetadata<br/>PublishReady / GetReady]
 ```
 
 ### Key Design Points
 
-1. **Custom vLLM Loaders**: NIXL transfer logic runs inside vLLM via `--load-format mx-source` / `--load-format mx-target`
+1. **Custom vLLM Loader**: NIXL transfer logic runs inside vLLM via `--load-format mx`
 2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly)
 3. **FP8 Support**: Raw tensors (including `weight_scale_inv`) transfer BEFORE FP8 processing
 4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU)
@@ -48,40 +43,20 @@ kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<your-toke
 ### 2. Deploy ModelExpress Server
 
 ```bash
-kubectl apply -f modelexpress-server.yaml
+kubectl apply -f deploy/modelexpress-server.yaml
 ```
 
-### 3. Deploy Source vLLM Instance
+### 3. Deploy vLLM Instances
 
-This instance loads real weights from HuggingFace and becomes the source:
+Deploy identical instances - the first loads from disk, subsequent ones receive via RDMA:
 
 ```bash
-kubectl apply -f vllm-source.yaml
+kubectl apply -f deploy/vllm.yaml
+# Scale up for more replicas
+kubectl scale deployment/mx-vllm --replicas=2
 ```
 
-Wait for it to be ready and client to publish metadata:
-
-```bash
-kubectl logs deployment/mx-source -c client -f
-```
-
-### 4. Deploy Target vLLM Instance
-
-This instance starts with dummy weights and receives real weights via P2P:
-
-```bash
-kubectl apply -f vllm-target.yaml
-```
-
-The client will automatically:
-1. Wait for vLLM ZMQ sockets to be ready
-2. Query ModelExpress server for the model
-3. Find source metadata and receive weights via NIXL RDMA
-4. Publish its own metadata (becomes another source)
-
-```bash
-kubectl logs deployment/mx-target -c client -f
-```
+The `mx` loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from disk and becomes a source for future nodes.
 
 ## Environment Variables
 
@@ -111,14 +86,13 @@ With TP=4, this creates sockets: `/tmp/mx/vllm-0.sock`, `/tmp/mx/vllm-1.sock`, e
 ### Check ZMQ sockets are created
 
 ```bash
-kubectl exec -it deployment/mx-source -c vllm -- ls -la /tmp/mx/
+kubectl exec -it deployment/mx-vllm -c vllm -- ls -la /tmp/mx/
 ```
 
 ### Check client logs
 
 ```bash
-kubectl logs deployment/mx-source -c client
-kubectl logs deployment/mx-target -c client
+kubectl logs deployment/mx-vllm -c client
 ```
 
 ### Check Redis connectivity
@@ -130,13 +104,13 @@ kubectl exec -it deployment/modelexpress-server -- redis-cli -h modelexpress-red
 ### Verify InfiniBand is working
 
 ```bash
-kubectl exec -it deployment/mx-source -c client -- ibstat
+kubectl exec -it deployment/mx-vllm -c client -- ibstat
 ```
 
 ### Check UCX configuration
 
 ```bash
-kubectl exec -it deployment/mx-source -c client -- ucx_info -d
+kubectl exec -it deployment/mx-vllm -c client -- ucx_info -d
 ```
 
 ## License

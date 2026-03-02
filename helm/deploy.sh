@@ -53,7 +53,7 @@ Options:
 
 Available values files (in script directory):
     values-production.yaml     Production configuration
-    values-development.yaml    Development configuration  
+    values-development.yaml    Development configuration
     values.yaml               Default configuration
     test-values.yaml          Test configuration
 
@@ -80,14 +80,14 @@ EOF
 find_default_values() {
     local script_dir=$(dirname "$0")
     local available_files=()
-    
+
     # Check for common values files in the script directory
     for file in "values-production.yaml" "values-development.yaml" "values.yaml" "test-values.yaml"; do
         if [[ -f "$script_dir/$file" ]]; then
             available_files+=("$file")
         fi
     done
-    
+
     if [[ ${#available_files[@]} -gt 0 ]]; then
         print_status "Available values files in $(basename "$script_dir"):"
         for i in "${!available_files[@]}"; do
@@ -100,7 +100,7 @@ find_default_values() {
 # Function to check prerequisites
 check_prerequisites() {
     print_status "Checking prerequisites..."
-    
+
     # Check for kubectl or microk8s kubectl (prioritize microk8s if available)
     KUBECTL_CMD=""
     if command -v microk8s &> /dev/null && microk8s kubectl version --client &> /dev/null; then
@@ -115,24 +115,24 @@ check_prerequisites() {
         print_error "Neither kubectl nor microk8s kubectl is available. Please install one of them."
         exit 1
     fi
-    
+
     # Check if helm is installed
     if ! command -v helm &> /dev/null; then
         print_error "Helm is not installed. Please install Helm first."
         exit 1
     fi
-    
+
     # Check if we can connect to Kubernetes cluster
     if ! $KUBECTL_CMD cluster-info &> /dev/null; then
         print_error "Cannot connect to Kubernetes cluster. Please check your kubeconfig."
         exit 1
     fi
-    
+
     # Check if we can access Docker Hub (optional check)
     if ! curl -s --max-time 5 https://registry-1.docker.io/v2/ > /dev/null; then
         print_warning "Cannot access Docker Hub. Ensure you have internet connectivity."
     fi
-    
+
     print_success "Prerequisites check passed"
 }
 
@@ -150,18 +150,18 @@ create_namespace() {
 # Function to deploy the chart
 deploy_chart() {
     local helm_args=()
-    
+
     if [ "$DRY_RUN" = true ]; then
         helm_args+=("--dry-run")
         print_status "Performing dry run..."
     fi
-    
+
     if [ -n "$VALUES_FILE" ]; then
         helm_args+=("-f" "$VALUES_FILE")
     fi
-    
+
     helm_args+=("--namespace" "$NAMESPACE")
-    
+
     if [ "$UPGRADE" = true ]; then
         print_status "Upgrading release: $RELEASE_NAME"
         helm upgrade "${helm_args[@]}" "$RELEASE_NAME" .
@@ -169,22 +169,22 @@ deploy_chart() {
         print_status "Installing release: $RELEASE_NAME"
         helm install "${helm_args[@]}" "$RELEASE_NAME" .
     fi
-    
+
     print_success "Deployment completed successfully"
 }
 
 # Function to show deployment status
 show_status() {
     print_status "Checking deployment status..."
-    
+
     echo
     echo "Pods:"
     $KUBECTL_CMD get pods -n "$NAMESPACE" -l app.kubernetes.io/name=modelexpress
-    
+
     echo
     echo "Services:"
     $KUBECTL_CMD get svc -n "$NAMESPACE" -l app.kubernetes.io/name=modelexpress
-    
+
     echo
     echo "PersistentVolumeClaims:"
     $KUBECTL_CMD get pvc -n "$NAMESPACE" -l app.kubernetes.io/name=modelexpress
@@ -235,12 +235,12 @@ main() {
     else
         print_status "Values file: Using default values"
     fi
-    
+
     find_default_values
     check_prerequisites
     create_namespace
     deploy_chart
-    
+
     if [ "$DRY_RUN" = false ]; then
         show_status
         print_success "Deployment completed!"

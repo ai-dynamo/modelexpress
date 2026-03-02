@@ -114,10 +114,10 @@ spec:
           args:
             - |
               set -ex
-              
+
               # MX_REGISTER_LOADERS=1 is set in env, which triggers sitecustomize.py
               # to register ModelExpress loaders in ALL Python processes (including workers)
-              
+
               # Start vLLM with mx-target loader
               # mx-target: Creates dummy weights, receives RAW tensors via RDMA,
               # THEN runs FP8 processing (identical to source)
@@ -128,7 +128,7 @@ spec:
                 --tensor-parallel-size 8 \
                 --enable-expert-parallel &
               VLLM_PID=$!
-              
+
               # Wait for vLLM to be ready
               echo "Waiting for vLLM to be ready..."
               python3 -c '
@@ -142,7 +142,7 @@ spec:
                       time.sleep(3)
               '
               echo "vLLM is ready - weights transferred and processed"
-              
+
               # Keep the container running (vLLM handles everything now)
               wait $VLLM_PID
           resources:
