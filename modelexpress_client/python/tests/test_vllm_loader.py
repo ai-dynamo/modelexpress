@@ -189,6 +189,54 @@ class TestDetectSource:
 
 
 # ---------------------------------------------------------------------------
+# Abstract method completeness
+# ---------------------------------------------------------------------------
+
+
+class TestAbstractMethodCompleteness:
+    """Verify MxModelLoader implements all BaseModelLoader abstract methods.
+
+    Regression tests for the production crash where MxModelLoader was missing
+    download_model and load_weights, causing TypeError at instantiation.
+    """
+
+    def test_instantiation_succeeds(self):
+        """MxModelLoader must be instantiable - fails if abstract methods are missing."""
+        loader = _make_auto_loader()
+        assert loader is not None
+
+    def test_no_remaining_abstract_methods(self):
+        """MxModelLoader must have no unimplemented abstract methods."""
+        from modelexpress.vllm_loader import MxModelLoader
+
+        remaining = getattr(MxModelLoader, "__abstractmethods__", frozenset())
+        assert remaining == frozenset(), (
+            f"MxModelLoader has unimplemented abstract methods: {remaining}"
+        )
+
+    def test_download_model_delegates_to_disk_loader(self):
+        """download_model() must delegate to the internal disk loader."""
+        loader = _make_auto_loader()
+        mock_model_config = MagicMock()
+
+        loader.download_model(mock_model_config)
+
+        loader._disk_loader.download_model.assert_called_once_with(mock_model_config)
+
+    def test_load_weights_delegates_to_disk_loader(self):
+        """load_weights() must delegate to the internal disk loader."""
+        loader = _make_auto_loader()
+        mock_model = MagicMock()
+        mock_model_config = MagicMock()
+
+        loader.load_weights(mock_model, mock_model_config)
+
+        loader._disk_loader.load_weights.assert_called_once_with(
+            mock_model, mock_model_config
+        )
+
+
+# ---------------------------------------------------------------------------
 # _publish_metadata_and_ready
 # ---------------------------------------------------------------------------
 

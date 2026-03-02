@@ -609,6 +609,14 @@ class MxModelLoader(BaseModelLoader):
         else:
             logger.warning(f"[Worker {device_id}] MODEL_NAME not set, skipping publish")
 
+    def download_model(self, model_config: ModelConfig) -> None:
+        """Download the model so it can be loaded immediately."""
+        self._disk_loader.download_model(model_config)
+
+    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        """Load weights into an already-initialized model (standalone API)."""
+        self._disk_loader.load_weights(model, model_config)
+
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
         """Access the NIXL manager for external use."""
