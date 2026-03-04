@@ -1,39 +1,3 @@
-
-=============
-== PyTorch ==
-=============
-
-NVIDIA Release 25.12 (build 245654590)
-PyTorch Version 2.10.0a0+b4e4ee8
-Container image Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Copyright (c) 2014-2024 Facebook Inc.
-Copyright (c) 2011-2014 Idiap Research Institute (Ronan Collobert)
-Copyright (c) 2012-2014 Deepmind Technologies    (Koray Kavukcuoglu)
-Copyright (c) 2011-2012 NEC Laboratories America (Koray Kavukcuoglu)
-Copyright (c) 2011-2013 NYU                      (Clement Farabet)
-Copyright (c) 2006-2010 NEC Laboratories America (Ronan Collobert, Leon Bottou, Iain Melvin, Jason Weston)
-Copyright (c) 2006      Idiap Research Institute (Samy Bengio)
-Copyright (c) 2001-2004 Idiap Research Institute (Ronan Collobert, Samy Bengio, Johnny Mariethoz)
-Copyright (c) 2015      Google Inc.
-Copyright (c) 2015      Yangqing Jia
-Copyright (c) 2013-2016 The Caffe contributors
-All rights reserved.
-
-Various files include modifications (c) NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
-
-GOVERNING TERMS: The software and materials are governed by the NVIDIA Software License Agreement
-(found at https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/)
-and the Product-Specific Terms for NVIDIA AI Products
-(found at https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/).
-
-WARNING: The NVIDIA Driver was not detected.  GPU functionality will not be available.
-   Use the NVIDIA Container Toolkit to start this container with GPU support; see
-   https://docs.nvidia.com/datacenter/cloud-native/ .
-
-NOTE: The SHMEM allocation limit is set to the default of 64MB.  This may be
-   insufficient for PyTorch.  NVIDIA recommends the use of the following flags:
-   docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 ...
-
 import ast
 import functools
 import json

@@ -1,0 +1,59 @@
+# Phase 3 P2P image for GCP GB200 (ARM64)
+# Layers ModelExpress client + Dynamo P2P hooks + PRESHARDED patches
+# on karenc's Dynamo v1.0.0 image
+#
+# Base: nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
+# - TRT-LLM 1.3.0rc5
+# - NIXL pre-installed
+# - ARM64 (aarch64)
+# - Dynamo worker (python3 -m dynamo.trtllm)
+#
+# Requires dynamo fork at ../dynamo (kavink/trtllm-p2p branch)
+#
+# Build (from modelexpress repo root):
+#   docker buildx build --platform linux/arm64 --no-cache \
+#       -f examples/p2p_transfer_trtllm/Dockerfile.ph3-gcp-gb200 \
+#       --build-context dynamo=../dynamo \
+#       -t nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.1.0 \
+#       --push .
+FROM nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
+
+USER root
+
+# Install ModelExpress client (gRPC + NIXL transfer)
+COPY modelexpress_client/python /tmp/modelexpress_client
+COPY modelexpress_common/proto /tmp/proto
+
+RUN cd /tmp/modelexpress_client && \
+    pip install --no-cache-dir grpcio grpcio-tools protobuf && \
+    python3 -m grpc_tools.protoc \
+        -I/tmp/proto \
+        --python_out=modelexpress \
+        --grpc_python_out=modelexpress \
+        /tmp/proto/p2p.proto && \
+    sed -i 's/^import p2p_pb2/from . import p2p_pb2/' modelexpress/p2p_pb2_grpc.py && \
+    pip install --no-cache-dir . && \
+    rm -rf /tmp/modelexpress_client /tmp/proto
+
+# Apply Dynamo P2P hooks (--model-express-url support)
+# From kavink/trtllm-p2p branch: backend_args.py, engine.py, llm_worker.py
+COPY --from=dynamo components/src/dynamo/trtllm/backend_args.py /tmp/dynamo_p2p/backend_args.py
+COPY --from=dynamo components/src/dynamo/trtllm/engine.py /tmp/dynamo_p2p/engine.py
+COPY --from=dynamo components/src/dynamo/trtllm/workers/llm_worker.py /tmp/dynamo_p2p/llm_worker.py
+
+RUN DYNAMO_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm && \
+    cp /tmp/dynamo_p2p/backend_args.py "$DYNAMO_PKG/backend_args.py" && \
+    cp /tmp/dynamo_p2p/engine.py "$DYNAMO_PKG/engine.py" && \
+    cp /tmp/dynamo_p2p/llm_worker.py "$DYNAMO_PKG/workers/llm_worker.py" && \
+    rm -rf /tmp/dynamo_p2p && \
+    grep -q "model.express.url\|model_express_url" "$DYNAMO_PKG/backend_args.py" && \
+    echo "Dynamo P2P hooks OK"
+
+# Apply PRESHARDED patches to TRT-LLM 1.3.0rc5
+COPY trtllm_patches/v1.3.0rc5/apply_patches.py /tmp/apply_patches.py
+RUN python3 /tmp/apply_patches.py && rm /tmp/apply_patches.py
+
+# Verify installation (can't import full TRT-LLM at build time — no GPU)
+RUN python3 -c "from modelexpress.client import MxClient; print('ModelExpress client OK')" && \
+    grep -q "PRESHARDED" /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_args.py && \
+    echo "LoadFormat.PRESHARDED OK"

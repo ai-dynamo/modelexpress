@@ -115,7 +115,6 @@ class MxLiveSource:
                 size=tensor.numel() * tensor.element_size(),
                 device_id=device_id,
                 dtype=str(tensor.dtype),
-                shape=list(tensor.shape),
             ))
 
         workers = [p2p_pb2.WorkerMetadata(
@@ -255,7 +254,8 @@ class MxLiveWeightLoader:
         )
 
         # 1. Query source metadata
-        source_meta = self._query_source(mx_server, model_name, timeout=600)
+        query_timeout = int(os.environ.get("MX_SOURCE_QUERY_TIMEOUT", "3600"))
+        source_meta = self._query_source(mx_server, model_name, timeout=query_timeout)
 
         # Find my rank's source worker
         my_workers = [w for w in source_meta.workers if w.worker_rank == device_id]

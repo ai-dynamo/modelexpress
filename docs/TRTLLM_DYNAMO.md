@@ -267,19 +267,18 @@ Files modified:
 - `container/context.yaml` - trtllm defaults for ModelExpress
 
 ### Phase 2: IN PROGRESS
-Current `MxCheckpointLoader` supports:
-- Single-rank and multi-rank TP transfers
-- Dense TP sharding (q_proj, k_proj, v_proj column-parallel; o_proj, down_proj row-parallel)
-- Full HF weight reconstruction from TP shards
+MoE EP sharding code written, needs testing with DeepSeek-V3.2:
+- Source: `trtllm_loader.py` — ep_size/num_experts params, expert filtering by EP rank (DONE)
+- Target: `trtllm_checkpoint_loader.py` — MoE expert pattern detection, FP4 dtypes (DONE)
+- Deploy recipe: `recipes/deepseek-v3.2/trtllm/disagg/dep8x2/deploy.yaml` (DONE)
 
-Needs for DeepSeek-V3.2 DEP8x2:
-- MoE expert-parallel sharding in source (`trtllm_loader.py`)
-- MoE expert-parallel reconstruction in target (`trtllm_checkpoint_loader.py`)
-- FP4 quantized weight handling (either transfer pre-quantized or BF16+requantize)
-- DeepSeek-specific layer patterns (MLA attention, MoE gate routing, shared experts)
-- Deployment recipe YAML
+Remaining for DSV3.2 end-to-end:
+1. Port TRT-LLM patches from 1.2.0rc6 to 1.3.0rc3 (dynamo uses 1.3.0rc3)
+2. Create MPI source script for DeepSeek-V3.2 with EP=8
+3. Verify MxLiveSource handles 256 MoE experts per layer
+4. Test on multi-node cluster (source 1 node, prefill 2 nodes, decode 2 nodes)
 
-### Phase 3: NOT STARTED
+### Phase 3: DONE (patches exist, pending upstream)
 
 ## Timeline Estimate
 
