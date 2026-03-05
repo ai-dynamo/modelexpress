@@ -48,6 +48,11 @@ def is_gds_available() -> bool:
 # GDS requires 4KB-aligned file offsets and transfer sizes.
 GDS_ALIGNMENT = 4096
 
+# GPU page size.  In native GDS mode, cuFile adds the GPU buffer's page
+# offset to the requested I/O size.  The total must fit within the
+# per_buffer_cache_size, so we subtract one GPU page from the max chunk.
+GPU_PAGE_SIZE = 65536
+
 # Default max chunk size per GDS I/O (must be <= cuFile per_buffer_cache_size).
 _DEFAULT_MAX_CHUNK = 16 * 1024 * 1024  # 16 MB
 
@@ -75,10 +80,10 @@ def _read_max_chunk_from_cufile() -> int:
         max_device_kb = props.get("max_device_cache_size_kb", 131072)
         io_batchsize = props.get("io_batchsize", 128)
         shadow_kb = max_device_kb // io_batchsize if io_batchsize > 0 else per_buffer_kb
-        effective_kb = min(per_buffer_kb, shadow_kb)
+        effective_kb = min(per_buffer_kb, shadow_kb) - (GPU_PAGE_SIZE // 1024)
         logger.info(
             "cufile.json: per_buffer=%dKB, max_device=%dKB, io_batchsize=%d "
-            "-> effective max_chunk=%dKB",
+            "-> effective max_chunk=%dKB (after GPU page reserve)",
             per_buffer_kb, max_device_kb, io_batchsize, effective_kb,
         )
         return effective_kb * 1024
