@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress Server with Kubernetes CRD backend (optional).
+# Use when you want metadata to persist across server restarts via K8s CRDs.
+#
+# Prerequisites:
+#   - kubectl apply -f crd-modelmetadata.yaml
+#   - kubectl apply -f rbac-modelmetadata.yaml -n <namespace>
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: grpc
+  selector:
+    app: modelexpress-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      serviceAccountName: modelexpress
+      containers:
+        - name: modelexpress-server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: 4
+              memory: 8Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

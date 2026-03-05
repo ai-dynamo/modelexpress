@@ -53,3 +53,4 @@ models.db
 .venv/
 *.egg-info/
 docs/FEEDBACK.md
+docs/optimization-comparison.md

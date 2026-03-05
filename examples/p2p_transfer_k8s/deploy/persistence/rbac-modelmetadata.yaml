@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# RBAC resources for ModelExpress CRD-based metadata
+# Required when using MX_METADATA_BACKEND=kubernetes
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  namespace: default  # Change to your target namespace
+  labels:
+    app.kubernetes.io/name: modelexpress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: modelexpress-metadata
+  namespace: default  # Change to your target namespace
+  labels:
+    app.kubernetes.io/name: modelexpress
+rules:
+  # ModelMetadata CRD access
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelmetadatas
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # ModelMetadata status subresource
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelmetadatas/status
+    verbs:
+      - get
+      - update
+      - patch
+  # ConfigMaps for tensor descriptors.
+  # NOTE: This grants access to ALL ConfigMaps in the namespace. K8s RBAC does not
+  # support label-based resource filtering. In shared namespaces, consider using a
+  # dedicated namespace for ModelExpress workloads.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: modelexpress-metadata
+  namespace: default  # Change to your target namespace
+  labels:
+    app.kubernetes.io/name: modelexpress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: modelexpress-metadata
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+    namespace: default  # Change to your target namespace
+---
+# ClusterRole for CRD management (cluster-admin typically handles this)
+# Only needed if server creates/manages the CRD itself
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: modelexpress-crd-reader
+  labels:
+    app.kubernetes.io/name: modelexpress
+rules:
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+      - watch

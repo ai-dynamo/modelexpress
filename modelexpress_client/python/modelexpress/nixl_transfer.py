@@ -61,6 +61,7 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        self._registered_regions: list[tuple[int, int]] | None = None
 
     @property
     def nixl_metadata(self) -> bytes:

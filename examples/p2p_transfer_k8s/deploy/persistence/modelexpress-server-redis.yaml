@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# ModelExpress Server deployment with Redis sidecar for P2P transfer coordination
+# ModelExpress Server with Redis backend (optional).
+# Use when you want metadata to persist across server restarts.
+# Deploy redis-standalone.yaml first, or use the Redis sidecar below.
 apiVersion: v1
 kind: Service
 metadata:
@@ -37,7 +39,6 @@ spec:
         app: modelexpress-server
     spec:
       # Native sidecar: Redis starts first and stays running
-      # Requires Kubernetes >= 1.29 (SidecarContainers feature gate)
       initContainers:
         - name: redis
           image: redis:7-alpine
@@ -57,8 +58,6 @@ spec:
             initialDelaySeconds: 1
             periodSeconds: 1
             failureThreshold: 30
-          securityContext:
-            allowPrivilegeEscalation: false
           livenessProbe:
             tcpSocket:
               port: 6379
@@ -66,12 +65,15 @@ spec:
 
       containers:
         - name: modelexpress-server
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:server-u64fix-1768535139
-          securityContext:
-            allowPrivilegeEscalation: false
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
+          imagePullPolicy: Always
           ports:
             - containerPort: 8001
           env:
+            # Use Redis backend
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            # Redis connection URL (sidecar runs on localhost)
             - name: REDIS_URL
               value: "redis://localhost:6379"
           resources:

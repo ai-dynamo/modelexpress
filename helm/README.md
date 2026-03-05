@@ -101,7 +101,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `replicaCount`                               | Number of ModelExpress replicas                | `1`     |
 | `image.repository`                           | ModelExpress image repository                  | `nvcr.io/nvidia/ai-dynamo/modelexpress-server` |
 | `image.pullPolicy`                           | Image pull policy                              | `IfNotPresent` |
-| `image.tag`                                  | ModelExpress image tag                         | `0.2.2` |
+| `image.tag`                                  | ModelExpress image tag                         | `0.3.0` |
 | `imagePullSecrets`                           | Image pull secrets for nvcr.io access          | `[]`     |
 | `nameOverride`                               | Override the chart name                        | `""`     |
 | `fullnameOverride`                           | Override the full app name                     | `""`     |

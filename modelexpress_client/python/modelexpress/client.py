@@ -23,10 +23,6 @@ import grpc
 from . import p2p_pb2
 from . import p2p_pb2_grpc
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("modelexpress.client")
 
 
