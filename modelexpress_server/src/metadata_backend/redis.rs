@@ -118,15 +118,24 @@ impl From<TensorRecordJson> for TensorRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRecordJson {
     pub worker_rank: u32,
+    #[serde(default)]
     pub nixl_metadata: Vec<u8>,
+    #[serde(default)]
+    pub transfer_engine_session_id: Option<String>,
     pub tensors: Vec<TensorRecordJson>,
 }
 
 impl From<WorkerRecord> for WorkerRecordJson {
     fn from(record: WorkerRecord) -> Self {
+        let (nixl_metadata, transfer_engine_session_id) = match record.backend_metadata {
+            super::BackendMetadataRecord::Nixl(data) => (data, None),
+            super::BackendMetadataRecord::TransferEngine(sid) => (Vec::new(), Some(sid)),
+            super::BackendMetadataRecord::None => (Vec::new(), None),
+        };
         Self {
             worker_rank: record.worker_rank,
-            nixl_metadata: record.nixl_metadata,
+            nixl_metadata,
+            transfer_engine_session_id,
             tensors: record
                 .tensors
                 .into_iter()
@@ -138,9 +147,22 @@ impl From<WorkerRecord> for WorkerRecordJson {
 
 impl From<WorkerRecordJson> for WorkerRecord {
     fn from(json: WorkerRecordJson) -> Self {
+        let backend_metadata = if let Some(sid) = json.transfer_engine_session_id {
+            if !sid.is_empty() {
+                super::BackendMetadataRecord::TransferEngine(sid)
+            } else if !json.nixl_metadata.is_empty() {
+                super::BackendMetadataRecord::Nixl(json.nixl_metadata)
+            } else {
+                super::BackendMetadataRecord::None
+            }
+        } else if !json.nixl_metadata.is_empty() {
+            super::BackendMetadataRecord::Nixl(json.nixl_metadata)
+        } else {
+            super::BackendMetadataRecord::None
+        };
         Self {
             worker_rank: json.worker_rank,
-            nixl_metadata: json.nixl_metadata,
+            backend_metadata,
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
         }
     }

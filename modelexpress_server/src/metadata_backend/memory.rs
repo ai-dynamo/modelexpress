@@ -125,6 +125,8 @@ mod tests {
     use super::*;
     use modelexpress_common::grpc::p2p::TensorDescriptor;
 
+    use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+
     #[tokio::test]
     async fn test_publish_and_get() {
         let backend = InMemoryBackend::new();
@@ -132,7 +134,7 @@ mod tests {
 
         let workers = vec![WorkerMetadata {
             worker_rank: 0,
-            nixl_metadata: vec![1, 2, 3],
+            backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1, 2, 3])),
             tensors: vec![TensorDescriptor {
                 name: "layer.0.weight".to_string(),
                 addr: 0x1000,
@@ -167,7 +169,7 @@ mod tests {
                 "test-model",
                 vec![WorkerMetadata {
                     worker_rank: 0,
-                    nixl_metadata: vec![1],
+                    backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1])),
                     tensors: vec![],
                 }],
             )
@@ -180,7 +182,7 @@ mod tests {
                 "test-model",
                 vec![WorkerMetadata {
                     worker_rank: 1,
-                    nixl_metadata: vec![2],
+                    backend_metadata: Some(BackendMetadata::NixlMetadata(vec![2])),
                     tensors: vec![],
                 }],
             )
@@ -203,7 +205,7 @@ mod tests {
                 "model-a",
                 vec![WorkerMetadata {
                     worker_rank: 0,
-                    nixl_metadata: vec![],
+                    backend_metadata: None,
                     tensors: vec![],
                 }],
             )
@@ -215,7 +217,7 @@ mod tests {
                 "model-b",
                 vec![WorkerMetadata {
                     worker_rank: 0,
-                    nixl_metadata: vec![],
+                    backend_metadata: None,
                     tensors: vec![],
                 }],
             )

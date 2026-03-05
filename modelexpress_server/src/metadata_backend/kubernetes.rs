@@ -260,9 +260,18 @@ impl MetadataBackend for KubernetesBackend {
                 )
                 .await?;
 
+            let (nixl_metadata, transfer_engine_session_id) = match &worker.backend_metadata {
+                super::BackendMetadataRecord::Nixl(data) => (BASE64.encode(data), None),
+                super::BackendMetadataRecord::TransferEngine(sid) => {
+                    (String::new(), Some(sid.clone()))
+                }
+                super::BackendMetadataRecord::None => (String::new(), None),
+            };
+
             worker_statuses.push(WorkerStatus {
                 worker_rank: worker.worker_rank as i32,
-                nixl_metadata: BASE64.encode(&worker.nixl_metadata),
+                nixl_metadata,
+                transfer_engine_session_id,
                 tensor_count: worker.tensors.len() as i32,
                 tensor_config_map: Some(cm_name),
                 ready: true,
@@ -383,13 +392,35 @@ impl MetadataBackend for KubernetesBackend {
         // Reconstruct workers from status + ConfigMaps
         let mut workers = Vec::new();
         for worker_status in status.workers {
-            // Decode NIXL metadata — propagate error instead of silently returning empty
-            let nixl_metadata = BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
-                format!(
-                    "Failed to decode NIXL metadata for worker {}: {}",
-                    worker_status.worker_rank, e
-                )
-            })?;
+            // Determine backend metadata variant
+            let backend_metadata =
+                if let Some(sid) = &worker_status.transfer_engine_session_id {
+                    if !sid.is_empty() {
+                        super::BackendMetadataRecord::TransferEngine(sid.clone())
+                    } else if !worker_status.nixl_metadata.is_empty() {
+                        let data =
+                            BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
+                                format!(
+                                    "Failed to decode NIXL metadata for worker {}: {}",
+                                    worker_status.worker_rank, e
+                                )
+                            })?;
+                        super::BackendMetadataRecord::Nixl(data)
+                    } else {
+                        super::BackendMetadataRecord::None
+                    }
+                } else if !worker_status.nixl_metadata.is_empty() {
+                    let data =
+                        BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
+                            format!(
+                                "Failed to decode NIXL metadata for worker {}: {}",
+                                worker_status.worker_rank, e
+                            )
+                        })?;
+                    super::BackendMetadataRecord::Nixl(data)
+                } else {
+                    super::BackendMetadataRecord::None
+                };
 
             // Read tensors from ConfigMap
             let tensors = if let Some(cm_name) = &worker_status.tensor_config_map {
@@ -406,7 +437,7 @@ impl MetadataBackend for KubernetesBackend {
 
             workers.push(WorkerRecord {
                 worker_rank: worker_status.worker_rank as u32,
-                nixl_metadata,
+                backend_metadata,
                 tensors,
             });
         }
