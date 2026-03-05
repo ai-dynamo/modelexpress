@@ -141,6 +141,10 @@ mod tests {
                 size: 4096,
                 device_id: 0,
                 dtype: "bfloat16".to_string(),
+                full_shape: vec![],
+                shard_dim: 0,
+                effective_tp_size: 0,
+                shard_index: 0,
             }],
         }];
 

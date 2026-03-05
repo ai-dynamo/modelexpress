@@ -36,6 +36,14 @@ struct TensorRecordJson {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub full_shape: Vec<u64>,
+    #[serde(default)]
+    pub shard_dim: i32,
+    #[serde(default)]
+    pub effective_tp_size: u32,
+    #[serde(default)]
+    pub shard_index: u32,
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -98,6 +106,10 @@ impl From<TensorRecord> for TensorRecordJson {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            full_shape: record.full_shape,
+            shard_dim: record.shard_dim,
+            effective_tp_size: record.effective_tp_size,
+            shard_index: record.shard_index,
         }
     }
 }
@@ -110,6 +122,10 @@ impl From<TensorRecordJson> for TensorRecord {
             size: json.size,
             device_id: json.device_id,
             dtype: json.dtype,
+            full_shape: json.full_shape,
+            shard_dim: json.shard_dim,
+            effective_tp_size: json.effective_tp_size,
+            shard_index: json.shard_index,
         }
     }
 }
