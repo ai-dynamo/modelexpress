@@ -358,7 +358,7 @@ class MxGdsLoader:
             key=lambda n: tensor_infos[n]["file_offset"],
         )
 
-        fd = os.open(file_path, os.O_RDONLY)
+        fd = os.open(file_path, os.O_RDONLY | os.O_DIRECT)
         result: dict[str, torch.Tensor] = {}
 
         try:

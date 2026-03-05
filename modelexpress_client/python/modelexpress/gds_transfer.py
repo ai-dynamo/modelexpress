@@ -53,23 +53,35 @@ _DEFAULT_MAX_CHUNK = 16 * 1024 * 1024  # 16 MB
 
 
 def _read_max_chunk_from_cufile() -> int:
-    """Read per_buffer_cache_size from cufile.json if available."""
+    """Read max safe chunk size from cufile.json.
+
+    The effective per-request limit is the smaller of:
+      - ``per_buffer_cache_size_kb``
+      - ``max_device_cache_size_kb / io_batchsize``
+    """
     cufile_path = os.environ.get("CUFILE_ENV_PATH_JSON", "/etc/cufile.json")
     try:
         with open(cufile_path) as f:
             text = f.read()
         # Strip C-style // comments but not inside quoted strings.
-        # Match strings first (group 1) to skip them, then // comments (group 2).
         text = re.sub(
             r'("(?:[^"\\]|\\.)*")|//[^\n]*',
             lambda m: m.group(1) if m.group(1) else "",
             text,
         )
         config = json.loads(text)
-        cache_kb = config.get("properties", {}).get("per_buffer_cache_size_kb", 16384)
-        value = cache_kb * 1024
-        logger.info("Read per_buffer_cache_size from %s: %d KB", cufile_path, cache_kb)
-        return value
+        props = config.get("properties", {})
+        per_buffer_kb = props.get("per_buffer_cache_size_kb", 1024)
+        max_device_kb = props.get("max_device_cache_size_kb", 131072)
+        io_batchsize = props.get("io_batchsize", 128)
+        shadow_kb = max_device_kb // io_batchsize if io_batchsize > 0 else per_buffer_kb
+        effective_kb = min(per_buffer_kb, shadow_kb)
+        logger.info(
+            "cufile.json: per_buffer=%dKB, max_device=%dKB, io_batchsize=%d "
+            "-> effective max_chunk=%dKB",
+            per_buffer_kb, max_device_kb, io_batchsize, effective_kb,
+        )
+        return effective_kb * 1024
     except Exception as e:
         logger.warning("Failed to parse %s: %s, using default %d KB",
                        cufile_path, e, _DEFAULT_MAX_CHUNK // 1024)
