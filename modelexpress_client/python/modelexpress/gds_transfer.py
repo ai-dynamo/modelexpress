@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -56,18 +57,22 @@ def _read_max_chunk_from_cufile() -> int:
     cufile_path = os.environ.get("CUFILE_ENV_PATH_JSON", "/etc/cufile.json")
     try:
         with open(cufile_path) as f:
-            lines = []
-            for line in f:
-                stripped = line.lstrip()
-                if not stripped.startswith("//"):
-                    comment_pos = line.find("//")
-                    if comment_pos >= 0:
-                        line = line[:comment_pos]
-                    lines.append(line)
-            config = json.loads("".join(lines))
+            text = f.read()
+        # Strip C-style // comments but not inside quoted strings.
+        # Match strings first (group 1) to skip them, then // comments (group 2).
+        text = re.sub(
+            r'("(?:[^"\\]|\\.)*")|//[^\n]*',
+            lambda m: m.group(1) if m.group(1) else "",
+            text,
+        )
+        config = json.loads(text)
         cache_kb = config.get("properties", {}).get("per_buffer_cache_size_kb", 16384)
-        return cache_kb * 1024
-    except Exception:
+        value = cache_kb * 1024
+        logger.info("Read per_buffer_cache_size from %s: %d KB", cufile_path, cache_kb)
+        return value
+    except Exception as e:
+        logger.warning("Failed to parse %s: %s, using default %d KB",
+                       cufile_path, e, _DEFAULT_MAX_CHUNK // 1024)
         return _DEFAULT_MAX_CHUNK
 
 
