@@ -33,8 +33,10 @@ logger = logging.getLogger("modelexpress.gds_transfer")
 
 NIXL_AVAILABLE = False
 NixlAgent = None
+NixlAgentConfig = None
 try:
     from nixl._api import nixl_agent as NixlAgent
+    from nixl._api import nixl_agent_config as NixlAgentConfig
     NIXL_AVAILABLE = True
 except ImportError:
     pass
@@ -154,13 +156,14 @@ class GdsTransferManager:
 
         self._device_id = torch.cuda.current_device()
 
-        # Create agent without pre-configured backends, then add GDS
-        self._agent = NixlAgent(self._agent_name)
-        self._agent.create_backend("GDS")
+        # Create agent with multithreaded GDS backend
+        thread_count = int(os.environ.get("MX_GDS_THREADS", "8"))
+        config = NixlAgentConfig(backends=["GDS_MT"], num_threads=thread_count)
+        self._agent = NixlAgent(self._agent_name, config)
 
         logger.info(
-            "GDS agent '%s' created on device %d (max_chunk=%dKB)",
-            self._agent_name, self._device_id,
+            "GDS_MT agent '%s' created on device %d (threads=%d, max_chunk=%dKB)",
+            self._agent_name, self._device_id, thread_count,
             self._max_chunk_size // 1024,
         )
 
