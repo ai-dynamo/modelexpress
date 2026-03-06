@@ -147,17 +147,82 @@ class MxLiveSource:
         )
 
     def _get_torch_model(self):
-        """Extract the underlying torch model."""
+        """Extract the underlying torch model.
+        
+        TRT-LLM 1.3.0rc5 structure:
+        - LLM._executor (PyExecutor)
+        - PyExecutor.model_engine (PyTorchModelEngine)
+        - PyTorchModelEngine.model (torch.nn.Module)
+        """
         model = self._model
+        logger.info(f"_get_torch_model: model type = {type(model)}")
+        
         # If model itself has named_parameters (direct torch model), use it
         if hasattr(model, 'named_parameters'):
-            return model
-        # Try common attribute paths for LLM wrapper
-        for attr in ['_model', 'model', '_executor', '_engine']:
+            try:
+                # Quick check: try to iterate one param to verify it's a real model
+                next(iter(model.named_parameters()), None)
+                logger.info("_get_torch_model: found direct torch model")
+                return model
+            except (AttributeError, TypeError) as e:
+                logger.debug(f"_get_torch_model: direct model check failed: {e}")
+        
+        # Try TRT-LLM 1.3.0rc5 path: _executor.model_engine.model
+        if hasattr(model, '_executor'):
+            try:
+                executor = getattr(model, '_executor')
+                logger.info(f"_get_torch_model: _executor = {executor}, type = {type(executor)}")
+                if executor is not None:
+                    if hasattr(executor, 'model_engine'):
+                        try:
+                            model_engine = getattr(executor, 'model_engine')
+                            logger.info(f"_get_torch_model: model_engine = {model_engine}, type = {type(model_engine)}")
+                            if model_engine is not None:
+                                if hasattr(model_engine, 'model'):
+                                    try:
+                                        torch_model = getattr(model_engine, 'model')
+                                        logger.info(f"_get_torch_model: torch_model = {torch_model}, type = {type(torch_model)}")
+                                        if hasattr(torch_model, 'named_parameters'):
+                                            try:
+                                                # Verify it's a real model
+                                                next(iter(torch_model.named_parameters()), None)
+                                                logger.info("_get_torch_model: found model via _executor.model_engine.model")
+                                                return torch_model
+                                            except (AttributeError, TypeError, StopIteration) as e:
+                                                logger.warning(f"_get_torch_model: torch_model has named_parameters but iteration failed: {e}")
+                                    except Exception as e:
+                                        logger.warning(f"_get_torch_model: failed to get model from model_engine: {e}")
+                                else:
+                                    logger.info("_get_torch_model: model_engine has no 'model' attribute")
+                                    logger.info(f"_get_torch_model: model_engine dir = {[a for a in dir(model_engine) if not a.startswith('__')][:20]}")
+                            else:
+                                logger.info("_get_torch_model: model_engine is None")
+                        except Exception as e:
+                            logger.warning(f"_get_torch_model: failed to get model_engine from executor: {e}")
+                    else:
+                        logger.info("_get_torch_model: executor has no 'model_engine' attribute")
+                        logger.info(f"_get_torch_model: executor dir = {[a for a in dir(executor) if not a.startswith('__')][:20]}")
+                else:
+                    logger.info("_get_torch_model: _executor is None")
+            except Exception as e:
+                logger.warning(f"_get_torch_model: failed to access _executor: {e}")
+        
+        # Try legacy/common attribute paths for LLM wrapper
+        for attr in ['_model', 'model', '_engine']:
             if hasattr(model, attr):
                 candidate = getattr(model, attr)
-                if hasattr(candidate, 'named_parameters'):
-                    return candidate
+                logger.debug(f"_get_torch_model: trying attr '{attr}' = {candidate}, type = {type(candidate)}")
+                if candidate is not None and hasattr(candidate, 'named_parameters'):
+                    try:
+                        # Verify it's a real model
+                        next(iter(candidate.named_parameters()), None)
+                        logger.debug(f"_get_torch_model: found model via '{attr}'")
+                        return candidate
+                    except (AttributeError, TypeError, StopIteration) as e:
+                        logger.debug(f"_get_torch_model: '{attr}' candidate failed: {e}")
+                        continue
+        
+        logger.error(f"_get_torch_model: failed to find torch model. Model type: {type(model)}, dir(model): {[a for a in dir(model) if not a.startswith('__')][:20]}")
         return None
 
     def _collect_model_files(self) -> dict[str, bytes]:
@@ -214,8 +279,9 @@ class MxLiveWeightLoader:
     No format conversion, no fusing, no CPU round-trip.
     """
 
-    def __init__(self):
+    def __init__(self, mx_server: Optional[str] = None):
         self._source_meta = None
+        self._mx_server = mx_server
 
     def load_weights(
         self,
@@ -229,7 +295,8 @@ class MxLiveWeightLoader:
         import grpc
         from . import p2p_pb2, p2p_pb2_grpc
 
-        mx_server = os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
+        # Use provided URL, then env var, then default
+        mx_server = self._mx_server or os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS", "localhost:8001")
         model_name = os.environ.get("MODEL_NAME", os.path.basename(checkpoint_dir))
 
         if model is None:
@@ -388,8 +455,10 @@ class MxLiveCheckpointLoader:
     (direct RDMA into model params).
     """
 
-    def __init__(self):
-        self._weight_loader = MxLiveWeightLoader()
+    def __init__(self, mx_server: Optional[str] = None):
+        # Pass mx_server to weight loader so it's available even if env var isn't set
+        # when load_weights() is called in a different process context
+        self._weight_loader = MxLiveWeightLoader(mx_server=mx_server)
         self._config_loader = None  # Lazy init
         self._weight_mapper = None
         self._checkpoint_format = "mx-p2p"

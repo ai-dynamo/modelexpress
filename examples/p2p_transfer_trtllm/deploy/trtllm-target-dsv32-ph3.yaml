@@ -1,0 +1,269 @@
+# Phase 3 target: DeepSeek-V3.2 NVFP4, EP=8
+# Uses MxLiveCheckpointLoader for direct GPU-to-GPU weight transfer
+# Receives 2718 params/rank (68.45 GB) via RDMA, then runs inference
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-target-dsv32
+  namespace: kavin
+  labels:
+    app: trtllm-target-dsv32
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-target-dsv32
+  template:
+    metadata:
+      labels:
+        app: trtllm-target-dsv32
+    spec:
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-trtllm-client:ph3-dynamo0.9
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MODEL_NAME
+              value: "nvidia/DeepSeek-V3.2-NVFP4"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: MX_TRANSFER_LOG_DIR
+              value: "/tmp/mx_logs"
+            - name: MX_SOURCE_QUERY_TIMEOUT
+              value: "3600"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: HF_HOME
+              value: "/model-cache"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              cat > /tmp/target_mpi.py << 'PYEOF'
+              import os, sys, time, logging, torch
+              from mpi4py import MPI
+
+              comm = MPI.COMM_WORLD
+              rank = comm.Get_rank()
+              world_size = comm.Get_size()
+
+              logging.basicConfig(level=logging.INFO,
+                  format=f'%(asctime)s [rank{rank}] %(name)s %(levelname)s %(message)s')
+              logger = logging.getLogger("trtllm-target-dsv32")
+              torch.cuda.set_device(rank)
+
+              model_name = os.environ["MODEL_NAME"]
+              mx_server = os.environ["MODEL_EXPRESS_URL"]
+
+              logger.info("Target rank %d/%d starting on GPU %d", rank, world_size, rank)
+
+              from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+              from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+              from tensorrt_llm._torch.models.checkpoints.hf.config_loader import HfConfigLoader
+              from tensorrt_llm.mapping import Mapping
+              from tensorrt_llm._torch.modules.linear import Linear
+              from modelexpress.trtllm_live_transfer import MxLiveWeightLoader
+
+              t0 = time.perf_counter()
+
+              mapping = Mapping(
+                  world_size=world_size, tp_size=world_size, rank=rank,
+                  moe_ep_size=world_size, moe_tp_size=1, enable_attention_dp=True)
+
+              hf_cache = os.environ.get("HF_HOME", "/root/.cache/huggingface")
+              config_path = os.path.join(hf_cache, "hub",
+                  f"models--{model_name.replace('/', '--')}", "snapshots")
+              # Find snapshot dir
+              import glob
+              snapshots = glob.glob(f"{config_path}/*/config.json")
+              if snapshots:
+                  config_dir = os.path.dirname(snapshots[0])
+              else:
+                  from huggingface_hub import snapshot_download
+                  config_dir = snapshot_download(model_name,
+                      cache_dir=os.path.join(hf_cache, "hub"))
+
+              logger.info("Config dir: %s", config_dir)
+              config = HfConfigLoader().load(config_dir, mapping=mapping, trust_remote_code=True)
+
+              with MetaInitMode():
+                  model = AutoModelForCausalLM.from_config(config)
+
+              def _init_meta(t, dev=rank):
+                  if t.device == torch.device('meta'):
+                      return torch.empty_like(t, device=f'cuda:{dev}')
+                  return t
+              model._apply(_init_meta)
+              model.to(f'cuda:{rank}')
+
+              for m in model.modules():
+                  if isinstance(m, Linear):
+                      m._weights_presharded = True
+
+              logger.info("Model created on GPU %d, loading weights via RDMA...", rank)
+
+              loader = MxLiveWeightLoader()
+              weights = loader.load_weights(config_dir, mapping=mapping, model=model)
+
+              if not weights:
+                  logger.info("PRESHARDED: weights already in model params (direct injection)")
+              else:
+                  logger.info("Got %d weights back, loading...", len(weights))
+
+              elapsed = time.perf_counter() - t0
+              params = list(model.named_parameters())
+              total_bytes = sum(p.numel() * p.element_size() for _, p in params)
+              logger.info("Rank %d: %d params (%.2f GB) ready in %.1fs", rank, len(params), total_bytes / 1e9, elapsed)
+
+              # Print per-rank transfer logs
+              log_dir = os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs")
+              log_file = os.path.join(log_dir, f"rank{rank}.log")
+              if os.path.exists(log_file):
+                  with open(log_file) as f:
+                      for line in f:
+                          print(f"[rank{rank}] {line.rstrip()}")
+
+              # Simple forward pass to validate weights
+              comm.Barrier()
+              if rank == 0:
+                  total_elapsed = time.perf_counter() - t0
+                  logger.info("All %d ranks received weights in %.1fs", world_size, total_elapsed)
+                  logger.info("SUCCESS: DSV3.2 NVFP4 P2P weight transfer validated!")
+
+              while True:
+                  time.sleep(3600)
+              PYEOF
+
+              cat > /tmp/target_llm.py << 'LLMEOF'
+              import sys, os
+              os.environ["PYTHONUNBUFFERED"] = "1"
+
+              def main():
+                  model_name = os.environ["MODEL_NAME"]
+                  print(f"Testing LLM() for {model_name}...", flush=True)
+
+                  import tensorrt_llm.executor.proxy as proxy
+                  orig_start = proxy.GenerationExecutorProxy._start_executor_workers
+                  def patched_start(self, *args, **kwargs):
+                      try:
+                          return orig_start(self, *args, **kwargs)
+                      except RuntimeError as e:
+                          print(f"\n=== WORKER ERROR ===", flush=True)
+                          print(f"Exception: {e}", flush=True)
+                          if e.__cause__:
+                              print(f"Cause type: {type(e.__cause__)}", flush=True)
+                              print(f"Cause: {e.__cause__}", flush=True)
+                              import traceback
+                              traceback.print_exception(type(e.__cause__), e.__cause__, e.__cause__.__traceback__)
+                          import glob
+                          for f in sorted(glob.glob("/tmp/mx_logs/rank*.log")):
+                              print(f"\n=== {f} ===", flush=True)
+                              with open(f) as fh:
+                                  print(fh.read())
+                          sys.stdout.flush()
+                          sys.stderr.flush()
+                          raise
+                  proxy.GenerationExecutorProxy._start_executor_workers = patched_start
+
+                  from modelexpress.trtllm_live_transfer import MxLiveCheckpointLoader
+                  from tensorrt_llm import LLM
+                  from tensorrt_llm.llmapi.llm_args import LoadFormat
+
+                  loader = MxLiveCheckpointLoader()
+                  llm = LLM(
+                      model=model_name,
+                      checkpoint_loader=loader,
+                      load_format=LoadFormat.PRESHARDED,
+                      tensor_parallel_size=8,
+                      moe_expert_parallel_size=8,
+                      enable_attention_dp=True,
+                      max_batch_size=1,
+                      max_num_tokens=512,
+                      max_seq_len=4096,
+                      kv_cache_config={"free_gpu_memory_fraction": 0.4, "dtype": "auto"},
+                  )
+                  print("LLM created! Running inference...", flush=True)
+
+                  from tensorrt_llm import SamplingParams
+                  output = llm.generate(
+                      ["Hello, I am a large language model"],
+                      sampling_params=SamplingParams(max_tokens=30, temperature=0.7),
+                  )
+                  print(f"\nInference: {output[0].outputs[0].text}", flush=True)
+                  print(f"\nSUCCESS!", flush=True)
+
+                  import time
+                  while True:
+                      time.sleep(3600)
+
+              if __name__ == "__main__":
+                  main()
+              LLMEOF
+              exec python3 -u /tmp/target_llm.py
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /model-cache
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

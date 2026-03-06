@@ -1,0 +1,141 @@
+# Step 1: Validate DSV3.2 NVFP4 loads from disk via Dynamo worker
+# No P2P, no ModelExpress — just python3 -m dynamo.trtllm loading from PVC
+# Uses aggregated mode (single worker, no disagg) for simplest test
+#
+# Based on exemplar: https://github.com/karen-sy/dynamo-exemplar-external
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dsv32-agg-config
+  namespace: kavin
+data:
+  agg_config.yaml: |
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    enable_attention_dp: true
+    max_batch_size: 4
+    max_num_tokens: 4096
+    max_seq_len: 8192
+    print_iter_log: true
+    moe_config:
+      backend: TRTLLM
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: fp8
+      tokens_per_block: 64
+    cuda_graph_config:
+      max_batch_size: 4
+      enable_padding: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trtllm-dynamo-disk-test
+  namespace: kavin
+  labels:
+    app: trtllm-dynamo-disk-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trtllm-dynamo-disk-test
+  template:
+    metadata:
+      labels:
+        app: trtllm-dynamo-disk-test
+    spec:
+      containers:
+        - name: trtllm
+          image: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:0.9.0
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - IPC_LOCK
+          workingDir: /workspace
+          command: ["python3", "-m", "dynamo.trtllm"]
+          args:
+            - --model
+            - nvidia/DeepSeek-V3.2-NVFP4
+            - --served-model-name
+            - nvidia/DeepSeek-V3.2-NVFP4
+            - --extra-engine-args
+            - /config/agg_config.yaml
+            - --kv-block-size
+            - "64"
+            - --store-kv
+            - etcd
+            - --request-plane
+            - nats
+          env:
+            - name: ETCD_ENDPOINTS
+              value: "http://dynamo-platform-etcd:2379"
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats:4222"
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/.triton-cache
+            - name: NCCL_MNNVL_ENABLE
+              value: "1"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              memory: "600Gi"
+              cpu: "64"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /model-cache
+            - name: config-volume
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 400Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-storage
+        - name: config-volume
+          configMap:
+            name: dsv32-agg-config
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

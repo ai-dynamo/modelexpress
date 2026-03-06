@@ -1,0 +1,90 @@
+# Minimal etcd + NATS for Dynamo worker in kavin namespace
+# Uses same images as other working namespaces on this cluster
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamo-platform-etcd
+  namespace: kavin
+spec:
+  type: ClusterIP
+  ports:
+    - port: 2379
+      targetPort: 2379
+      name: client
+  selector:
+    app: dynamo-platform-etcd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dynamo-platform-etcd
+  namespace: kavin
+spec:
+  serviceName: dynamo-platform-etcd
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dynamo-platform-etcd
+  template:
+    metadata:
+      labels:
+        app: dynamo-platform-etcd
+    spec:
+      containers:
+        - name: etcd
+          image: docker.io/bitnamilegacy/etcd:3.5.18-debian-12-r5
+          env:
+            - name: ALLOW_NONE_AUTHENTICATION
+              value: "yes"
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: "http://dynamo-platform-etcd:2379"
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: "http://0.0.0.0:2379"
+          ports:
+            - containerPort: 2379
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamo-platform-nats
+  namespace: kavin
+spec:
+  type: ClusterIP
+  ports:
+    - port: 4222
+      targetPort: 4222
+      name: client
+  selector:
+    app: dynamo-platform-nats
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dynamo-platform-nats
+  namespace: kavin
+spec:
+  serviceName: dynamo-platform-nats
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dynamo-platform-nats
+  template:
+    metadata:
+      labels:
+        app: dynamo-platform-nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10.21-alpine
+          args: ["-js"]
+          ports:
+            - containerPort: 4222
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi

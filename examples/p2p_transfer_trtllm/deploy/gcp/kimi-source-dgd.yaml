@@ -73,7 +73,7 @@ spec:
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
               value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.3.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.4.1
           name: ""
           resources: {}
         nodeSelector:
@@ -147,6 +147,10 @@ spec:
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
               value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: HF_HOME
               value: /model-cache
             - name: TRITON_CACHE_DIR
@@ -203,7 +207,7 @@ spec:
               value: "INFO"
             - name: TLLM_OVERRIDE_LAYER_NUM
               value: "61"
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.3.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.4.1
           imagePullPolicy: Always
           name: ""
           resources: {}
