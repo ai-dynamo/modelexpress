@@ -137,6 +137,8 @@ class GdsTransferManager:
         self._agent_name = agent_name
         self._device_id: int | None = None
         self._agent: Any = None
+        self._chunk_buffer: torch.Tensor | None = None
+        self._chunk_gpu_descs: Any = None
         self._max_chunk_size = _read_max_chunk_from_cufile()
 
     @property
@@ -169,101 +171,91 @@ class GdsTransferManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def batch_load_file(
+    def load_tensor(
         self,
         fd: int,
-        file_size: int,
-        tensor_list: list[tuple[int, int]],
+        file_offset: int,
+        tensor_size: int,
         device: torch.device,
-    ) -> list[torch.Tensor]:
-        """Load multiple tensors from one file in a single batch transfer.
-
-        All chunks for all tensors are submitted at once, letting GDS_MT
-        threads work in parallel.  One FILE registration per file.
+        file_size: int = 0,
+    ) -> torch.Tensor:
+        """Load raw bytes from file directly to a GPU tensor via GDS.
 
         Args:
             fd: Open file descriptor.
-            file_size: Total file size (to cap reads at EOF).
-            tensor_list: ``[(file_offset, tensor_size), ...]``
+            file_offset: Absolute byte offset of the tensor data in the file.
+            tensor_size: Number of bytes to read.
             device: Target CUDA device.
+            file_size: Total file size (to avoid reading past EOF).
 
         Returns:
-            List of ``uint8`` GPU tensors (same order as *tensor_list*).
+            A ``uint8`` GPU tensor of length *tensor_size*.
         """
         if self._agent is None:
             raise RuntimeError("GDS agent not initialized")
 
-        max_chunk = self._max_chunk_size
+        if file_size == 0:
+            file_size = os.fstat(fd).st_size
 
-        # Phase 1: Plan all chunks for all tensors
-        # Each entry: (aligned_offset, aligned_size, prefix, useful, tensor_idx, bytes_loaded)
-        chunk_plans: list[tuple[int, int, int, int, int, int]] = []
-        result_buffers = []
+        result_buffer = torch.empty(tensor_size, dtype=torch.uint8, device=device)
+        bytes_loaded = 0
 
-        for ti, (file_offset, tensor_size) in enumerate(tensor_list):
-            result_buffers.append(
-                torch.empty(tensor_size, dtype=torch.uint8, device=device)
+        while bytes_loaded < tensor_size:
+            cur_offset = file_offset + bytes_loaded
+            remaining = tensor_size - bytes_loaded
+
+            aligned_offset = (cur_offset // GDS_ALIGNMENT) * GDS_ALIGNMENT
+            prefix_bytes = cur_offset - aligned_offset
+            useful_bytes = min(remaining, self._max_chunk_size - prefix_bytes)
+
+            aligned_size = (
+                (prefix_bytes + useful_bytes + GDS_ALIGNMENT - 1)
+                // GDS_ALIGNMENT
+            ) * GDS_ALIGNMENT
+            aligned_size = min(aligned_size, file_size - aligned_offset)
+
+            # Reuse chunk buffer and its VRAM registration
+            if self._chunk_buffer is None or self._chunk_buffer.numel() < aligned_size:
+                if self._chunk_gpu_descs is not None:
+                    self._agent.deregister_memory(self._chunk_gpu_descs)
+                self._chunk_buffer = torch.empty(
+                    max(aligned_size, self._max_chunk_size),
+                    dtype=torch.uint8, device=device,
+                )
+                self._chunk_gpu_descs = self._agent.register_memory(
+                    self._chunk_buffer, "VRAM"
+                )
+            chunk_buf = self._chunk_buffer[:aligned_size]
+
+            self._transfer_chunk(fd, aligned_offset, chunk_buf, aligned_size)
+
+            result_buffer[bytes_loaded : bytes_loaded + useful_bytes] = (
+                chunk_buf[prefix_bytes : prefix_bytes + useful_bytes]
             )
-            bytes_loaded = 0
-            while bytes_loaded < tensor_size:
-                cur_offset = file_offset + bytes_loaded
-                remaining = tensor_size - bytes_loaded
+            bytes_loaded += useful_bytes
 
-                aligned_offset = (cur_offset // GDS_ALIGNMENT) * GDS_ALIGNMENT
-                prefix_bytes = cur_offset - aligned_offset
-                useful_bytes = min(remaining, max_chunk - prefix_bytes)
+        return result_buffer
 
-                aligned_size = (
-                    (prefix_bytes + useful_bytes + GDS_ALIGNMENT - 1)
-                    // GDS_ALIGNMENT
-                ) * GDS_ALIGNMENT
-                aligned_size = min(aligned_size, file_size - aligned_offset)
+    def _transfer_chunk(
+        self, fd: int, file_offset: int, gpu_buffer: torch.Tensor, size: int
+    ) -> None:
+        """Transfer one aligned chunk: file -> GPU via NIXL GDS."""
+        file_descs = self._agent.register_memory(
+            [(file_offset, size, fd, "")], "FILE"
+        )
+        file_xfer = file_descs.trim()
+        gpu_xfer = self._agent.get_xfer_descs(gpu_buffer, "VRAM")
 
-                chunk_plans.append((
-                    aligned_offset, aligned_size,
-                    prefix_bytes, useful_bytes,
-                    ti, bytes_loaded,
-                ))
-                bytes_loaded += useful_bytes
-
-        num_chunks = len(chunk_plans)
-
-        # Phase 2: Allocate one staging buffer, build FILE + VRAM region lists
-        total_staging = sum(p[1] for p in chunk_plans)
-        staging = torch.empty(total_staging, dtype=torch.uint8, device=device)
-        staging_base = staging.data_ptr()
-
-        file_regions = []
-        vram_regions = []
-        staging_offset = 0
-
-        for aligned_offset, aligned_size, _, _, _, _ in chunk_plans:
-            file_regions.append((aligned_offset, aligned_size, fd, ""))
-            vram_regions.append((
-                staging_base + staging_offset,
-                aligned_size,
-                self._device_id,
-                "",
-            ))
-            staging_offset += aligned_size
-
-        # Phase 3: Batch register (one call each)
-        file_descs = self._agent.register_memory(file_regions, "FILE")
-        vram_descs = self._agent.register_memory(vram_regions, "VRAM")
-
-        # Phase 4: Submit ALL transfers at once → GDS_MT threads parallelize
         handle = self._agent.initialize_xfer(
-            "READ", vram_descs.trim(), file_descs.trim(), self._agent.name
+            "READ", gpu_xfer, file_xfer, self._agent.name
         )
 
         state = self._agent.transfer(handle)
         if state == "ERR":
             self._agent.deregister_memory(file_descs)
-            self._agent.deregister_memory(vram_descs)
-            raise RuntimeError("GDS batch transfer failed")
+            raise RuntimeError(f"GDS transfer failed at offset {file_offset}")
 
-        # Poll for completion
-        timeout = float(os.environ.get("MX_GDS_TIMEOUT", "120"))
+        timeout = float(os.environ.get("MX_GDS_TIMEOUT", "60"))
         t0 = time.perf_counter()
         spins = 0
         while True:
@@ -273,13 +265,11 @@ class GdsTransferManager:
             if state == "ERR":
                 self._agent.release_xfer_handle(handle)
                 self._agent.deregister_memory(file_descs)
-                self._agent.deregister_memory(vram_descs)
-                raise RuntimeError("GDS batch transfer error")
+                raise RuntimeError(f"GDS transfer error at offset {file_offset}")
             if time.perf_counter() - t0 > timeout:
                 self._agent.release_xfer_handle(handle)
                 self._agent.deregister_memory(file_descs)
-                self._agent.deregister_memory(vram_descs)
-                raise TimeoutError("GDS batch transfer timeout")
+                raise TimeoutError(f"GDS transfer timeout at offset {file_offset}")
             spins += 1
             if spins > 100:
                 time.sleep(0.0001)
@@ -287,24 +277,12 @@ class GdsTransferManager:
 
         self._agent.release_xfer_handle(handle)
         self._agent.deregister_memory(file_descs)
-        self._agent.deregister_memory(vram_descs)
-
-        logger.info(
-            "Batch transfer: %d tensors, %d chunks, %.1f MB staging",
-            len(tensor_list), num_chunks, total_staging / 1e6,
-        )
-
-        # Phase 5: Copy from staging to result buffers
-        staging_offset = 0
-        for aligned_offset, aligned_size, prefix, useful, ti, bytes_loaded in chunk_plans:
-            result_buffers[ti][bytes_loaded : bytes_loaded + useful] = (
-                staging[staging_offset + prefix : staging_offset + prefix + useful]
-            )
-            staging_offset += aligned_size
-
-        return result_buffers
 
     def shutdown(self) -> None:
         """Clean up NIXL GDS resources."""
+        if self._chunk_gpu_descs is not None and self._agent is not None:
+            self._agent.deregister_memory(self._chunk_gpu_descs)
+            self._chunk_gpu_descs = None
+        self._chunk_buffer = None
         self._agent = None
         logger.info("GdsTransferManager shutdown complete")
