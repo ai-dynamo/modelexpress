@@ -147,22 +147,12 @@ impl From<WorkerRecord> for WorkerRecordJson {
 
 impl From<WorkerRecordJson> for WorkerRecord {
     fn from(json: WorkerRecordJson) -> Self {
-        let backend_metadata = if let Some(sid) = json.transfer_engine_session_id {
-            if !sid.is_empty() {
-                super::BackendMetadataRecord::TransferEngine(sid)
-            } else if !json.nixl_metadata.is_empty() {
-                super::BackendMetadataRecord::Nixl(json.nixl_metadata)
-            } else {
-                super::BackendMetadataRecord::None
-            }
-        } else if !json.nixl_metadata.is_empty() {
-            super::BackendMetadataRecord::Nixl(json.nixl_metadata)
-        } else {
-            super::BackendMetadataRecord::None
-        };
         Self {
             worker_rank: json.worker_rank,
-            backend_metadata,
+            backend_metadata: super::BackendMetadataRecord::from_flat(
+                json.nixl_metadata,
+                json.transfer_engine_session_id,
+            ),
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
         }
     }

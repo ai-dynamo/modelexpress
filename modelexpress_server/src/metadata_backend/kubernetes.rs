@@ -392,35 +392,21 @@ impl MetadataBackend for KubernetesBackend {
         // Reconstruct workers from status + ConfigMaps
         let mut workers = Vec::new();
         for worker_status in status.workers {
-            // Determine backend metadata variant
-            let backend_metadata =
-                if let Some(sid) = &worker_status.transfer_engine_session_id {
-                    if !sid.is_empty() {
-                        super::BackendMetadataRecord::TransferEngine(sid.clone())
-                    } else if !worker_status.nixl_metadata.is_empty() {
-                        let data =
-                            BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
-                                format!(
-                                    "Failed to decode NIXL metadata for worker {}: {}",
-                                    worker_status.worker_rank, e
-                                )
-                            })?;
-                        super::BackendMetadataRecord::Nixl(data)
-                    } else {
-                        super::BackendMetadataRecord::None
-                    }
-                } else if !worker_status.nixl_metadata.is_empty() {
-                    let data =
-                        BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
-                            format!(
-                                "Failed to decode NIXL metadata for worker {}: {}",
-                                worker_status.worker_rank, e
-                            )
-                        })?;
-                    super::BackendMetadataRecord::Nixl(data)
-                } else {
-                    super::BackendMetadataRecord::None
-                };
+            // Decode base64 NIXL metadata if present
+            let nixl_bytes = if !worker_status.nixl_metadata.is_empty() {
+                BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
+                    format!(
+                        "Failed to decode NIXL metadata for worker {}: {}",
+                        worker_status.worker_rank, e
+                    )
+                })?
+            } else {
+                Vec::new()
+            };
+            let backend_metadata = super::BackendMetadataRecord::from_flat(
+                nixl_bytes,
+                worker_status.transfer_engine_session_id.clone(),
+            );
 
             // Read tensors from ConfigMap
             let tensors = if let Some(cm_name) = &worker_status.tensor_config_map {
