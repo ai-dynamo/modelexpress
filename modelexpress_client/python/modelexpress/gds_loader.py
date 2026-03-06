@@ -331,8 +331,8 @@ class MxGdsLoader:
         """
         Load all tensors from one safetensors file via GDS.
 
-        Opens the file, allocates GPU tensors, performs a batch GDS transfer,
-        and returns the loaded tensors.
+        All tensors are submitted in a single batch transfer so GDS_MT
+        threads can work in parallel.
 
         Args:
             file_path: Path to the ``.safetensors`` file.
@@ -350,39 +350,34 @@ class MxGdsLoader:
             key=lambda n: tensor_infos[n]["file_offset"],
         )
 
+        # Build tensor list for batch transfer
+        tensor_list = []
+        tensor_meta = []
+        for name in sorted_names:
+            info = tensor_infos[name]
+            st_dtype = info["dtype"]
+            torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
+            if torch_dtype is None:
+                raise RuntimeError(
+                    f"Unsupported safetensors dtype '{st_dtype}' "
+                    f"for tensor '{name}'"
+                )
+            tensor_list.append((info["file_offset"], info["size"]))
+            tensor_meta.append((name, torch_dtype, info["shape"]))
+
         fd = os.open(file_path, os.O_RDONLY)
         file_size = os.fstat(fd).st_size
-        result: dict[str, torch.Tensor] = {}
 
         try:
-            for name in sorted_names:
-                info = tensor_infos[name]
-                st_dtype = info["dtype"]
-                torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
-                if torch_dtype is None:
-                    raise RuntimeError(
-                        f"Unsupported safetensors dtype '{st_dtype}' "
-                        f"for tensor '{name}'"
-                    )
-
-                tensor_size = info["size"]
-                file_offset = info["file_offset"]
-                shape = info["shape"]
-
-                # GDS transfer: file → GPU (raw bytes)
-                raw = self._gds_manager.load_tensor(
-                    fd=fd,
-                    file_offset=file_offset,
-                    tensor_size=tensor_size,
-                    device=device,
-                    file_size=file_size,
-                )
-
-                # Reinterpret raw bytes → correct dtype + shape
-                tensor = raw.view(torch_dtype).reshape(shape)
-                result[name] = tensor
+            raw_tensors = self._gds_manager.batch_load_file(
+                fd, file_size, tensor_list, device,
+            )
         finally:
             os.close(fd)
+
+        result: dict[str, torch.Tensor] = {}
+        for raw, (name, torch_dtype, shape) in zip(raw_tensors, tensor_meta):
+            result[name] = raw.view(torch_dtype).reshape(shape)
 
         logger.info("Loaded %s", Path(file_path).name)
 
