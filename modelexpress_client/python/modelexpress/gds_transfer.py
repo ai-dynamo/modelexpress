@@ -60,11 +60,14 @@ _DEFAULT_MAX_CHUNK = 16 * 1024 * 1024  # 16 MB
 def _read_max_chunk_from_cufile() -> int:
     """Read max safe chunk size from cufile.json.
 
-    The effective per-request limit is the smaller of:
-      - ``per_buffer_cache_size_kb``
-      - ``max_device_cache_size_kb / io_batchsize``
+    Supports both the new slab-based config (``gpu_bounce_buffer_slab_config``)
+    and the legacy ``per_buffer_cache_size_kb`` parameter.
+
+    For slab config, the max usable slab for nvidia-fs is 16MB (slabs >16MB
+    are for P2P mode only).
     """
     cufile_path = os.environ.get("CUFILE_ENV_PATH_JSON", "/etc/cufile.json")
+    max_nvfs_slab_kb = 16384  # nvidia-fs only supports slabs <= 16MB
     try:
         with open(cufile_path) as f:
             text = f.read()
@@ -76,14 +79,31 @@ def _read_max_chunk_from_cufile() -> int:
         )
         config = json.loads(text)
         props = config.get("properties", {})
+
+        # New slab-based config takes priority
+        slab_cfg = props.get("gpu_bounce_buffer_slab_config")
+        if slab_cfg:
+            slab_sizes = slab_cfg.get("slab_size_kb", [])
+            # Filter to nvidia-fs compatible slabs (<= 16MB)
+            nvfs_slabs = [s for s in slab_sizes if s <= max_nvfs_slab_kb]
+            buffer_kb = max(nvfs_slabs) if nvfs_slabs else 1024
+            effective_kb = buffer_kb - (GPU_PAGE_SIZE // 1024)
+            logger.info(
+                "cufile.json slab config: slabs=%s, max nvfs slab=%dKB "
+                "-> effective max_chunk=%dKB (after GPU page reserve)",
+                slab_sizes, buffer_kb, effective_kb,
+            )
+            return effective_kb * 1024
+
+        # Legacy config
         per_buffer_kb = props.get("per_buffer_cache_size_kb", 1024)
         max_device_kb = props.get("max_device_cache_size_kb", 131072)
         io_batchsize = props.get("io_batchsize", 128)
         shadow_kb = max_device_kb // io_batchsize if io_batchsize > 0 else per_buffer_kb
         effective_kb = min(per_buffer_kb, shadow_kb) - (GPU_PAGE_SIZE // 1024)
         logger.info(
-            "cufile.json: per_buffer=%dKB, max_device=%dKB, io_batchsize=%d "
-            "-> effective max_chunk=%dKB (after GPU page reserve)",
+            "cufile.json legacy config: per_buffer=%dKB, max_device=%dKB, "
+            "io_batchsize=%d -> effective max_chunk=%dKB (after GPU page reserve)",
             per_buffer_kb, max_device_kb, io_batchsize, effective_kb,
         )
         return effective_kb * 1024
