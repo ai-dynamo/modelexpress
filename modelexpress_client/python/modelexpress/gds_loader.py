@@ -141,8 +141,6 @@ class MxGdsLoader:
         # Discover safetensors files and their tensor mappings
         file_tensor_map = self._resolve_safetensors_files(model_path)
 
-        total_bytes = 0
-
         for file_path, tensor_names in file_tensor_map.items():
             # Parse header to get offsets/sizes/dtypes/shapes
             header_info = self._parse_safetensors_header(file_path)
@@ -160,15 +158,9 @@ class MxGdsLoader:
             # Batch-load all tensors from this file via GDS
             loaded = self._load_file_tensors(file_path, file_tensors)
             for name, tensor in loaded.items():
-                total_bytes += tensor.numel() * tensor.element_size()
                 yield name, tensor
 
-        duration = time.perf_counter() - load_start
-        logger.info(
-            "GDS load complete: %.2f GB in %.2fs",
-            total_bytes / 1e9,
-            duration,
-        )
+        logger.info("GDS load complete in %.2fs", time.perf_counter() - load_start)
 
     # ------------------------------------------------------------------
     # Internal helpers
