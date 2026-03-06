@@ -28,6 +28,7 @@ import struct
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
@@ -141,24 +142,42 @@ class MxGdsLoader:
         # Discover safetensors files and their tensor mappings
         file_tensor_map = self._resolve_safetensors_files(model_path)
 
+        # Build list of (file_path, file_tensors) to load
+        file_jobs = []
         for file_path, tensor_names in file_tensor_map.items():
-            # Parse header to get offsets/sizes/dtypes/shapes
             header_info = self._parse_safetensors_header(file_path)
-
-            # Filter to only the tensors in this file
             file_tensors = {
                 name: header_info[name]
                 for name in tensor_names
                 if name in header_info
             }
+            if file_tensors:
+                file_jobs.append((file_path, file_tensors))
 
-            if not file_tensors:
-                continue
+        if not file_jobs:
+            return
 
-            # Batch-load all tensors from this file via GDS
-            loaded = self._load_file_tensors(file_path, file_tensors)
-            for name, tensor in loaded.items():
-                yield name, tensor
+        # Prefetch pipeline: load file[i+1] in background while
+        # yielding file[i]'s tensors to the framework.
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            # Kick off first file in background
+            pending = pool.submit(self._load_file_tensors, *file_jobs[0])
+
+            for i in range(len(file_jobs)):
+                # Wait for current file
+                loaded = pending.result()
+
+                # Kick off next file before yielding (overlap I/O with vLLM processing)
+                if i + 1 < len(file_jobs):
+                    pending = pool.submit(
+                        self._load_file_tensors, *file_jobs[i + 1]
+                    )
+
+                for name, tensor in loaded.items():
+                    yield name, tensor
+        finally:
+            pool.shutdown(wait=False)
 
         logger.info("GDS load complete in %.2fs", time.perf_counter() - load_start)
 
