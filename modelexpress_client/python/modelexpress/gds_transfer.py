@@ -139,7 +139,11 @@ class GdsTransferManager:
         self._agent: Any = None
         self._chunk_buffer: torch.Tensor | None = None
         self._chunk_gpu_descs: Any = None
-        self._max_chunk_size = _read_max_chunk_from_cufile()
+        override = os.environ.get("MX_GDS_MAX_CHUNK_KB")
+        if override:
+            self._max_chunk_size = int(override) * 1024
+        else:
+            self._max_chunk_size = _read_max_chunk_from_cufile()
 
     @property
     def agent_name(self) -> str:
