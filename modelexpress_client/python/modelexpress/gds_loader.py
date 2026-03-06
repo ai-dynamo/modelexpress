@@ -351,6 +351,7 @@ class MxGdsLoader:
         )
 
         fd = os.open(file_path, os.O_RDONLY)
+        file_size = os.fstat(fd).st_size
         result: dict[str, torch.Tensor] = {}
 
         try:
@@ -374,6 +375,7 @@ class MxGdsLoader:
                     file_offset=file_offset,
                     tensor_size=tensor_size,
                     device=device,
+                    file_size=file_size,
                 )
 
                 # Reinterpret raw bytes → correct dtype + shape

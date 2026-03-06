@@ -177,6 +177,7 @@ class GdsTransferManager:
         file_offset: int,
         tensor_size: int,
         device: torch.device,
+        file_size: int = 0,
     ) -> torch.Tensor:
         """Load raw bytes from file directly to a GPU tensor via GDS.
 
@@ -187,12 +188,16 @@ class GdsTransferManager:
             file_offset: Absolute byte offset of the tensor data in the file.
             tensor_size: Number of bytes to read.
             device: Target CUDA device.
+            file_size: Total file size (to avoid reading past EOF).
 
         Returns:
             A ``uint8`` GPU tensor of length *tensor_size*.
         """
         if self._agent is None:
             raise RuntimeError("GDS agent not initialized")
+
+        if file_size == 0:
+            file_size = os.fstat(fd).st_size
 
         result_buffer = torch.empty(tensor_size, dtype=torch.uint8, device=device)
         bytes_loaded = 0
@@ -208,11 +213,12 @@ class GdsTransferManager:
             # Cap useful bytes so aligned_size stays <= max_chunk_size
             useful_bytes = min(remaining, self._max_chunk_size - prefix_bytes)
 
-            # Round up to 4KB
+            # Round up to 4KB, but never past end of file
             aligned_size = (
                 (prefix_bytes + useful_bytes + GDS_ALIGNMENT - 1)
                 // GDS_ALIGNMENT
             ) * GDS_ALIGNMENT
+            aligned_size = min(aligned_size, file_size - aligned_offset)
 
             # Reuse chunk buffer and its VRAM registration
             if self._chunk_buffer is None or self._chunk_buffer.numel() < aligned_size:
@@ -268,9 +274,10 @@ class GdsTransferManager:
             self._agent.deregister_memory(file_descs)
             raise RuntimeError(f"GDS transfer failed at offset {file_offset}")
 
-        # Poll for completion
+        # Poll for completion: busy-wait first, then sleep
         timeout = float(os.environ.get("MX_GDS_TIMEOUT", "60"))
         t0 = time.perf_counter()
+        spins = 0
         while True:
             state = self._agent.check_xfer_state(handle)
             if state == "DONE":
@@ -283,7 +290,9 @@ class GdsTransferManager:
                 self._agent.release_xfer_handle(handle)
                 self._agent.deregister_memory(file_descs)
                 raise TimeoutError(f"GDS transfer timeout at offset {file_offset}")
-            time.sleep(0.001)
+            spins += 1
+            if spins > 100:
+                time.sleep(0.0001)
 
         self._agent.release_xfer_handle(handle)
         self._agent.deregister_memory(file_descs)
