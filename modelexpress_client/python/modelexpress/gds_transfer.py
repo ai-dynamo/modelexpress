@@ -84,14 +84,21 @@ def _read_max_chunk_from_cufile() -> int:
         slab_cfg = props.get("gpu_bounce_buffer_slab_config")
         if slab_cfg:
             slab_sizes = slab_cfg.get("slab_size_kb", [])
-            # Filter to nvidia-fs compatible slabs (<= 16MB)
-            nvfs_slabs = [s for s in slab_sizes if s <= max_nvfs_slab_kb]
-            buffer_kb = max(nvfs_slabs) if nvfs_slabs else 1024
-            effective_kb = buffer_kb - (GPU_PAGE_SIZE // 1024)
+            slab_counts = slab_cfg.get("slab_count", [])
+            io_bs = props.get("io_batchsize", 128)
+            # Batch API needs io_batchsize shadow buffers.  Find the largest
+            # slab whose count >= io_batchsize (that's what batch uses).
+            batch_slab_kb = None
+            for sz, cnt in zip(slab_sizes, slab_counts):
+                if cnt >= io_bs and sz <= max_nvfs_slab_kb:
+                    batch_slab_kb = sz
+            if batch_slab_kb is None:
+                batch_slab_kb = min(slab_sizes) if slab_sizes else 1024
+            effective_kb = batch_slab_kb - (GPU_PAGE_SIZE // 1024)
             logger.info(
-                "cufile.json slab config: slabs=%s, max nvfs slab=%dKB "
-                "-> effective max_chunk=%dKB (after GPU page reserve)",
-                slab_sizes, buffer_kb, effective_kb,
+                "cufile.json slab config: slabs=%s counts=%s io_batchsize=%d "
+                "-> batch_slab=%dKB, effective max_chunk=%dKB",
+                slab_sizes, slab_counts, io_bs, batch_slab_kb, effective_kb,
             )
             return effective_kb * 1024
 
