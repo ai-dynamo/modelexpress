@@ -136,6 +136,7 @@ class GdsTransferManager:
         self._device_id: int | None = None
         self._agent: Any = None
         self._chunk_buffer: torch.Tensor | None = None
+        self._chunk_gpu_descs: Any = None  # registered once, reused
         self._max_chunk_size = _read_max_chunk_from_cufile()
 
     @property
@@ -210,11 +211,18 @@ class GdsTransferManager:
                 // GDS_ALIGNMENT
             ) * GDS_ALIGNMENT
 
-            # Reuse chunk buffer to avoid repeated GPU allocation
+            # Reuse chunk buffer and its VRAM registration
             if self._chunk_buffer is None or self._chunk_buffer.numel() < aligned_size:
+                # Deregister old buffer if any
+                if self._chunk_gpu_descs is not None:
+                    self._agent.deregister_memory(self._chunk_gpu_descs)
+                    self._chunk_gpu_descs = None
                 self._chunk_buffer = torch.empty(
                     max(aligned_size, self._max_chunk_size),
                     dtype=torch.uint8, device=device,
+                )
+                self._chunk_gpu_descs = self._agent.register_memory(
+                    self._chunk_buffer, "VRAM"
                 )
             chunk_buf = self._chunk_buffer[:aligned_size]
 
@@ -238,14 +246,13 @@ class GdsTransferManager:
     ) -> None:
         """Transfer one aligned chunk: file → GPU via NIXL GDS."""
 
-        # Register FILE region: (offset, size, fd, tag)
+        # Register FILE region (must be per-transfer, offset changes)
         file_descs = self._agent.register_memory(
             [(file_offset, size, fd, f"c_{file_offset}")], "FILE"
         )
         file_xfer = file_descs.trim()
 
-        # Register GPU buffer
-        gpu_descs = self._agent.register_memory(gpu_buffer, "VRAM")
+        # GPU buffer is already registered in load_tensor; get xfer descs
         gpu_xfer = self._agent.get_xfer_descs(gpu_buffer, "VRAM")
 
         # Execute transfer (READ = file → GPU)
@@ -256,7 +263,6 @@ class GdsTransferManager:
         state = self._agent.transfer(handle)
         if state == "ERR":
             self._agent.deregister_memory(file_descs)
-            self._agent.deregister_memory(gpu_descs)
             raise RuntimeError(f"GDS transfer failed at offset {file_offset}")
 
         # Poll for completion
@@ -269,21 +275,21 @@ class GdsTransferManager:
             if state == "ERR":
                 self._agent.release_xfer_handle(handle)
                 self._agent.deregister_memory(file_descs)
-                self._agent.deregister_memory(gpu_descs)
                 raise RuntimeError(f"GDS transfer error at offset {file_offset}")
             if time.perf_counter() - t0 > timeout:
                 self._agent.release_xfer_handle(handle)
                 self._agent.deregister_memory(file_descs)
-                self._agent.deregister_memory(gpu_descs)
                 raise TimeoutError(f"GDS transfer timeout at offset {file_offset}")
             time.sleep(0.001)
 
         self._agent.release_xfer_handle(handle)
         self._agent.deregister_memory(file_descs)
-        self._agent.deregister_memory(gpu_descs)
 
     def shutdown(self) -> None:
         """Clean up NIXL GDS resources."""
+        if self._chunk_gpu_descs is not None and self._agent is not None:
+            self._agent.deregister_memory(self._chunk_gpu_descs)
+            self._chunk_gpu_descs = None
         self._chunk_buffer = None
         self._agent = None
         logger.info("GdsTransferManager shutdown complete")
