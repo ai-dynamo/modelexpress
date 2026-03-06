@@ -43,6 +43,22 @@ pub enum BackendMetadataRecord {
     None,
 }
 
+impl BackendMetadataRecord {
+    /// Reconstruct from flat fields (used by Redis JSON and K8s CRD deserialization).
+    /// TransferEngine takes priority when both are present.
+    pub fn from_flat(nixl_metadata: Vec<u8>, transfer_engine_session_id: Option<String>) -> Self {
+        if let Some(sid) = transfer_engine_session_id
+            && !sid.is_empty()
+        {
+            return Self::TransferEngine(sid);
+        }
+        if !nixl_metadata.is_empty() {
+            return Self::Nixl(nixl_metadata);
+        }
+        Self::None
+    }
+}
+
 /// Worker metadata record
 #[derive(Debug, Clone)]
 pub struct WorkerRecord {
