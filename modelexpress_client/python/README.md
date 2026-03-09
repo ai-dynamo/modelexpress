@@ -19,7 +19,7 @@ pip install -e ".[dev]"
 - Python >= 3.10
 - NVIDIA GPUs with RDMA/InfiniBand support
 - [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
-- A running [ModelExpress server](../../modelexpress_server/) (Rust gRPC service backed by Redis)
+- A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
 
 ## Quick Start with vLLM
 
