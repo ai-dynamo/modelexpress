@@ -20,8 +20,9 @@ class TensorDescriptor:
 class WorkerMetadata:
     """Metadata for a single GPU worker."""
     worker_rank: int
-    nixl_metadata: bytes
     tensors: list[TensorDescriptor]
+    nixl_metadata: bytes = b""
+    transfer_engine_session_id: str = ""
 
 
 @dataclass

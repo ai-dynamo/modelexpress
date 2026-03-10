@@ -18,7 +18,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
-pub use crate::metadata_backend::{ModelMetadataRecord, TensorRecord, WorkerRecord};
+pub use crate::metadata_backend::{
+    BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
+};
 
 /// Ready state for a source worker (stored in-memory, always ephemeral).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,9 +238,11 @@ mod tests {
 
     #[test]
     fn test_worker_record_conversion() {
+        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+
         let meta = WorkerMetadata {
             worker_rank: 3,
-            nixl_metadata: vec![1, 2, 3, 4, 5],
+            backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1, 2, 3, 4, 5])),
             tensors: vec![TensorDescriptor {
                 name: "test.weight".to_string(),
                 addr: 0x1000,
@@ -250,12 +254,15 @@ mod tests {
 
         let record = WorkerRecord::from(meta.clone());
         assert_eq!(record.worker_rank, 3);
-        assert_eq!(record.nixl_metadata, vec![1, 2, 3, 4, 5]);
+        assert!(matches!(
+            &record.backend_metadata,
+            BackendMetadataRecord::Nixl(d) if d == &vec![1, 2, 3, 4, 5]
+        ));
         assert_eq!(record.tensors.len(), 1);
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
-        assert_eq!(back.nixl_metadata, meta.nixl_metadata);
+        assert_eq!(back.backend_metadata, meta.backend_metadata);
     }
 
     #[test]
@@ -265,7 +272,7 @@ mod tests {
             workers: vec![
                 WorkerRecord {
                     worker_rank: 0,
-                    nixl_metadata: vec![10, 20, 30],
+                    backend_metadata: BackendMetadataRecord::Nixl(vec![10, 20, 30]),
                     tensors: vec![TensorRecord {
                         name: "layer.0.weight".to_string(),
                         addr: 0x7f00_0000_0000,
@@ -276,7 +283,7 @@ mod tests {
                 },
                 WorkerRecord {
                     worker_rank: 1,
-                    nixl_metadata: vec![40, 50, 60],
+                    backend_metadata: BackendMetadataRecord::Nixl(vec![40, 50, 60]),
                     tensors: vec![TensorRecord {
                         name: "layer.0.weight".to_string(),
                         addr: 0x7f00_0000_0000,

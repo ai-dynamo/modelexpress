@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "model-express-workspace-tests"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "modelexpress-client",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-client"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-common"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-server"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

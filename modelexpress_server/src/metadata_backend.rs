@@ -32,11 +32,38 @@ pub struct ModelMetadataRecord {
     pub published_at: i64,
 }
 
+/// Backend-specific metadata for a worker
+#[derive(Debug, Clone)]
+pub enum BackendMetadataRecord {
+    /// Serialized NIXL agent metadata for RDMA connections
+    Nixl(Vec<u8>),
+    /// Mooncake TransferEngine session ID ("ip:port")
+    TransferEngine(String),
+    /// No backend metadata provided
+    None,
+}
+
+impl BackendMetadataRecord {
+    /// Reconstruct from flat fields (used by Redis JSON and K8s CRD deserialization).
+    /// TransferEngine takes priority when both are present.
+    pub fn from_flat(nixl_metadata: Vec<u8>, transfer_engine_session_id: Option<String>) -> Self {
+        if let Some(sid) = transfer_engine_session_id
+            && !sid.is_empty()
+        {
+            return Self::TransferEngine(sid);
+        }
+        if !nixl_metadata.is_empty() {
+            return Self::Nixl(nixl_metadata);
+        }
+        Self::None
+    }
+}
+
 /// Worker metadata record
 #[derive(Debug, Clone)]
 pub struct WorkerRecord {
     pub worker_rank: u32,
-    pub nixl_metadata: Vec<u8>,
+    pub backend_metadata: BackendMetadataRecord,
     pub tensors: Vec<TensorRecord>,
 }
 
@@ -53,9 +80,17 @@ pub struct TensorRecord {
 // Conversions from gRPC types
 impl From<WorkerMetadata> for WorkerRecord {
     fn from(meta: WorkerMetadata) -> Self {
+        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+        let backend_metadata = match meta.backend_metadata {
+            Some(BackendMetadata::NixlMetadata(data)) => BackendMetadataRecord::Nixl(data),
+            Some(BackendMetadata::TransferEngineSessionId(sid)) => {
+                BackendMetadataRecord::TransferEngine(sid)
+            }
+            None => BackendMetadataRecord::None,
+        };
         Self {
             worker_rank: meta.worker_rank,
-            nixl_metadata: meta.nixl_metadata,
+            backend_metadata,
             tensors: meta.tensors.into_iter().map(TensorRecord::from).collect(),
         }
     }
@@ -76,9 +111,17 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
 // Conversions back to gRPC types
 impl From<WorkerRecord> for WorkerMetadata {
     fn from(record: WorkerRecord) -> Self {
+        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+        let backend_metadata = match record.backend_metadata {
+            BackendMetadataRecord::Nixl(data) => Some(BackendMetadata::NixlMetadata(data)),
+            BackendMetadataRecord::TransferEngine(sid) => {
+                Some(BackendMetadata::TransferEngineSessionId(sid))
+            }
+            BackendMetadataRecord::None => None,
+        };
         Self {
             worker_rank: record.worker_rank,
-            nixl_metadata: record.nixl_metadata,
+            backend_metadata,
             tensors: record
                 .tensors
                 .into_iter()
