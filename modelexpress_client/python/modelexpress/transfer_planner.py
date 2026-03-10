@@ -102,6 +102,7 @@ class SourceIndexResult:
     source_index: dict[str, dict[int, SourceTensorInfo]]
     rank_to_session: dict[int, str] = field(default_factory=dict)
     rank_to_nixl_metadata: dict[int, bytes] = field(default_factory=dict)
+    rank_to_device_id: dict[int, int] = field(default_factory=dict)
     backend: str = "unknown"
 
 
@@ -120,6 +121,7 @@ def build_source_index(workers: list) -> SourceIndexResult:
     source_index: dict[str, dict[int, SourceTensorInfo]] = defaultdict(dict)
     rank_to_session: dict[int, str] = {}
     rank_to_nixl_metadata: dict[int, bytes] = {}
+    rank_to_device_id: dict[int, int] = {}
     backend = "unknown"
 
     for w in workers:
@@ -142,11 +144,15 @@ def build_source_index(workers: list) -> SourceIndexResult:
                 effective_tp_size=td.effective_tp_size,
                 shard_index=td.shard_index,
             )
+            # Use device_id from the first tensor of each worker
+            if w.worker_rank not in rank_to_device_id:
+                rank_to_device_id[w.worker_rank] = td.device_id
 
     return SourceIndexResult(
         source_index=dict(source_index),
         rank_to_session=rank_to_session,
         rank_to_nixl_metadata=rank_to_nixl_metadata,
+        rank_to_device_id=rank_to_device_id,
         backend=backend,
     )
 
@@ -398,6 +404,7 @@ class TransferPlanner:
         ops: list[TransferOp],
         rank_to_nixl_metadata: dict[int, bytes],
         device_id: int,
+        rank_to_device_id: dict[int, int] | None = None,
     ) -> None:
         """Execute RDMA transfer ops via NIXL, grouped by source rank.
 
@@ -409,6 +416,8 @@ class TransferPlanner:
             ops: Transfer operations from compute_plan().
             rank_to_nixl_metadata: {rank: nixl_metadata_bytes} from source workers.
             device_id: Local GPU device ID.
+            rank_to_device_id: {rank: gpu_device_id} for remote source ranks.
+                If None, defaults to rank as device_id.
         """
         import time
 
@@ -438,8 +447,9 @@ class TransferPlanner:
             remote_agent_name = nixl_agent.add_remote_agent(nixl_metadata)
 
             # Build descriptor lists as (addr, size, device_id) 3-tuples
+            src_dev = (rank_to_device_id or {}).get(src_rank, src_rank)
             remote_descs = [
-                (op.src_addr + op.src_offset, op.length, 0)
+                (op.src_addr + op.src_offset, op.length, src_dev)
                 for op in rank_ops
             ]
             local_descs = [
