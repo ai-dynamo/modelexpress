@@ -23,14 +23,18 @@ class TestGmsImports:
     def test_import_mx_hooks(self):
         pytest.importorskip("torch")
         from modelexpress.gms.mx_hooks import (
+            source_commit_gms,
+            source_connect_gms,
             source_finalize,
-            source_post_load,
+            source_register_nixl,
             target_allocate,
             target_commit,
             target_receive,
         )
 
-        assert callable(source_post_load)
+        assert callable(source_connect_gms)
+        assert callable(source_register_nixl)
+        assert callable(source_commit_gms)
         assert callable(source_finalize)
         assert callable(target_allocate)
         assert callable(target_receive)
@@ -72,11 +76,6 @@ class TestExistingImports:
 
         assert callable(register_modelexpress_loaders)
 
-    def test_import_register_gms_loader(self):
-        from modelexpress import register_gms_loader
-
-        assert callable(register_gms_loader)
-
     def test_import_types(self):
         from modelexpress.types import (
             GetMetadataResponse,
@@ -85,8 +84,3 @@ class TestExistingImports:
         )
 
         assert TensorDescriptor is not None
-
-    def test_import_run_gms_loader(self):
-        from modelexpress import run_gms_loader
-
-        assert callable(run_gms_loader)
