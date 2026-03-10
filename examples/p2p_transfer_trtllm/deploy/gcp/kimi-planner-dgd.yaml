@@ -153,12 +153,17 @@ spec:
             - name: metrics
               containerPort: 9085
           command:
-            - python3
-          args:
-            - -m
-            - dynamo.planner
-            - --config
-            - '{"environment": "kubernetes", "backend": "trtllm", "mode": "agg", "throughput_adjustment_interval": 30, "ttft": 3000, "itl": 30, "enable_throughput_scaling": true, "enable_load_scaling": true, "profile_results_dir": "/workspace/profiling_results"}'
+            - bash
+            - -c
+            - |
+              CORE=$(python3 -c "import dynamo.planner.utils.planner_core as m; print(m.__file__)")
+              AGG=$(python3 -c "import dynamo.planner.utils.agg_planner as m; print(m.__file__)")
+              sed -i 's/start_prometheus_server: bool = True,/start_prometheus_server: bool = True,\n        component_type=None,/' "$CORE"
+              sed -i '/^        self.config = config/a\        if component_type is not None:\n            self.component_type = component_type' "$CORE"
+              sed -i 's/start_prometheus_server=True,$/start_prometheus_server=True,\n            component_type=SubComponentType.DECODE,/' "$AGG"
+              sed -i '/Override: agg planner/,/self.planner.component_type/d' "$AGG"
+              echo "Patched planner_core.py and agg_planner.py for component_type fix"
+              exec python3 -m dynamo.planner --config '{"environment": "kubernetes", "backend": "trtllm", "mode": "agg", "throughput_adjustment_interval": 30, "ttft": 3000, "itl": 30, "enable_throughput_scaling": false, "enable_load_scaling": true}'
           env:
             - name: NATS_SERVER
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
@@ -168,6 +173,16 @@ spec:
             - name: planner-profile-data
               mountPath: /workspace/profiling_results
               readOnly: true
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-w0e
+                  - customer-gpu-o7v
         nodeSelector:
           kubernetes.io/arch: arm64
         tolerations:
@@ -180,6 +195,9 @@ spec:
             operator: Equal
             value: user-workload
           - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
             key: kubernetes.io/arch
             operator: Exists
         volumes:
@@ -189,6 +207,7 @@ spec:
 
     KimiWorker:
       componentType: worker
+      subComponentType: decode
       envFromSecret: hf-token-secret
       scalingAdapter:
         enabled: true
@@ -331,8 +350,6 @@ spec:
             - name: TLLM_OVERRIDE_LAYER_NUM
               value: "61"
           volumeMounts:
-            - mountPath: /dev/shm
-              name: shm
             - mountPath: /dev/infiniband
               name: infiniband
             - mountPath: /model-cache
@@ -361,10 +378,6 @@ spec:
           - name: compute-domain-channel
             resourceClaimTemplateName: kavin-compute-domain-channel
         volumes:
-          - name: shm
-            emptyDir:
-              medium: Memory
-              sizeLimit: 100Gi
           - name: infiniband
             hostPath:
               path: /dev/infiniband
