@@ -1,81 +1,166 @@
 # Kimi K2.5 P2P Weight Transfer on GCP GB200
 
-Fast GPU-to-GPU weight loading for Kimi K2.5 (589 GB, EP=4) via ModelExpress NIXL RDMA.
-A target instance loads weights from a running source in ~30s instead of ~75 min from disk.
+Fast GPU-to-GPU weight loading for Kimi K2.5 (648 GB, TP=4) via ModelExpress NIXL RDMA.
+New workers load weights in **3.5 seconds at 369 Gbps** instead of ~75 min from disk.
 
-## Quick Start
+## Validated Results
 
-### Prerequisites
+| Model | Mode | TP | Transfer | Speed | Transport |
+|-------|------|-----|----------|-------|-----------|
+| Qwen 0.5B | Aggregated | 2 | 1.26 GB | 25-33 Gbps | RoCE |
+| Kimi K2.5 | Aggregated | 4 | 648 GB | **369 Gbps** | RoCE |
+| Kimi K2.5 | Agg + DGDSA scale | 4 | 648 GB | **371-390 Gbps** | RoCE |
+| Kimi K2.5 | Disagg (prefill) | 4 | 648 GB | 255 Gbps | RoCE |
+| Kimi K2.5 | Disagg (decode) | 4 | 648 GB | 234 Gbps | RoCE |
+
+---
+
+## Deployment Modes
+
+### 1. Simple P2P (source + target)
+
+Standalone source holds weights, target receives via RDMA.
 
 ```bash
-# 1. Namespace with Dynamo platform
-kubectl -n kavin get pods  # should show etcd, nats running
-
-# 2. ModelExpress server + Redis
+# Deploy infra
 kubectl -n kavin apply -f mx-infra.yaml
 
-# 3. ComputeDomain (for GPU allocation via DRA)
-cat <<EOF | kubectl -n kavin apply -f -
-apiVersion: resource.nvidia.com/v1beta1
-kind: ComputeDomain
-metadata:
-  name: kavin-compute-domain
-spec:
-  numNodes: 0
-  channel:
-    resourceClaimTemplate:
-      name: kavin-compute-domain-channel
-EOF
-
-# 4. Secrets
-kubectl -n kavin get secret hf-token-secret        # HuggingFace token
-kubectl -n kavin get secret nvcr-imagepullsecret    # NVCR pull secret
-```
-
-### Deploy Source (loads from disk, publishes weights)
-
-```bash
-# Flush any stale metadata
+# Deploy source (~75 min to load)
 kubectl -n kavin exec deploy/redis -- redis-cli FLUSHALL
-
-# Deploy source — takes ~75 min to load Kimi K2.5
 kubectl -n kavin apply -f kimi-source-deploy.yaml
+# Watch for: "published ALL 4 workers to MX server"
 
-# Monitor progress
-kubectl -n kavin logs -f deploy/kimi-source-deploy
-# Look for: "ModelExpress source: all 4 workers published"
+# Deploy target (after source publishes)
+kubectl -n kavin apply -f kimi-target-deploy.yaml
+# Watch for: "Transfer complete: 1754 tensors, 162.09 GB in 3.51s (369 Gbps)"
 ```
 
-### Deploy Target (receives weights via RDMA)
+### 2. Aggregated + Planner (DGD with autoscaling)
+
+Single worker type (both prefill and decode in one engine), scaled by planner via DGDSA.
 
 ```bash
-# Only after source publishes successfully
-kubectl -n kavin apply -f kimi-target-deploy.yaml
+# Source must be running and published first (see above)
 
-# Check per-rank transfer logs
-kubectl -n kavin exec deploy/kimi-target-deploy -- cat /tmp/mx_logs/rank0.log
-# Expected: "transferred 1815 params (162.09 GB) in Xs (Y Gbps)"
+# Deploy aggregated DGD with planner
+kubectl -n kavin apply -f kimi-planner-dgd.yaml
+# Creates: Frontend + Planner + KimiWorker (MX target)
+
+# Worker loads via P2P automatically, planner monitors load metrics
+
+# Manual scale test
+kubectl -n kavin scale dgdsa/kimi-planner-kimiworker --replicas=2
+# Second worker loads via P2P in ~3.5s, ready in ~7.5 min
 ```
 
-## Image
+### 3. Disaggregated + Planner (prefill/decode split)
+
+Separate prefill and decode workers, each loading via P2P, independently scaled.
+
+```bash
+# Source must be running and published first
+
+# Deploy disagg DGD (same TP=4 for both)
+kubectl -n kavin apply -f kimi-disagg-mx-dgd.yaml
+# Creates: Frontend (KV router) + Planner + prefill (MX target) + decode (MX target)
+
+# Both workers load from the same source concurrently
+# Watch for transfer logs on each:
+kubectl -n kavin logs -l nvidia.com/dynamo-component=prefill | grep "Transfer complete"
+kubectl -n kavin logs -l nvidia.com/dynamo-component=decode  | grep "Transfer complete"
+
+# Scale prefill independently
+kubectl -n kavin scale dgdsa/kimi-disagg-prefill --replicas=2
+
+# Scale decode independently
+kubectl -n kavin scale dgdsa/kimi-disagg-decode --replicas=2
+```
+
+### 4. Mixed TP Disagg (Phase 2 — in progress)
+
+Prefill TP=4 + Decode TP=8 with separate MX sources per TP size.
+
+```bash
+# Deploy dual MX infrastructure
+kubectl -n kavin apply -f mx-infra.yaml          # prefill MX server
+kubectl -n kavin apply -f mx-infra-decode.yaml    # decode MX server
+
+# Deploy sources (both load in parallel, ~75 min each)
+kubectl -n kavin apply -f kimi-source-deploy.yaml            # TP=4 prefill source
+kubectl -n kavin apply -f kimi-source-decode-dgd.yaml        # TP=8 decode source (multinode)
+
+# After both sources publish, deploy disagg DGD
+kubectl -n kavin apply -f kimi-disagg-phase2-dgd.yaml
+# Prefill reads from modelexpress-server (TP=4 source)
+# Decode reads from modelexpress-server-decode (TP=8 source)
+
+# Scale decode (TP=8, multinode: 2 nodes per replica)
+kubectl -n kavin scale dgdsa/kimi-disagg-p2-decode --replicas=2
+```
+
+---
+
+## File Reference
+
+### Infrastructure
+
+| File | Purpose |
+|------|---------|
+| `mx-infra.yaml` | ModelExpress server + Redis (prefill source) |
+| `mx-infra-decode.yaml` | Second MX server + Redis (decode source, Phase 2) |
+
+### Sources (hold weights for RDMA)
+
+| File | TP | Type | Notes |
+|------|-----|------|-------|
+| `kimi-source-deploy.yaml` | 4 | Deployment | Single node, proven |
+| `kimi-source-dgd.yaml` | 4 | DGD | With frontend, for operator |
+| `kimi-source-decode-dgd.yaml` | 8 | DGD (multinode: 2) | Phase 2, needs `HOME=/root` fix |
+| `kimi-source.yaml` | 4 | Standalone MPI | Legacy, no Dynamo engine |
+
+### Targets / Workers (receive weights via P2P)
+
+| File | Mode | Workers | Planner | Scaling |
+|------|------|---------|---------|---------|
+| `kimi-target-deploy.yaml` | Simple | 1 aggregated | No | Manual |
+| `kimi-planner-dgd.yaml` | Aggregated DGD | 1 aggregated | Yes (agg) | DGDSA |
+| `kimi-disagg-mx-dgd.yaml` | Disagg DGD (same TP) | prefill + decode (TP=4) | Yes (disagg) | 2x DGDSA |
+| `kimi-disagg-phase2-dgd.yaml` | Disagg DGD (mixed TP) | prefill TP=4 + decode TP=8 | Yes (disagg) | 2x DGDSA |
+
+### Testing
+
+| File | Purpose |
+|------|---------|
+| `qwen-source-deploy.yaml` | Qwen 0.5B TP=2 source (fast iteration, loads in 30s) |
+| `qwen-target-deploy.yaml` | Qwen 0.5B TP=2 target |
+
+---
+
+## How Scaling Works
 
 ```
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+Source (separate Deployment)           DGD (scaled by planner/DGDSA)
+┌──────────────────────┐              ┌───────────────────────────┐
+│ kimi-source-deploy   │              │ Frontend (KV router)      │
+│ --model-express-role │  NIXL RDMA   │ Planner (load-based)      │
+│   source             │◄────────────│ Worker (--model-express-   │
+│ Holds 648 GB in GPU  │              │   role target)            │
+│ Publishes to MX srv  │              │ DGDSA scales replicas     │
+└──────────────────────┘              └───────────────────────────┘
+
+kubectl scale dgdsa/<name> --replicas=2
+  → Operator creates new pod with same spec (target role baked in)
+  → New pod queries MX server → NIXL RDMA from source → 3.5s
+  → Autotuning → ready to serve
+  → Frontend discovers new worker via NATS
 ```
 
-Built from `Dockerfile.ph3-gcp-gb200` on top of karenc's `dynamo-trtllm-v1.0.0-a9b6f95`.
-Includes ModelExpress client, TRT-LLM PRESHARDED patches, and worker-side publish hook.
+The source and workers are independent resources. The source is always 1 replica
+holding weights. Workers scale 1..N, each loading via P2P from the same source.
 
-## Deployment Options
+For disagg mode, prefill and decode have separate DGDSAs and scale independently.
 
-| File | Type | Use When |
-|------|------|----------|
-| `kimi-source-deploy.yaml` | Plain Deployment | Operator unavailable |
-| `kimi-target-deploy.yaml` | Plain Deployment | Operator unavailable |
-| `kimi-source-dgd.yaml` | DynamoGraphDeployment | Operator running |
-| `kimi-target-agg-mx.yaml` | DynamoGraphDeployment | Operator running |
-| `qwen-source-deploy.yaml` | Plain Deployment | Fast testing (TP=2, loads in 30s) |
-| `qwen-target-deploy.yaml` | Plain Deployment | Fast testing |
+---
 
 ## Required Pod Config for GB200
 
@@ -89,42 +174,67 @@ env:
   OMPI_MCA_btl: "tcp,self,vader"                     # MPI over TCP+shmem
 
 volumes:
-  /dev/shm:  emptyDir (100Gi, Memory)               # NCCL shared memory
+  # /dev/shm auto-injected by DGD operator — do NOT add in DGD specs
+  # For plain Deployments: emptyDir (100Gi, Memory)
   /dev/infiniband: hostPath                          # RoCE devices
 
 resourceClaims:
   compute-domain-channel                             # GPU allocation via DRA
 
 affinity:
-  topologyKey: nvidia.com/gpu.clique                 # same NVLink domain
+  topologyKey: nvidia.com/gpu.clique                 # same NVLink/RoCE domain
 ```
 
 ## Key Findings
 
-- **No `cuda_ipc` in UCX_TLS** — `cuIpcOpenMemHandle` fails on GB200, causing NIXL to reject remote metadata. Remove `cuda_ipc` to use host-staged RoCE RDMA instead.
-- **`/dev/shm` required** — NCCL needs >64MB for shared memory segments. K8s default is 64MB. Must mount explicit emptyDir.
-- **`OMPI_MCA_pml=ob1` + `OMPI_MCA_btl=tcp,self,vader`** — Required for TP>=4 with `privileged: true` on GB200. UCX UD endpoint times out during MPI bootstrap (confirmed on freshly restarted nodes — not a stale state issue). Forces MPI to use TCP+shared memory. Does not affect NCCL or NIXL RDMA performance.
-- **ComputeDomain** — required for IMEX channels on GB200. Without it, NIXL `loadRemoteMD` fails.
+- **No `cuda_ipc` in UCX_TLS** — `cuIpcOpenMemHandle` fails on GB200. Remove to use host-staged RoCE.
+- **`/dev/shm`** — NCCL needs >64MB. DGD operator auto-injects it; plain Deployments must add it manually.
+- **`ob1` PML** — Required for TP>=4 with privileged on GB200. UCX UD times out during MPI bootstrap.
+- **ComputeDomain** — Required for IMEX channels. Without it, NIXL `loadRemoteMD` fails.
+- **DGD `/dev/shm` conflict** — Do NOT define `/dev/shm` in DGD extraPodSpec (operator injects it, causes duplicate mount error).
+- **Multinode SSH** — DGD multinode worker needs `HOME=/root` if image has non-root user, or sshd can't find host keys.
 
-## Validated Results
-
-| Model | TP | Transfer | Speed | Transport |
-|-------|-----|----------|-------|-----------|
-| Qwen 0.5B | 2 | 0.63 GB/rank | 25-33 Gbps | rc_mlx5 (RoCE) |
-| Kimi K2.5 | 4 | 162 GB/rank | TBD | TBD |
-
-## Operator Webhook Fix
-
-If DGD operator webhook is down (`kube-rbac-proxy` image pull error):
+## Prerequisites
 
 ```bash
-kubectl -n dynamo-system patch deploy \
-  dynamo-platform-dynamo-operator-controller-manager \
-  --type='json' \
-  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"registry.k8s.io/kubebuilder/kube-rbac-proxy:v0.15.0"}]'
+# 1. Namespace with Dynamo platform
+kubectl -n kavin get pods  # etcd + nats running
+
+# 2. Secrets
+kubectl -n kavin get secret hf-token-secret
+kubectl -n kavin get secret nvcr-imagepullsecret
+
+# 3. ComputeDomain
+cat <<EOF | kubectl -n kavin apply -f -
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: kavin-compute-domain
+spec:
+  numNodes: 0
+  channel:
+    resourceClaimTemplate:
+      name: kavin-compute-domain-channel
+EOF
+
+# 4. Teleport auth
+tsh kube login dynamo-gcp-dev-01
+```
+
+## Image
+
+```
+nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
 ```
 
 ## Branches
 
 - **modelexpress:** `kavink/trtllm` on `github.com:ai-dynamo/modelexpress`
 - **dynamo:** `kavink/trtllm-p2p` on `github.com:ai-dynamo/dynamo`
+
+## Docs
+
+- [TRTLLM_DYNAMO_PHASE2_5.md](../../../docs/TRTLLM_DYNAMO_PHASE2_5.md) — Phase 2.5 aggregated P2P
+- [TRTLLM_PHASE_3.md](../../../docs/TRTLLM_PHASE_3.md) — Phase 3 disagg + mixed TP
+- [PLANNER_PLAN.md](../../../docs/PLANNER_PLAN.md) — Planner integration and scaling
+- [disagg_trtllm.md](../../../docs/disagg_trtllm.md) — Disagg architecture and mixed TP design
