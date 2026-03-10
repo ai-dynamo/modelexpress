@@ -108,7 +108,7 @@ cargo test
 docker-compose up --build
 
 # Or build and run manually
-docker build -t model-express .
+docker build -f container/Dockerfile.server -t model-express .
 docker run -p 8001:8001 model-express
 ```
 
@@ -127,7 +127,7 @@ docker run -p 8001:8001 model-express
 - **Model Express Image**: Built and pushed to your registry by building from root directory of repository
   ```bash
   # Build the Model Express image
-  docker build -t model-express:latest .
+  docker build -f container/Dockerfile.server -t model-express:latest .
 
   # Tag for your registry
   docker tag model-express:latest your-registry/model-express:latest

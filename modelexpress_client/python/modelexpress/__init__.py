@@ -22,8 +22,8 @@ Quick Start:
     from modelexpress import register_gms_loader
     register_gms_loader()
 
-    # Sidecar: python -m modelexpress.gms_sidecar --model <model> --device 0
-    # vLLM:    vllm serve <model> --load-format gms
+    # GMS: python -m modelexpress.gms --model <model> --device 0
+    # vLLM: vllm serve <model> --load-format gms
 """
 
 import logging
@@ -61,7 +61,7 @@ def register_gms_loader():
     Register GMS loader with vLLM.
 
     Call this function before creating an LLM instance to enable:
-        --load-format mx-gms-source  (for sidecar - loads from disk, writes to GMS)
+        --load-format mx-gms-source  (loads from disk, writes to GMS)
 
     Note: vLLM engines use --load-format gms (from gpu_memory_service) to read.
     """
@@ -74,8 +74,22 @@ def register_gms_loader():
     logging.getLogger("modelexpress").info("ModelExpress GMS loader registered: mx-gms-source")
 
 
+def run_gms_loader() -> int:
+    """Run the multi-GPU GMS weight loader CLI.
+
+    Entry point for multi-GPU model loading with GMS + NIXL.
+
+    Returns:
+        Exit code (0 on success).
+    """
+    from .gms.main import main
+
+    return main()
+
+
 __all__ = [
     "MxClient",
     "register_modelexpress_loaders",
     "register_gms_loader",
+    "run_gms_loader",
 ]

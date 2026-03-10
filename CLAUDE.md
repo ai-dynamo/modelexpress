@@ -291,16 +291,21 @@ Running pre-commit hooks early and often catches issues before they accumulate. 
 
 ## Common Development Tasks
 
-### Building Docker Image
+### Building Docker Images
 
 ```bash
 cd path/to/modelexpress
 
-# Build client image
-docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
-  -t nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG .
+# Build server image
+docker build -f container/Dockerfile.server -t modelexpress-server .
 
-docker push nvcr.io/nvidian/dynamo-dev/IMAGE_NAME:YOUR_TAG
+# Build client image
+docker build -f container/Dockerfile.client -t modelexpress-client .
+
+# Build client image with GMS support
+docker build -f container/Dockerfile.client \
+  --build-arg ENABLE_GMS=true \
+  -t modelexpress-client:gms .
 ```
 
 ### Deploying to Kubernetes

@@ -9,7 +9,6 @@ build-backend = "hatchling.build"
 name = "modelexpress"
 version = "0.3.0"
 description = "Python client for ModelExpress P2P GPU transfer service"
-readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [{ name = "NVIDIA Corporation", email = "sw-dl-dynamo@nvidia.com" }]

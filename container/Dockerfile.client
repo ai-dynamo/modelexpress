@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress client image on CUDA 12.9.
+# No CUDA compat shim -- works with driver 535+ including 580.
+#
+# Build without GMS (P2P only):
+#   docker build -f container/Dockerfile.client -t mx-client .
+#
+# Build with GMS support:
+#   docker build -f container/Dockerfile.client --build-arg ENABLE_GMS=true -t mx-client-gms .
+#
+# Pin vLLM version:
+#   docker build -f container/Dockerfile.client --build-arg VLLM_VERSION=0.16.0 -t mx-client .
+
+ARG CUDA_VERSION=12.9.1
+ARG UBUNTU_VERSION=ubuntu24.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${UBUNTU_VERSION} AS builder
+
+ARG ENABLE_GMS=false
+ARG VLLM_VERSION=0.15.1
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install uv outside the venv (won't be copied to runtime stage)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# PyTorch + vLLM with CUDA 12.9 pre-built wheels
+RUN uv pip install --no-cache --index-strategy unsafe-best-match \
+        "vllm==${VLLM_VERSION}" --extra-index-url https://download.pytorch.org/whl/cu129
+
+# ModelExpress dependencies (install before source for layer caching)
+COPY modelexpress_client/python/pyproject.toml /opt/modelexpress/client/pyproject.toml
+WORKDIR /opt/modelexpress/client
+RUN if [ "$ENABLE_GMS" = "true" ]; then \
+        uv pip install --no-cache --index-strategy unsafe-best-match ".[gms]"; \
+    else \
+        uv pip install --no-cache --index-strategy unsafe-best-match .; \
+    fi
+
+# ModelExpress source
+COPY modelexpress_client/python /opt/modelexpress/client
+RUN uv pip install --no-cache --index-strategy unsafe-best-match --no-deps .
+
+# Patch vLLM's model loader to include ModelExpress loaders (mx-source, mx-target).
+RUN LOADER_INIT="$(python3 -c 'import site; print(site.getsitepackages()[0])')/vllm/model_executor/model_loader/__init__.py" && \
+    echo '' >> $LOADER_INIT && \
+    echo 'import os as _os' >> $LOADER_INIT && \
+    echo 'if _os.environ.get("MX_REGISTER_LOADERS", "0") == "1":' >> $LOADER_INIT && \
+    echo '    try:' >> $LOADER_INIT && \
+    echo '        from modelexpress.vllm_loader import MxSourceModelLoader, MxTargetModelLoader' >> $LOADER_INIT && \
+    echo '        _LOAD_FORMAT_TO_MODEL_LOADER["mx-source"] = MxSourceModelLoader' >> $LOADER_INIT && \
+    echo '        _LOAD_FORMAT_TO_MODEL_LOADER["mx-target"] = MxTargetModelLoader' >> $LOADER_INIT && \
+    echo '    except ImportError:' >> $LOADER_INIT && \
+    echo '        pass' >> $LOADER_INIT
+
+# --- Runtime stage ---
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["/bin/bash"]
