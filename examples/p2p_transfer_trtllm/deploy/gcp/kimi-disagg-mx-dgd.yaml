@@ -1,0 +1,581 @@
+# Kimi K2.5 disaggregated serving with ModelExpress P2P weight loading
+# DGD with: Frontend (KV router) + Planner + Prefill (MX target) + Decode (MX target)
+# MX source runs separately (kimi-source-deploy.yaml) and holds GPU memory
+# Namespace: kavin
+#
+# Phase 1: Both prefill and decode use TP=4, single MX source
+# Phase 2 (follow-up): Mixed TP — prefill TP=4, decode TP=8/32 with separate MX sources
+#
+# For mixed TP, each worker type needs its own MX source at the matching TP size.
+# The per-service model-express-url env vars below are structured to support this:
+# just point prefill and decode at different MX servers when ready.
+#
+# Prerequisites:
+#   - MX source deployed and published at TP=4 (kimi-source-deploy.yaml)
+#   - modelexpress-server + redis running
+#   - shared-model-cache PVC with Kimi model (for tokenizer files)
+#   - Dynamo platform (etcd + NATS) in namespace
+#   - DGD operator webhook running
+#   - ComputeDomain 'kavin-compute-domain' created
+#
+# Usage:
+#   kubectl -n kavin apply -f kimi-disagg-mx-dgd.yaml
+#   # Both worker types load via P2P (~3.5s), ready after autotuning
+#   # Planner independently scales prefill and decode replicas
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-disagg-trtllm-config
+data:
+  prefill.yaml: |
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 16384
+    max_num_tokens: 4096
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: true
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.5
+      tokens_per_block: 32
+    max_batch_size: 4
+    max_seq_len: 16384
+    model_kwargs:
+      num_hidden_layers: 61
+    moe_config:
+      backend: TRTLLM
+    moe_expert_parallel_size: 4
+    print_iter_log: true
+    tensor_parallel_size: 4
+    trust_remote_code: true
+  decode.yaml: |
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 16384
+    max_num_tokens: 8192
+    cuda_graph_config:
+      max_batch_size: 8
+      enable_padding: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: true
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+      tokens_per_block: 32
+    max_batch_size: 8
+    max_seq_len: 16384
+    model_kwargs:
+      num_hidden_layers: 61
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 4
+    num_postprocess_workers: 4
+    print_iter_log: true
+    stream_interval: 10
+    tensor_parallel_size: 4
+    trust_remote_code: true
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: kimi-disagg
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          command:
+            - python3
+          args:
+            - -m
+            - dynamo.frontend
+            - --http-port
+            - "8000"
+            - --router-mode
+            - kv
+            - --router-reset-states
+            - --request-plane
+            - nats
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: HF_HOME
+              value: /model-cache
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        volumes:
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+
+    Planner:
+      componentType: planner
+      replicas: 1
+      extraPodSpec:
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          ports:
+            - name: metrics
+              containerPort: 9085
+          command:
+            - python3
+          args:
+            - -m
+            - dynamo.planner
+            - --config
+            - '{"environment": "kubernetes", "backend": "trtllm", "mode": "disagg", "throughput_adjustment_interval": 30, "ttft": 3000, "itl": 30, "enable_throughput_scaling": false, "enable_load_scaling": true}'
+          env:
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-w0e
+                  - customer-gpu-o7v
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+
+    # --- Prefill workers ---
+    # MX P2P target: receives weights from MX source via NIXL RDMA
+    # For mixed TP (Phase 2): change MODEL_EXPRESS_URL to a prefill-specific
+    # MX source that published at the prefill TP size.
+    prefill:
+      componentType: worker
+      subComponentType: prefill
+      envFromSecret: hf-token-secret
+      scalingAdapter:
+        enabled: true
+      replicas: 1
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9090
+        periodSeconds: 10
+        timeoutSeconds: 30
+        failureThreshold: 60
+      resources:
+        limits:
+          gpu: "4"
+        claims:
+          - name: compute-domain-channel
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext: {}
+        terminationGracePeriodSeconds: 600
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-w0e
+                  - customer-gpu-o7v
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - kimi-source-deploy
+              topologyKey: nvidia.com/gpu.clique
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          imagePullPolicy: Always
+          workingDir: /workspace/
+          securityContext:
+            privileged: true
+          command:
+            - python3
+            - -m
+            - dynamo.trtllm
+          args:
+            - --model-path
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --served-model-name
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --extra-engine-args
+            - /config/prefill.yaml
+            - --disaggregation-mode
+            - prefill
+            - --model-express-url
+            - modelexpress-server.kavin.svc.cluster.local:8001
+            - --model-express-role
+            - target
+            - --tensor-parallel-size
+            - "4"
+            - --publish-events-and-metrics
+            - --request-plane
+            - nats
+            - --kv-block-size
+            - "32"
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            # MX P2P — per-service URL enables mixed TP in Phase 2
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: WORLD_SIZE
+              value: "4"
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/.triton-cache
+            # UCX/NIXL — NO cuda_ipc (breaks on GB200)
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            # MPI — force ob1 PML to avoid UCX UD timeout on GB200
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
+            # NCCL
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NVIDIA_GDRCOPY
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            # TRT-LLM
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_MAX_NCHANNELS
+              value: "2"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+          volumeMounts:
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
+        volumes:
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: DirectoryOrCreate
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+          - name: trtllm-config
+            configMap:
+              name: kimi-disagg-trtllm-config
+
+    # --- Decode workers ---
+    # MX P2P target: receives same weights from MX source via NIXL RDMA
+    # For mixed TP (Phase 2): change MODEL_EXPRESS_URL to a decode-specific
+    # MX source that published at the decode TP size (e.g., TP=8/32).
+    # Also update WORLD_SIZE, tensor-parallel-size, and engine config.
+    decode:
+      componentType: worker
+      subComponentType: decode
+      envFromSecret: hf-token-secret
+      scalingAdapter:
+        enabled: true
+      replicas: 1
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9090
+        periodSeconds: 10
+        timeoutSeconds: 30
+        failureThreshold: 60
+      resources:
+        limits:
+          gpu: "4"
+        claims:
+          - name: compute-domain-channel
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext: {}
+        terminationGracePeriodSeconds: 600
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-w0e
+                  - customer-gpu-o7v
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - kimi-source-deploy
+              topologyKey: nvidia.com/gpu.clique
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          imagePullPolicy: Always
+          workingDir: /workspace/
+          securityContext:
+            privileged: true
+          command:
+            - python3
+            - -m
+            - dynamo.trtllm
+          args:
+            - --model-path
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --served-model-name
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --extra-engine-args
+            - /config/decode.yaml
+            - --disaggregation-mode
+            - decode
+            - --model-express-url
+            - modelexpress-server.kavin.svc.cluster.local:8001
+            - --model-express-role
+            - target
+            - --tensor-parallel-size
+            - "4"
+            - --publish-events-and-metrics
+            - --request-plane
+            - nats
+            - --kv-block-size
+            - "32"
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            # MX P2P — per-service URL enables mixed TP in Phase 2
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: WORLD_SIZE
+              value: "4"
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/.triton-cache
+            # UCX/NIXL — NO cuda_ipc (breaks on GB200)
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            # MPI — force ob1 PML to avoid UCX UD timeout on GB200
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
+            # NCCL
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NVIDIA_GDRCOPY
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            # TRT-LLM
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_MAX_NCHANNELS
+              value: "2"
+            - name: ENABLE_CONFIGURABLE_MOE
+              value: "1"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+          volumeMounts:
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
+        volumes:
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: DirectoryOrCreate
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+          - name: trtllm-config
+            configMap:
+              name: kimi-disagg-trtllm-config

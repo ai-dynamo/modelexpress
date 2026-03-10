@@ -294,17 +294,104 @@ kubectl -n kavin logs -l nvidia.com/dynamo-component=Planner --tail=50
 
 ---
 
-## 9. Open Questions
+## 9. Disaggregated Serving with MX P2P
+
+### 9.1 Architecture
+
+Disaggregated serving splits inference into separate prefill and decode workers.
+With MX P2P, both worker types receive weights from the same source via RDMA —
+the planner scales them independently.
+
+```
+MX Source (TP=4, 648 GB)
+  │
+  ├── NIXL RDMA ──→ Prefill Workers (TP=4, MX target, scaled by DGDSA)
+  │                   └── KV cache transfer (UCX) ──→ Decode Workers
+  │
+  └── NIXL RDMA ──→ Decode Workers (TP=4, MX target, scaled by DGDSA)
+                      └── tokens ──→ Frontend (KV-aware router)
+```
+
+### 9.2 Why same TP works
+
+P2P transfer matches tensors by name and size. Both prefill and decode load the
+same model with the same TP sharding — only the engine config differs (batch sizes,
+KV cache, CUDA graphs, cache_transceiver). The weight shards are identical, so one
+MX source serves both worker types.
+
+### 9.3 Scale-up flow (disagg)
+
+When the planner scales up either worker type:
+
+1. DGDSA patched (e.g., `kubectl scale dgdsa/kimi-disagg-prefill --replicas=2`)
+2. DGD operator creates new pod with same spec (`--model-express-role target`)
+3. New pod queries MX server, receives 648 GB via NIXL RDMA (~3.5s)
+4. Autotuning + CUDA graphs (prefill: ~30s, decode: ~5 min)
+5. Frontend discovers new worker via NATS, starts routing traffic
+
+Both worker types scale independently — the single MX source supports concurrent readers.
+
+### 9.4 Key differences from aggregated mode
+
+| Aspect | Aggregated | Disaggregated |
+|--------|-----------|---------------|
+| Workers | Single type | Prefill + Decode (separate services) |
+| Router | `round-robin` | `kv` (KV-aware) |
+| KV transfer | None (same worker) | UCX `cache_transceiver_config` |
+| Planner mode | `agg` | `disagg` |
+| Scaling | One DGDSA | Two DGDSAs (independent) |
+| Engine config | One `aggregated.yaml` | `prefill.yaml` + `decode.yaml` |
+
+### 9.5 YAML
+
+`deploy/gcp/kimi-disagg-mx-dgd.yaml` — 4 services:
+
+- `Frontend`: KV-aware router (`--router-mode kv`)
+- `Planner`: disagg mode, load-based scaling
+- `prefill`: `subComponentType: prefill`, `--disaggregation-mode prefill`, MX target, `scalingAdapter: true`
+- `decode`: `subComponentType: decode`, `--disaggregation-mode decode`, MX target, `scalingAdapter: true`
+
+### 9.6 Path to mixed TP (Phase 2)
+
+Phase 1 uses TP=4 for both prefill and decode. For production wideep configs
+(e.g., Karen's prefill TP=4 / decode TP=32), mixed TP is needed.
+
+**Constraint**: MX P2P requires same TP between source and target (tensor names
+match but per-rank sizes differ at different TP). This means:
+
+**Mixed TP requires separate MX sources:**
+
+```
+MX Source A (TP=4)  ──→ Prefill Workers (TP=4)
+MX Source B (TP=32) ──→ Decode Workers (TP=32, multinode: 8)
+```
+
+The YAML is structured to support this — each worker service has its own
+`MODEL_EXPRESS_URL` env var. To enable mixed TP:
+
+1. Deploy a second MX source at the decode TP size (e.g., TP=32 across 8 nodes)
+2. Point the decode service's `MODEL_EXPRESS_URL` at the decode-specific MX server
+3. Update decode engine config: `tensor_parallel_size: 32`, `moe_expert_parallel_size: 32`
+4. Add `multinode: {nodeCount: 8}` to the decode service
+5. Consider `allreduce_strategy: MNNVL` and `moe_config.backend: WIDEEP`
+
+**MX P2P changes needed for mixed TP** (upstream):
+- `trtllm_live_transfer.py`: support re-sharding (split TP=4 shards into TP=32 sub-shards)
+- Or: accept that each TP config needs its own source (simpler, current approach)
+- `p2p.proto`: add TP size to `WorkerMetadata` for validation
+
+## 10. Open Questions
 
 1. **Source lifecycle**: Should the MX source be part of the DGD or a separate deployment? If separate, who manages it?
 2. **Source redundancy**: What happens if the source pod dies? Should we have 2 sources for HA?
 3. **Multi-model**: Can one MX server coordinate P2P for multiple models simultaneously?
 4. **Scale-to-zero**: If planner scales targets to 0, the source still holds GPU memory. How to handle this?
 5. **Planner awareness**: Should the planner know about P2P load time (faster scaling decisions)?
+6. **Mixed TP re-sharding**: Should MX P2P support automatic re-sharding, or should each TP config have its own source?
 
 ---
 
-## 10. Prerequisites
+## 11. Prerequisites
 
 - [x] ModelExpress P2P transfer validated (Qwen TP=2 at 25-33 Gbps RoCE)
 - [x] **Kimi K2.5 TP=4 P2P transfer validated — 369 Gbps, 648 GB in 3.51s**
@@ -315,11 +402,14 @@ kubectl -n kavin logs -l nvidia.com/dynamo-component=Planner --tail=50
 - [x] Planner initializes, validates deployment, discovers frontend metrics URL
 - [ ] Planner per-worker load metrics flowing (blocked — see §11)
 - [ ] Planner-driven auto-scaling end-to-end (Phase 2)
+- [x] Disagg DGD YAML created: `deploy/gcp/kimi-disagg-mx-dgd.yaml`
+- [ ] Disagg + MX P2P validated (prefill + decode both load via P2P)
+- [ ] Mixed TP disagg (Phase 2: prefill TP=4, decode TP=32 with separate MX sources)
 - [ ] genai-perf or load generator for sustained traffic test
 
 ---
 
-## 11. Bugs Found During Planner Integration
+## 12. Bugs Found During Planner Integration
 
 ### 11.1 `AggPlanner` crash: `component_type` not set (FIXED)
 
