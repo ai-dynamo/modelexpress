@@ -95,26 +95,41 @@ class Dim1Fixup:
     elem_size: int
 
 
-def build_source_index(
-    workers: list,
-) -> tuple[dict[str, dict[int, SourceTensorInfo]], dict[int, str]]:
+@dataclass
+class SourceIndexResult:
+    """Result of building a source index from WorkerMetadata."""
+
+    source_index: dict[str, dict[int, SourceTensorInfo]]
+    rank_to_session: dict[int, str] = field(default_factory=dict)
+    rank_to_nixl_metadata: dict[int, bytes] = field(default_factory=dict)
+    backend: str = "unknown"
+
+
+def build_source_index(workers: list) -> SourceIndexResult:
     """Build source index from gRPC WorkerMetadata list.
+
+    Auto-detects the backend type (transfer_engine or nixl) from the
+    oneof backend_metadata field.
 
     Args:
         workers: List of WorkerMetadata protobuf objects.
 
     Returns:
-        (source_index, rank_to_session) where:
-        - source_index: {tensor_name: {src_rank: SourceTensorInfo}}
-        - rank_to_session: {rank: session_id}
+        SourceIndexResult with source_index and backend-specific connection info.
     """
     source_index: dict[str, dict[int, SourceTensorInfo]] = defaultdict(dict)
     rank_to_session: dict[int, str] = {}
+    rank_to_nixl_metadata: dict[int, bytes] = {}
+    backend = "unknown"
 
     for w in workers:
         backend_field = w.WhichOneof("backend_metadata")
         if backend_field == "transfer_engine_session_id":
             rank_to_session[w.worker_rank] = w.transfer_engine_session_id
+            backend = "transfer_engine"
+        elif backend_field == "nixl_metadata":
+            rank_to_nixl_metadata[w.worker_rank] = w.nixl_metadata
+            backend = "nixl"
 
         for td in w.tensors:
             source_index[td.name][w.worker_rank] = SourceTensorInfo(
@@ -128,7 +143,12 @@ def build_source_index(
                 shard_index=td.shard_index,
             )
 
-    return dict(source_index), rank_to_session
+    return SourceIndexResult(
+        source_index=dict(source_index),
+        rank_to_session=rank_to_session,
+        rank_to_nixl_metadata=rank_to_nixl_metadata,
+        backend=backend,
+    )
 
 
 class TransferPlanner:
@@ -373,12 +393,120 @@ class TransferPlanner:
                 ))
 
     @staticmethod
+    def execute_nixl(
+        nixl_agent: Any,
+        ops: list[TransferOp],
+        rank_to_nixl_metadata: dict[int, bytes],
+        device_id: int,
+    ) -> None:
+        """Execute RDMA transfer ops via NIXL, grouped by source rank.
+
+        Uses NIXL agents and UCX backend for GPU-to-GPU RDMA. UCX auto-detects
+        NVLink for intra-node transfers.
+
+        Args:
+            nixl_agent: Initialized nixl_agent instance.
+            ops: Transfer operations from compute_plan().
+            rank_to_nixl_metadata: {rank: nixl_metadata_bytes} from source workers.
+            device_id: Local GPU device ID.
+        """
+        import time
+
+        if not ops:
+            return
+
+        by_rank: dict[int, list[TransferOp]] = defaultdict(list)
+        for op in ops:
+            by_rank[op.src_rank].append(op)
+
+        total_bytes = sum(op.length for op in ops)
+        logger.info(
+            "ModelExpress NIXL: %d ops, %.2f GB across %d source ranks",
+            len(ops), total_bytes / 1e9, len(by_rank),
+        )
+
+        start_time = time.perf_counter()
+
+        for src_rank in sorted(by_rank.keys()):
+            rank_ops = by_rank[src_rank]
+            nixl_metadata = rank_to_nixl_metadata.get(src_rank)
+            if nixl_metadata is None:
+                raise RuntimeError(
+                    f"ModelExpress: no NIXL metadata for source rank {src_rank}"
+                )
+
+            remote_agent_name = nixl_agent.add_remote_agent(nixl_metadata)
+
+            # Build descriptor lists: (addr, size, device_id) tuples
+            remote_descs = [
+                (op.src_addr + op.src_offset, op.length, 0)  # source device_id from metadata
+                for op in rank_ops
+            ]
+            local_descs = [
+                (op.dst_addr + op.dst_offset, op.length, device_id)
+                for op in rank_ops
+            ]
+
+            src_prepped = nixl_agent.prep_xfer_dlist(
+                agent_name=remote_agent_name,
+                xfer_list=remote_descs,
+                mem_type="cuda",
+                backends=["UCX"],
+            )
+            dst_prepped = nixl_agent.prep_xfer_dlist(
+                agent_name="",
+                xfer_list=local_descs,
+                mem_type="cuda",
+                backends=["UCX"],
+            )
+
+            indices = list(range(len(rank_ops)))
+
+            handle = nixl_agent.make_prepped_xfer(
+                operation="READ",
+                local_xfer_side=dst_prepped,
+                local_indices=indices,
+                remote_xfer_side=src_prepped,
+                remote_indices=indices,
+                backends=["UCX"],
+            )
+            nixl_agent.transfer(handle)
+
+            # Wait for completion
+            while True:
+                status = nixl_agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    nixl_agent.release_xfer_handle(handle)
+                    break
+                if status in ("ERR", "ERROR", "FAIL"):
+                    nixl_agent.release_xfer_handle(handle)
+                    raise RuntimeError(
+                        f"NIXL transfer from rank {src_rank} failed: {status}"
+                    )
+                time.sleep(0.001)
+
+            rank_bytes = sum(op.length for op in rank_ops)
+            logger.info(
+                "ModelExpress NIXL: rank %d: %d ops (%.2f GB) done",
+                src_rank, len(rank_ops), rank_bytes / 1e9,
+            )
+
+        torch.cuda.synchronize(device_id)
+
+        duration = time.perf_counter() - start_time
+        bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
+        logger.info(
+            "ModelExpress NIXL: transfer complete: %.2f GB in %.2fs (%.1f Gbps)",
+            total_bytes / 1e9, duration, bandwidth_gbps,
+        )
+
+    @staticmethod
     def execute(
         transfer_engine: Any,
         ops: list[TransferOp],
         rank_to_session: dict[int, str],
     ) -> None:
-        """Execute RDMA transfer ops grouped by source rank."""
+        """Execute RDMA transfer ops via TransferEngine, grouped by source rank."""
         if not ops:
             return
 
