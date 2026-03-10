@@ -1,0 +1,503 @@
+# Kimi K2.5 disagg Phase 2 — mixed TP with dual MX sources
+# Prefill (TP=4) reads from modelexpress-server (Source A)
+# Decode (TP=8, multinode: 2) reads from modelexpress-server-decode (Source B)
+# Namespace: kavin
+#
+# Prerequisites:
+#   - Source A (TP=4) deployed and published to modelexpress-server
+#   - Source B (TP=8) deployed and published to modelexpress-server-decode
+#   - Dual MX infra: mx-infra.yaml + mx-infra-decode.yaml
+#   - Dynamo platform (etcd + NATS)
+#   - DGD operator webhook running
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-disagg-phase2-trtllm-config
+data:
+  prefill.yaml: |
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 16384
+    max_num_tokens: 4096
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: true
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.5
+      tokens_per_block: 32
+    max_batch_size: 4
+    max_seq_len: 16384
+    model_kwargs:
+      num_hidden_layers: 61
+    moe_config:
+      backend: TRTLLM
+    moe_expert_parallel_size: 4
+    print_iter_log: true
+    tensor_parallel_size: 4
+    trust_remote_code: true
+  decode.yaml: |
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 16384
+    max_num_tokens: 8192
+    cuda_graph_config:
+      max_batch_size: 8
+      enable_padding: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: true
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.5
+      tokens_per_block: 32
+    max_batch_size: 8
+    max_seq_len: 16384
+    model_kwargs:
+      num_hidden_layers: 61
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 8
+    num_postprocess_workers: 4
+    print_iter_log: true
+    stream_interval: 10
+    tensor_parallel_size: 8
+    trust_remote_code: true
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: kimi-disagg-p2
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          command:
+            - python3
+          args:
+            - -m
+            - dynamo.frontend
+            - --http-port
+            - "8000"
+            - --router-mode
+            - kv
+            - --router-reset-states
+            - --request-plane
+            - nats
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: HF_HOME
+              value: /model-cache
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        volumes:
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+
+    # --- Prefill: TP=4, reads from Source A (modelexpress-server) ---
+    prefill:
+      componentType: worker
+      subComponentType: prefill
+      envFromSecret: hf-token-secret
+      scalingAdapter:
+        enabled: true
+      replicas: 1
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9090
+        periodSeconds: 10
+        timeoutSeconds: 30
+        failureThreshold: 60
+      resources:
+        limits:
+          gpu: "4"
+        claims:
+          - name: compute-domain-channel
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext: {}
+        terminationGracePeriodSeconds: 600
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-w0e
+                  - customer-gpu-o7v
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - kimi-source-deploy
+              topologyKey: nvidia.com/gpu.clique
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          imagePullPolicy: Always
+          workingDir: /workspace/
+          securityContext:
+            privileged: true
+          command:
+            - python3
+            - -m
+            - dynamo.trtllm
+          args:
+            - --model-path
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --served-model-name
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --extra-engine-args
+            - /config/prefill.yaml
+            - --disaggregation-mode
+            - prefill
+            - --model-express-url
+            - modelexpress-server.kavin.svc.cluster.local:8001
+            - --model-express-role
+            - target
+            - --tensor-parallel-size
+            - "4"
+            - --publish-events-and-metrics
+            - --request-plane
+            - nats
+            - --kv-block-size
+            - "32"
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: WORLD_SIZE
+              value: "4"
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/.triton-cache
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NVIDIA_GDRCOPY
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_MAX_NCHANNELS
+              value: "2"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+          volumeMounts:
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
+        volumes:
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: DirectoryOrCreate
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+          - name: trtllm-config
+            configMap:
+              name: kimi-disagg-phase2-trtllm-config
+
+    # --- Decode: TP=8, 2 nodes, reads from Source B (modelexpress-server-decode) ---
+    decode:
+      componentType: worker
+      subComponentType: decode
+      envFromSecret: hf-token-secret
+      scalingAdapter:
+        enabled: true
+      multinode:
+        nodeCount: 2
+      replicas: 1
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9090
+        periodSeconds: 10
+        timeoutSeconds: 30
+        failureThreshold: 60
+      resources:
+        limits:
+          gpu: "4"
+        claims:
+          - name: compute-domain-channel
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext: {}
+        terminationGracePeriodSeconds: 600
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-w0e
+                  - customer-gpu-o7v
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/part-of
+                  operator: In
+                  values:
+                  - kimi-source-decode
+              topologyKey: nvidia.com/gpu.clique
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          imagePullPolicy: Always
+          workingDir: /workspace/
+          securityContext:
+            privileged: true
+          command:
+            - python3
+            - -m
+            - dynamo.trtllm
+          args:
+            - --model-path
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --served-model-name
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --extra-engine-args
+            - /config/decode.yaml
+            - --disaggregation-mode
+            - decode
+            - --model-express-url
+            - modelexpress-server-decode.kavin.svc.cluster.local:8001
+            - --model-express-role
+            - target
+            - --tensor-parallel-size
+            - "8"
+            - --publish-events-and-metrics
+            - --request-plane
+            - nats
+            - --kv-block-size
+            - "32"
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server-decode.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: WORLD_SIZE
+              value: "8"
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/.triton-cache
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: UCX_TLS
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
+            - name: NCCL_NET_PLUGIN
+              value: "none"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NVIDIA_GDRCOPY
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_MAX_NCHANNELS
+              value: "2"
+            - name: ENABLE_CONFIGURABLE_MOE
+              value: "1"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+          volumeMounts:
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
+        volumes:
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: DirectoryOrCreate
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+          - name: trtllm-config
+            configMap:
+              name: kimi-disagg-phase2-trtllm-config
