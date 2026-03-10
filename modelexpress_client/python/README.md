@@ -7,7 +7,13 @@ Instead of each vLLM instance loading model weights from storage, one "source" i
 ## Installation
 
 ```bash
-# From source
+pip install modelexpress
+```
+
+### Development
+
+```bash
+# Editable install from source
 pip install -e .
 
 # With dev dependencies (pytest, grpcio-tools)
@@ -34,7 +40,8 @@ export MX_EXPECTED_WORKERS=8
 
 vllm serve deepseek-ai/DeepSeek-V3 \
     --load-format mx-source \
-    --tensor-parallel-size 8
+    --tensor-parallel-size 8 \
+    --worker-cls modelexpress.vllm_worker.ModelExpressWorker
 ```
 
 ### Target Instance (receives weights via RDMA)
@@ -46,7 +53,8 @@ export MX_EXPECTED_WORKERS=8
 
 vllm serve deepseek-ai/DeepSeek-V3 \
     --load-format mx-target \
-    --tensor-parallel-size 8
+    --tensor-parallel-size 8 \
+    --worker-cls modelexpress.vllm_worker.ModelExpressWorker
 ```
 
 The target waits for the source to publish its NIXL ready flag, then pulls weights over RDMA. For DeepSeek-V3 (681 GB across 8 GPUs), this takes ~15 seconds vs ~25 minutes from NVMe storage.
