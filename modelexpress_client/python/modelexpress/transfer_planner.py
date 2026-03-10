@@ -437,15 +437,22 @@ class TransferPlanner:
 
             remote_agent_name = nixl_agent.add_remote_agent(nixl_metadata)
 
-            # Build descriptor lists: (addr, size, device_id) tuples
+            # Build descriptor lists as (addr, size, device_id) 3-tuples
             remote_descs = [
-                (op.src_addr + op.src_offset, op.length, 0)  # source device_id from metadata
+                (op.src_addr + op.src_offset, op.length, 0)
                 for op in rank_ops
             ]
             local_descs = [
                 (op.dst_addr + op.dst_offset, op.length, device_id)
                 for op in rank_ops
             ]
+
+            # Register local memory with NIXL (4-tuples with device string)
+            local_reg_tuples = [
+                (op.dst_addr + op.dst_offset, op.length, device_id, "cuda")
+                for op in rank_ops
+            ]
+            nixl_agent.register_memory(local_reg_tuples, mem_type="cuda", backends=["UCX"])
 
             src_prepped = nixl_agent.prep_xfer_dlist(
                 agent_name=remote_agent_name,
