@@ -1,6 +1,6 @@
 # Planner + ModelExpress P2P Scaling Plan
 
-**Status**: Ready to validate  
+**Status**: Phase 1 (manual DGDSA scaling) VALIDATED  
 **Date**: March 10, 2026  
 **Prerequisite**: Kimi K2.5 P2P transfer validated — **369 Gbps RoCE, 648 GB in 3.51s** (Phase 2.5b)
 
@@ -173,50 +173,67 @@ agg:  # or TRTLLMPrefillWorker/TRTLLMDecodeWorker for disagg
 
 ### Planner service spec
 
+The agg planner uses **load-based scaling only** (throughput-based is not supported in agg mode).
+It pulls per-worker metrics from the frontend's built-in `/metrics` endpoint — **no external Prometheus deployment required**.
+
+The worker must have `--publish-events-and-metrics` and `--request-plane nats` to push KV/load events
+via NATS. The frontend must also have `--request-plane nats` to subscribe.
+
 ```yaml
 Planner:
   componentType: planner
   extraPodSpec:
     mainContainer:
+      command: [python3]
       args:
-        - --sla-planner-config
-        - /config/planner.yaml
-      env:
-        - name: PROMETHEUS_URL
-          value: "http://prometheus:9090"
+        - -m
+        - dynamo.planner
+        - --config
+        - '{"environment": "kubernetes", "backend": "trtllm", "mode": "agg",
+           "enable_throughput_scaling": false, "enable_load_scaling": true,
+           "throughput_adjustment_interval": 30, "ttft": 3000, "itl": 30}'
 ```
 
-### Planner config
+Worker must include (in addition to MX target flags):
 
 ```yaml
-# planner.yaml
-prefill_ttft_sla_ms: 3000
-decode_itl_sla_ms: 30
-throughput_adjustment_interval: 30    # shorter with P2P (no 75 min wait)
-load_adjustment_interval: 5
-min_prefill_replicas: 1
-max_prefill_replicas: 8
-min_decode_replicas: 1
-max_decode_replicas: 8
-prediction_method: constant
-scaling_connector: kubernetes
+args:
+  - --publish-events-and-metrics
+  - --request-plane
+  - nats
 ```
+
+Worker service must have `subComponentType: decode` for planner validation.
 
 ---
 
 ## 7. Validation Steps
 
-### Phase 1: Manual scaling test
+### Phase 1: Manual scaling test — VALIDATED (March 10, 2026)
 
 **YAML**: `deploy/gcp/kimi-planner-dgd.yaml`
 
-1. Ensure MX source is deployed and published (`kimi-source-deploy.yaml`)
-2. Deploy DGD: `kubectl -n kavin apply -f kimi-planner-dgd.yaml`
-3. Verify first worker loads via P2P (~3.5s transfer + ~30s autotuning)
-4. Test inference: `curl <frontend>:8000/v1/chat/completions`
-5. Manually scale via DGDSA: `kubectl -n kavin scale dgdsa/kimi-planner-kimiworker --replicas=2`
-6. Verify second worker also loads via P2P in ~35s
-7. Measure: time from replica increase → worker ready
+**Results:**
+
+| Event | Timestamp | Duration |
+|-------|-----------|----------|
+| DGDSA patched (replicas: 1→2) | 04:58:59Z | — |
+| Second worker pod created | ~04:59:20Z | ~20s (scheduling) |
+| P2P transfer complete (648 GB) | 05:00:48Z | **3.3-3.5s** |
+| Second worker 1/1 Ready | ~05:06:30Z | ~6 min (autotuning + CUDA graphs) |
+| **Total: scale → ready** | | **~7.5 min** |
+
+**Transfer speeds (second worker, concurrent with first):**
+
+| Rank | Data | Time | Speed |
+|------|------|------|-------|
+| 0 | 162.09 GB | 3.32s | 390.5 Gbps |
+| 1 | 162.09 GB | 3.32s | 390.3 Gbps |
+| 2 | 162.09 GB | 3.48s | 372.5 Gbps |
+| 3 | 162.09 GB | 3.50s | 371.0 Gbps |
+
+Both workers serve inference through the DGD frontend (round-robin routing).
+Compare to **~75 min** loading from disk — **10x faster total, 180x faster transfer**.
 
 ### Phase 2: Planner-driven scaling
 
@@ -266,13 +283,14 @@ kubectl -n kavin logs -l nvidia.com/dynamo-component=Planner --tail=50
 
 ## 8. Key Metrics to Track
 
-| Metric | Disk Load | P2P Load (Measured) | Target |
-|--------|-----------|---------------------|--------|
-| Transfer time (Kimi K2.5 TP=4) | N/A | **3.51s** | < 10s |
-| Time to ready (incl. autotuning) | ~75 min | **~35s** (3.5s transfer + ~30s autotune) | < 60s |
-| Scale-up responsiveness | Impractical | Planner interval + P2P | < 2 min total |
-| Transfer bandwidth | N/A (disk) | **369 Gbps** (RoCE rc_mlx5) | > 200 Gbps |
-| GPU memory overhead (source) | 0 | 648 GB (4x 162 GB) | Acceptable |
+| Metric | Disk Load | P2P Load (Measured) | DGDSA Scale Test |
+|--------|-----------|---------------------|------------------|
+| Transfer time (Kimi K2.5 TP=4) | N/A | **3.51s** | **3.3-3.5s** (concurrent) |
+| Time to ready (incl. autotuning) | ~75 min | ~7.5 min (autotune dominates) | **7.5 min** |
+| Transfer bandwidth | N/A (disk) | **369 Gbps** (RoCE) | **371-390 Gbps** |
+| Scale command → ready | N/A | — | **7.5 min** |
+| GPU memory overhead (source) | 0 | 648 GB (4x 162 GB) | Same |
+| Concurrent P2P from same source | N/A | — | **Works** |
 
 ---
 
@@ -291,8 +309,58 @@ kubectl -n kavin logs -l nvidia.com/dynamo-component=Planner --tail=50
 - [x] ModelExpress P2P transfer validated (Qwen TP=2 at 25-33 Gbps RoCE)
 - [x] **Kimi K2.5 TP=4 P2P transfer validated — 369 Gbps, 648 GB in 3.51s**
 - [x] **Inference confirmed via Dynamo frontend**
-- [ ] DGD operator webhook fixed (kube-rbac-proxy image)
-- [ ] DGDSA scaling adapter tested
+- [x] DGD operator webhook working (`dynamo-system` namespace, kube-rbac-proxy fix applied)
+- [x] **DGDSA scaling adapter tested — scale 1→2 with P2P, both workers serving**
 - [x] Planner DGD YAML created: `deploy/gcp/kimi-planner-dgd.yaml`
-- [ ] Prometheus metrics collection verified
-- [ ] genai-perf or load generator available for testing
+- [x] Planner initializes, validates deployment, discovers frontend metrics URL
+- [ ] Planner per-worker load metrics flowing (blocked — see §11)
+- [ ] Planner-driven auto-scaling end-to-end (Phase 2)
+- [ ] genai-perf or load generator for sustained traffic test
+
+---
+
+## 11. Bugs Found During Planner Integration
+
+### 11.1 `AggPlanner` crash: `component_type` not set (FIXED)
+
+`BasePlanner.__init__()` accesses `self.component_type` before `AggPlanner` sets it.
+`PrefillPlanner`/`DecodePlanner` define it as a class attribute; `AggPlanner` creates a
+bare `BasePlanner` and sets it post-init — too late.
+
+**Fix** (pushed to `kavink/trtllm-p2p`): Add `component_type` parameter to `BasePlanner.__init__()`,
+pass `SubComponentType.DECODE` from `AggPlanner`. See `planner_core.py` and `agg_planner.py`.
+
+**Note**: `agg_planner.py` is main-only — does not exist in `release/0.9.1`.
+
+### 11.2 Planner `validate_deployment` requires `subComponentType: decode`
+
+The `KubernetesConnector.validate_deployment()` looks for a DGD service with
+`subComponentType: decode`. Our worker must set `subComponentType: decode` even in
+aggregated mode.
+
+### 11.3 Per-worker load metrics not flowing
+
+The agg planner's `DirectRouterMetricsClient` fetches from the frontend `/metrics` endpoint.
+The frontend exposes per-worker metrics (`worker_active_decode_blocks`, etc.) via `KvWorkerMonitor`,
+which subscribes to NATS KV events from workers. **No external Prometheus is needed.**
+
+Requirements for metrics to flow:
+- Worker: `--publish-events-and-metrics` + `--request-plane nats`
+- Frontend: `--request-plane nats`
+- Both connected to the same NATS server
+
+**Status**: NATS EventPublisher registered on worker, EventSubscriber registered on frontend,
+but per-worker gauges still not appearing on `/metrics` after inference traffic. Needs debugging
+with planner team — may be a timing or event format issue in the agg path.
+
+### 11.4 `wait_for_graph_deployment_ready` stuck after planner restart
+
+After deleting and recreating the planner pod, the `wait_for_graph_deployment_ready` loop
+sees `planner: desired=1, updated=2` due to stale PodCliqueSet revision. Blocks the planner
+from entering the load loop. Resolves eventually but can take 30+ minutes.
+
+### 11.5 `/dev/shm` duplicate mount in DGD
+
+The DGD operator auto-injects `/dev/shm` emptyDir volume. If the extraPodSpec also defines
+`/dev/shm`, the PodCliqueSet creation fails with `Duplicate value: {"mountPath":"/dev/shm"}`.
+Worker DGD specs must NOT include `/dev/shm` — the operator handles it.
