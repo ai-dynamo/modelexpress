@@ -108,6 +108,8 @@ spec:
             - "8000"
             - --router-mode
             - round-robin
+            - --request-plane
+            - nats
           env:
             - name: NATS_SERVER
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
@@ -280,6 +282,9 @@ spec:
             - target
             - --tensor-parallel-size
             - "4"
+            - --publish-events-and-metrics
+            - --request-plane
+            - nats
           env:
             - name: NATS_SERVER
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
