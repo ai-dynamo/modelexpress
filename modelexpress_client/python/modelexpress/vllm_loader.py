@@ -220,7 +220,9 @@ def _publish_metadata_and_ready(
                 stability_verified=True,
             )
         else:
-            logger.error(f"[Worker {device_id}] FAILED to publish metadata")
+            raise RuntimeError(
+                f"[Worker {device_id}] Failed to publish metadata to MX server"
+            )
 
     except Exception as e:
         import traceback
