@@ -3,7 +3,9 @@
 
 use crate::{Utils, constants, providers::ModelProviderTrait};
 use anyhow::{Context, Result};
+use hf_hub::Cache;
 use hf_hub::api::tokio::{ApiBuilder, ApiError};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -170,16 +172,19 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
     /// Attempt to delete a model from Hugging Face cache
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
-    async fn delete_model(&self, model_name: &str) -> Result<()> {
+    async fn delete_model(&self, model_name: &str, cache_dir: Option<PathBuf>) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
+        let cache_dir = get_cache_dir(cache_dir);
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
-        let api = ApiBuilder::new()
+        let api = ApiBuilder::from_env()
             .with_token(token)
+            .with_cache_dir(cache_dir.clone())
             .build()
             .context("Failed to create Hugging Face API client")?;
         let model_name = model_name.to_string();
 
         let repo = api.model(model_name.clone());
+        let cache_repo = Cache::new(cache_dir).model(model_name.clone());
 
         let info = match repo.info().await {
             Ok(info) => info,
@@ -197,6 +202,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         let mut files_deleted: u32 = 0;
         let mut deletion_errors = Vec::new();
+        let mut model_dirs: HashSet<PathBuf> = HashSet::new();
 
         for sib in &info.siblings {
             if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
@@ -209,13 +215,16 @@ impl ModelProviderTrait for HuggingFaceProvider {
                 continue;
             }
 
-            // Try to get the file path from cache first
-            if let Ok(cached_path) = repo.get(&sib.rfilename).await {
+            // Cache-only lookup: avoid network fetch during deletion.
+            if let Some(cached_path) = cache_repo.get(&sib.rfilename) {
                 // Delete the cached file
                 match std::fs::remove_file(&cached_path) {
                     Ok(_) => {
                         files_deleted = files_deleted.saturating_add(1);
                         info!("Deleted cached file: {}", cached_path.display());
+                        if let Some(model_dir) = cached_path.parent() {
+                            model_dirs.insert(model_dir.to_path_buf());
+                        }
                     }
                     Err(e) => {
                         let error_msg =
@@ -228,19 +237,15 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         // Try to remove the empty model directory if all files were deleted
         if files_deleted > 0 && deletion_errors.is_empty() {
-            // Get any file path to find the model directory
-            for sib in &info.siblings {
-                if let Ok(cached_path) = repo.get(&sib.rfilename).await
-                    && let Some(model_dir) = cached_path.parent()
-                    && let Ok(mut entries) = std::fs::read_dir(model_dir)
+            for model_dir in model_dirs {
+                if let Ok(mut entries) = std::fs::read_dir(&model_dir)
                     && entries.next().is_none()
                 {
-                    if let Err(e) = std::fs::remove_dir(model_dir) {
+                    if let Err(e) = std::fs::remove_dir(&model_dir) {
                         info!("Could not remove empty model directory: {e}");
                     } else {
                         info!("Removed empty model directory: {}", model_dir.display());
                     }
-                    break;
                 }
             }
         }
@@ -335,9 +340,20 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Mutex to serialize access to HF_HUB_OFFLINE environment variable across tests.
+    /// Mutex to serialize access to HF-related environment variables across tests.
     /// This prevents race conditions when tests run in parallel.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn acquire_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+        match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Avoid cascading failures after a single test panic.
+                warn!("ENV_MUTEX was poisoned; recovering lock");
+                poisoned.into_inner()
+            }
+        }
+    }
 
     /// Minimal mock of the Hugging Face Hub used by tests.
     ///
@@ -439,13 +455,151 @@ mod tests {
         // Test that the delete method exists and can be called
         // Note: This won't actually delete anything since we're not providing a real model
         // but it tests the trait implementation
-        let result = provider.delete_model("nonexistent/model").await;
+        let result = provider.delete_model("nonexistent/model", None).await;
         // Should succeed (return Ok(())) even if model doesn't exist
         assert!(result.is_ok());
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_delete_model_prefers_explicit_cache_dir_over_env() {
+        let _guard = acquire_env_mutex();
+        let mock_server = MockHFServer::new().await;
+        let provider = HuggingFaceProvider;
+
+        let explicit_cache = TempDir::new().expect("Failed to create explicit cache directory");
+        let env_cache = TempDir::new().expect("Failed to create env cache directory");
+
+        let explicit_snapshot = provider
+            .download_model(
+                "test/model",
+                Some(explicit_cache.path().to_path_buf()),
+                false,
+            )
+            .await
+            .expect("Failed to seed explicit cache");
+
+        let explicit_config = explicit_snapshot.join("config.json");
+        assert!(
+            explicit_config.exists(),
+            "Expected explicit cache to contain model file before delete"
+        );
+
+        let env_snapshot = provider
+            .download_model("test/model", Some(env_cache.path().to_path_buf()), false)
+            .await
+            .expect("Failed to seed env cache");
+        let env_config = env_snapshot.join("config.json");
+        assert!(
+            env_config.exists(),
+            "Expected env cache to contain model file before delete"
+        );
+
+        unsafe {
+            env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, env_cache.path());
+            env::set_var(HF_HUB_CACHE_ENV_VAR, env_cache.path());
+        }
+
+        let delete_result = provider
+            .delete_model("test/model", Some(explicit_cache.path().to_path_buf()))
+            .await;
+
+        unsafe {
+            env::remove_var(MODEL_EXPRESS_CACHE_ENV_VAR);
+            env::remove_var(HF_HUB_CACHE_ENV_VAR);
+        }
+
+        assert!(
+            delete_result.is_ok(),
+            "Delete request should succeed: {delete_result:?}"
+        );
+        assert!(
+            !explicit_config.exists(),
+            "Expected explicit cache file to be deleted when explicit cache dir is provided"
+        );
+        assert!(
+            env_config.exists(),
+            "Expected env cache file to remain untouched when explicit cache dir is provided"
+        );
+
+        drop(mock_server);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_delete_model_does_not_download_uncached_files() {
+        let _guard = acquire_env_mutex();
+        let temp_cache = TempDir::new().expect("Failed to create temporary cache directory");
+        let server = MockServer::start().await;
+        let provider = HuggingFaceProvider;
+        let model_name = "modelexpress-tests/delete-no-download";
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/api/models/modelexpress-tests/delete-no-download(?:/.*)?$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": model_name,
+                "sha": "def5678",
+                "siblings": [
+                    {"rfilename": "config.json"}
+                ]
+            })))
+            .expect(1)
+            .named("delete_model should query repo info exactly once")
+            .mount(&server)
+            .await;
+
+        // Deleting uncached files must not trigger any remote resolve/download requests.
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/modelexpress-tests/delete-no-download/resolve/(main|[^/]+)/config\.json$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("etag", "\"def5678\"")
+                    .insert_header("x-repo-commit", "def5678")
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("content-length", "64")
+                    .insert_header("content-range", "bytes 0-63/64")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .expect(0)
+            .named("delete_model should not call Hugging Face resolve endpoint")
+            .mount(&server)
+            .await;
+
+        let old_cache = env::var_os(MODEL_EXPRESS_CACHE_ENV_VAR);
+        let old_endpoint = env::var_os("HF_ENDPOINT");
+
+        unsafe {
+            env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache.path());
+            env::set_var("HF_ENDPOINT", server.uri());
+        }
+
+        let result = provider.delete_model(model_name, None).await;
+
+        unsafe {
+            if let Some(value) = old_cache {
+                env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, value);
+            } else {
+                env::remove_var(MODEL_EXPRESS_CACHE_ENV_VAR);
+            }
+
+            if let Some(value) = old_endpoint {
+                env::set_var("HF_ENDPOINT", value);
+            } else {
+                env::remove_var("HF_ENDPOINT");
+            }
+        }
+
+        assert!(result.is_ok(), "Delete should succeed when cache is empty");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_get_model_path_trait() {
+        let _guard = acquire_env_mutex();
         let mock_server = MockHFServer::new().await;
 
         // Construct a temporary cache dir with a model snapshots
@@ -471,7 +625,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_download_ignore_weights() {
+        let _guard = acquire_env_mutex();
         let mock_server = MockHFServer::new().await;
         let provider = HuggingFaceProvider;
         let result = provider
@@ -490,7 +646,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_download_ignores_subdirectories() {
+        let _guard = acquire_env_mutex();
         let mock_server = MockHFServer::new().await;
         let provider = HuggingFaceProvider;
 
@@ -508,7 +666,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_ignores_dotfiles() {
-        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        let _guard = acquire_env_mutex();
         // Create a mock server with dotfiles in siblings list but NO endpoint for them.
         // If the code tries to download a dotfile, it will fail since there's no mock.
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
@@ -563,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_is_offline_mode() {
-        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        let _guard = acquire_env_mutex();
         unsafe {
             env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
             assert!(is_offline_mode());
@@ -579,7 +737,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_model_offline_mode_with_cache() {
-        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        let _guard = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let snapshots_path = temp_dir
             .path()
@@ -607,7 +765,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_model_offline_mode_without_cache() {
-        let _guard = ENV_MUTEX.lock().expect("Failed to acquire env mutex");
+        let _guard = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
 
         unsafe {
