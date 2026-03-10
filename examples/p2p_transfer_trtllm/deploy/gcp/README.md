@@ -103,7 +103,7 @@ affinity:
 
 - **No `cuda_ipc` in UCX_TLS** — `cuIpcOpenMemHandle` fails on GB200, causing NIXL to reject remote metadata. Remove `cuda_ipc` to use host-staged RoCE RDMA instead.
 - **`/dev/shm` required** — NCCL needs >64MB for shared memory segments. K8s default is 64MB. Must mount explicit emptyDir.
-- **`OMPI_MCA_pml=ob1`** — UCX UD endpoint times out during MPI bootstrap with TP=4 on degraded nodes. Force MPI to use TCP+vader instead. Does not affect NCCL or NIXL performance.
+- **`OMPI_MCA_pml=ob1` + `OMPI_MCA_btl=tcp,self,vader`** — Required for TP>=4 with `privileged: true` on GB200. UCX UD endpoint times out during MPI bootstrap (confirmed on freshly restarted nodes — not a stale state issue). Forces MPI to use TCP+shared memory. Does not affect NCCL or NIXL RDMA performance.
 - **ComputeDomain** — required for IMEX channels on GB200. Without it, NIXL `loadRemoteMD` fails.
 
 ## Validated Results

@@ -1,7 +1,7 @@
 # TRT-LLM Dynamo Phase 2.5: Kimi K2.5 P2P on GCP GB200
 
-**Status**: P2P VALIDATED via Dynamo engine — RoCE 25-33 Gbps on Qwen TP=2
-**Date**: March 9, 2026 (updated)
+**Status**: P2P VALIDATED — Kimi K2.5 TP=4 at **369 Gbps RoCE** + inference confirmed
+**Date**: March 10, 2026 (updated)
 **Branch (modelexpress)**: `kavink/trtllm`
 **Branch (dynamo)**: `kavink/trtllm-p2p` (rebased on main with Kimi K2.5 recipe)
 **Cluster**: `dynamo-gcp-dev-01` (GCP GB200 NVL36, ARM64)
@@ -11,29 +11,42 @@
 
 ## 1. Summary
 
-Kimi K2.5 (589 GB, EP=4) P2P weight transfer validated end-to-end on GCP GB200
-NVL36 cluster. All 4 ranks transfer 162 GB each with 100% param match and
-verified checksums. Currently over TCP (~2-4 Gbps); pending RDMA enablement
-for NVLink/RoCE speeds.
+Kimi K2.5 (648 GB, TP=4) P2P weight transfer validated end-to-end on GCP GB200
+NVL36 cluster via the Dynamo TRT-LLM engine. All 4 ranks transfer 162.09 GB
+each at **369 Gbps** over RoCE RDMA in **3.51 seconds**. Inference confirmed
+via Dynamo frontend.
 
 **Model**: [`baseten-admin/Kimi-2.5-text-nvfp4-v3`](https://huggingface.co/baseten-admin/Kimi-2.5-text-nvfp4-v3)
 - Architecture: DeepSeek V3 family (same as DSV3.2 — `deepseek_v3`)
-- 589 GB, 118 safetensors, NVFP4 quantized via ModelOpt
+- 589 GB on disk, 118 safetensors, NVFP4 quantized via ModelOpt
 - MoE with 256 routed experts (same as DSV3.2)
 
-**Validation Results (Kimi K2.5 NVFP4, EP=4, cross-node, GCP GB200):**
+**Validation Results (Kimi K2.5 NVFP4, TP=4, RoCE, GCP GB200 — March 10, 2026):**
 
-| Rank | Params | Data | Time | Bandwidth | Status |
-|------|--------|------|------|-----------|--------|
-| 0 | 1755/1755 | 162.09 GB | 635s | ~2.0 Gbps | PASS |
-| 1 | 1755/1755 | 162.09 GB | 501s | ~2.6 Gbps | PASS |
-| 2 | 1755/1755 | 162.09 GB | 365s | ~3.6 Gbps | PASS |
-| 3 | 1755/1755 | 162.09 GB | 662s | ~2.0 Gbps | PASS |
-| **Total** | **7020** | **648.36 GB** | **~11 min** | TCP fallback | **ALL PASS** |
+| Rank | Params | Data | Time | Bandwidth | Transport | Status |
+|------|--------|------|------|-----------|-----------|--------|
+| 0 | 1754 | 162.09 GB | 3.51s | **369.5 Gbps** | rc_mlx5 (RoCE) | PASS |
+| 1 | 1754 | 162.09 GB | 3.51s | **369.0 Gbps** | rc_mlx5 (RoCE) | PASS |
+| 2 | 1754 | 162.09 GB | 3.51s | **369.4 Gbps** | rc_mlx5 (RoCE) | PASS |
+| 3 | 1754 | 162.09 GB | 3.51s | **369.2 Gbps** | rc_mlx5 (RoCE) | PASS |
+| **Total** | **7016** | **648 GB** | **3.51s** | **~369 Gbps** | RoCE RDMA | **ALL PASS** |
 
-Transfer is over TCP because RDMA transports are not available to UCX (see
-Section 10 for details). With RDMA (RoCE or MNNVL), expect ~3-15 seconds
-based on H200 results.
+**Inference test** (via Dynamo frontend on port 8000):
+```
+POST /v1/chat/completions {"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3","messages":[...]}
+→ 200 OK, 36 tokens, 3.98s total time
+```
+
+**Prior TCP-only results (Phase 2.5a, for reference):**
+
+| Rank | Data | Time | Bandwidth | Status |
+|------|------|------|-----------|--------|
+| 0 | 162.09 GB | 635s | ~2.0 Gbps | PASS (TCP) |
+| 1 | 162.09 GB | 501s | ~2.6 Gbps | PASS (TCP) |
+| 2 | 162.09 GB | 365s | ~3.6 Gbps | PASS (TCP) |
+| 3 | 162.09 GB | 662s | ~2.0 Gbps | PASS (TCP) |
+
+**Improvement: 180x faster** (11 min TCP → 3.5s RoCE)
 
 ---
 
@@ -327,6 +340,8 @@ See Section 11 for implementation plan.
 | Qwen 0.5B (v1.2.0rc6) | 1 | 1.26 GB | 78.8 Gbps | Nebius H200 | PASSED |
 | Llama 70B (v1.2.0rc6) | 8 | 141.1 GB | 368 Gbps | Nebius H200 | PASSED |
 | DSV3.2 NVFP4 EP=8 (H200) | 8 | 547.6 GB | 2,227 Gbps | Nebius H200 | PASSED |
+| Qwen 0.5B TP=2 (Dynamo) | 2 | 1.26 GB | 25-33 Gbps | GCP GB200 | PASSED |
+| **Kimi K2.5 TP=4 (Dynamo)** | **4** | **648 GB** | **369 Gbps** | **GCP GB200** | **PASSED** |
 
 ---
 
@@ -583,14 +598,69 @@ affinity:
 | `privileged` + `cuda_ipc` in UCX_TLS | Fails (`cuIpcOpenMemHandle` error) | N/A |
 | `privileged` + NO `cuda_ipc` | **RoCE (`rc_mlx5`)** | **25-33 Gbps** |
 
-### 13.10 Next steps
+### 13.10 Kimi K2.5 TP=4 RoCE P2P — VALIDATED (March 10, 2026)
 
-1. Deploy Kimi K2.5 TP=4 with RoCE config — validate at scale (162 GB/rank)
-2. Enable coalesced transfers for higher throughput
-3. Test DGD operator path (fix webhook first)
-4. Upstream: fix `cuda_ipc` on GB200 in NIXL for GPU-direct RDMA
-5. Upstream: Dynamo operator `kube-rbac-proxy` registry fix
+**Source**: `kimi-source-deploy-85686ffc4b-wpbwv` on `o7v-...b2bd` (w0e affinity relaxed to include o7v)
+**Target**: `kimi-target-deploy-764bb6bc4c-68flr` on `o7v-...mflg` (same clique via `nvidia.com/gpu.clique` affinity)
 
-### 13.11 Operator improvements
+**Source timeline** (~68 min total):
+1. MPI init (ob1 PML): ~10s
+2. Safetensors parallel loading (118 files): ~2.5 min
+3. Weight loading (1468 params): ~30 min
+4. Autotuner warmup (per rank, sequential): ~20 min
+5. CUDA graph capture: ~5 min
+6. NIXL registration + MPI gather + publish: ~5s
+
+**Source publish logs:**
+```
+NIXL agent 'trtllm-live-source-rank0-607' created on device 0
+Registered 1815 individual tensors with NIXL (x4 ranks)
+Gathered rank 0: 1815 tensors
+Gathered rank 1: 1815 tensors
+Gathered rank 2: 1815 tensors
+Gathered rank 3: 1815 tensors
+ModelExpress: published ALL 4 workers to MX server
+ModelExpress worker rank 0 published 162.09 GB
+```
+
+**Target transfer logs:**
+```
+[Coalesce] DISABLED - transferring 1754 individual tensors
+Added remote agent b'trtllm-live-source-rank0-607'
+Transfer complete: 1754 tensors, 162.09 GB in 3.51s (369.4 Gbps)
+Rank 0: transferred 1754 params (162.09 GB) in 3.51s (369.5 Gbps) — DIRECT into model params
+Rank 1: transferred 1754 params (162.09 GB) in 3.51s (369.0 Gbps) — DIRECT into model params
+Rank 2: transferred 1754 params (162.09 GB) in 3.51s (369.4 Gbps) — DIRECT into model params
+Rank 3: transferred 1754 params (162.09 GB) in 3.51s (369.2 Gbps) — DIRECT into model params
+```
+
+**Inference validated** via `python3 -m dynamo.frontend --http-port 8000` started inside target pod:
+```bash
+curl localhost:8000/v1/chat/completions -d '{"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3",...}'
+→ 200 OK, total_time_ms: 3979
+```
+
+**Deployment YAMLs used:**
+- Source: `deploy/gcp/kimi-source-deploy.yaml` (removed startup probe, ob1 PML, /dev/shm 100Gi)
+- Target: `deploy/gcp/kimi-target-deploy.yaml` (o7v+w0e affinity, same RoCE config)
+
+### 13.11 Cumulative speed comparison
+
+| Config | Model | TP | Transfer | Time | Speed | Transport |
+|--------|-------|-----|----------|------|-------|-----------|
+| TCP fallback | Kimi K2.5 | 4 | 648 GB | ~11 min | ~2-4 Gbps | TCP |
+| RoCE (no cuda_ipc) | Qwen 0.5B | 2 | 1.26 GB | 0.15-0.20s | 25-33 Gbps | rc_mlx5 |
+| **RoCE (no cuda_ipc)** | **Kimi K2.5** | **4** | **648 GB** | **3.51s** | **369 Gbps** | **rc_mlx5** |
+
+### 13.12 Next steps
+
+1. ~~Deploy Kimi K2.5 TP=4 with RoCE config~~ **DONE — 369 Gbps**
+2. Validate planner-driven scaling with MX P2P (see [PLANNER_PLAN.md](./PLANNER_PLAN.md))
+3. Enable coalesced transfers for even higher throughput
+4. Test DGD operator path (fix webhook first)
+5. Upstream: fix `cuda_ipc` on GB200 in NIXL for GPU-direct RDMA
+6. Upstream: Dynamo operator `kube-rbac-proxy` registry fix
+
+### 13.13 Operator improvements
 
 See [OPERATOR_LLM.md](./OPERATOR_LLM.md) for suggestions.

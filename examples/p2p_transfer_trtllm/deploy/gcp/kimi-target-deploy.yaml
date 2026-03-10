@@ -81,6 +81,7 @@ spec:
                 operator: In
                 values:
                 - customer-gpu-w0e
+                - customer-gpu-o7v
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
@@ -141,12 +142,18 @@ spec:
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
-            # MPI
+            # MPI — force ob1 PML to avoid UCX UD timeout on GB200
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
             - name: OMPI_MCA_btl_tcp_if_include
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
             # NCCL
+            - name: NCCL_NET_PLUGIN
+              value: "none"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -216,7 +223,7 @@ spec:
             type: DirectoryOrCreate
         - name: model-cache
           persistentVolumeClaim:
-            claimName: model-cache
+            claimName: shared-model-cache
         - name: trtllm-config
           configMap:
             name: kimi-target-deploy-trtllm-config

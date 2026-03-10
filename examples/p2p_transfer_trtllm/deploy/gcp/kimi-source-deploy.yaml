@@ -80,8 +80,8 @@ spec:
               - key: cloud.google.com/gke-nodepool
                 operator: In
                 values:
-                - customer-gpu-w0e
                 - customer-gpu-o7v
+                - customer-gpu-w0e
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
@@ -138,7 +138,7 @@ spec:
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "WARN"
-            # MPI — force ob1 PML with TCP+vader to avoid UCX UD timeout on GB200
+            # MPI — ob1 PML required: UCX UD times out with privileged+TP=4 on GB200
             - name: OMPI_MCA_pml
               value: "ob1"
             - name: OMPI_MCA_btl
@@ -147,7 +147,9 @@ spec:
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
-            # NCCL
+            # NCCL — NCCL_NET_PLUGIN=none required when NVSwitch fabric manager not healthy
+            - name: NCCL_NET_PLUGIN
+              value: "none"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -179,13 +181,6 @@ spec:
               value: "INFO"
             - name: TLLM_OVERRIDE_LAYER_NUM
               value: "61"
-          startupProbe:
-            failureThreshold: 120
-            httpGet:
-              path: /live
-              port: 9090
-            periodSeconds: 60
-            timeoutSeconds: 5
           resources:
             limits:
               nvidia.com/gpu: "4"
@@ -217,7 +212,7 @@ spec:
             type: DirectoryOrCreate
         - name: model-cache
           persistentVolumeClaim:
-            claimName: model-cache
+            claimName: shared-model-cache
         - name: trtllm-config
           configMap:
             name: kimi-source-deploy-trtllm-config

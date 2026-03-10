@@ -1,8 +1,8 @@
 # Planner + ModelExpress P2P Scaling Plan
 
-**Status**: Planning  
-**Date**: March 9, 2026  
-**Prerequisite**: Kimi K2.5 P2P transfer validated via Dynamo engine (Phase 2.5b)
+**Status**: Ready to validate  
+**Date**: March 10, 2026  
+**Prerequisite**: Kimi K2.5 P2P transfer validated — **369 Gbps RoCE, 648 GB in 3.51s** (Phase 2.5b)
 
 ---
 
@@ -63,7 +63,7 @@ With ModelExpress, the scale-up path becomes:
 2. Connector patches DGDSA/DGD (same)
 3. DGD operator creates new pod with `--model-express-role target` in spec
 4. New pod starts → queries ModelExpress server → NIXL RDMA from source
-5. **For Kimi K2.5: ~30 seconds at RoCE speeds** (estimated from Qwen results)
+5. **For Kimi K2.5: ~3.5 seconds transfer + ~30s autotuning** (validated March 10)
 
 **No planner code changes are required.** The load path is determined by the DGD worker spec — if it includes `--model-express-url` and `--model-express-role target`, the new pod uses P2P automatically.
 
@@ -208,37 +208,70 @@ scaling_connector: kubernetes
 
 ### Phase 1: Manual scaling test
 
-1. Deploy MX source (publishes Kimi K2.5 weights)
-2. Deploy DGD with 1 target worker (loads via P2P)
-3. Verify worker loads in ~30s via RoCE
-4. Manually patch DGD to `replicas: 2`
-5. Verify second worker also loads via P2P in ~30s
-6. Measure: time from replica increase → worker ready
+**YAML**: `deploy/gcp/kimi-planner-dgd.yaml`
+
+1. Ensure MX source is deployed and published (`kimi-source-deploy.yaml`)
+2. Deploy DGD: `kubectl -n kavin apply -f kimi-planner-dgd.yaml`
+3. Verify first worker loads via P2P (~3.5s transfer + ~30s autotuning)
+4. Test inference: `curl <frontend>:8000/v1/chat/completions`
+5. Manually scale via DGDSA: `kubectl -n kavin scale dgdsa/kimi-planner-kimiworker --replicas=2`
+6. Verify second worker also loads via P2P in ~35s
+7. Measure: time from replica increase → worker ready
 
 ### Phase 2: Planner-driven scaling
 
-1. Deploy full DGD with planner + MX source + 1 target worker
-2. Send load (e.g. via `genai-perf` or `curl`)
-3. Observe planner scaling up workers
-4. Verify new workers load via P2P (check per-rank logs)
-5. Measure: end-to-end latency from planner decision → worker ready → serving traffic
+1. Send sustained load via `genai-perf` or `curl` loop
+2. Observe planner scaling up workers (check planner pod logs)
+3. Verify new workers load via P2P (check per-rank transfer logs)
+4. Measure: end-to-end latency from planner decision → worker ready → serving traffic
+5. Expected: < 2 min total (planner interval 30s + P2P 3.5s + autotune 30s)
 
 ### Phase 3: Scale-down behavior
 
 1. Reduce load
 2. Observe planner scaling down workers
-3. Verify graceful shutdown (in-flight requests complete)
+3. Verify graceful shutdown (in-flight requests complete, `terminationGracePeriodSeconds: 600`)
 4. Verify MX source remains stable (GPU memory held)
+
+### Deployment commands
+
+```bash
+# 1. Ensure source is published
+kubectl -n kavin get pods -l app=kimi-source-deploy
+kubectl -n kavin exec deploy/redis -- redis-cli GET 'mx:model:baseten-admin/Kimi-2.5-text-nvfp4-v3'
+
+# 2. Deploy planner DGD
+kubectl -n kavin apply -f deploy/gcp/kimi-planner-dgd.yaml
+
+# 3. Watch pods come up
+watch kubectl -n kavin get pods -l app.kubernetes.io/part-of=kimi-planner
+
+# 4. Check worker P2P transfer logs
+kubectl -n kavin logs -l app.kubernetes.io/part-of=kimi-planner,nvidia.com/dynamo-component=KimiWorker | grep -i transfer
+
+# 5. Test inference
+FRONTEND=$(kubectl -n kavin get pod -l nvidia.com/dynamo-component=Frontend -o jsonpath='{.items[0].status.podIP}')
+curl http://$FRONTEND:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
+
+# 6. Manual scale test (Phase 1)
+kubectl -n kavin scale dgdsa/kimi-planner-kimiworker --replicas=2
+
+# 7. Check planner decisions
+kubectl -n kavin logs -l nvidia.com/dynamo-component=Planner --tail=50
+```
 
 ---
 
 ## 8. Key Metrics to Track
 
-| Metric | Disk Load | P2P Load | Target |
-|--------|-----------|----------|--------|
-| Time to ready (Kimi K2.5 TP=4) | ~75 min | ~30s (est.) | < 60s |
+| Metric | Disk Load | P2P Load (Measured) | Target |
+|--------|-----------|---------------------|--------|
+| Transfer time (Kimi K2.5 TP=4) | N/A | **3.51s** | < 10s |
+| Time to ready (incl. autotuning) | ~75 min | **~35s** (3.5s transfer + ~30s autotune) | < 60s |
 | Scale-up responsiveness | Impractical | Planner interval + P2P | < 2 min total |
-| Transfer bandwidth | N/A (disk) | 25-33 Gbps (RoCE) | > 20 Gbps |
+| Transfer bandwidth | N/A (disk) | **369 Gbps** (RoCE rc_mlx5) | > 200 Gbps |
 | GPU memory overhead (source) | 0 | 648 GB (4x 162 GB) | Acceptable |
 
 ---
@@ -256,9 +289,10 @@ scaling_connector: kubernetes
 ## 10. Prerequisites
 
 - [x] ModelExpress P2P transfer validated (Qwen TP=2 at 25-33 Gbps RoCE)
-- [ ] Kimi K2.5 TP=4 P2P transfer validated at scale
+- [x] **Kimi K2.5 TP=4 P2P transfer validated — 369 Gbps, 648 GB in 3.51s**
+- [x] **Inference confirmed via Dynamo frontend**
 - [ ] DGD operator webhook fixed (kube-rbac-proxy image)
 - [ ] DGDSA scaling adapter tested
-- [ ] Planner example with ModelExpress args
+- [x] Planner DGD YAML created: `deploy/gcp/kimi-planner-dgd.yaml`
 - [ ] Prometheus metrics collection verified
 - [ ] genai-perf or load generator available for testing
