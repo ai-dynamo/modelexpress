@@ -67,7 +67,11 @@ class MxLiveSource:
         # TRT-LLM's LLM class wraps the model differently depending on version
         torch_model = self._get_torch_model()
         if torch_model is None:
-            raise RuntimeError("Cannot access underlying torch model from LLM instance")
+            raise RuntimeError(
+                "Cannot access underlying torch model from LLM instance. "
+                "With TRT-LLM RPC/MPI executor (TP>1), the model lives in worker processes. "
+                "Use publish_from_worker() inside each worker instead."
+            )
 
         device_id = torch.cuda.current_device()
         logger.info(
@@ -202,13 +206,58 @@ class MxLiveSource:
                     else:
                         logger.info("_get_torch_model: executor has no 'model_engine' attribute")
                         logger.info(f"_get_torch_model: executor dir = {[a for a in dir(executor) if not a.startswith('__')][:20]}")
+                        
+                        # Try to access underlying executor from proxy
+                        # GenerationExecutorProxy may have internal attributes holding the actual executor
+                        for proxy_attr in ['_executor', 'executor', '_worker', 'worker', '_workers', 'workers']:
+                            if hasattr(executor, proxy_attr):
+                                try:
+                                    underlying = getattr(executor, proxy_attr)
+                                    logger.info(f"_get_torch_model: proxy has '{proxy_attr}' = {underlying}, type = {type(underlying)}")
+                                    if underlying is not None:
+                                        # If it's a list/dict of workers, try first one
+                                        if isinstance(underlying, (list, tuple)) and len(underlying) > 0:
+                                            underlying = underlying[0]
+                                        elif isinstance(underlying, dict) and len(underlying) > 0:
+                                            underlying = next(iter(underlying.values()))
+                                        
+                                        if hasattr(underlying, 'model_engine'):
+                                            try:
+                                                model_engine = getattr(underlying, 'model_engine')
+                                                if model_engine is not None and hasattr(model_engine, 'model'):
+                                                    torch_model = getattr(model_engine, 'model')
+                                                    if torch_model is not None and hasattr(torch_model, 'named_parameters'):
+                                                        try:
+                                                            next(iter(torch_model.named_parameters()), None)
+                                                            logger.info(f"_get_torch_model: found model via proxy.{proxy_attr}.model_engine.model")
+                                                            return torch_model
+                                                        except Exception:
+                                                            pass
+                                            except Exception as e:
+                                                logger.debug(f"_get_torch_model: failed to access model_engine from {proxy_attr}: {e}")
+                                except Exception as e:
+                                    logger.debug(f"_get_torch_model: failed to access proxy attr '{proxy_attr}': {e}")
                 else:
                     logger.info("_get_torch_model: _executor is None")
             except Exception as e:
                 logger.warning(f"_get_torch_model: failed to access _executor: {e}")
         
+        # Try accessing model through _disaggregated_params (for distributed setups)
+        if hasattr(model, '_disaggregated_params'):
+            try:
+                disaggregated = getattr(model, '_disaggregated_params')
+                logger.info(f"_get_torch_model: _disaggregated_params = {disaggregated}, type = {type(disaggregated)}")
+                # _disaggregated_params might be a dict of parameter tensors
+                if isinstance(disaggregated, dict) and len(disaggregated) > 0:
+                    # We can't return a dict, but we can check if it has the parameters we need
+                    logger.info(f"_get_torch_model: found {len(disaggregated)} parameters in _disaggregated_params")
+                    # Note: We'd need to reconstruct a model from these params, which is complex
+                    # For now, we'll continue trying other paths
+            except Exception as e:
+                logger.debug(f"_get_torch_model: failed to access _disaggregated_params: {e}")
+        
         # Try legacy/common attribute paths for LLM wrapper
-        for attr in ['_model', 'model', '_engine']:
+        for attr in ['_model', 'model', '_engine', '_build_model']:
             if hasattr(model, attr):
                 candidate = getattr(model, attr)
                 logger.debug(f"_get_torch_model: trying attr '{attr}' = {candidate}, type = {type(candidate)}")
@@ -268,6 +317,121 @@ class MxLiveSource:
         for nixl_mgr in self._nixl_managers.values():
             nixl_mgr.shutdown()
         self._nixl_managers.clear()
+
+
+def publish_from_worker(worker: Any) -> None:
+    """Publish this rank's model params to ModelExpress from inside a TRT-LLM executor worker.
+
+    Call this from TensorRT-LLM's BaseWorker.setup_engine() after the engine is created,
+    when MODEL_EXPRESS_SOURCE=1. The worker process has the real model (worker.engine.model_engine.model).
+    Each rank publishes its own NIXL metadata and tensor descriptors to the MX server.
+
+    Requires patching TRT-LLM's base_worker.setup_engine to call this at the end, e.g.:
+
+        if os.environ.get("MODEL_EXPRESS_SOURCE"):
+            try:
+                from modelexpress.trtllm_live_transfer import publish_from_worker
+                publish_from_worker(self)
+            except Exception as e:
+                logger.warning("ModelExpress publish_from_worker failed: %s", e)
+    """
+    from .nixl_transfer import NixlTransferManager
+    from . import p2p_pb2, p2p_pb2_grpc
+    import grpc
+
+    engine = getattr(worker, "engine", None)
+    if engine is None:
+        logger.warning("publish_from_worker: worker has no engine")
+        return
+    model_engine = getattr(engine, "model_engine", None)
+    if model_engine is None:
+        logger.warning("publish_from_worker: engine has no model_engine (not PyExecutor?)")
+        return
+    torch_model = getattr(model_engine, "model", None)
+    if torch_model is None or not hasattr(torch_model, "named_parameters"):
+        logger.warning("publish_from_worker: model_engine has no torch model")
+        return
+
+    device_id = getattr(worker, "rank", torch.cuda.current_device())
+    model_name = os.environ.get("MODEL_NAME", "unknown")
+    mx_server = os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001")
+
+    param_tensors = {}
+    total_bytes = 0
+    for name, param in torch_model.named_parameters():
+        if param.device.type == "cuda" and param.device.index == device_id:
+            param_tensors[name] = param.data
+            total_bytes += param.numel() * param.element_size()
+
+    if not param_tensors:
+        logger.warning("publish_from_worker: no params on device %d", device_id)
+        return
+
+    logger.info(
+        "ModelExpress worker publish: '%s' rank %d, %d params, %.2f GB",
+        model_name, device_id, len(param_tensors), total_bytes / 1e9,
+    )
+
+    nixl_mgr = NixlTransferManager(
+        agent_name=f"trtllm-live-source-rank{device_id}-{os.getpid()}",
+        device_id=device_id,
+    )
+    nixl_mgr.initialize()
+    nixl_mgr.register_tensors(param_tensors)
+
+    # Keep the NIXL manager alive for the lifetime of the worker process.
+    # If it goes out of scope, the UCX agent shuts down and the listening port
+    # closes — targets would get "Connection refused" when trying to RDMA.
+    worker._mx_nixl_manager = nixl_mgr
+
+    tensor_protos = []
+    for name, tensor in param_tensors.items():
+        tensor_protos.append(p2p_pb2.TensorDescriptor(
+            name=name,
+            addr=tensor.data_ptr(),
+            size=tensor.numel() * tensor.element_size(),
+            device_id=device_id,
+            dtype=str(tensor.dtype),
+        ))
+
+    my_worker = p2p_pb2.WorkerMetadata(
+        worker_rank=device_id,
+        nixl_metadata=nixl_mgr.nixl_metadata,
+        tensors=tensor_protos,
+    )
+
+    # Gather all workers on rank 0 via MPI, then publish once.
+    # This avoids the race condition where concurrent per-rank PublishMetadata
+    # calls overwrite each other in the MX server's Redis backend.
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    my_worker_bytes = my_worker.SerializeToString()
+    all_worker_bytes = comm.gather(my_worker_bytes, root=0)
+
+    if comm.Get_rank() == 0:
+        all_workers = []
+        for wb in all_worker_bytes:
+            w = p2p_pb2.WorkerMetadata()
+            w.ParseFromString(wb)
+            all_workers.append(w)
+            logger.info("  Gathered rank %d: %d tensors", w.worker_rank, len(w.tensors))
+
+        options = [
+            ("grpc.max_send_message_length", 200 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 200 * 1024 * 1024),
+        ]
+        channel = grpc.insecure_channel(mx_server, options=options)
+        stub = p2p_pb2_grpc.P2pServiceStub(channel)
+        request = p2p_pb2.PublishMetadataRequest(model_name=model_name, workers=all_workers)
+        response = stub.PublishMetadata(request)
+        channel.close()
+
+        if not response.success:
+            raise RuntimeError(f"ModelExpress publish_from_worker failed: {response.message}")
+        logger.info("ModelExpress: published ALL %d workers to MX server", len(all_workers))
+
+    comm.Barrier()
+    logger.info("ModelExpress worker rank %d published %.2f GB", device_id, total_bytes / 1e9)
 
 
 class MxLiveWeightLoader:

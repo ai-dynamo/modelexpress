@@ -14,7 +14,7 @@
 #   docker buildx build --platform linux/arm64 --no-cache \
 #       -f examples/p2p_transfer_trtllm/Dockerfile.ph3-gcp-gb200 \
 #       --build-context dynamo=../dynamo \
-#       -t nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.1.0 \
+#       -t nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0 \
 #       --push .
 FROM nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
 
@@ -56,4 +56,8 @@ RUN python3 /tmp/apply_patches.py && rm /tmp/apply_patches.py
 # Verify installation (can't import full TRT-LLM at build time — no GPU)
 RUN python3 -c "from modelexpress.client import MxClient; print('ModelExpress client OK')" && \
     grep -q "PRESHARDED" /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_args.py && \
-    echo "LoadFormat.PRESHARDED OK"
+    echo "LoadFormat.PRESHARDED OK" && \
+    grep -q "publish_from_worker" /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/executor/worker.py && \
+    echo "worker.py publish_from_worker hook OK" && \
+    grep -q "MODEL_EXPRESS_SOURCE" /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/engine.py && \
+    echo "engine.py MODEL_EXPRESS_SOURCE OK"

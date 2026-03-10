@@ -1,7 +1,7 @@
 # TRT-LLM Dynamo Phase 2.5: Kimi K2.5 P2P on GCP GB200
 
-**Status**: P2P VALIDATED (TCP) — pending RDMA/MNNVL transport
-**Date**: March 4, 2026 (updated)
+**Status**: P2P VALIDATED via Dynamo engine — RoCE 25-33 Gbps on Qwen TP=2
+**Date**: March 9, 2026 (updated)
 **Branch (modelexpress)**: `kavink/trtllm`
 **Branch (dynamo)**: `kavink/trtllm-p2p` (rebased on main with Kimi K2.5 recipe)
 **Cluster**: `dynamo-gcp-dev-01` (GCP GB200 NVL36, ARM64)
@@ -475,4 +475,122 @@ Already partially implemented via `MxLiveCheckpointLoader`:
 | Weight format | Raw tensors (pre-FP8 processing) | Fused, TP-sharded, TRT-LLM format |
 | Worker spawn | Python multiprocess (`ModelExpressWorker`) | MPI (NIXL works natively) |
 | Post-transfer | `process_weights_after_loading()` | Engine compilation |
-| TRT-LLM patches | None | 3 files: `llm_args.py`, `model_loader.py`, `linear.py` |
+| TRT-LLM patches | None | 4 files: `llm_args.py`, `model_loader.py`, `linear.py`, `worker.py` |
+
+---
+
+## 13. Phase 2.5b: DGD Source Publish Fix (March 8-9, 2026)
+
+### 13.1 Problem: Source crash-loop with TRT-LLM RPC executor
+
+The Dynamo engine (`python3 -m dynamo.trtllm --model-express-role source`) crashed because `LLM()` with TP>1 creates `GenerationExecutorProxy` (MPI proxy). The proxy has no `model_engine` — the real torch model lives in MPI worker processes. `MxLiveSource._get_torch_model()` always failed, retries exhausted, `/live` returned 503, pod restarted.
+
+### 13.2 Fix: Worker-side publish with MPI gather
+
+Implemented across 3 repos:
+
+- **modelexpress (`trtllm_live_transfer.py`):** New `publish_from_worker(worker)` — accesses `worker.engine.model_engine.model`, registers with NIXL, uses `MPI.COMM_WORLD.gather()` to collect all workers on rank 0, then rank 0 makes ONE `PublishMetadata` gRPC call with all workers.
+- **TRT-LLM (`worker.py` via `apply_patches.py`):** After worker creation in `worker_main()`, checks `MODEL_EXPRESS_SOURCE` env var and calls `publish_from_worker(worker)`.
+- **Dynamo engine (`engine.py`):** `_setup_modelexpress_source()` sets `MODEL_EXPRESS_SOURCE=1` env before `LLM()` init. After init, `_verify_workers_published()` polls MX server (300s timeout).
+
+### 13.3 Image and deployment
+
+**Image**: `nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0`
+
+**TRT-LLM patches** (`trtllm_patches/v1.3.0rc5/apply_patches.py`): `llm_args.py`, `model_loader.py`, `linear.py`, `worker.py`
+
+**YAMLs** (DGD + plain Deployment fallbacks):
+
+| File | Type | Role |
+|------|------|------|
+| `deploy/gcp/kimi-source-dgd.yaml` | DGD | Source (operator) |
+| `deploy/gcp/kimi-source-deploy.yaml` | Deployment | Source (no operator) |
+| `deploy/gcp/kimi-target-agg-mx.yaml` | DGD | Target (operator) |
+| `deploy/gcp/kimi-target-deploy.yaml` | Deployment | Target (no operator) |
+
+**Critical env vars** (must be in pod spec for MPI propagation):
+`MODEL_EXPRESS_SOURCE`, `MODEL_EXPRESS_URL`, `MODEL_NAME`, `WORLD_SIZE`, `NATS_SERVER`, `ETCD_ENDPOINTS`
+
+### 13.4 Source publish validated
+
+All 4 workers published via MPI gather + single gRPC call:
+- 4 × 1,815 params, 4 × 162.09 GB
+- Redis: 4 workers, 7,260 tensors, 4 × 486,722 bytes NIXL metadata
+- `_verify_workers_published`: confirmed all 4 on first poll
+
+### 13.5 Target UCX connectivity — RESOLVED
+
+Target UCX connection to source failed with `Connection refused` on the NIXL UCX port.
+
+**Root cause:** `publish_from_worker()` created `NixlTransferManager` as a local variable. When the function returned, Python GC destroyed it, shutting down the UCX agent and closing the listening port. Metadata in Redis still referenced the dead port.
+
+**Fix:** `worker._mx_nixl_manager = nixl_mgr` — keep reference alive for the process lifetime.
+
+### 13.6 NCCL cluster-wide failures — WORKAROUND
+
+After the UCX fix, source pods crash during autotuning/CUDA graph warmup with NCCL `unhandled system error`. All 4 ranks fail in MoE allgather. Cluster-wide GPU fabric issue — not node-specific (failed on both `o7v-6b99` and `o7v-2x2c`).
+
+**Why NCCL runs:** `LLM()` does autotuning + CUDA graph warmup with real forward passes that use NCCL for TP. The standalone MPI source never runs forward passes so it never hits NCCL.
+
+**Workaround:** Disable autotuner and CUDA graphs in source config:
+```yaml
+enable_autotuner: false
+cuda_graph_config:
+  max_batch_size: 0
+```
+
+### 13.7 Fixes discovered during debugging
+
+**NCCL `/dev/shm`:** Plain Deployments need explicit `/dev/shm` volume (16+ Gi). DGD operator auto-injects it. Without it, `preallocateNCCLWindowBuffer` fails (NCCL needs ~34 MB per shm segment, K8s default is 64 MB).
+
+**NIXL agent lifetime:** `publish_from_worker()` must store `nixl_mgr` on the worker object (`worker._mx_nixl_manager`). Otherwise Python GC destroys the agent, closing the UCX listening port.
+
+**`cuda_ipc` breaks GB200:** `cuda_ipc` in `UCX_TLS` causes `cuIpcOpenMemHandle() failed: invalid device context` → `NIXL_ERR_NOT_ALLOWED`. Remove `cuda_ipc` to use host-staged RoCE RDMA instead.
+
+### 13.8 RoCE P2P transfer — VALIDATED
+
+**Qwen 0.5B TP=2 end-to-end via Dynamo engine on GCP GB200:**
+
+| Rank | Params | Data | Time | Speed | Transport |
+|------|--------|------|------|-------|-----------|
+| 0 | 171/171 | 0.63 GB | 0.20s | **24.8 Gbps** | rc_mlx5 (RoCE) |
+| 1 | 171/171 | 0.63 GB | 0.15s | **33.2 Gbps** | rc_mlx5 (RoCE) |
+
+UCX bonded across `mlx5_0:1` + `mlx5_1:1` for zero-copy rendezvous.
+
+**Critical config:**
+```yaml
+securityContext:
+  privileged: true
+env:
+  UCX_TLS: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"   # NO cuda_ipc
+  UCX_RNDV_SCHEME: "get_zcopy"
+  UCX_RNDV_THRESH: "0"
+volumes:
+  /dev/shm (emptyDir, 16Gi+)
+  /dev/infiniband (hostPath)
+resourceClaims:
+  compute-domain-channel (for GPU allocation via DRA)
+affinity:
+  topologyKey: nvidia.com/gpu.clique
+```
+
+### 13.9 Speed comparison
+
+| Config | UCX Transport | Speed |
+|--------|--------------|-------|
+| `runAsUser: 0` + computeDomain | TCP | 3.5 Gbps |
+| `privileged` + `cuda_ipc` in UCX_TLS | Fails (`cuIpcOpenMemHandle` error) | N/A |
+| `privileged` + NO `cuda_ipc` | **RoCE (`rc_mlx5`)** | **25-33 Gbps** |
+
+### 13.10 Next steps
+
+1. Deploy Kimi K2.5 TP=4 with RoCE config — validate at scale (162 GB/rank)
+2. Enable coalesced transfers for higher throughput
+3. Test DGD operator path (fix webhook first)
+4. Upstream: fix `cuda_ipc` on GB200 in NIXL for GPU-direct RDMA
+5. Upstream: Dynamo operator `kube-rbac-proxy` registry fix
+
+### 13.11 Operator improvements
+
+See [OPERATOR_LLM.md](./OPERATOR_LLM.md) for suggestions.

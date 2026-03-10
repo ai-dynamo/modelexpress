@@ -1,13 +1,13 @@
-# Kimi K2.5 target — aggregated mode with P2P weight transfer via ModelExpress
-# Based on karenc's kimi-agg-rr.yaml but with --model-express-url and our MX image
-# EP=4, single node (matching kimi-source)
+# Kimi K2.5 target — DGD with RoCE P2P weight transfer via ModelExpress
+# EP=4, single node, loads weights via NIXL RDMA from source
 # Namespace: kavin
 #
 # Prerequisites:
 #   - modelexpress-server + redis running
-#   - kimi-source published (all 4 ranks, EP=4)
-#   - model-cache PVC (for HF config download)
-#   - Dynamo operator watching this namespace (dynamo-system)
+#   - kimi-source-dgd published (all 4 ranks)
+#   - model-cache PVC (for HF config)
+#   - ComputeDomain 'kavin-compute-domain' created
+#   - DGD operator webhook running
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -75,11 +75,7 @@ spec:
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
               value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
-            - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server.kavin.svc.cluster.local:8001"
-            - name: MODEL_NAME
-              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.4.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
           name: ""
           resources: {}
         nodeSelector:
@@ -115,8 +111,7 @@ spec:
                   operator: In
                   values:
                   - customer-gpu-w0e
-                  - customer-gpu-o7v
-          podAntiAffinity:
+          podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchExpressions:
@@ -124,7 +119,7 @@ spec:
                   operator: In
                   values:
                   - kimi-source-dgd
-              topologyKey: kubernetes.io/hostname
+              topologyKey: nvidia.com/gpu.clique
         containers: null
         imagePullSecrets:
           - name: nvcr-imagepullsecret
@@ -162,31 +157,33 @@ spec:
               value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
               value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: WORLD_SIZE
+              value: "4"
             - name: HF_HOME
               value: /model-cache
             - name: TRITON_CACHE_DIR
               value: /model-cache/.triton-cache
-            # UCX/NIXL for RoCE
+            # UCX/NIXL — NO cuda_ipc (breaks on GB200)
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "WARN"
             - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp"
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
-            # MPI/UCX for hostNetwork
+            # MPI
             - name: OMPI_MCA_btl_tcp_if_include
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
-            - name: UCX_NET_DEVICES
-              value: "eth0"
             # NCCL
-            - name: NCCL_DEBUG
-              value: INFO
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -218,7 +215,7 @@ spec:
               value: "INFO"
             - name: TLLM_OVERRIDE_LAYER_NUM
               value: "61"
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.4.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
           imagePullPolicy: Always
           name: ""
           resources: {}
@@ -239,6 +236,8 @@ spec:
               readOnly: true
             - mountPath: /dev/infiniband
               name: infiniband
+            - mountPath: /dev/shm
+              name: shm
           workingDir: /workspace/
         nodeSelector:
           kubernetes.io/arch: arm64
@@ -257,6 +256,9 @@ spec:
           - effect: NoSchedule
             key: kubernetes.io/arch
             operator: Exists
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
         volumes:
           - name: model-cache
             persistentVolumeClaim:
@@ -268,7 +270,13 @@ spec:
             hostPath:
               path: /dev/infiniband
               type: DirectoryOrCreate
+          - name: shm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 100Gi
       replicas: 1
       resources:
         limits:
           gpu: "4"
+        claims:
+          - name: compute-domain-channel

@@ -116,8 +116,41 @@ def patch_linear():
     print(f"linear.py: patched ({count} helpers, replaced module.tp_size with _tp_size)")
 
 
+def patch_worker_main():
+    """Add publish_from_worker() call to worker_main() after worker creation."""
+    p = SITE / "executor" / "worker.py"
+    text = p.read_text()
+    if "publish_from_worker" in text:
+        print("worker.py: already patched")
+        return
+
+    anchor = '''\
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":'''
+
+    patch = '''\
+    # ModelExpress source: publish this rank's model params via NIXL
+    if os.environ.get("MODEL_EXPRESS_SOURCE"):
+        try:
+            from modelexpress.trtllm_live_transfer import publish_from_worker
+            publish_from_worker(worker)
+        except Exception as e:
+            logger.warning("ModelExpress publish_from_worker failed on rank %d: %s", mpi_rank(), e)
+
+    # Optionally disable GC (default: not disabled)
+    if os.getenv("TRTLLM_WORKER_DISABLE_GC", "0") == "1":'''
+
+    if anchor not in text:
+        print("worker.py: ERROR — cannot find insertion point", file=sys.stderr)
+        sys.exit(1)
+    text = text.replace(anchor, patch)
+    p.write_text(text)
+    print("worker.py: patched (added publish_from_worker hook)")
+
+
 if __name__ == "__main__":
     patch_llm_args()
     patch_model_loader()
     patch_linear()
+    patch_worker_main()
     print("All patches applied successfully.")
