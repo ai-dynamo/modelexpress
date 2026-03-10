@@ -225,6 +225,10 @@ mod tests {
             size: 1024 * 1024 * 1024,
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            full_shape: vec![4096, 4096],
+            shard_dim: 0,
+            effective_tp_size: 2,
+            shard_index: 0,
         };
 
         let record = TensorRecord::from(desc.clone());
@@ -249,6 +253,10 @@ mod tests {
                 size: 4096,
                 device_id: 3,
                 dtype: "float16".to_string(),
+                full_shape: vec![],
+                shard_dim: 0,
+                effective_tp_size: 0,
+                shard_index: 0,
             }],
         };
 
@@ -279,6 +287,10 @@ mod tests {
                         size: 1_000_000,
                         device_id: 0,
                         dtype: "bfloat16".to_string(),
+                        full_shape: vec![],
+                        shard_dim: 0,
+                        effective_tp_size: 0,
+                        shard_index: 0,
                     }],
                 },
                 WorkerRecord {
@@ -290,6 +302,10 @@ mod tests {
                         size: 1_000_000,
                         device_id: 1,
                         dtype: "bfloat16".to_string(),
+                        full_shape: vec![],
+                        shard_dim: 0,
+                        effective_tp_size: 0,
+                        shard_index: 0,
                     }],
                 },
             ],

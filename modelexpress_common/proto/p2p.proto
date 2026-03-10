@@ -29,18 +29,31 @@ service P2pService {
 message TensorDescriptor {
   // Tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
   string name = 1;
-  
+
   // GPU memory address
   uint64 addr = 2;
-  
+
   // Size in bytes
   uint64 size = 3;
-  
+
   // GPU device ID (0-7 for 8-GPU setup)
   uint32 device_id = 4;
-  
+
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
+
+  // Shard metadata for mixed tensor-parallelism support.
+  // full_shape: unsharded tensor shape (e.g., [8192, 8192] for a full weight)
+  repeated uint64 full_shape = 6;
+
+  // Dimension along which the tensor is sharded (-1 = replicated, 0 = row, 1 = col)
+  int32 shard_dim = 7;
+
+  // Number of shards this tensor is split into (equals source TP size for sharded tensors)
+  uint32 effective_tp_size = 8;
+
+  // Index of this shard within the full tensor (0-based)
+  uint32 shard_index = 9;
 }
 
 // ============================================================================

@@ -47,8 +47,10 @@ def register_modelexpress_loaders():
 
 
 from .client import MxClient  # noqa: F401
+from .transfer_planner import TransferPlanner  # noqa: F401
 
 __all__ = [
     "MxClient",
+    "TransferPlanner",
     "register_modelexpress_loaders",
 ]

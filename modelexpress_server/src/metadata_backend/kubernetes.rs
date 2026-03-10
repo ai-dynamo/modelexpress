@@ -71,6 +71,10 @@ impl KubernetesBackend {
                 size: t.size.to_string(),
                 device_id: t.device_id,
                 dtype: t.dtype.clone(),
+                full_shape: t.full_shape.clone(),
+                shard_dim: t.shard_dim,
+                effective_tp_size: t.effective_tp_size,
+                shard_index: t.shard_index,
             })
             .collect();
 
@@ -165,6 +169,10 @@ impl KubernetesBackend {
                     size,
                     device_id: t.device_id,
                     dtype: t.dtype,
+                    full_shape: t.full_shape,
+                    shard_dim: t.shard_dim,
+                    effective_tp_size: t.effective_tp_size,
+                    shard_index: t.shard_index,
                 })
             })
             .collect::<MetadataResult<Vec<_>>>()?;

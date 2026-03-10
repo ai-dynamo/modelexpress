@@ -75,6 +75,10 @@ pub struct TensorRecord {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    pub full_shape: Vec<u64>,
+    pub shard_dim: i32,
+    pub effective_tp_size: u32,
+    pub shard_index: u32,
 }
 
 // Conversions from gRPC types
@@ -104,6 +108,10 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+            full_shape: desc.full_shape,
+            shard_dim: desc.shard_dim,
+            effective_tp_size: desc.effective_tp_size,
+            shard_index: desc.shard_index,
         }
     }
 }
@@ -139,6 +147,10 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            full_shape: record.full_shape,
+            shard_dim: record.shard_dim,
+            effective_tp_size: record.effective_tp_size,
+            shard_index: record.shard_index,
         }
     }
 }

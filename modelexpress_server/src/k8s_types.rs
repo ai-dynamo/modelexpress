@@ -153,6 +153,14 @@ pub struct TensorDescriptorJson {
     pub size: String,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub full_shape: Vec<u64>,
+    #[serde(default)]
+    pub shard_dim: i32,
+    #[serde(default)]
+    pub effective_tp_size: u32,
+    #[serde(default)]
+    pub shard_index: u32,
 }
 
 /// Sanitize model name to be a valid Kubernetes resource name
@@ -212,6 +220,10 @@ mod tests {
             size: "134217728".to_string(),
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            full_shape: vec![4096, 4096],
+            shard_dim: 0,
+            effective_tp_size: 2,
+            shard_index: 0,
         };
 
         let json = serde_json::to_string(&original).expect("serialize");
@@ -237,6 +249,10 @@ mod tests {
             size: u64::MAX.to_string(),
             device_id: 7,
             dtype: "float16".to_string(),
+            full_shape: vec![],
+            shard_dim: -1,
+            effective_tp_size: 0,
+            shard_index: 0,
         };
 
         let json = serde_json::to_string(&desc).expect("serialize");
