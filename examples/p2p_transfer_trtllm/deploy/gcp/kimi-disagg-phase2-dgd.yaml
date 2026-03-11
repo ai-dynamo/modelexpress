@@ -212,6 +212,10 @@ spec:
             - nats
             - --kv-block-size
             - "32"
+            - --dyn-tool-call-parser
+            - kimi_k2
+            - --dyn-reasoning-parser
+            - kimi_k25
           env:
             - name: POD_UID
               valueFrom:
@@ -403,6 +407,10 @@ spec:
             - nats
             - --kv-block-size
             - "32"
+            - --dyn-tool-call-parser
+            - kimi_k2
+            - --dyn-reasoning-parser
+            - kimi_k25
           env:
             - name: POD_UID
               valueFrom:

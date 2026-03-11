@@ -12,24 +12,22 @@ COMM_PATH = "/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/_torch/d
 
 SAFE_ALLGATHER = '''
 import pickle as _sa_pickle
-import numpy as _sa_np
 
 def safe_allgather(comm, obj, chunk_size=65536):
-    """Chunked allgather — avoids MPI_ERR_TRUNCATE with ob1 TCP BTL."""
+    """Allgather with size check — only chunks if message exceeds threshold."""
+    my_bytes = _sa_pickle.dumps(obj)
+    if len(my_bytes) <= chunk_size:
+        return comm.allgather(obj)
+    # Large object: use gather + broadcast to avoid allgather truncation
     rank = comm.Get_rank()
     size = comm.Get_size()
-    my_bytes = _sa_pickle.dumps(obj)
-    my_n = len(my_bytes)
-    lengths = _sa_np.array(comm.allgather(my_n), dtype=_sa_np.int64)
-    max_len = int(max(lengths))
-    all_data = [bytearray() for _ in range(size)]
-    for start in range(0, max_len, chunk_size):
-        end = min(start + chunk_size, my_n)
-        my_chunk = my_bytes[start:end] if start < my_n else b""
-        chunks = comm.allgather(bytes(my_chunk))
-        for i, c in enumerate(chunks):
-            all_data[i] += c
-    return [_sa_pickle.loads(bytes(d[:l])) for d, l in zip(all_data, lengths)]
+    gathered = comm.gather(my_bytes, root=0)
+    if rank == 0:
+        result = [_sa_pickle.loads(g) for g in gathered]
+    else:
+        result = None
+    result = comm.bcast(result, root=0)
+    return result
 '''
 
 REPLACEMENTS = [
