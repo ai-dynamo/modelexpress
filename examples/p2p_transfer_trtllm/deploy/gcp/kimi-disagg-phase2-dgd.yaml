@@ -17,7 +17,7 @@ metadata:
 data:
   prefill.yaml: |
     cache_transceiver_config:
-      backend: UCX
+      backend: DEFAULT
       max_tokens_in_buffer: 240000
     max_num_tokens: 4096
     enable_chunked_prefill: true
@@ -44,7 +44,7 @@ data:
   decode.yaml: |
     allreduce_strategy: MNNVL
     cache_transceiver_config:
-      backend: UCX
+      backend: DEFAULT
       max_tokens_in_buffer: 240000
     max_num_tokens: 8192
     cuda_graph_config:
@@ -169,7 +169,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - customer-gpu-w0e
+                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -360,7 +360,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - customer-gpu-w0e
+                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -378,11 +378,7 @@ spec:
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
-            capabilities:
-              add:
-                - IPC_LOCK
-                - SYS_RESOURCE
-            runAsUser: 0
+            privileged: true
           command:
             - python3
             - -m
@@ -432,10 +428,20 @@ spec:
               value: /tmp/hf_modules
             - name: TRITON_CACHE_DIR
               value: /tmp/.triton-cache
-            # MPI: UCX_TLS=tcp (Sara's B200 pattern). No ob1 needed.
-            # NIXL uses ibv_reg_mr via IPC_LOCK capability for RDMA.
             - name: UCX_TLS
-              value: "tcp"
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_ipc,cuda_copy,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE

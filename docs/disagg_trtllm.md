@@ -1,7 +1,28 @@
 # Disaggregated TRT-LLM Serving with ModelExpress P2P
 
-**Status**: P2P validated at all TP configs (345-610 Gbps). Multinode inference blocked by MPI/UCX.
+**Status**: END-TO-END VALIDATED — mixed TP disagg P2P + inference
 **Date**: March 11, 2026 (updated)
+
+### End-to-End Results (March 11, 2026)
+
+Kimi K2.5 disaggregated inference with MX P2P weight loading:
+
+| Component | TP | P2P Speed | Source |
+|-----------|-----|-----------|--------|
+| Prefill | 4 | 360-538 Gbps (RoCE) | modelexpress-server |
+| Decode | 8 (2 nodes) | 345-479 Gbps (RoCE) | modelexpress-server-decode |
+
+**Inference**:
+- Prefill: 3.4s TTFT
+- Decode: 4.1s total (8 tokens)
+- KV cache transfer: NIXL backend between prefill and decode
+- No `MPI_ERR_TRUNCATE` — fixed by `safe_allgather` patch
+
+**Key fixes for multinode**:
+- `safe_allgather` in `communicator.py` — chunks MPI allgather to 64KB (avoids TCP BTL truncation)
+- Multinode rank mapping — MPI rank vs `torch.cuda.current_device()` for source/target
+- `HOME=/root` + `/run/sshd` + `HF_MODULES_CACHE=/tmp/hf_modules` for DGD operator multinode
+- `cache_transceiver_config.backend: DEFAULT` (maps to NIXL) for KV cache transfer
 
 ---
 

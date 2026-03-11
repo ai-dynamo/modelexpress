@@ -1,17 +1,19 @@
 # Kimi K2.5 P2P Weight Transfer on GCP GB200
 
-Fast GPU-to-GPU weight loading for Kimi K2.5 (648 GB, TP=4) via ModelExpress NIXL RDMA.
-New workers load weights in **3.5 seconds at 369 Gbps** instead of ~75 min from disk.
+Fast GPU-to-GPU weight loading for Kimi K2.5 via ModelExpress NIXL RDMA.
+New workers load weights in **1.6-3.5 seconds at 370-610 Gbps** instead of ~75 min from disk.
+End-to-end disaggregated inference validated with mixed TP (prefill TP=4 + decode TP=8).
 
 ## Validated Results
 
-| Model | Mode | TP | Transfer | Speed | Transport |
-|-------|------|-----|----------|-------|-----------|
-| Qwen 0.5B | Aggregated | 2 | 1.26 GB | 25-33 Gbps | RoCE |
-| Kimi K2.5 | Aggregated | 4 | 648 GB | **369 Gbps** | RoCE |
-| Kimi K2.5 | Agg + DGDSA scale | 4 | 648 GB | **371-390 Gbps** | RoCE |
-| Kimi K2.5 | Disagg (prefill) | 4 | 648 GB | 255 Gbps | RoCE |
-| Kimi K2.5 | Disagg (decode) | 4 | 648 GB | 234 Gbps | RoCE |
+| Model | Mode | TP | Transfer | Speed | Inference | Transport |
+|-------|------|-----|----------|-------|-----------|-----------|
+| Qwen 0.5B | Aggregated | 2 | 1.26 GB | 25-33 Gbps | Works | RoCE |
+| Kimi K2.5 | Aggregated | 4 | 648 GB | **369 Gbps** | Works | RoCE |
+| Kimi K2.5 | Agg + DGDSA scale | 4 | 648 GB | **371-390 Gbps** | Works | RoCE |
+| Kimi K2.5 | Disagg same-TP | 4+4 | 1.3 TB | 234-538 Gbps | P2P only | RoCE |
+| Kimi K2.5 | **Mixed TP disagg** | **4+8** | **1.4 TB** | **345-610 Gbps** | **Works** | **RoCE** |
+| Kimi K2.5 | Mixed TP (inference) | 4+8 | — | — | TTFT 3.4s | NIXL KV |
 
 ---
 
@@ -115,7 +117,7 @@ kubectl -n kavin scale dgdsa/kimi-disagg-p2-decode --replicas=2
 |------|-----|------|-------|
 | `kimi-source-deploy.yaml` | 4 | Deployment | Single node, proven |
 | `kimi-source-dgd.yaml` | 4 | DGD | With frontend, for operator |
-| `kimi-source-decode-dgd.yaml` | 8 | DGD (multinode: 2) | Phase 2, needs `HOME=/root` fix |
+| `kimi-source-decode-dgd.yaml` | 8 | DGD (multinode: 2) | Phase 2, validated |
 | `kimi-source.yaml` | 4 | Standalone MPI | Legacy, no Dynamo engine |
 
 ### Targets / Workers (receive weights via P2P)
@@ -221,10 +223,36 @@ EOF
 tsh kube login dynamo-gcp-dev-01
 ```
 
+## Performance Summary
+
+### Weight Loading: Disk vs P2P
+
+| Metric | From Disk (PVC) | P2P RDMA | Speedup |
+|--------|----------------|----------|---------|
+| Prefill TP=4 weight load | ~68 min | **3.4s** | 1,200x |
+| Decode TP=8 weight load | ~31 min | **1.6s** | 1,160x |
+| Total startup (incl. autotuning) | ~68 min | **~90s** | 45x |
+
+### Inference (Mixed TP Disagg)
+
+| Metric | Value |
+|--------|-------|
+| TTFT (time to first token) | 3.4s |
+| Total time (8 tokens) | 4.1s |
+| KV cache backend | NIXL |
+| Prefill worker | TP=4 (single node) |
+| Decode worker | TP=8 (2 nodes, multinode MPI) |
+
+### Key Fix: `safe_allgather`
+
+The `safe_allgather` patch in TRT-LLM's `communicator.py` chunks MPI allgather
+messages into 64KB pieces, fixing `MPI_ERR_TRUNCATE` with `ob1` TCP BTL on GB200.
+Applied at build time via `trtllm_patches/v1.3.0rc5/patch_tp_allgather.py`.
+
 ## Image
 
 ```
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
 ```
 
 ## Branches
@@ -238,3 +266,4 @@ nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
 - [TRTLLM_PHASE_3.md](../../../docs/TRTLLM_PHASE_3.md) — Phase 3 disagg + mixed TP
 - [PLANNER_PLAN.md](../../../docs/PLANNER_PLAN.md) — Planner integration and scaling
 - [disagg_trtllm.md](../../../docs/disagg_trtllm.md) — Disagg architecture and mixed TP design
+- [disagg_inference_issues.md](../../../docs/disagg_inference_issues.md) — Multinode inference issues + fixes

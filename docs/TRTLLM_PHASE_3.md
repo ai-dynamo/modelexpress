@@ -1,6 +1,6 @@
 # TRT-LLM Phase 3: Disaggregated Serving with MX P2P
 
-**Status**: P2P transfer validated at all TP configs. Multinode inference blocked by MPI/UCX conflict.
+**Status**: END-TO-END VALIDATED — mixed TP disagg with MX P2P + inference
 **Date**: March 11, 2026 (updated)
 **Branch (modelexpress)**: `kavink/trtllm`
 **Branch (dynamo)**: `kavink/trtllm-p2p`
@@ -44,9 +44,24 @@ Prefill TP=4 + Decode TP=8 from separate MX sources:
 
 Cross-clique RoCE (o7v source → w0e target) also works at 345-379 Gbps.
 
-**Inference blocked**: `MPI_ERR_TRUNCATE` during multinode `tp_gather`. See [disagg_inference_issues.md](./disagg_inference_issues.md).
+**Inference VALIDATED** (March 11, 2026):
+```json
+{
+  "prefill_time_ms": 3431,
+  "ttft_ms": 3432,
+  "total_time_ms": 4080,
+  "prefill_worker": "TP=4 (dp_rank 1)",
+  "decode_worker": "TP=8 multinode (dp_rank 5)",
+  "kv_transfer": "NIXL backend",
+  "finish_reason": "length"
+}
+```
 
-### 1.4 Planner integration
+**Key fix**: `safe_allgather` patch in `communicator.py` — chunks MPI allgather
+into 64KB messages to avoid `MPI_ERR_TRUNCATE` with `ob1` TCP BTL. See
+[disagg_inference_issues.md](./disagg_inference_issues.md) for full details.
+
+### 1.5 Planner integration
 
 - AggPlanner `component_type` bug found and fixed (pushed to `kavink/trtllm-p2p`)
 - DisaggPlanner (`mode: disagg`) avoids this bug entirely

@@ -56,6 +56,10 @@ RUN DYNAMO_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm && \
 COPY trtllm_patches/v1.3.0rc5/apply_patches.py /tmp/apply_patches.py
 RUN python3 /tmp/apply_patches.py && rm /tmp/apply_patches.py
 
+# Patch tp_allgather to use chunked allgather (fixes MPI_ERR_TRUNCATE with ob1 TCP BTL)
+COPY trtllm_patches/v1.3.0rc5/patch_tp_allgather.py /tmp/patch_tp_allgather.py
+RUN python3 /tmp/patch_tp_allgather.py && rm /tmp/patch_tp_allgather.py
+
 # Verify installation (can't import full TRT-LLM at build time — no GPU)
 RUN python3 -c "from modelexpress.client import MxClient; print('ModelExpress client OK')" && \
     grep -q "PRESHARDED" /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/llmapi/llm_args.py && \
