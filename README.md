@@ -149,6 +149,29 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full configuration reference an
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, coding conventions, and contribution guidelines.
 
+## Roadmap
+
+### Forward-Looking Priorities
+
+Some active directions we are exploring:
+
+- **P2P compile/warmup caching**: Implementing torch.compile/deepGEMM cache strategy for follower workers. Operational model: leader performs full engine warmup; followers consume caches and skip full warmup.
+- **ModelStreamer Integration**: Integrating Model Streamer for pulling weights from cold storage, inheriting multi-cloud and multi-engine support.
+- **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high speed NVMe.
+- **RL workloads**: Exploring ways to utilize fast P2P transfers to optimize refit phase of RL and adding support for weight resharding.
+- **Earlier weight availability**: Bring weights to prefill earlier in the lifecycle and identify prefill workers that can act as strong source nodes.
+- **Expanded model pull providers**: Support NGC in addition to Hugging Face.
+- **GDS (GPUDirect Storage) integration**: Load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path entirely.
+- **Multi-tier cache hierarchy**: Automatically promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns and available capacity.
+- **Distributed sharded cache**: Shard large models across nodes using consistent hashing with parallel shard assembly, reducing per-node storage requirements for very large models.
+- **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts, dramatically reducing cold-start overhead.
+- **Metrics and observability**: Expose cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
+- **Predictive prefetching**: Pre-warm caches based on workload history or scheduling hints to reduce model load latency before a request arrives.
+- **P2P transfer fault tolerance**: Automatic recovery from stale rkeys on source restart, with retry logic and fallback to storage-based loading for production reliability.
+- **Multi-cloud storage backends**: Native support for AWS S3, Azure Blob, and NFS as model pull sources.
+
+We would love to hear your feedback! If you are interested in contributing to any of these paths, feel free to open up an issue!
+
 ## ModelExpress 0.1.0 Release
 
 **Includes:**
