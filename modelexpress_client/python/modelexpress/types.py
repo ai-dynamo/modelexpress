@@ -29,4 +29,3 @@ class GetMetadataResponse:
     """Response from GetMetadata RPC."""
     found: bool
     workers: list[WorkerMetadata]
-
