@@ -139,32 +139,89 @@ Error in UcxConnection constructor: Request canceled
 
 ## Approaches to Fix Multinode Inference
 
-### Option A: NIXL UCX_TLS override (implemented, untested)
+### Option A: `runAsUser: 0` for decode (immediate workaround)
+- Use Karen's config: `runAsUser: 0`, no OMPI/UCX overrides
+- MPI works, NCCL handles TP via NVIDIA driver, KV cache NIXL works
+- P2P falls back to TCP (~3 Gbps) — 90.75 GB in ~4 min (still 8x faster than disk)
+- **Pros**: Zero code changes, proven by Karen
+- **Cons**: No RoCE for decode P2P. Prefill (single-node) still gets RoCE.
+- **Status**: Ready to deploy
+
+### Option B: Add `safe_allgather` to TRT-LLM (recommended upstream fix)
+- **The actual bug**: `tp_allgather` uses raw `comm.allgather(obj)` without chunking.
+  `safe_gather` already exists with `chunk_size=4MB`, but `tp_allgather` bypasses it.
+- **File**: `tensorrt_llm/_torch/distributed/communicator.py` line 545
+- **Current code**: `return self.tp_comm.allgather(obj)` — no size limit
+- **Fix**: Route through chunked allgather (like `safe_gather`), or use
+  `torch.distributed.all_gather_object` which handles large messages natively
+- **Pros**: Minimal change, fixes ob1 truncation without changing executor
+- **Cons**: Requires TRT-LLM upstream PR
+- **Status**: Not implemented. Filed as suggestion.
+
+```python
+# Suggested fix in MPIDist (communicator.py):
+def tp_allgather(self, obj):
+    # Use safe chunked allgather instead of raw comm.allgather
+    return safe_allgather(self.tp_comm, obj, chunk_size=64 * 1024)
+```
+
+### Option C: `TLLM_DISABLE_MPI=1` (needs Ray)
+- TRT-LLM has `TLLM_DISABLE_MPI=1` → switches from `MPIDist` to `TorchDist` (NCCL)
+- **Problem**: Also switches executor from MPI-based to **Ray-based**
+- Requires Ray installed + Ray-based launch (not compatible with operator's `mpirun`)
+- **Tested**: Crashes with `ModuleNotFoundError: Cannot import Ray`
+- **Pros**: Would completely solve MPI issues
+- **Cons**: Different launch paradigm, needs Ray in image + operator support
+- **Status**: Tested, not viable with current operator
+
+### Option D: NIXL UCX_TLS override (implemented)
 - `UCX_TLS=tcp` globally for MPI
 - NIXL temporarily removes it during agent creation → auto-detects RoCE
 - `IPC_LOCK` + `SYS_RESOURCE` capabilities (not privileged)
-- **Pros**: Clean separation, no privileged needed
-- **Cons**: UCX context creation is not guaranteed to be isolated from global state
-- **Status**: Built in v1.6.0, pending cluster scheduling
+- **Problem**: operator's `mpirun -x UCX_TLS=tcp` re-sets env in worker processes,
+  so NIXL override doesn't take effect in multinode workers
+- **Pros**: Clean concept, works for single-node
+- **Cons**: Doesn't work with `mpirun -x` env propagation
+- **Status**: Built in v1.6.0, doesn't work for multinode
 
-### Option B: TRT-LLM fix — NCCL for tp_gather
-- Change TRT-LLM's `safe_gather` to use NCCL instead of MPI `allgather`
-- NCCL handles cross-node collectives natively via NVIDIA driver
-- **Pros**: Eliminates MPI runtime dependency entirely
-- **Cons**: Requires TRT-LLM upstream change
-- Karen's recipes work because NCCL handles TP communication
+### Option E: NIXL per-context UCX config (NIXL team)
+- NIXL C++ backend supports `engine_config` with `TLS=rc_v,rc_x,...`
+- Python API (`nixl_agent_config`) doesn't expose this yet
+- **Fix**: Add `ucx_engine_config` param to Python `nixl_agent_config`:
+  ```python
+  config = nixl_agent_config(
+      backends=["UCX"],
+      ucx_engine_config="TLS=rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
+  )
+  ```
+- This would override UCX_TLS at the NIXL context level, immune to `mpirun -x`
+- **Pros**: Proper isolation, works with any MPI config
+- **Cons**: Requires NIXL Python API change (C++ already supports it)
+- **Status**: Not implemented. File as NIXL feature request.
 
-### Option C: Fix MPI ob1 TCP BTL truncation
-- Increase `btl_tcp_max_send_size` and related buffer params
-- Or chunk the `allgather` into smaller messages in `safe_gather`
-- **Pros**: Minimal change
-- **Cons**: May not fully resolve for very large responses
-
-### Option D: Fix UCX UD timeout on GB200
+### Option F: Fix UCX UD timeout on GB200
 - Root cause fix in UCX/driver for IB UD transport timeout
 - Would allow default UCX PML to work with `privileged: true`
-- **Pros**: Fixes everything
+- **Pros**: Fixes everything at the source
 - **Cons**: Hardware/driver issue, not in our control
+- **Status**: Known issue, no ETA
+
+### Option G: Sara's pattern — `IPC_LOCK` + `UCX_TLS=tcp` + NCCL built-in IB
+- From [k8s-nccl-test B200](https://github.com/sara4dev/k8s-nccl-test/tree/b200)
+- `UCX_TLS=tcp` for MPI, NCCL uses built-in IB transport (not UCX)
+- `IPC_LOCK` + `SYS_RESOURCE` capabilities for RDMA memory registration
+- **Tested**: MPI works, but NIXL also gets `UCX_TLS=tcp` (no RoCE)
+- Same issue as Option D — global UCX_TLS affects NIXL
+- **Status**: Tested, NIXL falls back to TCP
+
+---
+
+## Recommendation Priority
+
+1. **Immediate**: Option A (`runAsUser: 0`) — get end-to-end inference working today
+2. **Short-term**: Option B (TRT-LLM `safe_allgather`) — one PR to TRT-LLM, fixes everything
+3. **Medium-term**: Option E (NIXL `ucx_engine_config`) — proper RoCE isolation for NIXL
+4. **Long-term**: Option F (fix UCX UD on GB200) — root cause, eliminates all workarounds
 
 ---
 
@@ -173,9 +230,9 @@ Error in UcxConnection constructor: Request canceled
 ### What works for P2P weight transfer (all scenarios):
 ```yaml
 securityContext:
-  privileged: true     # or IPC_LOCK + SYS_RESOURCE capabilities
+  privileged: true
 env:
-  UCX_TLS: "rc_v,rc_x,rc,dc_x,dc,cuda_ipc,cuda_copy,tcp"  # for NIXL
+  UCX_TLS: "rc_v,rc_x,rc,dc_x,dc,cuda_ipc,cuda_copy,tcp"
   OMPI_MCA_pml: "ob1"
   OMPI_MCA_btl: "tcp,self,vader"
 ```
@@ -190,21 +247,34 @@ env:
   OMPI_MCA_btl: "tcp,self,vader"
 ```
 
-### What Karen uses for multinode inference (no MX P2P):
+### What works for multinode inference (Karen's approach, no RoCE P2P):
 ```yaml
 securityContext:
   runAsUser: 0
 # No UCX_TLS, no OMPI_MCA overrides
 # NCCL handles TP collectives via NVIDIA driver
+# P2P falls back to TCP (~3 Gbps)
 ```
 
-### Target config for multinode with MX P2P (untested):
+### What works for multinode P2P + startup (not inference):
 ```yaml
 securityContext:
-  capabilities:
-    add: [IPC_LOCK, SYS_RESOURCE]
-  runAsUser: 0
+  privileged: true
 env:
-  UCX_TLS: "tcp"           # MPI stays on TCP
-  # NIXL auto-detects RoCE via UCX_TLS override in nixl_transfer.py
+  UCX_TLS: "rc_v,rc_x,rc,dc_x,dc,cuda_ipc,cuda_copy,tcp"
+  OMPI_MCA_pml: "ob1"
+  OMPI_MCA_btl: "tcp,self,vader"
+# P2P at 370-610 Gbps, autotuning works, inference hits MPI_ERR_TRUNCATE
 ```
+
+### What we tried and failed:
+
+| Config | P2P | MPI Init | Inference | Why it failed |
+|--------|-----|----------|-----------|---------------|
+| `privileged` + `ob1` + TCP BTL | RoCE 370+ Gbps | Works | `MPI_ERR_TRUNCATE` | TCP BTL can't handle large allgather |
+| `privileged` + no OMPI overrides | N/A | Hangs | N/A | UCX UD timeout on GB200 |
+| `runAsUser: 0` + no overrides | TCP ~3 Gbps | Works | Works (Karen) | No RoCE without IB devices |
+| `IPC_LOCK` + `UCX_TLS=tcp` | TCP ~3 Gbps | Works | Untested | NIXL also gets TCP |
+| `TLLM_DISABLE_MPI=1` | N/A | N/A | Ray not installed | Switches to Ray executor |
+| `UCX_TLS=tcp,cuda_ipc,...` + `privileged` | N/A | Hangs | N/A | UCX confused by visible IB |
+| No env overrides + operator mpirun | N/A | `btl_tcp` errors | N/A | Process ID mismatch |
