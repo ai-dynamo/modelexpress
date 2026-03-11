@@ -471,27 +471,39 @@ class MxLiveWeightLoader:
 
         device_id = torch.cuda.current_device()
 
+        # MPI rank may differ from local GPU index in multinode (e.g., rank 4
+        # on node B sees local GPU 0). Use MPI rank for source worker matching,
+        # local GPU index for NIXL agent and tensor registration.
+        try:
+            from mpi4py import MPI
+            mpi_rank = MPI.COMM_WORLD.Get_rank()
+        except Exception:
+            mpi_rank = device_id
+
         # MPI workers' stdout is swallowed by TRT-LLM — write to per-rank file
         log_dir = os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs")
         os.makedirs(log_dir, exist_ok=True)
-        rank_log = os.path.join(log_dir, f"rank{device_id}.log")
+        rank_log = os.path.join(log_dir, f"rank{mpi_rank}.log")
         fh = logging.FileHandler(rank_log, mode="w")
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
         logging.getLogger("modelexpress").addHandler(fh)
 
         logger.info(
-            "Live transfer: loading '%s' into model on GPU %d", model_name, device_id
+            "Live transfer: loading '%s' rank %d (GPU %d)", model_name, mpi_rank, device_id
         )
 
         # 1. Query source metadata
         query_timeout = int(os.environ.get("MX_SOURCE_QUERY_TIMEOUT", "3600"))
         source_meta = self._query_source(mx_server, model_name, timeout=query_timeout)
 
-        # Find my rank's source worker
-        my_workers = [w for w in source_meta.workers if w.worker_rank == device_id]
+        # Find my rank's source worker — use MPI rank, not local GPU index
+        my_workers = [w for w in source_meta.workers if w.worker_rank == mpi_rank]
         if not my_workers:
-            raise RuntimeError(f"No source worker for rank {device_id}")
+            raise RuntimeError(
+                f"No source worker for rank {mpi_rank} (device_id={device_id}). "
+                f"Source has workers: {[w.worker_rank for w in source_meta.workers]}"
+            )
         source_worker = my_workers[0]
 
         # 2. Build name→param map from target model
@@ -538,7 +550,7 @@ class MxLiveWeightLoader:
 
         # 5. Initialize NIXL and register TARGET param buffers
         nixl_mgr = NixlTransferManager(
-            agent_name=f"trtllm-live-target-rank{device_id}-{os.getpid()}",
+            agent_name=f"trtllm-live-target-rank{mpi_rank}-{os.getpid()}",
             device_id=device_id,
         )
         nixl_mgr.initialize()
@@ -573,7 +585,7 @@ class MxLiveWeightLoader:
 
         logger.info(
             "Rank %d: transferred %d params (%.2f GB) in %.2fs (%.1f Gbps) — DIRECT into model params",
-            device_id, n_tensors, bytes_transferred / 1e9, elapsed, bw,
+            mpi_rank, n_tensors, bytes_transferred / 1e9, elapsed, bw,
         )
 
         nixl_mgr.shutdown()

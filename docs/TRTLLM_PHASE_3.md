@@ -82,11 +82,61 @@ consistently. One-line change in `kimi-source-decode-dgd.yaml`.
 | `deploy/gcp/kimi-source-decode-dgd.yaml` | TP=8 decode source (DGD, multinode: 2) |
 | `deploy/gcp/kimi-disagg-phase2-dgd.yaml` | Disagg DGD: prefill→Server A, decode→Server B |
 
-### 2.5 Resume checklist
+### 2.5 Multinode implementation plan
+
+To support TP=4 prefill + TP=8 decode with DGDSA scaling:
+
+**Step 1: Fix rank mapping bug** (ModelExpress code change)
+- File: `modelexpress_client/python/modelexpress/trtllm_live_transfer.py`
+- Change `MxLiveWeightLoader.load_weights()` to use `MPI.COMM_WORLD.Get_rank()`
+  instead of `torch.cuda.current_device()` for source worker lookup
+- This is the only code change needed — everything else is YAML config
+
+**Step 2: Fix SSH key path** (YAML config)
+- Add `HOME=/root` env var to all multinode DGD specs
+- Affects: `kimi-source-decode-dgd.yaml`, `kimi-disagg-phase2-dgd.yaml` (decode service)
+
+**Step 3: Validate TP=8 source publish** (deployment)
+- Deploy `kimi-source-decode-dgd.yaml` with `HOME=/root` fix
+- Wait ~75 min for model loading
+- Verify Redis has 8 workers: `kubectl exec deploy/redis-decode -- redis-cli KEYS '*'`
+
+**Step 4: Validate TP=8 target receive** (deployment)
+- Deploy a standalone TP=8 decode target (multinode: 2) pointing at decode MX server
+- Verify all 8 ranks receive correct shards (rank N gets source rank N's data)
+- Check transfer speeds (expect ~370 Gbps per rank over RoCE)
+
+**Step 5: End-to-end disagg** (integration)
+- Deploy `kimi-disagg-phase2-dgd.yaml` with both prefill and decode
+- Prefill TP=4 → Server A (single node, proven path)
+- Decode TP=8 → Server B (multinode, new path)
+- Test inference through KV-aware frontend
+
+**Step 6: DGDSA scale test** (scaling)
+- Scale decode: `kubectl scale dgdsa/kimi-disagg-p2-decode --replicas=2`
+- Operator creates second decode pod group (2 more nodes, 8 more GPUs)
+- Second decode loads via P2P from Source B
+- Both decode replicas serve via frontend
+
+**GPU budget:**
+
+| Component | GPUs | Nodes |
+|-----------|------|-------|
+| Source A (TP=4 prefill) | 4 | 1 |
+| Source B (TP=8 decode) | 8 | 2 |
+| Prefill worker × 1 | 4 | 1 |
+| Decode worker × 1 | 8 | 2 |
+| **Total (1 replica each)** | **24** | **6** |
+| Decode worker × 2 (scaled) | +8 | +2 |
+| **Total (decode scaled to 2)** | **32** | **8** |
+
+### 2.6 Resume checklist
 
 1. `tsh kube login dynamo-gcp-dev-01`
-2. Fix SSH: Add `- name: HOME` / `value: "/root"` to `kimi-source-decode-dgd.yaml` env
-3. Delete and redeploy decode source:
+2. **Fix rank mapping bug** in `trtllm_live_transfer.py` (Step 1 above)
+3. **Rebuild image** with the fix → `dynamo-trtllm-mx-v1.6.0`
+4. Fix SSH: Add `HOME=/root` to `kimi-source-decode-dgd.yaml` and phase2 decode env
+5. Delete and redeploy decode source:
    ```bash
    kubectl -n kavin delete dgd kimi-source-decode
    kubectl -n kavin apply -f .../deploy/gcp/kimi-source-decode-dgd.yaml
@@ -129,14 +179,42 @@ creation fails. Worker DGD specs must NOT include `/dev/shm`.
 `~` resolves to `/home/dynamo` in our image but sshd runs as root and looks in `/root/.ssh/`.
 Fix: `HOME=/root` env var. Karen's image works natively.
 
-### 3.5 Planner metrics not flowing
+### 3.5 Multinode rank mapping bug in MxLiveWeightLoader (MUST FIX)
+
+`MxLiveWeightLoader.load_weights()` uses `torch.cuda.current_device()` to find
+the source worker:
+
+```python
+device_id = torch.cuda.current_device()   # returns LOCAL GPU index
+my_workers = [w for w in source_meta.workers if w.worker_rank == device_id]
+```
+
+In multinode, rank 4 runs on node B and sees local GPU 0 — so it looks up
+`worker_rank == 0` instead of `worker_rank == 4`, receiving the wrong weights.
+
+**Fix**: Use MPI rank for source worker lookup, local GPU index for NIXL:
+
+```python
+try:
+    from mpi4py import MPI
+    rank = MPI.COMM_WORLD.Get_rank()
+except Exception:
+    rank = torch.cuda.current_device()
+device_id = torch.cuda.current_device()
+my_workers = [w for w in source_meta.workers if w.worker_rank == rank]
+```
+
+This fix is required before TP=8 multinode targets will work correctly.
+Source-side publish is already correct (`worker.rank` is the MPI rank).
+
+### 3.6 Planner metrics not flowing (needs planner team)
 
 Per-worker load metrics (`worker_active_decode_blocks`) require:
 - Worker: `--publish-events-and-metrics` + `--request-plane nats`
 - Frontend: `--request-plane nats`
 - Metrics still not appearing on frontend `/metrics` after traffic. Needs planner team investigation.
 
-### 3.6 Disagg KV cache transceiver
+### 3.7 Disagg KV cache transceiver
 
 Prefill→decode KV cache transfer via `cache_transceiver_config` not working end-to-end.
 Prefill processes requests but decode doesn't receive KV data. Likely UCX connectivity

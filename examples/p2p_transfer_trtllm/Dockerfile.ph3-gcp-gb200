@@ -20,6 +20,9 @@ FROM nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
 
 USER root
 
+# Multinode MPI: sshd requires privilege separation directory owned by root, mode 0755
+RUN mkdir -p /run/sshd && chmod 0755 /run/sshd && chown root:root /run/sshd
+
 # Install ModelExpress client (gRPC + NIXL transfer)
 COPY modelexpress_client/python /tmp/modelexpress_client
 COPY modelexpress_common/proto /tmp/proto

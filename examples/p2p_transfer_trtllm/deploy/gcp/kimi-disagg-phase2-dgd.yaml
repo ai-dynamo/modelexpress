@@ -83,7 +83,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
           command:
             - python3
           args:
@@ -180,7 +180,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -364,7 +364,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -408,6 +408,8 @@ spec:
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: WORLD_SIZE
               value: "8"
+            - name: HOME
+              value: "/root"
             - name: HF_HOME
               value: /model-cache
             - name: TRITON_CACHE_DIR
