@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "model-express-workspace-tests"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "modelexpress-client",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-client"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-common"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-server"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2468,9 +2468,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.13"
+version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "bytes",
  "getrandom 0.3.3",
