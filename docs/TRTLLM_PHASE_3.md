@@ -1,7 +1,7 @@
 # TRT-LLM Phase 3: Disaggregated Serving with MX P2P
 
-**Status**: Phase 1 (same TP) validated, Phase 2 (mixed TP) in progress
-**Date**: March 10, 2026
+**Status**: P2P transfer validated at all TP configs. Multinode inference blocked by MPI/UCX conflict.
+**Date**: March 11, 2026 (updated)
 **Branch (modelexpress)**: `kavink/trtllm`
 **Branch (dynamo)**: `kavink/trtllm-p2p`
 **Cluster**: `dynamo-gcp-dev-01` (GCP GB200 NVL36, ARM64)
@@ -30,7 +30,23 @@ Both prefill and decode workers (TP=4) load from single MX source concurrently:
 
 YAML: `deploy/gcp/kimi-disagg-mx-dgd.yaml`
 
-### 1.3 Planner integration
+### 1.3 Mixed TP P2P (Phase 3b — P2P validated, inference blocked)
+
+Prefill TP=4 + Decode TP=8 from separate MX sources:
+
+| Worker | TP | Source | Data/rank | Time | Speed |
+|--------|-----|--------|-----------|------|-------|
+| Prefill | 4 | modelexpress-server (o7v) | 162 GB | 3.2-3.6s | 360-393 Gbps |
+| Decode rank 0 | 8 | modelexpress-server-decode (o7v) | 90.75 GB | 1.19s | **610 Gbps** |
+| Decode rank 1 | 8 | " | 90.75 GB | 1.52s | 479 Gbps |
+| Decode rank 4 (node B) | 8 | " | 90.75 GB | 1.78s | 408 Gbps |
+| Decode rank 7 (node B) | 8 | " | 90.75 GB | 1.60s | 455 Gbps |
+
+Cross-clique RoCE (o7v source → w0e target) also works at 345-379 Gbps.
+
+**Inference blocked**: `MPI_ERR_TRUNCATE` during multinode `tp_gather`. See [disagg_inference_issues.md](./disagg_inference_issues.md).
+
+### 1.4 Planner integration
 
 - AggPlanner `component_type` bug found and fixed (pushed to `kavink/trtllm-p2p`)
 - DisaggPlanner (`mode: disagg`) avoids this bug entirely

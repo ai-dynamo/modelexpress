@@ -1,7 +1,7 @@
 # Disaggregated TRT-LLM Serving with ModelExpress P2P
 
-**Status**: Phase 1 (same TP) validated, Phase 2 (mixed TP) planned
-**Date**: March 10, 2026
+**Status**: P2P validated at all TP configs (345-610 Gbps). Multinode inference blocked by MPI/UCX.
+**Date**: March 11, 2026 (updated)
 
 ---
 

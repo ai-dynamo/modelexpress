@@ -352,7 +352,15 @@ def publish_from_worker(worker: Any) -> None:
         logger.warning("publish_from_worker: model_engine has no torch model")
         return
 
-    device_id = getattr(worker, "rank", torch.cuda.current_device())
+    # MPI rank may differ from local GPU index in multinode.
+    # Use local GPU for param filtering and NIXL agent, MPI rank for metadata.
+    device_id = torch.cuda.current_device()
+    try:
+        from mpi4py import MPI
+        mpi_rank = MPI.COMM_WORLD.Get_rank()
+    except Exception:
+        mpi_rank = getattr(worker, "rank", device_id)
+
     model_name = os.environ.get("MODEL_NAME", "unknown")
     mx_server = os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001")
 
@@ -364,24 +372,21 @@ def publish_from_worker(worker: Any) -> None:
             total_bytes += param.numel() * param.element_size()
 
     if not param_tensors:
-        logger.warning("publish_from_worker: no params on device %d", device_id)
+        logger.warning("publish_from_worker: no params on device %d (rank %d)", device_id, mpi_rank)
         return
 
     logger.info(
-        "ModelExpress worker publish: '%s' rank %d, %d params, %.2f GB",
-        model_name, device_id, len(param_tensors), total_bytes / 1e9,
+        "ModelExpress worker publish: '%s' rank %d (GPU %d), %d params, %.2f GB",
+        model_name, mpi_rank, device_id, len(param_tensors), total_bytes / 1e9,
     )
 
     nixl_mgr = NixlTransferManager(
-        agent_name=f"trtllm-live-source-rank{device_id}-{os.getpid()}",
+        agent_name=f"trtllm-live-source-rank{mpi_rank}-{os.getpid()}",
         device_id=device_id,
     )
     nixl_mgr.initialize()
     nixl_mgr.register_tensors(param_tensors)
 
-    # Keep the NIXL manager alive for the lifetime of the worker process.
-    # If it goes out of scope, the UCX agent shuts down and the listening port
-    # closes — targets would get "Connection refused" when trying to RDMA.
     worker._mx_nixl_manager = nixl_mgr
 
     tensor_protos = []
@@ -395,7 +400,7 @@ def publish_from_worker(worker: Any) -> None:
         ))
 
     my_worker = p2p_pb2.WorkerMetadata(
-        worker_rank=device_id,
+        worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
         tensors=tensor_protos,
     )
@@ -431,7 +436,7 @@ def publish_from_worker(worker: Any) -> None:
         logger.info("ModelExpress: published ALL %d workers to MX server", len(all_workers))
 
     comm.Barrier()
-    logger.info("ModelExpress worker rank %d published %.2f GB", device_id, total_bytes / 1e9)
+    logger.info("ModelExpress worker rank %d (GPU %d) published %.2f GB", mpi_rank, device_id, total_bytes / 1e9)
 
 
 class MxLiveWeightLoader:

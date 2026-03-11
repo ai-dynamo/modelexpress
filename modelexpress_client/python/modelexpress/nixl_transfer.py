@@ -74,7 +74,15 @@ class NixlTransferManager:
         return self._tensor_descriptors
 
     def initialize(self) -> None:
-        """Initialize the NIXL agent."""
+        """Initialize the NIXL agent.
+
+        Temporarily overrides UCX_TLS to allow NIXL's UCX context to
+        auto-detect RoCE/IB transports, even if the global UCX_TLS is
+        restricted to TCP (e.g., for MPI). Restores the original value
+        after agent creation.
+        """
+        import os
+
         if not NIXL_AVAILABLE:
             raise RuntimeError("NIXL is not available")
 
@@ -83,9 +91,26 @@ class NixlTransferManager:
 
         torch.cuda.set_device(self._device_id)
 
-        config = nixl_agent_config(backends=["UCX"]) if nixl_agent_config else None
-        self._agent = NixlAgent(self._agent_name, config)
-        logger.info(f"NIXL agent '{self._agent_name}' created on device {self._device_id}")
+        # Override UCX_TLS for NIXL's context to enable RoCE auto-detection.
+        # MPI may set UCX_TLS=tcp globally, which would restrict NIXL to TCP.
+        saved_ucx_tls = os.environ.get("UCX_TLS")
+        nixl_ucx_tls = os.environ.get("NIXL_UCX_TLS")
+        if nixl_ucx_tls:
+            os.environ["UCX_TLS"] = nixl_ucx_tls
+            logger.info(f"NIXL UCX_TLS override: {nixl_ucx_tls} (was: {saved_ucx_tls})")
+        elif saved_ucx_tls == "tcp":
+            os.environ.pop("UCX_TLS", None)
+            logger.info(f"NIXL: removed UCX_TLS=tcp for RoCE auto-detection")
+
+        try:
+            config = nixl_agent_config(backends=["UCX"]) if nixl_agent_config else None
+            self._agent = NixlAgent(self._agent_name, config)
+            logger.info(f"NIXL agent '{self._agent_name}' created on device {self._device_id}")
+        finally:
+            if saved_ucx_tls is not None:
+                os.environ["UCX_TLS"] = saved_ucx_tls
+            elif "UCX_TLS" in os.environ:
+                os.environ.pop("UCX_TLS")
 
     def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
         """

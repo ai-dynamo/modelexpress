@@ -18,18 +18,21 @@ data:
   prefill.yaml: |
     cache_transceiver_config:
       backend: UCX
-      max_tokens_in_buffer: 16384
+      max_tokens_in_buffer: 240000
     max_num_tokens: 4096
     enable_chunked_prefill: true
+    cuda_graph_config:
+      max_batch_size: 4
+      enable_padding: true
     disable_overlap_scheduler: true
     enable_attention_dp: true
     kv_cache_config:
       dtype: fp8
       enable_block_reuse: true
-      free_gpu_memory_fraction: 0.5
+      free_gpu_memory_fraction: 0.7
       tokens_per_block: 32
     max_batch_size: 4
-    max_seq_len: 16384
+    max_seq_len: 240000
     model_kwargs:
       num_hidden_layers: 61
     moe_config:
@@ -39,9 +42,10 @@ data:
     tensor_parallel_size: 4
     trust_remote_code: true
   decode.yaml: |
+    allreduce_strategy: MNNVL
     cache_transceiver_config:
       backend: UCX
-      max_tokens_in_buffer: 16384
+      max_tokens_in_buffer: 240000
     max_num_tokens: 8192
     cuda_graph_config:
       max_batch_size: 8
@@ -51,10 +55,10 @@ data:
     kv_cache_config:
       dtype: fp8
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.5
+      free_gpu_memory_fraction: 0.7
       tokens_per_block: 32
     max_batch_size: 8
-    max_seq_len: 16384
+    max_seq_len: 240000
     model_kwargs:
       num_hidden_layers: 61
     moe_config:
@@ -130,7 +134,7 @@ spec:
         volumes:
           - name: model-cache
             persistentVolumeClaim:
-              claimName: shared-model-cache
+              claimName: model-cache
 
     # --- Prefill: TP=4, reads from Source A (modelexpress-server) ---
     prefill:
@@ -166,15 +170,14 @@ spec:
                   operator: In
                   values:
                   - customer-gpu-w0e
-                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchExpressions:
-                - key: app
+                - key: app.kubernetes.io/part-of
                   operator: In
                   values:
-                  - kimi-source-deploy
+                  - kimi-disagg-p2
               topologyKey: nvidia.com/gpu.clique
         containers: null
         imagePullSecrets:
@@ -226,8 +229,12 @@ spec:
               value: "4"
             - name: HF_HOME
               value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: HF_MODULES_CACHE
+              value: /tmp/hf_modules
             - name: TRITON_CACHE_DIR
-              value: /model-cache/.triton-cache
+              value: /tmp/.triton-cache
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
@@ -270,6 +277,10 @@ spec:
               value: "0"
             - name: NCCL_MAX_NCHANNELS
               value: "2"
+            - name: TRTLLM_FORCE_COMM_METHOD
+              value: NVLINK_TWO_SIDED
+            - name: ENABLE_CONFIGURABLE_MOE
+              value: "1"
             - name: TLLM_LOG_LEVEL
               value: "INFO"
             - name: TLLM_OVERRIDE_LAYER_NUM
@@ -309,7 +320,7 @@ spec:
               type: DirectoryOrCreate
           - name: model-cache
             persistentVolumeClaim:
-              claimName: shared-model-cache
+              claimName: model-cache
           - name: trtllm-config
             configMap:
               name: kimi-disagg-phase2-trtllm-config
@@ -350,7 +361,6 @@ spec:
                   operator: In
                   values:
                   - customer-gpu-w0e
-                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -358,7 +368,7 @@ spec:
                 - key: app.kubernetes.io/part-of
                   operator: In
                   values:
-                  - kimi-source-decode
+                  - kimi-disagg-p2
               topologyKey: nvidia.com/gpu.clique
         containers: null
         imagePullSecrets:
@@ -368,7 +378,11 @@ spec:
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
-            privileged: true
+            capabilities:
+              add:
+                - IPC_LOCK
+                - SYS_RESOURCE
+            runAsUser: 0
           command:
             - python3
             - -m
@@ -412,28 +426,16 @@ spec:
               value: "/root"
             - name: HF_HOME
               value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: HF_MODULES_CACHE
+              value: /tmp/hf_modules
             - name: TRITON_CACHE_DIR
-              value: /model-cache/.triton-cache
-            - name: NIXL_LOG_LEVEL
-              value: "INFO"
-            - name: UCX_LOG_LEVEL
-              value: "WARN"
+              value: /tmp/.triton-cache
+            # MPI: UCX_TLS=tcp (Sara's B200 pattern). No ob1 needed.
+            # NIXL uses ibv_reg_mr via IPC_LOCK capability for RDMA.
             - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
-            - name: UCX_RNDV_SCHEME
-              value: "get_zcopy"
-            - name: UCX_RNDV_THRESH
-              value: "0"
-            - name: OMPI_MCA_pml
-              value: "ob1"
-            - name: OMPI_MCA_btl
-              value: "tcp,self,vader"
-            - name: OMPI_MCA_btl_tcp_if_include
-              value: "eth0"
-            - name: OMPI_MCA_oob_tcp_if_include
-              value: "eth0"
-            - name: NCCL_NET_PLUGIN
-              value: "none"
+              value: "tcp"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -458,12 +460,8 @@ spec:
               value: "0"
             - name: NCCL_MAX_NCHANNELS
               value: "2"
-            - name: ENABLE_CONFIGURABLE_MOE
-              value: "1"
             - name: TLLM_LOG_LEVEL
               value: "INFO"
-            - name: TLLM_OVERRIDE_LAYER_NUM
-              value: "61"
           volumeMounts:
             - mountPath: /dev/infiniband
               name: infiniband
@@ -499,7 +497,7 @@ spec:
               type: DirectoryOrCreate
           - name: model-cache
             persistentVolumeClaim:
-              claimName: shared-model-cache
+              claimName: model-cache
           - name: trtllm-config
             configMap:
               name: kimi-disagg-phase2-trtllm-config

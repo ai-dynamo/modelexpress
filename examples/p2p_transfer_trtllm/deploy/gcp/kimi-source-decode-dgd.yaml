@@ -89,7 +89,7 @@ spec:
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
-            runAsUser: 0
+            privileged: true
           command:
             - python3
             - -m
@@ -128,6 +128,10 @@ spec:
               value: "/root"
             - name: HF_HOME
               value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: HF_MODULES_CACHE
+              value: /tmp/hf_modules
             - name: TRITON_CACHE_DIR
               value: /model-cache/.triton-cache
             - name: NIXL_LOG_LEVEL
