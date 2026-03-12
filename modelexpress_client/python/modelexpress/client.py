@@ -112,6 +112,7 @@ class MxClient:
         self,
         model_name: str,
         workers: list[p2p_pb2.WorkerMetadata],
+        world_size: int = 0,
     ) -> bool:
         """Publish worker metadata so targets can discover this source.
 
@@ -120,6 +121,7 @@ class MxClient:
         request = p2p_pb2.PublishMetadataRequest(
             model_name=model_name,
             workers=workers,
+            world_size=world_size,
         )
         response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:
@@ -127,10 +129,13 @@ class MxClient:
         return response.success
 
     def get_metadata(
-        self, model_name: str
+        self, model_name: str, world_size: int = 0
     ) -> p2p_pb2.GetMetadataResponse:
         """Query for existing source metadata for *model_name*."""
-        request = p2p_pb2.GetMetadataRequest(model_name=model_name)
+        request = p2p_pb2.GetMetadataRequest(
+            model_name=model_name,
+            world_size=world_size,
+        )
         return self.stub.GetMetadata(request, timeout=30)
 
     def publish_ready(
@@ -141,6 +146,7 @@ class MxClient:
         metadata_hash: str,
         nixl_ready: bool = True,
         stability_verified: bool = True,
+        world_size: int = 0,
     ) -> bool:
         """Publish a source-ready flag.  Returns *True* on success."""
         request = p2p_pb2.PublishReadyRequest(
@@ -150,6 +156,7 @@ class MxClient:
             metadata_hash=metadata_hash,
             nixl_ready=nixl_ready,
             stability_verified=stability_verified,
+            world_size=world_size,
         )
         response = self.stub.PublishReady(request, timeout=30)
         if not response.success:
@@ -158,12 +165,13 @@ class MxClient:
         return True
 
     def get_ready(
-        self, model_name: str, worker_id: int
+        self, model_name: str, worker_id: int, world_size: int = 0
     ) -> p2p_pb2.GetReadyResponse:
         """Check whether the source is ready for *model_name* / *worker_id*."""
         request = p2p_pb2.GetReadyRequest(
             model_name=model_name,
             worker_id=worker_id,
+            world_size=world_size,
         )
         return self.stub.GetReady(request, timeout=30)
 
@@ -175,6 +183,7 @@ class MxClient:
         worker_id: int,
         timeout_seconds: int = 7200,
         poll_interval: int = 10,
+        world_size: int = 0,
     ) -> tuple[bool, str | None, str | None]:
         """Poll until source is ready.
 
@@ -186,7 +195,7 @@ class MxClient:
 
         while time.time() - start_time < timeout_seconds:
             try:
-                response = self.get_ready(model_name, worker_id)
+                response = self.get_ready(model_name, worker_id, world_size)
                 if response.found and response.ready:
                     sid = response.session_id
                     mhash = response.metadata_hash
@@ -219,6 +228,7 @@ class MxClient:
         model_name: str,
         worker_id: int,
         cached_session_id: str | None,
+        world_size: int = 0,
     ) -> tuple[bool, str | None]:
         """Check if source session changed (indicates restart).
 
@@ -229,7 +239,7 @@ class MxClient:
             return False, None
 
         try:
-            response = self.get_ready(model_name, worker_id)
+            response = self.get_ready(model_name, worker_id, world_size)
             if response.found:
                 current_session = response.session_id
                 if current_session and current_session != cached_session_id:

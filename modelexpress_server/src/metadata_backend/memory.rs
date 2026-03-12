@@ -9,7 +9,7 @@
 //! Data is lost on server restart — pair with Redis or Kubernetes backends
 //! for persistence and high availability.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, WorkerRecord};
+use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, WorkerRecord, metadata_key};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use std::collections::HashMap;
@@ -50,17 +50,20 @@ impl MetadataBackend for InMemoryBackend {
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
+        world_size: u32,
     ) -> MetadataResult<()> {
         let new_workers: Vec<WorkerRecord> = workers.into_iter().map(WorkerRecord::from).collect();
         let total_tensors: usize = new_workers.iter().map(|w| w.tensors.len()).sum();
         let timestamp = chrono::Utc::now().timestamp();
+        let key = metadata_key(model_name, world_size);
 
         let mut models = self.models.write().await;
 
         let record = models
-            .entry(model_name.to_string())
+            .entry(key.clone())
             .or_insert_with(|| ModelMetadataRecord {
                 model_name: model_name.to_string(),
+                world_size,
                 workers: Vec::new(),
                 published_at: timestamp,
             });
@@ -85,18 +88,24 @@ impl MetadataBackend for InMemoryBackend {
         let worker_count = record.workers.len();
 
         info!(
-            "Published metadata for model '{}': {} workers total ({} new tensors)",
-            model_name, worker_count, total_tensors
+            "Published metadata for model '{}' (world_size={}): {} workers total ({} new tensors)",
+            model_name, world_size, worker_count, total_tensors
         );
         Ok(())
     }
 
-    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>> {
+    async fn get_metadata(
+        &self,
+        model_name: &str,
+        world_size: u32,
+    ) -> MetadataResult<Option<ModelMetadataRecord>> {
+        let key = metadata_key(model_name, world_size);
         let models = self.models.read().await;
-        let result = models.get(model_name).cloned();
+        let result = models.get(&key).cloned();
         debug!(
-            "get_metadata '{}': {}",
+            "get_metadata '{}' (world_size={}): {}",
             model_name,
+            world_size,
             if result.is_some() {
                 "found"
             } else {
@@ -106,10 +115,14 @@ impl MetadataBackend for InMemoryBackend {
         Ok(result)
     }
 
-    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
+    async fn remove_metadata(&self, model_name: &str, world_size: u32) -> MetadataResult<()> {
+        let key = metadata_key(model_name, world_size);
         let mut models = self.models.write().await;
-        models.remove(model_name);
-        info!("Removed metadata for model '{}'", model_name);
+        models.remove(&key);
+        info!(
+            "Removed metadata for model '{}' (world_size={})",
+            model_name, world_size
+        );
         Ok(())
     }
 
@@ -143,11 +156,11 @@ mod tests {
         }];
 
         backend
-            .publish_metadata("test-model", workers)
+            .publish_metadata("test-model", workers, 4)
             .await
             .unwrap();
 
-        let result = backend.get_metadata("test-model").await.unwrap();
+        let result = backend.get_metadata("test-model", 4).await.unwrap();
         assert!(result.is_some());
 
         let record = result.unwrap();
@@ -170,6 +183,7 @@ mod tests {
                     nixl_metadata: vec![1],
                     tensors: vec![],
                 }],
+                4,
             )
             .await
             .unwrap();
@@ -183,11 +197,16 @@ mod tests {
                     nixl_metadata: vec![2],
                     tensors: vec![],
                 }],
+                4,
             )
             .await
             .unwrap();
 
-        let record = backend.get_metadata("test-model").await.unwrap().unwrap();
+        let record = backend
+            .get_metadata("test-model", 4)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(record.workers.len(), 2);
         assert_eq!(record.workers[0].worker_rank, 0);
         assert_eq!(record.workers[1].worker_rank, 1);
@@ -206,6 +225,7 @@ mod tests {
                     nixl_metadata: vec![],
                     tensors: vec![],
                 }],
+                4,
             )
             .await
             .unwrap();
@@ -218,6 +238,7 @@ mod tests {
                     nixl_metadata: vec![],
                     tensors: vec![],
                 }],
+                4,
             )
             .await
             .unwrap();
@@ -225,10 +246,78 @@ mod tests {
         let models = backend.list_models().await.unwrap();
         assert_eq!(models.len(), 2);
 
-        backend.remove_metadata("model-a").await.unwrap();
+        backend.remove_metadata("model-a", 4).await.unwrap();
 
         let models = backend.list_models().await.unwrap();
         assert_eq!(models.len(), 1);
-        assert!(models.contains(&"model-b".to_string()));
+        assert!(models.contains(&"model-b::tp4".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_tp_isolation() {
+        let backend = InMemoryBackend::new();
+        backend.connect().await.unwrap();
+
+        // Publish TP4 for model
+        backend
+            .publish_metadata(
+                "test-model",
+                vec![WorkerMetadata {
+                    worker_rank: 0,
+                    nixl_metadata: vec![1],
+                    tensors: vec![],
+                }],
+                4,
+            )
+            .await
+            .unwrap();
+
+        // Publish TP8 for same model
+        backend
+            .publish_metadata(
+                "test-model",
+                vec![WorkerMetadata {
+                    worker_rank: 0,
+                    nixl_metadata: vec![2],
+                    tensors: vec![],
+                }],
+                8,
+            )
+            .await
+            .unwrap();
+
+        // TP4 and TP8 should be isolated
+        let tp4 = backend
+            .get_metadata("test-model", 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tp4.workers[0].nixl_metadata, vec![1]);
+        assert_eq!(tp4.world_size, 4);
+
+        let tp8 = backend
+            .get_metadata("test-model", 8)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tp8.workers[0].nixl_metadata, vec![2]);
+        assert_eq!(tp8.world_size, 8);
+
+        // Remove TP4 should not affect TP8
+        backend.remove_metadata("test-model", 4).await.unwrap();
+        assert!(
+            backend
+                .get_metadata("test-model", 4)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_metadata("test-model", 8)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

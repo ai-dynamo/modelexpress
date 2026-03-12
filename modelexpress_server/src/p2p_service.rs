@@ -45,17 +45,23 @@ impl P2pService for P2pServiceImpl {
 
         let num_workers = req.workers.len();
         let total_tensors: usize = req.workers.iter().map(|w| w.tensors.len()).sum();
+        let ranks: Vec<u32> = req.workers.iter().map(|w| w.worker_rank).collect();
+
+        info!(
+            "PublishMetadata request: model='{}', world_size={}, workers={}, ranks={:?}, tensors={}",
+            req.model_name, req.world_size, num_workers, ranks, total_tensors
+        );
 
         match self
             .state
-            .publish_metadata(&req.model_name, req.workers)
+            .publish_metadata(&req.model_name, req.workers, req.world_size)
             .await
         {
             Ok(()) => Ok(Response::new(PublishMetadataResponse {
                 success: true,
                 message: format!(
-                    "Published metadata for model '{}' ({} workers, {} tensors)",
-                    req.model_name, num_workers, total_tensors
+                    "Published metadata for model '{}' (world_size={}, {} workers, {} tensors)",
+                    req.model_name, req.world_size, num_workers, total_tensors
                 ),
             })),
             Err(e) => {
@@ -81,12 +87,17 @@ impl P2pService for P2pServiceImpl {
             }));
         }
 
-        match self.state.get_metadata(&req.model_name).await {
+        match self
+            .state
+            .get_metadata(&req.model_name, req.world_size)
+            .await
+        {
             Ok(Some(record)) => {
                 let total_tensors: usize = record.workers.iter().map(|w| w.tensors.len()).sum();
                 info!(
-                    "Found metadata for model '{}': {} workers, {} tensors",
+                    "Found metadata for model '{}' (world_size={}): {} workers, {} tensors",
                     req.model_name,
+                    req.world_size,
                     record.workers.len(),
                     total_tensors
                 );
@@ -103,7 +114,10 @@ impl P2pService for P2pServiceImpl {
                 }))
             }
             Ok(None) => {
-                info!("No metadata found for model '{}'", req.model_name);
+                info!(
+                    "No metadata found for model '{}' (world_size={})",
+                    req.model_name, req.world_size
+                );
                 Ok(Response::new(GetMetadataResponse {
                     found: false,
                     workers: Vec::new(),
@@ -143,6 +157,7 @@ impl P2pService for P2pServiceImpl {
             .state
             .publish_ready(
                 &req.model_name,
+                req.world_size,
                 req.worker_id,
                 &req.session_id,
                 &req.metadata_hash,
@@ -184,12 +199,17 @@ impl P2pService for P2pServiceImpl {
             }));
         }
 
-        match self.state.get_ready(&req.model_name, req.worker_id).await {
+        match self
+            .state
+            .get_ready(&req.model_name, req.world_size, req.worker_id)
+            .await
+        {
             Ok(Some(record)) => {
                 let ready = record.nixl_ready && record.stability_verified;
                 info!(
-                    "Ready status for model '{}' worker {}: ready={}, session={}...",
+                    "Ready status for model '{}' (world_size={}) worker {}: ready={}, session={}...",
                     req.model_name,
+                    req.world_size,
                     req.worker_id,
                     ready,
                     record.session_id.chars().take(8).collect::<String>()
@@ -205,8 +225,8 @@ impl P2pService for P2pServiceImpl {
             }
             Ok(None) => {
                 info!(
-                    "No ready flag found for model '{}' worker {}",
-                    req.model_name, req.worker_id
+                    "No ready flag found for model '{}' (world_size={}) worker {}",
+                    req.model_name, req.world_size, req.worker_id
                 );
                 Ok(Response::new(GetReadyResponse {
                     found: false,

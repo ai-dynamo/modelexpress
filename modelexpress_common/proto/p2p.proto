@@ -6,8 +6,8 @@ syntax = "proto3";
 package model_express.p2p;
 
 // P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
-// The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
-// Clients query for existing sources and publish their own metadata.
+// The server stores model metadata (NIXL agent info + tensor descriptors) keyed by
+// (model_name, world_size). Clients query for existing sources and publish their own metadata.
 service P2pService {
   // Publish model metadata - called by client after loading model weights
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
@@ -70,6 +70,9 @@ message PublishMetadataRequest {
 
   // Metadata for each GPU worker in this instance
   repeated WorkerMetadata workers = 2;
+
+  // Tensor-parallel world size. 0 = unspecified/legacy (no TP isolation).
+  uint32 world_size = 3;
 }
 
 message PublishMetadataResponse {
@@ -84,6 +87,9 @@ message PublishMetadataResponse {
 message GetMetadataRequest {
   // Model name to look up
   string model_name = 1;
+
+  // Tensor-parallel world size to look up. 0 = unspecified/legacy.
+  uint32 world_size = 2;
 }
 
 message GetMetadataResponse {
@@ -116,6 +122,9 @@ message PublishReadyRequest {
 
   // Whether stability has been verified (warmup complete)
   bool stability_verified = 6;
+
+  // Tensor-parallel world size. 0 = unspecified/legacy.
+  uint32 world_size = 7;
 }
 
 message PublishReadyResponse {
@@ -129,6 +138,9 @@ message GetReadyRequest {
 
   // Worker rank to check
   uint32 worker_id = 2;
+
+  // Tensor-parallel world size. 0 = unspecified/legacy.
+  uint32 world_size = 3;
 }
 
 message GetReadyResponse {

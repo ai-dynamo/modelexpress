@@ -60,15 +60,17 @@ impl LayeredBackend {
         }
 
         let mut hydrated: usize = 0;
-        for model_name in &models {
-            if let Some(record) = persistent.get_metadata(model_name).await? {
-                // Re-publish into in-memory cache
+        for composite_key in &models {
+            if let Some(record) = persistent.get_metadata(composite_key, 0).await? {
+                // Re-publish into in-memory cache using original model_name and world_size
                 let workers: Vec<WorkerMetadata> = record
                     .workers
                     .into_iter()
                     .map(WorkerMetadata::from)
                     .collect();
-                self.cache.publish_metadata(model_name, workers).await?;
+                self.cache
+                    .publish_metadata(&record.model_name, workers, record.world_size)
+                    .await?;
                 hydrated = hydrated.saturating_add(1);
             }
         }
@@ -111,15 +113,18 @@ impl MetadataBackend for LayeredBackend {
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
+        world_size: u32,
     ) -> MetadataResult<()> {
         // Write to in-memory cache first (fast path)
         self.cache
-            .publish_metadata(model_name, workers.clone())
+            .publish_metadata(model_name, workers.clone(), world_size)
             .await?;
 
         // Write-through to persistent backend (best-effort)
         if let Some(persistent) = &self.persistent
-            && let Err(e) = persistent.publish_metadata(model_name, workers).await
+            && let Err(e) = persistent
+                .publish_metadata(model_name, workers, world_size)
+                .await
         {
             warn!(
                 "Failed to write-through to persistent backend for '{}': {} - data is in cache only",
@@ -130,16 +135,20 @@ impl MetadataBackend for LayeredBackend {
         Ok(())
     }
 
-    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>> {
+    async fn get_metadata(
+        &self,
+        model_name: &str,
+        world_size: u32,
+    ) -> MetadataResult<Option<ModelMetadataRecord>> {
         // Always read from in-memory cache (fast path)
-        self.cache.get_metadata(model_name).await
+        self.cache.get_metadata(model_name, world_size).await
     }
 
-    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
-        self.cache.remove_metadata(model_name).await?;
+    async fn remove_metadata(&self, model_name: &str, world_size: u32) -> MetadataResult<()> {
+        self.cache.remove_metadata(model_name, world_size).await?;
 
         if let Some(persistent) = &self.persistent
-            && let Err(e) = persistent.remove_metadata(model_name).await
+            && let Err(e) = persistent.remove_metadata(model_name, world_size).await
         {
             warn!(
                 "Failed to remove '{}' from persistent backend: {}",
@@ -175,11 +184,11 @@ mod tests {
         backend.connect().await.unwrap();
 
         backend
-            .publish_metadata("test", test_workers(0))
+            .publish_metadata("test", test_workers(0), 4)
             .await
             .unwrap();
 
-        let result = backend.get_metadata("test").await.unwrap();
+        let result = backend.get_metadata("test", 4).await.unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap().workers.len(), 1);
     }
@@ -193,15 +202,15 @@ mod tests {
         backend.connect().await.unwrap();
 
         backend
-            .publish_metadata("model-a", test_workers(0))
+            .publish_metadata("model-a", test_workers(0), 4)
             .await
             .unwrap();
 
         // Both cache and persistent should have the data
-        let from_cache = backend.get_metadata("model-a").await.unwrap();
+        let from_cache = backend.get_metadata("model-a", 4).await.unwrap();
         assert!(from_cache.is_some(), "cache should have the data");
 
-        let from_persistent = persistent.get_metadata("model-a").await.unwrap();
+        let from_persistent = persistent.get_metadata("model-a", 4).await.unwrap();
         assert!(
             from_persistent.is_some(),
             "persistent backend should have the data"
@@ -215,7 +224,7 @@ mod tests {
         let persistent = Arc::new(InMemoryBackend::new());
         persistent.connect().await.unwrap();
         persistent
-            .publish_metadata("existing-model", test_workers(0))
+            .publish_metadata("existing-model", test_workers(0), 4)
             .await
             .unwrap();
 
@@ -224,7 +233,7 @@ mod tests {
         backend.connect().await.unwrap(); // should hydrate
 
         // Cache should have the data from persistent without re-publishing
-        let result = backend.get_metadata("existing-model").await.unwrap();
+        let result = backend.get_metadata("existing-model", 4).await.unwrap();
         assert!(result.is_some(), "cache should be hydrated from persistent");
         assert_eq!(result.unwrap().workers[0].worker_rank, 0);
     }
@@ -234,11 +243,11 @@ mod tests {
         let persistent = Arc::new(InMemoryBackend::new());
         persistent.connect().await.unwrap();
         persistent
-            .publish_metadata("model-1", test_workers(0))
+            .publish_metadata("model-1", test_workers(0), 4)
             .await
             .unwrap();
         persistent
-            .publish_metadata("model-2", test_workers(1))
+            .publish_metadata("model-2", test_workers(1), 4)
             .await
             .unwrap();
 
@@ -248,9 +257,9 @@ mod tests {
         let models = backend.list_models().await.unwrap();
         assert_eq!(models.len(), 2);
 
-        let m1 = backend.get_metadata("model-1").await.unwrap().unwrap();
+        let m1 = backend.get_metadata("model-1", 4).await.unwrap().unwrap();
         assert_eq!(m1.workers[0].worker_rank, 0);
-        let m2 = backend.get_metadata("model-2").await.unwrap().unwrap();
+        let m2 = backend.get_metadata("model-2", 4).await.unwrap().unwrap();
         assert_eq!(m2.workers[0].worker_rank, 1);
     }
 
@@ -263,16 +272,22 @@ mod tests {
         backend.connect().await.unwrap();
 
         backend
-            .publish_metadata("to-delete", test_workers(0))
+            .publish_metadata("to-delete", test_workers(0), 4)
             .await
             .unwrap();
 
-        backend.remove_metadata("to-delete").await.unwrap();
+        backend.remove_metadata("to-delete", 4).await.unwrap();
 
-        assert!(backend.get_metadata("to-delete").await.unwrap().is_none());
+        assert!(
+            backend
+                .get_metadata("to-delete", 4)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             persistent
-                .get_metadata("to-delete")
+                .get_metadata("to-delete", 4)
                 .await
                 .unwrap()
                 .is_none()

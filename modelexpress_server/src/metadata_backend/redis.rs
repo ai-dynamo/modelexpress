@@ -3,7 +3,9 @@
 
 //! Redis backend for P2P model metadata storage.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{
+    MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord, metadata_key,
+};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use redis::AsyncCommands;
@@ -150,6 +152,8 @@ impl From<WorkerRecordJson> for WorkerRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModelMetadataJson {
     pub model_name: String,
+    #[serde(default)]
+    pub world_size: u32,
     pub workers: Vec<WorkerRecordJson>,
     pub published_at: i64,
 }
@@ -158,6 +162,7 @@ impl From<ModelMetadataJson> for ModelMetadataRecord {
     fn from(json: ModelMetadataJson) -> Self {
         Self {
             model_name: json.model_name,
+            world_size: json.world_size,
             workers: json.workers.into_iter().map(WorkerRecord::from).collect(),
             published_at: json.published_at,
         }
@@ -236,9 +241,11 @@ impl MetadataBackend for RedisBackend {
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
+        world_size: u32,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}", keys::MODEL_PREFIX, model_name);
+        let composite = metadata_key(model_name, world_size);
+        let key = format!("{}{}", keys::MODEL_PREFIX, composite);
 
         // Convert new workers to records and serialize
         let new_workers: Vec<WorkerRecordJson> = workers
@@ -256,6 +263,8 @@ impl MetadataBackend for RedisBackend {
             local model_name = ARGV[2]
             local new_workers_json = ARGV[3]
             local timestamp = tonumber(ARGV[4])
+            local world_size = tonumber(ARGV[5])
+            local composite_key = ARGV[6]
 
             local new_workers = cjson.decode(new_workers_json)
 
@@ -289,12 +298,13 @@ impl MetadataBackend for RedisBackend {
 
             local record = {
                 model_name = model_name,
+                world_size = world_size,
                 workers = existing_workers,
                 published_at = timestamp
             }
 
             redis.call('SET', key, cjson.encode(record))
-            redis.call('SADD', models_set, model_name)
+            redis.call('SADD', models_set, composite_key)
             return #existing_workers
             "#,
         );
@@ -305,20 +315,27 @@ impl MetadataBackend for RedisBackend {
             .arg(model_name)
             .arg(&new_workers_json)
             .arg(timestamp)
+            .arg(world_size)
+            .arg(&composite)
             .invoke_async(&mut conn)
             .await?;
 
         let total_tensors: usize = new_workers.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for model '{}': {} workers total ({} new tensors)",
-            model_name, worker_count, total_tensors
+            "Published metadata for model '{}' (world_size={}): {} workers total ({} new tensors)",
+            model_name, world_size, worker_count, total_tensors
         );
         Ok(())
     }
 
-    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>> {
+    async fn get_metadata(
+        &self,
+        model_name: &str,
+        world_size: u32,
+    ) -> MetadataResult<Option<ModelMetadataRecord>> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}", keys::MODEL_PREFIX, model_name);
+        let composite = metadata_key(model_name, world_size);
+        let key = format!("{}{}", keys::MODEL_PREFIX, composite);
         let json: Option<String> = conn.get(&key).await?;
 
         match json {
@@ -334,14 +351,18 @@ impl MetadataBackend for RedisBackend {
         }
     }
 
-    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
+    async fn remove_metadata(&self, model_name: &str, world_size: u32) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}", keys::MODEL_PREFIX, model_name);
+        let composite = metadata_key(model_name, world_size);
+        let key = format!("{}{}", keys::MODEL_PREFIX, composite);
 
         conn.del::<_, ()>(&key).await?;
-        conn.srem::<_, _, ()>(keys::MODELS_SET, model_name).await?;
+        conn.srem::<_, _, ()>(keys::MODELS_SET, &composite).await?;
 
-        info!("Removed metadata for model '{}'", model_name);
+        info!(
+            "Removed metadata for model '{}' (world_size={})",
+            model_name, world_size
+        );
         Ok(())
     }
 

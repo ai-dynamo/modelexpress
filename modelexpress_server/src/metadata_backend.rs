@@ -28,8 +28,22 @@ pub type MetadataResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>
 #[derive(Debug, Clone)]
 pub struct ModelMetadataRecord {
     pub model_name: String,
+    pub world_size: u32,
     pub workers: Vec<WorkerRecord>,
     pub published_at: i64,
+}
+
+/// Build the composite key used by backends to store metadata.
+///
+/// When `world_size` is 0 (unspecified / legacy) the key is just the model
+/// name, preserving backward compatibility. Otherwise the key encodes the
+/// TP configuration so that different world sizes are stored independently.
+pub fn metadata_key(model_name: &str, world_size: u32) -> String {
+    if world_size == 0 {
+        model_name.to_string()
+    } else {
+        format!("{model_name}::tp{world_size}")
+    }
 }
 
 /// Worker metadata record
@@ -112,13 +126,18 @@ pub trait MetadataBackend: Send + Sync {
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
+        world_size: u32,
     ) -> MetadataResult<()>;
 
     /// Get metadata for a model
-    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>>;
+    async fn get_metadata(
+        &self,
+        model_name: &str,
+        world_size: u32,
+    ) -> MetadataResult<Option<ModelMetadataRecord>>;
 
     /// Remove metadata for a model
-    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()>;
+    async fn remove_metadata(&self, model_name: &str, world_size: u32) -> MetadataResult<()>;
 
     /// List all registered model names
     async fn list_models(&self) -> MetadataResult<Vec<String>>;

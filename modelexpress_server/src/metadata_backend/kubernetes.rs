@@ -5,7 +5,9 @@
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{
+    MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord, metadata_key,
+};
 use crate::k8s_types::{
     ModelMetadata, ModelMetadataPhase, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus,
     sanitize_model_name,
@@ -190,9 +192,10 @@ impl MetadataBackend for KubernetesBackend {
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
+        world_size: u32,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
-        let cr_name = sanitize_model_name(model_name);
+        let cr_name = sanitize_model_name(&metadata_key(model_name, world_size));
         let now = chrono::Utc::now().to_rfc3339();
 
         // Convert workers to internal format
@@ -360,9 +363,13 @@ impl MetadataBackend for KubernetesBackend {
         Ok(())
     }
 
-    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>> {
+    async fn get_metadata(
+        &self,
+        model_name: &str,
+        world_size: u32,
+    ) -> MetadataResult<Option<ModelMetadataRecord>> {
         let api = self.model_metadata_api();
-        let cr_name = sanitize_model_name(model_name);
+        let cr_name = sanitize_model_name(&metadata_key(model_name, world_size));
 
         let cr = match api.get_opt(&cr_name).await? {
             Some(cr) => cr,
@@ -426,13 +433,14 @@ impl MetadataBackend for KubernetesBackend {
 
         Ok(Some(ModelMetadataRecord {
             model_name: cr.spec.model_name,
+            world_size,
             workers,
             published_at,
         }))
     }
 
-    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
-        let cr_name = sanitize_model_name(model_name);
+    async fn remove_metadata(&self, model_name: &str, world_size: u32) -> MetadataResult<()> {
+        let cr_name = sanitize_model_name(&metadata_key(model_name, world_size));
 
         // Delete the CR (ConfigMaps are garbage-collected via ownerReferences)
         let api = self.model_metadata_api();

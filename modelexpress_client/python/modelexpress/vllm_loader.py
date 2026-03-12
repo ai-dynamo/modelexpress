@@ -275,8 +275,10 @@ def _publish_metadata_and_ready(
     """Publish tensor metadata and ready flag to the ModelExpress server."""
     from . import p2p_pb2
 
+    world_size = _get_expected_workers()
     logger.info(
-        f"[Worker {device_id}] Publishing {len(tensors)} tensors for model '{model_name}'"
+        f"[Worker {device_id}] Publishing {len(tensors)} tensors for model '{model_name}' "
+        f"(world_size={world_size})"
     )
 
     try:
@@ -318,7 +320,7 @@ def _publish_metadata_and_ready(
             tensors=tensor_protos,
         )
 
-        success = mx_client.publish_metadata(model_name, [worker])
+        success = mx_client.publish_metadata(model_name, [worker], world_size=world_size)
 
         if success:
             logger.info(f"[Worker {device_id}] Published metadata to MX server")
@@ -334,6 +336,7 @@ def _publish_metadata_and_ready(
                 metadata_hash=metadata_hash,
                 nixl_ready=True,
                 stability_verified=True,
+                world_size=world_size,
             )
         else:
             raise RuntimeError(
@@ -463,7 +466,8 @@ class MxModelLoader(BaseModelLoader):
             return None
 
         try:
-            ready_resp = self._mx_client.get_ready(model_name, device_id)
+            world_size = _get_expected_workers()
+            ready_resp = self._mx_client.get_ready(model_name, device_id, world_size)
             if not (ready_resp.found and ready_resp.ready):
                 logger.debug(
                     f"[Worker {device_id}] Source not ready "
@@ -471,7 +475,7 @@ class MxModelLoader(BaseModelLoader):
                 )
                 return None
 
-            metadata_resp = self._mx_client.get_metadata(model_name)
+            metadata_resp = self._mx_client.get_metadata(model_name, world_size=world_size)
             if not metadata_resp.found:
                 logger.debug(f"[Worker {device_id}] No metadata found for model")
                 return None
@@ -570,10 +574,11 @@ class MxModelLoader(BaseModelLoader):
 
         # RDMA transfer with retry
         cached_session_id = None
+        world_size = _get_expected_workers()
 
         # Capture session from earlier get_ready call
         try:
-            ready_resp = self._mx_client.get_ready(model_name, device_id)
+            ready_resp = self._mx_client.get_ready(model_name, device_id, world_size)
             if ready_resp.found:
                 cached_session_id = ready_resp.session_id
         except Exception:
@@ -613,6 +618,7 @@ class MxModelLoader(BaseModelLoader):
                         model_name=model_name,
                         worker_id=device_id,
                         cached_session_id=cached_session_id,
+                        world_size=world_size,
                     )
 
                     if session_changed:
@@ -620,7 +626,7 @@ class MxModelLoader(BaseModelLoader):
                             f"[Worker {device_id}] Source restarted, re-fetching metadata..."
                         )
                         cached_session_id = new_session_id
-                        response = self._mx_client.get_metadata(model_name)
+                        response = self._mx_client.get_metadata(model_name, world_size=world_size)
                         for w in response.workers:
                             if w.worker_rank == device_id and len(w.tensors) > 0:
                                 source_worker = w

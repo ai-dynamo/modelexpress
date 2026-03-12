@@ -126,24 +126,28 @@ impl P2pStateManager {
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
+        world_size: u32,
     ) -> MetadataResult<()> {
         let backend = self.get_backend().await?;
-        backend.publish_metadata(model_name, workers).await
+        backend
+            .publish_metadata(model_name, workers, world_size)
+            .await
     }
 
     /// Get metadata for a model
     pub async fn get_metadata(
         &self,
         model_name: &str,
+        world_size: u32,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
         let backend = self.get_backend().await?;
-        backend.get_metadata(model_name).await
+        backend.get_metadata(model_name, world_size).await
     }
 
     /// Remove metadata for a model (cleanup)
-    pub async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
+    pub async fn remove_metadata(&self, model_name: &str, world_size: u32) -> MetadataResult<()> {
         let backend = self.get_backend().await?;
-        backend.remove_metadata(model_name).await
+        backend.remove_metadata(model_name, world_size).await
     }
 
     /// List all registered model names
@@ -157,16 +161,24 @@ impl P2pStateManager {
     // ========================================================================
 
     /// Publish a source ready flag for a worker.
+    /// Key format: "{model_name}::tp{world_size}:worker:{worker_id}" when world_size > 0,
+    /// otherwise "{model_name}:worker:{worker_id}" for backward compatibility.
+    #[allow(clippy::too_many_arguments)]
     pub async fn publish_ready(
         &self,
         model_name: &str,
+        world_size: u32,
         worker_id: u32,
         session_id: &str,
         metadata_hash: &str,
         nixl_ready: bool,
         stability_verified: bool,
     ) -> MetadataResult<()> {
-        let key = format!("{}:worker:{}", model_name, worker_id);
+        let key = if world_size > 0 {
+            format!("{}::tp{}:worker:{}", model_name, world_size, worker_id)
+        } else {
+            format!("{}:worker:{}", model_name, worker_id)
+        };
         let record = ReadyRecord {
             session_id: session_id.to_string(),
             metadata_hash: metadata_hash.to_string(),
@@ -179,8 +191,8 @@ impl P2pStateManager {
         flags.insert(key, record);
 
         info!(
-            "Published ready flag for model '{}' worker {}: nixl_ready={}, stability_verified={}",
-            model_name, worker_id, nixl_ready, stability_verified
+            "Published ready flag for model '{}' (world_size={}) worker {}: nixl_ready={}, stability_verified={}",
+            model_name, world_size, worker_id, nixl_ready, stability_verified
         );
         Ok(())
     }
@@ -189,9 +201,14 @@ impl P2pStateManager {
     pub async fn get_ready(
         &self,
         model_name: &str,
+        world_size: u32,
         worker_id: u32,
     ) -> MetadataResult<Option<ReadyRecord>> {
-        let key = format!("{}:worker:{}", model_name, worker_id);
+        let key = if world_size > 0 {
+            format!("{}::tp{}:worker:{}", model_name, world_size, worker_id)
+        } else {
+            format!("{}:worker:{}", model_name, worker_id)
+        };
         let flags = self.ready_flags.read().await;
         let result = flags.get(&key).cloned();
 
@@ -262,6 +279,7 @@ mod tests {
     fn test_model_record_creation() {
         let record = ModelMetadataRecord {
             model_name: "meta-llama/Llama-3.1-70B".to_string(),
+            world_size: 2,
             workers: vec![
                 WorkerRecord {
                     worker_rank: 0,
