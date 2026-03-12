@@ -125,7 +125,7 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register mx-source/mx-target vLLM loaders |
+| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx vLLM loader |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |

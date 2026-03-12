@@ -20,7 +20,7 @@ class ModelExpressWorker(Worker):
     def __init__(self, *args, **kwargs):
         # Register loaders before parent initialization.
         # This imports modelexpress.vllm_loader which has @register_model_loader
-        # decorators on MxSourceModelLoader and MxTargetModelLoader classes.
+        # decorators on the MxModelLoader class.
         from modelexpress import register_modelexpress_loaders
 
         register_modelexpress_loaders()

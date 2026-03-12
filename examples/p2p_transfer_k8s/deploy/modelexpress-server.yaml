@@ -37,7 +37,7 @@ spec:
     spec:
       containers:
         - name: modelexpress-server
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8001
@@ -46,7 +46,10 @@ spec:
               value: "memory"
           resources:
             requests:
-              cpu: 4
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "4"
               memory: 8Gi
           livenessProbe:
             tcpSocket:
