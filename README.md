@@ -3,59 +3,107 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-<img src="ModelExpressTrainLogo.jpeg" alt="ModelExpress Logo" width="50%">
+<p align="center">
+  <img src="ModelExpressTrainLogo.jpeg" alt="ModelExpress Logo" width="50%">
+</p>
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+<p align="center">
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust"></a>
+</p>
 
-# ModelExpress
+<h1 align="center">Dynamo ModelExpress</h1>
 
-ModelExpress is a model weight management service for large language model (LLM) inference deployments. It reduces cold-start latency and operational cost by caching, routing, and transferring weights through the fastest available path—from external storage to live GPU memory via peer-to-peer RDMA.
+<p align="center">
+  <strong>Model weight management for LLM inference</strong> — cache, transfer, and serve weights at scale with GPU-to-GPU RDMA and multi-node coordination.
+</p>
 
-## Overview
-
-ModelExpress deploys standalone or as a sidecar alongside inference runtimes such as vLLM, SGLang, and NVIDIA Dynamo. It addresses two core challenges in production LLM serving:
-
-| Challenge | Solution |
-|-----------|----------|
-| **Cold start latency** | Local weight caching with GPU-to-GPU transfer in seconds via NIXL/RDMA, avoiding external downloads. In P2P mode, GPU-resident weights serving inference act as the cache with no additional storage and minimal impact on latency. |
-| **Multi-node coordination** | Metadata management coordinates weight sharing: a single node downloads or loads; others receive via local or P2P paths. |
-
-### Capabilities
-
-| Feature | Description |
-|---------|-------------|
-| **HuggingFace caching** | PVC-backed cache with `HF_HUB_OFFLINE` for air-gapped environments, handling of empty files and dotfiles, `ignore_weights` for config-only download, and `get_model_path` API for Dynamo. |
-| **Shared storage mode** | Client and server share a network volume; inference engines read directly from the cache. |
-| **Distributed (gRPC) mode** | File transfer over gRPC when shared storage is unavailable (`--no-shared-storage`). |
-| **GPU-to-GPU P2P transfer** | vLLM loaders (`mx-source`, `mx-target`) with NVIDIA NIXL over RDMA/InfiniBand; raw tensor transfer before FP8 processing. GPU-loaded weights serving inference act as the cache—no additional storage required, minimal impact on latency. |
-| **Metadata backends** | In-memory (default), Redis, or Kubernetes CRD; layered (in-memory with write-through) for high availability. |
-| **Kubernetes** | Helm chart with configurable persistence, metadata via CRDs or Redis, no-shared-storage deployments, ephemeral storage limits, and secure defaults. |
-| **CLI** | `modelexpress-cli` for health, download, list, validate, clear, and API operations; init-container support for cache pre-warming. |
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#dynamo-modelexpress-architecture">Architecture</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#deployment">Deployment</a> •
+  <a href="#documentation">Docs</a> •
+  <a href="#contributing">Contributing</a>
+</p>
 
 ---
 
-## Architecture
+## Overview
 
-ModelExpress manages the full lifecycle of model weights from acquisition to GPU memory. The diagram below illustrates how ModelExpress accelerates vLLM bootup by using GPU-to-GPU RDMA transfer instead of traditional disk-to-GPU loading—reducing weight transfer from ~25 minutes to ~15 seconds (~100× faster) and overall bootup from ~38 minutes to ~16 minutes.
+ModelExpress is a Rust-based service that manages the complete model weight lifecycle in the cluster—from acquisition to GPU memory. It accelerates LLM inference by caching, routing, and transferring weights through the fastest available path. Deploy standalone or as a sidecar alongside vLLM, NVIDIA Dynamo, and other inference runtimes.
 
-![ModelExpress Architecture: Accelerating vLLM Bootup](model-express-architecture.png)
+| LLM serving problem | How ModelExpress helps |
+|---------------------|------------------------|
+| **Models take too long to load** | GPU-to-GPU transfer via NIXL/RDMA instead of loading from storage. In P2P mode, weights already serving inference act as the cache—no extra storage. |
+| **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
 
-- **`modelexpress_server`**: gRPC server with configurable metadata backends (in-memory, Redis, Kubernetes CRD). Layered in-memory with persistence is recommended for high availability.
-- **`modelexpress_client`**: Rust CLI for cache management; Python package with vLLM loaders (`MxSourceModelLoader`, `MxTargetModelLoader`) and `MxClient` for gRPC.
-- **`modelexpress_common`**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
+### How ModelExpress manages weights in the cluster
+
+ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads a model from external sources (e.g., HuggingFace); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
+
+1. **Download from HuggingFace** — One node pulls the model; ModelExpress coordinates so no other node duplicates this download, reducing external ingress. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
+2. **Persist to disk** — Store in a cache backed by disk:
+   - **Host-attached disk** — Local disk on the node (single-node or per-node cache).
+   - **PVC** — RWO (ReadWriteOnce) for single-node; RWX (ReadWriteMany) for shared access across nodes.
+3. **Disk to GPU** — Inference engine (vLLM, etc.) loads weights from the cache (disk) into GPU memory.
+4. **P2P transfer** — Additional nodes receive weights via GPU-to-GPU RDMA from the first node instead of reading from disk—no duplicate downloads or disk reads.
+
+---
+
+## Features
+
+- **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
+- **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
+- **P2P GPU transfer** — vLLM `mx` loader with NVIDIA NIXL over RDMA; auto-detects source/target
+- **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
+- **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
+- **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
+
+### Integrations
+
+| Runtime | Integration |
+|---------|-------------|
+| vLLM | `--load-format mx` for P2P weight transfer |
+| NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
+| SGLang, TensorRT-LLM | Coming soon |
+
+---
+
+## ModelExpress Architecture
+
+![ModelExpress Architecture: Zero-copy GPU-to-GPU model weight transfer via NIXL RDMA](model-express-architecture.png)
+
+```
+                    ┌─────────────────────────────────────────────────────────────────┐
+                    │                    ModelExpress Server                          │
+                    │   Health • Model • P2P Metadata • Redis/K8s CRD backends        │
+                    └──────────────────────┬──────────────────────────────────────────┘
+                                           │
+                         ┌─────────────────┼─────────────────┐
+                         │ metadata                          │ metadata
+                         ▼                                   ▼
+              ┌──────────────────┐                 ┌──────────────────┐
+              │  Source (vLLM)   │  RDMA           │  Target (vLLM)   │
+              │  mx loader       │════════════════►│  mx loader       │
+              │  Load → NIXL     │  NIXL           │  Receive → FP8   │
+              │  Publish metadata│                 │  Serve inference │
+              └──────────────────┘                 └──────────────────┘
+```
+
+*Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
+
+- **modelexpress_server**: gRPC server with configurable metadata backends (in-memory, Redis, Kubernetes CRD). Layered in-memory with persistence is recommended for high availability.
+- **modelexpress_client**: Rust CLI for cache management; Python package with vLLM loaders and `MxClient` for gRPC.
+- **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
+
+See [Architecture](docs/ARCHITECTURE.md).
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-
-- Rust 1.90+ (or use the container image)
-- `protoc` (Protocol Buffers compiler)
-- Docker (optional, for containerized deployment)
-- NVIDIA GPU + InfiniBand (optional, for P2P transfers)
-
-### Build and Run
+**Requirements:** Rust 1.90+, `protoc`, Docker (optional)
 
 ```bash
 git clone https://github.com/ai-dynamo/modelexpress.git
@@ -65,20 +113,18 @@ cargo build
 cargo run --bin modelexpress-server
 ```
 
-The server listens on `0.0.0.0:8001` by default. See [Configuration](#configuration) for customization.
-
-### Download a Model
+Server listens on `0.0.0.0:8001`. In another terminal:
 
 ```bash
-# With shared storage (default)
+# Download a model (shared storage)
 modelexpress-cli model download meta-llama/Llama-3.3-70B-Instruct
 
-# Without shared storage (stream over gRPC)
-modelexpress-cli --no-shared-storage model download meta-llama/Llama-3.3-70B-Instruct
-
-# Air-gapped: serve from cache only
-HF_HUB_OFFLINE=1 modelexpress-cli model get meta-llama/Llama-3.3-70B-Instruct
+# Verify
+modelexpress-cli health
 ```
+
+**Without shared storage:** use `--no-shared-storage` for gRPC streaming.  
+**Air-gapped:** `HF_HUB_OFFLINE=1 modelexpress-cli model get <model-id>`.
 
 ---
 
@@ -86,112 +132,54 @@ HF_HUB_OFFLINE=1 modelexpress-cli model get meta-llama/Llama-3.3-70B-Instruct
 
 ### Kubernetes (Helm)
 
-ModelExpress is production-ready for Kubernetes:
-
 ```bash
-# Create HuggingFace token secret (required for model downloads)
-kubectl create secret generic hf-token-secret \
-  --from-literal=HF_TOKEN=${HF_TOKEN} \
-  -n <your-namespace>
-
+kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=${HF_TOKEN} -n <namespace>
 helm install modelexpress ./helm --namespace modelexpress --create-namespace
 ```
 
-- **Helm chart**: Configurable persistence, resource limits, health probes
-- **Metadata management**: K8s CRDs and Redis for multi-node P2P coordination
-- **No-shared-storage**: Models stream over gRPC when a shared volume is not available
-
-See [helm/README.md](helm/README.md) for configuration and production overrides.
+Override [values-production.yaml](helm/values-production.yaml) for your env. Full config: [helm/README.md](helm/README.md).
 
 ### P2P GPU Transfer (vLLM)
-
-GPU-to-GPU weight transfer between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand. The source GPU's loaded weights—already serving inference—act as the cache for P2P transfer with no additional storage and minimal latency impact.
-
-1. Deploy the ModelExpress server (gRPC; metadata backend: memory, Redis, or Kubernetes CRD).
-2. **Source**: Set `VLLM_LOAD_FORMAT=mx-source` — loads from disk, registers raw tensors with NIXL before FP8 processing, publishes metadata.
-3. **Target**: Set `VLLM_LOAD_FORMAT=mx-target` — receives raw tensors via RDMA, performs FP8 processing locally.
-
-Register loaders in Python:
 
 ```python
 from modelexpress import register_modelexpress_loaders
 register_modelexpress_loaders()
+# vllm serve <model> --load-format mx --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
 ```
 
-See [examples/p2p_transfer_k8s/README.md](examples/p2p_transfer_k8s/README.md) for deployment and [examples/p2p_transfer_k8s/deploy/persistence/README.md](examples/p2p_transfer_k8s/deploy/persistence/README.md) for metadata persistence (HA).
+First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Persistence (HA)](examples/p2p_transfer_k8s/deploy/persistence/README.md).
 
 ### Docker
 
 ```bash
 docker-compose up --build
-# Or: docker run -p 8001:8001 -v /path/to/cache:/cache model-express
+# Or: docker build -t modelexpress . && docker run -p 8001:8001 modelexpress
 ```
 
 ---
 
 ## Configuration
 
-ModelExpress uses layered configuration with the following precedence (highest to lowest):
+**Precedence:** CLI → env vars (`MODEL_EXPRESS_*`, `MX_*`) → YAML → defaults.
 
-- Command line arguments
-- Environment variables (`MODEL_EXPRESS_*`)
-- YAML config file
-- Default values
-
-### Example Configuration
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
+| `MX_METADATA_BACKEND` | `memory` | `memory` \| `redis` \| `kubernetes` |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server (P2P) |
+| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | InfiniBand transports |
 
 ```bash
 cargo run --bin config_gen -- --output model-express.yaml
-cargo run --bin modelexpress-server -- --config model-express.yaml
-
-# Validate config without starting the server
 cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
 ```
 
-### Key Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Bind address |
-| `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
-| `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
-| `HF_HUB_OFFLINE` | — | Set to `1` for air-gapped (serve from cache only) |
-
-### Metadata Backend (P2P)
-
-| Variable | Values | Description |
-|----------|--------|-------------|
-| `MX_METADATA_BACKEND` | `memory`, `redis`, `kubernetes`/`k8s` | In-memory (default); Redis or Kubernetes CRD for persistence. Layered in-memory with write-through for `redis` and `kubernetes`. |
-| `REDIS_URL` / `MX_REDIS_HOST` | — | When backend is Redis |
-| `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | — | When backend is Kubernetes |
-
-### P2P Transfer Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (also reads `MX_SERVER_ADDRESS` for compat) |
-| `MX_EXPECTED_WORKERS` | `8` | GPU workers to wait for before transfer |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register `mx-source`/`mx-target` loaders with vLLM |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing metadata |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before starting transfer |
-| `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental, currently blocked) |
-| `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
-
-### UCX/NIXL Tuning
-
-| Variable | Recommended | Description |
-|----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand + CUDA copy |
-| `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
-| `UCX_RNDV_THRESH` | `0` | Force rendezvous protocol for all transfers |
-| `NIXL_LOG_LEVEL` | `INFO` | NIXL logging (`DEBUG` for troubleshooting) |
-| `UCX_LOG_LEVEL` | `WARN` | UCX logging (`DEBUG` for troubleshooting) |
+Full reference: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ---
 
-## CLI Reference
-
-See [docs/CLI.md](docs/CLI.md) for full documentation.
+## CLI
 
 ```bash
 modelexpress-cli health
@@ -201,23 +189,7 @@ modelexpress-cli model validate <model-id>
 modelexpress-cli model clear <model-id>
 ```
 
----
-
-## Project Structure
-
-```
-modelexpress/
-├── modelexpress_server/     # gRPC server, Redis metadata
-├── modelexpress_client/     # Rust CLI + Python vLLM loaders
-├── modelexpress_common/     # Protobuf, shared types
-├── examples/                # Kubernetes deployments (P2P, aggregated)
-├── helm/                    # Helm chart
-├── docs/                    # CLI, metadata specs
-├── workspace-tests/         # Integration tests
-├── docker-compose.yml
-├── Dockerfile
-└── k8s-deployment.yaml
-```
+[CLI Reference](docs/CLI.md)
 
 ---
 
@@ -228,36 +200,29 @@ cargo test
 cargo test --test integration_tests
 cargo run --bin test_client -- --test-model "google-t5/t5-small"
 ./run_integration_tests.sh
-
-# Benchmarks
 cargo bench
-
-# Coverage (requires cargo-tarpaulin)
-cargo tarpaulin --out Html
 ```
 
-## Development
+---
 
-Set up pre-commit hooks to enforce formatting and linting before each commit:
+## Documentation
 
-```bash
-pip install pre-commit
-pre-commit install
-
-# Run manually on all files
-pre-commit run --all-files
-```
-
-Hooks run `cargo fmt`, `cargo clippy`, `cargo check`, and file hygiene checks. Run them early and often rather than waiting until commit time.
+| Doc | Description |
+|-----|-------------|
+| [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
+| [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
+| [CLI](docs/CLI.md) | Full CLI reference |
+| [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
+| [Helm](helm/README.md) | Kubernetes configuration |
 
 ---
 
 ## Known Issues
 
-- **NIXL_ERR_REMOTE_DISCONNECT**: If the source pod restarts during transfer, stale rkeys can cause remote access errors. Flush Redis and redeploy both source and target pods.
-- **Long source warmup (DeepSeek-V3)**: Source warmup (DeepGemm compilation, CUDA graph capture) can take significant time; targets coordinate via Redis and wait before starting transfer.
-- **Large model gRPC stream**: For very large models in distributed mode, the gRPC stream may not close automatically. Use client-side timeout or file-based completion checks.
-- **Contiguous region transfers** (`MX_CONTIGUOUS_REG=1`): Currently blocked — transfers fail with remote access errors even when the source is stable. Use baseline mode (`MX_CONTIGUOUS_REG=0`) until resolved.
+- **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
+- **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
+- **Large model gRPC stream** — May not close automatically; use client timeout.
+- **MX_CONTIGUOUS_REG=1** — Blocked; use `0`.
 
 ---
 
@@ -265,51 +230,36 @@ Hooks run `cargo fmt`, `cargo clippy`, `cargo check`, and file hygiene checks. R
 
 ### Priorities Under Development
 
-- **P2P compile/warmup caching**: Implementing torch.compile/deepGEMM cache strategy for follower workers. Operational model: leader performs full engine warmup; followers consume caches and skip full warmup.
-- **ModelStreamer Integration**: Integrating Model Streamer for pulling weights from cold storage, inheriting multi-cloud and multi-engine support.
-- **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high speed NVMe.
-- **RL workloads**: Exploring ways to utilize fast P2P transfers to optimize refit phase of RL and adding support for weight resharding.
-- **Earlier weight availability**: Bring weights to prefill earlier in the lifecycle and identify prefill workers that can act as strong source nodes.
+- **P2P compile/warmup caching**: torch.compile/deepGEMM cache for follower workers. Leader performs full warmup; followers consume caches and skip full warmup.
+- **ModelStreamer Integration**: Pull weights from cold storage with multi-cloud and multi-engine support.
+- **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
+- **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
+- **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
 - **Expanded model pull providers**: Support NGC in addition to Hugging Face.
-- **GDS (GPUDirect Storage) integration**: Load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path entirely.
-- **Multi-tier cache hierarchy**: Automatically promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns and available capacity.
-- **Distributed sharded cache**: Shard large models across nodes using consistent hashing with parallel shard assembly, reducing per-node storage requirements for very large models.
-- **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts, dramatically reducing cold-start overhead.
-- **Metrics and observability**: Expose cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
-- **Predictive prefetching**: Pre-warm caches based on workload history or scheduling hints to reduce model load latency before a request arrives.
-- **P2P transfer fault tolerance**: Automatic recovery from stale rkeys on source restart, with retry logic and fallback to storage-based loading for production reliability.
+- **GDS (GPUDirect Storage) integration**: Load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path.
+- **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
+- **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
+- **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
+- **Metrics and observability**: Cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
+- **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
+- **P2P transfer fault tolerance**: Auto-recovery from stale rkeys on source restart; retry and fallback to storage loading.
 - **Multi-cloud storage backends**: Native support for AWS S3, Azure Blob, and NFS as model pull sources.
-
-Contributions and feedback are welcome. See [Contributing](#contributing) or open an [issue](https://github.com/ai-dynamo/modelexpress/issues).
-
----
-
-## Documentation
-
-| Resource | Description |
-|----------|-------------|
-| [CLI Reference](docs/CLI.md) | Full `modelexpress-cli` documentation |
-| [Helm Chart](helm/README.md) | Kubernetes deployment and configuration |
-| [P2P Transfer (vLLM)](examples/p2p_transfer_k8s/README.md) | GPU-to-GPU transfer setup |
-| [Persistence Backends](examples/p2p_transfer_k8s/deploy/persistence/README.md) | Redis and Kubernetes CRD metadata persistence for HA |
-| [Metadata Spec](docs/metadata.md) | NIXL metadata, Redis keys, K8s CRD schema |
-| [Dynamo + K8s](examples/aggregated_k8s/README.md) | ModelExpress with Dynamo on Kubernetes |
 
 ---
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+```bash
+pip install pre-commit && pre-commit install
+pre-commit run --all-files
+```
 
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/ai-dynamo/modelexpress/issues)
-- **Examples**: `workspace-tests/` and `examples/` for integration and deployment walkthroughs
+**Issues:** [GitHub Issues](https://github.com/ai-dynamo/modelexpress/issues)
 
 ---
 
 ## License
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache 2.0. See [LICENSE](LICENSE).
