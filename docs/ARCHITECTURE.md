@@ -448,7 +448,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 Detection is a one-shot check with no retry loop. If the source is still warming up, this node loads from disk and becomes a source itself. Both paths register with NIXL and publish metadata, so future nodes can discover this one.
 
-The loader requires the `MODEL_NAME` environment variable to identify the model for coordination. Shared helpers (`_collect_cuda_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
+The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_cuda_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
 
 Module-level globals `_raw_tensor_registry` and `_nixl_managers` in `vllm_loader.py` bridge loaders and clients - vLLM's loader API doesn't expose loader instances after `load_model()` returns, so source loaders store state in these dicts (keyed by device ID) for the MxClient to access.
 
@@ -544,7 +544,6 @@ graph TD
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_NAME` | (none) | Model identifier for P2P coordination (e.g., `deepseek-ai/DeepSeek-V3`) |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |

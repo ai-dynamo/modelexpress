@@ -99,6 +99,13 @@ def _get_worker_rank(device: torch.device) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_TRANSFER_MAX_RETRIES = 120
+_TRANSFER_RETRY_DELAY_SECONDS = 30
+
+# ---------------------------------------------------------------------------
 # Shared helpers used by multiple loaders
 # ---------------------------------------------------------------------------
 
@@ -287,7 +294,7 @@ class MxModelLoader(BaseModelLoader):
         )
         target_device = torch.device(load_device)
         device_id = _get_worker_rank(target_device)
-        model_name = os.environ.get("MODEL_NAME", "")
+        model_name = model_config.model
 
         logger.info(f"[Worker {device_id}] MxModelLoader starting (model={model_name})")
 
@@ -307,7 +314,7 @@ class MxModelLoader(BaseModelLoader):
                     f"tensors - receiving via RDMA"
                 )
                 self._load_as_target(
-                    model, model_config, target_device, device_id,
+                    model, model_config, device_id,
                     model_name, source_worker,
                 )
             else:
@@ -338,7 +345,7 @@ class MxModelLoader(BaseModelLoader):
         is still warming up, this node becomes a source itself.
         """
         if not model_name:
-            logger.debug(f"[Worker {device_id}] MODEL_NAME not set, defaulting to source")
+            logger.debug(f"[Worker {device_id}] No model name available, defaulting to source")
             return None
 
         if not is_nixl_available():
@@ -400,7 +407,7 @@ class MxModelLoader(BaseModelLoader):
         self._dummy_loader.load_weights(model, model_config)
 
         # RDMA receive
-        self._receive_from_peer(model, target_device, device_id, model_name, source_worker)
+        self._receive_from_peer(model, device_id, model_name, source_worker)
 
         # Register with NIXL + publish so future nodes can discover us
         self._register_and_publish(model, target_device, device_id, model_name)
@@ -413,7 +420,6 @@ class MxModelLoader(BaseModelLoader):
     def _receive_from_peer(
         self,
         model: nn.Module,
-        device: torch.device,
         device_id: int,
         model_name: str,
         source_worker,
@@ -452,8 +458,6 @@ class MxModelLoader(BaseModelLoader):
         )
 
         # RDMA transfer with retry
-        transfer_retries = 120
-        transfer_retry_delay = 30
         cached_session_id = None
 
         # Capture session from earlier get_ready call
@@ -466,7 +470,7 @@ class MxModelLoader(BaseModelLoader):
 
         coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
 
-        for attempt in range(transfer_retries):
+        for attempt in range(_TRANSFER_MAX_RETRIES):
             try:
                 transfer_start = time.perf_counter()
                 bytes_transferred, tensor_count, _ = self._nixl_manager.receive_from_source(
@@ -487,10 +491,10 @@ class MxModelLoader(BaseModelLoader):
                 torch.cuda.synchronize()
                 break
             except Exception as transfer_err:
-                if attempt < transfer_retries - 1:
+                if attempt < _TRANSFER_MAX_RETRIES - 1:
                     logger.warning(
                         f"[Worker {device_id}] Transfer attempt {attempt + 1} failed: "
-                        f"{transfer_err}, retrying in {transfer_retry_delay}s..."
+                        f"{transfer_err}, retrying in {_TRANSFER_RETRY_DELAY_SECONDS}s..."
                     )
 
                     # Check for source restart
@@ -525,10 +529,10 @@ class MxModelLoader(BaseModelLoader):
                                 )
                                 break
 
-                    time.sleep(transfer_retry_delay)
+                    time.sleep(_TRANSFER_RETRY_DELAY_SECONDS)
                 else:
                     raise RuntimeError(
-                        f"Transfer failed after {transfer_retries} attempts: {transfer_err}"
+                        f"Transfer failed after {_TRANSFER_MAX_RETRIES} attempts: {transfer_err}"
                     ) from transfer_err
 
         total_time = time.perf_counter() - receive_start
@@ -609,7 +613,7 @@ class MxModelLoader(BaseModelLoader):
                 self._mx_client, self._nixl_manager, raw_tensors, device_id, model_name
             )
         else:
-            logger.warning(f"[Worker {device_id}] MODEL_NAME not set, skipping publish")
+            logger.warning(f"[Worker {device_id}] No model name available, skipping publish")
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""

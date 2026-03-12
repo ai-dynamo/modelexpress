@@ -225,7 +225,6 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_NAME` | (none) | Model identifier for P2P coordination (e.g., `deepseek-ai/DeepSeek-V3`) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for P2P state storage |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
