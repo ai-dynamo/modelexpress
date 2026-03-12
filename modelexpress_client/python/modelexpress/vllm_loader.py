@@ -314,8 +314,8 @@ class MxModelLoader(BaseModelLoader):
                     f"tensors - receiving via RDMA"
                 )
                 self._load_as_target(
-                    model, model_config, device_id,
-                    model_name, source_worker,
+                    model, model_config, target_device,
+                    device_id, model_name, source_worker,
                 )
             else:
                 logger.info(

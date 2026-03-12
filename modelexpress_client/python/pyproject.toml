@@ -48,6 +48,9 @@ Homepage = "https://github.com/ai-dynamo/modelexpress"
 Repository = "https://github.com/ai-dynamo/modelexpress.git"
 Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
+[project.entry-points."vllm.general_plugins"]
+modelexpress = "modelexpress:register_modelexpress_loaders"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["modelexpress*"]

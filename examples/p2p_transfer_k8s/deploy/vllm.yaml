@@ -43,28 +43,24 @@ spec:
       serviceAccountName: modelexpress
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:k8s-backend
-          imagePullPolicy: Always
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
           # Needed for GPUDirect RDMA to work.
           securityContext:
             capabilities:
               add:
                 - IPC_LOCK
           env:
-            - name: VLLM_SERVER_DEV_MODE
-              value: "1"
             # Increase startup timeout to allow DeepGemm warmup to complete (2 hours)
             - name: VLLM_RPC_TIMEOUT
               value: "7200000"
             - name: HF_HUB_CACHE
               value: "/models"
-            - name: MX_ZMQ_ADDRESS
-              value: "ipc:///tmp/mx/vllm.sock"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
-            # Register ModelExpress custom loaders for FP8 support
-            - name: MX_REGISTER_LOADERS
-              value: "1"
+            # Register ModelExpress loaders via vLLM plugin system
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
             # Server address for metadata publishing
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
@@ -108,31 +104,14 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
-          command: ["/bin/bash", "-c"]
           args:
-            - |
-              set -ex
-
-              # Background task: wait for vLLM health, run stability check,
-              # then publish NIXL ready flag via MX server gRPC.
-              # This is needed for the first node (source path) so that
-              # subsequent nodes can detect it as ready.
-              (
-                sleep 5
-                while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done
-                sleep 30
-                # Warmup inference (pre-warms CUDA graphs, not required for P2P transfer)
-                curl -sf -X POST http://127.0.0.1:8000/v1/completions \
-                  -H 'Content-Type: application/json' \
-                  -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
-              ) &
-
-              # Start vLLM with mx loader
-              exec python3 -m vllm.entrypoints.openai.api_server \
-                --model $MODEL_NAME \
-                --load-format mx \
-                --tensor-parallel-size 8 \
-                --enable-expert-parallel
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "8"
+            - --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"

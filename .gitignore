@@ -52,3 +52,7 @@ models.db
 **/__pycache__/
 docs/FEEDBACK.md
 docs/optimization-comparison.md
+docs/tmp
+
+# Python
+modelexpress_client/python/modelexpress.egg-info
