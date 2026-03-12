@@ -1,17 +1,92 @@
 # Disagg Multinode Inference Issues — GB200
 
-**Date**: March 11, 2026
+**Date**: March 11, 2026 (updated)
 **Cluster**: `dynamo-gcp-dev-01` (GCP GB200 NVL36, ARM64)
 
 ---
 
-## Summary
+## Overview: What We've Achieved and What's Left
 
-MX P2P weight transfer is fully validated for multinode disagg (TP=4 prefill + TP=8 decode at 345-610 Gbps). The remaining blockers are all **TRT-LLM multinode inference** issues on GB200 — not ModelExpress.
+### Fully validated (ModelExpress P2P)
+- **Aggregated TP=4**: P2P at 369 Gbps, end-to-end inference with coherent output (TTFT 3.4s)
+- **DGDSA scaling**: second worker loads via P2P at 371-390 Gbps, ready in ~7.5 min
+- **Disagg same-TP (TP=4+TP=4)**: both prefill and decode load concurrently at 234-538 Gbps
+- **Mixed TP P2P (TP=4+TP=8)**: prefill 360-538 Gbps, decode 345-610 Gbps (8 ranks, 2 nodes)
+- **Multinode source publish**: TP=8 source publishes all 8 workers correctly across 2 nodes
+- **Cross-clique RoCE**: works at 345-379 Gbps (o7v→w0e)
+
+### Infrastructure issues resolved
+- **`MPI_ERR_TRUNCATE`**: Fixed with `safe_allgather` patch (chunks large MPI messages to 64KB)
+- **UCX UD timeout**: Worked around with `ob1` PML
+- **Multinode SSH**: Fixed with `HOME=/root`, `/run/sshd`, `HF_MODULES_CACHE`
+- **Multinode rank mapping**: Fixed MPI rank vs `torch.cuda.current_device()` for source + target
+- **NFS file lock (ESTALE)**: Fixed with `HF_MODULES_CACHE=/tmp/hf_modules`
+- **KV cache transceiver backend**: Changed from `UCX` to `DEFAULT` (NIXL)
+
+### Current issue: Garbage output from mixed TP disagg inference
+
+Disagg inference pipeline runs end-to-end (prefill→KV transfer→decode→tokens), but
+output is nonsensical (e.g., `"0000000000 ".format`). Multiple requests succeed
+without crashing (no MPI errors, no hangs). Decode generates tokens at full speed
+(~16ms/step). The issue is purely **output quality**.
+
+**What works**: TP=4 aggregated inference produces coherent output from the same model
+and same source weights. This confirms the weights are correct for TP=4.
+
+**What's new**: This is our first time running TP=8 decode across 2 nodes. The TP=8
+decode source publishes 8 workers × 90.75 GB each. The TP=8 decode target receives
+all 8 shards correctly via NIXL RDMA at 365-376 Gbps.
+
+### Investigation plan for garbage output
+
+Two potential root causes:
+
+**Hypothesis A: Weight transfer correctness (TP=8)**
+
+The TP=8 weights may not be loaded correctly into the decode model, even though
+the transfer completes without errors. Possible issues:
+- Source publishes weights with `worker_rank` based on MPI rank, but target model
+  assigns parameters to local GPU indices differently in multinode
+- Weight tensor names match (same model) but the TP sharding layout at EP=8 might
+  differ from EP=4 in ways that affect MoE expert assignment
+- The source loaded from disk at TP=8, but TRT-LLM's weight sharding for EP=8
+  may produce different parameter layouts than simply splitting EP=4 shards
+
+**How to verify**:
+1. Run TP=8 aggregated inference (non-disagg) — deploy a standalone TP=8 target
+   with a frontend, verify output is coherent. If garbage, the TP=8 weights are wrong.
+2. Compare parameter checksums between source and target for each rank
+3. Run disagg with same TP (TP=8 prefill + TP=8 decode) to isolate mixed TP from
+   the KV cache question
+
+**Hypothesis B: KV cache format mismatch between TP=4 prefill and TP=8 decode**
+
+The KV cache produced by TP=4 prefill (EP=4) may be incompatible with TP=8 decode (EP=8).
+With `enable_attention_dp: true`, each rank computes attention independently (full heads),
+so KV cache format should be TP-independent. However:
+- The number of attention DP ranks differs (4 vs 8), so KV cache is distributed
+  across different rank counts — the NIXL KV transceiver needs to map 4 KV shards to 8 decode ranks
+- The `kv_block_size` and `tokens_per_block` settings must match between prefill and decode
+- Karen's mixed TP recipe uses the same clique affinity — both prefill and decode share
+  the NVLink domain, which may affect how NIXL KV transfer maps ranks
+
+**How to verify**:
+1. Run disagg with same TP=8 for both prefill and decode — if output is coherent,
+   the KV cache format is the issue when TP differs
+2. Check TRT-LLM docs/code for mixed EP support with NIXL KV transceiver
+3. Ask TRT-LLM team if `enable_attention_dp: true` guarantees KV cache compatibility
+   across different EP sizes
+
+### Priority
+1. Test TP=8 aggregated inference first (verifies weight correctness)
+2. If weights are correct, test same-TP disagg (TP=8+TP=8) to isolate KV cache
+3. If KV cache is the issue, align prefill and decode to same TP or ask TRT-LLM team
 
 ---
 
-## Issue 1: MPI_ERR_TRUNCATE with ob1 PML
+## Resolved Issues
+
+### Issue 1 (RESOLVED): MPI_ERR_TRUNCATE with ob1 PML
 
 **Symptom**: During inference, `tp_gather` → `comm.allgather` fails with `MPI_ERR_TRUNCATE: message truncated` on the decode TP=8 multinode worker.
 
@@ -45,7 +120,7 @@ py_executor._executor_loop
 
 ---
 
-## Issue 2: UCX_TLS conflict between MPI and NIXL
+### Issue 2 (RESOLVED): UCX_TLS conflict between MPI and NIXL
 
 **Symptom**: Setting `UCX_TLS=tcp` globally (to fix MPI) also restricts NIXL to TCP, dropping P2P from 370 Gbps to ~3 Gbps.
 
@@ -68,7 +143,7 @@ finally:
 
 ---
 
-## Issue 3: KV Cache Transceiver UCX Connection
+### Issue 3 (RESOLVED): KV Cache Transceiver UCX Connection
 
 **Symptom**: `CacheReceiver` can't connect to prefill's UCX port for KV cache transfer:
 ```
@@ -84,7 +159,7 @@ Error in UcxConnection constructor: Request canceled
 
 ---
 
-## Issue 4: Compute Domain / DRA Scheduling
+### Issue 4 (RESOLVED): Compute Domain / DRA Scheduling
 
 **Symptom**: Target pods stuck in `Pending` — "cannot allocate all claims" or "node is unschedulable".
 
@@ -97,7 +172,7 @@ Error in UcxConnection constructor: Request canceled
 
 ---
 
-## Issue 5: NFS File Lock (ESTALE) on Multinode
+### Issue 5 (RESOLVED): NFS File Lock (ESTALE) on Multinode
 
 **Symptom**: Ranks 4-7 on node B crash with `[Errno 116] Stale file handle` during model config loading.
 
@@ -109,7 +184,7 @@ Error in UcxConnection constructor: Request canceled
 
 ---
 
-## Issue 6: Multinode SSH / sshd
+### Issue 6 (RESOLVED): Multinode SSH / sshd
 
 **Symptom**: Worker pod CrashLoopBackOff — `sshd: no hostkeys available` or `Missing privilege separation directory`.
 
