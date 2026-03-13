@@ -18,7 +18,7 @@ pub trait ModelProviderTrait: Send + Sync {
 
     /// Delete a model from the provider's cache
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
-    async fn delete_model(&self, model_name: &str) -> Result<()>;
+    async fn delete_model(&self, model_name: &str, cache_dir: Option<PathBuf>) -> Result<()>;
 
     /// Get the full path to the latest model snapshot if it exists
     /// Returns the path if found, or an error if not found
