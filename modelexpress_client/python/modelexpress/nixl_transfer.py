@@ -91,43 +91,17 @@ class NixlTransferManager:
 
         torch.cuda.set_device(self._device_id)
 
-        # Override UCX_TLS for NIXL's context to enable RoCE auto-detection.
-        # MPI may set UCX_TLS=tcp globally, which would restrict NIXL to TCP.
+        # Let UCX auto-detect transports (RoCE, TCP, etc).
+        # OMPI_MCA_pml=ob1 keeps MPI on TCP independently.
+        # Only override UCX_TLS if explicitly set to "tcp" (legacy compat).
         saved_ucx_tls = os.environ.get("UCX_TLS")
-        saved_ucx_net_devices = os.environ.get("UCX_NET_DEVICES")
         nixl_ucx_tls = os.environ.get("NIXL_UCX_TLS")
         if nixl_ucx_tls:
             os.environ["UCX_TLS"] = nixl_ucx_tls
             logger.info(f"NIXL UCX_TLS override: {nixl_ucx_tls} (was: {saved_ucx_tls})")
         elif saved_ucx_tls == "tcp":
             os.environ.pop("UCX_TLS", None)
-            logger.info(f"NIXL: removed UCX_TLS=tcp for RoCE auto-detection")
-
-        # Discover routable + RDMA devices, excluding link-local interfaces.
-        # UCX_NET_DEVICES=eth0 would block RDMA; we need eth0 + RoCE devices.
-        if not saved_ucx_net_devices or saved_ucx_net_devices == "eth0":
-            try:
-                import glob as _glob
-                rdma_devs = set()
-                for path in _glob.glob("/sys/class/infiniband/*/ports/*/gid_attrs/ndevs/*"):
-                    try:
-                        with open(path) as f:
-                            dev = f.read().strip()
-                            if dev:
-                                rdma_devs.add(dev)
-                    except (OSError, IOError):
-                        continue
-                if rdma_devs:
-                    all_devs = sorted({"eth0"} | rdma_devs)
-                    os.environ["UCX_NET_DEVICES"] = ",".join(all_devs)
-                    logger.info(f"NIXL: UCX_NET_DEVICES={os.environ['UCX_NET_DEVICES']} (RoCE + eth0)")
-                elif not saved_ucx_net_devices:
-                    os.environ["UCX_NET_DEVICES"] = "eth0"
-                    logger.info("NIXL: UCX_NET_DEVICES=eth0 (no RDMA devices found)")
-            except Exception as e:
-                logger.warning(f"NIXL: failed to discover RDMA devices: {e}")
-                if not saved_ucx_net_devices:
-                    os.environ["UCX_NET_DEVICES"] = "eth0"
+            logger.info(f"NIXL: removed UCX_TLS=tcp for auto-detection")
 
         try:
             config = nixl_agent_config(backends=["UCX"]) if nixl_agent_config else None
@@ -137,10 +111,6 @@ class NixlTransferManager:
             if saved_ucx_tls is not None:
                 os.environ["UCX_TLS"] = saved_ucx_tls
             elif "UCX_TLS" in os.environ:
-                os.environ.pop("UCX_TLS")
-            if saved_ucx_net_devices is not None:
-                os.environ["UCX_NET_DEVICES"] = saved_ucx_net_devices
-            elif "UCX_NET_DEVICES" in os.environ:
                 os.environ.pop("UCX_NET_DEVICES")
 
     def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:

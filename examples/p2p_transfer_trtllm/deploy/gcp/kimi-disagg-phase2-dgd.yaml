@@ -89,7 +89,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.2
           command:
             - python3
           args:
@@ -187,7 +187,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.2
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -251,6 +251,12 @@ spec:
               value: "900"
             - name: TRTLLM_UCX_INTERFACE
               value: "eth0"
+            - name: UCX_TLS
+              value: "self,sm,rc,cuda_copy,gdr_copy"
+            - name: UCX_IB_GID_INDEX
+              value: "3"
+            - name: OMPI_MCA_orte_keep_fqdn_hostnames
+              value: "1"
             - name: OMPI_MCA_pml
               value: "ob1"
             - name: OMPI_MCA_btl
@@ -380,7 +386,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.2
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -444,6 +450,12 @@ spec:
               value: "900"
             - name: TRTLLM_UCX_INTERFACE
               value: "eth0"
+            - name: UCX_TLS
+              value: "self,sm,rc,cuda_copy,gdr_copy"
+            - name: UCX_IB_GID_INDEX
+              value: "3"
+            - name: OMPI_MCA_orte_keep_fqdn_hostnames
+              value: "1"
             - name: OMPI_MCA_pml
               value: "ob1"
             - name: OMPI_MCA_btl
