@@ -9,7 +9,8 @@
 use crate::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
     GetMetadataRequest, GetMetadataResponse, PublishMetadataRequest, PublishMetadataResponse,
-    UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
+    SourceStatus, UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata,
+    p2p_service_server::P2pService,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -131,9 +132,19 @@ impl P2pService for P2pServiceImpl {
             }));
         }
 
+        let status = match SourceStatus::try_from(req.status) {
+            Ok(s) => s as i32,
+            Err(_) => {
+                return Ok(Response::new(UpdateStatusResponse {
+                    success: false,
+                    message: format!("invalid status value: {}", req.status),
+                }));
+            }
+        };
+
         match self
             .state
-            .update_worker_status(&req.model_name, req.worker_id, req.status)
+            .update_worker_status(&req.model_name, req.worker_id, status)
             .await
         {
             Ok(()) => Ok(Response::new(UpdateStatusResponse {
@@ -310,6 +321,27 @@ mod tests {
     }
 
     // ── update_status ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_update_status_invalid_status_value() {
+        // Backend must never be called — the mock will panic on any unexpected call.
+        let svc = make_service(MockMetadataBackend::new());
+        let resp = svc
+            .update_status(Request::new(UpdateStatusRequest {
+                model_name: "my-model".to_string(),
+                worker_id: 0,
+                status: 99,
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.success);
+        assert!(
+            resp.message.contains("99"),
+            "message should include the bad value: {}",
+            resp.message
+        );
+    }
 
     #[tokio::test]
     async fn test_update_status_empty_model_name() {

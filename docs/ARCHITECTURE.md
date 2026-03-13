@@ -405,7 +405,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | Module | Purpose |
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
-| `client.py` | `MxClient` - gRPC client with session management, ready polling |
+| `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `vllm_loader.py` | `MxModelLoader` - custom vLLM model loader |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
@@ -419,10 +419,8 @@ gRPC client wrapping the P2P service stubs:
 | Method | Purpose |
 |--------|---------|
 | `publish_metadata(model_name, workers)` | Publish NIXL metadata for GPU workers |
-| `get_metadata(model_name)` | Query for existing source metadata |
-| `publish_ready(model_name, worker_id, ...)` | Signal NIXL readiness |
-| `wait_for_ready(model_name, worker_id, ...)` | Poll until source is ready (with timeout) |
-| `check_session_changed(model_name, worker_id, cached_session_id)` | Detect source restarts via session ID change |
+| `get_metadata(model_name)` | Query source metadata; target polls this until all workers reach `Ready` status |
+| `update_status(model_name, worker_id, status)` | Update a worker's `SourceStatus` (e.g., `Ready`); source calls this after health check and test inference |
 | `close()` | Close the underlying gRPC channel |
 
 ### NixlTransferManager

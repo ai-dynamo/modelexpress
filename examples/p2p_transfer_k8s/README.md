@@ -87,7 +87,7 @@ kubectl logs deployment/mx-vllm -c vllm
 ### Check Redis connectivity (Redis backend)
 
 ```bash
-kubectl exec -it deployment/modelexpress-server -- redis-cli ping
+kubectl exec -it deployment/modelexpress-server -c redis -- redis-cli ping
 ```
 
 ### Verify InfiniBand is working

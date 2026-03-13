@@ -382,7 +382,13 @@ impl MetadataBackend for KubernetesBackend {
                 Vec::new()
             };
 
-            let status = WorkerStatus::status_proto_from_name(&worker_status.status);
+            let status = WorkerStatus::status_proto_from_name(&worker_status.status)
+                .ok_or_else(|| {
+                    format!(
+                        "Unknown status string '{}' for worker {}",
+                        worker_status.status, worker_status.worker_rank
+                    )
+                })?;
             let updated_at = worker_status
                 .updated_at
                 .as_deref()

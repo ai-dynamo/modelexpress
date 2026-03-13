@@ -401,19 +401,26 @@ impl MetadataBackend for RedisBackend {
             .invoke_async(&mut conn)
             .await?;
 
-        if patched == 0 {
-            debug!(
-                "update_status: worker {} not found in model '{}', skipping",
-                worker_id, model_name
-            );
-        } else {
-            debug!(
-                "Updated status for model '{}' worker {}",
-                model_name, worker_id
-            );
-        }
+        check_patched(patched, worker_id, model_name)?;
+        debug!(
+            "Updated status for model '{}' worker {}",
+            model_name, worker_id
+        );
         Ok(())
     }
+}
+
+/// Return `Ok(())` when `patched == 1`, or a descriptive error when `patched == 0`
+/// (model key absent or worker not found).
+fn check_patched(patched: i32, worker_id: u32, model_name: &str) -> MetadataResult<()> {
+    if patched == 0 {
+        return Err(format!(
+            "update_status: worker {} not found in model '{}'",
+            worker_id, model_name
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -507,6 +514,33 @@ mod tests {
         let parsed: WorkerRecordJson = serde_json::from_str(json).expect("parse legacy");
         assert_eq!(parsed.status, 0);
         assert_eq!(parsed.updated_at, 0);
+    }
+
+    // ── check_patched ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_check_patched_ok() {
+        assert!(check_patched(1, 0, "my-model").is_ok());
+    }
+
+    #[test]
+    fn test_check_patched_zero_returns_err() {
+        let err = check_patched(0, 3, "my-model").expect_err("expected Err for patched==0");
+        let msg = err.to_string();
+        assert!(msg.contains("worker 3"), "error should name the worker: {msg}");
+        assert!(msg.contains("my-model"), "error should name the model: {msg}");
+    }
+
+    #[test]
+    fn test_check_patched_zero_unknown_worker() {
+        // Absent model key also returns 0 from the Lua script.
+        let err = check_patched(0, 0, "nonexistent-model")
+            .expect_err("absent model should be Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent-model"),
+            "error should name the model: {msg}"
+        );
     }
 
     // ── ModelMetadataJson serialization ─────────────────────────────────────
