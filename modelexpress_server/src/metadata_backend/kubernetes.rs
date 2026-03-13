@@ -21,7 +21,6 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
 
-
 /// Kubernetes backend for metadata storage
 pub struct KubernetesBackend {
     client: Client,
@@ -124,12 +123,8 @@ impl KubernetesBackend {
             }
             Err(kube::Error::Api(err)) if err.code == 409 => {
                 // Already exists — use merge patch to avoid SSA field manager conflicts
-                api.patch(
-                    &cm_name,
-                    &PatchParams::default(),
-                    &Patch::Merge(&cm),
-                )
-                .await?;
+                api.patch(&cm_name, &PatchParams::default(), &Patch::Merge(&cm))
+                    .await?;
                 debug!("Updated ConfigMap {} for worker {}", cm_name, worker_rank);
             }
             Err(e) => return Err(e.into()),
