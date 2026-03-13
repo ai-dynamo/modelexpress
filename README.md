@@ -72,7 +72,9 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ## ModelExpress Architecture
 
-![ModelExpress Architecture: Zero-copy GPU-to-GPU model weight transfer via NIXL RDMA](model-express-architecture.png)
+![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](model-express-architecture.png)
+
+*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format mx` for inference.
 
 ```
                     ┌─────────────────────────────────────────────────────────────────┐
@@ -81,14 +83,14 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
                     └──────────────────────┬──────────────────────────────────────────┘
                                            │
                          ┌─────────────────┼─────────────────┐
-                         │ metadata                          │ metadata
-                         ▼                                   ▼
-              ┌──────────────────┐                 ┌──────────────────┐
-              │  Source (vLLM)   │  RDMA           │  Target (vLLM)   │
-              │  mx loader       │════════════════►│  mx loader       │
-              │  Load → NIXL     │  NIXL           │  Receive → FP8   │
-              │  Publish metadata│                 │  Serve inference │
-              └──────────────────┘                 └──────────────────┘
+                         │ metadata        │                 │ metadata
+                         ▼                 │                 ▼
+              ┌──────────────────┐         │       ┌──────────────────┐
+              │  Source (vLLM)   │  RDMA   │       │  Target (vLLM)   │
+              │  mx loader       │════════►│       │  mx loader       │
+              │  Load → NIXL     │  NIXL   │       │  Receive → FP8   │
+              │  Publish metadata│         │       │  Serve inference │
+              └──────────────────┘         │       └──────────────────┘
 ```
 
 *Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
