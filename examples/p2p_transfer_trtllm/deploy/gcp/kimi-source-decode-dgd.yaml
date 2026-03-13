@@ -135,19 +135,9 @@ spec:
             - name: TRITON_CACHE_DIR
               value: /model-cache/.triton-cache
             - name: NIXL_LOG_LEVEL
-              value: "DEBUG"
-            - name: UCX_LOG_LEVEL
-              value: "DEBUG"
-            - name: UCX_PROTO_INFO
-              value: "y"
-            - name: UCX_NET_DEVICES
-              value: "eth0,eth2,eth3,eth4,eth5"
-            - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
-            - name: UCX_RNDV_SCHEME
-              value: "get_zcopy"
-            - name: UCX_RNDV_THRESH
-              value: "0"
+              value: "INFO"
+            - name: TRTLLM_UCX_INTERFACE
+              value: "eth0"
             - name: OMPI_MCA_pml
               value: "ob1"
             - name: OMPI_MCA_btl

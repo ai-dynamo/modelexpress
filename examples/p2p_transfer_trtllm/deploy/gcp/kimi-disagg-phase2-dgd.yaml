@@ -246,17 +246,11 @@ spec:
             - name: TRITON_CACHE_DIR
               value: /tmp/.triton-cache
             - name: NIXL_LOG_LEVEL
-              value: "DEBUG"
+              value: "INFO"
             - name: MX_TRANSFER_TIMEOUT
               value: "900"
-            - name: UCX_LOG_LEVEL
-              value: "DEBUG"
-            - name: UCX_PROTO_INFO
-              value: "y"
-            - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp"
-            - name: UCX_NET_DEVICES
-              value: "eth0,eth2,eth3,eth4,eth5"
+            - name: TRTLLM_UCX_INTERFACE
+              value: "eth0"
             - name: OMPI_MCA_pml
               value: "ob1"
             - name: OMPI_MCA_btl
@@ -445,17 +439,11 @@ spec:
             - name: TRITON_CACHE_DIR
               value: /tmp/.triton-cache
             - name: NIXL_LOG_LEVEL
-              value: "DEBUG"
+              value: "INFO"
             - name: MX_TRANSFER_TIMEOUT
               value: "900"
-            - name: UCX_LOG_LEVEL
-              value: "DEBUG"
-            - name: UCX_PROTO_INFO
-              value: "y"
-            - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp"
-            - name: UCX_NET_DEVICES
-              value: "eth0,eth2,eth3,eth4,eth5"
+            - name: TRTLLM_UCX_INTERFACE
+              value: "eth0"
             - name: OMPI_MCA_pml
               value: "ob1"
             - name: OMPI_MCA_btl
