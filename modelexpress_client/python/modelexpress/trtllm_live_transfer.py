@@ -578,11 +578,12 @@ class MxLiveWeightLoader:
 
         # 7. RDMA transfer: source params → target params
         coalesce = os.environ.get("MX_COALESCE_TRANSFERS", "0") == "1"
+        xfer_timeout = int(os.environ.get("MX_TRANSFER_TIMEOUT", "900"))
         t0 = time.perf_counter()
         bytes_transferred, n_tensors, _ = nixl_mgr.receive_from_source(
             source_metadata=source_worker.nixl_metadata,
             source_tensors=src_descs_for_transfer,
-            timeout_seconds=300,
+            timeout_seconds=xfer_timeout,
             coalesce_transfers=coalesce,
         )
         elapsed = time.perf_counter() - t0

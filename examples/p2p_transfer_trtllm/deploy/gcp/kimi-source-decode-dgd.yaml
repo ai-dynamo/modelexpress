@@ -85,7 +85,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -135,9 +135,13 @@ spec:
             - name: TRITON_CACHE_DIR
               value: /model-cache/.triton-cache
             - name: NIXL_LOG_LEVEL
-              value: "INFO"
+              value: "DEBUG"
             - name: UCX_LOG_LEVEL
-              value: "WARN"
+              value: "DEBUG"
+            - name: UCX_PROTO_INFO
+              value: "y"
+            - name: UCX_NET_DEVICES
+              value: "eth0,eth2,eth3,eth4,eth5"
             - name: UCX_TLS
               value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
             - name: UCX_RNDV_SCHEME

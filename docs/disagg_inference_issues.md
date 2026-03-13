@@ -353,3 +353,176 @@ env:
 | `TLLM_DISABLE_MPI=1` | N/A | N/A | Ray not installed | Switches to Ray executor |
 | `UCX_TLS=tcp,cuda_ipc,...` + `privileged` | N/A | Hangs | N/A | UCX confused by visible IB |
 | No env overrides + operator mpirun | N/A | `btl_tcp` errors | N/A | Process ID mismatch |
+| `runAsUser:0` + `IPC_LOCK` + no OMPI env | N/A | Inner MpiSession hangs | N/A | TRT-LLM's internal MPI picks `169.254.x.x` link-local |
+| `runAsUser:0` + `OMPI_MCA_*` env + no UCX fixes | Weights matched 1154/1815 | MPI works | `NIXL_ERR_BACKEND` | NIXL `loadRemoteMD` connects to `169.254.4.6` |
+| `runAsUser:0` + `OMPI_MCA_*` + `UCX_NET_DEVICES=eth0` | Same | MPI works | `NIXL_ERR_BACKEND` | Source published metadata with `169.254.4.6` baked in |
+
+### Issue #7: NIXL source address bound to link-local `169.254.x.x`
+**Status**: INVESTIGATING — needs source redeployment with `UCX_NET_DEVICES=eth0`
+
+The source's `nixl_transfer.py` temporarily removes `UCX_TLS` for NIXL agent creation to auto-detect
+RoCE. However, without `UCX_NET_DEVICES=eth0`, the NIXL agent binds to ALL interfaces including
+`169.254.x.x` link-local addresses. This address gets baked into the metadata published to Redis.
+When target pods try to `add_remote_agent(source_metadata)`, NIXL/UCX attempts to connect to
+`169.254.4.6` which is unreachable from other pods.
+
+**Fix**: Add `UCX_NET_DEVICES=eth0` to source DGD YAML, flush Redis, and redeploy.
+
+**Key learnings from this debugging session (multinode disagg + MX P2P)**:
+1. Inner MPI session (`start MpiSession with 8 workers`) needs `OMPI_MCA_pml=ob1` + `btl_tcp_if_include=eth0` as **env vars** (not just mpirun flags)
+2. `UCX_TCP_IF_INCLUDE` is NOT a valid UCX env var (UCX warns "unused")
+3. `UCX_NET_DEVICES=eth0,eth2,eth3,eth4,eth5` is the correct way to restrict UCX interface selection (exclude 169.254.x.x link-local)
+4. Source NIXL metadata contains the transport address — must be routable from target pods
+5. Karen's disagg recipe works without MX P2P because it loads from shared PVC directly
+6. DGD operator exports env vars via mpirun `-x` from `collectAllEnvVars()` — includes all vars set in container env spec
+7. MoE backend must match between source and target (TRTLLM vs WIDEEP causes garbage output)
+8. `MX_TRANSFER_TIMEOUT` env var added (default 900s) — TCP transfers of 90 GB can exceed the old 300s hardcoded timeout
+
+### Issue #8: RoCE not activating despite correct config
+**Status**: INVESTIGATING
+
+UCX selects TCP even with all correct config:
+- `privileged: true`, `ulimit -l unlimited`
+- `UCX_TLS=rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp` propagated to MPI workers
+- `UCX_NET_DEVICES=eth0,eth2,eth3,eth4,eth5`
+- IB devices active (`ibv_devinfo` shows `PORT_ACTIVE`)
+- UCX loads `libuct_ib_mlx5.so` and `libuct_rdmacm.so`
+- All 4 mlx5 devices visible
+
+UCX wireup logs show `tcp/eth4` on all lanes with `software emulation`.
+Previous TP=4 aggregated test (plain Deployment, not DGD) achieved 369 Gbps RoCE on same nodes.
+
+## RoCE Debug Plan
+
+### Problem Summary
+Two NIXL users in the same process need different UCX transport configs:
+1. **MX P2P weight transfer** (modelexpress `nixl_transfer.py`) — wants RoCE for fast weight transfer
+2. **TRT-LLM KV cache transceiver** (C++ `NixlTransferAgent`) — needs TCP-safe config for prefill↔decode
+
+Setting `UCX_TLS` with RoCE globally breaks TRT-LLM's KV cache NIXL (hangs on inference).
+Setting `UCX_TLS=tcp` globally limits weight transfer to ~3-4 Gbps.
+
+### Root Causes Identified
+
+#### RC1: TRT-LLM `getAvailableIP()` picks `169.254.x.x`
+**Repo**: `TensorRT-LLM`
+**File**: `cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.cpp:119-158`
+
+`getAvailableIP()` iterates interfaces and returns the FIRST IPv4 address, only skipping
+`docker*` and `lo`. Does NOT skip link-local `169.254.x.x`. With `hostNetwork: true` on
+GB200 nodes, `169.254.x.x` appears before `eth0` and gets baked into the NIXL agent address.
+
+**Fix**: Set `TRTLLM_UCX_INTERFACE=eth0` env var (checked at line 125-129 via `getEnvNixlInterface()`).
+This forces TRT-LLM's KV cache NIXL to bind to `eth0` specifically.
+
+#### RC2: UCX selects TCP even with RC transports requested
+**Repo**: UCX / NIXL
+**Evidence**: `UCX_TLS=rc_v,rc_x,...,tcp`, `privileged: true`, `ulimit -l unlimited`,
+`ibv_devinfo` shows `PORT_ACTIVE`, UCX loads `libuct_ib_mlx5.so` — yet wireup selects `tcp/ethX`.
+
+**Hypotheses**:
+- (a) UCX `rc_v`/`rc_x` requires explicit `rdma/ib` Kubernetes resource requests
+  (Sara's NCCL test uses `rdma/ib: "8"` resource limit)
+- (b) NIXL's UCX agent config overrides transport selection
+  (`nixlAgentConfig` may force TCP internally)
+- (c) GKE container runtime blocks IB verbs even with `privileged: true`
+  (need to test `ibv_rc_pingpong` inside the pod)
+- (d) Missing GDRCopy or CUDA IPC configuration for GPU-direct RDMA
+
+#### RC3: Two NIXL agents share same UCX process context
+**Repos**: `modelexpress` + `TensorRT-LLM`
+
+Our `nixl_transfer.py` temporarily overrides `UCX_TLS` before creating the MX NIXL agent,
+then restores it. But UCX caches transport resources per-process — the first agent's context
+affects the second. TRT-LLM creates its KV cache NIXL agent later in the same process.
+
+### Debug Plan
+
+#### Phase 1: Isolate UCX RC transport (standalone test in DGD pod)
+**Goal**: Determine if UCX RC verbs work at all inside a DGD-managed pod
+**Repos**: None (manual test)
+
+```bash
+# Exec into decode leader pod
+kubectl exec -it <decode-ldr-pod> -c main -- bash
+
+# Test 1: IB verbs directly
+ibv_rc_pingpong -d mlx5_0 -g 0  # Run on source node
+ibv_rc_pingpong -d mlx5_0 -g 0 <source-ip>  # Run on target node
+
+# Test 2: UCX perftest with RC
+ucx_perftest -t tag_bw -m cuda -s 1048576  # Server on source
+ucx_perftest <source-ip> -t tag_bw -m cuda -s 1048576  # Client on target
+
+# Test 3: Check UCX transport availability
+ucx_info -d | grep -i "rc_mlx5\|rc_v\|Transport"
+```
+
+#### Phase 2: Fix TRT-LLM KV cache NIXL interface binding
+**Goal**: TRT-LLM KV cache NIXL binds to `eth0`, not `169.254.x.x`
+**Repo**: `TensorRT-LLM`
+**File**: `cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.cpp`
+
+- **Quick fix**: Add `TRTLLM_UCX_INTERFACE=eth0` to DGD YAML env vars
+- **Proper fix**: `getAvailableIP()` should skip link-local addresses (`169.254.x.x`)
+  Add check: `if (strncmp(address_buffer, "169.254.", 8) == 0) continue;`
+
+#### Phase 3: Add `rdma/ib` resource requests
+**Goal**: Ensure RDMA device plugin properly allocates IB devices to pods
+**Repo**: `modelexpress` (YAML configs) + `dynamo` (operator)
+
+Sara's NCCL test uses `rdma/ib: "8"` in resource limits. Our DGD YAMLs don't request
+this resource. The RDMA shared device plugin may not expose IB devices properly without it.
+
+```yaml
+resources:
+  limits:
+    gpu: "4"
+    rdma/ib: "4"   # <-- add this
+```
+
+Check if `rdma/ib` resource is available: `kubectl describe node <gpu-node> | grep rdma`
+
+#### Phase 4: NIXL agent UCX context isolation
+**Goal**: MX P2P NIXL uses RoCE, TRT-LLM KV cache NIXL uses TCP, independently
+**Repos**: `modelexpress` + `nixl`
+
+Options:
+- (a) **NIXL agent-level transport config**: Check if `nixlAgentConfig` supports
+  per-agent `UCX_TLS` override (not env var based). Look at NIXL's `_api.py` and
+  `nixl_agent.cpp` for backend config params.
+- (b) **Process isolation**: Run MX P2P transfer in a subprocess with different
+  UCX env vars, then exit. TRT-LLM's NIXL agent creates in the main process
+  with TCP config afterward.
+- (c) **Sequential override**: Ensure MX NIXL agent is created and transfer
+  completes BEFORE TRT-LLM creates its KV cache NIXL agent. Currently both
+  happen inside `LLM()` constructor — weight load (our NIXL) then executor
+  setup (TRT-LLM NIXL).
+
+#### Phase 5: Dynamo operator env var propagation audit
+**Goal**: Ensure all UCX/NIXL env vars reach MPI workers
+**Repo**: `dynamo`
+**File**: `deploy/operator/internal/dynamo/backend_trtllm.go:251-278`
+
+`collectAllEnvVars()` already includes all container env vars in mpirun `-x` flags.
+Verified working. Add `TRTLLM_UCX_INTERFACE` to the common vars list for convenience:
+
+```go
+func getCommonTRTLLMEnvVars() map[string]bool {
+    return map[string]bool{
+        // ... existing vars ...
+        "TRTLLM_USE_UCX_KVCACHE": true,
+        "TRTLLM_UCX_INTERFACE": true,  // <-- add
+        "UCX_TLS": true,               // <-- add
+        "UCX_NET_DEVICES": true,       // <-- add
+    }
+}
+```
+
+### Immediate Next Steps (priority order)
+
+1. **Set `TRTLLM_UCX_INTERFACE=eth0`** in DGD YAML → fixes KV cache NIXL `169.254.x.x` → allows RoCE `UCX_TLS` without breaking inference
+2. **Revert to `UCX_TLS=tcp` + test inference** → validate MoE backend fix produces correct output
+3. **Run `ibv_rc_pingpong` inside DGD pod** → confirm IB verbs work at all
+4. **Check `rdma/ib` resource** → may be required for proper RDMA device exposure
+5. **Test with `TRTLLM_UCX_INTERFACE=eth0` + RoCE `UCX_TLS`** → should fix both issues simultaneously

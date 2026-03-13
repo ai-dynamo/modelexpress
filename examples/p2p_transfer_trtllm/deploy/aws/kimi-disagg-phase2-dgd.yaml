@@ -1,6 +1,6 @@
-# Kimi K2.5 disagg Phase 2 — mixed TP with dual MX sources
-# Prefill (TP=4) reads from modelexpress-server (Source A)
-# Decode (TP=8, multinode: 2) reads from modelexpress-server-decode (Source B)
+# Kimi K2.5 disagg Phase 2 — mixed TP with dual MX sources (AWS GB200)
+# Prefill (TP=4) reads from modelexpress-server (Source A - TP=4 plain Deployment)
+# Decode (TP=8, multinode: 2) reads from modelexpress-server-decode (Source B - TP=8 DGD)
 # Namespace: kavin
 #
 # Prerequisites:
@@ -8,7 +8,7 @@
 #   - Source B (TP=8) deployed and published to modelexpress-server-decode
 #   - Dual MX infra: mx-infra.yaml + mx-infra-decode.yaml
 #   - Dynamo platform (etcd + NATS)
-#   - DGD operator webhook running
+#   - DGD operator running
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -64,7 +64,7 @@ data:
     model_kwargs:
       num_hidden_layers: 61
     moe_config:
-      backend: TRTLLM
+      backend: WIDEEP
       use_low_precision_moe_combine: true
     moe_expert_parallel_size: 8
     num_postprocess_workers: 4
@@ -89,7 +89,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
           command:
             - python3
           args:
@@ -117,7 +117,7 @@ spec:
             - mountPath: /model-cache
               name: model-cache
         nodeSelector:
-          kubernetes.io/arch: arm64
+          node-role.kubernetes.io/customer-gpu: ""
         tolerations:
           - effect: NoSchedule
             key: dedicated
@@ -138,7 +138,6 @@ spec:
             persistentVolumeClaim:
               claimName: model-cache
 
-    # --- Prefill: TP=8, reads from Source B (modelexpress-server-decode) ---
     prefill:
       componentType: worker
       subComponentType: prefill
@@ -166,14 +165,6 @@ spec:
         securityContext: {}
         terminationGracePeriodSeconds: 600
         affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                - key: cloud.google.com/gke-nodepool
-                  operator: In
-                  values:
-                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -187,11 +178,13 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
-            privileged: true
+            capabilities:
+              add: [IPC_LOCK, SYS_RESOURCE]
+            runAsUser: 0
           command:
             - python3
             - -m
@@ -246,25 +239,9 @@ spec:
             - name: TRITON_CACHE_DIR
               value: /tmp/.triton-cache
             - name: NIXL_LOG_LEVEL
-              value: "DEBUG"
-            - name: MX_TRANSFER_TIMEOUT
-              value: "900"
+              value: "INFO"
             - name: UCX_LOG_LEVEL
-              value: "DEBUG"
-            - name: UCX_PROTO_INFO
-              value: "y"
-            - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp"
-            - name: UCX_NET_DEVICES
-              value: "eth0,eth2,eth3,eth4,eth5"
-            - name: OMPI_MCA_pml
-              value: "ob1"
-            - name: OMPI_MCA_btl
-              value: "tcp,self,vader"
-            - name: OMPI_MCA_btl_tcp_if_include
-              value: "eth0"
-            - name: OMPI_MCA_oob_tcp_if_include
-              value: "eth0"
+              value: "WARN"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -272,9 +249,9 @@ spec:
             - name: NVIDIA_GDRCOPY
               value: "1"
             - name: NCCL_SOCKET_IFNAME
-              value: eth0
+              value: enp4s0
             - name: GLOO_SOCKET_IFNAME
-              value: eth0
+              value: enp4s0
             - name: NCCL_STORE_TIMEOUT
               value: "7200"
             - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
@@ -306,7 +283,7 @@ spec:
               name: trtllm-config
               readOnly: true
         nodeSelector:
-          kubernetes.io/arch: arm64
+          node-role.kubernetes.io/customer-gpu: ""
         tolerations:
           - effect: NoSchedule
             key: dedicated
@@ -337,7 +314,6 @@ spec:
             configMap:
               name: kimi-disagg-phase2-trtllm-config
 
-    # --- Decode: TP=8, 2 nodes, reads from Source B (modelexpress-server-decode) ---
     decode:
       componentType: worker
       subComponentType: decode
@@ -365,14 +341,6 @@ spec:
         securityContext: {}
         terminationGracePeriodSeconds: 600
         affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                - key: cloud.google.com/gke-nodepool
-                  operator: In
-                  values:
-                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -386,11 +354,13 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.1
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
-            privileged: true
+            capabilities:
+              add: [IPC_LOCK, SYS_RESOURCE]
+            runAsUser: 0
           command:
             - python3
             - -m
@@ -444,26 +414,6 @@ spec:
               value: /tmp/hf_modules
             - name: TRITON_CACHE_DIR
               value: /tmp/.triton-cache
-            - name: NIXL_LOG_LEVEL
-              value: "DEBUG"
-            - name: MX_TRANSFER_TIMEOUT
-              value: "900"
-            - name: UCX_LOG_LEVEL
-              value: "DEBUG"
-            - name: UCX_PROTO_INFO
-              value: "y"
-            - name: UCX_TLS
-              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp"
-            - name: UCX_NET_DEVICES
-              value: "eth0,eth2,eth3,eth4,eth5"
-            - name: OMPI_MCA_pml
-              value: "ob1"
-            - name: OMPI_MCA_btl
-              value: "tcp,self,vader"
-            - name: OMPI_MCA_btl_tcp_if_include
-              value: "eth0"
-            - name: OMPI_MCA_oob_tcp_if_include
-              value: "eth0"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -471,9 +421,9 @@ spec:
             - name: NVIDIA_GDRCOPY
               value: "1"
             - name: NCCL_SOCKET_IFNAME
-              value: eth0
+              value: enp4s0
             - name: GLOO_SOCKET_IFNAME
-              value: eth0
+              value: enp4s0
             - name: NCCL_STORE_TIMEOUT
               value: "7200"
             - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
@@ -499,7 +449,7 @@ spec:
               name: trtllm-config
               readOnly: true
         nodeSelector:
-          kubernetes.io/arch: arm64
+          node-role.kubernetes.io/customer-gpu: ""
         tolerations:
           - effect: NoSchedule
             key: dedicated
