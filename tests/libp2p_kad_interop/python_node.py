@@ -45,13 +45,14 @@ async def run_put(args):
     key_pair = create_new_key_pair()
     host = new_host(key_pair=key_pair)
 
-    async with host.run(listen_addrs=[Multiaddr(f"/ip4/0.0.0.0/tcp/0")]):
+    async with host.run(listen_addrs=[Multiaddr("/ip4/127.0.0.1/tcp/0")]):
         async with trio.open_nursery() as nursery:
             nursery.start_soon(host.get_peerstore().start_cleanup_task, 60)
 
             peer_id = host.get_id()
             addrs = host.get_addrs()
-            full_addr = f"{addrs[0]}/p2p/{peer_id.to_string()}"
+            # get_addrs() already includes /p2p/{peer_id} in each addr
+            full_addr = str(addrs[0])
             log.info("Listening on: %s", full_addr)
             print(f"LISTEN_ADDR={full_addr}", flush=True)
 
@@ -78,7 +79,7 @@ async def run_get(args):
     key_pair = create_new_key_pair()
     host = new_host(key_pair=key_pair)
 
-    async with host.run(listen_addrs=[Multiaddr(f"/ip4/0.0.0.0/tcp/0")]):
+    async with host.run(listen_addrs=[Multiaddr("/ip4/127.0.0.1/tcp/0")]):
         async with trio.open_nursery() as nursery:
             nursery.start_soon(host.get_peerstore().start_cleanup_task, 60)
 
