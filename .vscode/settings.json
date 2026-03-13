@@ -1,7 +1,6 @@
 {
     "rust-analyzer.check.command": "clippy",
     "rust-analyzer.check.extraArgs": [
-        "--workspace",
         "--all-targets",
         "--all-features",
         "--",

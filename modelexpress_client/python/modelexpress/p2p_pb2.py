@@ -27,33 +27,31 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tp2p.proto\x12\x11model_express.p2p\"^\n\x10TensorDescriptor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04\x61\x64\x64r\x18\x02 \x01(\x04\x12\x0c\n\x04size\x18\x03 \x01(\x04\x12\x11\n\tdevice_id\x18\x04 \x01(\r\x12\r\n\x05\x64type\x18\x05 \x01(\t\"r\n\x0eWorkerMetadata\x12\x13\n\x0bworker_rank\x18\x01 \x01(\r\x12\x15\n\rnixl_metadata\x18\x02 \x01(\x0c\x12\x34\n\x07tensors\x18\x03 \x03(\x0b\x32#.model_express.p2p.TensorDescriptor\"`\n\x16PublishMetadataRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x32\n\x07workers\x18\x02 \x03(\x0b\x32!.model_express.p2p.WorkerMetadata\";\n\x17PublishMetadataResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"(\n\x12GetMetadataRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\"X\n\x13GetMetadataResponse\x12\r\n\x05\x66ound\x18\x01 \x01(\x08\x12\x32\n\x07workers\x18\x02 \x03(\x0b\x32!.model_express.p2p.WorkerMetadata\"\x97\x01\n\x13PublishReadyRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\r\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x15\n\rmetadata_hash\x18\x04 \x01(\t\x12\x12\n\nnixl_ready\x18\x05 \x01(\x08\x12\x1a\n\x12stability_verified\x18\x06 \x01(\x08\"8\n\x14PublishReadyResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"8\n\x0fGetReadyRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\r\"n\n\x10GetReadyResponse\x12\r\n\x05\x66ound\x18\x01 \x01(\x08\x12\r\n\x05ready\x18\x02 \x01(\x08\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x15\n\rmetadata_hash\x18\x04 \x01(\t\x12\x11\n\ttimestamp\x18\x05 \x01(\x01\x32\x8a\x03\n\nP2pService\x12h\n\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n\x0bGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n\x0cPublishReady\x12&.model_express.p2p.PublishReadyRequest\x1a\'.model_express.p2p.PublishReadyResponse\x12S\n\x08GetReady\x12\".model_express.p2p.GetReadyRequest\x1a#.model_express.p2p.GetReadyResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tp2p.proto\x12\x11model_express.p2p\"^\n\x10TensorDescriptor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04\x61\x64\x64r\x18\x02 \x01(\x04\x12\x0c\n\x04size\x18\x03 \x01(\x04\x12\x11\n\tdevice_id\x18\x04 \x01(\r\x12\r\n\x05\x64type\x18\x05 \x01(\t\"\xb7\x01\n\x0eWorkerMetadata\x12\x13\n\x0bworker_rank\x18\x01 \x01(\r\x12\x15\n\rnixl_metadata\x18\x02 \x01(\x0c\x12\x34\n\x07tensors\x18\x03 \x03(\x0b\x32#.model_express.p2p.TensorDescriptor\x12/\n\x06status\x18\x04 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatus\x12\x12\n\nupdated_at\x18\x05 \x01(\x03\"`\n\x16PublishMetadataRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x32\n\x07workers\x18\x02 \x03(\x0b\x32!.model_express.p2p.WorkerMetadata\";\n\x17PublishMetadataResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"(\n\x12GetMetadataRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\"X\n\x13GetMetadataResponse\x12\r\n\x05\x66ound\x18\x01 \x01(\x08\x12\x32\n\x07workers\x18\x02 \x03(\x0b\x32!.model_express.p2p.WorkerMetadata\"m\n\x13UpdateStatusRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\r\x12/\n\x06status\x18\x03 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatus\"8\n\x14UpdateStatusResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t*{\n\x0cSourceStatus\x12\x19\n\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n\x13SOURCE_STATUS_READY\x10\x02\x12\x17\n\x13SOURCE_STATUS_STALE\x10\x03\x32\xb5\x02\n\nP2pService\x12h\n\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n\x0bGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n\x0cUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a\'.model_express.p2p.UpdateStatusResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'p2p_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
+  _globals['_SOURCESTATUS']._serialized_start=774
+  _globals['_SOURCESTATUS']._serialized_end=897
   _globals['_TENSORDESCRIPTOR']._serialized_start=32
   _globals['_TENSORDESCRIPTOR']._serialized_end=126
-  _globals['_WORKERMETADATA']._serialized_start=128
-  _globals['_WORKERMETADATA']._serialized_end=242
-  _globals['_PUBLISHMETADATAREQUEST']._serialized_start=244
-  _globals['_PUBLISHMETADATAREQUEST']._serialized_end=340
-  _globals['_PUBLISHMETADATARESPONSE']._serialized_start=342
-  _globals['_PUBLISHMETADATARESPONSE']._serialized_end=401
-  _globals['_GETMETADATAREQUEST']._serialized_start=403
-  _globals['_GETMETADATAREQUEST']._serialized_end=443
-  _globals['_GETMETADATARESPONSE']._serialized_start=445
-  _globals['_GETMETADATARESPONSE']._serialized_end=533
-  _globals['_PUBLISHREADYREQUEST']._serialized_start=536
-  _globals['_PUBLISHREADYREQUEST']._serialized_end=687
-  _globals['_PUBLISHREADYRESPONSE']._serialized_start=689
-  _globals['_PUBLISHREADYRESPONSE']._serialized_end=745
-  _globals['_GETREADYREQUEST']._serialized_start=747
-  _globals['_GETREADYREQUEST']._serialized_end=803
-  _globals['_GETREADYRESPONSE']._serialized_start=805
-  _globals['_GETREADYRESPONSE']._serialized_end=915
-  _globals['_P2PSERVICE']._serialized_start=918
-  _globals['_P2PSERVICE']._serialized_end=1312
+  _globals['_WORKERMETADATA']._serialized_start=129
+  _globals['_WORKERMETADATA']._serialized_end=312
+  _globals['_PUBLISHMETADATAREQUEST']._serialized_start=314
+  _globals['_PUBLISHMETADATAREQUEST']._serialized_end=410
+  _globals['_PUBLISHMETADATARESPONSE']._serialized_start=412
+  _globals['_PUBLISHMETADATARESPONSE']._serialized_end=471
+  _globals['_GETMETADATAREQUEST']._serialized_start=473
+  _globals['_GETMETADATAREQUEST']._serialized_end=513
+  _globals['_GETMETADATARESPONSE']._serialized_start=515
+  _globals['_GETMETADATARESPONSE']._serialized_end=603
+  _globals['_UPDATESTATUSREQUEST']._serialized_start=605
+  _globals['_UPDATESTATUSREQUEST']._serialized_end=714
+  _globals['_UPDATESTATUSRESPONSE']._serialized_start=716
+  _globals['_UPDATESTATUSRESPONSE']._serialized_end=772
+  _globals['_P2PSERVICE']._serialized_start=900
+  _globals['_P2PSERVICE']._serialized_end=1209
 # @@protoc_insertion_point(module_scope)

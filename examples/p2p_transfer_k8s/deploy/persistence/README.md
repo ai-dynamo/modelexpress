@@ -1,40 +1,24 @@
 # Persistence Backends for ModelExpress Server
 
-By default, the ModelExpress server uses an **in-memory** metadata backend — fast, zero-dependency,
-and sufficient for most deployments. If you need metadata to survive server restarts, you can
-enable **write-through persistence** to Redis or Kubernetes CRDs.
+The ModelExpress server requires a persistent metadata backend. Two options are supported:
+**Redis** (low-latency, horizontally scalable) and **Kubernetes CRDs** (no external dependency,
+native K8s integration).
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────┐
-│                ModelExpress Server                 │
-│                                                    │
-│  ┌──────────────────────────────────────────────┐  │
-│  │         In-Memory Cache (always on)          │  │
-│  │    Fast reads/writes via RwLock<HashMap>     │  │
-│  └───────────────────┬──────────────────────────┘  │
-│                      │ write-through (optional)    │
-│            ┌─────────┴──────────┐                  │
-│            ▼                    ▼                  │
-│  ┌──────────────────┐ ┌────────────────────┐       │
-│  │  Redis Backend   │ │ Kubernetes CRD     │       │
-│  │  (HA, fast)      │ │ Backend (native)   │       │    
-│  └──────────────────┘ └────────────────────┘       │
-└────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    S[ModelExpress Server]
+    S --> R[Redis Backend\nHA, fast, external dependency]
+    S --> K[Kubernetes CRD Backend\nnative K8s, no extra infra]
 ```
 
-On startup, the server **hydrates** the in-memory cache from the persistent backend,
-so it recovers state without sources needing to re-publish.
-
-## When to Use Persistence
+## When to Use Each Backend
 
 | Scenario | Recommended Backend |
 |----------|-------------------|
-| Development / testing | In-memory (default) |
-| Single MX server, can tolerate re-publish on restart | In-memory (default) |
-| Need HA — metadata survives MX server restarts | Redis write-through |
-| Kubernetes-native, no Redis dependency | K8s CRD write-through |
+| General deployment, need HA | Redis |
+| Kubernetes-native, no Redis dependency | K8s CRD |
 
 ## Files
 
