@@ -19,7 +19,7 @@ import trio
 from multiaddr import Multiaddr
 
 from libp2p import new_host
-from libp2p.crypto.secp256k1 import create_new_key_pair
+from libp2p.crypto.ed25519 import create_new_key_pair
 from libp2p.kad_dht.kad_dht import DHTMode, KadDHT
 from libp2p.records.validator import Validator
 from libp2p.tools.async_service import background_trio_service
@@ -42,7 +42,7 @@ class MxValidator(Validator):
 
 async def run_put(args):
     """Start a node, store a record, and wait for peers to query it."""
-    key_pair = create_new_key_pair(secrets.token_bytes(32))
+    key_pair = create_new_key_pair()
     host = new_host(key_pair=key_pair)
 
     async with host.run(listen_addrs=[Multiaddr(f"/ip4/0.0.0.0/tcp/0")]):
@@ -75,7 +75,7 @@ async def run_put(args):
 
 async def run_get(args):
     """Connect to a peer, retrieve a record, and verify it."""
-    key_pair = create_new_key_pair(secrets.token_bytes(32))
+    key_pair = create_new_key_pair()
     host = new_host(key_pair=key_pair)
 
     async with host.run(listen_addrs=[Multiaddr(f"/ip4/0.0.0.0/tcp/0")]):
