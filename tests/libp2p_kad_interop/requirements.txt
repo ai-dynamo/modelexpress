@@ -1,0 +1,2 @@
+libp2p>=0.6.0
+multiaddr
