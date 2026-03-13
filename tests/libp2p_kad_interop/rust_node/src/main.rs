@@ -27,7 +27,7 @@ struct Args {
     mode: String,
 
     /// Key to store/retrieve
-    #[arg(long, default_value = "mx:model:test-model:worker:0")]
+    #[arg(long, default_value = "/mx/model:test-model:worker:0")]
     key: String,
 
     /// Value to store (put mode only)

@@ -15,7 +15,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUST_DIR="$SCRIPT_DIR/rust_node"
 PYTHON_SCRIPT="$SCRIPT_DIR/python_node.py"
-TEST_KEY="mx:model:test-model:worker:0"
+TEST_KEY="/mx/model:test-model:worker:0"
 TEST_VALUE='{"rank":0,"tensors":[{"name":"layer.0.weight","size":1024}]}'
 TIMEOUT=30
 
