@@ -527,15 +527,20 @@ mod tests {
     fn test_check_patched_zero_returns_err() {
         let err = check_patched(0, 3, "my-model").expect_err("expected Err for patched==0");
         let msg = err.to_string();
-        assert!(msg.contains("worker 3"), "error should name the worker: {msg}");
-        assert!(msg.contains("my-model"), "error should name the model: {msg}");
+        assert!(
+            msg.contains("worker 3"),
+            "error should name the worker: {msg}"
+        );
+        assert!(
+            msg.contains("my-model"),
+            "error should name the model: {msg}"
+        );
     }
 
     #[test]
     fn test_check_patched_zero_unknown_worker() {
         // Absent model key also returns 0 from the Lua script.
-        let err = check_patched(0, 0, "nonexistent-model")
-            .expect_err("absent model should be Err");
+        let err = check_patched(0, 0, "nonexistent-model").expect_err("absent model should be Err");
         let msg = err.to_string();
         assert!(
             msg.contains("nonexistent-model"),
