@@ -25,23 +25,11 @@ pub struct ModelMetadataSpec {
     /// Full model name (e.g., deepseek-ai/DeepSeek-V3)
     #[serde(rename = "modelName")]
     pub model_name: String,
-
-    /// Number of GPU workers expected to publish metadata
-    #[serde(rename = "expectedWorkers", default = "default_expected_workers")]
-    pub expected_workers: i32,
-}
-
-fn default_expected_workers() -> i32 {
-    8
 }
 
 /// ModelMetadata status - the observed state
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ModelMetadataStatus {
-    /// Current phase of the model metadata
-    #[serde(default)]
-    pub phase: ModelMetadataPhase,
-
     /// Per-worker NIXL metadata and readiness state
     #[serde(default)]
     pub workers: Vec<WorkerStatus>,
@@ -57,27 +45,6 @@ pub struct ModelMetadataStatus {
     /// Timestamp when first worker published
     #[serde(rename = "publishedAt", default)]
     pub published_at: Option<String>,
-}
-
-/// Phase of the ModelMetadata
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-pub enum ModelMetadataPhase {
-    #[default]
-    Pending,
-    Initializing,
-    Ready,
-    Stale,
-}
-
-impl std::fmt::Display for ModelMetadataPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => write!(f, "Pending"),
-            Self::Initializing => write!(f, "Initializing"),
-            Self::Ready => write!(f, "Ready"),
-            Self::Stale => write!(f, "Stale"),
-        }
-    }
 }
 
 /// Per-worker status
@@ -99,21 +66,36 @@ pub struct WorkerStatus {
     #[serde(rename = "tensorConfigMap", default)]
     pub tensor_config_map: Option<String>,
 
-    /// Whether worker has completed NIXL registration
+    /// Worker lifecycle status (Unknown, Initializing, Ready, Stale)
     #[serde(default)]
-    pub ready: bool,
+    pub status: String,
 
-    /// Whether worker has passed stability verification
-    #[serde(rename = "stabilityVerified", default)]
-    pub stability_verified: bool,
+    /// Timestamp of last status update (RFC3339)
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: Option<String>,
+}
 
-    /// Unique session ID for detecting source restarts
-    #[serde(rename = "sessionId", default)]
-    pub session_id: Option<String>,
+impl WorkerStatus {
+    /// Convert a `SourceStatus` proto enum value (i32) to the CRD status string.
+    pub fn status_name_from_proto(status: i32) -> String {
+        match status {
+            1 => "Initializing",
+            2 => "Ready",
+            3 => "Stale",
+            _ => "Unknown",
+        }
+        .to_string()
+    }
 
-    /// Timestamp when worker metadata was published
-    #[serde(rename = "publishedAt", default)]
-    pub published_at: Option<String>,
+    /// Convert a CRD status string back to the `SourceStatus` proto enum value (i32).
+    pub fn status_proto_from_name(name: &str) -> i32 {
+        match name {
+            "Initializing" => 1,
+            "Ready" => 2,
+            "Stale" => 3,
+            _ => 0,
+        }
+    }
 }
 
 /// Standard Kubernetes condition

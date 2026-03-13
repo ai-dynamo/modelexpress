@@ -232,8 +232,7 @@ Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Do
 |-----|---------|----------|---------|
 | `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes NIXL metadata + tensors |
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Target queries for source metadata |
-| `PublishReady` | `PublishReadyRequest` | `PublishReadyResponse` | Source signals NIXL readiness |
-| `GetReady` | `GetReadyRequest` | `GetReadyResponse` | Target checks source readiness |
+| `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Source updates per-worker status (Initializing/Ready/Stale) |
 
 Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `WorkerMetadata` (rank, nixl_metadata bytes, tensors).
 
@@ -525,16 +524,15 @@ graph TD
 
 | Key Pattern | Purpose |
 |-------------|---------|
-| `mx:model:{model_name}` | Model metadata (workers, tensor descriptors, NIXL metadata) |
+| `mx:model:{model_name}` | Model metadata (workers, tensor descriptors, NIXL metadata, per-worker status) |
 | `mx:models` | Set of all registered model names |
-| `mx:nixl_ready:{model}:worker:{id}` | Source readiness signal (2hr TTL) |
 
 ### Flow
 
 1. **Source starts**: Loads weights, registers with NIXL, publishes metadata to gRPC server
 2. **Source warmup**: DeepGemm compilation, CUDA graph capture
-3. **Source publishes ready**: After health check + test inference, publishes NIXL ready flag
-4. **Target waits**: Polls for ready flag via gRPC (`GetReady`)
+3. **Source publishes ready**: After health check + test inference, calls `UpdateStatus` to set worker status to `Ready`
+4. **Target waits**: Polls `GetMetadata` until all source workers are `Ready`
 5. **Target transfers**: Executes RDMA reads from source
 6. **Target warmup**: Same DeepGemm + CUDA graph as source
 

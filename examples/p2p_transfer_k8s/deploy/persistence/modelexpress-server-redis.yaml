@@ -66,7 +66,7 @@ spec:
       containers:
         - name: modelexpress-server
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8001
           env:
