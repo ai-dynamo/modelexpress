@@ -45,17 +45,44 @@ pub enum BackendMetadataRecord {
 
 impl BackendMetadataRecord {
     /// Reconstruct from flat fields (used by Redis JSON and K8s CRD deserialization).
-    /// TransferEngine takes priority when both are present.
-    pub fn from_flat(nixl_metadata: Vec<u8>, transfer_engine_session_id: Option<String>) -> Self {
-        if let Some(sid) = transfer_engine_session_id
-            && !sid.is_empty()
-        {
-            return Self::TransferEngine(sid);
+    ///
+    /// When `backend_type` is provided, it is used as the authoritative discriminator.
+    /// Falls back to field-inference for backwards compatibility with records written
+    /// before `backend_type` was persisted.
+    pub fn from_flat(
+        nixl_metadata: Vec<u8>,
+        transfer_engine_session_id: Option<String>,
+        backend_type: Option<&str>,
+    ) -> Self {
+        match backend_type {
+            Some("transfer_engine") => {
+                let sid = transfer_engine_session_id.unwrap_or_default();
+                Self::TransferEngine(sid)
+            }
+            Some("nixl") => Self::Nixl(nixl_metadata),
+            Some("none") => Self::None,
+            // Unknown or missing backend_type: infer from fields (backwards compat)
+            _ => {
+                if let Some(sid) = transfer_engine_session_id
+                    && !sid.is_empty()
+                {
+                    return Self::TransferEngine(sid);
+                }
+                if !nixl_metadata.is_empty() {
+                    return Self::Nixl(nixl_metadata);
+                }
+                Self::None
+            }
         }
-        if !nixl_metadata.is_empty() {
-            return Self::Nixl(nixl_metadata);
+    }
+
+    /// Returns the backend type string for persistence.
+    pub fn backend_type_str(&self) -> &'static str {
+        match self {
+            Self::Nixl(_) => "nixl",
+            Self::TransferEngine(_) => "transfer_engine",
+            Self::None => "none",
         }
-        Self::None
     }
 }
 

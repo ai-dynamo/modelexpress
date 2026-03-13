@@ -260,6 +260,7 @@ impl MetadataBackend for KubernetesBackend {
                 )
                 .await?;
 
+            let backend_type = worker.backend_metadata.backend_type_str().to_string();
             let (nixl_metadata, transfer_engine_session_id) = match &worker.backend_metadata {
                 super::BackendMetadataRecord::Nixl(data) => (BASE64.encode(data), None),
                 super::BackendMetadataRecord::TransferEngine(sid) => {
@@ -270,6 +271,7 @@ impl MetadataBackend for KubernetesBackend {
 
             worker_statuses.push(WorkerStatus {
                 worker_rank: worker.worker_rank as i32,
+                backend_type: Some(backend_type),
                 nixl_metadata,
                 transfer_engine_session_id,
                 tensor_count: worker.tensors.len() as i32,
@@ -406,6 +408,7 @@ impl MetadataBackend for KubernetesBackend {
             let backend_metadata = super::BackendMetadataRecord::from_flat(
                 nixl_bytes,
                 worker_status.transfer_engine_session_id.clone(),
+                worker_status.backend_type.as_deref(),
             );
 
             // Read tensors from ConfigMap

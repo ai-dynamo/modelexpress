@@ -118,6 +118,10 @@ impl From<TensorRecordJson> for TensorRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRecordJson {
     pub worker_rank: u32,
+    /// Explicit backend type discriminator ("nixl", "transfer_engine", "none").
+    /// Used as the authoritative source when reconstructing BackendMetadataRecord.
+    #[serde(default)]
+    pub backend_type: Option<String>,
     #[serde(default)]
     pub nixl_metadata: Vec<u8>,
     #[serde(default)]
@@ -127,6 +131,7 @@ struct WorkerRecordJson {
 
 impl From<WorkerRecord> for WorkerRecordJson {
     fn from(record: WorkerRecord) -> Self {
+        let backend_type = record.backend_metadata.backend_type_str().to_string();
         let (nixl_metadata, transfer_engine_session_id) = match record.backend_metadata {
             super::BackendMetadataRecord::Nixl(data) => (data, None),
             super::BackendMetadataRecord::TransferEngine(sid) => (Vec::new(), Some(sid)),
@@ -134,6 +139,7 @@ impl From<WorkerRecord> for WorkerRecordJson {
         };
         Self {
             worker_rank: record.worker_rank,
+            backend_type: Some(backend_type),
             nixl_metadata,
             transfer_engine_session_id,
             tensors: record
@@ -152,6 +158,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             backend_metadata: super::BackendMetadataRecord::from_flat(
                 json.nixl_metadata,
                 json.transfer_engine_session_id,
+                json.backend_type.as_deref(),
             ),
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
         }

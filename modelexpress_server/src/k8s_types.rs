@@ -87,11 +87,15 @@ pub struct WorkerStatus {
     #[serde(rename = "workerRank")]
     pub worker_rank: i32,
 
-    /// Base64-encoded NIXL agent metadata blob (mutually exclusive with transferEngineSessionId)
+    /// Backend type discriminator ("nixl", "transfer_engine", "none")
+    #[serde(rename = "backendType", default)]
+    pub backend_type: Option<String>,
+
+    /// Base64-encoded NIXL agent metadata blob
     #[serde(rename = "nixlMetadata", default)]
     pub nixl_metadata: String,
 
-    /// Mooncake TransferEngine session ID (mutually exclusive with nixlMetadata)
+    /// Mooncake TransferEngine session ID
     #[serde(rename = "transferEngineSessionId", default)]
     pub transfer_engine_session_id: Option<String>,
 
