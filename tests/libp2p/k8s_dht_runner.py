@@ -316,6 +316,61 @@ async def test_record_filter(node_with_filter: DhtNode, source_node: DhtNode, re
                     f"put_ok={ok_bad}, stored={bad_rec is not None}")
 
 
+async def test_data_distribution(node: DhtNode, results: TestResult) -> None:
+    """Verify records are actually stored on REMOTE peers, not just locally.
+
+    This catches the case where put() succeeds but records only exist in
+    the local cache. We PUT a record, delete it locally, then query each
+    remote peer directly to confirm at least one has it.
+    """
+    log.info("TEST: data_distribution")
+    pod_name = os.environ.get("POD_NAME", "test")
+
+    key = f"/k8s/{pod_name}/distribution-check".encode()
+    value = json.dumps({"test": "distribution", "pod": pod_name}).encode()
+
+    count = await node.put(key, value)
+    results.record("distribution put", count >= 1, f"stored on {count} peers")
+
+    # Delete the record from local store so get() MUST hit a remote peer
+    if key in node.kad_handler.records:
+        del node.kad_handler.records[key]
+    if key in node._originated_records:
+        del node._originated_records[key]
+
+    local_check = node.kad_handler.get_local(key)
+    results.record("local record removed", local_check is None)
+
+    # Query each known peer directly for the record
+    all_peers = node.routing_table.all_peers()
+    remote_hits = 0
+    remote_peers_checked = 0
+    for entry in all_peers:
+        remote_peers_checked += 1
+        try:
+            val, _ttl, _closer = await asyncio.wait_for(
+                node._get_value_single(entry.peer_id, entry.addrs, key),
+                timeout=5.0,
+            )
+            if val == value:
+                remote_hits += 1
+        except Exception as e:
+            log.debug(f"  direct query to {entry.peer_id.hex()[:16]}... failed: {e}")
+
+    results.record(
+        "record found on remote peers",
+        remote_hits >= 1,
+        f"{remote_hits}/{remote_peers_checked} peers have the record",
+    )
+
+    # Also verify iterative get (with empty local store) reaches a remote copy
+    iterative_result = await node.get(key)
+    results.record(
+        "iterative get finds remote copy",
+        iterative_result == value,
+    )
+
+
 async def test_multi_hop_lookup(node: DhtNode, results: TestResult) -> None:
     """Store a record with a far key and verify lookup works via multi-hop."""
     log.info("TEST: multi_hop_lookup")
@@ -378,6 +433,7 @@ async def run_test(host: str, port: int, dns: str | None, bootstrap: list[str]) 
         await test_cross_node_routing(node, results)
         await test_observed_ip_detection(node, results)
         await test_routing_table_health(node, results)
+        await test_data_distribution(node, results)
         await test_batch_records(node, results)
         await test_per_record_ttl(node, results)
         await test_concurrent_puts(node, results)
