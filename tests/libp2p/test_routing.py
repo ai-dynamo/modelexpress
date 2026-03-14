@@ -118,8 +118,8 @@ def test_kbucket_evicts_stale_peer(monkeypatch):
     assert bucket.add_or_update(b"\x01", [])
     assert bucket.add_or_update(b"\x02", [])
 
-    # Make LRU peer stale by backdating last_seen
-    bucket.peers[0].last_seen = time.monotonic() - STALE_PEER_TIMEOUT - 1
+    # Make LRU peer stale by backdating last_seen (extra margin for jitter)
+    bucket.peers[0].last_seen = time.monotonic() - STALE_PEER_TIMEOUT * 2
 
     # Now newcomer should evict the stale LRU
     assert bucket.add_or_update(b"\x03", [])

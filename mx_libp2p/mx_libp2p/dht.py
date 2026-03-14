@@ -274,7 +274,10 @@ class DhtNode:
 
                 addr_bytes = parse_multiaddr_string(addr_str)
                 self.peer_store.add_addrs(peer_id, [addr_bytes])
-                conn = await self.peer_store.get_or_dial(peer_id)
+                conn = await asyncio.wait_for(
+                    self.peer_store.get_or_dial(peer_id),
+                    timeout=self.dial_timeout,
+                )
                 self.routing_table.add_or_update(peer_id, [addr_bytes])
                 log.info(f"bootstrapped with peer {peer_id.hex()[:16]}...")
 
