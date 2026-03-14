@@ -87,6 +87,16 @@ empty Lock objects. Each Lock is small, but the dict grows unbounded.
 **Fix:** Remove the lock entry after the dial completes (success or failure), or
 use a WeakValueDictionary / periodic cleanup.
 
+### 1.7 Bootstrap Dial Missing Timeout (dht.py:277) - Medium
+
+`bootstrap()` calls `peer_store.get_or_dial()` without wrapping it in
+`asyncio.wait_for(timeout=self.dial_timeout)`. If a bootstrap peer is unreachable,
+the TCP SYN retransmits for the system default (~120s on Linux), blocking the entire
+bootstrap sequence. This is inconsistent with `bootstrap_from_dns()` and the iterative
+lookup code, which both use the configured dial timeout.
+
+**Fix:** Wrap the call in `asyncio.wait_for(timeout=self.dial_timeout)`. **Fixed.**
+
 ---
 
 ## 2. Anti-Patterns and Code Quality
@@ -228,6 +238,7 @@ Interop tests confirm bidirectional compatibility for all implemented operations
 | Regression tests | test_critical_regressions.py | Excellent | Real bugs with targeted validation |
 | K8s integration | k8s_dht_runner.py | Excellent | Real network, real timing, cross-pod routing |
 | Error path tests | test_error_paths.py | Adequate | Basic error handling, not adversarial |
+| Robustness tests | test_robustness.py | Good | Noise failure paths, bootstrap recovery, concurrent PUTs, connection drops |
 | Background loop tests | test_republish.py, test_coverage_gaps.py | Good | Timing-dependent but functional |
 
 ### 4.2 Strengths
@@ -273,9 +284,9 @@ Interop tests confirm bidirectional compatibility for all implemented operations
 
 **Missing specific test scenarios:**
 - Record deletion propagation (does `remove()` affect remote copies?)
-- Bootstrap failure recovery (unreachable bootstrap -> later recovery)
+- ~~Bootstrap failure recovery (unreachable bootstrap -> later recovery)~~ Added in test_robustness.py
 - Yamux stream ordering under concurrent multiplexing
-- Noise handshake failure paths (bad signature, key mismatch)
+- ~~Noise handshake failure paths (bad signature, key mismatch)~~ Added in test_robustness.py
 - Connection limit enforcement during concurrent inbound connections
 
 ### 4.4 Test Infrastructure Notes
@@ -380,29 +391,29 @@ No hallucinations found. The implementation matches its documented behavior.
 
 ### Must Fix (Before Merge)
 
-| # | Issue | Location | Severity |
-|---|---|---|---|
-| 1 | DNS bootstrap self-filter | dht.py:322-329 | Medium |
-| 2 | Hardcoded loop limit in GET | dht.py:804 | Low |
+| # | Issue | Location | Severity | Status |
+|---|---|---|---|---|
+| 1 | DNS bootstrap self-filter | dht.py:322-329 | Medium | **Fixed** |
+| 2 | Hardcoded loop limit in GET | dht.py:804 | Low | **Fixed** |
 
 ### Should Fix (Before Production)
 
-| # | Issue | Location | Severity |
-|---|---|---|---|
-| 3 | Dial backoff instead of address pruning | peer_store.py:157-160 | Medium |
-| 4 | Stale peer timeout jitter | routing.py:164-168 | Low |
-| 5 | Replication via put() is wasteful | dht.py:999-1001 | Medium |
-| 6 | Dial lock memory leak | peer_store.py:110-111 | Low |
-| 7 | Stream negotiation error visibility | connection.py:86-97 | Low |
-| 8 | CI must build Rust interop binary | tests/libp2p_kad_interop/ | Medium |
+| # | Issue | Location | Severity | Status |
+|---|---|---|---|---|
+| 3 | Dial backoff instead of address pruning | peer_store.py:157-160 | Medium | **Fixed** |
+| 4 | Stale peer timeout jitter | routing.py:164-168 | Low | **Fixed** |
+| 5 | Replication via put() is wasteful | dht.py:999-1001 | Medium | Open |
+| 6 | Dial lock memory leak | peer_store.py:110-111 | Low | Open |
+| 7 | Stream negotiation error visibility | connection.py:86-97 | Low | **Fixed** |
+| 8 | CI must build Rust interop binary | tests/libp2p_kad_interop/ | Medium | Open |
 
 ### Nice to Have (Future)
 
 | # | Issue | Notes |
 |---|---|---|
-| 9 | Return closer peers for unknown message types | Defensive spec compliance; no MX peer sends provider messages, but trivial to add |
-| 10 | Adversarial/chaos tests | Important for untrusted networks, not for datacenter |
-| 11 | Distributed consistency tests | Validates Kademlia correctness guarantees |
+| 9 | Return closer peers for unknown message types | **Fixed** - kad_handler.py now returns closer peers for unknown types |
+| 10 | Adversarial/chaos tests | Partially addressed: Noise failure paths, connection drops, dead peer handling in test_robustness.py |
+| 11 | Distributed consistency tests | Partially addressed: concurrent PUT convergence and rapid overwrite tests in test_robustness.py |
 | 12 | Large-scale tests (20+ nodes) | Validates routing table at scale |
 | 13 | Peer scoring | Improves lookup performance under degraded conditions |
 | 14 | Disjoint lookup paths | Fault tolerance for larger clusters |
