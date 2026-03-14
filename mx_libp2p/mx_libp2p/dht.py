@@ -319,14 +319,13 @@ class DhtNode:
             info[4][0] for info in infos
         ))
 
-        # Filter out our own IP
-        my_ip = None
+        # Filter out our own IPs (both listen and observed, since they can differ)
+        my_ips = set()
         if self._listen_addr:
-            my_ip = self._listen_addr[0]
-            # Also check observed IP
-            if self._observed_ip:
-                my_ip = self._observed_ip
-        ips = [ip for ip in ips if ip != my_ip]
+            my_ips.add(self._listen_addr[0])
+        if self._observed_ip:
+            my_ips.add(self._observed_ip)
+        ips = [ip for ip in ips if ip not in my_ips]
 
         if not ips:
             log.info(f"DNS bootstrap: {hostname} resolved but no peers to dial (only self)")
@@ -801,7 +800,7 @@ class DhtNode:
         for entry in closest:
             peer_map[entry.peer_id] = entry.addrs
 
-        for _round in range(10):
+        for _round in range(MAX_LOOKUP_ROUNDS):
             candidates = sorted(peer_map.keys(), key=lambda p: xor_distance(p, key))
             to_query = [p for p in candidates if p not in queried][:ALPHA]
 

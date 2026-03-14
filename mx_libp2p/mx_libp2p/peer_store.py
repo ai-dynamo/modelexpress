@@ -11,6 +11,7 @@ import asyncio
 import logging
 import socket
 import struct
+import time
 
 from typing import Callable
 
@@ -20,14 +21,62 @@ from .multiaddr import decode_multiaddr, PROTO_IP4, PROTO_IP6, PROTO_TCP, PROTO_
 
 log = logging.getLogger(__name__)
 
+# Dial backoff parameters
+BACKOFF_BASE = 1.0        # initial backoff in seconds
+BACKOFF_MAX = 60.0        # maximum backoff in seconds
+MAX_DIAL_FAILURES = 5     # remove address after this many consecutive failures
+
+
+class AddrInfo:
+    """Tracks an address with dial failure state for backoff."""
+
+    __slots__ = ("addr", "failures", "backoff_until")
+
+    def __init__(self, addr: bytes):
+        self.addr = addr
+        self.failures: int = 0
+        self.backoff_until: float = 0.0
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        backoff = min(BACKOFF_BASE * (2 ** (self.failures - 1)), BACKOFF_MAX)
+        self.backoff_until = time.monotonic() + backoff
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.backoff_until = 0.0
+
+    @property
+    def is_backed_off(self) -> bool:
+        return time.monotonic() < self.backoff_until
+
+    @property
+    def should_remove(self) -> bool:
+        return self.failures >= MAX_DIAL_FAILURES
+
 
 class PeerInfo:
     """Known information about a peer."""
 
     def __init__(self, peer_id: bytes, addrs: list[bytes] | None = None):
         self.peer_id = peer_id
-        self.addrs: list[bytes] = addrs or []
+        self.addr_infos: dict[bytes, AddrInfo] = {}
+        if addrs:
+            for addr in addrs:
+                self.addr_infos[addr] = AddrInfo(addr)
         self.connection: Connection | None = None
+
+    @property
+    def addrs(self) -> list[bytes]:
+        return [info.addr for info in self.addr_infos.values()]
+
+    @addrs.setter
+    def addrs(self, value: list[bytes]) -> None:
+        new_infos: dict[bytes, AddrInfo] = {}
+        for addr in value:
+            existing = self.addr_infos.get(addr)
+            new_infos[addr] = existing if existing else AddrInfo(addr)
+        self.addr_infos = new_infos
 
 
 class PeerStore:
@@ -57,8 +106,8 @@ class PeerStore:
             info = PeerInfo(peer_id)
             self._peers[peer_id] = info
         for addr in addrs:
-            if addr not in info.addrs:
-                info.addrs.append(addr)
+            if addr not in info.addr_infos:
+                info.addr_infos[addr] = AddrInfo(addr)
 
     def replace_addrs(self, peer_id: bytes, addrs: list[bytes]) -> None:
         """Replace all addresses for a peer (clears stale addrs first)."""
@@ -66,7 +115,7 @@ class PeerStore:
         if info is None:
             info = PeerInfo(peer_id)
             self._peers[peer_id] = info
-        info.addrs = list(addrs)
+        info.addr_infos = {addr: AddrInfo(addr) for addr in addrs}
 
     def set_connection(self, peer_id: bytes, conn: Connection) -> None:
         """Register an active connection for a peer (e.g. from an inbound accept)."""
@@ -127,14 +176,16 @@ class PeerStore:
                         f"connection limit reached ({active}/{self.max_connections})"
                     )
 
-            # Dial
-            known_addrs = self.get_addrs(peer_id)
-            if not known_addrs:
+            # Dial with backoff
+            info = self._peers.get(peer_id)
+            if not info or not info.addr_infos:
                 raise ConnectionError(f"no addresses known for peer {peer_id.hex()[:16]}...")
 
             last_err = None
-            failed_addrs = []
-            for addr in known_addrs:
+            for addr, addr_info in list(info.addr_infos.items()):
+                if addr_info.is_backed_off:
+                    log.debug(f"skipping backed-off address for {peer_id.hex()[:16]}...")
+                    continue
                 host, port = _extract_ip_tcp(addr)
                 if host is None:
                     continue
@@ -143,21 +194,21 @@ class PeerStore:
                         self.identity, host, port,
                         supported_protocols=self.supported_protocols,
                     )
+                    addr_info.record_success()
                     self.set_connection(peer_id, conn)
                     if self.on_new_connection:
                         self.on_new_connection(conn)
                     return conn
                 except Exception as e:
                     last_err = e
-                    failed_addrs.append(addr)
-                    log.debug(f"dial to {host}:{port} failed: {e}")
-
-            # Remove addresses that failed to connect, so we don't
-            # retry them on the next dial attempt
-            if failed_addrs:
-                info = self._peers.get(peer_id)
-                if info:
-                    info.addrs = [a for a in info.addrs if a not in failed_addrs]
+                    addr_info.record_failure()
+                    log.debug(
+                        f"dial to {host}:{port} failed (attempt {addr_info.failures}/"
+                        f"{MAX_DIAL_FAILURES}): {e}"
+                    )
+                    if addr_info.should_remove:
+                        del info.addr_infos[addr]
+                        log.debug(f"removed address {host}:{port} after {MAX_DIAL_FAILURES} failures")
 
             raise ConnectionError(
                 f"failed to dial peer {peer_id.hex()[:16]}...: {last_err}"
@@ -181,7 +232,7 @@ class PeerStore:
         to_remove = []
         for peer_id, info in self._peers.items():
             has_live_conn = info.connection is not None and info.connection.is_alive
-            has_addrs = len(info.addrs) > 0
+            has_addrs = len(info.addr_infos) > 0
             if not has_live_conn and not has_addrs:
                 to_remove.append(peer_id)
             # Also clear dead connection objects to free resources

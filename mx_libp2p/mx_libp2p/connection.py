@@ -94,7 +94,7 @@ class Connection:
             if q:
                 q.put_nowait((stream, reader, writer))
         except Exception as e:
-            log.debug(f"inbound stream negotiation failed: {e}")
+            log.warning(f"inbound stream negotiation failed: {e}")
 
     async def open_stream(self, protocol_id: str) -> tuple[YamuxStream, asyncio.StreamReader, asyncio.StreamWriter]:
         """Open a new outbound stream and negotiate the given protocol."""

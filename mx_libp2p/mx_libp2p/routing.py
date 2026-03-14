@@ -11,6 +11,7 @@ Buckets are indexed by the number of leading zero bits in the XOR distance,
 giving 256 buckets for SHA-256-based peer IDs.
 """
 
+import random
 import time
 import logging
 from typing import Callable
@@ -161,7 +162,9 @@ class KBucket:
                 return False
         else:
             age = time.monotonic() - lru.last_seen
-            if age < STALE_PEER_TIMEOUT:
+            # Jitter prevents synchronized eviction when traffic stops
+            jittered_timeout = STALE_PEER_TIMEOUT * random.uniform(0.8, 1.2)
+            if age < jittered_timeout:
                 # Recently seen: keep it, cache the newcomer
                 self._pending = PeerEntry(peer_id, addrs)
                 self._pending_since = time.monotonic()

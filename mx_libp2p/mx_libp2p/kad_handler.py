@@ -190,8 +190,12 @@ class KadHandler:
             elif msg_type == MSG_PING:
                 response = self._handle_ping(msg)
             else:
-                log.debug(f"ignoring unsupported kad message type: {msg_type}")
-                return
+                # Unknown message type (e.g. ADD_PROVIDER, GET_PROVIDERS).
+                # Return closer peers as a graceful fallback per Kademlia spec.
+                log.debug(f"unknown kad message type {msg_type}, returning closer peers")
+                key = msg.get("key", b"")
+                closer = self._closest_peers_encoded(key)
+                response = encode_kad_message(msg_type, key=key, closer_peers=closer)
 
             _write_length_prefixed(writer, response)
             await writer.drain()
