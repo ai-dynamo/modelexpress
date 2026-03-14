@@ -41,6 +41,22 @@ message TensorDescriptor {
   
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
+
+  // Shard metadata for mixed tensor-parallelism support.
+  // When present, allows target instances with different TP to compute
+  // which byte ranges to read from which source ranks.
+
+  // Unsharded logical shape (e.g., [5120, 5120] for a full weight matrix)
+  repeated uint64 full_shape = 6;
+
+  // Which dimension is sharded: -1 = replicated, 0 or 1 = sharded dim
+  int32 shard_dim = 7;
+
+  // Number of shards this tensor is split across (effective TP for this tensor)
+  uint32 effective_tp_size = 8;
+
+  // Which shard this rank holds (0..effective_tp_size-1)
+  uint32 shard_index = 9;
 }
 
 // ============================================================================
