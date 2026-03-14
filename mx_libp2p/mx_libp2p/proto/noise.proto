@@ -1,0 +1,10 @@
+// libp2p Noise handshake payload
+// Reference: https://github.com/libp2p/specs/blob/master/noise/README.md
+
+syntax = "proto3";
+package noise;
+
+message NoiseHandshakePayload {
+    bytes identity_key = 1;     // protobuf-encoded libp2p PublicKey
+    bytes identity_sig = 2;     // Ed25519 signature over "noise-libp2p-static-key:" + static DH pubkey
+}

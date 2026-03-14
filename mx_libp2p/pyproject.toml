@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "mx-libp2p"
+version = "0.1.0"
+description = "Minimal asyncio-native libp2p for ModelExpress DHT metadata exchange"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "cryptography",
+    "protobuf>=4.0",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
