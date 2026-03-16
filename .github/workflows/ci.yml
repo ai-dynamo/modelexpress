@@ -133,17 +133,7 @@ jobs:
     - name: Build release
       run: cargo build --release
 
-    - name: Start server in background
-      env:
-        MX_METADATA_BACKEND: redis
-        REDIS_URL: redis://localhost:6379
-      run: |
-        ./target/release/modelexpress-server &
-        echo $! > server.pid
-        sleep 5  # Give server time to start
-
     - name: Run integration test script
-      if: always()
       env:
         MX_METADATA_BACKEND: redis
         REDIS_URL: redis://localhost:6379
@@ -151,14 +141,6 @@ jobs:
         if [ -f run_integration_tests.sh ]; then
           chmod +x run_integration_tests.sh
           ./run_integration_tests.sh || echo "Integration test script failed (expected in CI)"
-        fi
-
-    - name: Stop server
-      if: always()
-      run: |
-        if [ -f server.pid ]; then
-          kill $(cat server.pid) || true
-          rm server.pid
         fi
 
   security-audit:
