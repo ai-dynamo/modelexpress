@@ -172,9 +172,8 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
     /// Attempt to delete a model from Hugging Face cache
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
-    async fn delete_model(&self, model_name: &str, cache_dir: Option<PathBuf>) -> Result<()> {
+    async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
-        let cache_dir = get_cache_dir(cache_dir);
         let token = env::var(HF_TOKEN_ENV_VAR).ok();
         let api = ApiBuilder::from_env()
             .with_token(token)
@@ -452,10 +451,13 @@ mod tests {
     #[tokio::test]
     async fn test_delete_model_trait() {
         let provider = HuggingFaceProvider;
+        let cache_dir = TempDir::new().expect("Failed to create temporary cache directory");
         // Test that the delete method exists and can be called
         // Note: This won't actually delete anything since we're not providing a real model
         // but it tests the trait implementation
-        let result = provider.delete_model("nonexistent/model", None).await;
+        let result = provider
+            .delete_model("nonexistent/model", cache_dir.path().to_path_buf())
+            .await;
         // Should succeed (return Ok(())) even if model doesn't exist
         assert!(result.is_ok());
     }
@@ -501,7 +503,7 @@ mod tests {
         }
 
         let delete_result = provider
-            .delete_model("test/model", Some(explicit_cache.path().to_path_buf()))
+            .delete_model("test/model", explicit_cache.path().to_path_buf())
             .await;
 
         unsafe {
@@ -577,7 +579,9 @@ mod tests {
             env::set_var("HF_ENDPOINT", server.uri());
         }
 
-        let result = provider.delete_model(model_name, None).await;
+        let result = provider
+            .delete_model(model_name, temp_cache.path().to_path_buf())
+            .await;
 
         unsafe {
             if let Some(value) = old_cache {
