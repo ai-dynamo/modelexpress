@@ -289,7 +289,10 @@ mod tests {
             &record.backend_metadata,
             BackendMetadataRecord::TransferEngine(sid) if sid == "192.168.1.10:12345"
         ));
-        assert_eq!(record.backend_metadata.backend_type_str(), "transfer_engine");
+        assert_eq!(
+            record.backend_metadata.backend_type_str(),
+            "transfer_engine"
+        );
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
@@ -299,7 +302,11 @@ mod tests {
     #[test]
     fn test_backend_metadata_from_flat_with_discriminator() {
         // Explicit backend_type takes precedence
-        let te = BackendMetadataRecord::from_flat(Vec::new(), Some("10.0.0.1:5000".into()), Some("transfer_engine"));
+        let te = BackendMetadataRecord::from_flat(
+            Vec::new(),
+            Some("10.0.0.1:5000".into()),
+            Some("transfer_engine"),
+        );
         assert!(matches!(te, BackendMetadataRecord::TransferEngine(ref s) if s == "10.0.0.1:5000"));
 
         let nixl = BackendMetadataRecord::from_flat(vec![1, 2, 3], None, Some("nixl"));
@@ -309,8 +316,12 @@ mod tests {
         assert!(matches!(none, BackendMetadataRecord::None));
 
         // Backwards compat: missing backend_type infers from fields
-        let inferred_te = BackendMetadataRecord::from_flat(Vec::new(), Some("10.0.0.1:5000".into()), None);
-        assert!(matches!(inferred_te, BackendMetadataRecord::TransferEngine(_)));
+        let inferred_te =
+            BackendMetadataRecord::from_flat(Vec::new(), Some("10.0.0.1:5000".into()), None);
+        assert!(matches!(
+            inferred_te,
+            BackendMetadataRecord::TransferEngine(_)
+        ));
 
         let inferred_nixl = BackendMetadataRecord::from_flat(vec![1, 2], None, None);
         assert!(matches!(inferred_nixl, BackendMetadataRecord::Nixl(_)));
