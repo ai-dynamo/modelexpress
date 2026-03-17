@@ -118,7 +118,14 @@ impl From<TensorRecordJson> for TensorRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRecordJson {
     pub worker_rank: u32,
+    /// Explicit backend type discriminator ("nixl", "transfer_engine", "none").
+    /// Used as the authoritative source when reconstructing BackendMetadataRecord.
+    #[serde(default)]
+    pub backend_type: Option<String>,
+    #[serde(default)]
     pub nixl_metadata: Vec<u8>,
+    #[serde(default)]
+    pub transfer_engine_session_id: Option<String>,
     pub tensors: Vec<TensorRecordJson>,
     #[serde(default)]
     pub status: i32,
@@ -128,9 +135,17 @@ struct WorkerRecordJson {
 
 impl From<WorkerRecord> for WorkerRecordJson {
     fn from(record: WorkerRecord) -> Self {
+        let backend_type = record.backend_metadata.backend_type_str().to_string();
+        let (nixl_metadata, transfer_engine_session_id) = match record.backend_metadata {
+            super::BackendMetadataRecord::Nixl(data) => (data, None),
+            super::BackendMetadataRecord::TransferEngine(sid) => (Vec::new(), Some(sid)),
+            super::BackendMetadataRecord::None => (Vec::new(), None),
+        };
         Self {
             worker_rank: record.worker_rank,
-            nixl_metadata: record.nixl_metadata,
+            backend_type: Some(backend_type),
+            nixl_metadata,
+            transfer_engine_session_id,
             tensors: record
                 .tensors
                 .into_iter()
@@ -146,7 +161,11 @@ impl From<WorkerRecordJson> for WorkerRecord {
     fn from(json: WorkerRecordJson) -> Self {
         Self {
             worker_rank: json.worker_rank,
-            nixl_metadata: json.nixl_metadata,
+            backend_metadata: super::BackendMetadataRecord::from_flat(
+                json.nixl_metadata,
+                json.transfer_engine_session_id,
+                json.backend_type.as_deref(),
+            ),
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
             status: json.status,
             updated_at: json.updated_at,
@@ -483,7 +502,9 @@ mod tests {
     fn test_worker_record_json_roundtrip_with_status() {
         let record = WorkerRecord {
             worker_rank: 2,
-            nixl_metadata: vec![0xde, 0xad, 0xbe, 0xef],
+            backend_metadata: super::super::BackendMetadataRecord::Nixl(vec![
+                0xde, 0xad, 0xbe, 0xef,
+            ]),
             tensors: vec![TensorRecord {
                 name: "t".to_string(),
                 addr: 0x1000,
@@ -501,7 +522,7 @@ mod tests {
         let back = WorkerRecord::from(parsed);
 
         assert_eq!(back.worker_rank, record.worker_rank);
-        assert_eq!(back.nixl_metadata, record.nixl_metadata);
+        assert_eq!(back.backend_metadata, record.backend_metadata);
         assert_eq!(back.status, record.status);
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);

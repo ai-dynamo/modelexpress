@@ -206,7 +206,9 @@ mod tests {
                 model_name: "my-model".to_string(),
                 workers: vec![WorkerMetadata {
                     worker_rank: 0,
-                    nixl_metadata: vec![1, 2, 3],
+                    backend_metadata: Some(
+                        modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata::NixlMetadata(vec![1, 2, 3]),
+                    ),
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
@@ -262,7 +264,7 @@ mod tests {
                 model_name: "my-model".to_string(),
                 workers: vec![WorkerRecord {
                     worker_rank: 0,
-                    nixl_metadata: vec![],
+                    backend_metadata: crate::metadata_backend::BackendMetadataRecord::None,
                     tensors: vec![],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
