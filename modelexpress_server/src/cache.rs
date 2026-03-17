@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{debug, error, info, warn};
 
+use std::path::PathBuf;
+
 use crate::database::{ModelDatabase, ModelRecord};
 use modelexpress_common::config::DurationConfig;
+use modelexpress_common::download::get_provider;
 use modelexpress_common::models::ModelStatus;
 
 /// Configuration for cache eviction policies
@@ -202,12 +205,21 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
 pub struct CacheEvictionService {
     database: ModelDatabase,
     config: CacheEvictionConfig,
+    cache_directory: PathBuf,
 }
 
 impl CacheEvictionService {
     /// Create a new cache eviction service
-    pub fn new(database: ModelDatabase, config: CacheEvictionConfig) -> Self {
-        Self { database, config }
+    pub fn new(
+        database: ModelDatabase,
+        config: CacheEvictionConfig,
+        cache_directory: PathBuf,
+    ) -> Self {
+        Self {
+            database,
+            config,
+            cache_directory,
+        }
     }
 
     /// Start the background eviction service
@@ -329,27 +341,27 @@ impl CacheEvictionService {
         Ok(result)
     }
 
-    /// Evict a single model (remove from database and filesystem)
+    /// Evict a single model (remove from filesystem, then from database)
     async fn evict_model(
         &self,
         model_name: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Remove from database first
+        // Look up the model record to determine the provider
+        let record = self
+            .database
+            .get_model_record(model_name)?
+            .ok_or_else(|| format!("model '{model_name}' not found in database"))?;
+
+        // Delete files from disk first. If this fails, we keep the DB record
+        // so the next eviction cycle can retry.
+        let provider = get_provider(record.provider);
+        provider
+            .delete_model(model_name, self.cache_directory.clone())
+            .await
+            .map_err(|e| format!("failed to delete model files for '{model_name}': {e}"))?;
+
+        // Only remove from database after successful filesystem deletion
         self.database.delete_model(model_name)?;
-
-        // Remove from filesystem
-        // This is where you would implement actual file removal
-        // For now, we'll just log the action since the download module
-        // would need to be consulted for the actual file paths
-        debug!(
-            "Would remove model files for: {model_name}",
-            model_name = model_name
-        );
-
-        // In a real implementation, you would:
-        // 1. Get the model file path from the download module
-        // 2. Remove the model files from disk
-        // 3. Update any in-memory caches
 
         Ok(())
     }
@@ -450,6 +462,11 @@ mod tests {
         let db = ModelDatabase::new(db_path.to_str().expect("Invalid path"))
             .expect("Failed to create test database");
         (db, temp_dir)
+    }
+
+    fn create_test_service(db: ModelDatabase, config: CacheEvictionConfig) -> CacheEvictionService {
+        let cache_dir = TempDir::new().expect("Failed to create cache directory");
+        CacheEvictionService::new(db, config, cache_dir.path().to_path_buf())
     }
 
     #[test]
@@ -653,7 +670,7 @@ mod tests {
         let (db, _temp_dir) = create_test_database();
         let config = CacheEvictionConfig::default();
 
-        let service = CacheEvictionService::new(db, config.clone());
+        let service = create_test_service(db, config);
         assert!(service.config.enabled);
     }
 
@@ -671,7 +688,7 @@ mod tests {
         )
         .expect("Failed to set model status");
 
-        let service = CacheEvictionService::new(db.clone(), config);
+        let service = create_test_service(db.clone(), config);
 
         let models_to_evict = vec!["test-model".to_string()];
         let result = service
@@ -719,7 +736,7 @@ mod tests {
         )
         .expect("Failed to set model3 status");
 
-        let service = CacheEvictionService::new(db, config);
+        let service = create_test_service(db, config);
         let stats = service
             .get_cache_stats()
             .await

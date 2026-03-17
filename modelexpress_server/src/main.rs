@@ -74,7 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create cache eviction service
-    let cache_service = CacheEvictionService::new(database.clone(), config.cache.eviction.clone());
+    let cache_service = CacheEvictionService::new(
+        database.clone(),
+        config.cache.eviction.clone(),
+        config.cache.directory.clone(),
+    );
 
     // Create shutdown channels
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
