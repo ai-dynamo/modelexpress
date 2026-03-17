@@ -162,9 +162,10 @@ mod tests {
     use super::*;
 
     fn test_workers(rank: u32) -> Vec<WorkerMetadata> {
+        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
         vec![WorkerMetadata {
             worker_rank: rank,
-            nixl_metadata: vec![1, 2, 3],
+            backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1, 2, 3])),
             tensors: vec![],
         }]
     }
