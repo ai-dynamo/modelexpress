@@ -37,6 +37,7 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
+from vllm.utils.mem_utils import log_gpu_memory_stage
 from vllm.utils.torch_utils import set_default_torch_dtype
 from .nixl_transfer import NixlTransferManager, is_nixl_available
 from .types import TensorDescriptor
@@ -297,6 +298,7 @@ class MxModelLoader(BaseModelLoader):
         model_name = model_config.model
 
         logger.info(f"[Worker {device_id}] MxModelLoader starting (model={model_name})")
+        prev = log_gpu_memory_stage("Before model init (mx)", logger=logger)
 
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
@@ -305,6 +307,9 @@ class MxModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config
                 )
                 logger.info(f"[Worker {device_id}] Model structure initialized")
+                prev = log_gpu_memory_stage(
+                    "After initialize_model (mx)", prev, logger=logger
+                )
 
             source_worker = self._detect_source(model_name, device_id)
 
@@ -402,20 +407,36 @@ class MxModelLoader(BaseModelLoader):
         source_worker,
     ) -> None:
         """Receive weights via RDMA from an existing source, then publish."""
+        prev = log_gpu_memory_stage(
+            "Before dummy load_weights (mx-target)", logger=logger
+        )
+
         # Create dummy weights as receive buffers
         logger.info(f"[Worker {device_id}] Creating dummy weights as RDMA receive buffers...")
         self._dummy_loader.load_weights(model, model_config)
+        prev = log_gpu_memory_stage(
+            "After dummy load_weights (mx-target)", prev, logger=logger
+        )
 
         # RDMA receive
         self._receive_from_peer(model, device_id, model_name, source_worker)
+        prev = log_gpu_memory_stage(
+            "After RDMA transfer (mx-target)", prev, logger=logger
+        )
 
         # Register with NIXL + publish so future nodes can discover us
         self._register_and_publish(model, target_device, device_id, model_name)
+        prev = log_gpu_memory_stage(
+            "After NIXL registration (mx-target)", prev, logger=logger
+        )
 
         # FP8 processing
         logger.info(f"[Worker {device_id}] Processing weights (FP8 transformation)...")
         process_weights_after_loading(model, model_config, target_device)
         logger.info(f"[Worker {device_id}] Weight processing complete")
+        log_gpu_memory_stage(
+            "After process_weights_after_loading (mx-target)", prev, logger=logger
+        )
 
     def _receive_from_peer(
         self,
@@ -551,17 +572,30 @@ class MxModelLoader(BaseModelLoader):
         model_name: str,
     ) -> None:
         """Load weights from disk, then register + publish."""
+        prev = log_gpu_memory_stage(
+            "Before load_weights (mx-source)", logger=logger
+        )
+
         logger.info(f"[Worker {device_id}] Loading weights from disk...")
         self._disk_loader.load_weights(model, model_config)
         logger.info(f"[Worker {device_id}] Weights loaded from disk")
+        prev = log_gpu_memory_stage(
+            "After load_weights (mx-source)", prev, logger=logger
+        )
 
         # Register with NIXL + publish
         self._register_and_publish(model, target_device, device_id, model_name)
+        prev = log_gpu_memory_stage(
+            "After NIXL registration (mx-source)", prev, logger=logger
+        )
 
         # FP8 processing
         logger.info(f"[Worker {device_id}] Processing weights (FP8 transformation)...")
         process_weights_after_loading(model, model_config, target_device)
         logger.info(f"[Worker {device_id}] Weight processing complete")
+        log_gpu_memory_stage(
+            "After process_weights_after_loading (mx-source)", prev, logger=logger
+        )
 
     # ------------------------------------------------------------------
     # Shared: register with NIXL and publish metadata
