@@ -22,6 +22,10 @@ serviceAccount:
   annotations: {}
   name: ""
   automount: false
+  rbac:
+    # Enable Role + RoleBinding for the Kubernetes metadata backend.
+    # Required when MX_METADATA_BACKEND=kubernetes.
+    enabled: false
 
 podAnnotations: {}
 

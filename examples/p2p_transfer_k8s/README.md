@@ -7,15 +7,15 @@ This example demonstrates how to set up ModelExpress for P2P GPU weight transfer
 ```mermaid
 graph TD
     subgraph "Node A"
-        A[vLLM + MxModelLoader<br/>- Loads weights from disk<br/>- Registers tensors with NIXL<br/>- Publishes metadata via MxClient<br/>- Publishes ready flag]
+        A[vLLM + MxModelLoader<br/>- Loads weights from disk<br/>- Registers tensors with NIXL<br/>- PublishMetadata + UpdateStatus]
     end
     subgraph "Node B"
-        B[vLLM + MxModelLoader<br/>- Detects source via MX server<br/>- Receives weights via NIXL<br/>- Runs FP8 processing<br/>- Serves inference]
+        B[vLLM + MxModelLoader<br/>- GetMetadata, checks worker status<br/>- Receives weights via NIXL<br/>- Runs FP8 processing]
     end
     A -- "RDMA via NIXL" --> B
     A --> S
     B --> S
-    S[ModelExpress Server - gRPC + Redis<br/>PublishMetadata / GetMetadata<br/>PublishReady / GetReady]
+    S[ModelExpress Server - gRPC<br/>PublishMetadata / GetMetadata / UpdateStatus]
 ```
 
 ### Key Design Points
@@ -40,21 +40,9 @@ graph TD
 kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<your-token>
 ```
 
-### 2. Deploy ModelExpress Server
+### 2. Choose a Persistence Backend and Deploy
 
-```bash
-kubectl apply -f deploy/modelexpress-server.yaml
-```
-
-### 3. Deploy vLLM Instances
-
-Deploy identical instances - the first loads from disk, subsequent ones receive via RDMA:
-
-```bash
-kubectl apply -f deploy/vllm.yaml
-# Scale up for more replicas
-kubectl scale deployment/mx-vllm --replicas=2
-```
+See [`deploy/persistence/`](deploy/persistence/) for backend-specific manifests (Redis or Kubernetes CRD).
 
 The `mx` loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from disk and becomes a source for future nodes.
 
@@ -72,7 +60,8 @@ With TP=4, this creates sockets: `/tmp/mx/vllm-0.sock`, `/tmp/mx/vllm-1.sock`, e
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `REDIS_URL` | Redis connection URL | `redis://localhost:6379` |
+| `MX_METADATA_BACKEND` | Backend type: `redis` or `kubernetes` | (required) |
+| `REDIS_URL` | Redis connection URL (redis backend) | `redis://localhost:6379` |
 
 ## Performance Expectations
 
@@ -89,28 +78,28 @@ With TP=4, this creates sockets: `/tmp/mx/vllm-0.sock`, `/tmp/mx/vllm-1.sock`, e
 kubectl exec -it deployment/mx-vllm -c vllm -- ls -la /tmp/mx/
 ```
 
-### Check client logs
+### Check vLLM logs
 
 ```bash
-kubectl logs deployment/mx-vllm -c client
+kubectl logs deployment/mx-vllm -c vllm
 ```
 
-### Check Redis connectivity
+### Check Redis connectivity (Redis backend)
 
 ```bash
-kubectl exec -it deployment/modelexpress-server -- redis-cli -h modelexpress-redis ping
+kubectl exec -it deployment/modelexpress-server -c redis -- redis-cli ping
 ```
 
 ### Verify InfiniBand is working
 
 ```bash
-kubectl exec -it deployment/mx-vllm -c client -- ibstat
+kubectl exec -it deployment/mx-vllm -c vllm -- ibstat
 ```
 
 ### Check UCX configuration
 
 ```bash
-kubectl exec -it deployment/mx-vllm -c client -- ucx_info -d
+kubectl exec -it deployment/mx-vllm -c vllm -- ucx_info -d
 ```
 
 ## License

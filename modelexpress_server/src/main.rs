@@ -16,7 +16,7 @@ use modelexpress_server::{
 };
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
@@ -97,21 +97,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_service = ApiServiceImpl;
     let model_service = ModelServiceImpl;
 
-    // Initialize P2P state manager with Redis (optional)
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let p2p_state = Arc::new(P2pStateManager::new(&redis_url));
+    // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
+    let p2p_state = Arc::new(P2pStateManager::new());
 
-    // Try to connect to Redis (non-fatal if unavailable)
-    match tokio::time::timeout(std::time::Duration::from_secs(5), p2p_state.connect()).await {
-        Ok(Ok(())) => info!("P2P state manager connected to Redis"),
-        Ok(Err(e)) => warn!(
-            "P2P state manager could not connect to Redis: {} - P2P features may be unavailable",
-            e
-        ),
-        Err(_) => warn!(
-            "P2P state manager timed out connecting to Redis - P2P features may be unavailable"
-        ),
+    match tokio::time::timeout(std::time::Duration::from_secs(10), p2p_state.connect()).await {
+        Ok(Ok(())) => info!("P2P state manager connected to metadata backend"),
+        Ok(Err(e)) => {
+            error!("Failed to connect to P2P metadata backend: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            error!("Timed out connecting to P2P metadata backend");
+            return Err("P2P metadata backend connection timed out".into());
+        }
     }
 
     let p2p_service = P2pServiceImpl::new(p2p_state);

@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# RBAC for the Kubernetes metadata backend.
+# Required when MX_METADATA_BACKEND=kubernetes so the server can manage
+# ModelMetadata CRDs and tensor descriptor ConfigMaps in its namespace.
+{{- if and .Values.serviceAccount.create .Values.serviceAccount.rbac.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "modelexpress.fullname" . }}
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["modelexpress.nvidia.com"]
+    resources: ["modelmetadatas", "modelmetadatas/status"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "modelexpress.fullname" . }}
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "modelexpress.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "modelexpress.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -7,8 +7,7 @@
 
 use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
 use crate::k8s_types::{
-    ModelMetadata, ModelMetadataPhase, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus,
-    sanitize_model_name,
+    ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus, sanitize_model_name,
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -123,13 +122,9 @@ impl KubernetesBackend {
                 debug!("Created ConfigMap {} for worker {}", cm_name, worker_rank);
             }
             Err(kube::Error::Api(err)) if err.code == 409 => {
-                // Already exists, patch it
-                api.patch(
-                    &cm_name,
-                    &PatchParams::apply("modelexpress"),
-                    &Patch::Apply(&cm),
-                )
-                .await?;
+                // Already exists — use merge patch to avoid SSA field manager conflicts
+                api.patch(&cm_name, &PatchParams::default(), &Patch::Merge(&cm))
+                    .await?;
                 debug!("Updated ConfigMap {} for worker {}", cm_name, worker_rank);
             }
             Err(e) => return Err(e.into()),
@@ -220,10 +215,6 @@ impl MetadataBackend for KubernetesBackend {
                 },
                 spec: ModelMetadataSpec {
                     model_name: model_name.to_string(),
-                    expected_workers: std::env::var("MX_EXPECTED_WORKERS")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(worker_records.len() as i32),
                 },
                 status: None,
             };
@@ -276,10 +267,8 @@ impl MetadataBackend for KubernetesBackend {
                 transfer_engine_session_id,
                 tensor_count: worker.tensors.len() as i32,
                 tensor_config_map: Some(cm_name),
-                ready: true,
-                stability_verified: false, // Set by source after warmup
-                session_id: None,
-                published_at: Some(now.clone()),
+                status: WorkerStatus::status_name_from_proto(worker.status),
+                updated_at: Some(now.clone()),
             });
         }
 
@@ -304,21 +293,10 @@ impl MetadataBackend for KubernetesBackend {
 
             all_workers.sort_by_key(|w| w.worker_rank);
 
-            let phase = if all_workers.is_empty() {
-                ModelMetadataPhase::Pending
-            } else if all_workers.iter().all(|w| w.ready && w.stability_verified) {
-                ModelMetadataPhase::Ready
-            } else if all_workers.iter().any(|w| w.ready) {
-                ModelMetadataPhase::Initializing
-            } else {
-                ModelMetadataPhase::Pending
-            };
-
             let resource_version = current.metadata.resource_version.unwrap_or_default();
             let status_patch = json!({
                 "metadata": { "resourceVersion": resource_version },
                 "status": {
-                    "phase": phase.to_string(),
                     "workers": all_workers,
                     "publishedAt": now
                 }
@@ -327,7 +305,7 @@ impl MetadataBackend for KubernetesBackend {
             match api
                 .patch_status(
                     &cr_name,
-                    &PatchParams::apply("modelexpress"),
+                    &PatchParams::default(),
                     &Patch::Merge(&status_patch),
                 )
                 .await
@@ -424,10 +402,26 @@ impl MetadataBackend for KubernetesBackend {
                 Vec::new()
             };
 
+            let status =
+                WorkerStatus::status_proto_from_name(&worker_status.status).ok_or_else(|| {
+                    format!(
+                        "Unknown status string '{}' for worker {}",
+                        worker_status.status, worker_status.worker_rank
+                    )
+                })?;
+            let updated_at = worker_status
+                .updated_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0);
+
             workers.push(WorkerRecord {
                 worker_rank: worker_status.worker_rank as u32,
                 backend_metadata,
                 tensors,
+                status,
+                updated_at,
             });
         }
 
@@ -500,5 +494,83 @@ impl MetadataBackend for KubernetesBackend {
         let models: Vec<String> = crs.items.into_iter().map(|cr| cr.spec.model_name).collect();
 
         Ok(models)
+    }
+
+    async fn update_status(
+        &self,
+        model_name: &str,
+        worker_id: u32,
+        status: i32,
+        updated_at: i64,
+    ) -> MetadataResult<()> {
+        let api = self.model_metadata_api();
+        let cr_name = sanitize_model_name(model_name);
+        let status_name = WorkerStatus::status_name_from_proto(status);
+        let updated_at_rfc3339 = chrono::DateTime::from_timestamp_millis(updated_at)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+        let max_retries: u32 = 5;
+        for attempt in 0..max_retries {
+            let current = api.get(&cr_name).await?;
+            let mut all_workers: Vec<WorkerStatus> =
+                current.status.map(|s| s.workers).unwrap_or_default();
+
+            if let Some(worker) = all_workers
+                .iter_mut()
+                .find(|w| w.worker_rank == worker_id as i32)
+            {
+                worker.status = status_name.clone();
+                worker.updated_at = Some(updated_at_rfc3339.clone());
+            } else {
+                debug!(
+                    "update_status: worker {} not found in CR '{}', skipping",
+                    worker_id, cr_name
+                );
+                return Ok(());
+            }
+
+            let resource_version = current.metadata.resource_version.unwrap_or_default();
+            let status_patch = serde_json::json!({
+                "metadata": { "resourceVersion": resource_version },
+                "status": { "workers": all_workers }
+            });
+
+            match api
+                .patch_status(
+                    &cr_name,
+                    &PatchParams::default(),
+                    &Patch::Merge(&status_patch),
+                )
+                .await
+            {
+                Ok(_) => {
+                    debug!(
+                        "Updated status for model '{}' worker {} -> {}",
+                        model_name, worker_id, status_name
+                    );
+                    return Ok(());
+                }
+                Err(kube::Error::Api(err)) if err.code == 409 => {
+                    debug!(
+                        "Conflict updating status for '{}', retrying ({}/{})",
+                        cr_name,
+                        attempt.saturating_add(1),
+                        max_retries
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100_u64.saturating_mul(u64::from(attempt).saturating_add(1)),
+                    ))
+                    .await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(format!(
+            "Failed to update status for '{}' worker {} after {} retries",
+            cr_name, worker_id, max_retries
+        )
+        .into())
     }
 }

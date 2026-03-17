@@ -14,9 +14,6 @@ registered by the owning process for GPUDirect RDMA.
 
 import logging
 import os
-import time
-import uuid
-from dataclasses import dataclass
 
 import grpc
 
@@ -59,7 +56,7 @@ class MxClient:
     Lightweight gRPC client for ModelExpress server communication.
 
     Provides typed methods for every P2P RPC (``PublishMetadata``,
-    ``GetMetadata``, ``PublishReady``, ``GetReady``) so that callers
+    ``GetMetadata``, ``UpdateStatus``) so that callers
     (loaders, coordinators) never need to create gRPC channels or
     stubs directly.
 
@@ -82,7 +79,6 @@ class MxClient:
         self._max_message_size = max_message_size
         self._channel: grpc.Channel | None = None
         self._stub: p2p_pb2_grpc.P2pServiceStub | None = None
-        self.session_id: str = str(uuid.uuid4())
 
     # -- connection management ------------------------------------------------
 
@@ -133,114 +129,20 @@ class MxClient:
         request = p2p_pb2.GetMetadataRequest(model_name=model_name)
         return self.stub.GetMetadata(request, timeout=30)
 
-    def publish_ready(
+    def update_status(
         self,
         model_name: str,
         worker_id: int,
-        session_id: str,
-        metadata_hash: str,
-        nixl_ready: bool = True,
-        stability_verified: bool = True,
+        status: "p2p_pb2.SourceStatus",
     ) -> bool:
-        """Publish a source-ready flag.  Returns *True* on success."""
-        request = p2p_pb2.PublishReadyRequest(
+        """Update worker status.  Returns *True* on success."""
+        request = p2p_pb2.UpdateStatusRequest(
             model_name=model_name,
             worker_id=worker_id,
-            session_id=session_id,
-            metadata_hash=metadata_hash,
-            nixl_ready=nixl_ready,
-            stability_verified=stability_verified,
+            status=status,
         )
-        response = self.stub.PublishReady(request, timeout=30)
+        response = self.stub.UpdateStatus(request, timeout=30)
         if not response.success:
-            logger.error("PublishReady failed: %s", response.message)
-            return False
-        return True
+            logger.error("UpdateStatus failed: %s", response.message)
+        return response.success
 
-    def get_ready(
-        self, model_name: str, worker_id: int
-    ) -> p2p_pb2.GetReadyResponse:
-        """Check whether the source is ready for *model_name* / *worker_id*."""
-        request = p2p_pb2.GetReadyRequest(
-            model_name=model_name,
-            worker_id=worker_id,
-        )
-        return self.stub.GetReady(request, timeout=30)
-
-    # -- coordination helpers -------------------------------------------------
-
-    def wait_for_ready(
-        self,
-        model_name: str,
-        worker_id: int,
-        timeout_seconds: int = 7200,
-        poll_interval: int = 10,
-    ) -> tuple[bool, str | None, str | None]:
-        """Poll until source is ready.
-
-        Returns:
-            (success, session_id, metadata_hash)
-        """
-        start_time = time.time()
-        logger.info("[Worker %d] Waiting for source ready flag...", worker_id)
-
-        while time.time() - start_time < timeout_seconds:
-            try:
-                response = self.get_ready(model_name, worker_id)
-                if response.found and response.ready:
-                    sid = response.session_id
-                    mhash = response.metadata_hash
-                    logger.info(
-                        "[Worker %d] Source ready! session=%s, hash=%s",
-                        worker_id,
-                        sid[:8] if sid else "N/A",
-                        mhash[:8] if mhash else "N/A",
-                    )
-                    return True, sid, mhash
-            except Exception as e:
-                logger.warning("[Worker %d] Error checking ready flag: %s", worker_id, e)
-
-            time.sleep(poll_interval)
-            elapsed = int(time.time() - start_time)
-            if elapsed % 60 == 0:
-                logger.info(
-                    "[Worker %d] Still waiting for source ready (%ds/%ds)...",
-                    worker_id, elapsed, timeout_seconds,
-                )
-
-        logger.error(
-            "[Worker %d] Timeout waiting for source ready after %ds",
-            worker_id, timeout_seconds,
-        )
-        return False, None, None
-
-    def check_session_changed(
-        self,
-        model_name: str,
-        worker_id: int,
-        cached_session_id: str | None,
-    ) -> tuple[bool, str | None]:
-        """Check if source session changed (indicates restart).
-
-        Returns:
-            (changed, new_session_id)
-        """
-        if cached_session_id is None:
-            return False, None
-
-        try:
-            response = self.get_ready(model_name, worker_id)
-            if response.found:
-                current_session = response.session_id
-                if current_session and current_session != cached_session_id:
-                    logger.warning(
-                        "[Worker %d] Source restarted! cached=%s != current=%s",
-                        worker_id,
-                        cached_session_id[:8],
-                        current_session[:8],
-                    )
-                    return True, current_session
-        except Exception as e:
-            logger.warning("[Worker %d] Error checking session: %s", worker_id, e)
-
-        return False, cached_session_id

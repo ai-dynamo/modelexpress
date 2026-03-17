@@ -3,16 +3,12 @@
 
 //! State management for P2P model metadata.
 //!
-//! This module provides the `P2pStateManager` which wraps a metadata backend
-//! (Redis or Kubernetes CRD) for storing model metadata.
-//!
-//! For new code, prefer using `metadata_backend` directly. This module exists
-//! for backwards compatibility with existing code.
+//! `P2pStateManager` wraps a metadata backend (Redis or Kubernetes CRD).
+//! All state — model metadata and source status — is persisted to the backend,
+//! making the server stateless and horizontally scalable.
 
 use crate::metadata_backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
 use modelexpress_common::grpc::p2p::WorkerMetadata;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -22,82 +18,67 @@ pub use crate::metadata_backend::{
     BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
 };
 
-/// Ready state for a source worker (stored in-memory, always ephemeral).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadyRecord {
-    pub session_id: String,
-    pub metadata_hash: String,
-    pub nixl_ready: bool,
-    pub stability_verified: bool,
-    pub timestamp: f64,
-}
-
 /// State manager that handles P2P metadata operations.
 ///
-/// This is a wrapper around the metadata backend abstraction that provides
-/// a simpler API for common operations. It automatically selects the backend
-/// based on environment variables (MX_METADATA_BACKEND).
+/// Wraps the metadata backend abstraction and provides a simpler API for
+/// common operations. Configure via `MX_METADATA_BACKEND` env var.
 #[derive(Clone)]
 pub struct P2pStateManager {
     backend: Arc<RwLock<Option<Arc<dyn MetadataBackend>>>>,
-    config: BackendConfig,
-    /// In-memory ready flags (always ephemeral - not persisted to backend).
-    /// Key: "{model_name}:worker:{worker_id}"
-    ready_flags: Arc<RwLock<HashMap<String, ReadyRecord>>>,
+    config: Option<BackendConfig>,
+}
+
+impl Default for P2pStateManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl P2pStateManager {
-    /// Create a new state manager with default configuration from environment.
+    /// Create a new state manager, resolving backend config from the environment.
     ///
-    /// The `redis_url` is used as a fallback when `MX_METADATA_BACKEND=redis`
-    /// and no `REDIS_URL` env var is set. The default backend is in-memory.
-    pub fn new(redis_url: &str) -> Self {
-        let mut config = BackendConfig::from_env();
-
-        // If the env resolved to a layered-redis or redis-only config but
-        // the URL came from the default, override with the explicit redis_url
-        // passed by main.rs for backward compatibility.
-        match &mut config {
-            BackendConfig::LayeredRedis { url } | BackendConfig::Redis { url }
-                if std::env::var("REDIS_URL").is_err() =>
-            {
-                *url = redis_url.to_string();
-            }
-            _ => {}
-        }
-
+    /// Configure via `MX_METADATA_BACKEND` (required) and `REDIS_URL` /
+    /// `MX_REDIS_HOST` / `MX_REDIS_PORT` (for Redis).
+    pub fn new() -> Self {
         Self {
             backend: Arc::new(RwLock::new(None)),
-            config,
-            ready_flags: Arc::new(RwLock::new(HashMap::new())),
+            config: BackendConfig::from_env().ok(),
         }
     }
 
-    /// Create a new state manager with explicit backend configuration
+    /// Create a new state manager with an explicit backend configuration.
     pub fn with_config(config: BackendConfig) -> Self {
         Self {
             backend: Arc::new(RwLock::new(None)),
-            config,
-            ready_flags: Arc::new(RwLock::new(HashMap::new())),
+            config: Some(config),
         }
     }
 
-    /// Initialize the backend connection
-    pub async fn connect(&self) -> MetadataResult<()> {
-        let backend = create_backend(self.config.clone()).await?;
+    /// Inject a pre-built backend directly (test only).
+    #[cfg(test)]
+    pub fn with_backend(backend: Arc<dyn MetadataBackend>) -> Self {
+        Self {
+            backend: Arc::new(RwLock::new(Some(backend))),
+            config: None,
+        }
+    }
 
+    /// Initialize the backend connection.
+    pub async fn connect(&self) -> MetadataResult<()> {
+        let config = self.config.clone().ok_or(
+            "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
+        )?;
+
+        let backend = create_backend(config.clone()).await?;
         let mut guard = self.backend.write().await;
         *guard = Some(backend);
 
-        info!("P2pStateManager connected with {:?}", self.config);
+        info!("P2pStateManager connected with {:?}", config);
         Ok(())
     }
 
-    /// Get the backend, connecting if necessary.
-    /// Uses double-checked locking to prevent duplicate backend creation
-    /// when multiple callers race on first access.
+    /// Get the backend, connecting lazily if not yet connected.
     async fn get_backend(&self) -> MetadataResult<Arc<dyn MetadataBackend>> {
-        // Fast path: read lock
         {
             let guard = self.backend.read().await;
             if let Some(backend) = guard.as_ref() {
@@ -105,109 +86,78 @@ impl P2pStateManager {
             }
         }
 
-        // Slow path: write lock with double-check
         let mut guard = self.backend.write().await;
         if let Some(backend) = guard.as_ref() {
             return Ok(backend.clone());
         }
 
-        let backend = create_backend(self.config.clone()).await?;
-        info!("P2pStateManager connected with {:?}", self.config);
+        let config = self.config.clone().ok_or(
+            "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
+        )?;
+
+        let backend = create_backend(config.clone()).await?;
+        info!("P2pStateManager connected with {:?}", config);
         *guard = Some(backend.clone());
         Ok(backend)
     }
 
     // ========================================================================
-    // Model Metadata Management
+    // Model Metadata
     // ========================================================================
 
-    /// Publish metadata for a model
-    /// NOTE: This MERGES workers with existing data, allowing incremental publishing
-    /// from multiple workers in a distributed system.
+    /// Publish metadata for a model (merges workers with existing data).
     pub async fn publish_metadata(
         &self,
         model_name: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()> {
-        let backend = self.get_backend().await?;
-        backend.publish_metadata(model_name, workers).await
+        self.get_backend()
+            .await?
+            .publish_metadata(model_name, workers)
+            .await
     }
 
-    /// Get metadata for a model
+    /// Get metadata for a model.
     pub async fn get_metadata(
         &self,
         model_name: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
-        let backend = self.get_backend().await?;
-        backend.get_metadata(model_name).await
+        self.get_backend().await?.get_metadata(model_name).await
     }
 
-    /// Remove metadata for a model (cleanup)
+    /// Remove metadata for a model.
     pub async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
-        let backend = self.get_backend().await?;
-        backend.remove_metadata(model_name).await
+        self.get_backend().await?.remove_metadata(model_name).await
     }
 
-    /// List all registered model names
+    /// List all registered model names.
     pub async fn list_models(&self) -> MetadataResult<Vec<String>> {
-        let backend = self.get_backend().await?;
-        backend.list_models().await
+        self.get_backend().await?.list_models().await
     }
 
     // ========================================================================
-    // Ready Coordination (always in-memory, ephemeral)
+    // Worker Status
     // ========================================================================
 
-    /// Publish a source ready flag for a worker.
-    pub async fn publish_ready(
+    /// Update the status of a worker within its stored metadata record.
+    /// `status` is the `SourceStatus` proto enum value (i32).
+    pub async fn update_worker_status(
         &self,
         model_name: &str,
         worker_id: u32,
-        session_id: &str,
-        metadata_hash: &str,
-        nixl_ready: bool,
-        stability_verified: bool,
+        status: i32,
     ) -> MetadataResult<()> {
-        let key = format!("{}:worker:{}", model_name, worker_id);
-        let record = ReadyRecord {
-            session_id: session_id.to_string(),
-            metadata_hash: metadata_hash.to_string(),
-            nixl_ready,
-            stability_verified,
-            timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-        };
-
-        let mut flags = self.ready_flags.write().await;
-        flags.insert(key, record);
-
-        info!(
-            "Published ready flag for model '{}' worker {}: nixl_ready={}, stability_verified={}",
-            model_name, worker_id, nixl_ready, stability_verified
-        );
-        Ok(())
-    }
-
-    /// Get the ready flag for a specific worker.
-    pub async fn get_ready(
-        &self,
-        model_name: &str,
-        worker_id: u32,
-    ) -> MetadataResult<Option<ReadyRecord>> {
-        let key = format!("{}:worker:{}", model_name, worker_id);
-        let flags = self.ready_flags.read().await;
-        let result = flags.get(&key).cloned();
+        let updated_at = chrono::Utc::now().timestamp_millis();
+        self.get_backend()
+            .await?
+            .update_status(model_name, worker_id, status, updated_at)
+            .await?;
 
         debug!(
-            "get_ready '{}' worker {}: {}",
-            model_name,
-            worker_id,
-            if result.is_some() {
-                "found"
-            } else {
-                "not found"
-            }
+            "Updated status for model '{}' worker {} -> {}",
+            model_name, worker_id, status
         );
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -215,7 +165,9 @@ impl P2pStateManager {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use modelexpress_common::grpc::p2p::TensorDescriptor;
+    use crate::metadata_backend::MockMetadataBackend;
+    use mockall::predicate::eq;
+    use modelexpress_common::grpc::p2p::{SourceStatus, TensorDescriptor};
 
     #[test]
     fn test_tensor_record_conversion() {
@@ -250,6 +202,8 @@ mod tests {
                 device_id: 3,
                 dtype: "float16".to_string(),
             }],
+            status: SourceStatus::Initializing as i32,
+            updated_at: 1234567890000,
         };
 
         let record = WorkerRecord::from(meta.clone());
@@ -259,6 +213,8 @@ mod tests {
             BackendMetadataRecord::Nixl(d) if d == &vec![1, 2, 3, 4, 5]
         ));
         assert_eq!(record.tensors.len(), 1);
+        assert_eq!(record.status, SourceStatus::Initializing as i32);
+        assert_eq!(record.updated_at, 1234567890000);
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
@@ -281,6 +237,8 @@ mod tests {
                 device_id: 0,
                 dtype: "float16".to_string(),
             }],
+            status: 0,
+            updated_at: 0,
         };
 
         let record = WorkerRecord::from(meta.clone());
@@ -345,6 +303,8 @@ mod tests {
                         device_id: 0,
                         dtype: "bfloat16".to_string(),
                     }],
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
                 },
                 WorkerRecord {
                     worker_rank: 1,
@@ -356,6 +316,8 @@ mod tests {
                         device_id: 1,
                         dtype: "bfloat16".to_string(),
                     }],
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
                 },
             ],
             published_at: 1234567890,
@@ -372,46 +334,90 @@ mod tests {
         let default_redis = "redis://localhost:6379";
         let default_ns = "default";
 
-        // Memory (default)
-        let config = BackendConfig::from_type_str("memory", default_redis, default_ns);
-        assert!(matches!(config, BackendConfig::Memory));
-
-        // Empty string also defaults to memory
-        let config = BackendConfig::from_type_str("", default_redis, default_ns);
-        assert!(matches!(config, BackendConfig::Memory));
-
-        // Redis (layered)
-        let config = BackendConfig::from_type_str("redis", "redis://myhost:6379", default_ns);
-        assert!(
-            matches!(config, BackendConfig::LayeredRedis { url } if url == "redis://myhost:6379")
-        );
-
-        // Redis-only
-        let config = BackendConfig::from_type_str("redis-only", "redis://myhost:6379", default_ns);
+        // Redis
+        let config =
+            BackendConfig::from_type_str("redis", "redis://myhost:6379", default_ns).expect("ok");
         assert!(matches!(config, BackendConfig::Redis { url } if url == "redis://myhost:6379"));
 
-        // Kubernetes (layered)
-        let config = BackendConfig::from_type_str("kubernetes", default_redis, "prod-ns");
-        assert!(
-            matches!(config, BackendConfig::LayeredKubernetes { namespace } if namespace == "prod-ns")
-        );
+        // Kubernetes aliases
+        for alias in &["kubernetes", "k8s", "crd"] {
+            let config = BackendConfig::from_type_str(alias, default_redis, "prod-ns").expect("ok");
+            assert!(
+                matches!(config, BackendConfig::Kubernetes { namespace } if namespace == "prod-ns")
+            );
+        }
 
-        // K8s aliases
-        let config = BackendConfig::from_type_str("k8s", default_redis, "test-ns");
-        assert!(matches!(config, BackendConfig::LayeredKubernetes { .. }));
-        let config = BackendConfig::from_type_str("crd", default_redis, "test-ns");
-        assert!(matches!(config, BackendConfig::LayeredKubernetes { .. }));
-
-        // Kubernetes-only
-        let config = BackendConfig::from_type_str("kubernetes-only", default_redis, "ns");
-        assert!(matches!(config, BackendConfig::Kubernetes { .. }));
-
-        // Unknown falls back to memory
-        let config = BackendConfig::from_type_str("bogus", default_redis, default_ns);
-        assert!(matches!(config, BackendConfig::Memory));
+        // Unknown returns Err
+        assert!(BackendConfig::from_type_str("bogus", default_redis, default_ns).is_err());
+        assert!(BackendConfig::from_type_str("memory", default_redis, default_ns).is_err());
+        assert!(BackendConfig::from_type_str("", default_redis, default_ns).is_err());
 
         // Case insensitive
-        let config = BackendConfig::from_type_str("REDIS", default_redis, default_ns);
-        assert!(matches!(config, BackendConfig::LayeredRedis { .. }));
+        let config = BackendConfig::from_type_str("REDIS", default_redis, default_ns).expect("ok");
+        assert!(matches!(config, BackendConfig::Redis { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_connect_fails_without_config() {
+        let manager = P2pStateManager {
+            backend: Arc::new(RwLock::new(None)),
+            config: None,
+        };
+        assert!(manager.connect().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_status_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_update_status()
+            .with(
+                eq("my-model"),
+                eq(2u32),
+                eq(2i32),
+                mockall::predicate::always(),
+            )
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        manager
+            .update_worker_status("my-model", 2, SourceStatus::Ready as i32)
+            .await
+            .expect("update_worker_status failed");
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_status_propagates_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_update_status()
+            .once()
+            .returning(|_, _, _, _| Err("redis unavailable".into()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        assert!(
+            manager
+                .update_worker_status("my-model", 0, SourceStatus::Ready as i32)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_status_stores_correct_status() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_update_status()
+            .withf(|model, worker_id, status, _updated_at| {
+                model == "deepseek-ai/DeepSeek-V3"
+                    && *worker_id == 7
+                    && *status == SourceStatus::Ready as i32
+            })
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        manager
+            .update_worker_status("deepseek-ai/DeepSeek-V3", 7, SourceStatus::Ready as i32)
+            .await
+            .expect("update_worker_status failed");
     }
 }
