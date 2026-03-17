@@ -232,8 +232,7 @@ Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Do
 |-----|---------|----------|---------|
 | `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes NIXL metadata + tensors |
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Target queries for source metadata |
-| `PublishReady` | `PublishReadyRequest` | `PublishReadyResponse` | Source signals NIXL readiness |
-| `GetReady` | `GetReadyRequest` | `GetReadyResponse` | Target checks source readiness |
+| `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Source updates per-worker status (Initializing/Ready/Stale) |
 
 Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `WorkerMetadata` (rank, nixl_metadata bytes, tensors).
 
@@ -406,7 +405,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | Module | Purpose |
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
-| `client.py` | `MxClient` - gRPC client with session management, ready polling |
+| `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `vllm_loader.py` | `MxModelLoader` - custom vLLM model loader |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
@@ -420,10 +419,8 @@ gRPC client wrapping the P2P service stubs:
 | Method | Purpose |
 |--------|---------|
 | `publish_metadata(model_name, workers)` | Publish NIXL metadata for GPU workers |
-| `get_metadata(model_name)` | Query for existing source metadata |
-| `publish_ready(model_name, worker_id, ...)` | Signal NIXL readiness |
-| `wait_for_ready(model_name, worker_id, ...)` | Poll until source is ready (with timeout) |
-| `check_session_changed(model_name, worker_id, cached_session_id)` | Detect source restarts via session ID change |
+| `get_metadata(model_name)` | Query source metadata; target polls this until all workers reach `Ready` status |
+| `update_status(model_name, worker_id, status)` | Update a worker's `SourceStatus` (e.g., `Ready`); source calls this after health check and test inference |
 | `close()` | Close the underlying gRPC channel |
 
 ### NixlTransferManager
@@ -537,16 +534,15 @@ graph TD
 
 | Key Pattern | Purpose |
 |-------------|---------|
-| `mx:model:{model_name}` | Model metadata (workers, tensor descriptors, NIXL metadata) |
+| `mx:model:{model_name}` | Model metadata (workers, tensor descriptors, NIXL metadata, per-worker status) |
 | `mx:models` | Set of all registered model names |
-| `mx:nixl_ready:{model}:worker:{id}` | Source readiness signal (2hr TTL) |
 
 ### Flow
 
 1. **Source starts**: Loads weights, registers with NIXL, publishes metadata to gRPC server
 2. **Source warmup**: DeepGemm compilation, CUDA graph capture
-3. **Source publishes ready**: After health check + test inference, publishes NIXL ready flag
-4. **Target waits**: Polls for ready flag via gRPC (`GetReady`)
+3. **Source publishes ready**: After health check + test inference, calls `UpdateStatus` to set worker status to `Ready`
+4. **Target waits**: Polls `GetMetadata` until all source workers are `Ready`
 5. **Target transfers**: Executes RDMA reads from source
 6. **Target warmup**: Same DeepGemm + CUDA graph as source
 

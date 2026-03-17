@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 
 from .client import MxClient  # All gRPC communication goes through MxClient
+from . import p2p_pb2
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -254,8 +255,6 @@ def _publish_metadata_and_ready(
     model_name: str,
 ) -> None:
     """Publish tensor metadata and ready flag to the ModelExpress server."""
-    from . import p2p_pb2
-
     logger.info(
         f"[Worker {device_id}] Publishing {len(tensors)} tensors for model '{model_name}'"
     )
@@ -303,18 +302,10 @@ def _publish_metadata_and_ready(
 
         if success:
             logger.info(f"[Worker {device_id}] Published metadata to MX server")
-
-            metadata_hash = hashlib.md5(
-                ",".join(sorted(tensors.keys())).encode()
-            ).hexdigest()
-
-            mx_client.publish_ready(
+            mx_client.update_status(
                 model_name=model_name,
                 worker_id=device_id,
-                session_id=mx_client.session_id,
-                metadata_hash=metadata_hash,
-                nixl_ready=True,
-                stability_verified=True,
+                status=p2p_pb2.SOURCE_STATUS_READY,
             )
         else:
             raise RuntimeError(
@@ -442,25 +433,17 @@ class MxModelLoader(BaseModelLoader):
             return None
 
         try:
-            ready_resp = self._mx_client.get_ready(model_name, device_id)
-            if not (ready_resp.found and ready_resp.ready):
-                logger.debug(
-                    f"[Worker {device_id}] Source not ready "
-                    f"(found={ready_resp.found}, ready={getattr(ready_resp, 'ready', False)})"
-                )
-                return None
-
             metadata_resp = self._mx_client.get_metadata(model_name)
             if not metadata_resp.found:
                 logger.debug(f"[Worker {device_id}] No metadata found for model")
                 return None
 
+            ready = p2p_pb2.SOURCE_STATUS_READY
             for w in metadata_resp.workers:
-                if w.worker_rank == device_id and len(w.tensors) > 0:
+                if w.worker_rank == device_id and w.status == ready and len(w.tensors) > 0:
                     logger.info(
                         f"[Worker {device_id}] Detected ready source: "
-                        f"rank={w.worker_rank}, tensors={len(w.tensors)}, "
-                        f"session={ready_resp.session_id[:8] if ready_resp.session_id else 'N/A'}"
+                        f"rank={w.worker_rank}, tensors={len(w.tensors)}"
                     )
                     return w
 
@@ -543,17 +526,6 @@ class MxModelLoader(BaseModelLoader):
             f"[Worker {device_id}] Receiving {len(source_tensors)} tensors from source"
         )
 
-        # RDMA transfer with retry
-        cached_session_id = None
-
-        # Capture session from earlier get_ready call
-        try:
-            ready_resp = self._mx_client.get_ready(model_name, device_id)
-            if ready_resp.found:
-                cached_session_id = ready_resp.session_id
-        except Exception:
-            pass
-
         coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
 
         for attempt in range(_TRANSFER_MAX_RETRIES):
@@ -583,37 +555,26 @@ class MxModelLoader(BaseModelLoader):
                         f"{transfer_err}, retrying in {_TRANSFER_RETRY_DELAY_SECONDS}s..."
                     )
 
-                    # Check for source restart
-                    session_changed, new_session_id = self._mx_client.check_session_changed(
-                        model_name=model_name,
-                        worker_id=device_id,
-                        cached_session_id=cached_session_id,
-                    )
-
-                    if session_changed:
-                        logger.warning(
-                            f"[Worker {device_id}] Source restarted, re-fetching metadata..."
-                        )
-                        cached_session_id = new_session_id
-                        response = self._mx_client.get_metadata(model_name)
-                        for w in response.workers:
-                            if w.worker_rank == device_id and len(w.tensors) > 0:
-                                source_worker = w
-                                source_tensors = [
-                                    TensorDescriptor(
-                                        name=t.name,
-                                        addr=t.addr,
-                                        size=t.size,
-                                        device_id=t.device_id,
-                                        dtype=t.dtype,
-                                    )
-                                    for t in source_worker.tensors
-                                ]
-                                logger.info(
-                                    f"[Worker {device_id}] Refreshed metadata: "
-                                    f"{len(source_tensors)} tensors from new session"
+                    # Re-fetch metadata in case source was restarted
+                    response = self._mx_client.get_metadata(model_name)
+                    for w in response.workers:
+                        if w.worker_rank == device_id and len(w.tensors) > 0:
+                            source_worker = w
+                            source_tensors = [
+                                TensorDescriptor(
+                                    name=t.name,
+                                    addr=t.addr,
+                                    size=t.size,
+                                    device_id=t.device_id,
+                                    dtype=t.dtype,
                                 )
-                                break
+                                for t in source_worker.tensors
+                            ]
+                            logger.info(
+                                f"[Worker {device_id}] Refreshed metadata: "
+                                f"{len(source_tensors)} tensors"
+                            )
+                            break
 
                     time.sleep(_TRANSFER_RETRY_DELAY_SECONDS)
                 else:
