@@ -23,24 +23,24 @@
 # the Kubernetes API and only require standard kubeconfig access.
 #
 # Usage:
-#   ./test_multinode_k8s.sh [--skip-build] [-- cargo test args...]
+#   ./test_multinode_k8s.sh [--skip-build] [-- test filter args...]
 #
 # Examples:
 #   ./test_multinode_k8s.sh                              # Build + run all tests
 #   ./test_multinode_k8s.sh --skip-build                 # Skip image build, just run tests
-#   ./test_multinode_k8s.sh -- --test cross_node         # Run only cross_node tests
+#   ./test_multinode_k8s.sh -- --test cross_node         # Run only tests matching "cross_node"
 
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
 
 SKIP_BUILD=false
-CARGO_ARGS=()
+TEST_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-build) SKIP_BUILD=true; shift ;;
-        --) shift; CARGO_ARGS=("$@"); break ;;
-        *) CARGO_ARGS=("$@"); break ;;
+        --) shift; TEST_ARGS=("$@"); break ;;
+        *) TEST_ARGS=("$@"); break ;;
     esac
 done
 
@@ -56,4 +56,4 @@ if [ "$SKIP_BUILD" = false ]; then
 fi
 
 # Step 2: Run the Rust k8s tests (ignored by default, --ignored enables them)
-cargo test --test k8s_multinode_tests -- --ignored "${CARGO_ARGS[@]}"
+cargo test --test k8s_multinode_tests -- --ignored "${TEST_ARGS[@]}"

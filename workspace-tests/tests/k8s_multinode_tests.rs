@@ -124,7 +124,7 @@ async fn deploy_server(
             "template": {
                 "metadata": { "labels": { "app": release } },
                 "spec": {
-                    "nodeSelector": { "kubernetes.io/hostname": node },
+                    "nodeName": node,
                     "containers": [{
                         "name": "server",
                         "image": IMAGE,
@@ -245,7 +245,7 @@ async fn submit_client_job(
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
-                    "nodeSelector": { "kubernetes.io/hostname": node },
+                    "nodeName": node,
                     "containers": [{
                         "name": "client",
                         "image": IMAGE,
@@ -398,7 +398,7 @@ async fn submit_checksum_job(
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
-                    "nodeSelector": { "kubernetes.io/hostname": node },
+                    "nodeName": node,
                     "containers": [{
                         "name": "client",
                         "image": IMAGE,
