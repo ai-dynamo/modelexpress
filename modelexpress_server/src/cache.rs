@@ -464,9 +464,13 @@ mod tests {
         (db, temp_dir)
     }
 
-    fn create_test_service(db: ModelDatabase, config: CacheEvictionConfig) -> CacheEvictionService {
+    fn create_test_service(
+        db: ModelDatabase,
+        config: CacheEvictionConfig,
+    ) -> (CacheEvictionService, TempDir) {
         let cache_dir = TempDir::new().expect("Failed to create cache directory");
-        CacheEvictionService::new(db, config, cache_dir.path().to_path_buf())
+        let service = CacheEvictionService::new(db, config, cache_dir.path().to_path_buf());
+        (service, cache_dir)
     }
 
     #[test]
@@ -670,7 +674,7 @@ mod tests {
         let (db, _temp_dir) = create_test_database();
         let config = CacheEvictionConfig::default();
 
-        let service = create_test_service(db, config);
+        let (service, _cache_dir) = create_test_service(db, config);
         assert!(service.config.enabled);
     }
 
@@ -688,7 +692,7 @@ mod tests {
         )
         .expect("Failed to set model status");
 
-        let service = create_test_service(db.clone(), config);
+        let (service, _cache_dir) = create_test_service(db.clone(), config);
 
         let models_to_evict = vec!["test-model".to_string()];
         let result = service
@@ -736,7 +740,7 @@ mod tests {
         )
         .expect("Failed to set model3 status");
 
-        let service = create_test_service(db, config);
+        let (service, _cache_dir) = create_test_service(db, config);
         let stats = service
             .get_cache_stats()
             .await
