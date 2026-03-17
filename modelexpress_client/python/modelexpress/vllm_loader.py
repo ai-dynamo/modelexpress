@@ -37,7 +37,6 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
-from vllm.utils.mem_utils import log_gpu_memory_stage
 from vllm.utils.torch_utils import set_default_torch_dtype
 from .nixl_transfer import NixlTransferManager, is_nixl_available
 from .types import TensorDescriptor
@@ -51,6 +50,25 @@ if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     logger.addHandler(handler)
+
+_GIB_BYTES = 1 << 30
+_MEM_STAGE_PREFIX = ">>>>> [GPU MEM STAGE]"
+
+
+def log_gpu_memory_stage(label: str, prev_used: int = 0,
+                         logger=None) -> int:
+    """Log GPU memory at a stage boundary. Returns current used bytes."""
+    free, total = torch.cuda.mem_get_info()
+    used = total - free
+    delta = used - prev_used
+    if logger is not None:
+        logger.info(
+            "%s %-45s %7.2f / %.2f GiB  (delta: %+.2f GiB)",
+            _MEM_STAGE_PREFIX, label,
+            used / _GIB_BYTES, total / _GIB_BYTES, delta / _GIB_BYTES,
+        )
+    return used
+
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
