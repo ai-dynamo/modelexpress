@@ -18,7 +18,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
-pub use crate::metadata_backend::{ModelMetadataRecord, TensorRecord, WorkerRecord};
+pub use crate::metadata_backend::{
+    BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
+};
 
 /// Ready state for a source worker (stored in-memory, always ephemeral).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,9 +238,11 @@ mod tests {
 
     #[test]
     fn test_worker_record_conversion() {
+        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+
         let meta = WorkerMetadata {
             worker_rank: 3,
-            nixl_metadata: vec![1, 2, 3, 4, 5],
+            backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1, 2, 3, 4, 5])),
             tensors: vec![TensorDescriptor {
                 name: "test.weight".to_string(),
                 addr: 0x1000,
@@ -250,12 +254,80 @@ mod tests {
 
         let record = WorkerRecord::from(meta.clone());
         assert_eq!(record.worker_rank, 3);
-        assert_eq!(record.nixl_metadata, vec![1, 2, 3, 4, 5]);
+        assert!(matches!(
+            &record.backend_metadata,
+            BackendMetadataRecord::Nixl(d) if d == &vec![1, 2, 3, 4, 5]
+        ));
         assert_eq!(record.tensors.len(), 1);
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
-        assert_eq!(back.nixl_metadata, meta.nixl_metadata);
+        assert_eq!(back.backend_metadata, meta.backend_metadata);
+    }
+
+    #[test]
+    fn test_worker_record_transfer_engine_roundtrip() {
+        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+
+        let meta = WorkerMetadata {
+            worker_rank: 1,
+            backend_metadata: Some(BackendMetadata::TransferEngineSessionId(
+                "192.168.1.10:12345".to_string(),
+            )),
+            tensors: vec![TensorDescriptor {
+                name: "test.weight".to_string(),
+                addr: 0x2000,
+                size: 8192,
+                device_id: 0,
+                dtype: "float16".to_string(),
+            }],
+        };
+
+        let record = WorkerRecord::from(meta.clone());
+        assert_eq!(record.worker_rank, 1);
+        assert!(matches!(
+            &record.backend_metadata,
+            BackendMetadataRecord::TransferEngine(sid) if sid == "192.168.1.10:12345"
+        ));
+        assert_eq!(
+            record.backend_metadata.backend_type_str(),
+            "transfer_engine"
+        );
+
+        let back: WorkerMetadata = record.into();
+        assert_eq!(back.worker_rank, meta.worker_rank);
+        assert_eq!(back.backend_metadata, meta.backend_metadata);
+    }
+
+    #[test]
+    fn test_backend_metadata_from_flat_with_discriminator() {
+        // Explicit backend_type takes precedence
+        let te = BackendMetadataRecord::from_flat(
+            Vec::new(),
+            Some("10.0.0.1:5000".into()),
+            Some("transfer_engine"),
+        );
+        assert!(matches!(te, BackendMetadataRecord::TransferEngine(ref s) if s == "10.0.0.1:5000"));
+
+        let nixl = BackendMetadataRecord::from_flat(vec![1, 2, 3], None, Some("nixl"));
+        assert!(matches!(nixl, BackendMetadataRecord::Nixl(ref d) if d == &vec![1, 2, 3]));
+
+        let none = BackendMetadataRecord::from_flat(Vec::new(), None, Some("none"));
+        assert!(matches!(none, BackendMetadataRecord::None));
+
+        // Backwards compat: missing backend_type infers from fields
+        let inferred_te =
+            BackendMetadataRecord::from_flat(Vec::new(), Some("10.0.0.1:5000".into()), None);
+        assert!(matches!(
+            inferred_te,
+            BackendMetadataRecord::TransferEngine(_)
+        ));
+
+        let inferred_nixl = BackendMetadataRecord::from_flat(vec![1, 2], None, None);
+        assert!(matches!(inferred_nixl, BackendMetadataRecord::Nixl(_)));
+
+        let inferred_none = BackendMetadataRecord::from_flat(Vec::new(), None, None);
+        assert!(matches!(inferred_none, BackendMetadataRecord::None));
     }
 
     #[test]
@@ -265,7 +337,7 @@ mod tests {
             workers: vec![
                 WorkerRecord {
                     worker_rank: 0,
-                    nixl_metadata: vec![10, 20, 30],
+                    backend_metadata: BackendMetadataRecord::Nixl(vec![10, 20, 30]),
                     tensors: vec![TensorRecord {
                         name: "layer.0.weight".to_string(),
                         addr: 0x7f00_0000_0000,
@@ -276,7 +348,7 @@ mod tests {
                 },
                 WorkerRecord {
                     worker_rank: 1,
-                    nixl_metadata: vec![40, 50, 60],
+                    backend_metadata: BackendMetadataRecord::Nixl(vec![40, 50, 60]),
                     tensors: vec![TensorRecord {
                         name: "layer.0.weight".to_string(),
                         addr: 0x7f00_0000_0000,

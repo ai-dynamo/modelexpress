@@ -57,10 +57,20 @@ spec:
                       workerRank:
                         type: integer
                         description: Worker rank (0-indexed)
+                      backendType:
+                        type: string
+                        description: Backend type discriminator (nixl, transfer_engine, none)
+                        enum:
+                          - nixl
+                          - transfer_engine
+                          - none
                       nixlMetadata:
                         type: string
                         format: byte
                         description: Base64-encoded NIXL agent metadata blob
+                      transferEngineSessionId:
+                        type: string
+                        description: Mooncake TransferEngine session ID (ip:port)
                       tensorCount:
                         type: integer
                         description: Number of tensors registered by this worker
