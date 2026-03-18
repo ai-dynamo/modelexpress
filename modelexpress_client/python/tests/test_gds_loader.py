@@ -5,7 +5,7 @@
 
 import json
 import struct
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 import torch
@@ -48,21 +48,19 @@ class TestIsGdsAvailable:
 class TestNvidiaFsLoaded:
     """Tests for nvidia_fs kernel module detection."""
 
-    def test_module_present(self, tmp_path):
-        proc_modules = tmp_path / "modules"
-        proc_modules.write_text(
+    def test_module_present(self):
+        content = (
             "nvidia_fs 12345 0 - Live 0xffffffff\n"
             "nvidia 67890 1 - Live 0xfffffffe\n"
         )
         from modelexpress.gds_transfer import _nvidia_fs_loaded
-        with patch("builtins.open", return_value=open(proc_modules)):
+        with patch("builtins.open", mock_open(read_data=content)):
             assert _nvidia_fs_loaded() is True
 
-    def test_module_absent(self, tmp_path):
-        proc_modules = tmp_path / "modules"
-        proc_modules.write_text("nvidia 67890 1 - Live 0xfffffffe\n")
+    def test_module_absent(self):
+        content = "nvidia 67890 1 - Live 0xfffffffe\n"
         from modelexpress.gds_transfer import _nvidia_fs_loaded
-        with patch("builtins.open", return_value=open(proc_modules)):
+        with patch("builtins.open", mock_open(read_data=content)):
             assert _nvidia_fs_loaded() is False
 
     def test_proc_not_readable(self):
@@ -192,7 +190,7 @@ class TestResolveSafetensorsFiles:
     def test_no_files_raises(self, tmp_path):
         from modelexpress.gds_loader import MxGdsLoader
         loader = MxGdsLoader()
-        with pytest.raises(FileNotFoundError, match="No .safetensors"):
+        with pytest.raises(FileNotFoundError, match=r"No \.safetensors"):
             loader._resolve_safetensors_files(str(tmp_path))
 
 

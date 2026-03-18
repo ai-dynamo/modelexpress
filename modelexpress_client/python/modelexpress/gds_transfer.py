@@ -176,6 +176,11 @@ class GdsTransferManager:
             while loaded < tensor_size:
                 chunk = min(tensor_size - loaded, max_chunk)
                 chunk = min(chunk, file_size - (file_offset + loaded))
+                if chunk <= 0:
+                    raise RuntimeError(
+                        f"GDS read beyond EOF: file_offset={file_offset}, "
+                        f"loaded={loaded}, file_size={file_size}"
+                    )
 
                 file_regions.append((file_offset + loaded, chunk, fd, ""))
                 vram_regions.append((gpu_base + loaded, chunk, self._device_id, ""))

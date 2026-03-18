@@ -137,50 +137,27 @@ class MxGdsLoader:
 
                 for name, tensor in loaded.items():
                     yield name, tensor
+
+            logger.info("GDS load complete in %.2fs", time.perf_counter() - load_start)
         finally:
             pbar.close()
-            pool.shutdown(wait=False)
-
-        logger.info("GDS load complete in %.2fs", time.perf_counter() - load_start)
-
-    def load_weights_into_model(
-        self,
-        model: torch.nn.Module,
-        model_path: str,
-    ) -> int:
-        """
-        Load weights directly into an existing model's parameters via GDS.
-
-        Integration point for MxModelLoader. Loads all safetensors weights
-        via GDS and copies matching tensors into model parameters.
-
-        Returns:
-            Number of parameters loaded.
-        """
-        count = 0
-        param_map: dict[str, torch.nn.Parameter] = dict(model.named_parameters())
-
-        for name, tensor in self.load_iter(model_path):
-            if name in param_map:
-                param_map[name].data.copy_(tensor)
-                count += 1
-
-        logger.info("GDS weight loading complete: %d parameters", count)
-        return count
+            pool.shutdown(wait=True)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_model_path(model_path: str) -> str:
+    def _resolve_model_path(
+        model_path: str, revision: str | None = None
+    ) -> str:
         """Resolve model_path to a local directory."""
         p = Path(model_path)
         if p.is_dir():
             return str(p.resolve())
 
         from huggingface_hub import snapshot_download
-        local_dir = snapshot_download(model_path)
+        local_dir = snapshot_download(model_path, revision=revision)
         logger.info("Resolved HF model '%s' -> %s", model_path, local_dir)
         return local_dir
 
@@ -332,7 +309,7 @@ class MxGdsLoader:
             os.close(fd)
 
         result: dict[str, torch.Tensor] = {}
-        for raw, (name, torch_dtype, shape) in zip(raw_tensors, tensor_meta):
+        for raw, (name, torch_dtype, shape) in zip(raw_tensors, tensor_meta, strict=True):
             result[name] = raw.view(torch_dtype).reshape(shape)
 
         logger.info("Loaded %s", Path(file_path).name)
