@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import sys
 import time
 import uuid
@@ -64,32 +65,16 @@ def _safe_checksum(tensor: torch.Tensor) -> str:
         return f"err:{e}"
 
 
-def _get_expected_workers() -> int:
-    """Get expected worker count from env var or auto-detect from TP world size."""
-    env_workers = os.environ.get("MX_EXPECTED_WORKERS")
-    if env_workers:
-        return int(env_workers)
-
-    # Auto-detect from vLLM tensor parallel world size
+def _get_global_rank(device: torch.device) -> int:
+    """Get the global rank of this worker across all TP and PP groups."""
     try:
-        from vllm.distributed import get_tensor_model_parallel_world_size
-        world_size = get_tensor_model_parallel_world_size()
-        logger.debug(f"Auto-detected expected workers from TP world size: {world_size}")
-        return world_size
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            logger.debug(f"Got global rank from torch.distributed: {rank}")
+            return rank
     except (ImportError, RuntimeError) as e:
-        logger.debug(f"Could not get TP world size: {e}, defaulting to 1")
-        return 1
-
-
-def _get_worker_rank(device: torch.device) -> int:
-    """Get the TP rank of this worker."""
-    try:
-        from vllm.distributed import get_tensor_model_parallel_rank
-        rank = get_tensor_model_parallel_rank()
-        logger.debug(f"Got TP rank from vllm.distributed: {rank}")
-        return rank
-    except (ImportError, RuntimeError) as e:
-        logger.debug(f"Could not get TP rank from vllm.distributed: {e}")
+        logger.debug(f"Could not get global rank from torch.distributed: {e}")
 
     # Fallback to device index
     if hasattr(device, "index") and device.index is not None:
@@ -103,8 +88,6 @@ def _get_worker_rank(device: torch.device) -> int:
 # Constants
 # ---------------------------------------------------------------------------
 
-_TRANSFER_MAX_RETRIES = 120
-_TRANSFER_RETRY_DELAY_SECONDS = 30
 
 # ---------------------------------------------------------------------------
 # Shared helpers used by multiple loaders
@@ -157,16 +140,50 @@ def _log_tensor_summary(
         )
 
 
+def _build_source_identity(
+    vllm_config: VllmConfig, model_config: ModelConfig
+) -> "p2p_pb2.SourceIdentity":
+    """Build a SourceIdentity from vLLM config objects."""
+    from importlib.metadata import version as pkg_version
+
+    try:
+        mx_version = pkg_version("modelexpress")
+    except Exception:
+        mx_version = "0.0.0"
+
+    parallel = vllm_config.parallel_config
+    tp_size = getattr(parallel, "tensor_parallel_size", 1)
+    pp_size = getattr(parallel, "pipeline_parallel_size", 1)
+    ep_size = getattr(parallel, "expert_parallel_size", 0)
+
+    # torch.dtype.__str__ returns e.g. "torch.bfloat16"; strip the prefix
+    dtype = str(model_config.dtype).replace("torch.", "")
+    quantization = model_config.quantization or ""
+
+    return p2p_pb2.SourceIdentity(
+        mx_version=mx_version,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        model_name=model_config.model,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=pp_size,
+        expert_parallel_size=ep_size,
+        dtype=dtype,
+        quantization=quantization,
+    )
+
+
 def _publish_metadata_and_ready(
     mx_client: MxClient,
     nixl_manager: NixlTransferManager,
     tensors: dict[str, torch.Tensor],
     device_id: int,
-    model_name: str,
+    identity: "p2p_pb2.SourceIdentity",
+    instance_id: str,
 ) -> None:
     """Publish tensor metadata and ready flag to the ModelExpress server."""
     logger.info(
-        f"[Worker {device_id}] Publishing {len(tensors)} tensors for model '{model_name}'"
+        f"[Worker {device_id}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
     try:
@@ -208,18 +225,21 @@ def _publish_metadata_and_ready(
             tensors=tensor_protos,
         )
 
-        success = mx_client.publish_metadata(model_name, [worker])
-
-        if success:
-            logger.info(f"[Worker {device_id}] Published metadata to MX server")
-            mx_client.update_status(
-                model_name=model_name,
-                worker_id=device_id,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-            )
-        else:
-            raise RuntimeError(
-                f"[Worker {device_id}] Failed to publish metadata to MX server"
+        mx_source_id = mx_client.publish_metadata(identity, [worker], instance_id)
+        logger.info(
+            f"[Worker {device_id}] Published metadata to MX server "
+            f"(mx_source_id={mx_source_id}, instance_id={instance_id})"
+        )
+        success = mx_client.update_status(
+            mx_source_id=mx_source_id,
+            instance_id=instance_id,
+            worker_id=device_id,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        )
+        if not success:
+            logger.error(
+                f"[Worker {device_id}] UpdateStatus to READY failed for "
+                f"model '{identity.model_name}' (mx_source_id={mx_source_id})"
             )
 
     except Exception as e:
@@ -253,7 +273,8 @@ class MxModelLoader(BaseModelLoader):
         self._nixl_manager: NixlTransferManager | None = None
         self._raw_tensors: dict[str, torch.Tensor] = {}
         self._mx_client = MxClient()
-        logger.debug("MxModelLoader initialized successfully")
+        self._instance_id = uuid.uuid4().hex[:8]
+        logger.debug("MxModelLoader initialized (instance_id=%s)", self._instance_id)
 
         # Build internal loaders for the two weight-loading strategies.
         # We only use their load_weights() methods - everything else is ours.
@@ -284,10 +305,10 @@ class MxModelLoader(BaseModelLoader):
             device_config.device if load_config.device is None else load_config.device
         )
         target_device = torch.device(load_device)
-        device_id = _get_worker_rank(target_device)
-        model_name = model_config.model
+        device_id = _get_global_rank(target_device)
+        identity = _build_source_identity(vllm_config, model_config)
 
-        logger.info(f"[Worker {device_id}] MxModelLoader starting (model={model_name})")
+        logger.info(f"[Worker {device_id}] MxModelLoader starting (model={identity.model_name})")
 
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
@@ -297,23 +318,45 @@ class MxModelLoader(BaseModelLoader):
                 )
                 logger.info(f"[Worker {device_id}] Model structure initialized")
 
-            source_worker = self._detect_source(model_name, device_id)
+            instances = self._find_source_instances(identity, device_id)
 
-            if source_worker is not None:
+            loaded_as_target = False
+            for source_worker, mx_source_id, instance_id in instances:
                 logger.info(
-                    f"[Worker {device_id}] Source found with {len(source_worker.tensors)} "
-                    f"tensors - receiving via RDMA"
+                    f"[Worker {device_id}] Trying source instance {instance_id} "
+                    f"({len(source_worker.tensors)} tensors)"
                 )
-                self._load_as_target(
-                    model, model_config, target_device,
-                    device_id, model_name, source_worker,
-                )
-            else:
-                logger.info(
-                    f"[Worker {device_id}] No source found - loading from disk"
-                )
+                try:
+                    self._load_as_target(
+                        model, model_config, target_device,
+                        device_id, identity, source_worker, mx_source_id, instance_id,
+                    )
+                    loaded_as_target = True
+                    break
+                except Exception as e:
+                    logger.warning(
+                        f"[Worker {device_id}] Failed to load from instance {instance_id}: {e}. "
+                        f"Marking STALE and trying next instance. "
+                        f"TODO: heartbeat mechanism will handle STALE marking automatically."
+                    )
+                    # TODO: heartbeat will mark instances STALE automatically on pod deletion
+                    self._mx_client.update_status(
+                        mx_source_id=mx_source_id,
+                        instance_id=instance_id,
+                        worker_id=device_id,
+                        status=p2p_pb2.SOURCE_STATUS_STALE,
+                    )
+
+            if not loaded_as_target:
+                if instances:
+                    logger.warning(
+                        f"[Worker {device_id}] All {len(instances)} source instances failed, "
+                        f"loading from disk"
+                    )
+                else:
+                    logger.info(f"[Worker {device_id}] No source found - loading from disk")
                 self._load_as_source(
-                    model, model_config, target_device, device_id, model_name,
+                    model, model_config, target_device, device_id, identity,
                 )
 
         total_time = time.perf_counter() - load_start
@@ -327,49 +370,73 @@ class MxModelLoader(BaseModelLoader):
     # Source detection
     # ------------------------------------------------------------------
 
-    def _detect_source(self, model_name: str, device_id: int):
+    def _find_source_instances(
+        self, identity: "p2p_pb2.SourceIdentity", device_id: int
+    ) -> "list[tuple[p2p_pb2.WorkerMetadata, str, str]]":
         """
-        One-shot check for an existing ready source.
+        Return all ready source instances that have a worker matching device_id,
+        shuffled for load balancing.
 
-        Returns the matching WorkerMetadata proto if a ready source with
-        our rank exists, or None otherwise. No retry loop - if the source
-        is still warming up, this node becomes a source itself.
+        Calls ListSources to get all READY instances, fetches tensor metadata for
+        each, and returns those that have a worker for our rank. Each instance will
+        be tried exactly once by the caller — failures mark the instance STALE.
+
+        Returns a list of (WorkerMetadata, mx_source_id, instance_id). Empty list
+        means no sources available and the caller should load from disk.
         """
-        if not model_name:
-            logger.debug(f"[Worker {device_id}] No model name available, defaulting to source")
-            return None
-
         if not is_nixl_available():
             logger.debug(f"[Worker {device_id}] NIXL not available, defaulting to source")
-            return None
+            return []
 
         try:
-            metadata_resp = self._mx_client.get_metadata(model_name)
-            if not metadata_resp.found:
-                logger.debug(f"[Worker {device_id}] No metadata found for model")
-                return None
-
-            ready = p2p_pb2.SOURCE_STATUS_READY
-            for w in metadata_resp.workers:
-                if w.worker_rank == device_id and w.status == ready and len(w.tensors) > 0:
-                    logger.info(
-                        f"[Worker {device_id}] Detected ready source: "
-                        f"rank={w.worker_rank}, tensors={len(w.tensors)}"
-                    )
-                    return w
-
-            available_ranks = [w.worker_rank for w in metadata_resp.workers]
-            logger.debug(
-                f"[Worker {device_id}] Source has metadata but no matching rank. "
-                f"Available: {available_ranks}"
+            list_resp = self._mx_client.list_sources(
+                identity=identity,
+                status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
-            return None
+            if not list_resp.instances:
+                logger.debug(f"[Worker {device_id}] No ready source instances found")
+                return []
+
+            candidates = list(list_resp.instances)
+            random.shuffle(candidates)
+            logger.debug(
+                f"[Worker {device_id}] Found {len(candidates)} ready instances, "
+                f"fetching metadata for each"
+            )
+
+            result = []
+            for instance in candidates:
+                try:
+                    metadata_resp = self._mx_client.get_metadata(
+                        mx_source_id=instance.mx_source_id,
+                        instance_id=instance.instance_id,
+                    )
+                    if not metadata_resp.found:
+                        logger.debug(
+                            f"[Worker {device_id}] Metadata not found for instance "
+                            f"{instance.instance_id}, skipping"
+                        )
+                        continue
+                    for w in metadata_resp.workers:
+                        if w.worker_rank == device_id and len(w.tensors) > 0:
+                            result.append((w, instance.mx_source_id, instance.instance_id))
+                            break
+                except Exception as e:
+                    logger.warning(
+                        f"[Worker {device_id}] Failed to fetch metadata for instance "
+                        f"{instance.instance_id}: {e}, skipping"
+                    )
+
+            logger.info(
+                f"[Worker {device_id}] {len(result)} source instance(s) available for rank {device_id}"
+            )
+            return result
 
         except Exception as e:
             logger.warning(
-                f"[Worker {device_id}] Error detecting source, falling back to disk: {e}"
+                f"[Worker {device_id}] Error listing sources, falling back to disk: {e}"
             )
-            return None
+            return []
 
     # ------------------------------------------------------------------
     # Target path: receive via RDMA then register + publish
@@ -381,8 +448,10 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         target_device: torch.device,
         device_id: int,
-        model_name: str,
+        identity: "p2p_pb2.SourceIdentity",
         source_worker,
+        mx_source_id: str,
+        instance_id: str,
     ) -> None:
         """Receive weights via RDMA from an existing source, then publish."""
         # Create dummy weights as receive buffers
@@ -390,10 +459,10 @@ class MxModelLoader(BaseModelLoader):
         self._dummy_loader.load_weights(model, model_config)
 
         # RDMA receive
-        self._receive_from_peer(model, device_id, model_name, source_worker)
+        self._receive_from_peer(model, device_id, source_worker)
 
         # Register with NIXL + publish so future nodes can discover us
-        self._register_and_publish(model, target_device, device_id, model_name)
+        self._register_and_publish(model, target_device, device_id, identity, self._instance_id)
 
         # FP8 processing
         logger.info(f"[Worker {device_id}] Processing weights (FP8 transformation)...")
@@ -404,7 +473,6 @@ class MxModelLoader(BaseModelLoader):
         self,
         model: nn.Module,
         device_id: int,
-        model_name: str,
         source_worker,
     ) -> None:
         """Receive raw tensors via RDMA from the detected source."""
@@ -442,59 +510,23 @@ class MxModelLoader(BaseModelLoader):
 
         coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
 
-        for attempt in range(_TRANSFER_MAX_RETRIES):
-            try:
-                transfer_start = time.perf_counter()
-                bytes_transferred, tensor_count, _ = self._nixl_manager.receive_from_source(
-                    source_metadata=source_worker.nixl_metadata,
-                    source_tensors=source_tensors,
-                    timeout_seconds=300.0,
-                    coalesce_transfers=coalesce,
-                )
-                transfer_time = time.perf_counter() - transfer_start
+        transfer_start = time.perf_counter()
+        bytes_transferred, tensor_count, _ = self._nixl_manager.receive_from_source(
+            source_metadata=source_worker.nixl_metadata,
+            source_tensors=source_tensors,
+            timeout_seconds=300.0,
+            coalesce_transfers=coalesce,
+        )
+        transfer_time = time.perf_counter() - transfer_start
 
-                bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
-                logger.info(
-                    f"[Worker {device_id}] [TIMING] RDMA transfer complete: "
-                    f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
-                    f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
-                )
+        bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
+        logger.info(
+            f"[Worker {device_id}] [TIMING] RDMA transfer complete: "
+            f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
+            f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
+        )
 
-                torch.cuda.synchronize()
-                break
-            except Exception as transfer_err:
-                if attempt < _TRANSFER_MAX_RETRIES - 1:
-                    logger.warning(
-                        f"[Worker {device_id}] Transfer attempt {attempt + 1} failed: "
-                        f"{transfer_err}, retrying in {_TRANSFER_RETRY_DELAY_SECONDS}s..."
-                    )
-
-                    # Re-fetch metadata in case source was restarted
-                    response = self._mx_client.get_metadata(model_name)
-                    for w in response.workers:
-                        if w.worker_rank == device_id and len(w.tensors) > 0:
-                            source_worker = w
-                            source_tensors = [
-                                TensorDescriptor(
-                                    name=t.name,
-                                    addr=t.addr,
-                                    size=t.size,
-                                    device_id=t.device_id,
-                                    dtype=t.dtype,
-                                )
-                                for t in source_worker.tensors
-                            ]
-                            logger.info(
-                                f"[Worker {device_id}] Refreshed metadata: "
-                                f"{len(source_tensors)} tensors"
-                            )
-                            break
-
-                    time.sleep(_TRANSFER_RETRY_DELAY_SECONDS)
-                else:
-                    raise RuntimeError(
-                        f"Transfer failed after {_TRANSFER_MAX_RETRIES} attempts: {transfer_err}"
-                    ) from transfer_err
+        torch.cuda.synchronize()
 
         total_time = time.perf_counter() - receive_start
         logger.info(f"[Worker {device_id}] [TIMING] Total receive time: {total_time:.2f}s")
@@ -509,7 +541,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         target_device: torch.device,
         device_id: int,
-        model_name: str,
+        identity: "p2p_pb2.SourceIdentity",
     ) -> None:
         """Load weights from disk, then register + publish."""
         logger.info(f"[Worker {device_id}] Loading weights from disk...")
@@ -517,7 +549,7 @@ class MxModelLoader(BaseModelLoader):
         logger.info(f"[Worker {device_id}] Weights loaded from disk")
 
         # Register with NIXL + publish
-        self._register_and_publish(model, target_device, device_id, model_name)
+        self._register_and_publish(model, target_device, device_id, identity, self._instance_id)
 
         # FP8 processing
         logger.info(f"[Worker {device_id}] Processing weights (FP8 transformation)...")
@@ -533,7 +565,8 @@ class MxModelLoader(BaseModelLoader):
         model: nn.Module,
         device: torch.device,
         device_id: int,
-        model_name: str,
+        identity: "p2p_pb2.SourceIdentity",
+        instance_id: str,
     ) -> None:
         """Register tensors with NIXL and publish metadata to the MX server."""
         if not is_nixl_available():
@@ -556,25 +589,9 @@ class MxModelLoader(BaseModelLoader):
         _raw_tensor_registry[device_id] = raw_tensors
         _nixl_managers[device_id] = self._nixl_manager
 
-        # Optional synchronized publish
-        sync_publish = os.environ.get("MX_SYNC_PUBLISH", "0") == "1"
-        if sync_publish:
-            expected_workers = _get_expected_workers()
-            logger.info(f"[Worker {device_id}] Synchronized publish, waiting for {expected_workers} workers...")
-            try:
-                import torch.distributed as dist
-                if dist.is_initialized():
-                    dist.barrier()
-                    logger.info(f"[Worker {device_id}] Barrier passed")
-            except (ImportError, RuntimeError) as e:
-                logger.debug(f"[Worker {device_id}] Barrier not available: {e}")
-
-        if model_name:
-            _publish_metadata_and_ready(
-                self._mx_client, self._nixl_manager, raw_tensors, device_id, model_name
-            )
-        else:
-            logger.warning(f"[Worker {device_id}] No model name available, skipping publish")
+        _publish_metadata_and_ready(
+            self._mx_client, self._nixl_manager, raw_tensors, device_id, identity, instance_id
+        )
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""

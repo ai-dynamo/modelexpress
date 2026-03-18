@@ -68,14 +68,6 @@ spec:
             # Server address for metadata publishing
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            # OPTIMIZATION: Synchronized publish - wait for all workers before publishing
-            - name: MX_SYNC_PUBLISH
-              value: "1"
-            - name: MX_EXPECTED_WORKERS
-              value: "8"
-            # Metadata backend: Kubernetes CRD
-            - name: MX_METADATA_BACKEND
-              value: "kubernetes"
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG

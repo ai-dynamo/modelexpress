@@ -56,7 +56,7 @@ class MxClient:
     Lightweight gRPC client for ModelExpress server communication.
 
     Provides typed methods for every P2P RPC (``PublishMetadata``,
-    ``GetMetadata``, ``UpdateStatus``) so that callers
+    ``ListSources``, ``GetMetadata``, ``UpdateStatus``) so that callers
     (loaders, coordinators) never need to create gRPC channels or
     stubs directly.
 
@@ -106,38 +106,59 @@ class MxClient:
 
     def publish_metadata(
         self,
-        model_name: str,
-        workers: list[p2p_pb2.WorkerMetadata],
-    ) -> bool:
+        identity: "p2p_pb2.SourceIdentity",
+        workers: list["p2p_pb2.WorkerMetadata"],
+        instance_id: str,
+    ) -> str:
         """Publish worker metadata so targets can discover this source.
 
-        Returns *True* on success.
+        Returns the *mx_source_id* (16-char hex) on success, raises on failure.
         """
         request = p2p_pb2.PublishMetadataRequest(
-            model_name=model_name,
+            identity=identity,
             workers=workers,
+            instance_id=instance_id,
         )
         response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:
-            logger.error("PublishMetadata failed: %s", response.message)
-        return response.success
+            raise RuntimeError(f"PublishMetadata failed: {response.message}")
+        return response.mx_source_id
+
+    def list_sources(
+        self,
+        identity: "p2p_pb2.SourceIdentity | None" = None,
+        status_filter: "p2p_pb2.SourceStatus | None" = None,
+    ) -> "p2p_pb2.ListSourcesResponse":
+        """List available source instances, optionally filtered by identity and status."""
+        request = p2p_pb2.ListSourcesRequest(
+            identity=identity,
+            status_filter=status_filter,
+        )
+        return self.stub.ListSources(request, timeout=30)
 
     def get_metadata(
-        self, model_name: str
-    ) -> p2p_pb2.GetMetadataResponse:
-        """Query for existing source metadata for *model_name*."""
-        request = p2p_pb2.GetMetadataRequest(model_name=model_name)
+        self,
+        mx_source_id: str,
+        instance_id: str,
+    ) -> "p2p_pb2.GetMetadataResponse":
+        """Fetch full tensor metadata for one specific source instance."""
+        request = p2p_pb2.GetMetadataRequest(
+            mx_source_id=mx_source_id,
+            instance_id=instance_id,
+        )
         return self.stub.GetMetadata(request, timeout=30)
 
     def update_status(
         self,
-        model_name: str,
+        mx_source_id: str,
+        instance_id: str,
         worker_id: int,
         status: "p2p_pb2.SourceStatus",
     ) -> bool:
         """Update worker status.  Returns *True* on success."""
         request = p2p_pb2.UpdateStatusRequest(
-            model_name=model_name,
+            mx_source_id=mx_source_id,
+            instance_id=instance_id,
             worker_id=worker_id,
             status=status,
         )

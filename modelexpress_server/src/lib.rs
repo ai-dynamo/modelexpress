@@ -8,6 +8,7 @@ pub mod k8s_types;
 pub mod metadata_backend;
 pub mod p2p_service;
 pub mod services;
+pub mod source_identity;
 pub mod state;
 
 // Re-export for testing

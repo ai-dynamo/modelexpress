@@ -87,7 +87,8 @@ impl WorkerStatus {
     /// Convert a `SourceStatus` proto enum value (i32) to the CRD status string.
     pub fn status_name_from_proto(status: i32) -> String {
         match status {
-            1 => "Initializing",
+            0 => "Initializing",
+            1 => "PendingVerification",
             2 => "Ready",
             3 => "Stale",
             _ => "Unknown",
@@ -99,7 +100,8 @@ impl WorkerStatus {
     /// Returns `None` if `name` is not a recognised status string.
     pub fn status_proto_from_name(name: &str) -> Option<i32> {
         match name {
-            "Initializing" => Some(1),
+            "Initializing" => Some(0),
+            "PendingVerification" => Some(1),
             "Ready" => Some(2),
             "Stale" => Some(3),
             _ => None,
@@ -162,7 +164,12 @@ mod tests {
 
     #[test]
     fn test_status_roundtrip() {
-        for (proto, name) in [(1, "Initializing"), (2, "Ready"), (3, "Stale")] {
+        for (proto, name) in [
+            (0, "Initializing"),
+            (1, "PendingVerification"),
+            (2, "Ready"),
+            (3, "Stale"),
+        ] {
             assert_eq!(WorkerStatus::status_name_from_proto(proto), name);
             assert_eq!(WorkerStatus::status_proto_from_name(name), Some(proto));
         }
@@ -170,8 +177,8 @@ mod tests {
 
     #[test]
     fn test_status_name_from_proto_unknown() {
-        assert_eq!(WorkerStatus::status_name_from_proto(0), "Unknown");
         assert_eq!(WorkerStatus::status_name_from_proto(99), "Unknown");
+        assert_eq!(WorkerStatus::status_name_from_proto(4), "Unknown");
     }
 
     #[test]

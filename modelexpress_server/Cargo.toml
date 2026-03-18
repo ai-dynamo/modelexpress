@@ -43,6 +43,7 @@ kube = { workspace = true }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
 base64 = { workspace = true }
+sha2 = "0.10.9"
 
 [dev-dependencies]
 mockall = { workspace = true }
