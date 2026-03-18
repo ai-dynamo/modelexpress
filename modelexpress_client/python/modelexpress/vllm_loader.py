@@ -262,7 +262,7 @@ class MxModelLoader(BaseModelLoader):
             disk_config.load_format = "auto"
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
-        self._disk_loader = DefaultModelLoader(disk_config)
+        self._default_loader = DefaultModelLoader(disk_config)
 
         dummy_config = copy.copy(load_config)
         try:
@@ -520,7 +520,7 @@ class MxModelLoader(BaseModelLoader):
 
         if not loaded_via_gds:
             logger.info(f"[Worker {device_id}] Loading weights from disk...")
-            self._disk_loader.load_weights(model, model_config)
+            self._default_loader.load_weights(model, model_config)
             logger.info(f"[Worker {device_id}] Weights loaded from disk")
 
         # Register with NIXL + publish
@@ -549,7 +549,8 @@ class MxModelLoader(BaseModelLoader):
         logger.info(f"[Worker {device_id}] GDS available, attempting GDS loading...")
         gds_loader = MxGdsLoader()
         try:
-            weights_iter = gds_loader.load_iter(model_config.model)
+            use_tqdm = getattr(self.load_config, "use_tqdm_on_load", True)
+            weights_iter = gds_loader.load_iter(model_config.model, use_tqdm=use_tqdm)
             model.load_weights(weights_iter)
             logger.info(f"[Worker {device_id}] GDS weight loading complete")
             return True
@@ -621,11 +622,11 @@ class MxModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
-        self._disk_loader.download_model(model_config)
+        self._default_loader.download_model(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into an already-initialized model (standalone API)."""
-        self._disk_loader.load_weights(model, model_config)
+        self._default_loader.load_weights(model, model_config)
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:

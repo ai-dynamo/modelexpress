@@ -30,6 +30,8 @@ from .gds_transfer import GdsTransferManager, is_gds_available
 
 logger = logging.getLogger("modelexpress.gds_loader")
 
+# Complete dtype mapping from the safetensors spec:
+# https://huggingface.co/docs/safetensors/metadata_parsing#accepted-dtypes
 SAFETENSORS_DTYPE_MAP: dict[str, torch.dtype] = {
     "F64": torch.float64,
     "F32": torch.float32,
@@ -78,7 +80,7 @@ class MxGdsLoader:
         return result
 
     def load_iter(
-        self, model_path: str
+        self, model_path: str, *, use_tqdm: bool = True
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """
         Yield (tensor_name, gpu_tensor) pairs loaded via GDS.
@@ -114,13 +116,15 @@ class MxGdsLoader:
             return
 
         # Prefetch pipeline: load file[i+1] while yielding file[i]
-        from tqdm import tqdm
         total_files = len(file_jobs)
-        pbar = tqdm(
-            total=total_files,
-            desc="Loading safetensors via GDS",
-            unit="file",
-        )
+        pbar = None
+        if use_tqdm:
+            from tqdm import tqdm
+            pbar = tqdm(
+                total=total_files,
+                desc="Loading safetensors via GDS",
+                unit="file",
+            )
 
         pool = ThreadPoolExecutor(max_workers=1)
         try:
@@ -128,7 +132,8 @@ class MxGdsLoader:
 
             for i in range(total_files):
                 loaded = pending.result()
-                pbar.update(1)
+                if pbar is not None:
+                    pbar.update(1)
 
                 if i + 1 < total_files:
                     pending = pool.submit(
@@ -140,7 +145,8 @@ class MxGdsLoader:
 
             logger.info("GDS load complete in %.2fs", time.perf_counter() - load_start)
         finally:
-            pbar.close()
+            if pbar is not None:
+                pbar.close()
             pool.shutdown(wait=True)
 
     # ------------------------------------------------------------------
