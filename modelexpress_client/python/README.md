@@ -7,12 +7,9 @@ Instead of each vLLM instance loading model weights from storage, one "source" i
 ## Installation
 
 ```bash
+# From PyPI (coming soon)
 pip install modelexpress
-```
 
-### Development
-
-```bash
 # Editable install from source
 pip install -e .
 
@@ -31,33 +28,17 @@ pip install -e ".[dev]"
 
 ModelExpress integrates with vLLM via custom model loaders. Set `MX_REGISTER_LOADERS=1` to auto-register them, or call `register_modelexpress_loaders()` in your code.
 
-### Source Instance (loads weights from disk, serves via RDMA)
-
 ```bash
 export MODEL_EXPRESS_URL="modelexpress-server:8001"
-export MODEL_NAME="deepseek-ai/DeepSeek-V3"
-export MX_EXPECTED_WORKERS=8
 
 vllm serve deepseek-ai/DeepSeek-V3 \
-    --load-format mx-source \
+    --load-format mx \
     --tensor-parallel-size 8 \
     --worker-cls modelexpress.vllm_worker.ModelExpressWorker
 ```
 
-### Target Instance (receives weights via RDMA)
-
-```bash
-export MODEL_EXPRESS_URL="modelexpress-server:8001"
-export MODEL_NAME="deepseek-ai/DeepSeek-V3"
-export MX_EXPECTED_WORKERS=8
-
-vllm serve deepseek-ai/DeepSeek-V3 \
-    --load-format mx-target \
-    --tensor-parallel-size 8 \
-    --worker-cls modelexpress.vllm_worker.ModelExpressWorker
-```
-
-The target waits for the source to publish its NIXL ready flag, then pulls weights over RDMA. For DeepSeek-V3 (681 GB across 8 GPUs), this takes ~15 seconds vs ~25 minutes from NVMe storage.
+Starting the vLLM engine with `mx` loader on the source worker will load the weights from disk and register/publish the NIXL and tensor metadata to the MX server.
+And on the target worker, it will retrieve these metadata from MX serverand stream weights over RDMA from GPU to GPU.
 
 ## Programmatic Usage
 
@@ -101,8 +82,7 @@ register_modelexpress_loaders()
 |----------|---------|-------------|
 | `MODEL_EXPRESS_URL` | `localhost:8001` | ModelExpress gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compatible alias for `MODEL_EXPRESS_URL` |
-| `MODEL_NAME` | _(required)_ | Model name used for source/target coordination |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register `mx-source`/`mx-target` loaders with vLLM |
+| `MX_REGISTER_LOADERS` | `1` | Auto-register `mx` loader with vLLM |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
 | `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
