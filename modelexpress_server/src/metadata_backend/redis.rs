@@ -118,20 +118,41 @@ impl From<TensorRecordJson> for TensorRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRecordJson {
     pub worker_rank: u32,
+    /// Explicit backend type discriminator ("nixl", "transfer_engine", "none").
+    /// Used as the authoritative source when reconstructing BackendMetadataRecord.
+    #[serde(default)]
+    pub backend_type: Option<String>,
+    #[serde(default)]
     pub nixl_metadata: Vec<u8>,
+    #[serde(default)]
+    pub transfer_engine_session_id: Option<String>,
     pub tensors: Vec<TensorRecordJson>,
+    #[serde(default)]
+    pub status: i32,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 impl From<WorkerRecord> for WorkerRecordJson {
     fn from(record: WorkerRecord) -> Self {
+        let backend_type = record.backend_metadata.backend_type_str().to_string();
+        let (nixl_metadata, transfer_engine_session_id) = match record.backend_metadata {
+            super::BackendMetadataRecord::Nixl(data) => (data, None),
+            super::BackendMetadataRecord::TransferEngine(sid) => (Vec::new(), Some(sid)),
+            super::BackendMetadataRecord::None => (Vec::new(), None),
+        };
         Self {
             worker_rank: record.worker_rank,
-            nixl_metadata: record.nixl_metadata,
+            backend_type: Some(backend_type),
+            nixl_metadata,
+            transfer_engine_session_id,
             tensors: record
                 .tensors
                 .into_iter()
                 .map(TensorRecordJson::from)
                 .collect(),
+            status: record.status,
+            updated_at: record.updated_at,
         }
     }
 }
@@ -140,8 +161,14 @@ impl From<WorkerRecordJson> for WorkerRecord {
     fn from(json: WorkerRecordJson) -> Self {
         Self {
             worker_rank: json.worker_rank,
-            nixl_metadata: json.nixl_metadata,
+            backend_metadata: super::BackendMetadataRecord::from_flat(
+                json.nixl_metadata,
+                json.transfer_engine_session_id,
+                json.backend_type.as_deref(),
+            ),
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
+            status: json.status,
+            updated_at: json.updated_at,
         }
     }
 }
@@ -349,5 +376,216 @@ impl MetadataBackend for RedisBackend {
         let mut conn = self.get_conn().await?;
         let models: Vec<String> = conn.smembers(keys::MODELS_SET).await?;
         Ok(models)
+    }
+
+    async fn update_status(
+        &self,
+        model_name: &str,
+        worker_id: u32,
+        status: i32,
+        updated_at: i64,
+    ) -> MetadataResult<()> {
+        let mut conn = self.get_conn().await?;
+        let key = format!("{}{}", keys::MODEL_PREFIX, model_name);
+
+        // Lua script: patch status + updated_at for a specific worker in the model record
+        let script = redis::Script::new(
+            r#"
+            local key = KEYS[1]
+            local worker_rank = tonumber(ARGV[1])
+            local new_status = tonumber(ARGV[2])
+            local new_updated_at = tonumber(ARGV[3])
+
+            local json = redis.call('GET', key)
+            if not json then return 0 end
+
+            local record = cjson.decode(json)
+            for _, worker in ipairs(record.workers) do
+                if worker.worker_rank == worker_rank then
+                    worker.status = new_status
+                    worker.updated_at = new_updated_at
+                    redis.call('SET', key, cjson.encode(record))
+                    return 1
+                end
+            end
+            return 0
+            "#,
+        );
+
+        let patched: i32 = script
+            .key(&key)
+            .arg(worker_id)
+            .arg(status)
+            .arg(updated_at)
+            .invoke_async(&mut conn)
+            .await?;
+
+        check_patched(patched, worker_id, model_name)?;
+        debug!(
+            "Updated status for model '{}' worker {}",
+            model_name, worker_id
+        );
+        Ok(())
+    }
+}
+
+/// Return `Ok(())` when `patched == 1`, or a descriptive error when `patched == 0`
+/// (model key absent or worker not found).
+fn check_patched(patched: i32, worker_id: u32, model_name: &str) -> MetadataResult<()> {
+    if patched == 0 {
+        return Err(format!(
+            "update_status: worker {} not found in model '{}'",
+            worker_id, model_name
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // ── TensorRecordJson serialization ──────────────────────────────────────
+
+    #[test]
+    fn test_tensor_record_json_roundtrip() {
+        let record = TensorRecord {
+            name: "model.layers.0.weight".to_string(),
+            addr: 0x7f00_0000_0000,
+            size: 1_073_741_824,
+            device_id: 3,
+            dtype: "bfloat16".to_string(),
+        };
+        let json_record = TensorRecordJson::from(record.clone());
+        let json = serde_json::to_string(&json_record).expect("serialize");
+
+        // addr and size must be serialized as strings
+        assert!(json.contains(r#""addr":"#));
+        let parsed: TensorRecordJson = serde_json::from_str(&json).expect("deserialize");
+        let back = TensorRecord::from(parsed);
+
+        assert_eq!(back.name, record.name);
+        assert_eq!(back.addr, record.addr);
+        assert_eq!(back.size, record.size);
+        assert_eq!(back.device_id, record.device_id);
+        assert_eq!(back.dtype, record.dtype);
+    }
+
+    #[test]
+    fn test_deserialize_u64_from_string() {
+        let json = r#"{"name":"w","addr":"139948187451390","size":"134217728","device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse string");
+        assert_eq!(t.addr, 139948187451390);
+        assert_eq!(t.size, 134217728);
+    }
+
+    #[test]
+    fn test_deserialize_u64_from_number() {
+        let json = r#"{"name":"w","addr":1234567890,"size":4096,"device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse number");
+        assert_eq!(t.addr, 1234567890);
+    }
+
+    #[test]
+    fn test_deserialize_u64_from_float() {
+        // cjson can emit floats for large integers
+        let json = r#"{"name":"w","addr":1048576.0,"size":4096.0,"device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse float");
+        assert_eq!(t.addr, 1048576);
+    }
+
+    // ── WorkerRecordJson serialization ──────────────────────────────────────
+
+    #[test]
+    fn test_worker_record_json_roundtrip_with_status() {
+        let record = WorkerRecord {
+            worker_rank: 2,
+            backend_metadata: super::super::BackendMetadataRecord::Nixl(vec![
+                0xde, 0xad, 0xbe, 0xef,
+            ]),
+            tensors: vec![TensorRecord {
+                name: "t".to_string(),
+                addr: 0x1000,
+                size: 512,
+                device_id: 2,
+                dtype: "float16".to_string(),
+            }],
+            status: 2, // SOURCE_STATUS_READY
+            updated_at: 1_700_000_000_000,
+        };
+
+        let json_record = WorkerRecordJson::from(record.clone());
+        let json = serde_json::to_string(&json_record).expect("serialize");
+        let parsed: WorkerRecordJson = serde_json::from_str(&json).expect("deserialize");
+        let back = WorkerRecord::from(parsed);
+
+        assert_eq!(back.worker_rank, record.worker_rank);
+        assert_eq!(back.backend_metadata, record.backend_metadata);
+        assert_eq!(back.status, record.status);
+        assert_eq!(back.updated_at, record.updated_at);
+        assert_eq!(back.tensors.len(), 1);
+    }
+
+    #[test]
+    fn test_worker_record_json_backward_compat_missing_status() {
+        // Records written before status/updated_at fields existed must default to 0
+        let json = r#"{"worker_rank":0,"nixl_metadata":[],"tensors":[]}"#;
+        let parsed: WorkerRecordJson = serde_json::from_str(json).expect("parse legacy");
+        assert_eq!(parsed.status, 0);
+        assert_eq!(parsed.updated_at, 0);
+    }
+
+    // ── check_patched ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_check_patched_ok() {
+        assert!(check_patched(1, 0, "my-model").is_ok());
+    }
+
+    #[test]
+    fn test_check_patched_zero_returns_err() {
+        let err = check_patched(0, 3, "my-model").expect_err("expected Err for patched==0");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worker 3"),
+            "error should name the worker: {msg}"
+        );
+        assert!(
+            msg.contains("my-model"),
+            "error should name the model: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_patched_zero_unknown_worker() {
+        // Absent model key also returns 0 from the Lua script.
+        let err = check_patched(0, 0, "nonexistent-model").expect_err("absent model should be Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent-model"),
+            "error should name the model: {msg}"
+        );
+    }
+
+    // ── ModelMetadataJson serialization ─────────────────────────────────────
+
+    #[test]
+    fn test_model_metadata_json_roundtrip() {
+        let json = r#"{
+            "model_name": "meta-llama/Llama-3.1-70B",
+            "workers": [
+                {"worker_rank": 0, "nixl_metadata": [], "tensors": [], "status": 2, "updated_at": 1000}
+            ],
+            "published_at": 1700000000
+        }"#;
+        let parsed: ModelMetadataJson = serde_json::from_str(json).expect("parse");
+        let record = ModelMetadataRecord::from(parsed);
+
+        assert_eq!(record.model_name, "meta-llama/Llama-3.1-70B");
+        assert_eq!(record.workers.len(), 1);
+        assert_eq!(record.workers[0].status, 2);
+        assert_eq!(record.published_at, 1700000000);
     }
 }

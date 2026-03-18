@@ -15,11 +15,8 @@ service P2pService {
   // Query for existing source with the same model - called at client startup
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
 
-  // Publish ready flag - called by source after NIXL registration and warmup
-  rpc PublishReady(PublishReadyRequest) returns (PublishReadyResponse);
-
-  // Get ready status - called by target to check if source is ready
-  rpc GetReady(GetReadyRequest) returns (GetReadyResponse);
+  // Update source status - called by source after NIXL registration and warmup
+  rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
 }
 
 // ============================================================================
@@ -47,16 +44,34 @@ message TensorDescriptor {
 // Worker Metadata
 // ============================================================================
 
+// Source lifecycle status
+enum SourceStatus {
+  SOURCE_STATUS_UNKNOWN = 0;
+  SOURCE_STATUS_INITIALIZING = 1;  // publishing metadata, not yet ready
+  SOURCE_STATUS_READY = 2;         // ready for transfers
+  SOURCE_STATUS_STALE = 3;         // source gone, metadata may be stale
+}
+
 message WorkerMetadata {
   // Worker rank (GPU index within the instance)
   uint32 worker_rank = 1;
 
-  // Serialized NIXL agent metadata for this worker
-  // Used by remote agents to establish RDMA connections
-  bytes nixl_metadata = 2;
+  // Backend-specific metadata for establishing transfers.
+  // NIXL: serialized agent metadata for RDMA connections.
+  // TransferEngine: Mooncake session ID ("ip:port").
+  oneof backend_metadata {
+    bytes nixl_metadata = 2;
+    string transfer_engine_session_id = 10;
+  }
 
   // Tensor descriptors for this worker's GPU
   repeated TensorDescriptor tensors = 3;
+
+  // Worker lifecycle status
+  SourceStatus status = 4;
+
+  // Timestamp of last status update (unix millis)
+  int64 updated_at = 5;
 }
 
 // ============================================================================
@@ -95,55 +110,22 @@ message GetMetadataResponse {
 }
 
 // ============================================================================
-// Ready Coordination (replaces direct Redis access)
+// Status Coordination
 // ============================================================================
 
-message PublishReadyRequest {
-  // Model name this ready flag is for
+message UpdateStatusRequest {
+  // Model name
   string model_name = 1;
 
   // Worker rank (GPU index)
   uint32 worker_id = 2;
 
-  // Unique session ID (detects restarts)
-  string session_id = 3;
-
-  // Hash of metadata for validation
-  string metadata_hash = 4;
-
-  // Whether NIXL is registered and ready
-  bool nixl_ready = 5;
-
-  // Whether stability has been verified (warmup complete)
-  bool stability_verified = 6;
+  // New status
+  SourceStatus status = 3;
 }
 
-message PublishReadyResponse {
+message UpdateStatusResponse {
   bool success = 1;
   string message = 2;
 }
 
-message GetReadyRequest {
-  // Model name to check
-  string model_name = 1;
-
-  // Worker rank to check
-  uint32 worker_id = 2;
-}
-
-message GetReadyResponse {
-  // Whether a ready flag exists
-  bool found = 1;
-
-  // Whether source is fully ready (NIXL + stability verified)
-  bool ready = 2;
-
-  // Session ID for restart detection
-  string session_id = 3;
-
-  // Metadata hash for validation
-  string metadata_hash = 4;
-
-  // Timestamp when ready was published (unix seconds)
-  double timestamp = 5;
-}

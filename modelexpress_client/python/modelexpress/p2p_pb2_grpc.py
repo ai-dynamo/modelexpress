@@ -8,7 +8,7 @@ import warnings
 
 from . import p2p_pb2 as p2p__pb2
 
-GRPC_GENERATED_VERSION = '1.66.2'
+GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -21,7 +21,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in p2p_pb2_grpc.py depends on'
+        + ' but the generated code in p2p_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -50,15 +50,10 @@ class P2pServiceStub(object):
                 request_serializer=p2p__pb2.GetMetadataRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetMetadataResponse.FromString,
                 _registered_method=True)
-        self.PublishReady = channel.unary_unary(
-                '/model_express.p2p.P2pService/PublishReady',
-                request_serializer=p2p__pb2.PublishReadyRequest.SerializeToString,
-                response_deserializer=p2p__pb2.PublishReadyResponse.FromString,
-                _registered_method=True)
-        self.GetReady = channel.unary_unary(
-                '/model_express.p2p.P2pService/GetReady',
-                request_serializer=p2p__pb2.GetReadyRequest.SerializeToString,
-                response_deserializer=p2p__pb2.GetReadyResponse.FromString,
+        self.UpdateStatus = channel.unary_unary(
+                '/model_express.p2p.P2pService/UpdateStatus',
+                request_serializer=p2p__pb2.UpdateStatusRequest.SerializeToString,
+                response_deserializer=p2p__pb2.UpdateStatusResponse.FromString,
                 _registered_method=True)
 
 
@@ -82,15 +77,8 @@ class P2pServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PublishReady(self, request, context):
-        """Publish ready flag - called by source after NIXL registration and warmup
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GetReady(self, request, context):
-        """Get ready status - called by target to check if source is ready
+    def UpdateStatus(self, request, context):
+        """Update source status - called by source after NIXL registration and warmup
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -109,15 +97,10 @@ def add_P2pServiceServicer_to_server(servicer, server):
                     request_deserializer=p2p__pb2.GetMetadataRequest.FromString,
                     response_serializer=p2p__pb2.GetMetadataResponse.SerializeToString,
             ),
-            'PublishReady': grpc.unary_unary_rpc_method_handler(
-                    servicer.PublishReady,
-                    request_deserializer=p2p__pb2.PublishReadyRequest.FromString,
-                    response_serializer=p2p__pb2.PublishReadyResponse.SerializeToString,
-            ),
-            'GetReady': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetReady,
-                    request_deserializer=p2p__pb2.GetReadyRequest.FromString,
-                    response_serializer=p2p__pb2.GetReadyResponse.SerializeToString,
+            'UpdateStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateStatus,
+                    request_deserializer=p2p__pb2.UpdateStatusRequest.FromString,
+                    response_serializer=p2p__pb2.UpdateStatusResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -188,7 +171,7 @@ class P2pService(object):
             _registered_method=True)
 
     @staticmethod
-    def PublishReady(request,
+    def UpdateStatus(request,
             target,
             options=(),
             channel_credentials=None,
@@ -201,36 +184,9 @@ class P2pService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/model_express.p2p.P2pService/PublishReady',
-            p2p__pb2.PublishReadyRequest.SerializeToString,
-            p2p__pb2.PublishReadyResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def GetReady(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/model_express.p2p.P2pService/GetReady',
-            p2p__pb2.GetReadyRequest.SerializeToString,
-            p2p__pb2.GetReadyResponse.FromString,
+            '/model_express.p2p.P2pService/UpdateStatus',
+            p2p__pb2.UpdateStatusRequest.SerializeToString,
+            p2p__pb2.UpdateStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,

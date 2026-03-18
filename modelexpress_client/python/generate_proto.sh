@@ -23,7 +23,7 @@ python -m grpc_tools.protoc \
 
 # Fix relative import in grpc file
 echo "Fixing imports in p2p_pb2_grpc.py..."
-sed -i 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "${OUT_DIR}/p2p_pb2_grpc.py"
+sed -i'' 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "${OUT_DIR}/p2p_pb2_grpc.py"
 
 # Add SPDX header to generated files
 for file in "${OUT_DIR}/p2p_pb2.py" "${OUT_DIR}/p2p_pb2_grpc.py"; do

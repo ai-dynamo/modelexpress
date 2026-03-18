@@ -1,5 +1,7 @@
 # ModelExpress Metadata Architecture
 
+> **Work in progress — this document is out of date.** It predates the unified `WorkerRecord` schema, removal of `ModelMetadataPhase`/`expectedWorkers`, and the `GetStatus`/`PublishReady`/`GetReady` RPC removals. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for current information.
+
 This document describes the metadata storage layer for ModelExpress P2P transfers, covering both the current Redis-based implementation and the proposed Kubernetes CRD alternative.
 
 ## Overview
