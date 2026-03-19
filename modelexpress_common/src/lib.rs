@@ -10,6 +10,7 @@ pub mod config;
 pub mod download;
 pub mod models;
 pub mod providers;
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
 

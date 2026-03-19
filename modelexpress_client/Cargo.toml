@@ -29,6 +29,7 @@ clap = { workspace = true }
 colored = { workspace = true }
 
 [dev-dependencies]
+modelexpress-common = { workspace = true, features = ["test-support"] }
 tokio-test = "0.4"
 tonic-build = { workspace = true }
 tempfile = "3.20"
