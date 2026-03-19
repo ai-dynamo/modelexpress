@@ -427,8 +427,10 @@ impl Client {
         let mut current_file: Option<(PathBuf, tokio::fs::File)> = None;
         let mut files_received: u64 = 0;
         let mut bytes_received: u64 = 0;
+        let mut saw_chunk = false;
 
         while let Some(chunk_result) = stream.message().await? {
+            saw_chunk = true;
             if model_dir.is_none() {
                 let (dir, canonical_dir) = prepare_stream_model_dir(
                     &local_cache_path,
@@ -531,6 +533,14 @@ impl Client {
             if chunk_result.is_last_file && chunk_result.is_last_chunk {
                 break;
             }
+        }
+
+        if !saw_chunk {
+            return Err(modelexpress_common::Error::Server(format!(
+                "Server streamed no files for model {}",
+                model_name
+            ))
+            .into());
         }
 
         // Ensure the last file is properly closed
@@ -705,12 +715,82 @@ impl Client {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use futures::Stream;
     use modelexpress_common::{
         cache::CacheConfig,
+        grpc::model::{
+            FileChunk, ModelDownloadRequest, ModelFileList, ModelFilesRequest, ModelStatusUpdate,
+            model_service_server::{ModelService, ModelServiceServer},
+        },
         test_support::{EnvVarGuard, acquire_env_mutex},
     };
     use std::collections::HashMap;
+    use std::pin::Pin;
     use tempfile::TempDir;
+    use tonic::{Request, Response, Status, transport::Server};
+
+    struct EmptyFileStreamModelService;
+
+    #[tonic::async_trait]
+    impl ModelService for EmptyFileStreamModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            _request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            Err(Status::unimplemented(
+                "ensure_model_downloaded is not used in this test",
+            ))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            Ok(Response::new(Box::pin(futures::stream::empty())))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    async fn spawn_model_service(
+        service: impl ModelService + 'static,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind test listener");
+        let addr = listener
+            .local_addr()
+            .expect("Failed to read test listener address");
+        let incoming = futures::stream::unfold(listener, |listener| async {
+            match listener.accept().await {
+                Ok((stream, _)) => Some((Ok::<_, std::io::Error>(stream), listener)),
+                Err(_) => None,
+            }
+        });
+
+        let handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ModelServiceServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        (addr, handle)
+    }
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig::for_testing("http://test-endpoint:1234")
@@ -887,6 +967,32 @@ mod tests {
             prepare_stream_model_dir(cache_root, ModelProvider::HuggingFace, "test/model", None);
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_model_files_from_server_errors_on_empty_stream() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(EmptyFileStreamModelService).await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        let result = client
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let err = result.expect_err("Expected empty stream to fail");
+        assert!(
+            err.to_string()
+                .contains("Server streamed no files for model test/model"),
+            "Unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
