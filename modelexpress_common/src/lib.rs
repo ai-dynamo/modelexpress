@@ -10,6 +10,8 @@ pub mod config;
 pub mod download;
 pub mod models;
 pub mod providers;
+#[doc(hidden)]
+pub mod test_support;
 
 // Generated gRPC code
 #[allow(clippy::similar_names)]

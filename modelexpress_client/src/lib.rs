@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use modelexpress_common::providers::ModelProviderTrait;
 use modelexpress_common::{
     Result as CommonResult,
-    cache::{CacheConfig, CacheStats},
+    cache::{CacheConfig, CacheStats, resolve_model_path},
     client_config::ClientConfig as Config,
     constants, download,
     grpc::{
@@ -15,7 +14,6 @@ use modelexpress_common::{
         },
     },
     models::{ModelStatus, Status},
-    providers::huggingface::HuggingFaceProvider,
 };
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
@@ -38,6 +36,63 @@ pub struct Client {
     api_client: ApiServiceClient<Channel>,
     model_client: ModelServiceClient<Channel>,
     cache_config: Option<CacheConfig>,
+}
+
+fn is_safe_relative_path(path: &std::path::Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+            )
+        })
+}
+
+fn prepare_stream_model_dir(
+    local_cache_path: &std::path::Path,
+    provider: ModelProvider,
+    model_name: &str,
+    commit_hash: Option<&str>,
+) -> CommonResult<(PathBuf, PathBuf)> {
+    if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
+        return Err(modelexpress_common::Error::Server(format!(
+            "Failed to resolve model directory: missing required revision for provider {:?}",
+            provider
+        ))
+        .into());
+    }
+
+    let model_dir = resolve_model_path(local_cache_path, provider, model_name, commit_hash)
+        .map_err(|e| {
+            modelexpress_common::Error::Server(format!("Failed to resolve model directory: {e}"))
+        })?;
+
+    std::fs::create_dir_all(&model_dir).map_err(|e| {
+        modelexpress_common::Error::Server(format!("Failed to create model directory: {e}"))
+    })?;
+
+    let canonical_cache_dir = local_cache_path.canonicalize().map_err(|e| {
+        modelexpress_common::Error::Server(format!(
+            "Failed to canonicalize cache directory {:?}: {e}",
+            local_cache_path
+        ))
+    })?;
+    let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
+        modelexpress_common::Error::Server(format!("Failed to canonicalize model directory: {e}"))
+    })?;
+
+    if !canonical_model_dir.starts_with(&canonical_cache_dir) {
+        return Err(modelexpress_common::Error::Server(format!(
+            "Received model directory that resolves outside cache root: {:?}",
+            model_dir
+        ))
+        .into());
+    }
+
+    Ok((model_dir, canonical_model_dir))
 }
 
 impl Client {
@@ -97,13 +152,17 @@ impl Client {
         })
     }
 
-    /// Clear specific model from cache
-    pub fn clear_cached_model(&self, model_name: &str) -> CommonResult<()> {
+    /// Clear specific model from cache for a given provider.
+    pub fn clear_cached_model(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> CommonResult<()> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
             modelexpress_common::Error::Server("Cache not configured".to_string())
         })?;
 
-        cache_config.clear_model(model_name).map_err(|e| {
+        cache_config.clear_model(model_name, provider).map_err(|e| {
             modelexpress_common::Error::Server(format!("Failed to clear model: {e}")).into()
         })
     }
@@ -119,29 +178,33 @@ impl Client {
         })
     }
 
-    /// Get the cache directory path, using client's cache config if available,
-    /// otherwise discovering from environment variables and defaults.
-    fn get_cache_dir(&self) -> PathBuf {
-        // Check Hugging Face's HF_HUB_CACHE environment variable first,
-        // as it takes precedence, and isn't specific to our client.
+    /// Get the cache directory path for the requested provider, using the
+    /// provider's environment overrides first and then falling back to the
+    /// client's configured cache root.
+    fn get_cache_dir(&self, provider: ModelProvider) -> PathBuf {
         use std::env;
-        if let Ok(cache_path) = env::var("HF_HUB_CACHE") {
+        if provider == ModelProvider::HuggingFace
+            && let Ok(cache_path) = env::var("HF_HUB_CACHE")
+        {
             return PathBuf::from(cache_path);
         }
-        // Use client's cache config if available
-        if let Some(cache_config) = &self.cache_config {
+
+        if let Some(cache_config) = self.cache_config.as_ref() {
             return cache_config.local_path.clone();
         }
 
-        // Fall back to discovery
         CacheConfig::discover()
             .map(|config| config.local_path)
             .unwrap_or_else(|_| CacheConfig::default().local_path)
     }
 
-    pub async fn get_model_path(&self, model_name: &str) -> anyhow::Result<PathBuf> {
-        let cache_dir = self.get_cache_dir();
-        let model_path = HuggingFaceProvider
+    pub async fn get_model_path(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> anyhow::Result<PathBuf> {
+        let cache_dir = self.get_cache_dir(provider);
+        let model_path = download::get_provider(provider)
             .get_model_path(model_name, cache_dir)
             .await
             .map_err(|e| anyhow::anyhow!(format!("Failed to get model path: {e}")))?;
@@ -338,6 +401,12 @@ impl Client {
             "Streaming model {} files to {:?} with chunk size {} bytes",
             model_name, local_cache_path, chunk_size
         );
+        std::fs::create_dir_all(&local_cache_path).map_err(|e| {
+            modelexpress_common::Error::Server(format!(
+                "Failed to create local cache directory {:?}: {e}",
+                local_cache_path
+            ))
+        })?;
 
         let grpc_request = tonic::Request::new(ModelFilesRequest {
             model_name: model_name.to_string(),
@@ -351,13 +420,7 @@ impl Client {
             .await?
             .into_inner();
 
-        // Create a normalized model directory path (similar to HuggingFace cache structure)
-        let normalized_name = model_name.replace('/', "--");
-        let snapshots_dir = local_cache_path
-            .join(format!("models--{}", normalized_name))
-            .join("snapshots");
-
-        // Model directory will be set after receiving the first chunk with commit hash
+        // Model directory will be set after receiving the first chunk.
         let mut model_dir: Option<PathBuf> = None;
         let mut canonical_model_dir: Option<PathBuf> = None;
 
@@ -366,28 +429,13 @@ impl Client {
         let mut bytes_received: u64 = 0;
 
         while let Some(chunk_result) = stream.message().await? {
-            // Extract commit hash from first chunk and create model directory
             if model_dir.is_none() {
-                let commit_hash = chunk_result.commit_hash.as_ref().ok_or_else(|| {
-                    modelexpress_common::Error::Server(
-                        "Server did not provide commit hash in first chunk".to_string(),
-                    )
-                })?;
-
-                let dir = snapshots_dir.join(commit_hash);
-                std::fs::create_dir_all(&dir).map_err(|e| {
-                    modelexpress_common::Error::Server(format!(
-                        "Failed to create model directory: {e}"
-                    ))
-                })?;
-
-                // Canonicalize model_dir once for efficiency and security
-                let canonical_dir = dir.canonicalize().map_err(|e| {
-                    modelexpress_common::Error::Server(format!(
-                        "Failed to canonicalize model directory: {e}"
-                    ))
-                })?;
-
+                let (dir, canonical_dir) = prepare_stream_model_dir(
+                    &local_cache_path,
+                    provider,
+                    model_name,
+                    chunk_result.commit_hash.as_deref(),
+                )?;
                 model_dir = Some(dir);
                 canonical_model_dir = Some(canonical_dir);
             }
@@ -403,15 +451,7 @@ impl Client {
 
             let relative_path = PathBuf::from(&chunk_result.relative_path);
 
-            // Validate that the relative path does not contain any '..' components or is absolute
-            let is_safe = !relative_path.components().any(|c| {
-                matches!(
-                    c,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            });
-
-            if !is_safe {
+            if !is_safe_relative_path(&relative_path) {
                 return Err(Box::new(modelexpress_common::Error::Server(format!(
                     "Received potentially unsafe file path from server: {:?}",
                     chunk_result.relative_path
@@ -665,11 +705,26 @@ impl Client {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use modelexpress_common::cache::CacheConfig;
+    use modelexpress_common::{
+        cache::CacheConfig,
+        test_support::{EnvVarGuard, acquire_env_mutex},
+    };
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig::for_testing("http://test-endpoint:1234")
+    }
+
+    fn create_test_client(cache_config: Option<CacheConfig>) -> Client {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+
+        Client {
+            health_client: HealthServiceClient::new(channel.clone()),
+            api_client: ApiServiceClient::new(channel.clone()),
+            model_client: ModelServiceClient::new(channel),
+            cache_config,
+        }
     }
 
     #[test]
@@ -720,6 +775,34 @@ mod tests {
         assert_eq!(
             cache_config.server_endpoint,
             "http://override-endpoint:5678"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_cache_dir_for_hf_prefers_hf_hub_cache() {
+        let _env_lock = acquire_env_mutex();
+        let hf_cache_dir = TempDir::new().expect("Failed to create HF cache dir");
+        let configured_cache_dir = TempDir::new().expect("Failed to create configured cache dir");
+        let _hf_cache_guard = EnvVarGuard::set(
+            "HF_HUB_CACHE",
+            hf_cache_dir
+                .path()
+                .to_str()
+                .expect("Expected HF cache path"),
+        );
+
+        let cache_config = CacheConfig {
+            local_path: configured_cache_dir.path().to_path_buf(),
+            server_endpoint: "http://localhost:8001".to_string(),
+            timeout_secs: None,
+            shared_storage: true,
+            transfer_chunk_size: modelexpress_common::constants::DEFAULT_TRANSFER_CHUNK_SIZE,
+        };
+        let client = create_test_client(Some(cache_config));
+
+        assert_eq!(
+            client.get_cache_dir(ModelProvider::HuggingFace),
+            hf_cache_dir.path()
         );
     }
 
@@ -777,6 +860,33 @@ mod tests {
                 .expect("Deserialization should not fail in test");
 
         assert_eq!(payload, deserialized);
+    }
+
+    #[test]
+    fn test_prepare_stream_model_dir_falls_back_to_hf_snapshot_layout() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path();
+
+        let (dir, _) = prepare_stream_model_dir(
+            cache_root,
+            ModelProvider::HuggingFace,
+            "test/model",
+            Some("abc123"),
+        )
+        .expect("Expected legacy snapshot layout");
+
+        assert_eq!(dir, cache_root.join("models--test--model/snapshots/abc123"));
+    }
+
+    #[test]
+    fn test_prepare_stream_model_dir_requires_hf_commit_hash() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path();
+
+        let result =
+            prepare_stream_model_dir(cache_root, ModelProvider::HuggingFace, "test/model", None);
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

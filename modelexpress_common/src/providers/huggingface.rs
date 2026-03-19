@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Utils, constants, providers::ModelProviderTrait};
+use crate::{
+    Utils,
+    cache::{ModelInfo, ProviderCache, directory_size},
+    constants,
+    models::ModelProvider,
+    providers::ModelProviderTrait,
+};
 use anyhow::{Context, Result};
 use hf_hub::Cache;
 use hf_hub::api::tokio::{ApiBuilder, ApiError};
@@ -52,6 +58,118 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
 
 /// Hugging Face model provider implementation
 pub struct HuggingFaceProvider;
+
+pub(crate) struct HuggingFaceProviderCache;
+
+impl HuggingFaceProviderCache {
+    fn repo_root(cache_root: &Path, model_name: &str) -> PathBuf {
+        cache_root.join(format!("models--{}", model_name.replace('/', "--")))
+    }
+
+    fn snapshots_dir(cache_root: &Path, model_name: &str) -> PathBuf {
+        Self::repo_root(cache_root, model_name).join("snapshots")
+    }
+
+    fn folder_name_to_model_id(folder_name: &str) -> String {
+        if let Some(stripped) = folder_name.strip_prefix("models--") {
+            stripped.replace("--", "/")
+        } else {
+            folder_name.to_string()
+        }
+    }
+
+    fn latest_local_snapshot_path(cache_root: &Path, model_name: &str) -> Result<PathBuf> {
+        let path = Self::snapshots_dir(cache_root, model_name);
+
+        if !path.exists() {
+            anyhow::bail!("Model snapshots for '{model_name}' not found in cache");
+        }
+
+        let mut files: Vec<fs::DirEntry> = fs::read_dir(path)?.filter_map(Result::ok).collect();
+        if files.is_empty() {
+            anyhow::bail!("Model snapshots for '{model_name}' is empty");
+        }
+
+        files.sort_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.created().or_else(|_| metadata.modified()))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+        files.reverse();
+
+        Ok(files[0].path())
+    }
+}
+
+impl ProviderCache for HuggingFaceProviderCache {
+    fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()> {
+        let model_path = Self::repo_root(cache_root, model_name);
+
+        if model_path.exists() {
+            fs::remove_dir_all(&model_path)
+                .with_context(|| format!("Failed to remove model: {model_path:?}"))?;
+            info!(
+                "Cleared model: {} ({:?})",
+                model_name,
+                ModelProvider::HuggingFace
+            );
+        } else {
+            warn!(
+                "Model not found in cache: {} ({:?})",
+                model_name,
+                ModelProvider::HuggingFace
+            );
+        }
+
+        Ok(())
+    }
+
+    fn resolve_model_path(
+        &self,
+        cache_root: &Path,
+        model_name: &str,
+        revision: Option<&str>,
+    ) -> Result<PathBuf> {
+        match revision {
+            Some(revision) => Ok(Self::snapshots_dir(cache_root, model_name).join(revision)),
+            None => Self::latest_local_snapshot_path(cache_root, model_name),
+        }
+    }
+
+    fn list_models(&self, cache_root: &Path) -> Result<Vec<ModelInfo>> {
+        let mut models = Vec::new();
+
+        if !cache_root.exists() {
+            return Ok(models);
+        }
+
+        for entry in fs::read_dir(cache_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            let Some(folder_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if !folder_name.starts_with("models--") {
+                continue;
+            }
+
+            models.push(ModelInfo {
+                provider: ModelProvider::HuggingFace,
+                name: Self::folder_name_to_model_id(folder_name),
+                size: directory_size(&path)?,
+                path,
+            });
+        }
+
+        Ok(models)
+    }
+}
 
 impl HuggingFaceProvider {
     /// Determine whether the provided filename refers to a file that lives in a sub-directory.
@@ -273,31 +391,12 @@ impl ModelProviderTrait for HuggingFaceProvider {
     /// Get the full path to the latest model snapshot if it exists.
     /// Returns the path if found, or an error if not found.
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
-        let normalized_name = model_name.replace("/", "--");
-        let path = cache_dir
-            .join(format!["models--{normalized_name}"])
-            .join("snapshots");
-
-        if !path.exists() {
-            anyhow::bail!("Model snapshots for '{model_name}' not found in cache");
-        }
-
-        let mut files: Vec<fs::DirEntry> = fs::read_dir(path)?.filter_map(Result::ok).collect();
-        if files.is_empty() {
-            anyhow::bail!("Model snapshots for '{model_name}' is empty");
-        }
-
-        // Sort by creation/modification time to get the most recent snapshot
-        files.sort_by_key(|e| {
-            e.metadata()
-                .and_then(|m| m.created().or_else(|_| m.modified()))
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        });
-        files.reverse();
+        let latest_local_snapshot =
+            HuggingFaceProviderCache.resolve_model_path(&cache_dir, model_name, None)?;
 
         // In offline mode, skip network validation and return the latest local snapshot
         if is_offline_mode() {
-            return Ok(files[0].path());
+            return Ok(latest_local_snapshot);
         }
 
         // Check against the latest commit hash from HF
@@ -308,10 +407,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
             anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace: {e}")
         })?;
 
-        for file in &files {
-            if file.file_name().display().to_string() == info.sha {
-                return Ok(file.path());
-            }
+        let latest_remote_snapshot =
+            HuggingFaceProviderCache.resolve_model_path(&cache_dir, model_name, Some(&info.sha))?;
+        if latest_remote_snapshot.exists() {
+            return Ok(latest_remote_snapshot);
         }
 
         warn!(
@@ -320,7 +419,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
             info.sha
         );
 
-        Ok(files[0].path())
+        Ok(latest_local_snapshot)
     }
 
     fn provider_name(&self) -> &'static str {
@@ -332,27 +431,12 @@ impl ModelProviderTrait for HuggingFaceProvider {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::test_support::{EnvVarGuard, acquire_env_mutex};
     use serde_json::json;
-    use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::time::Duration;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Mutex to serialize access to HF-related environment variables across tests.
-    /// This prevents race conditions when tests run in parallel.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    fn acquire_env_mutex() -> std::sync::MutexGuard<'static, ()> {
-        match ENV_MUTEX.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                // Avoid cascading failures after a single test panic.
-                warn!("ENV_MUTEX was poisoned; recovering lock");
-                poisoned.into_inner()
-            }
-        }
-    }
 
     /// Minimal mock of the Hugging Face Hub used by tests.
     ///
@@ -368,6 +452,8 @@ mod tests {
         _server: MockServer,
         /// Temporary HF cache root that tests pass to `ApiBuilder::with_cache_dir`
         pub cache_path: PathBuf,
+        /// Restores HF_ENDPOINT when the mock server is dropped.
+        _hf_endpoint_guard: EnvVarGuard,
     }
 
     impl MockHFServer {
@@ -416,13 +502,12 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            unsafe {
-                std::env::set_var("HF_ENDPOINT", server.uri());
-            }
+            let hf_endpoint_guard = EnvVarGuard::set("HF_ENDPOINT", &server.uri());
 
             Self {
                 _server: server,
                 cache_path: temp_dir.path().to_path_buf(),
+                _hf_endpoint_guard: hf_endpoint_guard,
             }
         }
     }
@@ -497,19 +582,14 @@ mod tests {
             "Expected env cache to contain model file before delete"
         );
 
-        unsafe {
-            env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, env_cache.path());
-            env::set_var(HF_HUB_CACHE_ENV_VAR, env_cache.path());
-        }
+        let env_cache_path = env_cache.path().to_str().expect("Expected env cache path");
+        let _model_express_cache_guard =
+            EnvVarGuard::set(MODEL_EXPRESS_CACHE_ENV_VAR, env_cache_path);
+        let _hf_hub_cache_guard = EnvVarGuard::set(HF_HUB_CACHE_ENV_VAR, env_cache_path);
 
         let delete_result = provider
             .delete_model("test/model", explicit_cache.path().to_path_buf())
             .await;
-
-        unsafe {
-            env::remove_var(MODEL_EXPRESS_CACHE_ENV_VAR);
-            env::remove_var(HF_HUB_CACHE_ENV_VAR);
-        }
 
         assert!(
             delete_result.is_ok(),
@@ -571,31 +651,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let old_cache = env::var_os(MODEL_EXPRESS_CACHE_ENV_VAR);
-        let old_endpoint = env::var_os("HF_ENDPOINT");
-
-        unsafe {
-            env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache.path());
-            env::set_var("HF_ENDPOINT", server.uri());
-        }
+        let temp_cache_path = temp_cache.path().to_str().expect("Expected cache path");
+        let _model_express_cache_guard =
+            EnvVarGuard::set(MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache_path);
+        let _hf_endpoint_guard = EnvVarGuard::set("HF_ENDPOINT", &server.uri());
 
         let result = provider
             .delete_model(model_name, temp_cache.path().to_path_buf())
             .await;
-
-        unsafe {
-            if let Some(value) = old_cache {
-                env::set_var(MODEL_EXPRESS_CACHE_ENV_VAR, value);
-            } else {
-                env::remove_var(MODEL_EXPRESS_CACHE_ENV_VAR);
-            }
-
-            if let Some(value) = old_endpoint {
-                env::set_var("HF_ENDPOINT", value);
-            } else {
-                env::remove_var("HF_ENDPOINT");
-            }
-        }
 
         assert!(result.is_ok(), "Delete should succeed when cache is empty");
     }
@@ -708,9 +771,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        unsafe {
-            std::env::set_var("HF_ENDPOINT", server.uri());
-        }
+        let _hf_endpoint_guard = EnvVarGuard::set("HF_ENDPOINT", &server.uri());
 
         let provider = HuggingFaceProvider;
         let result = provider
@@ -726,16 +787,20 @@ mod tests {
     #[test]
     fn test_is_offline_mode() {
         let _guard = acquire_env_mutex();
-        unsafe {
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
+        {
+            let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "1");
             assert!(is_offline_mode());
-
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "0");
-            assert!(!is_offline_mode());
-
-            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
         }
-        assert!(!is_offline_mode());
+
+        {
+            let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "0");
+            assert!(!is_offline_mode());
+        }
+
+        {
+            let _offline_guard = EnvVarGuard::remove(HF_HUB_OFFLINE_ENV_VAR);
+            assert!(!is_offline_mode());
+        }
     }
 
     #[tokio::test]
@@ -750,17 +815,11 @@ mod tests {
             .join("abc1234");
         std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
 
-        unsafe {
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
-        }
+        let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "1");
 
         let result = HuggingFaceProvider
             .download_model("test/model", Some(temp_dir.path().into()), false)
             .await;
-
-        unsafe {
-            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
-        }
 
         assert!(result.is_ok());
         assert!(result.expect("Expected path").ends_with("abc1234"));
@@ -772,17 +831,11 @@ mod tests {
         let _guard = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
 
-        unsafe {
-            env::set_var(HF_HUB_OFFLINE_ENV_VAR, "1");
-        }
+        let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "1");
 
         let result = HuggingFaceProvider
             .download_model("nonexistent/model", Some(temp_dir.path().into()), false)
             .await;
-
-        unsafe {
-            env::remove_var(HF_HUB_OFFLINE_ENV_VAR);
-        }
 
         assert!(result.is_err());
         assert!(

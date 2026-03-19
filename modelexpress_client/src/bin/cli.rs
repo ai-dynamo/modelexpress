@@ -114,7 +114,7 @@ async fn main() {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::modules::args::{Cli, CliModelProvider};
+    use super::modules::args::{Cli, CliModelProvider, Commands};
     use clap::Parser;
     use modelexpress_client::ModelProvider;
 
@@ -183,5 +183,35 @@ mod tests {
 
         assert_eq!(cli.format, super::modules::args::OutputFormat::Json);
         assert_eq!(cli.verbose, 3);
+    }
+
+    #[test]
+    fn test_cli_model_clear_defaults_to_hugging_face_provider() {
+        let parsed = Cli::try_parse_from([
+            "modelexpress-cli",
+            "model",
+            "clear",
+            "--provider",
+            "hugging-face",
+            "dev/bake/qwen/rev123",
+        ]);
+        assert!(parsed.is_ok());
+
+        let missing_provider =
+            Cli::try_parse_from(["modelexpress-cli", "model", "clear", "dev/bake/qwen/rev123"])
+                .expect("Expected clear command to parse without provider");
+
+        let Commands::Model { command } = missing_provider.command else {
+            panic!("Expected model command");
+        };
+        let super::modules::args::ModelCommands::Clear {
+            provider,
+            model_name,
+        } = command
+        else {
+            panic!("Expected clear subcommand");
+        };
+        assert_eq!(ModelProvider::from(provider), ModelProvider::HuggingFace);
+        assert_eq!(model_name, "dev/bake/qwen/rev123");
     }
 }

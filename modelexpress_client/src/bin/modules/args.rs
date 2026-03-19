@@ -106,6 +106,10 @@ pub enum ModelCommands {
 
     /// Clear specific model from storage
     Clear {
+        /// Model provider
+        #[arg(long, short = 'p', value_enum, default_value_t = CliModelProvider::HuggingFace)]
+        provider: CliModelProvider,
+
         /// Model name to clear
         model_name: String,
     },
@@ -158,8 +162,9 @@ pub enum OutputFormat {
     JsonPretty,
 }
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, Default)]
 pub enum CliModelProvider {
+    #[default]
     #[value(name = "hugging-face")]
     HuggingFace,
 }

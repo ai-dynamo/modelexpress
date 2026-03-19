@@ -3,7 +3,7 @@
 
 use crate::database::ModelDatabase;
 use modelexpress_common::{
-    cache::CacheConfig,
+    cache::{CacheConfig, resolve_model_path},
     constants, download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
@@ -270,11 +270,39 @@ impl ModelService for ModelServiceImpl {
         // Get the model path using the provider from the request
         let provider_impl = download::get_provider(provider);
         let model_path = provider_impl
-            .get_model_path(&model_name, cache_dir)
+            .get_model_path(&model_name, cache_dir.clone())
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
         debug!("Model path resolved to: {:?}", model_path);
+
+        let commit_hash = if provider == ModelProvider::HuggingFace {
+            model_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from)
+        } else {
+            None
+        };
+
+        if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
+            return Err(Status::internal(
+                "Resolved Hugging Face model path did not contain a revision",
+            ));
+        }
+
+        let expected_model_path =
+            resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref()).map_err(
+                |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
+            )?;
+
+        if model_path != expected_model_path {
+            return Err(Status::internal(format!(
+                "Resolved model path '{}' does not match expected cache layout '{}'",
+                model_path.display(),
+                expected_model_path.display()
+            )));
+        }
 
         // Collect all files to stream
         let files = collect_model_files(&model_path, &model_path);
@@ -288,12 +316,6 @@ impl ModelService for ModelServiceImpl {
             "Found {} files to stream for model {}",
             total_files, model_name
         );
-
-        // Extract commit hash from model path (last component of path like .../snapshots/{commit_hash})
-        let commit_hash = model_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(String::from);
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
@@ -339,6 +361,11 @@ impl ModelService for ModelServiceImpl {
 
                     let is_last_chunk = offset.saturating_add(bytes_read as u64) >= *total_size;
 
+                    let first_chunk = is_first_chunk;
+                    if first_chunk {
+                        is_first_chunk = false;
+                    }
+
                     let chunk = FileChunk {
                         relative_path: relative_path.to_string_lossy().to_string(),
                         data: buffer[..bytes_read].to_vec(),
@@ -346,8 +373,7 @@ impl ModelService for ModelServiceImpl {
                         total_size: *total_size,
                         is_last_chunk,
                         is_last_file: is_last_file && is_last_chunk,
-                        commit_hash: if is_first_chunk {
-                            is_first_chunk = false;
+                        commit_hash: if first_chunk {
                             commit_hash.clone()
                         } else {
                             None
@@ -736,6 +762,7 @@ mod tests {
     use modelexpress_common::grpc::{
         api::ApiRequest, health::HealthRequest, model::ModelDownloadRequest,
     };
+    use modelexpress_common::test_support::{EnvVarGuard, acquire_env_mutex};
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
     use tonic::Request;
@@ -1129,5 +1156,45 @@ mod tests {
         assert!(result.is_err());
         let status = result.expect_err("Should return error");
         assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_hf_first_chunk_includes_commit_hash() {
+        let _env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set("HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
+            .expect("Failed to write model file");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+        });
+
+        let response = service
+            .stream_model_files(request)
+            .await
+            .expect("Expected stream response");
+        let mut stream = response.into_inner();
+        let first_chunk = stream
+            .next()
+            .await
+            .expect("Expected stream item")
+            .expect("Expected first chunk");
+
+        assert_eq!(first_chunk.relative_path, "config.json");
+        assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
+        assert!(first_chunk.is_last_chunk);
+        assert!(first_chunk.is_last_file);
     }
 }
