@@ -17,7 +17,8 @@ class TestProtobufCompatibility:
         """Regenerate p2p_pb2.py if this fails (see pyproject.toml [dev] deps)."""
         import modelexpress.p2p_pb2 as pb2
 
-        src = open(pb2.__file__).read()
+        with open(pb2.__file__) as f:
+            src = f.read()
         m = re.search(r"Protobuf Python Version: (\d+)\.", src)
         assert m, "Could not parse gencode version from p2p_pb2.py"
         gencode_major = int(m.group(1))

@@ -309,7 +309,7 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [test, integration-test, security-audit, docker-build, k8s-grpc-test]
+    needs: [test, python-test, integration-test, security-audit, docker-build, k8s-grpc-test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
@@ -352,7 +352,7 @@ jobs:
   notify:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [test, integration-test, security-audit, docker-build, k8s-grpc-test]
+    needs: [test, python-test, integration-test, security-audit, docker-build, k8s-grpc-test]
     if: failure()
 
     steps:
