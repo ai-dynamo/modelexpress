@@ -102,7 +102,7 @@ register_modelexpress_loaders()
 | Module | Description |
 |--------|-------------|
 | `modelexpress.client` | `MxClient` -- gRPC client for the ModelExpress server |
-| `modelexpress.vllm_loader` | `MxSourceModelLoader`, `MxTargetModelLoader` -- vLLM integration |
+| `modelexpress.vllm_loader` | `MxModelLoader` -- vLLM integration |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
 | `modelexpress.vllm_worker` | vLLM worker extensions |
