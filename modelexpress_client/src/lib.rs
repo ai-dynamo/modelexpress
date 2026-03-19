@@ -95,6 +95,60 @@ fn prepare_stream_model_dir(
     Ok((model_dir, canonical_model_dir))
 }
 
+async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<tokio::fs::File> {
+    match std::fs::symlink_metadata(file_path) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                return Err(modelexpress_common::Error::Server(format!(
+                    "Refusing to overwrite directory in model directory: {:?}",
+                    file_path
+                ))
+                .into());
+            }
+
+            if !metadata.is_file() && !metadata.file_type().is_symlink() {
+                return Err(modelexpress_common::Error::Server(format!(
+                    "Refusing to overwrite unsupported file type in model directory: {:?}",
+                    file_path
+                ))
+                .into());
+            }
+
+            // Existing HF snapshot entries may be symlinks into `blobs/`.
+            // Unlink the final path itself so we never follow it when recreating the file.
+            std::fs::remove_file(file_path).map_err(|e| {
+                modelexpress_common::Error::Server(format!(
+                    "Failed to replace existing file {:?}: {e}",
+                    file_path
+                ))
+            })?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(modelexpress_common::Error::Server(format!(
+                "Failed to inspect output file {:?}: {e}",
+                file_path
+            ))
+            .into());
+        }
+    }
+
+    // `create_new` ensures a final-path symlink introduced after the metadata
+    // check is rejected instead of being followed.
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file_path)
+        .await
+        .map_err(|e| {
+            modelexpress_common::Error::Server(format!(
+                "Failed to create file {:?}: {e}",
+                file_path
+            ))
+            .into()
+        })
+}
+
 impl Client {
     /// Create a new client with the given configuration
     pub async fn new(config: Config) -> CommonResult<Self> {
@@ -506,12 +560,7 @@ impl Client {
                 }
 
                 // Create new file (parent directory was already created during validation)
-                let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
-                    modelexpress_common::Error::Server(format!(
-                        "Failed to create file {:?}: {e}",
-                        file_path
-                    ))
-                })?;
+                let file = create_stream_output_file(&file_path).await?;
 
                 debug!(
                     "Starting to receive file: {:?} ({} bytes)",
@@ -725,6 +774,8 @@ mod tests {
         test_support::{EnvVarGuard, acquire_env_mutex},
     };
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::pin::Pin;
     use tempfile::TempDir;
     use tonic::{Request, Response, Status, transport::Server};
@@ -967,6 +1018,47 @@ mod tests {
             prepare_stream_model_dir(cache_root, ModelProvider::HuggingFace, "test/model", None);
 
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_create_stream_output_file_replaces_symlink_without_following_it() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_dir = temp_dir.path().join("model");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+
+        let outside_path = temp_dir.path().join("outside.txt");
+        std::fs::write(&outside_path, b"outside").expect("Failed to write outside file");
+
+        let file_path = model_dir.join("config.json");
+        symlink(&outside_path, &file_path).expect("Failed to create symlink");
+
+        let mut file = create_stream_output_file(&file_path)
+            .await
+            .expect("Expected symlink output path to be replaced");
+        file.write_all(b"inside")
+            .await
+            .expect("Failed to write replacement file");
+        file.sync_all()
+            .await
+            .expect("Failed to sync replacement file");
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_path).expect("Failed to read outside file"),
+            "outside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_path).expect("Failed to read replacement file"),
+            "inside"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&file_path)
+                .expect("Failed to stat replacement file")
+                .file_type()
+                .is_symlink(),
+            "Expected replacement file to no longer be a symlink"
+        );
     }
 
     #[tokio::test]
