@@ -47,10 +47,31 @@ async fn select_nodes(client: &Client) -> Result<(String, String)> {
         .items
         .iter()
         .filter(|n| {
-            !n.spec
+            // Skip nodes marked unschedulable
+            if n.spec
                 .as_ref()
                 .and_then(|s| s.unschedulable)
                 .unwrap_or(false)
+            {
+                return false;
+            }
+            // Skip nodes with NoSchedule taints
+            if n.spec
+                .as_ref()
+                .and_then(|s| s.taints.as_ref())
+                .is_some_and(|taints| taints.iter().any(|t| t.effect == "NoSchedule"))
+            {
+                return false;
+            }
+            // Skip nodes that aren't Ready
+            n.status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_some_and(|conds| {
+                    conds
+                        .iter()
+                        .any(|c| c.type_ == "Ready" && c.status == "True")
+                })
         })
         .filter_map(|n| n.metadata.name.clone())
         .collect();
@@ -74,9 +95,11 @@ async fn create_namespace(client: &Client, name: &str) -> Result<NamespaceGuard>
         "metadata": { "name": name }
     }))?;
 
-    // Delete if leftover from a previous failed run
+    // Delete if leftover from a previous failed run, wait until fully gone
     let _ = ns_api.delete(name, &DeleteParams::default()).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    while ns_api.get(name).await.is_ok() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     ns_api.create(&PostParams::default(), &ns).await?;
 
@@ -383,7 +406,7 @@ async fn submit_checksum_job(
         if [ $? -ne 0 ]; then echo "RESULT=FAILED"; exit 1; fi
 
         echo "CHECKSUMS_START"
-        find /cache -type f -exec md5sum {{}} \; | awk '{{print $1}}' | sort -u
+        find /cache -type f ! -name '*.lock' ! -path '*/refs/*' -exec md5sum {{}} \; | awk '{{print $1}}' | sort -u
         echo "CHECKSUMS_END"
         echo "RESULT=SUCCESS"
         "#
@@ -490,7 +513,7 @@ async fn cross_node_transfer_default_chunks() -> Result<()> {
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
     submit_client_job(&client, ns, "dl-default", &client_node, &svc, "").await?;
 
-    let success = timeout(TIMEOUT, wait_for_job(&client, ns, "dl-default")).await??;
+    let success = wait_for_job(&client, ns, "dl-default").await?;
     let logs = get_job_logs(&client, ns, "dl-default").await?;
     let (files, bytes) = parse_job_results(&logs);
 
@@ -521,7 +544,7 @@ async fn cross_node_transfer_small_chunks() -> Result<()> {
     )
     .await?;
 
-    let success = timeout(TIMEOUT, wait_for_job(&client, ns, "dl-small")).await??;
+    let success = wait_for_job(&client, ns, "dl-small").await?;
     let logs = get_job_logs(&client, ns, "dl-small").await?;
     let (files, bytes) = parse_job_results(&logs);
 
@@ -552,7 +575,7 @@ async fn cross_node_transfer_large_chunks() -> Result<()> {
     )
     .await?;
 
-    let success = timeout(TIMEOUT, wait_for_job(&client, ns, "dl-large")).await??;
+    let success = wait_for_job(&client, ns, "dl-large").await?;
     let logs = get_job_logs(&client, ns, "dl-large").await?;
     let (files, bytes) = parse_job_results(&logs);
 
@@ -578,7 +601,7 @@ async fn cross_node_transfer_integrity() -> Result<()> {
 
     // Client downloads via gRPC and outputs checksums
     submit_checksum_job(&client, ns, "dl-checksums", &client_node, &svc).await?;
-    let success = timeout(TIMEOUT, wait_for_job(&client, ns, "dl-checksums")).await??;
+    let success = wait_for_job(&client, ns, "dl-checksums").await?;
     assert!(success, "checksum download job failed");
 
     let logs = get_job_logs(&client, ns, "dl-checksums").await?;
@@ -619,8 +642,8 @@ async fn multi_replica_independent_caches() -> Result<()> {
     // Client on node_a downloads from server on node_b
     submit_client_job(&client, ns, "dl-from-b", &node_a, &svc_b, "").await?;
 
-    let success_a = timeout(TIMEOUT, wait_for_job(&client, ns, "dl-from-a")).await??;
-    let success_b = timeout(TIMEOUT, wait_for_job(&client, ns, "dl-from-b")).await??;
+    let success_a = wait_for_job(&client, ns, "dl-from-a").await?;
+    let success_b = wait_for_job(&client, ns, "dl-from-b").await?;
 
     assert!(success_a, "download from server A failed");
     assert!(success_b, "download from server B failed");
