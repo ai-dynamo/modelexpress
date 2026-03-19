@@ -23,13 +23,19 @@ python -m grpc_tools.protoc \
 
 # Fix relative import in grpc file
 echo "Fixing imports in p2p_pb2_grpc.py..."
-sed -i'' 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "${OUT_DIR}/p2p_pb2_grpc.py"
+tmp_grpc=$(mktemp)
+sed 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "${OUT_DIR}/p2p_pb2_grpc.py" > "${tmp_grpc}"
+mv "${tmp_grpc}" "${OUT_DIR}/p2p_pb2_grpc.py"
 
-# Add SPDX header to generated files
+# Add SPDX header to generated files (skip if already present)
 for file in "${OUT_DIR}/p2p_pb2.py" "${OUT_DIR}/p2p_pb2_grpc.py"; do
+    if grep -q "SPDX-License-Identifier" "${file}"; then
+        echo "SPDX header already present in ${file}, skipping"
+        continue
+    fi
     echo "Adding SPDX header to ${file}..."
     tmp_file=$(mktemp)
-    echo "${SPDX_HEADER}" > "${tmp_file}"
+    printf '%s\n' "${SPDX_HEADER}" > "${tmp_file}"
     cat "${file}" >> "${tmp_file}"
     mv "${tmp_file}" "${file}"
 done

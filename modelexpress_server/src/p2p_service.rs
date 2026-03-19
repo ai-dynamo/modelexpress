@@ -45,7 +45,7 @@ impl P2pService for P2pServiceImpl {
                     success: false,
                     message: "identity is required".to_string(),
                     mx_source_id: String::new(),
-                    instance_id: String::new(),
+                    worker_id: String::new(),
                 }));
             }
         };
@@ -55,43 +55,55 @@ impl P2pService for P2pServiceImpl {
                 success: false,
                 message: e,
                 mx_source_id: String::new(),
-                instance_id: String::new(),
+                worker_id: String::new(),
             }));
         }
 
-        if req.instance_id.is_empty() {
+        if req.worker_id.is_empty() {
             return Ok(Response::new(PublishMetadataResponse {
                 success: false,
-                message: "instance_id is required".to_string(),
+                message: "worker_id is required".to_string(),
                 mx_source_id: String::new(),
-                instance_id: String::new(),
+                worker_id: String::new(),
             }));
         }
 
+        let worker = match req.worker {
+            Some(w) => w,
+            None => {
+                return Ok(Response::new(PublishMetadataResponse {
+                    success: false,
+                    message: "worker is required".to_string(),
+                    mx_source_id: String::new(),
+                    worker_id: String::new(),
+                }));
+            }
+        };
+
         let source_id = compute_mx_source_id(&identity);
-        let instance_id = req.instance_id.clone();
+        let worker_id = req.worker_id.clone();
         let model_name = identity.model_name.clone();
-        let num_workers = req.workers.len();
-        let total_tensors: usize = req.workers.iter().map(|w| w.tensors.len()).sum();
+        let worker_rank = worker.worker_rank;
+        let tensor_count = worker.tensors.len();
 
         match self
             .state
-            .publish_metadata(&identity, &instance_id, req.workers)
+            .publish_metadata(&identity, &worker_id, vec![worker])
             .await
         {
             Ok(()) => {
                 info!(
-                    "PublishMetadata: model='{}' source_id={} instance_id={} workers={} tensors={}",
-                    model_name, source_id, instance_id, num_workers, total_tensors
+                    "PublishMetadata: model='{}' source_id={} worker_id={} worker_rank={} tensors={}",
+                    model_name, source_id, worker_id, worker_rank, tensor_count
                 );
                 Ok(Response::new(PublishMetadataResponse {
                     success: true,
                     message: format!(
-                        "Published metadata for '{}' (source_id={}, instance_id={}, {} workers, {} tensors)",
-                        model_name, source_id, instance_id, num_workers, total_tensors
+                        "Published metadata for '{}' (source_id={}, worker_id={}, worker_rank={}, {} tensors)",
+                        model_name, source_id, worker_id, worker_rank, tensor_count
                     ),
                     mx_source_id: source_id,
-                    instance_id,
+                    worker_id,
                 }))
             }
             Err(e) => {
@@ -100,7 +112,7 @@ impl P2pService for P2pServiceImpl {
                     success: false,
                     message: format!("Failed to publish metadata: {e}"),
                     mx_source_id: String::new(),
-                    instance_id: String::new(),
+                    worker_id: String::new(),
                 }))
             }
         }
@@ -144,8 +156,9 @@ impl P2pService for P2pServiceImpl {
             .into_iter()
             .map(|info| SourceInstanceRef {
                 mx_source_id: info.source_id,
-                instance_id: info.instance_id,
+                worker_id: info.instance_id,
                 model_name: info.model_name,
+                worker_rank: info.worker_rank,
             })
             .collect();
 
@@ -160,63 +173,57 @@ impl P2pService for P2pServiceImpl {
     ) -> Result<Response<GetMetadataResponse>, Status> {
         let req = request.into_inner();
 
-        if req.mx_source_id.is_empty() || req.instance_id.is_empty() {
+        if req.mx_source_id.is_empty() || req.worker_id.is_empty() {
             return Ok(Response::new(GetMetadataResponse {
                 found: false,
-                workers: Vec::new(),
+                worker: None,
                 mx_source_id: String::new(),
-                instance_id: String::new(),
+                worker_id: String::new(),
             }));
         }
 
         match self
             .state
-            .get_metadata(&req.mx_source_id, &req.instance_id)
+            .get_metadata(&req.mx_source_id, &req.worker_id)
             .await
         {
             Ok(Some(record)) => {
-                let total_tensors: usize = record.workers.iter().map(|w| w.tensors.len()).sum();
+                // Each worker_id maps to exactly one worker record; take the first.
+                let worker = record.workers.into_iter().next().map(WorkerMetadata::from);
+                let found = worker.is_some();
                 info!(
-                    "GetMetadata '{}' (source_id={}, instance_id={}): {} workers, {} tensors",
+                    "GetMetadata '{}' (source_id={}, worker_id={}): {} tensors",
                     record.model_name,
                     req.mx_source_id,
-                    req.instance_id,
-                    record.workers.len(),
-                    total_tensors
+                    req.worker_id,
+                    worker.as_ref().map_or(0, |w| w.tensors.len()),
                 );
-
-                let workers: Vec<WorkerMetadata> = record
-                    .workers
-                    .into_iter()
-                    .map(WorkerMetadata::from)
-                    .collect();
-
                 Ok(Response::new(GetMetadataResponse {
-                    found: true,
-                    workers,
+                    found,
+                    worker,
                     mx_source_id: req.mx_source_id,
-                    instance_id: req.instance_id,
+                    worker_id: req.worker_id,
                 }))
             }
             Ok(None) => {
                 info!(
-                    "No metadata found for source_id={} instance_id={}",
-                    req.mx_source_id, req.instance_id
+                    "No metadata found for source_id={} worker_id={}",
+                    req.mx_source_id, req.worker_id
                 );
                 Ok(Response::new(GetMetadataResponse {
                     found: false,
-                    workers: Vec::new(),
+                    worker: None,
                     mx_source_id: req.mx_source_id,
-                    instance_id: req.instance_id,
+                    worker_id: req.worker_id,
                 }))
             }
             Err(e) => {
                 error!("Failed to get metadata: {}", e);
                 Ok(Response::new(GetMetadataResponse {
                     found: false,
-                    workers: Vec::new(),
+                    worker: None,
                     mx_source_id: String::new(),
-                    instance_id: String::new(),
+                    worker_id: String::new(),
                 }))
             }
         }
@@ -235,10 +242,10 @@ impl P2pService for P2pServiceImpl {
             }));
         }
 
-        if req.instance_id.is_empty() {
+        if req.worker_id.is_empty() {
             return Ok(Response::new(UpdateStatusResponse {
                 success: false,
-                message: "instance_id is required".to_string(),
+                message: "worker_id is required".to_string(),
             }));
         }
 
@@ -254,14 +261,14 @@ impl P2pService for P2pServiceImpl {
 
         match self
             .state
-            .update_worker_status(&req.mx_source_id, &req.instance_id, req.worker_id, status)
+            .update_worker_status(&req.mx_source_id, &req.worker_id, req.worker_rank, status)
             .await
         {
             Ok(()) => Ok(Response::new(UpdateStatusResponse {
                 success: true,
                 message: format!(
-                    "Updated status for source '{}' instance '{}' worker {}",
-                    req.mx_source_id, req.instance_id, req.worker_id
+                    "Updated status for source '{}' worker_id '{}' rank {}",
+                    req.mx_source_id, req.worker_id, req.worker_rank
                 ),
             })),
             Err(e) => {
@@ -312,8 +319,8 @@ mod tests {
         let resp = svc
             .publish_metadata(Request::new(PublishMetadataRequest {
                 identity: None,
-                workers: vec![],
-                instance_id: "test-instance".to_string(),
+                worker: None,
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
@@ -330,8 +337,8 @@ mod tests {
         let resp = svc
             .publish_metadata(Request::new(PublishMetadataRequest {
                 identity: Some(id),
-                workers: vec![],
-                instance_id: "test-instance".to_string(),
+                worker: None,
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
@@ -340,19 +347,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publish_metadata_missing_instance_id() {
+    async fn test_publish_metadata_missing_worker_id() {
         let svc = make_service(MockMetadataBackend::new());
         let resp = svc
             .publish_metadata(Request::new(PublishMetadataRequest {
                 identity: Some(test_identity()),
-                workers: vec![],
-                instance_id: String::new(),
+                worker: None,
+                worker_id: String::new(),
             }))
             .await
             .expect("rpc")
             .into_inner();
         assert!(!resp.success);
-        assert!(resp.message.contains("instance_id"));
+        assert!(resp.message.contains("worker_id"));
     }
 
     #[tokio::test]
@@ -366,7 +373,7 @@ mod tests {
         let resp = svc
             .publish_metadata(Request::new(PublishMetadataRequest {
                 identity: Some(test_identity()),
-                workers: vec![WorkerMetadata {
+                worker: Some(WorkerMetadata {
                     worker_rank: 0,
                     backend_metadata: Some(
                         modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata::NixlMetadata(vec![1, 2, 3]),
@@ -374,8 +381,8 @@ mod tests {
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
-                }],
-                instance_id: "test-instance".to_string(),
+                }),
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
@@ -383,7 +390,7 @@ mod tests {
         assert!(resp.success);
         assert!(!resp.mx_source_id.is_empty());
         assert_eq!(resp.mx_source_id.len(), 16);
-        assert_eq!(resp.instance_id, "test-instance");
+        assert_eq!(resp.worker_id, "worker-uuid-1");
     }
 
     #[tokio::test]
@@ -397,8 +404,14 @@ mod tests {
         let resp = svc
             .publish_metadata(Request::new(PublishMetadataRequest {
                 identity: Some(test_identity()),
-                workers: vec![],
-                instance_id: "test-instance".to_string(),
+                worker: Some(WorkerMetadata {
+                    worker_rank: 0,
+                    backend_metadata: None,
+                    tensors: vec![],
+                    status: SourceStatus::Initializing as i32,
+                    updated_at: 0,
+                }),
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
@@ -415,13 +428,13 @@ mod tests {
         let resp = svc
             .get_metadata(Request::new(GetMetadataRequest {
                 mx_source_id: String::new(),
-                instance_id: "test-instance".to_string(),
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
             .into_inner();
         assert!(!resp.found);
-        assert!(resp.workers.is_empty());
+        assert!(resp.worker.is_none());
     }
 
     #[tokio::test]
@@ -429,10 +442,10 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_get_metadata()
             .once()
-            .returning(|source_id, instance_id| {
+            .returning(|source_id, worker_id| {
                 Ok(Some(ModelMetadataRecord {
                     source_id: source_id.to_string(),
-                    instance_id: instance_id.to_string(),
+                    instance_id: worker_id.to_string(),
                     model_name: "my-model".to_string(),
                     workers: vec![WorkerRecord {
                         worker_rank: 0,
@@ -449,16 +462,16 @@ mod tests {
         let resp = svc
             .get_metadata(Request::new(GetMetadataRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
-                instance_id: "test-instance".to_string(),
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
             .into_inner();
         assert!(resp.found);
-        assert_eq!(resp.workers.len(), 1);
-        assert_eq!(resp.workers[0].status, SourceStatus::Ready as i32);
+        assert!(resp.worker.is_some());
+        assert_eq!(resp.worker.unwrap().status, SourceStatus::Ready as i32);
         assert_eq!(resp.mx_source_id, "abc123def456abcd");
-        assert_eq!(resp.instance_id, "test-instance");
+        assert_eq!(resp.worker_id, "worker-uuid-1");
     }
 
     #[tokio::test]
@@ -470,13 +483,13 @@ mod tests {
         let resp = svc
             .get_metadata(Request::new(GetMetadataRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
-                instance_id: "test-instance".to_string(),
+                worker_id: "worker-uuid-1".to_string(),
             }))
             .await
             .expect("rpc")
             .into_inner();
         assert!(!resp.found);
-        assert!(resp.workers.is_empty());
+        assert!(resp.worker.is_none());
         assert_eq!(resp.mx_source_id, "abc123def456abcd");
     }
 
@@ -488,8 +501,8 @@ mod tests {
         let resp = svc
             .update_status(Request::new(UpdateStatusRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
-                instance_id: "test-instance".to_string(),
-                worker_id: 0,
+                worker_id: "worker-uuid-1".to_string(),
+                worker_rank: 0,
                 status: 99,
             }))
             .await
@@ -505,8 +518,8 @@ mod tests {
         let resp = svc
             .update_status(Request::new(UpdateStatusRequest {
                 mx_source_id: String::new(),
-                instance_id: "test-instance".to_string(),
-                worker_id: 0,
+                worker_id: "worker-uuid-1".to_string(),
+                worker_rank: 0,
                 status: SourceStatus::Ready as i32,
             }))
             .await
@@ -516,13 +529,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_status_empty_instance_id() {
+    async fn test_update_status_empty_worker_id() {
         let svc = make_service(MockMetadataBackend::new());
         let resp = svc
             .update_status(Request::new(UpdateStatusRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
-                instance_id: String::new(),
-                worker_id: 0,
+                worker_id: String::new(),
+                worker_rank: 0,
                 status: SourceStatus::Ready as i32,
             }))
             .await
@@ -542,8 +555,8 @@ mod tests {
         let resp = svc
             .update_status(Request::new(UpdateStatusRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
-                instance_id: "test-instance".to_string(),
-                worker_id: 3,
+                worker_id: "worker-uuid-1".to_string(),
+                worker_rank: 3,
                 status: SourceStatus::Ready as i32,
             }))
             .await
@@ -563,8 +576,8 @@ mod tests {
         let resp = svc
             .update_status(Request::new(UpdateStatusRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
-                instance_id: "test-instance".to_string(),
-                worker_id: 0,
+                worker_id: "worker-uuid-1".to_string(),
+                worker_rank: 0,
                 status: SourceStatus::Ready as i32,
             }))
             .await

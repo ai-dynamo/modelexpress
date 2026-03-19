@@ -68,11 +68,11 @@ spec:
                         type: string
                         description: Worker lifecycle status
                         enum:
+                          - Unknown
                           - Initializing
-                          - PendingVerification
                           - Ready
                           - Stale
-                        default: Initializing
+                        default: Unknown
                       updatedAt:
                         type: string
                         format: date-time
