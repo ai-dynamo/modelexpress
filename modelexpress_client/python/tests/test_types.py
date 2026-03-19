@@ -3,7 +3,32 @@
 
 """Tests for ModelExpress type definitions."""
 
+import re
+
+from google.protobuf import __version__ as _pb_version
+
 from modelexpress.types import TensorDescriptor, WorkerMetadata, GetMetadataResponse
+
+
+class TestProtobufCompatibility:
+    """Guard against generated protobuf code drifting from the installed runtime."""
+
+    def test_p2p_pb2_gencode_matches_runtime_major_version(self):
+        """Regenerate p2p_pb2.py if this fails (see pyproject.toml [dev] deps)."""
+        import modelexpress.p2p_pb2 as pb2
+
+        src = open(pb2.__file__).read()
+        m = re.search(r"Protobuf Python Version: (\d+)\.", src)
+        assert m, "Could not parse gencode version from p2p_pb2.py"
+        gencode_major = int(m.group(1))
+        runtime_major = int(_pb_version.split(".")[0])
+        assert gencode_major == runtime_major, (
+            f"p2p_pb2.py was generated with protobuf {gencode_major}.x "
+            f"but runtime is {runtime_major}.x - regenerate with: "
+            f"python -m grpc_tools.protoc -I../../modelexpress_common/proto "
+            f"--python_out=modelexpress --grpc_python_out=modelexpress "
+            f"../../modelexpress_common/proto/p2p.proto"
+        )
 
 
 class TestTensorDescriptor:
