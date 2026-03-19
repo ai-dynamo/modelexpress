@@ -11,39 +11,54 @@ import torch.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# _collect_cuda_tensors
+# _collect_module_tensors
 # ---------------------------------------------------------------------------
 
 
-class TestCollectCudaTensors:
-    """Tests for the _collect_cuda_tensors helper."""
+class TestCollectModuleTensors:
+    """Tests for the _collect_module_tensors helper."""
 
     def test_empty_model(self):
-        from modelexpress.vllm_loader import _collect_cuda_tensors
+        from modelexpress.vllm_loader import _collect_module_tensors
 
         model = nn.Module()
-        result = _collect_cuda_tensors(model)
+        result = _collect_module_tensors(model)
         assert result == {}
 
     def test_cpu_only_model(self):
-        from modelexpress.vllm_loader import _collect_cuda_tensors
+        from modelexpress.vllm_loader import _collect_module_tensors
 
         model = nn.Linear(4, 2, bias=False)
-        # Parameters default to CPU
-        result = _collect_cuda_tensors(model)
+        # Parameters default to CPU -- not CUDA, so should be empty
+        result = _collect_module_tensors(model)
         assert result == {}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_model(self):
-        from modelexpress.vllm_loader import _collect_cuda_tensors
+        from modelexpress.vllm_loader import _collect_module_tensors
 
         model = nn.Linear(4, 2, bias=True).cuda()
-        result = _collect_cuda_tensors(model)
+        result = _collect_module_tensors(model)
         assert len(result) == 2  # weight + bias
         assert "weight" in result
         assert "bias" in result
         for t in result.values():
             assert t.is_cuda
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_skips_non_contiguous(self):
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        # Register a contiguous parameter
+        model.weight = nn.Parameter(torch.randn(4, 3, device="cuda"))
+        # Attach a non-contiguous view (transpose)
+        model.weight_t = model.weight.data.T
+        assert not model.weight_t.is_contiguous()
+
+        result = _collect_module_tensors(model)
+        assert "weight" in result
+        assert "weight_t" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -51,23 +66,19 @@ class TestCollectCudaTensors:
 # ---------------------------------------------------------------------------
 
 
-class _FakeReadyResponse:
-    """Minimal stand-in for p2p_pb2.GetReadyResponse."""
-
-    def __init__(self, found=False, ready=False, session_id="", metadata_hash=""):
-        self.found = found
-        self.ready = ready
-        self.session_id = session_id
-        self.metadata_hash = metadata_hash
-
-
 class _FakeWorker:
     """Minimal stand-in for p2p_pb2.WorkerMetadata."""
 
-    def __init__(self, worker_rank, tensors=None, nixl_metadata=b""):
+    def __init__(self, worker_rank, tensors=None, nixl_metadata=b"", status=None):
         self.worker_rank = worker_rank
         self.tensors = tensors or []
         self.nixl_metadata = nixl_metadata
+        # Default to SOURCE_STATUS_READY (value 2 in the proto enum)
+        if status is None:
+            from modelexpress import p2p_pb2
+            self.status = p2p_pb2.SOURCE_STATUS_READY
+        else:
+            self.status = status
 
 
 class _FakeTensor:
@@ -122,17 +133,25 @@ class TestDetectSource:
     def test_server_unreachable(self, _mock_nixl):
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.side_effect = Exception("connection refused")
+        loader._mx_client.get_metadata.side_effect = Exception("connection refused")
 
         result = loader._detect_source("model", device_id=0)
         assert result is None
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
     def test_not_ready(self, _mock_nixl):
+        from modelexpress import p2p_pb2
+
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=False
+        # Worker exists but status is not READY
+        loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
+            found=True,
+            workers=[_FakeWorker(
+                worker_rank=0,
+                tensors=[_FakeTensor()],
+                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+            )],
         )
 
         result = loader._detect_source("model", device_id=0)
@@ -142,9 +161,6 @@ class TestDetectSource:
     def test_ready_no_metadata(self, _mock_nixl):
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=True, session_id="abc"
-        )
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(found=False)
 
         result = loader._detect_source("model", device_id=0)
@@ -154,9 +170,6 @@ class TestDetectSource:
     def test_ready_wrong_rank(self, _mock_nixl):
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=True, session_id="abc"
-        )
         # Source has rank 1 but we need rank 0
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
             found=True,
@@ -170,9 +183,6 @@ class TestDetectSource:
     def test_happy_path(self, _mock_nixl):
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=True, session_id="session-123"
-        )
         worker = _FakeWorker(
             worker_rank=0,
             tensors=[_FakeTensor(name="layer.0.weight")],
@@ -244,16 +254,11 @@ class TestAbstractMethodCompleteness:
 class TestPublishMetadataAndReady:
     """Tests for the _publish_metadata_and_ready helper."""
 
-    @patch("modelexpress.vllm_loader.p2p_pb2", create=True)
-    def test_publishes_correct_tensor_count(self, mock_pb2):
+    def test_publishes_correct_tensor_count(self):
         from modelexpress.vllm_loader import _publish_metadata_and_ready
-
-        mock_pb2.TensorDescriptor = MagicMock()
-        mock_pb2.WorkerMetadata = MagicMock()
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = True
-        mx_client.session_id = "test-session"
 
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"metadata"
@@ -272,19 +277,13 @@ class TestPublishMetadataAndReady:
                 mx_client, nixl_manager, tensors, device_id=0, model_name="test-model"
             )
 
-        # Check that publish_metadata was called with the worker proto
         mx_client.publish_metadata.assert_called_once()
-        # Check that publish_ready was called
-        mx_client.publish_ready.assert_called_once()
-        call_kwargs = mx_client.publish_ready.call_args
+        mx_client.update_status.assert_called_once()
+        call_kwargs = mx_client.update_status.call_args
         assert call_kwargs[1]["model_name"] == "test-model" or call_kwargs.kwargs.get("model_name") == "test-model"
 
-    @patch("modelexpress.vllm_loader.p2p_pb2", create=True)
-    def test_publish_failure_does_not_publish_ready(self, mock_pb2):
+    def test_publish_failure_raises(self):
         from modelexpress.vllm_loader import _publish_metadata_and_ready
-
-        mock_pb2.TensorDescriptor = MagicMock()
-        mock_pb2.WorkerMetadata = MagicMock()
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = False
@@ -293,8 +292,9 @@ class TestPublishMetadataAndReady:
         nixl_manager.nixl_metadata = b"metadata"
 
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
-            _publish_metadata_and_ready(
-                mx_client, nixl_manager, {}, device_id=0, model_name="test"
-            )
+            with pytest.raises(RuntimeError, match="Failed to publish metadata"):
+                _publish_metadata_and_ready(
+                    mx_client, nixl_manager, {}, device_id=0, model_name="test"
+                )
 
-        mx_client.publish_ready.assert_not_called()
+        mx_client.update_status.assert_not_called()

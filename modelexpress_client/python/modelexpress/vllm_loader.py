@@ -483,8 +483,8 @@ class MxModelLoader(BaseModelLoader):
         # RDMA receive (fully-processed tensors, no post-processing needed)
         self._receive_from_peer(model, device_id, model_name, source_worker)
 
-        # Register with NIXL + publish so future nodes can discover us
-        self._register_and_publish(model, target_device, device_id, model_name)
+        # Publish metadata
+        self._publish_metadata(device_id, model_name)
 
     def _receive_from_peer(
         self,
@@ -495,20 +495,7 @@ class MxModelLoader(BaseModelLoader):
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
-
-        target_tensors = _collect_module_tensors(model)
-        _log_tensor_summary(target_tensors, device_id, "Target tensors (RDMA buffers)")
-
-        # Initialize NIXL manager and register target tensors for RDMA
-        init_start = time.perf_counter()
-        self._nixl_manager = _init_nixl_manager(device_id, "auto")
-        nixl_init_time = time.perf_counter() - init_start
-        logger.info(f"[Worker {device_id}] [TIMING] NIXL manager initialized in {nixl_init_time:.3f}s")
-
-        reg_start = time.perf_counter()
-        self._nixl_manager.register_tensors(target_tensors)
-        reg_time = time.perf_counter() - reg_start
-        logger.info(f"[Worker {device_id}] [TIMING] Target tensors registered in {reg_time:.3f}s")
+        self._register_tensors(model, device_id)
 
         # Build source tensor descriptors
         source_tensors = [
@@ -603,41 +590,35 @@ class MxModelLoader(BaseModelLoader):
         # Process weights FIRST, then register final tensors
         process_weights_after_loading(model, model_config, target_device)
 
-        # Register with NIXL + publish
-        self._register_and_publish(model, target_device, device_id, model_name)
+        # Register tensors
+        self._register_tensors(model, device_id)
+
+        # Publish metadata
+        self._publish_metadata(device_id, model_name)
 
     # ------------------------------------------------------------------
     # Shared: register with NIXL and publish metadata
     # ------------------------------------------------------------------
 
-    def _register_and_publish(
-        self,
-        model: nn.Module,
-        device: torch.device,
-        device_id: int,
-        model_name: str,
-    ) -> None:
-        """Register tensors with NIXL and publish metadata to the MX server."""
+    def _register_tensors(self, model: nn.Module, device_id: int) -> None:
+        """Collect model tensors and register them with NIXL."""
         if not is_nixl_available():
             logger.warning(f"[Worker {device_id}] NIXL not available, skipping registration")
             return
 
-        tensors = _collect_module_tensors(model)
-        self._tensors = tensors
-        _log_tensor_summary(tensors, device_id, "Registering tensors")
+        self._tensors = _collect_module_tensors(model)
+        _log_tensor_summary(self._tensors, device_id, "Registering tensors")
 
         if self._nixl_manager is None:
             self._nixl_manager = _init_nixl_manager(device_id, "auto")
 
-        # Only register if not already registered (target path already did this)
         if not self._nixl_manager.tensor_descriptors:
             logger.debug(f"[Worker {device_id}] Registering tensors with NIXL...")
-            self._nixl_manager.register_tensors(tensors)
+            self._nixl_manager.register_tensors(self._tensors)
             logger.debug(f"[Worker {device_id}] Tensors registered with NIXL")
 
-        _tensor_registry[device_id] = tensors
-        _nixl_managers[device_id] = self._nixl_manager
-
+    def _publish_metadata(self, device_id: int, model_name: str) -> None:
+        """Publish metadata to the MX server."""
         # Optional synchronized publish
         sync_publish = os.environ.get("MX_SYNC_PUBLISH", "0") == "1"
         if sync_publish:
@@ -653,7 +634,7 @@ class MxModelLoader(BaseModelLoader):
 
         if model_name:
             _publish_metadata_and_ready(
-                self._mx_client, self._nixl_manager, tensors, device_id, model_name
+                self._mx_client, self._nixl_manager, self._tensors, device_id, model_name
             )
         else:
             logger.warning(f"[Worker {device_id}] No model name available, skipping publish")
@@ -675,12 +656,3 @@ class MxModelLoader(BaseModelLoader):
     def tensors(self) -> dict[str, torch.Tensor]:
         """Access the registered tensor dict."""
         return self._tensors
-
-
-# Global storage for tensor metadata, keyed by device_id.
-# Required because vLLM's loader API doesn't expose loader instances after
-# load_model() returns. Source loaders store state here so the MxClient
-# (running in the same worker process) can access NIXL managers and tensors.
-# Each device_id maps to exactly one loader, so there are no concurrent writers.
-_tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
-_nixl_managers: dict[int, "NixlTransferManager"] = {}

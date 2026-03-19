@@ -447,8 +447,6 @@ Detection is a one-shot check with no retry loop. If the source is still warming
 
 The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_module_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
 
-Module-level globals `_tensor_registry` and `_nixl_managers` in `vllm_loader.py` bridge loaders and clients - vLLM's loader API doesn't expose loader instances after `load_model()` returns, so source loaders store state in these dicts (keyed by device ID) for the MxClient to access.
-
 ### Tensor Discovery
 
 The loader uses `_iter_module_tensors()` to walk the full PyTorch module tree and find all CUDA tensors after post-processing. This discovers three categories:
