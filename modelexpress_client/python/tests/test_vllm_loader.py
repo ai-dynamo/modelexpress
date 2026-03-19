@@ -123,12 +123,6 @@ class TestFindSourceInstances:
         assert result == []
         loader._mx_client.list_sources.assert_not_called()
 
-    def test_returns_empty_when_no_model_name(self):
-        loader = _make_loader()
-        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True):
-            result = loader._find_source_instances(_make_identity(model_name=""), device_id=0)
-        assert result == []
-
     def test_returns_empty_when_no_instances(self):
         loader = _make_loader()
         loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[])
@@ -154,148 +148,178 @@ class TestFindSourceInstances:
             status_filter=p2p_pb2.SOURCE_STATUS_READY,
         )
 
-    def test_returns_instance_with_matching_rank(self):
+    def test_does_not_call_get_metadata(self):
+        """Metadata is fetched on demand by the caller, not here."""
         loader = _make_loader()
         inst = _make_instance_ref()
         loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[inst])
-        loader._mx_client.get_metadata.return_value = _make_metadata_resp(rank=0)
+        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True):
+            loader._find_source_instances(_make_identity(), device_id=0)
+        loader._mx_client.get_metadata.assert_not_called()
+
+    def test_returns_source_instance_refs(self):
+        loader = _make_loader()
+        inst = _make_instance_ref()
+        loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[inst])
         with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True), \
              patch("modelexpress.vllm_loader.random.shuffle"):
             result = loader._find_source_instances(_make_identity(), device_id=0)
         assert len(result) == 1
-        w, mx_id, iid = result[0]
-        assert w.worker_rank == 0
-        assert mx_id == inst.mx_source_id
-        assert iid == inst.instance_id
+        assert result[0].mx_source_id == inst.mx_source_id
+        assert result[0].instance_id == inst.instance_id
 
-    def test_skips_instance_when_metadata_not_found(self):
-        loader = _make_loader()
-        loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
-            instances=[_make_instance_ref()]
-        )
-        loader._mx_client.get_metadata.return_value = _make_metadata_resp(found=False)
-        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True):
-            result = loader._find_source_instances(_make_identity(), device_id=0)
-        assert result == []
-
-    def test_skips_instance_when_no_matching_rank(self):
-        loader = _make_loader()
-        loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
-            instances=[_make_instance_ref()]
-        )
-        # Instance has rank 1, we are rank 0
-        loader._mx_client.get_metadata.return_value = _make_metadata_resp(rank=1)
-        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True):
-            result = loader._find_source_instances(_make_identity(), device_id=0)
-        assert result == []
-
-    def test_skips_instance_when_get_metadata_raises(self):
-        loader = _make_loader()
-        loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
-            instances=[_make_instance_ref()]
-        )
-        loader._mx_client.get_metadata.side_effect = RuntimeError("connection refused")
-        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True):
-            result = loader._find_source_instances(_make_identity(), device_id=0)
-        assert result == []
-
-    def test_returns_multiple_matching_instances(self):
+    def test_returns_all_instances_regardless_of_rank(self):
+        """Rank filtering happens in the caller; all instances are returned here."""
         loader = _make_loader()
         insts = [_make_instance_ref(instance_id="inst-1"), _make_instance_ref(instance_id="inst-2")]
         loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=insts)
-        loader._mx_client.get_metadata.side_effect = [
-            _make_metadata_resp(rank=0, instance_id="inst-1"),
-            _make_metadata_resp(rank=0, instance_id="inst-2"),
-        ]
         with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True), \
              patch("modelexpress.vllm_loader.random.shuffle"):
             result = loader._find_source_instances(_make_identity(), device_id=0)
         assert len(result) == 2
 
-    def test_skips_instances_without_tensors(self):
+
+# ---------------------------------------------------------------------------
+# _fetch_worker_metadata
+# ---------------------------------------------------------------------------
+
+
+class TestFetchWorkerMetadata:
+    def test_returns_worker_with_matching_rank(self):
         loader = _make_loader()
-        loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
-            instances=[_make_instance_ref()]
-        )
-        # Worker has matching rank but no tensors
+        loader._mx_client.get_metadata.return_value = _make_metadata_resp(rank=0)
+        result = loader._fetch_worker_metadata("src", "inst-1", device_id=0)
+        assert result is not None
+        assert result.worker_rank == 0
+
+    def test_returns_none_when_not_found(self):
+        loader = _make_loader()
+        loader._mx_client.get_metadata.return_value = _make_metadata_resp(found=False)
+        result = loader._fetch_worker_metadata("src", "inst-1", device_id=0)
+        assert result is None
+
+    def test_returns_none_when_no_matching_rank(self):
+        loader = _make_loader()
+        loader._mx_client.get_metadata.return_value = _make_metadata_resp(rank=1)
+        result = loader._fetch_worker_metadata("src", "inst-1", device_id=0)
+        assert result is None
+
+    def test_returns_none_when_worker_has_no_tensors(self):
+        loader = _make_loader()
         empty_worker = p2p_pb2.WorkerMetadata(worker_rank=0, tensors=[])
         loader._mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
             found=True, workers=[empty_worker]
         )
-        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True):
-            result = loader._find_source_instances(_make_identity(), device_id=0)
-        assert result == []
+        result = loader._fetch_worker_metadata("src", "inst-1", device_id=0)
+        assert result is None
 
 
 # ---------------------------------------------------------------------------
-# STALE marking on transfer failure
+# _try_load_from_candidates
 # ---------------------------------------------------------------------------
 
 
-class TestStaleMarkingOnFailure:
-    def test_marks_stale_on_failed_instance(self):
-        """Failed instance is marked STALE before trying the next one."""
-        loader = _make_loader()
+class TestTryLoadFromCandidates:
+    def _setup(self, loader, candidates, metadata_side_effects, load_raises_for=None):
+        loader._mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+            instances=candidates
+        )
+        loader._mx_client.get_metadata.side_effect = metadata_side_effects
         attempts = []
 
-        def fake_load_as_target(_model, _cfg, _dev, _did, _ident, _worker, mx_source_id, instance_id):
+        def fake_load_as_target(_m, _mc, _td, _did, _ident, _worker, _mx_id, instance_id):
             attempts.append(instance_id)
-            if instance_id == "inst-1":
-                raise RuntimeError("NIXL connect failed")
+            if load_raises_for and instance_id in load_raises_for:
+                raise RuntimeError(f"transfer failed: {instance_id}")
 
         loader._load_as_target = fake_load_as_target
+        loader._load_as_source = MagicMock()
+        return attempts
 
-        instances = [
-            (_make_worker(rank=0), "src-id", "inst-1"),
-            (_make_worker(rank=0), "src-id", "inst-2"),
+    def test_returns_true_on_first_success(self):
+        loader = _make_loader()
+        candidates = [_make_instance_ref(instance_id="inst-1")]
+        attempts = self._setup(loader, candidates, [_make_metadata_resp(rank=0, instance_id="inst-1")])
+
+        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True), \
+             patch("modelexpress.vllm_loader.random.shuffle"):
+            result = loader._try_load_from_candidates(
+                MagicMock(), MagicMock(), MagicMock(), 0, _make_identity()
+            )
+
+        assert result is True
+        assert attempts == ["inst-1"]
+
+    def test_marks_stale_on_failure_and_tries_next(self):
+        loader = _make_loader()
+        candidates = [
+            _make_instance_ref(instance_id="inst-1"),
+            _make_instance_ref(instance_id="inst-2"),
         ]
+        attempts = self._setup(
+            loader, candidates,
+            [_make_metadata_resp(rank=0, instance_id="inst-1"),
+             _make_metadata_resp(rank=0, instance_id="inst-2")],
+            load_raises_for={"inst-1"},
+        )
 
-        loaded_as_target = False
-        for source_worker, mx_source_id, instance_id in instances:
-            try:
-                loader._load_as_target(None, None, None, 0, None, source_worker, mx_source_id, instance_id)
-                loaded_as_target = True
-                break
-            except Exception:
-                loader._mx_client.update_status(
-                    mx_source_id=mx_source_id,
-                    instance_id=instance_id,
-                    worker_id=0,
-                    status=p2p_pb2.SOURCE_STATUS_STALE,
-                )
+        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True), \
+             patch("modelexpress.vllm_loader.random.shuffle"):
+            result = loader._try_load_from_candidates(
+                MagicMock(), MagicMock(), MagicMock(), 0, _make_identity()
+            )
 
-        assert loaded_as_target is True
+        assert result is True
         assert attempts == ["inst-1", "inst-2"]
         loader._mx_client.update_status.assert_called_once_with(
-            mx_source_id="src-id",
+            mx_source_id=candidates[0].mx_source_id,
             instance_id="inst-1",
             worker_id=0,
             status=p2p_pb2.SOURCE_STATUS_STALE,
         )
 
-    def test_marks_all_stale_when_all_instances_fail(self):
-        """Every failed instance is marked STALE."""
+    def test_returns_false_when_no_candidates(self):
         loader = _make_loader()
-        instances = [(_make_worker(rank=0), "src-id", f"inst-{i}") for i in range(3)]
+        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=False):
+            result = loader._try_load_from_candidates(
+                MagicMock(), MagicMock(), MagicMock(), 0, _make_identity()
+            )
+        assert result is False
 
-        loaded_as_target = False
-        for source_worker, mx_source_id, instance_id in instances:
-            try:
-                raise RuntimeError("transfer error")
-            except Exception:
-                loader._mx_client.update_status(
-                    mx_source_id=mx_source_id,
-                    instance_id=instance_id,
-                    worker_id=0,
-                    status=p2p_pb2.SOURCE_STATUS_STALE,
-                )
+    def test_returns_false_when_all_fail(self):
+        loader = _make_loader()
+        candidates = [_make_instance_ref(instance_id=f"inst-{i}") for i in range(3)]
+        self._setup(
+            loader, candidates,
+            [_make_metadata_resp(rank=0, instance_id=f"inst-{i}") for i in range(3)],
+            load_raises_for={"inst-0", "inst-1", "inst-2"},
+        )
 
-        assert not loaded_as_target
+        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True), \
+             patch("modelexpress.vllm_loader.random.shuffle"):
+            result = loader._try_load_from_candidates(
+                MagicMock(), MagicMock(), MagicMock(), 0, _make_identity()
+            )
+
+        assert result is False
         assert loader._mx_client.update_status.call_count == 3
-        stale_instances = [
-            c.kwargs["instance_id"] for c in loader._mx_client.update_status.call_args_list
+
+    def test_get_metadata_not_called_after_first_success(self):
+        """Only one GetMetadata RPC is issued when the first instance succeeds."""
+        loader = _make_loader()
+        candidates = [
+            _make_instance_ref(instance_id="inst-1"),
+            _make_instance_ref(instance_id="inst-2"),
         ]
-        assert stale_instances == ["inst-0", "inst-1", "inst-2"]
+        self._setup(loader, candidates, [_make_metadata_resp(rank=0, instance_id="inst-1")])
+
+        with patch("modelexpress.vllm_loader.is_nixl_available", return_value=True), \
+             patch("modelexpress.vllm_loader.random.shuffle"):
+            loader._try_load_from_candidates(
+                MagicMock(), MagicMock(), MagicMock(), 0, _make_identity()
+            )
+
+        loader._mx_client.get_metadata.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -142,7 +142,7 @@ def _log_tensor_summary(
 
 def _build_source_identity(
     vllm_config: VllmConfig, model_config: ModelConfig
-) -> "p2p_pb2.SourceIdentity":
+) -> p2p_pb2.SourceIdentity:
     """Build a SourceIdentity from vLLM config objects."""
     from importlib.metadata import version as pkg_version
 
@@ -318,46 +318,11 @@ class MxModelLoader(BaseModelLoader):
                 )
                 logger.info(f"[Worker {device_id}] Model structure initialized")
 
-            instances = self._find_source_instances(identity, device_id)
-
-            loaded_as_target = False
-            for source_worker, mx_source_id, instance_id in instances:
-                logger.info(
-                    f"[Worker {device_id}] Trying source instance {instance_id} "
-                    f"({len(source_worker.tensors)} tensors)"
-                )
-                try:
-                    self._load_as_target(
-                        model, model_config, target_device,
-                        device_id, identity, source_worker, mx_source_id, instance_id,
-                    )
-                    loaded_as_target = True
-                    break
-                except Exception as e:
-                    logger.warning(
-                        f"[Worker {device_id}] Failed to load from instance {instance_id}: {e}. "
-                        f"Marking STALE and trying next instance. "
-                        f"TODO: heartbeat mechanism will handle STALE marking automatically."
-                    )
-                    # TODO: heartbeat will mark instances STALE automatically on pod deletion
-                    self._mx_client.update_status(
-                        mx_source_id=mx_source_id,
-                        instance_id=instance_id,
-                        worker_id=device_id,
-                        status=p2p_pb2.SOURCE_STATUS_STALE,
-                    )
-
+            loaded_as_target = self._try_load_from_candidates(
+                model, model_config, target_device, device_id, identity
+            )
             if not loaded_as_target:
-                if instances:
-                    logger.warning(
-                        f"[Worker {device_id}] All {len(instances)} source instances failed, "
-                        f"loading from disk"
-                    )
-                else:
-                    logger.info(f"[Worker {device_id}] No source found - loading from disk")
-                self._load_as_source(
-                    model, model_config, target_device, device_id, identity,
-                )
+                self._load_as_source(model, model_config, target_device, device_id, identity)
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -370,19 +335,99 @@ class MxModelLoader(BaseModelLoader):
     # Source detection
     # ------------------------------------------------------------------
 
-    def _find_source_instances(
-        self, identity: "p2p_pb2.SourceIdentity", device_id: int
-    ) -> "list[tuple[p2p_pb2.WorkerMetadata, str, str]]":
+    def _fetch_worker_metadata(
+        self,
+        mx_source_id: str,
+        instance_id: str,
+        device_id: int,
+    ) -> p2p_pb2.WorkerMetadata | None:
+        """Fetch tensor metadata for one instance and return the worker matching device_id.
+
+        Returns None if the instance is not found or has no worker for this rank.
         """
-        Return all ready source instances that have a worker matching device_id,
-        shuffled for load balancing.
+        metadata_resp = self._mx_client.get_metadata(
+            mx_source_id=mx_source_id,
+            instance_id=instance_id,
+        )
+        if not metadata_resp.found:
+            logger.debug(
+                f"[Worker {device_id}] Metadata not found for instance {instance_id}, skipping"
+            )
+            return None
+        worker = next(
+            (w for w in metadata_resp.workers
+             if w.worker_rank == device_id and len(w.tensors) > 0),
+            None,
+        )
+        if worker is None:
+            logger.debug(
+                f"[Worker {device_id}] No matching worker in instance {instance_id}, skipping"
+            )
+        return worker
 
-        Calls ListSources to get all READY instances, fetches tensor metadata for
-        each, and returns those that have a worker for our rank. Each instance will
-        be tried exactly once by the caller — failures mark the instance STALE.
+    def _try_load_from_candidates(
+        self,
+        model: nn.Module,
+        model_config: ModelConfig,
+        target_device: torch.device,
+        device_id: int,
+        identity: p2p_pb2.SourceIdentity,
+    ) -> bool:
+        """Try RDMA load from each candidate source instance in order.
 
-        Returns a list of (WorkerMetadata, mx_source_id, instance_id). Empty list
-        means no sources available and the caller should load from disk.
+        Returns True if a load succeeded. Marks failed instances STALE and tries
+        the next. Falls back to disk (logs a warning/info) and returns False if
+        all candidates are exhausted.
+        """
+        candidates = self._find_source_instances(identity, device_id)
+        for instance in candidates:
+            mx_source_id = instance.mx_source_id
+            instance_id = instance.instance_id
+            try:
+                source_worker = self._fetch_worker_metadata(mx_source_id, instance_id, device_id)
+                if source_worker is None:
+                    continue
+                logger.info(
+                    f"[Worker {device_id}] Trying source instance {instance_id} "
+                    f"({len(source_worker.tensors)} tensors)"
+                )
+                self._load_as_target(
+                    model, model_config, target_device,
+                    device_id, identity, source_worker, mx_source_id, instance_id,
+                )
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {device_id}] Failed to load from instance {instance_id}: {e}. "
+                    f"Marking STALE and trying next instance. "
+                    f"TODO: heartbeat mechanism will handle STALE marking automatically."
+                )
+                # TODO: heartbeat will mark instances STALE automatically on pod deletion
+                self._mx_client.update_status(
+                    mx_source_id=mx_source_id,
+                    instance_id=instance_id,
+                    worker_id=device_id,
+                    status=p2p_pb2.SOURCE_STATUS_STALE,
+                )
+        if candidates:
+            logger.warning(
+                f"[Worker {device_id}] All {len(candidates)} source instances failed, "
+                f"loading from disk"
+            )
+        else:
+            logger.info(f"[Worker {device_id}] No source found - loading from disk")
+        return False
+
+    def _find_source_instances(
+        self, identity: p2p_pb2.SourceIdentity, device_id: int
+    ) -> list[p2p_pb2.SourceInstanceRef]:
+        """
+        Return all READY source instances (shuffled for load balancing).
+
+        Only calls ListSources — metadata is fetched on demand by the caller
+        when each instance is actually tried.
+
+        Returns an empty list if NIXL is unavailable or no sources are registered.
         """
         if not is_nixl_available():
             logger.debug(f"[Worker {device_id}] NIXL not available, defaulting to source")
@@ -399,38 +444,10 @@ class MxModelLoader(BaseModelLoader):
 
             candidates = list(list_resp.instances)
             random.shuffle(candidates)
-            logger.debug(
-                f"[Worker {device_id}] Found {len(candidates)} ready instances, "
-                f"fetching metadata for each"
-            )
-
-            result = []
-            for instance in candidates:
-                try:
-                    metadata_resp = self._mx_client.get_metadata(
-                        mx_source_id=instance.mx_source_id,
-                        instance_id=instance.instance_id,
-                    )
-                    if not metadata_resp.found:
-                        logger.debug(
-                            f"[Worker {device_id}] Metadata not found for instance "
-                            f"{instance.instance_id}, skipping"
-                        )
-                        continue
-                    for w in metadata_resp.workers:
-                        if w.worker_rank == device_id and len(w.tensors) > 0:
-                            result.append((w, instance.mx_source_id, instance.instance_id))
-                            break
-                except Exception as e:
-                    logger.warning(
-                        f"[Worker {device_id}] Failed to fetch metadata for instance "
-                        f"{instance.instance_id}: {e}, skipping"
-                    )
-
             logger.info(
-                f"[Worker {device_id}] {len(result)} source instance(s) available for rank {device_id}"
+                f"[Worker {device_id}] Found {len(candidates)} ready source instance(s)"
             )
-            return result
+            return candidates
 
         except Exception as e:
             logger.warning(
