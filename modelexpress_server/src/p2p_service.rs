@@ -138,25 +138,25 @@ impl P2pService for P2pServiceImpl {
             .status_filter
             .and_then(|s| SourceStatus::try_from(s).ok());
 
-        let instances: Vec<SourceInstanceInfo> = match self
+        let workers: Vec<SourceInstanceInfo> = match self
             .state
-            .list_instances(source_id_filter, status_filter)
+            .list_workers(source_id_filter, status_filter)
             .await
         {
             Ok(v) => v,
             Err(e) => {
-                error!("Failed to list instances: {}", e);
+                error!("Failed to list workers: {}", e);
                 return Ok(Response::new(ListSourcesResponse {
                     instances: Vec::new(),
                 }));
             }
         };
 
-        let refs: Vec<SourceInstanceRef> = instances
+        let refs: Vec<SourceInstanceRef> = workers
             .into_iter()
             .map(|info| SourceInstanceRef {
                 mx_source_id: info.source_id,
-                worker_id: info.instance_id,
+                worker_id: info.worker_id,
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
             })
@@ -445,7 +445,7 @@ mod tests {
             .returning(|source_id, worker_id| {
                 Ok(Some(ModelMetadataRecord {
                     source_id: source_id.to_string(),
-                    instance_id: worker_id.to_string(),
+                    worker_id: worker_id.to_string(),
                     model_name: "my-model".to_string(),
                     workers: vec![WorkerRecord {
                         worker_rank: 0,
@@ -469,7 +469,10 @@ mod tests {
             .into_inner();
         assert!(resp.found);
         assert!(resp.worker.is_some());
-        assert_eq!(resp.worker.unwrap().status, SourceStatus::Ready as i32);
+        assert_eq!(
+            resp.worker.expect("worker should be present").status,
+            SourceStatus::Ready as i32
+        );
         assert_eq!(resp.mx_source_id, "abc123def456abcd");
         assert_eq!(resp.worker_id, "worker-uuid-1");
     }

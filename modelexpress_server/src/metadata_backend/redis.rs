@@ -6,9 +6,9 @@
 //! Storage layout:
 //!   `mx:source:{source_id}`               — Redis Hash; field `__attributes__` stores
 //!                                            JSON-serialized SourceAttributesJson (once
-//!                                            per source); each other field is an instance_id
+//!                                            per source); each other field is an worker_id
 //!                                            with an empty-string value (presence marker).
-//!   `mx:source:{source_id}:{instance_id}` — Redis Hash; field = worker_rank (string),
+//!   `mx:source:{source_id}:{worker_id}` — Redis Hash; field = worker_rank (string),
 //!                                            value = JSON-serialized WorkerRecordJson.
 //!
 //! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
@@ -326,12 +326,12 @@ impl MetadataBackend for RedisBackend {
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
-        instance_id: &str,
+        worker_id: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()> {
         let source_id = crate::source_identity::compute_mx_source_id(identity);
         let mut conn = self.get_conn().await?;
-        let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, instance_id);
+        let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
 
         // Each worker is stored as an independent hash field — no merge needed.
@@ -354,7 +354,7 @@ impl MetadataBackend for RedisBackend {
             .map(|w| w.worker_rank.to_string())
             .unwrap_or_default();
         pipe.hset(&source_key, keys::ATTRIBUTES_FIELD, &attr_json);
-        pipe.hset(&source_key, instance_id, &rank);
+        pipe.hset(&source_key, worker_id, &rank);
 
         // Refresh TTL on both keys so they expire if the source goes away
         let ttl = get_ttl_secs();
@@ -365,9 +365,9 @@ impl MetadataBackend for RedisBackend {
 
         let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for '{}' (source_id={source_id}, instance_id={}): {} workers ({} tensors)",
+            "Published metadata for '{}' (source_id={source_id}, worker_id={}): {} workers ({} tensors)",
             identity.model_name,
-            instance_id,
+            worker_id,
             worker_records.len(),
             total_tensors
         );
@@ -377,16 +377,16 @@ impl MetadataBackend for RedisBackend {
     async fn get_metadata(
         &self,
         source_id: &str,
-        instance_id: &str,
+        worker_id: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, instance_id);
+        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
 
         let fields: std::collections::HashMap<String, String> = conn.hgetall(&key).await?;
         if fields.is_empty() {
             debug!(
-                "No metadata found for source_id={} instance_id={}",
-                source_id, instance_id
+                "No metadata found for source_id={} worker_id={}",
+                source_id, worker_id
             );
             return Ok(None);
         }
@@ -407,22 +407,22 @@ impl MetadataBackend for RedisBackend {
         workers.sort_by_key(|w| w.worker_rank);
 
         debug!(
-            "Retrieved metadata for source_id={} instance_id={}: {} workers",
+            "Retrieved metadata for source_id={} worker_id={}: {} workers",
             source_id,
-            instance_id,
+            worker_id,
             workers.len()
         );
 
         Ok(Some(ModelMetadataRecord {
             source_id: source_id.to_string(),
-            instance_id: instance_id.to_string(),
+            worker_id: worker_id.to_string(),
             model_name,
             workers,
             published_at: 0,
         }))
     }
 
-    async fn list_instances(
+    async fn list_workers(
         &self,
         source_id: Option<String>,
         status_filter: Option<SourceStatus>,
@@ -478,7 +478,7 @@ impl MetadataBackend for RedisBackend {
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
-                    instance_id: iid.to_string(),
+                    worker_id: iid.to_string(),
                     model_name: model_name.clone(),
                     worker_rank,
                 });
@@ -531,20 +531,20 @@ impl MetadataBackend for RedisBackend {
     async fn update_status(
         &self,
         source_id: &str,
-        instance_id: &str,
-        worker_id: u32,
+        worker_id: &str,
+        worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
-        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, instance_id);
-        let field = worker_id.to_string();
+        let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+        let field = worker_rank.to_string();
 
         let value: Option<String> = conn.hget(&key, &field).await?;
         let json_str = value.ok_or_else(|| {
             format!(
-                "update_status: worker {} not found in source '{}' instance '{}'",
-                worker_id, source_id, instance_id
+                "update_status: rank {} not found in source '{}' worker '{}'",
+                worker_rank, source_id, worker_id
             )
         })?;
 
@@ -560,8 +560,8 @@ impl MetadataBackend for RedisBackend {
         pipe.exec_async(&mut conn).await?;
 
         debug!(
-            "Updated status for source '{}' instance '{}' worker {} -> {}",
-            source_id, instance_id, worker_id, status as i32
+            "Updated status for source '{}' worker '{}' rank {} -> {}",
+            source_id, worker_id, worker_rank, status as i32
         );
         Ok(())
     }

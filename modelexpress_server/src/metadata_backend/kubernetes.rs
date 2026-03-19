@@ -51,13 +51,13 @@ impl KubernetesBackend {
     async fn upsert_tensor_configmap(
         &self,
         source_id: &str,
-        instance_id: &str,
+        worker_id: &str,
         worker_rank: u32,
         tensors: &[TensorRecord],
         owner_name: Option<&str>,
         owner_uid: Option<&str>,
     ) -> MetadataResult<String> {
-        let cr_name = format!("mx-source-{}-{}", source_id, instance_id);
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
         let cm_name = format!("{}-tensors-worker-{}", cr_name, worker_rank);
 
         // Convert tensors to JSON
@@ -183,14 +183,14 @@ impl MetadataBackend for KubernetesBackend {
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
-        instance_id: &str,
+        worker_id: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()> {
         let source_id = crate::source_identity::compute_mx_source_id(identity);
         let source_id = source_id.as_str();
         let model_name = &identity.model_name;
         let api = self.model_metadata_api();
-        let cr_name = format!("mx-source-{}-{}", source_id, instance_id);
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
         let now = chrono::Utc::now().to_rfc3339();
 
         // Convert workers to internal format
@@ -212,8 +212,8 @@ impl MetadataBackend for KubernetesBackend {
                             source_id.to_string(),
                         );
                         labels.insert(
-                            "modelexpress.nvidia.com/mx-instance-id".to_string(),
-                            instance_id.to_string(),
+                            "modelexpress.nvidia.com/mx-worker-id".to_string(),
+                            worker_id.to_string(),
                         );
                         labels
                     }),
@@ -250,7 +250,7 @@ impl MetadataBackend for KubernetesBackend {
             let cm_name = self
                 .upsert_tensor_configmap(
                     source_id,
-                    instance_id,
+                    worker_id,
                     worker.worker_rank,
                     &worker.tensors,
                     owner_name,
@@ -325,7 +325,7 @@ impl MetadataBackend for KubernetesBackend {
                     debug!(
                         "Conflict updating status for source '{}' instance '{}', retrying ({}/{})",
                         source_id,
-                        instance_id,
+                        worker_id,
                         attempt.saturating_add(1),
                         max_retries
                     );
@@ -341,17 +341,17 @@ impl MetadataBackend for KubernetesBackend {
         if !status_updated {
             return Err(format!(
                 "Failed to update status for source '{}' instance '{}' after {} retries",
-                source_id, instance_id, max_retries
+                source_id, worker_id, max_retries
             )
             .into());
         }
 
         let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for '{}' (source_id={}, instance_id={}): {} workers ({} tensors)",
+            "Published metadata for '{}' (source_id={}, worker_id={}): {} workers ({} tensors)",
             model_name,
             source_id,
-            instance_id,
+            worker_id,
             worker_records.len(),
             total_tensors
         );
@@ -362,17 +362,17 @@ impl MetadataBackend for KubernetesBackend {
     async fn get_metadata(
         &self,
         source_id: &str,
-        instance_id: &str,
+        worker_id: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
         let api = self.model_metadata_api();
-        let cr_name = format!("mx-source-{}-{}", source_id, instance_id);
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
 
         let cr = match api.get_opt(&cr_name).await? {
             Some(cr) => cr,
             None => {
                 debug!(
-                    "No ModelMetadata CR found for source_id={} instance_id={}",
-                    source_id, instance_id
+                    "No ModelMetadata CR found for source_id={} worker_id={}",
+                    source_id, worker_id
                 );
                 return Ok(None);
             }
@@ -446,22 +446,22 @@ impl MetadataBackend for KubernetesBackend {
             .unwrap_or(0);
 
         debug!(
-            "Retrieved metadata for source_id={} instance_id={}: {} workers",
+            "Retrieved metadata for source_id={} worker_id={}: {} workers",
             source_id,
-            instance_id,
+            worker_id,
             workers.len()
         );
 
         Ok(Some(ModelMetadataRecord {
             source_id: source_id.to_string(),
-            instance_id: instance_id.to_string(),
+            worker_id: worker_id.to_string(),
             model_name: cr.spec.model_name.clone(),
             workers,
             published_at,
         }))
     }
 
-    async fn list_instances(
+    async fn list_workers(
         &self,
         source_id: Option<String>,
         status_filter: Option<SourceStatus>,
@@ -493,7 +493,7 @@ impl MetadataBackend for KubernetesBackend {
                 .metadata
                 .labels
                 .as_ref()
-                .and_then(|l| l.get("modelexpress.nvidia.com/mx-instance-id"))
+                .and_then(|l| l.get("modelexpress.nvidia.com/mx-worker-id"))
                 .cloned()
                 .unwrap_or_default();
 
@@ -519,7 +519,7 @@ impl MetadataBackend for KubernetesBackend {
 
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
-                instance_id: iid,
+                worker_id: iid,
                 model_name: cr.spec.model_name,
                 worker_rank,
             });
@@ -599,13 +599,13 @@ impl MetadataBackend for KubernetesBackend {
     async fn update_status(
         &self,
         source_id: &str,
-        instance_id: &str,
-        worker_id: u32,
+        worker_id: &str,
+        worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
-        let cr_name = format!("mx-source-{}-{}", source_id, instance_id);
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
         let status_name = WorkerStatus::status_name_from_proto(status as i32);
         let updated_at_rfc3339 = chrono::DateTime::from_timestamp_millis(updated_at)
             .map(|dt| dt.to_rfc3339())
@@ -614,27 +614,26 @@ impl MetadataBackend for KubernetesBackend {
         let max_retries: u32 = 5;
         for attempt in 0..max_retries {
             let current = api.get(&cr_name).await?;
-            let mut all_workers: Vec<WorkerStatus> =
+            let mut workers: Vec<WorkerStatus> =
                 current.status.map(|s| s.workers).unwrap_or_default();
 
-            if let Some(worker) = all_workers
-                .iter_mut()
-                .find(|w| w.worker_rank == worker_id as i32)
-            {
-                worker.status = status_name.clone();
-                worker.updated_at = Some(updated_at_rfc3339.clone());
-            } else {
-                debug!(
-                    "update_status: worker {} not found in source '{}' instance '{}', skipping",
-                    worker_id, source_id, instance_id
-                );
-                return Ok(());
+            if workers.is_empty() {
+                return Err(format!(
+                    "update_status: no workers in source '{}' worker '{}'",
+                    source_id, worker_id
+                )
+                .into());
+            }
+
+            for w in &mut workers {
+                w.status = status_name.clone();
+                w.updated_at = Some(updated_at_rfc3339.clone());
             }
 
             let resource_version = current.metadata.resource_version.unwrap_or_default();
             let status_patch = serde_json::json!({
                 "metadata": { "resourceVersion": resource_version },
-                "status": { "workers": all_workers }
+                "status": { "workers": workers }
             });
 
             match api
@@ -647,16 +646,16 @@ impl MetadataBackend for KubernetesBackend {
             {
                 Ok(_) => {
                     debug!(
-                        "Updated status for source '{}' instance '{}' worker {} -> {}",
-                        source_id, instance_id, worker_id, status_name
+                        "Updated status for source '{}' worker '{}' rank {} -> {}",
+                        source_id, worker_id, worker_rank, status_name
                     );
                     return Ok(());
                 }
                 Err(kube::Error::Api(err)) if err.code == 409 => {
                     debug!(
-                        "Conflict updating status for source '{}' instance '{}', retrying ({}/{})",
+                        "Conflict updating status for source '{}' worker '{}', retrying ({}/{})",
                         source_id,
-                        instance_id,
+                        worker_id,
                         attempt.saturating_add(1),
                         max_retries
                     );
@@ -670,8 +669,8 @@ impl MetadataBackend for KubernetesBackend {
         }
 
         Err(format!(
-            "Failed to update status for source '{}' instance '{}' worker {} after {} retries",
-            source_id, instance_id, worker_id, max_retries
+            "Failed to update status for source '{}' worker '{}' rank {} after {} retries",
+            source_id, worker_id, worker_rank, max_retries
         )
         .into())
     }

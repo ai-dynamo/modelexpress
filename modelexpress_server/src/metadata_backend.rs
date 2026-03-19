@@ -24,22 +24,22 @@ pub type MetadataResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>
 pub struct ModelMetadataRecord {
     /// 16-char hex key derived from SourceIdentity hash
     pub source_id: String,
-    /// Unique identifier for this running instance (UUID)
-    pub instance_id: String,
+    /// Unique identifier for this running worker (UUID)
+    pub worker_id: String,
     /// Human-readable model name from SourceIdentity
     pub model_name: String,
     pub workers: Vec<WorkerRecord>,
     pub published_at: i64,
 }
 
-/// Lightweight reference to a source instance (no tensor metadata).
-/// Used by `list_instances` to support the `ListSources` RPC.
+/// Lightweight reference to a source worker (no tensor metadata).
+/// Used by `list_workers` to support the `ListSources` RPC.
 #[derive(Debug, Clone)]
 pub struct SourceInstanceInfo {
     pub source_id: String,
-    pub instance_id: String,
+    pub worker_id: String,
     pub model_name: String,
-    /// Global rank of the worker in this instance.
+    /// Global rank of this worker.
     pub worker_rank: u32,
 }
 
@@ -196,45 +196,45 @@ pub trait MetadataBackend: Send + Sync {
     /// Connect to the backend (initialize connections, etc.)
     async fn connect(&self) -> MetadataResult<()>;
 
-    /// Publish metadata for a source instance.
-    /// `instance_id` uniquely identifies this running pod/process among all replicas
+    /// Publish metadata for a source worker.
+    /// `worker_id` uniquely identifies this running pod/process among all replicas
     /// with the same identity. The backend derives `mx_source_id` from `identity`.
     async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
-        instance_id: &str,
+        worker_id: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()>;
 
-    /// Get full tensor metadata for one specific instance.
-    /// Returns `None` if the instance is not found.
+    /// Get full tensor metadata for one specific worker.
+    /// Returns `None` if the worker is not found.
     async fn get_metadata(
         &self,
         source_id: &str,
-        instance_id: &str,
+        worker_id: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>>;
 
-    /// List available instances, optionally filtered by source_id and status.
-    /// `source_id`: if `Some`, return only instances for that source; if `None`, all sources.
-    /// `status_filter`: if `Some(s)`, return only instances where all workers have status `s`.
-    async fn list_instances(
+    /// List available workers, optionally filtered by source_id and status.
+    /// `source_id`: if `Some`, return only workers for that source; if `None`, all sources.
+    /// `status_filter`: if `Some(s)`, return only workers where all workers have status `s`.
+    async fn list_workers(
         &self,
         source_id: Option<String>,
         status_filter: Option<SourceStatus>,
     ) -> MetadataResult<Vec<SourceInstanceInfo>>;
 
-    /// Remove all instances of a source by mx_source_id
+    /// Remove all workers of a source by mx_source_id
     async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()>;
 
     /// List all registered source IDs and their model names
     async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>>;
 
-    /// Patch the status of a worker for a specific instance.
+    /// Patch the status of a worker for a specific worker.
     async fn update_status(
         &self,
         source_id: &str,
-        instance_id: &str,
-        worker_id: u32,
+        worker_id: &str,
+        worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
     ) -> MetadataResult<()>;

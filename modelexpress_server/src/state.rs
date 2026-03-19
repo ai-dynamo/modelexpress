@@ -109,12 +109,12 @@ impl P2pStateManager {
     pub async fn publish_metadata(
         &self,
         identity: &SourceIdentity,
-        instance_id: &str,
+        worker_id: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .publish_metadata(identity, instance_id, workers)
+            .publish_metadata(identity, worker_id, workers)
             .await
     }
 
@@ -122,23 +122,23 @@ impl P2pStateManager {
     pub async fn get_metadata(
         &self,
         source_id: &str,
-        instance_id: &str,
+        worker_id: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
         self.get_backend()
             .await?
-            .get_metadata(source_id, instance_id)
+            .get_metadata(source_id, worker_id)
             .await
     }
 
     /// List available source instances, optionally filtered by status.
-    pub async fn list_instances(
+    pub async fn list_workers(
         &self,
         source_id: Option<String>,
         status_filter: Option<modelexpress_common::grpc::p2p::SourceStatus>,
     ) -> MetadataResult<Vec<crate::metadata_backend::SourceInstanceInfo>> {
         self.get_backend()
             .await?
-            .list_instances(source_id, status_filter)
+            .list_workers(source_id, status_filter)
             .await
     }
 
@@ -160,19 +160,19 @@ impl P2pStateManager {
     pub async fn update_worker_status(
         &self,
         source_id: &str,
-        instance_id: &str,
-        worker_id: u32,
+        worker_id: &str,
+        worker_rank: u32,
         status: modelexpress_common::grpc::p2p::SourceStatus,
     ) -> MetadataResult<()> {
         let updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
             .await?
-            .update_status(source_id, instance_id, worker_id, status, updated_at)
+            .update_status(source_id, worker_id, worker_rank, status, updated_at)
             .await?;
 
         debug!(
-            "Updated status for source '{}' instance '{}' worker {} -> {}",
-            source_id, instance_id, worker_id, status as i32
+            "Updated status for source '{}' worker '{}' rank {} -> {}",
+            source_id, worker_id, worker_rank, status as i32
         );
         Ok(())
     }
@@ -326,7 +326,7 @@ mod tests {
     fn test_model_record_creation() {
         let record = ModelMetadataRecord {
             source_id: "abc123def456abcd".to_string(),
-            instance_id: "test-instance-id".to_string(),
+            worker_id: "test-instance-id".to_string(),
             model_name: "meta-llama/Llama-3.1-70B".to_string(),
             workers: vec![
                 WorkerRecord {
@@ -397,10 +397,10 @@ mod tests {
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|identity, instance_id, workers| {
+            .withf(|identity, worker_id, workers| {
                 identity.model_name == "my-model"
                     && identity.tensor_parallel_size == 8
-                    && instance_id == "a1b2c3d4"
+                    && worker_id == "a1b2c3d4"
                     && workers.len() == 1
                     && workers[0].worker_rank == 3
             })
@@ -490,10 +490,10 @@ mod tests {
     async fn test_update_worker_status_stores_correct_status() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
-            .withf(|source_id, instance_id, worker_id, status, _updated_at| {
+            .withf(|source_id, worker_id, worker_rank, status, _updated_at| {
                 source_id == "abc123def456abcd"
-                    && instance_id == "test-instance"
-                    && *worker_id == 7
+                    && worker_id == "test-instance"
+                    && *worker_rank == 7
                     && *status == SourceStatus::Ready
             })
             .once()
