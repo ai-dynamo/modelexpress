@@ -3,7 +3,7 @@
 
 use crate::database::ModelDatabase;
 use modelexpress_common::{
-    cache::{CacheConfig, resolve_model_path},
+    cache::CacheConfig,
     constants, download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
@@ -289,19 +289,6 @@ impl ModelService for ModelServiceImpl {
             return Err(Status::internal(
                 "Resolved Hugging Face model path did not contain a revision",
             ));
-        }
-
-        let expected_model_path =
-            resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref()).map_err(
-                |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
-            )?;
-
-        if model_path != expected_model_path {
-            return Err(Status::internal(format!(
-                "Resolved model path '{}' does not match expected cache layout '{}'",
-                model_path.display(),
-                expected_model_path.display()
-            )));
         }
 
         // Collect all files to stream
