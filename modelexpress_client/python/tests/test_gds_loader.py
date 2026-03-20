@@ -256,7 +256,8 @@ class TestMxModelLoaderGdsIntegration:
         model_config = MagicMock()
         model_config.model = "test-model"
 
-        with patch.object(loader, "_register_and_publish"), \
+        with patch.object(loader, "_register_tensors"), \
+             patch.object(loader, "_publish_metadata"), \
              patch("modelexpress.vllm_loader.process_weights_after_loading"):
             loader._load_as_source(
                 model, model_config,
