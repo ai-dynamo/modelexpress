@@ -311,7 +311,7 @@ version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "grpcio" },
-    { name = "nixl", extra = ["cu12"] },
+    { name = "nixl", extra = ["cu12"], marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "protobuf" },
@@ -330,7 +330,7 @@ dev = [
 requires-dist = [
     { name = "grpcio", specifier = ">=1.66.2" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60.0,<=1.66.2" },
-    { name = "nixl", extras = ["cu12"] },
+    { name = "nixl", extras = ["cu12"], marker = "sys_platform == 'linux'" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "protobuf", specifier = ">=5.27.0,<6.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
