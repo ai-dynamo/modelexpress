@@ -243,23 +243,21 @@ def _log_tensor_summary(
 ) -> None:
     """Log a summary of tensor count, size, scale_inv count, and sample checksums."""
     total_size = sum(t.numel() * t.element_size() for t in tensors.values())
-    scale_count = sum(1 for n in tensors if "scale_inv" in n.lower())
-
     logger.info(
-        f"[Worker {device_id}] {label}: {len(tensors)} tensors "
-        f"({total_size / 1e9:.2f} GB), including {scale_count} scale_inv tensors"
+        f"[Worker {device_id}] {label}: {len(tensors)} tensors ({total_size / 1e9:.2f} GB)"
     )
 
-    tensor_names = list(tensors.keys())
-    logger.debug(f"[Worker {device_id}] First 5 tensor names: {tensor_names[:5]}")
+    if logger.isEnabledFor(logging.DEBUG):
+        tensor_names = list(tensors.keys())
+        logger.debug(f"[Worker {device_id}] First 5 tensor names: {tensor_names[:5]}")
 
-    for name in tensor_names[:3]:
-        t = tensors[name]
-        checksum = _safe_checksum(t)
-        logger.debug(
-            f"[Worker {device_id}] Sample tensor '{name}': "
-            f"shape={t.shape}, dtype={t.dtype}, checksum={checksum}"
-        )
+        for name in tensor_names[:3]:
+            t = tensors[name]
+            checksum = _safe_checksum(t)
+            logger.debug(
+                f"[Worker {device_id}] Sample tensor '{name}': "
+                f"shape={t.shape}, dtype={t.dtype}, checksum={checksum}"
+            )
 
 
 def _publish_metadata_and_ready(
@@ -632,6 +630,9 @@ class MxModelLoader(BaseModelLoader):
             self._nixl_manager.register_tensors(self._tensors)
             logger.debug(f"[Worker {device_id}] Tensors registered with NIXL")
 
+        _tensor_registry[device_id] = self._tensors
+        _nixl_managers[device_id] = self._nixl_manager
+
     def _publish_metadata(self, device_id: int, model_name: str) -> None:
         """Publish metadata to the MX server."""
         # Optional synchronized publish
@@ -671,3 +672,12 @@ class MxModelLoader(BaseModelLoader):
     def tensors(self) -> dict[str, torch.Tensor]:
         """Access the registered tensor dict."""
         return self._tensors
+
+
+# Global storage for tensor metadata, keyed by device_id.
+# Required because vLLM's loader API doesn't expose loader instances after
+# load_model() returns. Source loaders store state here so the MxClient
+# (running in the same worker process) can access NIXL managers and tensors.
+# Each device_id maps to exactly one loader, so there are no concurrent writers.
+_tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
+_nixl_managers: dict[int, "NixlTransferManager"] = {}
