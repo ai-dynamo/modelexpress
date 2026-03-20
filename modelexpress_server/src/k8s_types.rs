@@ -97,14 +97,12 @@ impl WorkerStatus {
     }
 
     /// Convert a CRD status string back to the `SourceStatus` proto enum value (i32).
-    /// Returns `None` if `name` is not a recognised status string.
-    pub fn status_proto_from_name(name: &str) -> Option<i32> {
+    pub fn status_proto_from_name(name: &str) -> i32 {
         match name {
-            "Unknown" => Some(0),
-            "Initializing" => Some(1),
-            "Ready" => Some(2),
-            "Stale" => Some(3),
-            _ => None,
+            "Initializing" => 1,
+            "Ready" => 2,
+            "Stale" => 3,
+            _ => 0,
         }
     }
 }
@@ -171,8 +169,23 @@ mod tests {
             (3, "Stale"),
         ] {
             assert_eq!(WorkerStatus::status_name_from_proto(proto), name);
-            assert_eq!(WorkerStatus::status_proto_from_name(name), Some(proto));
+            assert_eq!(WorkerStatus::status_proto_from_name(name), proto);
         }
+    }
+
+    /// Regression test: proto status 0 (SOURCE_STATUS_UNKNOWN) must survive a
+    /// write-to-CRD -> read-from-CRD roundtrip. Before the fix, status_proto_from_name
+    /// returned None for "Unknown", causing get_metadata to hard-error on any worker
+    /// that hadn't received an explicit UpdateStatus call after PublishMetadata.
+    #[test]
+    fn test_status_unknown_roundtrip() {
+        let written = WorkerStatus::status_name_from_proto(0);
+        assert_eq!(written, "Unknown");
+        let read_back = WorkerStatus::status_proto_from_name(&written);
+        assert_eq!(
+            read_back, 0,
+            "Unknown status must roundtrip to proto value 0"
+        );
     }
 
     #[test]
@@ -182,10 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn test_status_proto_from_name_invalid() {
-        assert_eq!(WorkerStatus::status_proto_from_name("Unknown"), Some(0));
-        assert_eq!(WorkerStatus::status_proto_from_name(""), None);
-        assert_eq!(WorkerStatus::status_proto_from_name("ready"), None);
+    fn test_status_proto_from_name_unknown() {
+        assert_eq!(WorkerStatus::status_proto_from_name("Unknown"), 0);
+        assert_eq!(WorkerStatus::status_proto_from_name(""), 0);
+        assert_eq!(WorkerStatus::status_proto_from_name("ready"), 0);
     }
 
     #[test]

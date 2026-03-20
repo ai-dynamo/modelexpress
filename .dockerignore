@@ -3,4 +3,5 @@
 
 .dockerignore
 .git/
+target/
 Dockerfile
