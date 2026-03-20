@@ -154,12 +154,12 @@ class TestResolveModelPath:
         result = MxGdsLoader._resolve_model_path(str(tmp_path))
         assert result == str(tmp_path.resolve())
 
-    @patch("modelexpress.gds_loader.snapshot_download")
+    @patch("huggingface_hub.snapshot_download")
     def test_hf_model_calls_snapshot_download(self, mock_download):
         from modelexpress.gds_loader import MxGdsLoader
         mock_download.return_value = "/cache/models/org/model"
         result = MxGdsLoader._resolve_model_path("org/model")
-        mock_download.assert_called_once_with("org/model")
+        mock_download.assert_called_once_with("org/model", revision=None)
         assert result == "/cache/models/org/model"
 
 
@@ -256,13 +256,15 @@ class TestMxModelLoaderGdsIntegration:
         model_config = MagicMock()
         model_config.model = "test-model"
 
-        with patch.object(loader, "_register_and_publish"), \
+        with patch.object(loader, "_register_tensors"), \
+             patch.object(loader, "_publish_metadata"), \
              patch("modelexpress.vllm_loader.process_weights_after_loading"):
             loader._load_as_source(
                 model, model_config,
                 target_device=torch.device("cpu"),
+                global_rank=0,
                 device_id=0,
-                model_name="test-model",
+                identity=MagicMock(),
             )
 
         loader._default_loader.load_weights.assert_called_once_with(model, model_config)
