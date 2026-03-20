@@ -487,6 +487,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_workers_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .withf(|source_id, status_filter| {
+                source_id.as_deref() == Some("abc123def456abcd")
+                    && *status_filter == Some(SourceStatus::Ready)
+            })
+            .once()
+            .returning(|_, _| {
+                Ok(vec![crate::metadata_backend::SourceInstanceInfo {
+                    source_id: "abc123def456abcd".to_string(),
+                    worker_id: "w1".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                }])
+            });
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let result = manager
+            .list_workers(
+                Some("abc123def456abcd".to_string()),
+                Some(SourceStatus::Ready),
+            )
+            .await
+            .expect("list_workers failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].worker_id, "w1");
+    }
+
+    #[tokio::test]
+    async fn test_list_workers_propagates_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Err("backend error".into()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        assert!(manager.list_workers(None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_remove_metadata_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_remove_metadata()
+            .with(eq("abc123def456abcd"))
+            .once()
+            .returning(|_| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        manager
+            .remove_metadata("abc123def456abcd")
+            .await
+            .expect("remove_metadata failed");
+    }
+
+    #[tokio::test]
+    async fn test_remove_metadata_propagates_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_remove_metadata()
+            .once()
+            .returning(|_| Err("delete failed".into()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        assert!(manager.remove_metadata("abc123def456abcd").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_sources()
+            .once()
+            .returning(|| Ok(vec![("src1".to_string(), "model-a".to_string())]));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let result = manager.list_sources().await.expect("list_sources failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "src1");
+        assert_eq!(result[0].1, "model-a");
+    }
+
+    #[tokio::test]
     async fn test_update_worker_status_stores_correct_status() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()

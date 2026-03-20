@@ -568,6 +568,190 @@ mod tests {
         assert!(resp.success);
     }
 
+    // ── publish_metadata (missing worker) ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_publish_metadata_missing_worker() {
+        let svc = make_service(MockMetadataBackend::new());
+        let resp = svc
+            .publish_metadata(Request::new(PublishMetadataRequest {
+                identity: Some(test_identity()),
+                worker: None,
+                worker_id: "worker-uuid-1".to_string(),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.success);
+        assert!(resp.message.contains("worker is required"));
+    }
+
+    // ── list_sources ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_sources_returns_instances() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers().once().returning(|_, _| {
+            Ok(vec![
+                SourceInstanceInfo {
+                    source_id: "abc123def456abcd".to_string(),
+                    worker_id: "w1".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                },
+                SourceInstanceInfo {
+                    source_id: "abc123def456abcd".to_string(),
+                    worker_id: "w2".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 1,
+                },
+            ])
+        });
+
+        let svc = make_service(mock);
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                status_filter: Some(SourceStatus::Ready as i32),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert_eq!(resp.instances.len(), 2);
+        assert_eq!(resp.instances[0].worker_id, "w1");
+        assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(resp.instances[1].worker_id, "w2");
+        assert_eq!(resp.instances[1].worker_rank, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_no_identity() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Ok(vec![]));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: None,
+                status_filter: None,
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_backend_error_returns_empty() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Err("backend down".into()));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                status_filter: None,
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_empty_model_name_no_filter() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .withf(|source_id, _| source_id.is_none())
+            .once()
+            .returning(|_, _| Ok(vec![]));
+
+        let svc = make_service(mock);
+        let mut id = test_identity();
+        id.model_name = String::new();
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(id),
+                status_filter: None,
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.instances.is_empty());
+    }
+
+    // ── get_metadata (additional) ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_metadata_empty_worker_id() {
+        let svc = make_service(MockMetadataBackend::new());
+        let resp = svc
+            .get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "abc123def456abcd".to_string(),
+                worker_id: String::new(),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.found);
+        assert!(resp.worker.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_get_metadata()
+            .once()
+            .returning(|_, _| Err("storage error".into()));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "abc123def456abcd".to_string(),
+                worker_id: "worker-uuid-1".to_string(),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.found);
+        assert!(resp.worker.is_none());
+        assert!(resp.mx_source_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_record_with_empty_workers() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_get_metadata()
+            .once()
+            .returning(|source_id, worker_id| {
+                Ok(Some(ModelMetadataRecord {
+                    source_id: source_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    model_name: "my-model".to_string(),
+                    workers: vec![],
+                    published_at: 0,
+                }))
+            });
+
+        let svc = make_service(mock);
+        let resp = svc
+            .get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "abc123def456abcd".to_string(),
+                worker_id: "worker-uuid-1".to_string(),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.found);
+        assert!(resp.worker.is_none());
+    }
+
+    // ── update_status (additional) ──────────────────────────────────────────
+
     #[tokio::test]
     async fn test_update_status_backend_error() {
         let mut mock = MockMetadataBackend::new();
