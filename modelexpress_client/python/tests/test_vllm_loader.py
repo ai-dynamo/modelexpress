@@ -51,23 +51,14 @@ class TestCollectCudaTensors:
 # ---------------------------------------------------------------------------
 
 
-class _FakeReadyResponse:
-    """Minimal stand-in for p2p_pb2.GetReadyResponse."""
-
-    def __init__(self, found=False, ready=False, session_id="", metadata_hash=""):
-        self.found = found
-        self.ready = ready
-        self.session_id = session_id
-        self.metadata_hash = metadata_hash
-
-
 class _FakeWorker:
     """Minimal stand-in for p2p_pb2.WorkerMetadata."""
 
-    def __init__(self, worker_rank, tensors=None, nixl_metadata=b""):
+    def __init__(self, worker_rank, tensors=None, nixl_metadata=b"", status=None):
         self.worker_rank = worker_rank
         self.tensors = tensors or []
         self.nixl_metadata = nixl_metadata
+        self.status = status
 
 
 class _FakeTensor:
@@ -122,45 +113,51 @@ class TestDetectSource:
     def test_server_unreachable(self, _mock_nixl):
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.side_effect = Exception("connection refused")
+        loader._mx_client.get_metadata.side_effect = Exception("connection refused")
 
         result = loader._detect_source("model", device_id=0)
         assert result is None
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
-    def test_not_ready(self, _mock_nixl):
+    def test_no_metadata(self, _mock_nixl):
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=False
-        )
-
-        result = loader._detect_source("model", device_id=0)
-        assert result is None
-
-    @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
-    def test_ready_no_metadata(self, _mock_nixl):
-        loader = _make_auto_loader()
-        loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=True, session_id="abc"
-        )
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(found=False)
 
         result = loader._detect_source("model", device_id=0)
         assert result is None
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
-    def test_ready_wrong_rank(self, _mock_nixl):
+    def test_not_ready(self, _mock_nixl):
+        from modelexpress import p2p_pb2
+
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=True, session_id="abc"
-        )
-        # Source has rank 1 but we need rank 0
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
             found=True,
-            workers=[_FakeWorker(worker_rank=1, tensors=[_FakeTensor()])],
+            workers=[_FakeWorker(
+                worker_rank=0,
+                tensors=[_FakeTensor()],
+                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+            )],
+        )
+
+        result = loader._detect_source("model", device_id=0)
+        assert result is None
+
+    @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
+    def test_wrong_rank(self, _mock_nixl):
+        from modelexpress import p2p_pb2
+
+        loader = _make_auto_loader()
+        loader._mx_client = MagicMock()
+        loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
+            found=True,
+            workers=[_FakeWorker(
+                worker_rank=1,
+                tensors=[_FakeTensor()],
+                status=p2p_pb2.SOURCE_STATUS_READY,
+            )],
         )
 
         result = loader._detect_source("model", device_id=0)
@@ -168,15 +165,15 @@ class TestDetectSource:
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
     def test_happy_path(self, _mock_nixl):
+        from modelexpress import p2p_pb2
+
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_ready.return_value = _FakeReadyResponse(
-            found=True, ready=True, session_id="session-123"
-        )
         worker = _FakeWorker(
             worker_rank=0,
             tensors=[_FakeTensor(name="layer.0.weight")],
             nixl_metadata=b"nixl-data",
+            status=p2p_pb2.SOURCE_STATUS_READY,
         )
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
             found=True, workers=[worker],
@@ -272,15 +269,13 @@ class TestPublishMetadataAndReady:
                 mx_client, nixl_manager, tensors, device_id=0, model_name="test-model"
             )
 
-        # Check that publish_metadata was called with the worker proto
         mx_client.publish_metadata.assert_called_once()
-        # Check that publish_ready was called
-        mx_client.publish_ready.assert_called_once()
-        call_kwargs = mx_client.publish_ready.call_args
-        assert call_kwargs[1]["model_name"] == "test-model" or call_kwargs.kwargs.get("model_name") == "test-model"
+        mx_client.update_status.assert_called_once()
+        call_kwargs = mx_client.update_status.call_args
+        assert call_kwargs.kwargs.get("model_name") == "test-model" or call_kwargs[1]["model_name"] == "test-model"
 
     @patch("modelexpress.vllm_loader.p2p_pb2", create=True)
-    def test_publish_failure_does_not_publish_ready(self, mock_pb2):
+    def test_publish_failure_raises(self, mock_pb2):
         from modelexpress.vllm_loader import _publish_metadata_and_ready
 
         mock_pb2.TensorDescriptor = MagicMock()
@@ -293,8 +288,9 @@ class TestPublishMetadataAndReady:
         nixl_manager.nixl_metadata = b"metadata"
 
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
-            _publish_metadata_and_ready(
-                mx_client, nixl_manager, {}, device_id=0, model_name="test"
-            )
+            with pytest.raises(RuntimeError, match="Failed to publish metadata"):
+                _publish_metadata_and_ready(
+                    mx_client, nixl_manager, {}, device_id=0, model_name="test"
+                )
 
-        mx_client.publish_ready.assert_not_called()
+        mx_client.update_status.assert_not_called()
