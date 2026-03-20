@@ -50,9 +50,7 @@ class TestCollectModuleTensors:
         from modelexpress.vllm_loader import _collect_module_tensors
 
         model = nn.Module()
-        # Register a contiguous parameter
         model.weight = nn.Parameter(torch.randn(4, 3, device="cuda"))
-        # Attach a non-contiguous view (transpose)
         model.weight_t = model.weight.data.T
         assert not model.weight_t.is_contiguous()
 
@@ -86,7 +84,7 @@ class TestCollectModuleTensors:
 
         model = nn.Module()
         model.weight = nn.Parameter(torch.randn(4, 3, device="cuda"))
-        model.__dict__["w_alias"] = model.weight.data  # same data_ptr, different name
+        model.__dict__["w_alias"] = model.weight.data
 
         result = _collect_module_tensors(model)
         assert "weight" in result
@@ -106,12 +104,7 @@ class _FakeWorker:
         self.worker_rank = worker_rank
         self.tensors = tensors or []
         self.nixl_metadata = nixl_metadata
-        # Default to SOURCE_STATUS_READY (value 2 in the proto enum)
-        if status is None:
-            from modelexpress import p2p_pb2
-            self.status = p2p_pb2.SOURCE_STATUS_READY
-        else:
-            self.status = status
+        self.status = status
 
 
 class _FakeTensor:
@@ -172,12 +165,20 @@ class TestDetectSource:
         assert result is None
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
+    def test_no_metadata(self, _mock_nixl):
+        loader = _make_auto_loader()
+        loader._mx_client = MagicMock()
+        loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(found=False)
+
+        result = loader._detect_source("model", device_id=0)
+        assert result is None
+
+    @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
     def test_not_ready(self, _mock_nixl):
         from modelexpress import p2p_pb2
 
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        # Worker exists but status is not READY
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
             found=True,
             workers=[_FakeWorker(
@@ -191,22 +192,18 @@ class TestDetectSource:
         assert result is None
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
-    def test_ready_no_metadata(self, _mock_nixl):
+    def test_wrong_rank(self, _mock_nixl):
+        from modelexpress import p2p_pb2
+
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
-        loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(found=False)
-
-        result = loader._detect_source("model", device_id=0)
-        assert result is None
-
-    @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
-    def test_ready_wrong_rank(self, _mock_nixl):
-        loader = _make_auto_loader()
-        loader._mx_client = MagicMock()
-        # Source has rank 1 but we need rank 0
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
             found=True,
-            workers=[_FakeWorker(worker_rank=1, tensors=[_FakeTensor()])],
+            workers=[_FakeWorker(
+                worker_rank=1,
+                tensors=[_FakeTensor()],
+                status=p2p_pb2.SOURCE_STATUS_READY,
+            )],
         )
 
         result = loader._detect_source("model", device_id=0)
@@ -214,12 +211,15 @@ class TestDetectSource:
 
     @patch("modelexpress.vllm_loader.is_nixl_available", return_value=True)
     def test_happy_path(self, _mock_nixl):
+        from modelexpress import p2p_pb2
+
         loader = _make_auto_loader()
         loader._mx_client = MagicMock()
         worker = _FakeWorker(
             worker_rank=0,
             tensors=[_FakeTensor(name="layer.0.weight")],
             nixl_metadata=b"nixl-data",
+            status=p2p_pb2.SOURCE_STATUS_READY,
         )
         loader._mx_client.get_metadata.return_value = _FakeMetadataResponse(
             found=True, workers=[worker],
@@ -287,11 +287,16 @@ class TestAbstractMethodCompleteness:
 class TestPublishMetadataAndReady:
     """Tests for the _publish_metadata_and_ready helper."""
 
-    def test_publishes_correct_tensor_count(self):
+    @patch("modelexpress.vllm_loader.p2p_pb2", create=True)
+    def test_publishes_correct_tensor_count(self, mock_pb2):
         from modelexpress.vllm_loader import _publish_metadata_and_ready
+
+        mock_pb2.TensorDescriptor = MagicMock()
+        mock_pb2.WorkerMetadata = MagicMock()
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = True
+        mx_client.session_id = "test-session"
 
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"metadata"
@@ -313,10 +318,14 @@ class TestPublishMetadataAndReady:
         mx_client.publish_metadata.assert_called_once()
         mx_client.update_status.assert_called_once()
         call_kwargs = mx_client.update_status.call_args
-        assert call_kwargs[1]["model_name"] == "test-model" or call_kwargs.kwargs.get("model_name") == "test-model"
+        assert call_kwargs.kwargs.get("model_name") == "test-model" or call_kwargs[1]["model_name"] == "test-model"
 
-    def test_publish_failure_raises(self):
+    @patch("modelexpress.vllm_loader.p2p_pb2", create=True)
+    def test_publish_failure_raises(self, mock_pb2):
         from modelexpress.vllm_loader import _publish_metadata_and_ready
+
+        mock_pb2.TensorDescriptor = MagicMock()
+        mock_pb2.WorkerMetadata = MagicMock()
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = False
