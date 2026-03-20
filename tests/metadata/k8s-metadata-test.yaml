@@ -1,0 +1,168 @@
+# DHT metadata backend integration test for K8s.
+#
+# Tests DhtMetadataClient end-to-end across pods:
+#   - 3 DHT peer pods form the network backbone
+#   - 1 publisher pod publishes known metadata
+#   - 1 test job reads published data + runs self-contained tests
+#
+# Usage:
+#   ./run_k8s_metadata_test.sh
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dht-metadata-test
+---
+# Headless service for DNS-based peer discovery.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-dht
+  namespace: dht-metadata-test
+spec:
+  clusterIP: None
+  selector:
+    dht-member: "true"
+  ports:
+    - port: 4001
+      targetPort: 4001
+      protocol: TCP
+---
+# DHT peer nodes - form the network backbone.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dht-peer
+  namespace: dht-metadata-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: dht-peer
+  template:
+    metadata:
+      labels:
+        app: dht-peer
+        dht-member: "true"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: dht-peer
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: dht
+          image: localhost:32000/dht-metadata-test:latest
+          args: ["--role", "peer", "--listen", "0.0.0.0:4001"]
+          ports:
+            - containerPort: 4001
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: BOOTSTRAP_DNS
+              value: "mx-dht.dht-metadata-test.svc.cluster.local"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            tcpSocket:
+              port: 4001
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+# Publisher pod - publishes well-known metadata for cross-pod tests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metadata-publisher
+  namespace: dht-metadata-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metadata-publisher
+  template:
+    metadata:
+      labels:
+        app: metadata-publisher
+        dht-member: "true"
+    spec:
+      containers:
+        - name: publisher
+          image: localhost:32000/dht-metadata-test:latest
+          args: ["--role", "publisher", "--listen", "0.0.0.0:4001"]
+          ports:
+            - containerPort: 4001
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: BOOTSTRAP_DNS
+              value: "mx-dht.dht-metadata-test.svc.cluster.local"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+# Test job - runs all test scenarios and exits.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: metadata-test
+  namespace: dht-metadata-test
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: metadata-test
+        dht-member: "true"
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-peers
+          image: busybox:1.36
+          env:
+            - name: MIN_PEERS
+              value: "2"
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "Waiting for at least $MIN_PEERS DHT peers..."
+              while true; do
+                ready=$(nslookup mx-dht.dht-metadata-test.svc.cluster.local 2>/dev/null | grep -c 'Address:' || true)
+                peers=$((ready - 1))
+                if [ "$peers" -ge "$MIN_PEERS" ]; then
+                  echo "Found $peers peer(s), proceeding"
+                  break
+                fi
+                echo "Only $peers/$MIN_PEERS peer(s) ready, waiting..."
+                sleep 2
+              done
+              echo "Settling for 5s..."
+              sleep 5
+      containers:
+        - name: test
+          image: localhost:32000/dht-metadata-test:latest
+          args: ["--role", "test", "--listen", "0.0.0.0:4001"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: BOOTSTRAP_DNS
+              value: "mx-dht.dht-metadata-test.svc.cluster.local"
