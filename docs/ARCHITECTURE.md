@@ -439,15 +439,25 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 **MxModelLoader** (extends `BaseModelLoader`):
 1. Query MX server to detect whether a ready source exists for this model/rank
-2. If source found: create dummy tensors, receive via RDMA, register + publish
-3. If no source: load weights from disk, register + publish
-4. Run `process_weights_after_loading()` (FP8 transform)
+2. If source found: create dummy tensors, process dummy weights, receive fully-processed weights via RDMA
+3. If no source: load weights from disk, process weights
+4. Register ALL final tensors with NIXL + publish metadata
 
 Detection is a one-shot check with no retry loop. If the source is still warming up, this node loads from disk and becomes a source itself. Both paths register with NIXL and publish metadata, so future nodes can discover this one.
 
-The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_cuda_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
+The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_module_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
 
-Module-level globals `_raw_tensor_registry` and `_nixl_managers` in `vllm_loader.py` bridge loaders and clients - vLLM's loader API doesn't expose loader instances after `load_model()` returns, so source loaders store state in these dicts (keyed by device ID) for the MxClient to access.
+### Tensor Discovery
+
+The loader uses `_iter_module_tensors()` to walk the full PyTorch module tree and find all CUDA tensors after post-processing. This discovers three categories:
+
+| Category | Source | Example |
+|----------|--------|---------|
+| Parameters | `module._parameters` | `layers.0.attention.weight` |
+| Buffers | `module._buffers` | Batch norm running mean |
+| Tensor attributes | `dir(module)` scan | FP8 `weight_scale`, `_k_scale` |
+
+This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. transposed views like `W_UK_T`) are skipped because they are views over contiguous tensors already in the module tree. Tensors are deduplicated by `data_ptr()` so tied weights (e.g. `embed_tokens.weight` and `lm_head.weight` sharing the same memory) are only registered and transferred once.
 
 ## NIXL Integration
 
@@ -493,27 +503,27 @@ agent.release_xfer_handle(handle)
 
 ## FP8 Model Handling (DeepSeek-V3)
 
-DeepSeek-V3 uses FP8 quantization with scale factors. vLLM's `process_weights_after_loading()` renames `weight_scale_inv` to `weight_scale` and transforms the data. If we transfer after processing, the source has `weight_scale` but the target expects `weight_scale_inv`, causing a mismatch.
+DeepSeek-V3 uses FP8 quantization with scale factors. vLLM's `process_weights_after_loading()` transforms `weight_scale_inv` into `weight_scale` and may create new tensors as bare attributes or buffers.
 
-The solution: transfer raw tensors BEFORE `process_weights_after_loading()` runs. Both source and target then run the same FP8 transform independently, producing identical final weights.
+The solution: both source and target run `process_weights_after_loading()` first, then register and transfer the fully-processed tensors. The target runs post-processing on dummy data purely to establish the correct tensor layout (shapes, dtypes, attribute names), then receives the real data via RDMA.
 
 ```mermaid
 graph TD
     subgraph Source
-        S1[Load weight_scale_inv from safetensors]
-        S2[Register raw tensors with NIXL]
-        S3[process_weights: scale_inv to scale]
-        S4[Identical weights]
+        S1[Load real weights from disk]
+        S2[process_weights_after_loading]
+        S3[Register ALL final tensors with NIXL]
+        S4[Publish metadata]
         S1 --> S2 --> S3 --> S4
     end
     subgraph Target
-        T1[Dummy weight_scale_inv]
-        T2[Receive raw tensors into dummy memory]
-        T3[process_weights: scale_inv to scale]
-        T4[Identical weights]
+        T1[Load dummy weights]
+        T2[process_weights_after_loading on dummy]
+        T3[Register ALL final tensors with NIXL]
+        T4[Receive processed weights via RDMA]
         T1 --> T2 --> T3 --> T4
     end
-    S2 -- "RDMA" --> T2
+    S3 -- "RDMA" --> T4
 ```
 
 ## Coordination Protocol

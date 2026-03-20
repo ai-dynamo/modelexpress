@@ -5,8 +5,9 @@
 ModelExpress Custom Model Loader for vLLM.
 
 This loader hooks into vLLM's weight loading pipeline to perform RDMA transfers
-BEFORE process_weights_after_loading() runs. This is critical for FP8 models
-like DeepSeek-V3 where weight scales are transformed after loading.
+of fully-processed model tensors. Registration happens AFTER
+process_weights_after_loading() so that all final tensors (parameters, buffers,
+and bare tensor attributes like FP8 scales) are captured and transferred.
 
 Usage:
     --load-format mx  (auto-detect: RDMA if source exists, else disk)
@@ -46,7 +47,7 @@ if TYPE_CHECKING:
     from .nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.vllm_loader")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
@@ -111,13 +112,117 @@ _TRANSFER_RETRY_DELAY_SECONDS = 30
 # ---------------------------------------------------------------------------
 
 
-def _collect_cuda_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Collect all CUDA parameter tensors from a model."""
-    return {
-        name: param.data
-        for name, param in model.named_parameters()
-        if param.is_cuda
-    }
+
+def _iter_module_tensors(
+    module: nn.Module,
+    prefix: str = "",
+) -> list[tuple[str, torch.Tensor, str]]:
+    """Iterate over all CUDA tensors in a module tree.
+
+    Discovers three categories of tensors:
+    - Parameters (registered via nn.Module parameter system)
+    - Buffers (registered via register_buffer)
+    - Tensor attributes (bare tensors attached directly, e.g. FP8 scales)
+
+    This is more thorough than named_parameters() which only finds parameters.
+    Post-processing steps like process_weights_after_loading() often create
+    new tensors as buffers or bare attributes that named_parameters() misses.
+
+    Args:
+        module: The nn.Module to iterate.
+        prefix: Prefix for qualified names (used in recursion).
+
+    Returns:
+        List of (qualified_name, tensor, tensor_type) tuples for each CUDA tensor.
+    """
+    results: list[tuple[str, torch.Tensor, str]] = []
+
+    for name, param in module._parameters.items():
+        if param is not None and param.is_cuda:
+            qualified = f"{prefix}{name}" if prefix else name
+            results.append((qualified, param, "parameter"))
+
+    for name, buf in module._buffers.items():
+        if buf is not None and buf.is_cuda:
+            qualified = f"{prefix}{name}" if prefix else name
+            results.append((qualified, buf, "buffer"))
+
+    skip = (
+        set(module._parameters.keys())
+        | set(module._buffers.keys())
+        | set(module._modules.keys())
+    )
+    for attr_name in dir(module):
+        if attr_name in skip or attr_name.startswith("__"):
+            continue
+        try:
+            attr_val = getattr(module, attr_name, None)
+        except Exception:
+            continue
+
+        if torch.is_tensor(attr_val) and attr_val.is_cuda:
+            qualified = f"{prefix}{attr_name}" if prefix else attr_name
+            results.append((qualified, attr_val, "tensor_attr"))
+        elif isinstance(attr_val, (list, tuple)) and attr_val:
+            if all(torch.is_tensor(x) and x.is_cuda for x in attr_val):
+                for i, x in enumerate(attr_val):
+                    qualified = (
+                        f"{prefix}{attr_name}.{i}" if prefix else f"{attr_name}.{i}"
+                    )
+                    results.append((qualified, x, "tensor_attr"))
+
+    for name, submodule in module._modules.items():
+        if submodule is not None:
+            subprefix = f"{prefix}{name}." if prefix else f"{name}."
+            results.extend(_iter_module_tensors(submodule, subprefix))
+
+    return results
+
+
+def _collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Collect all contiguous CUDA tensors from a module tree into a flat dict.
+
+    Uses _iter_module_tensors to find parameters, buffers, and tensor
+    attributes, then returns them as a name -> tensor mapping suitable
+    for NIXL registration.
+
+    Non-contiguous tensors (e.g. transposed views like W_UK_T) are skipped
+    because they are views over contiguous tensors that are already in the
+    module tree. Transferring the underlying contiguous tensor automatically
+    updates the view.
+
+    Deduplicates by data_ptr() to avoid registering the same GPU memory
+    twice (e.g. tied weights where embed_tokens.weight and lm_head.weight
+    share the same tensor).
+    """
+    tensors: dict[str, torch.Tensor] = {}
+    seen_ptrs: set[int] = set()
+    skipped_noncontiguous = 0
+    skipped_duplicate = 0
+    for name, tensor, _tensor_type in _iter_module_tensors(model):
+        t = tensor.data if hasattr(tensor, "data") else tensor
+
+        if not t.is_contiguous():
+            logger.debug(f"Skipping non-contiguous tensor '{name}' (view of another tensor)")
+            skipped_noncontiguous += 1
+            continue
+
+        ptr = t.data_ptr()
+        if ptr in seen_ptrs:
+            logger.debug(f"Skipping duplicate tensor '{name}' (same data_ptr as already registered tensor)")
+            skipped_duplicate += 1
+            continue
+        seen_ptrs.add(ptr)
+
+        tensors[name] = t
+
+    if skipped_noncontiguous:
+        logger.info(
+            f"Skipped {skipped_noncontiguous} non-contiguous tensors (views of contiguous tensors already registered)"
+        )
+    if skipped_duplicate:
+        logger.info(f"Skipped {skipped_duplicate} duplicate tensors (tied weights sharing the same memory)")
+    return tensors
 
 
 def _init_nixl_manager(device_id: int, role: str) -> NixlTransferManager:
@@ -138,23 +243,21 @@ def _log_tensor_summary(
 ) -> None:
     """Log a summary of tensor count, size, scale_inv count, and sample checksums."""
     total_size = sum(t.numel() * t.element_size() for t in tensors.values())
-    scale_count = sum(1 for n in tensors if "scale_inv" in n.lower())
-
     logger.info(
-        f"[Worker {device_id}] {label}: {len(tensors)} tensors "
-        f"({total_size / 1e9:.2f} GB), including {scale_count} scale_inv tensors"
+        f"[Worker {device_id}] {label}: {len(tensors)} tensors ({total_size / 1e9:.2f} GB)"
     )
 
-    tensor_names = list(tensors.keys())
-    logger.debug(f"[Worker {device_id}] First 5 tensor names: {tensor_names[:5]}")
+    if logger.isEnabledFor(logging.DEBUG):
+        tensor_names = list(tensors.keys())
+        logger.debug(f"[Worker {device_id}] First 5 tensor names: {tensor_names[:5]}")
 
-    for name in tensor_names[:3]:
-        t = tensors[name]
-        checksum = _safe_checksum(t)
-        logger.debug(
-            f"[Worker {device_id}] Sample tensor '{name}': "
-            f"shape={t.shape}, dtype={t.dtype}, checksum={checksum}"
-        )
+        for name in tensor_names[:3]:
+            t = tensors[name]
+            checksum = _safe_checksum(t)
+            logger.debug(
+                f"[Worker {device_id}] Sample tensor '{name}': "
+                f"shape={t.shape}, dtype={t.dtype}, checksum={checksum}"
+            )
 
 
 def _publish_metadata_and_ready(
@@ -243,15 +346,16 @@ class MxModelLoader(BaseModelLoader):
     Flow:
         1. initialize_model()
         2. _detect_source() - one-shot check against MX server
-        3a. Source found -> load dummy weights, RDMA receive, register + publish
-        3b. No source   -> load from disk, register + publish
+        3a. Source found -> load dummy weights, RDMA receive
+        3b. No source   -> load from disk
         4. process_weights_after_loading()
+        5. Register ALL final tensors with NIXL + publish
     """
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         self._nixl_manager: NixlTransferManager | None = None
-        self._raw_tensors: dict[str, torch.Tensor] = {}
+        self._tensors: dict[str, torch.Tensor] = {}
         self._mx_client = MxClient()
         logger.debug("MxModelLoader initialized successfully")
 
@@ -291,11 +395,9 @@ class MxModelLoader(BaseModelLoader):
 
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                logger.info(f"[Worker {device_id}] Initializing model structure...")
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config
                 )
-                logger.info(f"[Worker {device_id}] Model structure initialized")
 
             source_worker = self._detect_source(model_name, device_id)
 
@@ -384,21 +486,18 @@ class MxModelLoader(BaseModelLoader):
         model_name: str,
         source_worker,
     ) -> None:
-        """Receive weights via RDMA from an existing source, then publish."""
+        """Receive fully-processed weights via RDMA from an existing source."""
         # Create dummy weights as receive buffers
-        logger.info(f"[Worker {device_id}] Creating dummy weights as RDMA receive buffers...")
         self._dummy_loader.load_weights(model, model_config)
 
-        # RDMA receive
+        # Process dummy weights to establish final tensor layout
+        process_weights_after_loading(model, model_config, target_device)
+
+        # RDMA receive (fully-processed tensors, no post-processing needed)
         self._receive_from_peer(model, device_id, model_name, source_worker)
 
-        # Register with NIXL + publish so future nodes can discover us
-        self._register_and_publish(model, target_device, device_id, model_name)
-
-        # FP8 processing
-        logger.info(f"[Worker {device_id}] Processing weights (FP8 transformation)...")
-        process_weights_after_loading(model, model_config, target_device)
-        logger.info(f"[Worker {device_id}] Weight processing complete")
+        # Publish metadata
+        self._publish_metadata(device_id, model_name)
 
     def _receive_from_peer(
         self,
@@ -407,22 +506,9 @@ class MxModelLoader(BaseModelLoader):
         model_name: str,
         source_worker,
     ) -> None:
-        """Receive raw tensors via RDMA from the detected source."""
+        """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
-
-        target_tensors = _collect_cuda_tensors(model)
-        _log_tensor_summary(target_tensors, device_id, "Target tensors (RDMA buffers)")
-
-        # Initialize NIXL manager and register target tensors for RDMA
-        init_start = time.perf_counter()
-        self._nixl_manager = _init_nixl_manager(device_id, "auto")
-        nixl_init_time = time.perf_counter() - init_start
-        logger.info(f"[Worker {device_id}] [TIMING] NIXL manager initialized in {nixl_init_time:.3f}s")
-
-        reg_start = time.perf_counter()
-        self._nixl_manager.register_tensors(target_tensors)
-        reg_time = time.perf_counter() - reg_start
-        logger.info(f"[Worker {device_id}] [TIMING] Target tensors registered in {reg_time:.3f}s")
+        self._register_tensors(model, device_id)
 
         # Build source tensor descriptors
         source_tensors = [
@@ -511,51 +597,44 @@ class MxModelLoader(BaseModelLoader):
         device_id: int,
         model_name: str,
     ) -> None:
-        """Load weights from disk, then register + publish."""
-        logger.info(f"[Worker {device_id}] Loading weights from disk...")
+        """Load weights from disk, process, then register + publish."""
         self._disk_loader.load_weights(model, model_config)
-        logger.info(f"[Worker {device_id}] Weights loaded from disk")
 
-        # Register with NIXL + publish
-        self._register_and_publish(model, target_device, device_id, model_name)
-
-        # FP8 processing
-        logger.info(f"[Worker {device_id}] Processing weights (FP8 transformation)...")
+        # Process weights FIRST, then register final tensors
         process_weights_after_loading(model, model_config, target_device)
-        logger.info(f"[Worker {device_id}] Weight processing complete")
+
+        # Register tensors
+        self._register_tensors(model, device_id)
+
+        # Publish metadata
+        self._publish_metadata(device_id, model_name)
 
     # ------------------------------------------------------------------
     # Shared: register with NIXL and publish metadata
     # ------------------------------------------------------------------
 
-    def _register_and_publish(
-        self,
-        model: nn.Module,
-        device: torch.device,
-        device_id: int,
-        model_name: str,
-    ) -> None:
-        """Register tensors with NIXL and publish metadata to the MX server."""
+    def _register_tensors(self, model: nn.Module, device_id: int) -> None:
+        """Collect model tensors and register them with NIXL."""
         if not is_nixl_available():
             logger.warning(f"[Worker {device_id}] NIXL not available, skipping registration")
             return
 
-        raw_tensors = _collect_cuda_tensors(model)
-        self._raw_tensors = raw_tensors
-        _log_tensor_summary(raw_tensors, device_id, "Registering tensors")
+        self._tensors = _collect_module_tensors(model)
+        _log_tensor_summary(self._tensors, device_id, "Registering tensors")
 
         if self._nixl_manager is None:
             self._nixl_manager = _init_nixl_manager(device_id, "auto")
 
-        # Only register if not already registered (target path already did this)
         if not self._nixl_manager.tensor_descriptors:
             logger.debug(f"[Worker {device_id}] Registering tensors with NIXL...")
-            self._nixl_manager.register_tensors(raw_tensors)
+            self._nixl_manager.register_tensors(self._tensors)
             logger.debug(f"[Worker {device_id}] Tensors registered with NIXL")
 
-        _raw_tensor_registry[device_id] = raw_tensors
+        _tensor_registry[device_id] = self._tensors
         _nixl_managers[device_id] = self._nixl_manager
 
+    def _publish_metadata(self, device_id: int, model_name: str) -> None:
+        """Publish metadata to the MX server."""
         # Optional synchronized publish
         sync_publish = os.environ.get("MX_SYNC_PUBLISH", "0") == "1"
         if sync_publish:
@@ -571,7 +650,7 @@ class MxModelLoader(BaseModelLoader):
 
         if model_name:
             _publish_metadata_and_ready(
-                self._mx_client, self._nixl_manager, raw_tensors, device_id, model_name
+                self._mx_client, self._nixl_manager, self._tensors, device_id, model_name
             )
         else:
             logger.warning(f"[Worker {device_id}] No model name available, skipping publish")
@@ -590,16 +669,15 @@ class MxModelLoader(BaseModelLoader):
         return self._nixl_manager
 
     @property
-    def raw_tensors(self) -> dict[str, torch.Tensor]:
-        """Access the raw tensor registry."""
-        return self._raw_tensors
+    def tensors(self) -> dict[str, torch.Tensor]:
+        """Access the registered tensor dict."""
+        return self._tensors
 
 
-
-# Global storage for raw tensor metadata, keyed by device_id.
+# Global storage for tensor metadata, keyed by device_id.
 # Required because vLLM's loader API doesn't expose loader instances after
 # load_model() returns. Source loaders store state here so the MxClient
 # (running in the same worker process) can access NIXL managers and tensors.
 # Each device_id maps to exactly one loader, so there are no concurrent writers.
-_raw_tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
+_tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, "NixlTransferManager"] = {}
