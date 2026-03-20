@@ -47,10 +47,12 @@ def register_modelexpress_loaders():
 
 
 from .client import MxClient  # noqa: F401
+from .dht_client import DhtMetadataClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 
 __all__ = [
+    "DhtMetadataClient",
     "GdsTransferManager",
     "MxClient",
     "MxGdsLoader",

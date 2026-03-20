@@ -84,6 +84,13 @@ ModelExpress/
 │       ├── state.rs                    # P2pStateManager, Redis + Lua scripts
 │       ├── services.rs                 # Health, API, Model gRPC services
 │       ├── p2p_service.rs              # P2P gRPC service (publish/get metadata + ready)
+│       ├── metadata_backend.rs        # Backend trait, config, factory
+│       ├── metadata_backend/
+│       │   ├── in_memory.rs           # In-memory backend (HashMap + RwLock)
+│       │   ├── redis.rs               # Redis backend (Lua atomic merge)
+│       │   ├── kubernetes.rs          # K8s CRD backend
+│       │   ├── layered.rs             # Cache + persistent write-through
+│       │   └── dht.rs                 # Kademlia DHT backend (rust-libp2p)
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -107,6 +114,7 @@ ModelExpress/
 │   └── modelexpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
+│       ├── dht_client.py              # DhtMetadataClient (DHT-based metadata, no server)
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── vllm_loader.py              # MxModelLoader
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
@@ -406,6 +414,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `GetMetadata`, and `UpdateStatus` RPCs |
+| `dht_client.py` | `DhtMetadataClient` - DHT-based metadata client using `mx_libp2p`, same interface as `MxClient` |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `vllm_loader.py` | `MxModelLoader` - custom vLLM model loader |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |

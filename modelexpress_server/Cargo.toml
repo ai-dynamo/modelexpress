@@ -43,6 +43,8 @@ kube = { workspace = true }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
 sha2 = { workspace = true }
+# libp2p for DHT-based metadata backend
+libp2p = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }

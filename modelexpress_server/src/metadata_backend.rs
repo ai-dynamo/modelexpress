@@ -3,11 +3,12 @@
 
 //! Metadata backend abstraction for P2P model metadata.
 //!
-//! Supports two persistent backends:
+//! Supports three backends:
 //! - **Redis**: Persistent storage via Redis keys + atomic Lua merge
 //! - **Kubernetes**: CRDs and ConfigMaps for native K8s integration
+//! - **DHT**: Decentralized Kademlia DHT (no centralized server needed)
 //!
-//! Select the backend via `MX_METADATA_BACKEND=redis` or `MX_METADATA_BACKEND=kubernetes`.
+//! Select the backend via `MX_METADATA_BACKEND=redis|kubernetes|dht`.
 //!
 //! NIXL agent blobs are NOT stored in the backend. Workers exchange them
 //! peer-to-peer via NIXL's native listen thread. The backend only stores
@@ -17,6 +18,7 @@ use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
 use std::sync::Arc;
 
+pub mod dht;
 pub mod kubernetes;
 pub mod redis;
 
@@ -226,6 +228,8 @@ pub enum BackendConfig {
     Redis { url: String },
     /// Kubernetes CRD backend -- native K8s integration
     Kubernetes { namespace: String },
+    /// DHT backend -- decentralized Kademlia, no centralized server
+    Dht(dht::DhtConfig),
 }
 
 impl BackendConfig {
@@ -234,6 +238,7 @@ impl BackendConfig {
     /// `MX_METADATA_BACKEND` is required. Valid values:
     /// - `redis`: Redis
     /// - `kubernetes` | `k8s` | `crd`: Kubernetes CRD
+    /// - `dht`: Kademlia DHT (decentralized)
     pub fn from_env() -> Result<Self, String> {
         let backend_type = std::env::var("MX_METADATA_BACKEND").unwrap_or_default();
         let redis_url = Self::redis_url_from_env();
@@ -254,8 +259,9 @@ impl BackendConfig {
             "kubernetes" | "k8s" | "crd" => Ok(Self::Kubernetes {
                 namespace: k8s_namespace.to_string(),
             }),
+            "dht" => Ok(Self::Dht(dht::DhtConfig::from_env())),
             other => Err(format!(
-                "MX_METADATA_BACKEND='{}' is not valid. Use 'redis' or 'kubernetes'.",
+                "MX_METADATA_BACKEND='{}' is not valid. Use 'redis', 'kubernetes', or 'dht'.",
                 other
             )),
         }
@@ -296,6 +302,11 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesBackend::new(&namespace).await?;
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
+        }
+        BackendConfig::Dht(dht_config) => {
+            let backend = dht::DhtBackend::new(dht_config).await?;
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }

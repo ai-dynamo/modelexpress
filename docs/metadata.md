@@ -186,6 +186,7 @@ Configured via `MX_METADATA_BACKEND` environment variable:
 | **K8s Native** | `kubernetes` | Cache | CRD write-through | K8s-native deployments |
 | **Redis Only** | `redis-only` | None | Redis direct | Legacy / backward compat |
 | **K8s Only** | `kubernetes-only` | None | CRD direct | Minimal memory footprint |
+| **DHT** | `dht` | None | Kademlia DHT | Fully decentralized, no server needed |
 
 ### Startup Hydration
 
@@ -524,6 +525,78 @@ MX_METADATA_BACKEND: "kubernetes"  # or "redis" (default)
 MX_METADATA_NAMESPACE: "default"   # For CRD backend — change to your namespace
 MX_REDIS_HOST: "modelexpress-server"  # For Redis backend
 MX_REDIS_PORT: "6379"
+```
+
+---
+
+## DHT Backend (Decentralized)
+
+The DHT backend uses [Kademlia](https://en.wikipedia.org/wiki/Kademlia) distributed hash table for fully decentralized metadata exchange. No MX server, no Redis, no K8s CRDs needed. Workers discover each other by participating in the same DHT network.
+
+The Rust server side uses `rust-libp2p` and the Python client side uses `mx_libp2p` (a pure-Python libp2p implementation included in this repo). Both are wire-compatible on the `/ipfs/kad/1.0.0` protocol.
+
+### Key Schema
+
+All records are stored as Kademlia key-value pairs with JSON values:
+
+| Key | Value | Purpose |
+|-----|-------|---------|
+| `/mx/<model_name>/<rank>` | `{worker_rank, metadata_endpoint, agent_name, tensors, status, updated_at}` | Per-worker record |
+| `/mx/<model_name>/workers` | `{ranks: [0, 1, ...], updated_at}` | Directory of active ranks |
+| `/mx/_models` | `{models: ["model-a", ...], updated_at}` | Global model list |
+
+All records are well under the 14KB DHT record limit (typically a few hundred bytes per worker).
+
+### Configuration
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `MX_METADATA_BACKEND` | `memory` | Set to `dht` to enable DHT backend |
+| `MX_DHT_LISTEN` | `0.0.0.0:4001` | DHT node listen address (host:port) |
+| `MX_DHT_BOOTSTRAP_PEERS` | (none) | Comma-separated multiaddrs of bootstrap nodes |
+| `MX_DHT_BOOTSTRAP_DNS` | (none) | K8s headless service hostname for DNS-based bootstrap |
+| `MX_DHT_RECORD_TTL` | `300` | Record time-to-live in seconds |
+
+For Kubernetes deployments, DNS-based bootstrap is recommended. Create a headless service that resolves to all worker pod IPs, then set `MX_DHT_BOOTSTRAP_DNS` to the service hostname.
+
+### Kubernetes Headless Service Example
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-dht
+spec:
+  clusterIP: None
+  selector:
+    app: mx-worker
+  ports:
+    - name: dht
+      port: 4001
+      targetPort: 4001
+```
+
+Workers start their DHT node, resolve the headless service, and connect to all discovered peers. No ordering or leader election needed - Kademlia is symmetric.
+
+### Workflow
+
+```mermaid
+sequenceDiagram
+    participant S as Source Worker
+    participant DHT as Kademlia DHT
+    participant T as Target Worker
+
+    S->>DHT: PUT /mx/model/0 (worker record)
+    S->>DHT: PUT /mx/model/workers (directory)
+    S->>DHT: PUT /mx/_models (model list)
+    S->>DHT: PUT /mx/model/0 (status=READY)
+
+    T->>DHT: GET /mx/model/workers (discover ranks)
+    DHT-->>T: {ranks: [0]}
+    T->>DHT: GET /mx/model/0 (worker record)
+    DHT-->>T: {endpoint, agent_name, tensors}
+    T->>S: NIXL fetch_remote_metadata (direct P2P)
+    T->>S: RDMA transfer (direct GPU-to-GPU)
 ```
 
 ---

@@ -67,6 +67,18 @@ k8s-openapi = { version = "0.24", features = ["v1_31"] }
 schemars = "0.8"
 sha2 = "0.10"
 
+# libp2p for DHT-based metadata backend
+libp2p = { version = "0.56", features = [
+    "tokio",
+    "noise",
+    "yamux",
+    "tcp",
+    "kad",
+    "identify",
+    "macros",
+    "ed25519",
+] }
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 #pedantic = { level = "deny", priority = -1 }
