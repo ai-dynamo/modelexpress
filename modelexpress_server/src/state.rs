@@ -8,7 +8,7 @@
 //! making the server stateless and horizontally scalable.
 
 use crate::metadata_backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
-use modelexpress_common::grpc::p2p::WorkerMetadata;
+use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -105,34 +105,51 @@ impl P2pStateManager {
     // Model Metadata
     // ========================================================================
 
-    /// Publish metadata for a model (merges workers with existing data).
+    /// Publish metadata for a source instance.
     pub async fn publish_metadata(
         &self,
-        model_name: &str,
+        identity: &SourceIdentity,
+        worker_id: &str,
         workers: Vec<WorkerMetadata>,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .publish_metadata(model_name, workers)
+            .publish_metadata(identity, worker_id, workers)
             .await
     }
 
-    /// Get metadata for a model.
+    /// Get full tensor metadata for one specific instance.
     pub async fn get_metadata(
         &self,
-        model_name: &str,
+        source_id: &str,
+        worker_id: &str,
     ) -> MetadataResult<Option<ModelMetadataRecord>> {
-        self.get_backend().await?.get_metadata(model_name).await
+        self.get_backend()
+            .await?
+            .get_metadata(source_id, worker_id)
+            .await
     }
 
-    /// Remove metadata for a model.
-    pub async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()> {
-        self.get_backend().await?.remove_metadata(model_name).await
+    /// List available source instances, optionally filtered by status.
+    pub async fn list_workers(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<modelexpress_common::grpc::p2p::SourceStatus>,
+    ) -> MetadataResult<Vec<crate::metadata_backend::SourceInstanceInfo>> {
+        self.get_backend()
+            .await?
+            .list_workers(source_id, status_filter)
+            .await
     }
 
-    /// List all registered model names.
-    pub async fn list_models(&self) -> MetadataResult<Vec<String>> {
-        self.get_backend().await?.list_models().await
+    /// Remove metadata by mx_source_id.
+    pub async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()> {
+        self.get_backend().await?.remove_metadata(source_id).await
+    }
+
+    /// List all registered source IDs and model names.
+    pub async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>> {
+        self.get_backend().await?.list_sources().await
     }
 
     // ========================================================================
@@ -140,22 +157,22 @@ impl P2pStateManager {
     // ========================================================================
 
     /// Update the status of a worker within its stored metadata record.
-    /// `status` is the `SourceStatus` proto enum value (i32).
     pub async fn update_worker_status(
         &self,
-        model_name: &str,
-        worker_id: u32,
-        status: i32,
+        source_id: &str,
+        worker_id: &str,
+        worker_rank: u32,
+        status: modelexpress_common::grpc::p2p::SourceStatus,
     ) -> MetadataResult<()> {
         let updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
             .await?
-            .update_status(model_name, worker_id, status, updated_at)
+            .update_status(source_id, worker_id, worker_rank, status, updated_at)
             .await?;
 
         debug!(
-            "Updated status for model '{}' worker {} -> {}",
-            model_name, worker_id, status
+            "Updated status for source '{}' worker '{}' rank {} -> {}",
+            source_id, worker_id, worker_rank, status as i32
         );
         Ok(())
     }
@@ -167,7 +184,24 @@ mod tests {
     use super::*;
     use crate::metadata_backend::MockMetadataBackend;
     use mockall::predicate::eq;
-    use modelexpress_common::grpc::p2p::{SourceStatus, TensorDescriptor};
+    use modelexpress_common::grpc::p2p::{
+        MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor,
+    };
+
+    fn test_identity() -> SourceIdentity {
+        SourceIdentity {
+            mx_version: "0.3.0".to_string(),
+            mx_source_type: MxSourceType::Weights as i32,
+            model_name: "my-model".to_string(),
+            backend_framework: 1,
+            tensor_parallel_size: 8,
+            pipeline_parallel_size: 1,
+            expert_parallel_size: 0,
+            dtype: "bfloat16".to_string(),
+            quantization: String::new(),
+            extra_parameters: Default::default(),
+        }
+    }
 
     #[test]
     fn test_tensor_record_conversion() {
@@ -291,6 +325,8 @@ mod tests {
     #[test]
     fn test_model_record_creation() {
         let record = ModelMetadataRecord {
+            source_id: "abc123def456abcd".to_string(),
+            worker_id: "test-instance-id".to_string(),
             model_name: "meta-llama/Llama-3.1-70B".to_string(),
             workers: vec![
                 WorkerRecord {
@@ -358,6 +394,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_publish_metadata_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata()
+            .withf(|identity, worker_id, workers| {
+                identity.model_name == "my-model"
+                    && identity.tensor_parallel_size == 8
+                    && worker_id == "a1b2c3d4"
+                    && workers.len() == 1
+                    && workers[0].worker_rank == 3
+            })
+            .once()
+            .returning(|_, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        manager
+            .publish_metadata(
+                &test_identity(),
+                "a1b2c3d4",
+                vec![WorkerMetadata {
+                    worker_rank: 3,
+                    backend_metadata: None,
+                    tensors: vec![],
+                    status: SourceStatus::Initializing as i32,
+                    updated_at: 0,
+                }],
+            )
+            .await
+            .expect("publish_metadata failed");
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_propagates_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata()
+            .once()
+            .returning(|_, _, _| Err("storage unavailable".into()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        assert!(
+            manager
+                .publish_metadata(&test_identity(), "a1b2c3d4", vec![])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn test_connect_fails_without_config() {
         let manager = P2pStateManager {
             backend: Arc::new(RwLock::new(None)),
@@ -371,17 +454,18 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .with(
-                eq("my-model"),
+                eq("abc123def456abcd"),
+                eq("test-instance"),
                 eq(2u32),
-                eq(2i32),
+                eq(SourceStatus::Ready),
                 mockall::predicate::always(),
             )
             .once()
-            .returning(|_, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("my-model", 2, SourceStatus::Ready as i32)
+            .update_worker_status("abc123def456abcd", "test-instance", 2, SourceStatus::Ready)
             .await
             .expect("update_worker_status failed");
     }
@@ -391,32 +475,114 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .once()
-            .returning(|_, _, _, _| Err("redis unavailable".into()));
+            .returning(|_, _, _, _, _| Err("redis unavailable".into()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .update_worker_status("my-model", 0, SourceStatus::Ready as i32)
+                .update_worker_status("abc123def456abcd", "test-instance", 0, SourceStatus::Ready)
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn test_update_worker_status_stores_correct_status() {
+    async fn test_list_workers_calls_backend() {
         let mut mock = MockMetadataBackend::new();
-        mock.expect_update_status()
-            .withf(|model, worker_id, status, _updated_at| {
-                model == "deepseek-ai/DeepSeek-V3"
-                    && *worker_id == 7
-                    && *status == SourceStatus::Ready as i32
+        mock.expect_list_workers()
+            .withf(|source_id, status_filter| {
+                source_id.as_deref() == Some("abc123def456abcd")
+                    && *status_filter == Some(SourceStatus::Ready)
             })
             .once()
-            .returning(|_, _, _, _| Ok(()));
+            .returning(|_, _| {
+                Ok(vec![crate::metadata_backend::SourceInstanceInfo {
+                    source_id: "abc123def456abcd".to_string(),
+                    worker_id: "w1".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                }])
+            });
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let result = manager
+            .list_workers(
+                Some("abc123def456abcd".to_string()),
+                Some(SourceStatus::Ready),
+            )
+            .await
+            .expect("list_workers failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].worker_id, "w1");
+    }
+
+    #[tokio::test]
+    async fn test_list_workers_propagates_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Err("backend error".into()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        assert!(manager.list_workers(None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_remove_metadata_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_remove_metadata()
+            .with(eq("abc123def456abcd"))
+            .once()
+            .returning(|_| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("deepseek-ai/DeepSeek-V3", 7, SourceStatus::Ready as i32)
+            .remove_metadata("abc123def456abcd")
+            .await
+            .expect("remove_metadata failed");
+    }
+
+    #[tokio::test]
+    async fn test_remove_metadata_propagates_backend_error() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_remove_metadata()
+            .once()
+            .returning(|_| Err("delete failed".into()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        assert!(manager.remove_metadata("abc123def456abcd").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_sources()
+            .once()
+            .returning(|| Ok(vec![("src1".to_string(), "model-a".to_string())]));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let result = manager.list_sources().await.expect("list_sources failed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "src1");
+        assert_eq!(result[0].1, "model-a");
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_status_stores_correct_status() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_update_status()
+            .withf(|source_id, worker_id, worker_rank, status, _updated_at| {
+                source_id == "abc123def456abcd"
+                    && worker_id == "test-instance"
+                    && *worker_rank == 7
+                    && *status == SourceStatus::Ready
+            })
+            .once()
+            .returning(|_, _, _, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        manager
+            .update_worker_status("abc123def456abcd", "test-instance", 7, SourceStatus::Ready)
             .await
             .expect("update_worker_status failed");
     }

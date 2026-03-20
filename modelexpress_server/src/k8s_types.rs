@@ -74,7 +74,7 @@ pub struct WorkerStatus {
     #[serde(rename = "tensorConfigMap", default)]
     pub tensor_config_map: Option<String>,
 
-    /// Worker lifecycle status (Unknown, Initializing, Ready, Stale)
+    /// Worker lifecycle status (Initializing, Ready, Stale)
     #[serde(default)]
     pub status: String,
 
@@ -87,6 +87,7 @@ impl WorkerStatus {
     /// Convert a `SourceStatus` proto enum value (i32) to the CRD status string.
     pub fn status_name_from_proto(status: i32) -> String {
         match status {
+            0 => "Unknown",
             1 => "Initializing",
             2 => "Ready",
             3 => "Stale",
@@ -161,7 +162,12 @@ mod tests {
 
     #[test]
     fn test_status_roundtrip() {
-        for (proto, name) in [(1, "Initializing"), (2, "Ready"), (3, "Stale")] {
+        for (proto, name) in [
+            (0, "Unknown"),
+            (1, "Initializing"),
+            (2, "Ready"),
+            (3, "Stale"),
+        ] {
             assert_eq!(WorkerStatus::status_name_from_proto(proto), name);
             assert_eq!(WorkerStatus::status_proto_from_name(name), proto);
         }
@@ -184,8 +190,8 @@ mod tests {
 
     #[test]
     fn test_status_name_from_proto_unknown() {
-        assert_eq!(WorkerStatus::status_name_from_proto(0), "Unknown");
         assert_eq!(WorkerStatus::status_name_from_proto(99), "Unknown");
+        assert_eq!(WorkerStatus::status_name_from_proto(4), "Unknown");
     }
 
     #[test]
