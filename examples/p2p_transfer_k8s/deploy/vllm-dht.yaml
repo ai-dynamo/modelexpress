@@ -107,8 +107,9 @@ spec:
             - name: MX_CONTIGUOUS_REG
               value: "0"
             # NIXL over TCP (no RDMA hardware on test cluster)
+            # cuda_copy is required so UCX keeps CUDA memory domains alive
             - name: UCX_TLS
-              value: "tcp"
+              value: "tcp,cuda_copy"
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
