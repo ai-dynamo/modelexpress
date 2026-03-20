@@ -62,26 +62,85 @@ def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", wor
 
 
 # ---------------------------------------------------------------------------
-# _collect_cuda_tensors
+# _collect_module_tensors
 # ---------------------------------------------------------------------------
 
 
-class TestCollectCudaTensors:
+class TestCollectModuleTensors:
+    """Tests for the _collect_module_tensors helper."""
+
     def test_empty_model(self):
-        from modelexpress.vllm_loader import _collect_cuda_tensors
-        assert _collect_cuda_tensors(nn.Module()) == {}
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        result = _collect_module_tensors(model)
+        assert result == {}
 
     def test_cpu_only_model(self):
-        from modelexpress.vllm_loader import _collect_cuda_tensors
-        assert _collect_cuda_tensors(nn.Linear(4, 2, bias=False)) == {}
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Linear(4, 2, bias=False)
+        # Parameters default to CPU -- not CUDA, so should be empty
+        result = _collect_module_tensors(model)
+        assert result == {}
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_model(self):
-        from modelexpress.vllm_loader import _collect_cuda_tensors
+        from modelexpress.vllm_loader import _collect_module_tensors
+
         model = nn.Linear(4, 2, bias=True).cuda()
-        result = _collect_cuda_tensors(model)
-        assert len(result) == 2
-        assert all(t.is_cuda for t in result.values())
+        result = _collect_module_tensors(model)
+        assert len(result) == 2  # weight + bias
+        assert "weight" in result
+        assert "bias" in result
+        for t in result.values():
+            assert t.is_cuda
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_skips_non_contiguous(self):
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.randn(4, 3, device="cuda"))
+        model.weight_t = model.weight.data.T
+        assert not model.weight_t.is_contiguous()
+
+        result = _collect_module_tensors(model)
+        assert "weight" in result
+        assert "weight_t" not in result
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_deduplicate_tied_weights(self):
+        """Tied weights (same data_ptr) should only be registered once."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        shared = nn.Parameter(torch.randn(4, 3, device="cuda"))
+        embed = nn.Module()
+        embed.weight = shared
+        head = nn.Module()
+        head.weight = shared
+        model.embed_tokens = embed
+        model.lm_head = head
+
+        result = _collect_module_tensors(model)
+        ptrs = [t.data_ptr() for t in result.values()]
+        assert len(ptrs) == len(set(ptrs)), "duplicate data_ptr found in result"
+        assert len(result) == 1
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_deduplicate_bare_attr_alias(self):
+        """A bare tensor attr sharing data_ptr with a parameter is skipped."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.randn(4, 3, device="cuda"))
+        model.__dict__["w_alias"] = model.weight.data
+
+        result = _collect_module_tensors(model)
+        assert "weight" in result
+        assert "w_alias" not in result
+        assert len(result) == 1
 
 
 # ---------------------------------------------------------------------------
