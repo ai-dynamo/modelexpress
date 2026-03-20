@@ -55,4 +55,6 @@ docs/optimization-comparison.md
 docs/tmp
 
 # Python
+.venv/
+*.egg-info/
 modelexpress_client/python/modelexpress.egg-info

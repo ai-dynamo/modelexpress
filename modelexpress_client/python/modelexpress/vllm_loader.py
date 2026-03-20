@@ -9,8 +9,13 @@ of fully-processed model tensors. Registration happens AFTER
 process_weights_after_loading() so that all final tensors (parameters, buffers,
 and bare tensor attributes like FP8 scales) are captured and transferred.
 
+Supports a three-tier loading strategy:
+    1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
+    2. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
+    3. Disk (vLLM DefaultModelLoader) - standard CPU-staged loading
+
 Usage:
-    --load-format mx  (auto-detect: RDMA if source exists, else disk)
+    --load-format mx  (auto-detect: RDMA -> GDS -> disk)
 """
 
 from __future__ import annotations
@@ -18,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import sys
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -40,6 +44,8 @@ from vllm.model_executor.model_loader.utils import (
     process_weights_after_loading,
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
+from .gds_loader import MxGdsLoader
+from .gds_transfer import is_gds_available
 from .nixl_transfer import NixlTransferManager, is_nixl_available
 from .types import TensorDescriptor
 
@@ -47,11 +53,6 @@ if TYPE_CHECKING:
     from .nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.vllm_loader")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-    logger.addHandler(handler)
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
@@ -325,10 +326,7 @@ def _publish_metadata_and_ready(
                 f"[Worker {device_id}] Failed to publish metadata to MX server"
             )
 
-    except Exception as e:
-        import traceback
-        logger.error(f"[Worker {device_id}] EXCEPTION publishing metadata: {e}")
-        logger.error(f"[Worker {device_id}] Traceback: {traceback.format_exc()}")
+    except Exception:
         raise
 
 
@@ -338,16 +336,17 @@ class MxModelLoader(BaseModelLoader):
     Auto-detecting model loader for ModelExpress P2P transfers.
 
     On load_model(), queries the MX server to see if an existing source
-    is ready for this model. If yes, receives weights via RDMA (like
-    a target). If no, loads weights from disk (as a source). Either
-    way, registers tensors and publishes metadata so future nodes can
-    discover this one as a source.
+    is ready for this model. If yes, receives weights via RDMA. If no,
+    attempts GDS (GPUDirect Storage) for direct file-to-GPU loading,
+    falling back to standard disk loading if GDS is unavailable.
+    Either way, registers tensors and publishes metadata so future nodes
+    can discover this one as a source.
 
     Flow:
         1. initialize_model()
         2. _detect_source() - one-shot check against MX server
         3a. Source found -> load dummy weights, RDMA receive
-        3b. No source   -> load from disk
+        3b. No source   -> try GDS, else disk load
         4. process_weights_after_loading()
         5. Register ALL final tensors with NIXL + publish
     """
@@ -367,7 +366,7 @@ class MxModelLoader(BaseModelLoader):
             disk_config.load_format = "auto"
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
-        self._disk_loader = DefaultModelLoader(disk_config)
+        self._default_loader = DefaultModelLoader(disk_config)
 
         dummy_config = copy.copy(load_config)
         try:
@@ -412,7 +411,7 @@ class MxModelLoader(BaseModelLoader):
                 )
             else:
                 logger.info(
-                    f"[Worker {device_id}] No source found - loading from disk"
+                    f"[Worker {device_id}] No RDMA source found - trying GDS then disk"
                 )
                 self._load_as_source(
                     model, model_config, target_device, device_id, model_name,
@@ -469,7 +468,7 @@ class MxModelLoader(BaseModelLoader):
 
         except Exception as e:
             logger.warning(
-                f"[Worker {device_id}] Error detecting source, falling back to disk: {e}"
+                f"[Worker {device_id}] Error detecting source, falling back: {e}"
             )
             return None
 
@@ -586,7 +585,7 @@ class MxModelLoader(BaseModelLoader):
         logger.info(f"[Worker {device_id}] [TIMING] Total receive time: {total_time:.2f}s")
 
     # ------------------------------------------------------------------
-    # Source path: load from disk then register + publish
+    # Source path: GDS -> disk, then register + publish
     # ------------------------------------------------------------------
 
     def _load_as_source(
@@ -597,8 +596,18 @@ class MxModelLoader(BaseModelLoader):
         device_id: int,
         model_name: str,
     ) -> None:
-        """Load weights from disk, process, then register + publish."""
-        self._disk_loader.load_weights(model, model_config)
+        """Load weights via GDS or disk, process, then register + publish."""
+        loaded_via_gds = False
+
+        if is_gds_available():
+            loaded_via_gds = self._try_gds_load(
+                model, model_config, device_id
+            )
+
+        if not loaded_via_gds:
+            logger.info(f"[Worker {device_id}] Loading weights from disk...")
+            self._default_loader.load_weights(model, model_config)
+            logger.info(f"[Worker {device_id}] Weights loaded from disk")
 
         # Process weights FIRST, then register final tensors
         process_weights_after_loading(model, model_config, target_device)
@@ -608,6 +617,40 @@ class MxModelLoader(BaseModelLoader):
 
         # Publish metadata
         self._publish_metadata(device_id, model_name)
+
+    def _try_gds_load(
+        self,
+        model: nn.Module,
+        model_config: ModelConfig,
+        device_id: int,
+    ) -> bool:
+        """
+        Attempt to load weights via GDS.
+
+        Uses MxGdsLoader.load_iter() to yield (name, tensor) pairs, then
+        feeds them to model.load_weights() so vLLM handles tensor name
+        mapping (e.g. merging q/k/v into qkv_proj) correctly.
+
+        Returns True if GDS loading succeeded, False to fall back to disk.
+        """
+        logger.info(f"[Worker {device_id}] GDS available, attempting GDS loading...")
+        gds_loader = MxGdsLoader()
+        try:
+            use_tqdm = getattr(self.load_config, "use_tqdm_on_load", True)
+            revision = getattr(model_config, "revision", None)
+            weights_iter = gds_loader.load_iter(
+                model_config.model, use_tqdm=use_tqdm, revision=revision
+            )
+            model.load_weights(weights_iter)
+            logger.info(f"[Worker {device_id}] GDS weight loading complete")
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[Worker {device_id}] GDS loading failed, falling back to disk: {e}"
+            )
+            return False
+        finally:
+            gds_loader.shutdown()
 
     # ------------------------------------------------------------------
     # Shared: register with NIXL and publish metadata
@@ -649,19 +692,25 @@ class MxModelLoader(BaseModelLoader):
                 logger.debug(f"[Worker {device_id}] Barrier not available: {e}")
 
         if model_name:
-            _publish_metadata_and_ready(
-                self._mx_client, self._nixl_manager, self._tensors, device_id, model_name
-            )
+            try:
+                _publish_metadata_and_ready(
+                    self._mx_client, self._nixl_manager, self._tensors, device_id, model_name
+                )
+            except Exception:
+                logger.warning(
+                    f"[Worker {device_id}] MX server unavailable, "
+                    f"skipping P2P registration"
+                )
         else:
             logger.warning(f"[Worker {device_id}] No model name available, skipping publish")
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
-        self._disk_loader.download_model(model_config)
+        self._default_loader.download_model(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into an already-initialized model (standalone API)."""
-        self._disk_loader.load_weights(model, model_config)
+        self._default_loader.load_weights(model, model_config)
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
