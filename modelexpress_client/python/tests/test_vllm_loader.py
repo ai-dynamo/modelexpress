@@ -60,6 +60,39 @@ class TestCollectModuleTensors:
         assert "weight" in result
         assert "weight_t" not in result
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_deduplicate_tied_weights(self):
+        """Tied weights (same data_ptr) should only be registered once."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        shared = nn.Parameter(torch.randn(4, 3, device="cuda"))
+        embed = nn.Module()
+        embed.weight = shared
+        head = nn.Module()
+        head.weight = shared
+        model.embed_tokens = embed
+        model.lm_head = head
+
+        result = _collect_module_tensors(model)
+        ptrs = [t.data_ptr() for t in result.values()]
+        assert len(ptrs) == len(set(ptrs)), "duplicate data_ptr found in result"
+        assert len(result) == 1
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_deduplicate_bare_attr_alias(self):
+        """A bare tensor attr sharing data_ptr with a parameter is skipped."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.randn(4, 3, device="cuda"))
+        model.__dict__["w_alias"] = model.weight.data  # same data_ptr, different name
+
+        result = _collect_module_tensors(model)
+        assert "weight" in result
+        assert "w_alias" not in result
+        assert len(result) == 1
+
 
 # ---------------------------------------------------------------------------
 # _detect_source (via MxModelLoader)

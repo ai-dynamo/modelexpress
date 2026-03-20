@@ -457,7 +457,7 @@ The loader uses `_iter_module_tensors()` to walk the full PyTorch module tree an
 | Buffers | `module._buffers` | Batch norm running mean |
 | Tensor attributes | `dir(module)` scan | FP8 `weight_scale`, `_k_scale` |
 
-This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. transposed views like `W_UK_T`) are skipped because they are views over contiguous tensors already in the module tree.
+This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. transposed views like `W_UK_T`) are skipped because they are views over contiguous tensors already in the module tree. Tensors are deduplicated by `data_ptr()` so tied weights (e.g. `embed_tokens.weight` and `lm_head.weight` sharing the same memory) are only registered and transferred once.
 
 ## NIXL Integration
 

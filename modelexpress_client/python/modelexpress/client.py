@@ -145,4 +145,3 @@ class MxClient:
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)
         return response.success
-

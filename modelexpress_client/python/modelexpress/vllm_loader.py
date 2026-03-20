@@ -190,23 +190,38 @@ def _collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
     because they are views over contiguous tensors that are already in the
     module tree. Transferring the underlying contiguous tensor automatically
     updates the view.
+
+    Deduplicates by data_ptr() to avoid registering the same GPU memory
+    twice (e.g. tied weights where embed_tokens.weight and lm_head.weight
+    share the same tensor).
     """
     tensors: dict[str, torch.Tensor] = {}
-    skipped = 0
+    seen_ptrs: set[int] = set()
+    skipped_noncontiguous = 0
+    skipped_duplicate = 0
     for name, tensor, _tensor_type in _iter_module_tensors(model):
         t = tensor.data if hasattr(tensor, "data") else tensor
 
         if not t.is_contiguous():
             logger.debug(f"Skipping non-contiguous tensor '{name}' (view of another tensor)")
-            skipped += 1
+            skipped_noncontiguous += 1
             continue
+
+        ptr = t.data_ptr()
+        if ptr in seen_ptrs:
+            logger.debug(f"Skipping duplicate tensor '{name}' (same data_ptr as already registered tensor)")
+            skipped_duplicate += 1
+            continue
+        seen_ptrs.add(ptr)
 
         tensors[name] = t
 
-    if skipped:
+    if skipped_noncontiguous:
         logger.info(
-            f"Skipped {skipped} non-contiguous tensors (views of contiguous tensors already registered)"
+            f"Skipped {skipped_noncontiguous} non-contiguous tensors (views of contiguous tensors already registered)"
         )
+    if skipped_duplicate:
+        logger.info(f"Skipped {skipped_duplicate} duplicate tensors (tied weights sharing the same memory)")
     return tensors
 
 
