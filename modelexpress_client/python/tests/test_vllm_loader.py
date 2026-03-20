@@ -157,17 +157,17 @@ class TestAbstractMethodCompleteness:
         remaining = getattr(MxModelLoader, "__abstractmethods__", frozenset())
         assert remaining == frozenset()
 
-    def test_download_model_delegates_to_disk_loader(self):
+    def test_download_model_delegates_to_default_loader(self):
         loader = _make_loader()
         cfg = MagicMock()
         loader.download_model(cfg)
-        loader._disk_loader.download_model.assert_called_once_with(cfg)
+        loader._default_loader.download_model.assert_called_once_with(cfg)
 
-    def test_load_weights_delegates_to_disk_loader(self):
+    def test_load_weights_delegates_to_default_loader(self):
         loader = _make_loader()
         model, cfg = MagicMock(), MagicMock()
         loader.load_weights(model, cfg)
-        loader._disk_loader.load_weights.assert_called_once_with(model, cfg)
+        loader._default_loader.load_weights.assert_called_once_with(model, cfg)
 
 
 # ---------------------------------------------------------------------------
