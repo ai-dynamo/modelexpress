@@ -264,7 +264,7 @@ class TestAbstractMethodCompleteness:
 
         loader.download_model(mock_model_config)
 
-        loader._disk_loader.download_model.assert_called_once_with(mock_model_config)
+        loader._default_loader.download_model.assert_called_once_with(mock_model_config)
 
     def test_load_weights_delegates_to_disk_loader(self):
         """load_weights() must delegate to the internal disk loader."""
@@ -274,7 +274,7 @@ class TestAbstractMethodCompleteness:
 
         loader.load_weights(mock_model, mock_model_config)
 
-        loader._disk_loader.load_weights.assert_called_once_with(
+        loader._default_loader.load_weights.assert_called_once_with(
             mock_model, mock_model_config
         )
 
