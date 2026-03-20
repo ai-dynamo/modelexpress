@@ -364,9 +364,9 @@ class MxModelLoader(BaseModelLoader):
             )
             return None
 
-        except Exception:
+        except Exception as e:
             logger.warning(
-                f"[Worker {device_id}] MX server unavailable, skipping RDMA source detection"
+                f"[Worker {device_id}] Error detecting source, falling back: {e}"
             )
             return None
 
@@ -550,7 +550,10 @@ class MxModelLoader(BaseModelLoader):
         gds_loader = MxGdsLoader()
         try:
             use_tqdm = getattr(self.load_config, "use_tqdm_on_load", True)
-            weights_iter = gds_loader.load_iter(model_config.model, use_tqdm=use_tqdm)
+            revision = getattr(model_config, "revision", None)
+            weights_iter = gds_loader.load_iter(
+                model_config.model, use_tqdm=use_tqdm, revision=revision
+            )
             model.load_weights(weights_iter)
             logger.info(f"[Worker {device_id}] GDS weight loading complete")
             return True

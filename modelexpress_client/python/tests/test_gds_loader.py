@@ -218,7 +218,7 @@ class TestMxModelLoaderGdsIntegration:
         loader = self._make_loader()
 
         mock_gds = MagicMock()
-        mock_gds.load_weights_into_model.return_value = 10
+        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
         mock_gds_cls.return_value = mock_gds
 
         model = MagicMock()
@@ -227,7 +227,8 @@ class TestMxModelLoaderGdsIntegration:
 
         result = loader._try_gds_load(model, model_config, device_id=0)
         assert result is True
-        mock_gds.load_weights_into_model.assert_called_once()
+        mock_gds.load_iter.assert_called_once()
+        model.load_weights.assert_called_once()
         mock_gds.shutdown.assert_called_once()
 
     @patch("modelexpress.vllm_loader.is_gds_available", return_value=True)
@@ -236,7 +237,7 @@ class TestMxModelLoaderGdsIntegration:
         loader = self._make_loader()
 
         mock_gds = MagicMock()
-        mock_gds.load_weights_into_model.side_effect = RuntimeError("GDS error")
+        mock_gds.load_iter.side_effect = RuntimeError("GDS error")
         mock_gds_cls.return_value = mock_gds
 
         model = MagicMock()
@@ -264,4 +265,4 @@ class TestMxModelLoaderGdsIntegration:
                 model_name="test-model",
             )
 
-        loader._disk_loader.load_weights.assert_called_once_with(model, model_config)
+        loader._default_loader.load_weights.assert_called_once_with(model, model_config)

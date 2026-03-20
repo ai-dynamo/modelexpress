@@ -197,8 +197,8 @@ class GdsTransferManager:
 
         state = self._agent.transfer(handle)
         if state == "ERR":
-            self._agent.deregister_memory(file_descs)
-            self._agent.deregister_memory(vram_descs)
+            self._agent.release_xfer_handle(handle)
+            self._free_nixl_memory(file_descs, vram_descs)
             raise RuntimeError("GDS batch transfer failed")
 
         # Phase 4: Wait for completion
@@ -211,13 +211,11 @@ class GdsTransferManager:
                 break
             if state == "ERR":
                 self._agent.release_xfer_handle(handle)
-                self._agent.deregister_memory(file_descs)
-                self._agent.deregister_memory(vram_descs)
+                self._free_nixl_memory(file_descs, vram_descs)
                 raise RuntimeError("GDS batch transfer error")
             if time.perf_counter() - t0 > timeout:
                 self._agent.release_xfer_handle(handle)
-                self._agent.deregister_memory(file_descs)
-                self._agent.deregister_memory(vram_descs)
+                self._free_nixl_memory(file_descs, vram_descs)
                 raise TimeoutError("GDS batch transfer timeout")
             spins += 1
             if spins > 100:
@@ -225,10 +223,14 @@ class GdsTransferManager:
                 spins = 0
 
         self._agent.release_xfer_handle(handle)
-        self._agent.deregister_memory(file_descs)
-        self._agent.deregister_memory(vram_descs)
+        self._free_nixl_memory(file_descs, vram_descs)
 
         return result_buffers
+
+    def _free_nixl_memory(self, file_descs: Any, vram_descs: Any) -> None:
+        """Deregister FILE and VRAM descriptors from the NIXL agent."""
+        self._agent.deregister_memory(file_descs)
+        self._agent.deregister_memory(vram_descs)
 
     def shutdown(self) -> None:
         """Clean up NIXL GDS resources."""

@@ -80,7 +80,11 @@ class MxGdsLoader:
         return result
 
     def load_iter(
-        self, model_path: str, *, use_tqdm: bool = True
+        self,
+        model_path: str,
+        *,
+        use_tqdm: bool = True,
+        revision: str | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """
         Yield (tensor_name, gpu_tensor) pairs loaded via GDS.
@@ -89,7 +93,7 @@ class MxGdsLoader:
         transfer, then its tensors are yielded one by one.
         """
         load_start = time.perf_counter()
-        model_path = self._resolve_model_path(model_path)
+        model_path = self._resolve_model_path(model_path, revision=revision)
 
         if not is_gds_available():
             raise RuntimeError(
