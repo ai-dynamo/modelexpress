@@ -6,3 +6,7 @@
 Supports exactly one protocol stack: TCP + Noise XX (Ed25519) + Yamux + Kademlia.
 No pluggable transports, no relay, no pubsub. Purpose-built for DHT metadata exchange.
 """
+
+from .dht import DhtNode  # noqa: F401
+
+__all__ = ["DhtNode"]
