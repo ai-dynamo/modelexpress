@@ -24,6 +24,14 @@ STALL_PARALLELISM_BOOST = 2
 class QueryMixin:
     """Iterative Kademlia lookups and single-peer RPCs for DhtNode."""
 
+    def _is_peer_reachable(self, peer_id: bytes) -> bool:
+        """Check if a peer is worth dialing. Returns False for peers marked
+        disconnected in the routing table (they'd just timeout)."""
+        entry = self.routing_table.find(peer_id)
+        if entry is None:
+            return True  # unknown peer, worth trying
+        return entry.connected
+
     async def _iterative_find_node(self, target: bytes) -> list[tuple[bytes, list[bytes]]]:
         """Iterative FIND_NODE lookup with stall detection.
 
@@ -51,7 +59,11 @@ class QueryMixin:
         for _round in range(MAX_LOOKUP_ROUNDS):
             # Sort by distance, pick unqueried peers up to current parallelism
             candidates = sorted(peer_map.keys(), key=lambda p: xor_distance(p, target))
-            to_query = [p for p in candidates if p not in queried][:parallelism]
+            # Skip peers already marked disconnected - they'd just timeout
+            to_query = [
+                p for p in candidates
+                if p not in queried and self._is_peer_reachable(p)
+            ][:parallelism]
 
             if not to_query:
                 break
@@ -141,7 +153,10 @@ class QueryMixin:
 
         for _round in range(MAX_LOOKUP_ROUNDS):
             candidates = sorted(peer_map.keys(), key=lambda p: xor_distance(p, key))
-            to_query = [p for p in candidates if p not in queried][:ALPHA]
+            to_query = [
+                p for p in candidates
+                if p not in queried and self._is_peer_reachable(p)
+            ][:ALPHA]
 
             if not to_query:
                 break
@@ -205,13 +220,16 @@ class QueryMixin:
             return None, None, new_peers
         except Exception as e:
             log.debug(f"get_value from {peer_id.hex()[:16]}... failed: {e}", exc_info=True)
+            self.routing_table.mark_disconnected(peer_id)
             return None, None, []
 
     async def _put_to_peer(
         self, peer_id: bytes, addrs: list[bytes], key: bytes, value: bytes,
         publisher: bytes | None = None, ttl_secs: int | None = None,
     ) -> bool:
-        """Send PUT_VALUE to a single peer."""
+        """Send PUT_VALUE to a single peer. Skips peers marked disconnected."""
+        if not self._is_peer_reachable(peer_id):
+            return False
         try:
             conn = await asyncio.wait_for(
                 self.peer_store.get_or_dial(peer_id, addrs), timeout=self.dial_timeout
@@ -222,5 +240,6 @@ class QueryMixin:
             )
             return True
         except Exception as e:
+            self.routing_table.mark_disconnected(peer_id)
             log.debug(f"put_value to {peer_id.hex()[:16]}... failed: {e}", exc_info=True)
             return False
