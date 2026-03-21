@@ -7,7 +7,7 @@ Tests DhtMetadataClient end-to-end in a real K8s cluster:
   - Publish/get worker metadata through the DHT
   - Cross-pod discovery (pod A publishes, pod B reads)
   - Status updates
-  - Model listing
+  - Source listing
   - Incremental publishing (add workers one at a time)
   - Directory merge correctness
 
@@ -36,7 +36,7 @@ log = logging.getLogger("k8s-metadata")
 
 
 # ---------------------------------------------------------------------------
-# Test infrastructure (same pattern as k8s_dht_runner.py)
+# Test infrastructure
 # ---------------------------------------------------------------------------
 
 
@@ -68,151 +68,162 @@ class TestResult:
 
 
 # ---------------------------------------------------------------------------
-# DhtMetadataClient helpers (imported from modelexpress package)
+# Async helpers using the new source_id-based key schema
 # ---------------------------------------------------------------------------
 
 
-def _make_client(node: DhtNode, ttl: int = 300):
-    """Create a DhtMetadataClient pre-wired with an existing DhtNode.
-
-    This bypasses the normal constructor (which creates its own node and
-    background thread) so we can share the test node's event loop.
-    """
-    import threading
-    from modelexpress.dht_client import DhtMetadataClient
-
-    client = DhtMetadataClient.__new__(DhtMetadataClient)
-    client._record_ttl = ttl
-    client._lock = threading.Lock()
-
-    loop = asyncio.get_event_loop()
-    client._loop = loop
-    client._thread = None  # We're running in the same loop
-    client._node = node
-    client._started = True
-    client._listen_addr = "0.0.0.0:4001"
-    client._bootstrap_peers_str = ""
-    client._bootstrap_dns = None
-    return client
+from modelexpress.dht_client import (
+    _compute_mx_source_id,
+    _worker_to_json,
+    _json_to_worker_metadata,
+    _worker_key,
+    _worker_directory_key,
+    _instances_key,
+    _attrs_key,
+    _sources_key,
+    _FakeGetMetadataResponse,
+    _FakeListSourcesResponse,
+    _FakeSourceInstanceRef,
+)
 
 
-async def _run_in_loop(client, coro_func, *args):
-    """Run an async operation directly since we share the event loop.
+async def _async_publish(node, identity, worker, worker_id, ttl=300):
+    """Publish one worker's metadata using the new source_id-based schema."""
+    from modelexpress import p2p_pb2
 
-    DhtMetadataClient normally submits async ops to its background thread.
-    Since our test shares the event loop, we call the coroutine directly.
-    """
-    return await coro_func(*args)
-
-
-def _sync_publish(client, model_name, workers):
-    """Synchronous publish using the client's internal async methods."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(_async_publish(client, model_name, workers))
-
-
-async def _async_publish(client, model_name, workers):
-    """Publish metadata using the client's async internals."""
-    from modelexpress.dht_client import (
-        _worker_to_json, _worker_key, _directory_key, _models_key,
-    )
-    import json as _json
-    import time as _time
+    source_id = _compute_mx_source_id(identity)
+    now = int(time.time() * 1000)
+    rank = worker.worker_rank
 
     try:
-        for w in workers:
-            record = _worker_to_json(w)
-            key = _worker_key(model_name, w.worker_rank)
-            await client._node.put(key, _json.dumps(record).encode(),
-                                   ttl=client._record_ttl)
+        # Store worker record
+        record = _worker_to_json(worker)
+        await node.put(
+            _worker_key(source_id, worker_id, rank),
+            json.dumps(record).encode(),
+            ttl=ttl,
+        )
 
-        # Update directory
-        ranks = sorted(w.worker_rank for w in workers)
-        dir_record = {"ranks": ranks, "updated_at": int(_time.time())}
-        await client._node.put(_directory_key(model_name),
-                               _json.dumps(dir_record).encode(),
-                               ttl=client._record_ttl)
+        # Merge rank into worker_id's directory
+        raw = await node.get(_worker_directory_key(source_id, worker_id))
+        existing_ranks = set(json.loads(raw).get("ranks", [])) if raw else set()
+        existing_ranks.add(rank)
+        directory = {"ranks": sorted(existing_ranks), "updated_at": now}
+        await node.put(
+            _worker_directory_key(source_id, worker_id),
+            json.dumps(directory).encode(),
+            ttl=ttl,
+        )
 
-        # Update models list
-        existing = await client._node.get(_models_key())
-        if existing:
-            models_data = _json.loads(existing)
-            models = models_data.get("models", [])
-        else:
-            models = []
-        if model_name not in models:
-            models.append(model_name)
-        models_record = {"models": models, "updated_at": int(_time.time())}
-        await client._node.put(_models_key(),
-                               _json.dumps(models_record).encode(),
-                               ttl=client._record_ttl)
-        return True
+        # Merge worker_id into instances directory
+        raw = await node.get(_instances_key(source_id))
+        worker_ids = set(json.loads(raw).get("worker_ids", [])) if raw else set()
+        worker_ids.add(worker_id)
+        instances = {"worker_ids": sorted(worker_ids), "updated_at": now}
+        await node.put(
+            _instances_key(source_id),
+            json.dumps(instances).encode(),
+            ttl=ttl,
+        )
+
+        # Store source attributes
+        attrs = {"model_name": identity.model_name, "updated_at": now}
+        await node.put(
+            _attrs_key(source_id),
+            json.dumps(attrs).encode(),
+            ttl=ttl,
+        )
+
+        # Add to global sources list
+        raw = await node.get(_sources_key())
+        source_ids = set(json.loads(raw).get("source_ids", [])) if raw else set()
+        source_ids.add(source_id)
+        sources_list = {"source_ids": sorted(source_ids), "updated_at": now}
+        await node.put(
+            _sources_key(),
+            json.dumps(sources_list).encode(),
+            ttl=ttl,
+        )
+
+        return source_id
     except Exception as e:
         log.error(f"Publish failed: {e}")
-        return False
+        return None
 
 
-async def _async_get(client, model_name):
-    """Get metadata using the client's async internals."""
-    from modelexpress.dht_client import (
-        _directory_key, _worker_key, _json_to_worker_metadata,
-        _FakeGetMetadataResponse,
-    )
-    import json as _json
-
+async def _async_get(node, source_id, worker_id):
+    """Get metadata for a specific source_id + worker_id."""
     try:
-        dir_data = await client._node.get(_directory_key(model_name))
-        if dir_data is None:
-            return _FakeGetMetadataResponse(found=False, workers=[])
+        raw = await node.get(_worker_directory_key(source_id, worker_id))
+        if raw is None:
+            return _FakeGetMetadataResponse(found=False)
 
-        directory = _json.loads(dir_data)
+        directory = json.loads(raw)
         ranks = directory.get("ranks", [])
         workers = []
         for rank in ranks:
-            raw = await client._node.get(_worker_key(model_name, rank))
+            raw = await node.get(_worker_key(source_id, worker_id, rank))
             if raw:
-                workers.append(_json_to_worker_metadata(_json.loads(raw)))
-        return _FakeGetMetadataResponse(found=True, workers=workers)
+                workers.append(_json_to_worker_metadata(json.loads(raw)))
+
+        if not workers:
+            return _FakeGetMetadataResponse(found=False)
+
+        return _FakeGetMetadataResponse(
+            found=True, worker=workers[0],
+            mx_source_id=source_id, worker_id=worker_id,
+        )
     except Exception as e:
         log.error(f"Get failed: {e}")
-        return _FakeGetMetadataResponse(found=False, workers=[])
+        return _FakeGetMetadataResponse(found=False)
 
 
-async def _async_update_status(client, model_name, worker_rank, status):
-    """Update status using the client's async internals."""
-    from modelexpress.dht_client import _worker_key
-    import json as _json
-    import time as _time
-
+async def _async_update_status(node, source_id, worker_id, worker_rank, status, ttl=300):
+    """Update worker status in the DHT."""
     try:
-        key = _worker_key(model_name, worker_rank)
-        raw = await client._node.get(key)
+        key = _worker_key(source_id, worker_id, worker_rank)
+        raw = await node.get(key)
         if raw is None:
             return False
-        record = _json.loads(raw)
-        record["status"] = status
-        record["updated_at"] = int(_time.time())
-        await client._node.put(key, _json.dumps(record).encode(),
-                               ttl=client._record_ttl)
+        record = json.loads(raw)
+        record["status"] = int(status)
+        record["updated_at"] = int(time.time() * 1000)
+        await node.put(key, json.dumps(record).encode(), ttl=ttl)
         return True
     except Exception as e:
         log.error(f"Update status failed: {e}")
         return False
 
 
-async def _async_list_models(client):
-    """List models using the client's async internals."""
-    from modelexpress.dht_client import _models_key
-    import json as _json
-
+async def _async_list_sources(node):
+    """List all source_ids and their model names."""
     try:
-        raw = await client._node.get(_models_key())
+        raw = await node.get(_sources_key())
         if raw is None:
             return []
-        data = _json.loads(raw)
-        return data.get("models", [])
+        data = json.loads(raw)
+        results = []
+        for sid in data.get("source_ids", []):
+            attrs_raw = await node.get(_attrs_key(sid))
+            model_name = ""
+            if attrs_raw:
+                model_name = json.loads(attrs_raw).get("model_name", "")
+            results.append((sid, model_name))
+        return results
     except Exception as e:
-        log.error(f"List models failed: {e}")
+        log.error(f"List sources failed: {e}")
+        return []
+
+
+async def _async_list_instances(node, source_id):
+    """List all worker_ids for a source."""
+    try:
+        raw = await node.get(_instances_key(source_id))
+        if raw is None:
+            return []
+        return json.loads(raw).get("worker_ids", [])
+    except Exception as e:
+        log.error(f"List instances failed: {e}")
         return []
 
 
@@ -236,6 +247,7 @@ async def run_peer(host: str, port: int, dns: str | None) -> None:
 
 
 PUBLISHER_MODEL = "k8s-test-model"
+PUBLISHER_WORKER_ID = "publisher-instance-1"
 
 
 async def run_publisher(host: str, port: int, dns: str | None) -> None:
@@ -249,7 +261,8 @@ async def run_publisher(host: str, port: int, dns: str | None) -> None:
 
     await asyncio.sleep(5.0)  # Settle
 
-    client = _make_client(node)
+    identity = p2p_pb2.SourceIdentity(model_name=PUBLISHER_MODEL)
+    source_id = _compute_mx_source_id(identity)
 
     # Publish 2 workers for the well-known model
     workers = [
@@ -268,7 +281,7 @@ async def run_publisher(host: str, port: int, dns: str | None) -> None:
                 ),
             ],
             status=p2p_pb2.SOURCE_STATUS_READY,
-            updated_at=int(time.time()),
+            updated_at=int(time.time() * 1000),
         ),
         p2p_pb2.WorkerMetadata(
             worker_rank=1,
@@ -281,19 +294,26 @@ async def run_publisher(host: str, port: int, dns: str | None) -> None:
                 ),
             ],
             status=p2p_pb2.SOURCE_STATUS_READY,
-            updated_at=int(time.time()),
+            updated_at=int(time.time() * 1000),
         ),
     ]
 
-    ok = await _async_publish(client, PUBLISHER_MODEL, workers)
-    if ok:
-        log.info(f"Published {len(workers)} workers for '{PUBLISHER_MODEL}'")
-    else:
-        log.error("Failed to publish metadata")
+    # Each worker gets published separately (matching the MxClient interface)
+    for w in workers:
+        sid = await _async_publish(node, identity, w, PUBLISHER_WORKER_ID)
+        if sid:
+            log.info(f"Published worker rank {w.worker_rank} (source_id={sid})")
+        else:
+            log.error(f"Failed to publish worker rank {w.worker_rank}")
 
     # Signal readiness via a well-known key
     await node.put(b"/mx/_test_signal/publisher-ready",
-                   json.dumps({"ready": True, "model": PUBLISHER_MODEL}).encode(),
+                   json.dumps({
+                       "ready": True,
+                       "model": PUBLISHER_MODEL,
+                       "source_id": source_id,
+                       "worker_id": PUBLISHER_WORKER_ID,
+                   }).encode(),
                    ttl=600)
     log.info("Publisher signal key set, staying alive...")
 
@@ -315,49 +335,56 @@ async def test_publish_and_get(node: DhtNode, results: TestResult) -> None:
     log.info("TEST: publish_and_get")
     from modelexpress import p2p_pb2
 
-    client = _make_client(node)
-    model = "test-publish-get"
+    identity = p2p_pb2.SourceIdentity(model_name="test-publish-get")
+    worker_id = "test-wid-1"
 
-    workers = [
-        p2p_pb2.WorkerMetadata(
-            worker_rank=0,
-            metadata_endpoint="10.1.0.1:5555",
-            agent_name="test-agent-0",
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="layer.0.weight", addr=12345678, size=1024,
-                    device_id=0, dtype="torch.float16",
-                ),
-            ],
-            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-        ),
-        p2p_pb2.WorkerMetadata(
-            worker_rank=1,
-            metadata_endpoint="10.1.0.2:5556",
-            agent_name="test-agent-1",
-            tensors=[],
-            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-        ),
-    ]
+    w0 = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        metadata_endpoint="10.1.0.1:5555",
+        agent_name="test-agent-0",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="layer.0.weight", addr=12345678, size=1024,
+                device_id=0, dtype="torch.float16",
+            ),
+        ],
+        status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+    )
+    w1 = p2p_pb2.WorkerMetadata(
+        worker_rank=1,
+        metadata_endpoint="10.1.0.2:5556",
+        agent_name="test-agent-1",
+        tensors=[],
+        status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+    )
 
-    ok = await _async_publish(client, model, workers)
-    results.record("publish metadata", ok)
+    sid0 = await _async_publish(node, identity, w0, worker_id)
+    sid1 = await _async_publish(node, identity, w1, worker_id)
+    results.record("publish metadata", sid0 is not None)
+    results.record("consistent source_id", sid0 == sid1)
 
     await asyncio.sleep(1.0)
 
-    resp = await _async_get(client, model)
-    results.record("get finds model", resp.found)
-    results.record("correct worker count", len(resp.workers) == 2, f"got {len(resp.workers)}")
+    # Get rank 0
+    resp = await _async_get(node, sid0, worker_id)
+    results.record("get finds worker", resp.found)
 
-    if len(resp.workers) >= 1:
-        w0 = resp.workers[0]
-        results.record("worker 0 rank", w0.worker_rank == 0)
-        results.record("worker 0 endpoint", w0.metadata_endpoint == "10.1.0.1:5555")
-        results.record("worker 0 agent_name", w0.agent_name == "test-agent-0")
-        results.record("worker 0 tensors", len(w0.tensors) == 1)
-        if w0.tensors:
-            results.record("tensor name", w0.tensors[0].name == "layer.0.weight")
-            results.record("tensor addr preserved", w0.tensors[0].addr == 12345678)
+    if resp.found and resp.worker:
+        results.record("worker rank", resp.worker.worker_rank == 0)
+        results.record("worker endpoint", resp.worker.metadata_endpoint == "10.1.0.1:5555")
+        results.record("worker agent_name", resp.worker.agent_name == "test-agent-0")
+        results.record("worker tensors", len(resp.worker.tensors) == 1)
+        if resp.worker.tensors:
+            results.record("tensor name", resp.worker.tensors[0].name == "layer.0.weight")
+            results.record("tensor addr preserved", resp.worker.tensors[0].addr == 12345678)
+
+    # Check directory has both ranks
+    raw = await node.get(_worker_directory_key(sid0, worker_id))
+    if raw:
+        directory = json.loads(raw)
+        results.record("directory has both ranks",
+                       sorted(directory.get("ranks", [])) == [0, 1],
+                       str(directory.get("ranks")))
 
 
 async def test_update_status(node: DhtNode, results: TestResult) -> None:
@@ -365,83 +392,83 @@ async def test_update_status(node: DhtNode, results: TestResult) -> None:
     log.info("TEST: update_status")
     from modelexpress import p2p_pb2
 
-    client = _make_client(node)
-    model = "test-update-status"
+    identity = p2p_pb2.SourceIdentity(model_name="test-update-status")
+    worker_id = "status-wid-1"
 
-    workers = [
-        p2p_pb2.WorkerMetadata(
-            worker_rank=0,
-            metadata_endpoint="10.2.0.1:5555",
-            agent_name="status-agent-0",
-            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-        ),
-    ]
+    w = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        metadata_endpoint="10.2.0.1:5555",
+        agent_name="status-agent-0",
+        status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+    )
 
-    await _async_publish(client, model, workers)
+    source_id = await _async_publish(node, identity, w, worker_id)
     await asyncio.sleep(0.5)
 
     ok = await _async_update_status(
-        client, model, 0, p2p_pb2.SOURCE_STATUS_READY)
+        node, source_id, worker_id, 0, p2p_pb2.SOURCE_STATUS_READY)
     results.record("update status call", ok)
 
     await asyncio.sleep(0.5)
 
-    resp = await _async_get(client, model)
-    if resp.found and resp.workers:
+    resp = await _async_get(node, source_id, worker_id)
+    if resp.found and resp.worker:
         results.record("status updated",
-                       resp.workers[0].status == p2p_pb2.SOURCE_STATUS_READY,
-                       f"got status={resp.workers[0].status}")
+                       resp.worker.status == p2p_pb2.SOURCE_STATUS_READY,
+                       f"got status={resp.worker.status}")
     else:
-        results.record("status updated", False, "model not found after update")
+        results.record("status updated", False, "worker not found after update")
 
 
-async def test_list_models(node: DhtNode, results: TestResult) -> None:
-    """Publish multiple models and verify they appear in the models list."""
-    log.info("TEST: list_models")
+async def test_list_sources(node: DhtNode, results: TestResult) -> None:
+    """Publish multiple sources and verify they appear in the sources list."""
+    log.info("TEST: list_sources")
     from modelexpress import p2p_pb2
 
-    client = _make_client(node)
-
-    for model in ["list-model-a", "list-model-b"]:
+    for model_name in ["list-model-a", "list-model-b"]:
+        identity = p2p_pb2.SourceIdentity(model_name=model_name)
         w = p2p_pb2.WorkerMetadata(worker_rank=0, metadata_endpoint="x:0",
                                     agent_name="a")
-        await _async_publish(client, model, [w])
+        await _async_publish(node, identity, w, "list-wid")
 
     await asyncio.sleep(0.5)
 
-    models = await _async_list_models(client)
-    results.record("list-model-a in list", "list-model-a" in models, str(models))
-    results.record("list-model-b in list", "list-model-b" in models, str(models))
+    sources = await _async_list_sources(node)
+    model_names = [m for _, m in sources]
+    results.record("list-model-a in list", "list-model-a" in model_names, str(model_names))
+    results.record("list-model-b in list", "list-model-b" in model_names, str(model_names))
 
 
-async def test_incremental_publish(node: DhtNode, results: TestResult) -> None:
-    """Publish workers one at a time and verify directory accumulates."""
-    log.info("TEST: incremental_publish")
+async def test_multiple_worker_ids(node: DhtNode, results: TestResult) -> None:
+    """Publish from two worker_ids and verify both appear in instances."""
+    log.info("TEST: multiple_worker_ids")
     from modelexpress import p2p_pb2
 
-    client = _make_client(node)
-    model = "test-incremental"
+    identity = p2p_pb2.SourceIdentity(model_name="test-multi-worker")
 
-    # Publish rank 0
-    w0 = p2p_pb2.WorkerMetadata(worker_rank=0, metadata_endpoint="10.3.0.1:5555",
-                                 agent_name="incr-0")
-    await _async_publish(client, model, [w0])
+    w0 = p2p_pb2.WorkerMetadata(
+        worker_rank=0, metadata_endpoint="10.4.0.1:5555", agent_name="agent-a")
+    w1 = p2p_pb2.WorkerMetadata(
+        worker_rank=0, metadata_endpoint="10.4.0.2:5555", agent_name="agent-b")
+
+    source_id = await _async_publish(node, identity, w0, "wid-a")
+    await _async_publish(node, identity, w1, "wid-b")
     await asyncio.sleep(0.5)
 
-    resp = await _async_get(client, model)
-    results.record("after rank 0: found", resp.found)
-    results.record("after rank 0: 1 worker", len(resp.workers) == 1)
+    instances = await _async_list_instances(node, source_id)
+    results.record("two worker_ids", len(instances) == 2, str(instances))
+    results.record("wid-a in instances", "wid-a" in instances)
+    results.record("wid-b in instances", "wid-b" in instances)
 
-    # Publish rank 1 (adds to existing)
-    w1 = p2p_pb2.WorkerMetadata(worker_rank=1, metadata_endpoint="10.3.0.2:5556",
-                                 agent_name="incr-1")
-    # Need to publish both so the directory is correct
-    await _async_publish(client, model, [w0, w1])
-    await asyncio.sleep(0.5)
-
-    resp = await _async_get(client, model)
-    results.record("after rank 1: 2 workers", len(resp.workers) == 2,
-                   f"got {len(resp.workers)}")
+    # Each worker_id should have its own rank 0
+    resp_a = await _async_get(node, source_id, "wid-a")
+    resp_b = await _async_get(node, source_id, "wid-b")
+    results.record("wid-a found", resp_a.found)
+    results.record("wid-b found", resp_b.found)
+    if resp_a.found and resp_a.worker:
+        results.record("wid-a endpoint", resp_a.worker.metadata_endpoint == "10.4.0.1:5555")
+    if resp_b.found and resp_b.worker:
+        results.record("wid-b endpoint", resp_b.worker.metadata_endpoint == "10.4.0.2:5555")
 
 
 async def test_cross_pod_discovery(node: DhtNode, results: TestResult) -> None:
@@ -463,54 +490,63 @@ async def test_cross_pod_discovery(node: DhtNode, results: TestResult) -> None:
         return
 
     results.record("publisher signal received", True)
+    source_id = signal_data["source_id"]
+    worker_id = signal_data["worker_id"]
     model_name = signal_data["model"]
 
-    client = _make_client(node)
-    resp = await _async_get(client, model_name)
+    resp = await _async_get(node, source_id, worker_id)
+    results.record("cross-pod: worker found", resp.found)
 
-    results.record("cross-pod: model found", resp.found)
-    results.record("cross-pod: 2 workers", len(resp.workers) == 2,
-                   f"got {len(resp.workers)}")
+    if resp.found and resp.worker:
+        # The directory should have ranks [0, 1] for this worker_id
+        raw = await node.get(_worker_directory_key(source_id, worker_id))
+        if raw:
+            directory = json.loads(raw)
+            ranks = sorted(directory.get("ranks", []))
+            results.record("cross-pod: 2 ranks", ranks == [0, 1], str(ranks))
 
-    if len(resp.workers) >= 2:
-        w0 = next((w for w in resp.workers if w.worker_rank == 0), None)
-        w1 = next((w for w in resp.workers if w.worker_rank == 1), None)
+        # Read both ranks individually
+        for rank in [0, 1]:
+            raw = await node.get(_worker_key(source_id, worker_id, rank))
+            if raw:
+                w = _json_to_worker_metadata(json.loads(raw))
+                results.record(f"cross-pod: rank {rank} readable", True)
+                if rank == 0:
+                    results.record("cross-pod: w0 endpoint",
+                                  w.metadata_endpoint == "10.0.0.1:5555",
+                                  w.metadata_endpoint)
+                    results.record("cross-pod: w0 agent_name",
+                                  w.agent_name == "publisher-agent-0",
+                                  w.agent_name)
+                    results.record("cross-pod: w0 tensors", len(w.tensors) == 2,
+                                  f"got {len(w.tensors)}")
+                    results.record("cross-pod: w0 status ready",
+                                  w.status == 2)  # SOURCE_STATUS_READY
+                elif rank == 1:
+                    results.record("cross-pod: w1 endpoint",
+                                  w.metadata_endpoint == "10.0.0.2:5556",
+                                  w.metadata_endpoint)
+                    results.record("cross-pod: w1 tensors", len(w.tensors) == 1,
+                                  f"got {len(w.tensors)}")
+            else:
+                results.record(f"cross-pod: rank {rank} readable", False, "got None")
 
-        if w0:
-            results.record("cross-pod: w0 endpoint",
-                          w0.metadata_endpoint == "10.0.0.1:5555",
-                          w0.metadata_endpoint)
-            results.record("cross-pod: w0 agent_name",
-                          w0.agent_name == "publisher-agent-0",
-                          w0.agent_name)
-            results.record("cross-pod: w0 tensors", len(w0.tensors) == 2,
-                          f"got {len(w0.tensors)}")
-            results.record("cross-pod: w0 status ready",
-                          w0.status == 2)  # SOURCE_STATUS_READY
-        else:
-            results.record("cross-pod: w0 found", False, "rank 0 missing")
-
-        if w1:
-            results.record("cross-pod: w1 endpoint",
-                          w1.metadata_endpoint == "10.0.0.2:5556",
-                          w1.metadata_endpoint)
-            results.record("cross-pod: w1 tensors", len(w1.tensors) == 1,
-                          f"got {len(w1.tensors)}")
-        else:
-            results.record("cross-pod: w1 found", False, "rank 1 missing")
-
-    # Verify model appears in global list
-    models = await _async_list_models(client)
-    results.record("cross-pod: model in list", model_name in models, str(models))
+    # Verify source appears in global list
+    sources = await _async_list_sources(node)
+    source_ids = [sid for sid, _ in sources]
+    results.record("cross-pod: source in list", source_id in source_ids, str(sources))
 
 
 async def test_json_schema_correctness(node: DhtNode, results: TestResult) -> None:
     """Verify the raw JSON stored in DHT matches expected schema."""
     log.info("TEST: json_schema_correctness")
-    from modelexpress.dht_client import _worker_key, _directory_key, _models_key
+    from modelexpress import p2p_pb2
+
+    identity = p2p_pb2.SourceIdentity(model_name=PUBLISHER_MODEL)
+    source_id = _compute_mx_source_id(identity)
 
     # Read the raw bytes from DHT and verify JSON structure
-    raw = await node.get(_worker_key(PUBLISHER_MODEL, 0))
+    raw = await node.get(_worker_key(source_id, PUBLISHER_WORKER_ID, 0))
     if raw is None:
         results.record("raw worker record readable", False, "got None")
         return
@@ -532,8 +568,8 @@ async def test_json_schema_correctness(node: DhtNode, results: TestResult) -> No
         for field in tensor_fields:
             results.record(f"schema: tensor '{field}' present", field in t)
 
-    # Verify directory record
-    raw_dir = await node.get(_directory_key(PUBLISHER_MODEL))
+    # Verify worker directory
+    raw_dir = await node.get(_worker_directory_key(source_id, PUBLISHER_WORKER_ID))
     if raw_dir:
         dir_record = json.loads(raw_dir)
         results.record("schema: directory has 'ranks'", "ranks" in dir_record)
@@ -541,11 +577,19 @@ async def test_json_schema_correctness(node: DhtNode, results: TestResult) -> No
                       sorted(dir_record.get("ranks", [])) == [0, 1],
                       str(dir_record.get("ranks")))
 
-    # Verify models list
-    raw_models = await node.get(_models_key())
-    if raw_models:
-        models_record = json.loads(raw_models)
-        results.record("schema: models has 'models'", "models" in models_record)
+    # Verify instances directory
+    raw_inst = await node.get(_instances_key(source_id))
+    if raw_inst:
+        inst_record = json.loads(raw_inst)
+        results.record("schema: instances has 'worker_ids'", "worker_ids" in inst_record)
+        results.record("schema: publisher worker_id present",
+                      PUBLISHER_WORKER_ID in inst_record.get("worker_ids", []))
+
+    # Verify sources list
+    raw_sources = await node.get(_sources_key())
+    if raw_sources:
+        sources_record = json.loads(raw_sources)
+        results.record("schema: sources has 'source_ids'", "source_ids" in sources_record)
 
 
 # ---------------------------------------------------------------------------
@@ -571,8 +615,8 @@ async def run_test(host: str, port: int, dns: str | None) -> bool:
         # Self-contained tests (publish + get within same node)
         await test_publish_and_get(node, results)
         await test_update_status(node, results)
-        await test_list_models(node, results)
-        await test_incremental_publish(node, results)
+        await test_list_sources(node, results)
+        await test_multiple_worker_ids(node, results)
 
         # Cross-pod tests (read metadata published by the publisher pod)
         await test_cross_pod_discovery(node, results)
