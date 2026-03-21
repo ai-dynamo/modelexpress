@@ -8,6 +8,10 @@
 //! - **Kubernetes**: CRDs and ConfigMaps for native K8s integration
 //!
 //! Select the backend via `MX_METADATA_BACKEND=redis` or `MX_METADATA_BACKEND=kubernetes`.
+//!
+//! NIXL agent blobs are NOT stored in the backend. Workers exchange them
+//! peer-to-peer via NIXL's native listen thread. The backend only stores
+//! lightweight directory entries: endpoints, tensor layouts, and status.
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
@@ -18,6 +22,12 @@ pub mod redis;
 
 /// Result type for metadata operations
 pub type MetadataResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Convert an empty string to `None`, non-empty to `Some`.
+/// Used by Redis and Kubernetes backends when serializing optional string fields.
+pub fn none_if_empty(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
 
 /// Model metadata record returned from backends
 #[derive(Debug, Clone)]
@@ -46,8 +56,9 @@ pub struct SourceInstanceInfo {
 /// Backend-specific metadata for a worker
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendMetadataRecord {
-    /// Serialized NIXL agent metadata for RDMA connections
-    Nixl(Vec<u8>),
+    /// NIXL transfer backend. The NIXL agent blob is exchanged peer-to-peer
+    /// via the worker's `metadata_endpoint`, not stored here.
+    Nixl,
     /// Mooncake TransferEngine session ID ("ip:port")
     TransferEngine(String),
     /// No backend metadata provided
@@ -59,9 +70,10 @@ impl BackendMetadataRecord {
     ///
     /// When `backend_type` is provided, it is used as the authoritative discriminator.
     /// Falls back to field-inference for backwards compatibility with records written
-    /// before `backend_type` was persisted.
+    /// before `backend_type` was persisted. Note: NIXL can no longer be inferred from
+    /// blob presence (blobs are exchanged peer-to-peer now), so the fallback path
+    /// only detects TransferEngine. NIXL requires an explicit `backend_type` tag.
     pub fn from_flat(
-        nixl_metadata: Vec<u8>,
         transfer_engine_session_id: Option<String>,
         backend_type: Option<&str>,
     ) -> Self {
@@ -70,7 +82,7 @@ impl BackendMetadataRecord {
                 let sid = transfer_engine_session_id.unwrap_or_default();
                 Self::TransferEngine(sid)
             }
-            Some("nixl") => Self::Nixl(nixl_metadata),
+            Some("nixl") => Self::Nixl,
             Some("none") => Self::None,
             // Unknown or missing backend_type: infer from fields (backwards compat)
             _ => {
@@ -78,9 +90,6 @@ impl BackendMetadataRecord {
                     && !sid.is_empty()
                 {
                     return Self::TransferEngine(sid);
-                }
-                if !nixl_metadata.is_empty() {
-                    return Self::Nixl(nixl_metadata);
                 }
                 Self::None
             }
@@ -90,7 +99,7 @@ impl BackendMetadataRecord {
     /// Returns the backend type string for persistence.
     pub fn backend_type_str(&self) -> &'static str {
         match self {
-            Self::Nixl(_) => "nixl",
+            Self::Nixl => "nixl",
             Self::TransferEngine(_) => "transfer_engine",
             Self::None => "none",
         }
@@ -102,6 +111,10 @@ impl BackendMetadataRecord {
 pub struct WorkerRecord {
     pub worker_rank: u32,
     pub backend_metadata: BackendMetadataRecord,
+    /// Endpoint (host:port) where this worker's NIXL listen thread serves metadata.
+    pub metadata_endpoint: String,
+    /// NIXL agent name for this worker (needed for check_remote_metadata).
+    pub agent_name: String,
     pub tensors: Vec<TensorRecord>,
     /// Worker lifecycle status (maps to `SourceStatus` proto enum)
     pub status: i32,
@@ -122,17 +135,21 @@ pub struct TensorRecord {
 // Conversions from gRPC types
 impl From<WorkerMetadata> for WorkerRecord {
     fn from(meta: WorkerMetadata) -> Self {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
-        let backend_metadata = match meta.backend_metadata {
-            Some(BackendMetadata::NixlMetadata(data)) => BackendMetadataRecord::Nixl(data),
-            Some(BackendMetadata::TransferEngineSessionId(sid)) => {
-                BackendMetadataRecord::TransferEngine(sid)
-            }
-            None => BackendMetadataRecord::None,
+        // TransferEngine takes priority when both fields are present because
+        // it requires an explicit session ID, whereas NIXL is inferred from
+        // the metadata_endpoint being set.
+        let backend_metadata = if !meta.transfer_engine_session_id.is_empty() {
+            BackendMetadataRecord::TransferEngine(meta.transfer_engine_session_id.clone())
+        } else if !meta.metadata_endpoint.is_empty() {
+            BackendMetadataRecord::Nixl
+        } else {
+            BackendMetadataRecord::None
         };
         Self {
             worker_rank: meta.worker_rank,
             backend_metadata,
+            metadata_endpoint: meta.metadata_endpoint,
+            agent_name: meta.agent_name,
             tensors: meta.tensors.into_iter().map(TensorRecord::from).collect(),
             status: meta.status,
             updated_at: meta.updated_at,
@@ -155,17 +172,15 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
 // Conversions back to gRPC types
 impl From<WorkerRecord> for WorkerMetadata {
     fn from(record: WorkerRecord) -> Self {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
-        let backend_metadata = match record.backend_metadata {
-            BackendMetadataRecord::Nixl(data) => Some(BackendMetadata::NixlMetadata(data)),
-            BackendMetadataRecord::TransferEngine(sid) => {
-                Some(BackendMetadata::TransferEngineSessionId(sid))
-            }
-            BackendMetadataRecord::None => None,
+        let transfer_engine_session_id = match &record.backend_metadata {
+            BackendMetadataRecord::TransferEngine(sid) => sid.clone(),
+            _ => String::new(),
         };
         Self {
             worker_rank: record.worker_rank,
-            backend_metadata,
+            metadata_endpoint: record.metadata_endpoint,
+            agent_name: record.agent_name,
+            transfer_engine_session_id,
             tensors: record
                 .tensors
                 .into_iter()
@@ -243,9 +258,9 @@ pub trait MetadataBackend: Send + Sync {
 /// Configuration for metadata backends
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
-    /// Redis backend — persistent, horizontally scalable
+    /// Redis backend -- persistent, horizontally scalable
     Redis { url: String },
-    /// Kubernetes CRD backend — native K8s integration
+    /// Kubernetes CRD backend -- native K8s integration
     Kubernetes { namespace: String },
 }
 
@@ -303,6 +318,11 @@ impl BackendConfig {
 }
 
 /// Create a backend from configuration.
+///
+/// # Errors
+///
+/// Returns an error if the backend cannot connect (e.g. Redis unreachable,
+/// K8s API unavailable).
 pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn MetadataBackend>> {
     match config {
         BackendConfig::Redis { url } => {
@@ -315,5 +335,66 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_flat_explicit_nixl() {
+        let record = BackendMetadataRecord::from_flat(None, Some("nixl"));
+        assert_eq!(record, BackendMetadataRecord::Nixl);
+    }
+
+    #[test]
+    fn from_flat_explicit_transfer_engine() {
+        let record =
+            BackendMetadataRecord::from_flat(Some("1.2.3.4:9000".into()), Some("transfer_engine"));
+        assert_eq!(
+            record,
+            BackendMetadataRecord::TransferEngine("1.2.3.4:9000".into())
+        );
+    }
+
+    #[test]
+    fn from_flat_explicit_none() {
+        let record = BackendMetadataRecord::from_flat(None, Some("none"));
+        assert_eq!(record, BackendMetadataRecord::None);
+    }
+
+    #[test]
+    fn from_flat_no_discriminator_no_te_returns_none() {
+        // With the P2P redesign, NIXL can no longer be inferred without an
+        // explicit backend_type tag. When both discriminator and TE session
+        // are absent, the result is None (not Nixl).
+        let record = BackendMetadataRecord::from_flat(None, None);
+        assert_eq!(record, BackendMetadataRecord::None);
+    }
+
+    #[test]
+    fn from_flat_no_discriminator_with_te_infers_transfer_engine() {
+        let record = BackendMetadataRecord::from_flat(Some("1.2.3.4:9000".into()), None);
+        assert_eq!(
+            record,
+            BackendMetadataRecord::TransferEngine("1.2.3.4:9000".into())
+        );
+    }
+
+    #[test]
+    fn from_flat_no_discriminator_empty_te_returns_none() {
+        let record = BackendMetadataRecord::from_flat(Some(String::new()), None);
+        assert_eq!(record, BackendMetadataRecord::None);
+    }
+
+    #[test]
+    fn none_if_empty_with_empty_string() {
+        assert_eq!(none_if_empty(String::new()), None);
+    }
+
+    #[test]
+    fn none_if_empty_with_non_empty_string() {
+        assert_eq!(none_if_empty("hello".into()), Some("hello".into()));
     }
 }

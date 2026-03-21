@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! P2P Metadata Service implementation for storing and retrieving NIXL/RDMA metadata.
+//! P2P Metadata Service implementation for model directory and status coordination.
 //!
 //! Metadata is keyed by mx_source_id, a 16-char hex hash of SourceIdentity.
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
+//! NIXL agent blobs are exchanged peer-to-peer via NIXL's native listen thread,
+//! never stored on the server.
 
 use crate::metadata_backend::SourceInstanceInfo;
 use crate::source_identity::{compute_mx_source_id, validate_identity};
@@ -375,9 +377,9 @@ mod tests {
                 identity: Some(test_identity()),
                 worker: Some(WorkerMetadata {
                     worker_rank: 0,
-                    backend_metadata: Some(
-                        modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata::NixlMetadata(vec![1, 2, 3]),
-                    ),
+                    metadata_endpoint: "10.0.1.5:50051".to_string(),
+                    agent_name: String::new(),
+                    transfer_engine_session_id: String::new(),
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
@@ -406,10 +408,10 @@ mod tests {
                 identity: Some(test_identity()),
                 worker: Some(WorkerMetadata {
                     worker_rank: 0,
-                    backend_metadata: None,
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
+                    ..Default::default()
                 }),
                 worker_id: "worker-uuid-1".to_string(),
             }))
@@ -450,6 +452,8 @@ mod tests {
                     workers: vec![WorkerRecord {
                         worker_rank: 0,
                         backend_metadata: BackendMetadataRecord::None,
+                        metadata_endpoint: String::new(),
+                        agent_name: String::new(),
                         tensors: vec![],
                         status: SourceStatus::Ready as i32,
                         updated_at: 1234567890000,

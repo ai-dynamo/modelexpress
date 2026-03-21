@@ -4,11 +4,11 @@
 //! Kubernetes CRD backend for P2P model metadata storage.
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
+//! NIXL agent blobs are exchanged peer-to-peer via NIXL's native listen thread, never stored in K8s.
 
 use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
 use crate::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
@@ -121,7 +121,7 @@ impl KubernetesBackend {
                 debug!("Created ConfigMap {} for worker {}", cm_name, worker_rank);
             }
             Err(kube::Error::Api(err)) if err.code == 409 => {
-                // Already exists — use merge patch to avoid SSA field manager conflicts
+                // Already exists -- use merge patch to avoid SSA field manager conflicts
                 api.patch(&cm_name, &PatchParams::default(), &Patch::Merge(&cm))
                     .await?;
                 debug!("Updated ConfigMap {} for worker {}", cm_name, worker_rank);
@@ -259,18 +259,18 @@ impl MetadataBackend for KubernetesBackend {
                 .await?;
 
             let backend_type = worker.backend_metadata.backend_type_str().to_string();
-            let (nixl_metadata, transfer_engine_session_id) = match &worker.backend_metadata {
-                super::BackendMetadataRecord::Nixl(data) => (BASE64.encode(data), None),
-                super::BackendMetadataRecord::TransferEngine(sid) => {
-                    (String::new(), Some(sid.clone()))
-                }
-                super::BackendMetadataRecord::None => (String::new(), None),
+            let metadata_endpoint = super::none_if_empty(worker.metadata_endpoint.clone());
+            let agent_name = super::none_if_empty(worker.agent_name.clone());
+            let transfer_engine_session_id = match &worker.backend_metadata {
+                super::BackendMetadataRecord::TransferEngine(sid) => Some(sid.clone()),
+                _ => None,
             };
 
             worker_statuses.push(WorkerStatus {
                 worker_rank: worker.worker_rank as i32,
                 backend_type: Some(backend_type),
-                nixl_metadata,
+                metadata_endpoint,
+                agent_name,
                 transfer_engine_session_id,
                 tensor_count: worker.tensors.len() as i32,
                 tensor_config_map: Some(cm_name),
@@ -388,18 +388,7 @@ impl MetadataBackend for KubernetesBackend {
 
         let mut workers = Vec::new();
         for worker_status in status.workers {
-            let nixl_bytes = if !worker_status.nixl_metadata.is_empty() {
-                BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
-                    format!(
-                        "Failed to decode NIXL metadata for worker {}: {}",
-                        worker_status.worker_rank, e
-                    )
-                })?
-            } else {
-                Vec::new()
-            };
             let backend_metadata = super::BackendMetadataRecord::from_flat(
-                nixl_bytes,
                 worker_status.transfer_engine_session_id.clone(),
                 worker_status.backend_type.as_deref(),
             );
@@ -427,6 +416,8 @@ impl MetadataBackend for KubernetesBackend {
             workers.push(WorkerRecord {
                 worker_rank: worker_status.worker_rank as u32,
                 backend_metadata,
+                metadata_endpoint: worker_status.metadata_endpoint.unwrap_or_default(),
+                agent_name: worker_status.agent_name.unwrap_or_default(),
                 tensors,
                 status,
                 updated_at,

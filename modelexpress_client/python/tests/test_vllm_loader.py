@@ -396,7 +396,7 @@ class TestPublishMetadataAndReady:
         mx_client.update_status.return_value = True
 
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"nixl-data"
+
 
         tensors = {}
         for i in range(3):
@@ -432,7 +432,7 @@ class TestPublishMetadataAndReady:
         mx_client.update_status.return_value = False  # server rejected
 
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
+
 
         identity = _make_identity()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
@@ -446,9 +446,101 @@ class TestPublishMetadataAndReady:
         mx_client.publish_metadata.side_effect = RuntimeError("grpc error")
 
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
+
 
         identity = _make_identity()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
             with pytest.raises(RuntimeError, match="grpc error"):
                 _publish_metadata_and_ready(mx_client, nixl_manager, {}, global_rank=0, device_id=0, identity=identity, worker_id="w-1")
+
+
+# ---------------------------------------------------------------------------
+# fetch_remote_and_wait
+# ---------------------------------------------------------------------------
+
+
+class TestFetchRemoteAndWait:
+    """Tests for NixlTransferManager.fetch_remote_and_wait."""
+
+    def test_timeout_raises(self):
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        manager = NixlTransferManager.__new__(NixlTransferManager)
+        agent = MagicMock()
+        agent.check_remote_metadata.return_value = False
+        manager._agent = agent
+
+        with pytest.raises(TimeoutError, match="Timed out"):
+            manager.fetch_remote_and_wait(
+                agent_name="remote-agent",
+                ip="10.0.0.1",
+                port=5555,
+                timeout=0.05,
+            )
+
+        agent.fetch_remote_metadata.assert_called_once_with("remote-agent", "10.0.0.1", 5555)
+
+    def test_successful_poll_returns_agent_name(self):
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        manager = NixlTransferManager.__new__(NixlTransferManager)
+        agent = MagicMock()
+        # Succeed on the second check
+        agent.check_remote_metadata.side_effect = [False, True]
+        manager._agent = agent
+
+        result = manager.fetch_remote_and_wait(
+            agent_name="remote-agent",
+            ip="10.0.0.1",
+            port=5555,
+            timeout=5.0,
+        )
+        assert result == "remote-agent"
+
+
+# ---------------------------------------------------------------------------
+# _get_worker_host
+# ---------------------------------------------------------------------------
+
+
+class TestGetWorkerHost:
+    """Tests for _get_worker_host env var priority."""
+
+    def test_mx_worker_address_takes_priority(self):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        with patch.dict("os.environ", {
+            "MX_WORKER_ADDRESS": "explicit-host",
+            "POD_IP": "10.0.0.99",
+        }):
+            assert _get_worker_host() == "explicit-host"
+
+    def test_pod_ip_fallback(self):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        env = {"POD_IP": "10.0.0.99"}
+        with patch.dict("os.environ", env, clear=False):
+            # Remove MX_WORKER_ADDRESS if present
+            import os
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            assert _get_worker_host() == "10.0.0.99"
+
+    @patch("socket.getfqdn", return_value="worker-node.local")
+    def test_fqdn_fallback(self, _mock_fqdn):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            os.environ.pop("POD_IP", None)
+            assert _get_worker_host() == "worker-node.local"
+
+    @patch("socket.getfqdn", side_effect=Exception("DNS failure"))
+    def test_localhost_fallback(self, _mock_fqdn):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            os.environ.pop("POD_IP", None)
+            assert _get_worker_host() == "localhost"

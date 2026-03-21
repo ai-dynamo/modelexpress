@@ -230,11 +230,11 @@ Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Do
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
-| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes NIXL metadata + tensors |
+| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes directory entry (endpoint + tensors) |
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Target queries for source metadata |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Source updates per-worker status (Initializing/Ready/Stale) |
 
-Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `WorkerMetadata` (rank, nixl_metadata bytes, tensors).
+Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `WorkerMetadata` (rank, metadata_endpoint, agent_name, tensors). NIXL agent blobs are exchanged peer-to-peer via NIXL's native listen thread (`fetch_remote_metadata` / `check_remote_metadata`), never stored on the MX server. Each source worker starts a NIXL listen thread on port `MX_METADATA_PORT` (default 5555) + worker_rank, and publishes the endpoint and agent name to the MX server directory.
 
 ## Rust Server
 
@@ -429,10 +429,11 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 | Method | Purpose |
 |--------|---------|
-| `__init__(agent_name, device_id)` | Create NIXL agent with UCX backend |
+| `__init__(agent_name, device_id, listen_port=None)` | Create manager. If `listen_port` is set, enables the NIXL listen thread for native P2P metadata exchange. |
 | `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata |
 | `get_registered_descriptors()` | Return region descriptors (`MX_CONTIGUOUS_REG=1`) or tensor descriptors |
-| `receive_from_source(source_metadata, source_tensors, ...)` | Execute RDMA read transfer with optional coalescing |
+| `fetch_remote_and_wait(agent_name, ip, port, timeout)` | Fetch remote agent metadata via NIXL native P2P and poll until loaded |
+| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer with optional coalescing. Pass `remote_agent_name` when the remote agent was loaded via `fetch_remote_and_wait()`. |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 ### vLLM Loader

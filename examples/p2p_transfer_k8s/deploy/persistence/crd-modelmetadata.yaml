@@ -51,10 +51,12 @@ spec:
                           - nixl
                           - transfer_engine
                           - none
-                      nixlMetadata:
+                      metadataEndpoint:
                         type: string
-                        format: byte
-                        description: Base64-encoded NIXL agent metadata blob
+                        description: Endpoint (host:port) where the worker's NIXL listen thread serves metadata
+                      agentName:
+                        type: string
+                        description: NIXL agent name for this worker
                       transferEngineSessionId:
                         type: string
                         description: Mooncake TransferEngine session ID (ip:port)

@@ -1,6 +1,6 @@
 # ModelExpress Metadata Architecture
 
-> **Work in progress — this document is out of date.** It predates the unified `WorkerRecord` schema, removal of `ModelMetadataPhase`/`expectedWorkers`, and the `GetStatus`/`PublishReady`/`GetReady` RPC removals. See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for current information.
+> **Work in progress -- this document is out of date.** It predates the unified `WorkerRecord` schema, removal of `ModelMetadataPhase`/`expectedWorkers`, the `GetStatus`/`PublishReady`/`GetReady` RPC removals, and the peer-to-peer NIXL metadata exchange redesign (NIXL blobs are no longer stored centrally - workers exchange them via NIXL's native listen thread). See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for current information.
 
 This document describes the metadata storage layer for ModelExpress P2P transfers, covering both the current Redis-based implementation and the proposed Kubernetes CRD alternative.
 
@@ -31,7 +31,9 @@ ModelExpress P2P transfers require coordination between source and target instan
   "workers": [
     {
       "worker_rank": 0,
-      "nixl_metadata": "<base64-encoded NIXL agent blob>",
+      "backend_type": "nixl",
+      "metadata_endpoint": "10.0.1.5:5555",
+      "agent_name": "mx-auto-worker0-a1b2c3d4",
       "tensors": [
         {
           "name": "model.layers.0.self_attn.q_proj.weight",
@@ -40,7 +42,9 @@ ModelExpress P2P transfers require coordination between source and target instan
           "device_id": 0,
           "dtype": "float8_e4m3fn"
         }
-      ]
+      ],
+      "status": 2,
+      "updated_at": 1769568000
     }
   ],
   "published_at": 1769568000
@@ -74,28 +78,25 @@ ModelExpress P2P transfers require coordination between source and target instan
 │                            SOURCE INSTANCE                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 1. Load model weights from disk                                              │
-│ 2. Register tensors with NIXL                                                │
-│ 3. Publish metadata via gRPC → Server → Redis                                │
-│    - Server receives PublishMetadata(model_name, workers)                    │
-│    - Server runs atomic Lua merge: mx:model:{model_name}                     │
-│ 4. Wait for health check + warmup                                            │
-│ 5. Publish NIXL ready flag directly to Redis:                                │
-│    - mx:nixl_ready:{model}:worker:{id} (for each worker)                     │
+│ 2. Register tensors with NIXL (enables listen thread on MX_METADATA_PORT)    │
+│ 3. Publish metadata via gRPC -> Server -> Backend                            │
+│    - Sends: endpoint, agent_name, tensor descriptors, status                 │
+│    - Server runs atomic merge into backend                                   │
+│ 4. Mark status as READY via UpdateStatus RPC                                 │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            TARGET INSTANCE                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 1. Initialize dummy model structure                                          │
-│ 2. Register target tensors with NIXL                                         │
-│ 3. Poll Redis for NIXL ready flag:                                           │
-│    - mx:nixl_ready:{model}:worker:{id}                                       │
-│    - Wait until nixl_ready=true AND stability_verified=true                  │
-│ 4. Query metadata via gRPC → Server → Redis                                  │
-│    - Server receives GetMetadata(model_name)                                 │
-│    - Server returns workers from mx:model:{model_name}                       │
-│ 5. Add remote NIXL agents using nixl_metadata                                │
-│ 6. Execute RDMA transfers (get_zcopy)                                        │
+│ 2. Register target tensors with NIXL (listen thread for P2P exchange)        │
+│ 3. Query metadata via gRPC -> Server -> Backend                              │
+│    - Check for READY worker with matching rank                               │
+│ 4. Fetch NIXL agent blob via native P2P exchange:                            │
+│    - fetch_remote_metadata(agent_name, ip, port)                             │
+│    - Poll check_remote_metadata() until loaded                               │
+│ 5. Execute RDMA transfers                                                    │
+│ 6. Register + publish own tensors (become a source for future targets)       │
 │ 7. Run FP8 processing on received weights                                    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -106,12 +107,18 @@ ModelExpress P2P transfers require coordination between source and target instan
 service P2pService {
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+  rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
 }
 
 message WorkerMetadata {
   uint32 worker_rank = 1;
-  bytes nixl_metadata = 2;           // Serialized NIXL agent blob
+  // Field 2 reserved (formerly nixl_metadata blob, now exchanged peer-to-peer)
   repeated TensorDescriptor tensors = 3;
+  string metadata_endpoint = 4;      // host:port for NIXL listen thread
+  string agent_name = 5;             // NIXL agent name for P2P fetch
+  string transfer_engine_session_id = 6;
+  int32  status = 7;                 // SourceStatus enum
+  int64  updated_at = 8;             // Unix millis
 }
 
 message TensorDescriptor {
@@ -256,11 +263,12 @@ status:
   phase: Ready  # Pending | Initializing | Ready | Stale
   workers:
     - workerRank: 0
-      nixlMetadata: <base64-encoded blob>
+      backendType: nixl
+      metadataEndpoint: "10.0.1.5:5555"
+      agentName: "mx-auto-worker0-a1b2c3d4"
       tensorCount: 1327
+      status: 2  # READY
       publishedAt: "2026-01-27T18:02:47Z"
-      ready: true
-      stabilityVerified: true
     - workerRank: 1
       # ...
   conditions:
@@ -328,7 +336,7 @@ data:
 │    - Wait for all workers: status.workers[*].ready=true                      │
 │ 4. Read ConfigMaps for tensor descriptors:                                   │
 │    - Get deepseek-ai-deepseek-v3-tensors-worker-{rank}                       │
-│ 5. Add remote NIXL agents using status.workers[rank].nixlMetadata            │
+│ 5. Fetch NIXL agent blob via P2P (metadataEndpoint + agentName)              │
 │ 6. Execute RDMA transfers (get_zcopy)                                        │
 │ 7. Run FP8 processing on received weights                                    │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -376,9 +384,12 @@ spec:
                     properties:
                       workerRank:
                         type: integer
-                      nixlMetadata:
+                      backendType:
                         type: string
-                        format: byte
+                      metadataEndpoint:
+                        type: string
+                      agentName:
+                        type: string
                       tensorCount:
                         type: integer
                       ready:

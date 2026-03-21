@@ -58,9 +58,13 @@ pub struct WorkerStatus {
     #[serde(rename = "backendType", default)]
     pub backend_type: Option<String>,
 
-    /// Base64-encoded NIXL agent metadata blob
-    #[serde(rename = "nixlMetadata", default)]
-    pub nixl_metadata: String,
+    /// Endpoint (host:port) where this worker's NIXL listen thread serves metadata.
+    #[serde(rename = "metadataEndpoint", default)]
+    pub metadata_endpoint: Option<String>,
+
+    /// NIXL agent name for this worker
+    #[serde(rename = "agentName", default)]
+    pub agent_name: Option<String>,
 
     /// Mooncake TransferEngine session ID
     #[serde(rename = "transferEngineSessionId", default)]

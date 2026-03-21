@@ -4,8 +4,12 @@
 //! State management for P2P model metadata.
 //!
 //! `P2pStateManager` wraps a metadata backend (Redis or Kubernetes CRD).
-//! All state — model metadata and source status — is persisted to the backend,
+//! All state -- model metadata and source status -- is persisted to the backend,
 //! making the server stateless and horizontally scalable.
+//!
+//! NIXL agent blobs are NOT stored here. Workers exchange them peer-to-peer
+//! via NIXL's native listen thread. The backend only holds lightweight directory
+//! entries: endpoints, tensor layouts, and status.
 
 use crate::metadata_backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
 use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
@@ -223,12 +227,12 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_record_conversion() {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
-
+    fn test_worker_record_conversion_nixl() {
         let meta = WorkerMetadata {
             worker_rank: 3,
-            backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1, 2, 3, 4, 5])),
+            metadata_endpoint: "10.0.1.5:50051".to_string(),
+            agent_name: "mx-source-worker3-abc12345".to_string(),
+            transfer_engine_session_id: String::new(),
             tensors: vec![TensorDescriptor {
                 name: "test.weight".to_string(),
                 addr: 0x1000,
@@ -244,26 +248,27 @@ mod tests {
         assert_eq!(record.worker_rank, 3);
         assert!(matches!(
             &record.backend_metadata,
-            BackendMetadataRecord::Nixl(d) if d == &vec![1, 2, 3, 4, 5]
+            BackendMetadataRecord::Nixl
         ));
+        assert_eq!(record.metadata_endpoint, "10.0.1.5:50051");
+        assert_eq!(record.agent_name, "mx-source-worker3-abc12345");
         assert_eq!(record.tensors.len(), 1);
         assert_eq!(record.status, SourceStatus::Initializing as i32);
         assert_eq!(record.updated_at, 1234567890000);
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
-        assert_eq!(back.backend_metadata, meta.backend_metadata);
+        assert_eq!(back.metadata_endpoint, meta.metadata_endpoint);
+        assert_eq!(back.agent_name, meta.agent_name);
     }
 
     #[test]
     fn test_worker_record_transfer_engine_roundtrip() {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
-
         let meta = WorkerMetadata {
             worker_rank: 1,
-            backend_metadata: Some(BackendMetadata::TransferEngineSessionId(
-                "192.168.1.10:12345".to_string(),
-            )),
+            metadata_endpoint: String::new(),
+            agent_name: String::new(),
+            transfer_engine_session_id: "192.168.1.10:12345".to_string(),
             tensors: vec![TensorDescriptor {
                 name: "test.weight".to_string(),
                 addr: 0x2000,
@@ -288,37 +293,33 @@ mod tests {
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
-        assert_eq!(back.backend_metadata, meta.backend_metadata);
+        assert_eq!(
+            back.transfer_engine_session_id,
+            meta.transfer_engine_session_id
+        );
     }
 
     #[test]
     fn test_backend_metadata_from_flat_with_discriminator() {
         // Explicit backend_type takes precedence
-        let te = BackendMetadataRecord::from_flat(
-            Vec::new(),
-            Some("10.0.0.1:5000".into()),
-            Some("transfer_engine"),
-        );
+        let te =
+            BackendMetadataRecord::from_flat(Some("10.0.0.1:5000".into()), Some("transfer_engine"));
         assert!(matches!(te, BackendMetadataRecord::TransferEngine(ref s) if s == "10.0.0.1:5000"));
 
-        let nixl = BackendMetadataRecord::from_flat(vec![1, 2, 3], None, Some("nixl"));
-        assert!(matches!(nixl, BackendMetadataRecord::Nixl(ref d) if d == &vec![1, 2, 3]));
+        let nixl = BackendMetadataRecord::from_flat(None, Some("nixl"));
+        assert!(matches!(nixl, BackendMetadataRecord::Nixl));
 
-        let none = BackendMetadataRecord::from_flat(Vec::new(), None, Some("none"));
+        let none = BackendMetadataRecord::from_flat(None, Some("none"));
         assert!(matches!(none, BackendMetadataRecord::None));
 
         // Backwards compat: missing backend_type infers from fields
-        let inferred_te =
-            BackendMetadataRecord::from_flat(Vec::new(), Some("10.0.0.1:5000".into()), None);
+        let inferred_te = BackendMetadataRecord::from_flat(Some("10.0.0.1:5000".into()), None);
         assert!(matches!(
             inferred_te,
             BackendMetadataRecord::TransferEngine(_)
         ));
 
-        let inferred_nixl = BackendMetadataRecord::from_flat(vec![1, 2], None, None);
-        assert!(matches!(inferred_nixl, BackendMetadataRecord::Nixl(_)));
-
-        let inferred_none = BackendMetadataRecord::from_flat(Vec::new(), None, None);
+        let inferred_none = BackendMetadataRecord::from_flat(None, None);
         assert!(matches!(inferred_none, BackendMetadataRecord::None));
     }
 
@@ -331,7 +332,9 @@ mod tests {
             workers: vec![
                 WorkerRecord {
                     worker_rank: 0,
-                    backend_metadata: BackendMetadataRecord::Nixl(vec![10, 20, 30]),
+                    backend_metadata: BackendMetadataRecord::Nixl,
+                    metadata_endpoint: "10.0.1.5:50051".to_string(),
+                    agent_name: "mx-auto-worker0-aaa11111".to_string(),
                     tensors: vec![TensorRecord {
                         name: "layer.0.weight".to_string(),
                         addr: 0x7f00_0000_0000,
@@ -344,7 +347,9 @@ mod tests {
                 },
                 WorkerRecord {
                     worker_rank: 1,
-                    backend_metadata: BackendMetadataRecord::Nixl(vec![40, 50, 60]),
+                    backend_metadata: BackendMetadataRecord::Nixl,
+                    metadata_endpoint: "10.0.1.5:50052".to_string(),
+                    agent_name: "mx-auto-worker1-bbb22222".to_string(),
                     tensors: vec![TensorRecord {
                         name: "layer.0.weight".to_string(),
                         addr: 0x7f00_0000_0000,
@@ -414,10 +419,10 @@ mod tests {
                 "a1b2c3d4",
                 vec![WorkerMetadata {
                     worker_rank: 3,
-                    backend_metadata: None,
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
+                    ..Default::default()
                 }],
             )
             .await

@@ -74,8 +74,8 @@ class TestTensorDescriptor:
 class TestWorkerMetadata:
     """Tests for WorkerMetadata dataclass."""
 
-    def test_creation(self):
-        """Test basic worker metadata creation."""
+    def test_creation_with_endpoint(self):
+        """Test worker metadata creation with metadata endpoint."""
         tensors = [
             TensorDescriptor(
                 name=f"layer.{i}.weight",
@@ -88,12 +88,19 @@ class TestWorkerMetadata:
         ]
         metadata = WorkerMetadata(
             worker_rank=0,
-            nixl_metadata=b"test_metadata",
+            metadata_endpoint="10.0.1.5:50051",
             tensors=tensors,
         )
         assert metadata.worker_rank == 0
         assert len(metadata.tensors) == 3
-        assert metadata.nixl_metadata == b"test_metadata"
+        assert metadata.metadata_endpoint == "10.0.1.5:50051"
+
+    def test_default_fields(self):
+        """Test that optional fields default to empty strings."""
+        metadata = WorkerMetadata(worker_rank=0, tensors=[])
+        assert metadata.metadata_endpoint == ""
+        assert metadata.agent_name == ""
+        assert metadata.transfer_engine_session_id == ""
 
 
 class TestGetMetadataResponse:
@@ -104,7 +111,7 @@ class TestGetMetadataResponse:
         workers = [
             WorkerMetadata(
                 worker_rank=i,
-                nixl_metadata=b"metadata",
+                metadata_endpoint=f"10.0.1.{i}:50051",
                 tensors=[],
             )
             for i in range(4)

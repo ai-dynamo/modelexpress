@@ -18,10 +18,16 @@ class TensorDescriptor:
 
 @dataclass
 class WorkerMetadata:
-    """Metadata for a single GPU worker."""
+    """Metadata for a single GPU worker.
+
+    NIXL agent blobs are NOT stored here. Workers exchange them peer-to-peer
+    via NIXL's native listen thread. The metadata_endpoint field tells targets
+    where to connect, and agent_name identifies the remote NIXL agent.
+    """
     worker_rank: int
     tensors: list[TensorDescriptor]
-    nixl_metadata: bytes = b""
+    metadata_endpoint: str = ""
+    agent_name: str = ""
     transfer_engine_session_id: str = ""
 
 
