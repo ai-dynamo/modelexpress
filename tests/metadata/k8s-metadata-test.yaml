@@ -57,6 +57,7 @@ spec:
       containers:
         - name: dht
           image: localhost:32000/dht-metadata-test:latest
+          imagePullPolicy: Always
           args: ["--role", "peer", "--listen", "0.0.0.0:4001"]
           ports:
             - containerPort: 4001
@@ -100,6 +101,7 @@ spec:
       containers:
         - name: publisher
           image: localhost:32000/dht-metadata-test:latest
+          imagePullPolicy: Always
           args: ["--role", "publisher", "--listen", "0.0.0.0:4001"]
           ports:
             - containerPort: 4001
@@ -158,6 +160,7 @@ spec:
       containers:
         - name: test
           image: localhost:32000/dht-metadata-test:latest
+          imagePullPolicy: Always
           args: ["--role", "test", "--listen", "0.0.0.0:4001"]
           env:
             - name: POD_IP
