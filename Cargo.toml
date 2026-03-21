@@ -9,6 +9,7 @@ members = [
     "modelexpress_common", # modelexpress-common
     "workspace-tests",
 ]
+exclude = ["tests/libp2p_kad_interop/rust_node"]
 resolver = "3"
 
 [workspace.package]

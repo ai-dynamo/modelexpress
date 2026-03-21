@@ -104,16 +104,41 @@ jobs:
     - name: Install uv
       uses: astral-sh/setup-uv@v5
 
-    - name: Install dependencies
+    - name: Install MX client dependencies
       working-directory: modelexpress_client/python
       run: |
         uv venv .venv --python 3.12
         uv pip install -e ".[dev]"
 
-    - name: Run tests
+    - name: Run MX client tests
       working-directory: modelexpress_client/python
       run: |
         .venv/bin/python -m pytest tests/ -v
+
+    - name: Install mx_libp2p and test dependencies
+      run: |
+        pip install ./mx_libp2p/
+        pip install pytest pytest-asyncio
+
+    - name: Run libp2p tests
+      run: |
+        python -m pytest tests/libp2p/ -x -q \
+          --ignore=tests/libp2p/k8s_dht_runner.py \
+          -k "not interop"
+
+    - name: Install Rust toolchain (for interop binary)
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Build Rust interop binary
+      run: |
+        cd tests/libp2p_kad_interop/rust_node
+        cargo build --release
+
+    - name: Run interop tests
+      run: |
+        python -m pytest tests/libp2p/test_interop.py -x -q
 
   integration-test:
     name: Integration Tests
