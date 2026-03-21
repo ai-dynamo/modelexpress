@@ -18,9 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
-pub use crate::metadata_backend::{
-    BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
-};
+pub use crate::metadata_backend::{BackendMetadataRecord, ModelMetadataRecord, WorkerRecord};
 
 /// State manager that handles P2P metadata operations.
 ///
@@ -188,9 +186,7 @@ mod tests {
     use super::*;
     use crate::metadata_backend::MockMetadataBackend;
     use mockall::predicate::eq;
-    use modelexpress_common::grpc::p2p::{
-        MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor,
-    };
+    use modelexpress_common::grpc::p2p::{MxSourceType, SourceIdentity, SourceStatus};
 
     fn test_identity() -> SourceIdentity {
         SourceIdentity {
@@ -208,38 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tensor_record_conversion() {
-        let desc = TensorDescriptor {
-            name: "model.layers.0.weight".to_string(),
-            addr: 0x7f0000000000,
-            size: 1024 * 1024 * 1024,
-            device_id: 0,
-            dtype: "bfloat16".to_string(),
-        };
-
-        let record = TensorRecord::from(desc.clone());
-        assert_eq!(record.name, "model.layers.0.weight");
-        assert_eq!(record.size, 1024 * 1024 * 1024);
-
-        let back: TensorDescriptor = record.into();
-        assert_eq!(back.name, desc.name);
-        assert_eq!(back.addr, desc.addr);
-    }
-
-    #[test]
     fn test_worker_record_conversion_nixl() {
         let meta = WorkerMetadata {
             worker_rank: 3,
             metadata_endpoint: "10.0.1.5:50051".to_string(),
             agent_name: "mx-source-worker3-abc12345".to_string(),
+            worker_grpc_endpoint: "10.0.1.5:60051".to_string(),
             transfer_engine_session_id: String::new(),
-            tensors: vec![TensorDescriptor {
-                name: "test.weight".to_string(),
-                addr: 0x1000,
-                size: 4096,
-                device_id: 3,
-                dtype: "float16".to_string(),
-            }],
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
         };
@@ -252,7 +223,7 @@ mod tests {
         ));
         assert_eq!(record.metadata_endpoint, "10.0.1.5:50051");
         assert_eq!(record.agent_name, "mx-source-worker3-abc12345");
-        assert_eq!(record.tensors.len(), 1);
+        assert_eq!(record.worker_grpc_endpoint, "10.0.1.5:60051");
         assert_eq!(record.status, SourceStatus::Initializing as i32);
         assert_eq!(record.updated_at, 1234567890000);
 
@@ -260,6 +231,7 @@ mod tests {
         assert_eq!(back.worker_rank, meta.worker_rank);
         assert_eq!(back.metadata_endpoint, meta.metadata_endpoint);
         assert_eq!(back.agent_name, meta.agent_name);
+        assert_eq!(back.worker_grpc_endpoint, meta.worker_grpc_endpoint);
     }
 
     #[test]
@@ -268,14 +240,8 @@ mod tests {
             worker_rank: 1,
             metadata_endpoint: String::new(),
             agent_name: String::new(),
+            worker_grpc_endpoint: String::new(),
             transfer_engine_session_id: "192.168.1.10:12345".to_string(),
-            tensors: vec![TensorDescriptor {
-                name: "test.weight".to_string(),
-                addr: 0x2000,
-                size: 8192,
-                device_id: 0,
-                dtype: "float16".to_string(),
-            }],
             status: 0,
             updated_at: 0,
         };
@@ -335,13 +301,7 @@ mod tests {
                     backend_metadata: BackendMetadataRecord::Nixl,
                     metadata_endpoint: "10.0.1.5:50051".to_string(),
                     agent_name: "mx-auto-worker0-aaa11111".to_string(),
-                    tensors: vec![TensorRecord {
-                        name: "layer.0.weight".to_string(),
-                        addr: 0x7f00_0000_0000,
-                        size: 1_000_000,
-                        device_id: 0,
-                        dtype: "bfloat16".to_string(),
-                    }],
+                    worker_grpc_endpoint: "10.0.1.5:60051".to_string(),
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                 },
@@ -350,13 +310,7 @@ mod tests {
                     backend_metadata: BackendMetadataRecord::Nixl,
                     metadata_endpoint: "10.0.1.5:50052".to_string(),
                     agent_name: "mx-auto-worker1-bbb22222".to_string(),
-                    tensors: vec![TensorRecord {
-                        name: "layer.0.weight".to_string(),
-                        addr: 0x7f00_0000_0000,
-                        size: 1_000_000,
-                        device_id: 1,
-                        dtype: "bfloat16".to_string(),
-                    }],
+                    worker_grpc_endpoint: "10.0.1.5:60052".to_string(),
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                 },
@@ -419,7 +373,7 @@ mod tests {
                 "a1b2c3d4",
                 vec![WorkerMetadata {
                     worker_rank: 3,
-                    tensors: vec![],
+                    worker_grpc_endpoint: String::new(),
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
                     ..Default::default()

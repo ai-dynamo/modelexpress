@@ -70,13 +70,9 @@ pub struct WorkerStatus {
     #[serde(rename = "transferEngineSessionId", default)]
     pub transfer_engine_session_id: Option<String>,
 
-    /// Number of tensors registered by this worker
-    #[serde(rename = "tensorCount", default)]
-    pub tensor_count: i32,
-
-    /// Name of ConfigMap containing tensor descriptors
-    #[serde(rename = "tensorConfigMap", default)]
-    pub tensor_config_map: Option<String>,
+    /// Endpoint (host:port) for this worker's gRPC server (WorkerService)
+    #[serde(rename = "workerGrpcEndpoint", default)]
+    pub worker_grpc_endpoint: Option<String>,
 
     /// Worker lifecycle status (Initializing, Ready, Stale)
     #[serde(default)]
@@ -132,18 +128,6 @@ pub struct Condition {
     /// Timestamp of last transition
     #[serde(rename = "lastTransitionTime", default)]
     pub last_transition_time: Option<String>,
-}
-
-/// Tensor descriptor stored in ConfigMap
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TensorDescriptorJson {
-    pub name: String,
-    /// Serialized as string to avoid precision loss
-    pub addr: String,
-    /// Serialized as string to avoid precision loss
-    pub size: String,
-    pub device_id: u32,
-    pub dtype: String,
 }
 
 /// Sanitize model name to be a valid Kubernetes resource name
@@ -234,47 +218,5 @@ mod tests {
         assert_eq!(sanitize_model_name("///"), "");
         assert_eq!(sanitize_model_name("---"), "");
         assert_eq!(sanitize_model_name("-model-"), "model");
-    }
-
-    #[test]
-    fn test_tensor_descriptor_json_roundtrip() {
-        let original = TensorDescriptorJson {
-            name: "model.layers.0.weight".to_string(),
-            addr: "139948187451390".to_string(),
-            size: "134217728".to_string(),
-            device_id: 0,
-            dtype: "bfloat16".to_string(),
-        };
-
-        let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(parsed.name, original.name);
-        assert_eq!(parsed.addr, original.addr);
-        assert_eq!(parsed.size, original.size);
-        assert_eq!(parsed.device_id, original.device_id);
-        assert_eq!(parsed.dtype, original.dtype);
-
-        let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
-        assert_eq!(addr, 139948187451390);
-        let size: u64 = parsed.size.parse().expect("size should parse as u64");
-        assert_eq!(size, 134217728);
-    }
-
-    #[test]
-    fn test_tensor_descriptor_json_large_values() {
-        let desc = TensorDescriptorJson {
-            name: "test".to_string(),
-            addr: u64::MAX.to_string(),
-            size: u64::MAX.to_string(),
-            device_id: 7,
-            dtype: "float16".to_string(),
-        };
-
-        let json = serde_json::to_string(&desc).expect("serialize");
-        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
-
-        let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
-        assert_eq!(addr, u64::MAX);
     }
 }

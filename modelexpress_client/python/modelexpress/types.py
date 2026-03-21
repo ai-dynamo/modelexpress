@@ -21,13 +21,13 @@ class WorkerMetadata:
     """Metadata for a single GPU worker.
 
     NIXL agent blobs are NOT stored here. Workers exchange them peer-to-peer
-    via NIXL's native listen thread. The metadata_endpoint field tells targets
-    where to connect, and agent_name identifies the remote NIXL agent.
+    via NIXL's native listen thread. Tensor manifests are served directly by
+    the source worker's gRPC server at worker_grpc_endpoint.
     """
     worker_rank: int
-    tensors: list[TensorDescriptor]
     metadata_endpoint: str = ""
     agent_name: str = ""
+    worker_grpc_endpoint: str = ""
     transfer_engine_session_id: str = ""
 
 

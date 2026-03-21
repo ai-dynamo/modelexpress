@@ -17,7 +17,7 @@
 //! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
 //! to enumerate source index keys without a separate secondary index.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, WorkerRecord};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
@@ -106,103 +106,8 @@ async fn scan_keys(conn: &mut ConnectionManager, pattern: &str) -> MetadataResul
     Ok(all_keys)
 }
 
-/// Serializable version of TensorRecord for Redis storage
-/// NOTE: addr and size are serialized as strings to avoid Lua cjson precision issues
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TensorRecordJson {
-    pub name: String,
-    #[serde(
-        serialize_with = "serialize_u64_as_string",
-        deserialize_with = "deserialize_u64_from_any"
-    )]
-    pub addr: u64,
-    #[serde(
-        serialize_with = "serialize_u64_as_string",
-        deserialize_with = "deserialize_u64_from_any"
-    )]
-    pub size: u64,
-    pub device_id: u32,
-    pub dtype: String,
-}
-
-fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&value.to_string())
-}
-
-fn deserialize_u64_from_any<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{self, Visitor};
-
-    struct U64Visitor;
-
-    impl<'de> Visitor<'de> for U64Visitor {
-        type Value = u64;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a u64 as string or number")
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-            Ok(value)
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            u64::try_from(value).map_err(|_| E::custom("negative value"))
-        }
-
-        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            // Handle floats from cjson (the problematic case)
-            Ok(value as u64)
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            value.parse::<u64>().map_err(de::Error::custom)
-        }
-    }
-
-    deserializer.deserialize_any(U64Visitor)
-}
-
-impl From<TensorRecord> for TensorRecordJson {
-    fn from(record: TensorRecord) -> Self {
-        Self {
-            name: record.name,
-            addr: record.addr,
-            size: record.size,
-            device_id: record.device_id,
-            dtype: record.dtype,
-        }
-    }
-}
-
-impl From<TensorRecordJson> for TensorRecord {
-    fn from(json: TensorRecordJson) -> Self {
-        Self {
-            name: json.name,
-            addr: json.addr,
-            size: json.size,
-            device_id: json.device_id,
-            dtype: json.dtype,
-        }
-    }
-}
-
 /// Serializable version of WorkerRecord for Redis storage.
-/// No NIXL blobs - only lightweight directory data.
+/// No NIXL blobs or tensor descriptors - only lightweight directory data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRecordJson {
     pub worker_rank: u32,
@@ -217,7 +122,9 @@ struct WorkerRecordJson {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub transfer_engine_session_id: Option<String>,
-    pub tensors: Vec<TensorRecordJson>,
+    /// Endpoint (host:port) for this worker's gRPC server (WorkerService)
+    #[serde(default)]
+    pub worker_grpc_endpoint: Option<String>,
     #[serde(default)]
     pub status: i32,
     #[serde(default)]
@@ -233,17 +140,14 @@ impl WorkerRecordJson {
         };
         let metadata_endpoint = super::none_if_empty(record.metadata_endpoint);
         let agent_name = super::none_if_empty(record.agent_name);
+        let worker_grpc_endpoint = super::none_if_empty(record.worker_grpc_endpoint);
         Self {
             worker_rank: record.worker_rank,
             backend_type: Some(backend_type),
             metadata_endpoint,
             agent_name,
             transfer_engine_session_id,
-            tensors: record
-                .tensors
-                .into_iter()
-                .map(TensorRecordJson::from)
-                .collect(),
+            worker_grpc_endpoint,
             status: record.status,
             updated_at: record.updated_at,
         }
@@ -260,7 +164,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             ),
             metadata_endpoint: json.metadata_endpoint.unwrap_or_default(),
             agent_name: json.agent_name.unwrap_or_default(),
-            tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
+            worker_grpc_endpoint: json.worker_grpc_endpoint.unwrap_or_default(),
             status: json.status,
             updated_at: json.updated_at,
         }
@@ -374,13 +278,11 @@ impl MetadataBackend for RedisBackend {
 
         pipe.exec_async(&mut conn).await?;
 
-        let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for '{}' (source_id={source_id}, worker_id={}): {} workers ({} tensors)",
+            "Published metadata for '{}' (source_id={source_id}, worker_id={}): {} workers",
             identity.model_name,
             worker_id,
             worker_records.len(),
-            total_tensors
         );
         Ok(())
     }
@@ -583,55 +485,6 @@ impl MetadataBackend for RedisBackend {
 mod tests {
     use super::*;
 
-    // -- TensorRecordJson serialization --
-
-    #[test]
-    fn test_tensor_record_json_roundtrip() {
-        let record = TensorRecord {
-            name: "model.layers.0.weight".to_string(),
-            addr: 0x7f00_0000_0000,
-            size: 1_073_741_824,
-            device_id: 3,
-            dtype: "bfloat16".to_string(),
-        };
-        let json_record = TensorRecordJson::from(record.clone());
-        let json = serde_json::to_string(&json_record).expect("serialize");
-
-        // addr and size must be serialized as strings
-        assert!(json.contains(r#""addr":"#));
-        let parsed: TensorRecordJson = serde_json::from_str(&json).expect("deserialize");
-        let back = TensorRecord::from(parsed);
-
-        assert_eq!(back.name, record.name);
-        assert_eq!(back.addr, record.addr);
-        assert_eq!(back.size, record.size);
-        assert_eq!(back.device_id, record.device_id);
-        assert_eq!(back.dtype, record.dtype);
-    }
-
-    #[test]
-    fn test_deserialize_u64_from_string() {
-        let json = r#"{"name":"w","addr":"139948187451390","size":"134217728","device_id":0,"dtype":"f16"}"#;
-        let t: TensorRecordJson = serde_json::from_str(json).expect("parse string");
-        assert_eq!(t.addr, 139948187451390);
-        assert_eq!(t.size, 134217728);
-    }
-
-    #[test]
-    fn test_deserialize_u64_from_number() {
-        let json = r#"{"name":"w","addr":1234567890,"size":4096,"device_id":0,"dtype":"f16"}"#;
-        let t: TensorRecordJson = serde_json::from_str(json).expect("parse number");
-        assert_eq!(t.addr, 1234567890);
-    }
-
-    #[test]
-    fn test_deserialize_u64_from_float() {
-        // cjson can emit floats for large integers
-        let json = r#"{"name":"w","addr":1048576.0,"size":4096.0,"device_id":0,"dtype":"f16"}"#;
-        let t: TensorRecordJson = serde_json::from_str(json).expect("parse float");
-        assert_eq!(t.addr, 1048576);
-    }
-
     // -- WorkerRecordJson serialization --
 
     #[test]
@@ -641,13 +494,7 @@ mod tests {
             backend_metadata: super::super::BackendMetadataRecord::Nixl,
             metadata_endpoint: "10.0.1.5:50051".to_string(),
             agent_name: "mx-auto-worker2-abc12345".to_string(),
-            tensors: vec![TensorRecord {
-                name: "t".to_string(),
-                addr: 0x1000,
-                size: 512,
-                device_id: 2,
-                dtype: "float16".to_string(),
-            }],
+            worker_grpc_endpoint: "10.0.1.5:60051".to_string(),
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,
         };
@@ -660,9 +507,9 @@ mod tests {
         assert_eq!(back.worker_rank, record.worker_rank);
         assert_eq!(back.backend_metadata, record.backend_metadata);
         assert_eq!(back.metadata_endpoint, record.metadata_endpoint);
+        assert_eq!(back.worker_grpc_endpoint, record.worker_grpc_endpoint);
         assert_eq!(back.status, record.status);
         assert_eq!(back.updated_at, record.updated_at);
-        assert_eq!(back.tensors.len(), 1);
     }
 
     #[test]
@@ -674,7 +521,7 @@ mod tests {
             ),
             metadata_endpoint: String::new(),
             agent_name: String::new(),
-            tensors: vec![],
+            worker_grpc_endpoint: String::new(),
             status: 2,
             updated_at: 1_700_000_000_000,
         };
@@ -690,12 +537,13 @@ mod tests {
 
     #[test]
     fn test_worker_record_json_backward_compat_missing_fields() {
-        // Records written before metadata_endpoint existed must default gracefully
-        let json = r#"{"worker_rank":0,"tensors":[]}"#;
+        // Records written before worker_grpc_endpoint existed must default gracefully
+        let json = r#"{"worker_rank":0}"#;
         let parsed: WorkerRecordJson = serde_json::from_str(json).expect("parse legacy");
         assert_eq!(parsed.status, 0);
         assert_eq!(parsed.updated_at, 0);
         assert!(parsed.metadata_endpoint.is_none());
+        assert!(parsed.worker_grpc_endpoint.is_none());
     }
 
     // ── SourceAttributesJson ────────────────────────────────────────────────

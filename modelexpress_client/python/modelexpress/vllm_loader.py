@@ -52,6 +52,7 @@ from .gds_loader import MxGdsLoader
 from .gds_transfer import is_gds_available
 from .nixl_transfer import NixlTransferManager, is_nixl_available
 from .types import TensorDescriptor
+from .worker_server import WorkerGrpcServer, fetch_tensor_manifest
 
 logger = logging.getLogger("modelexpress.vllm_loader")
 
@@ -115,6 +116,7 @@ class SourceTransferError(Exception):
 _TRANSFER_MAX_RETRIES = 120
 _TRANSFER_RETRY_DELAY_SECONDS = 30
 _MX_METADATA_PORT_DEFAULT = 5555
+_MX_WORKER_GRPC_PORT_DEFAULT = 6555
 
 # ---------------------------------------------------------------------------
 # Shared helpers used by multiple loaders
@@ -127,8 +129,14 @@ def _get_listen_port(device_id: int) -> int:
     return base_port + device_id
 
 
-def _source_tensors_from_proto(worker) -> list[TensorDescriptor]:
-    """Build TensorDescriptor list from a WorkerMetadata proto's tensor list."""
+def _get_worker_grpc_port(device_id: int) -> int:
+    """Compute the worker gRPC port for a given device/rank."""
+    base_port = int(os.environ.get("MX_WORKER_GRPC_PORT", str(_MX_WORKER_GRPC_PORT_DEFAULT)))
+    return base_port + device_id
+
+
+def _tensors_from_proto(tensor_protos) -> list[TensorDescriptor]:
+    """Convert a list of TensorDescriptor protos to TensorDescriptor dataclasses."""
     return [
         TensorDescriptor(
             name=t.name,
@@ -137,7 +145,7 @@ def _source_tensors_from_proto(worker) -> list[TensorDescriptor]:
             device_id=t.device_id,
             dtype=t.dtype,
         )
-        for t in worker.tensors
+        for t in tensor_protos
     ]
 
 
@@ -356,15 +364,17 @@ def _publish_metadata_and_ready(
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
     metadata_endpoint: str = "",
+    worker_grpc_endpoint: str = "",
 ) -> None:
-    """Publish tensor metadata and ready flag to the ModelExpress server.
+    """Start a per-worker gRPC server for the tensor manifest, then publish
+    lightweight metadata and ready flag to the ModelExpress server.
 
-    NIXL agent blobs are NOT sent to the server. Instead, the worker's
-    metadata_endpoint and agent_name are published so targets can connect
-    via NIXL's native P2P exchange.
+    Tensor descriptors are served directly by the worker's gRPC server.
+    The centralized MX server only stores endpoints and agent names.
     """
     logger.info(
-        f"[Worker {global_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {global_rank}] Publishing metadata for model '{identity.model_name}' "
+        f"({len(tensors)} tensors served at {worker_grpc_endpoint})"
     )
 
     try:
@@ -398,11 +408,17 @@ def _publish_metadata_and_ready(
                 for name, t in tensors.items()
             ]
 
+        # Start per-worker gRPC server to serve tensor manifest
+        grpc_port = _get_worker_grpc_port(device_id)
+        server = WorkerGrpcServer(tensor_protos, port=grpc_port)
+        server.start()
+        _worker_servers[device_id] = server
+
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=global_rank,
             metadata_endpoint=metadata_endpoint,
             agent_name=nixl_manager.agent_name,
-            tensors=tensor_protos,
+            worker_grpc_endpoint=worker_grpc_endpoint,
         )
 
         mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
@@ -519,9 +535,10 @@ class MxModelLoader(BaseModelLoader):
         worker_id: str,
         global_rank: int,
     ) -> p2p_pb2.WorkerMetadata | None:
-        """Fetch tensor metadata for one worker.
+        """Fetch lightweight metadata for one worker from the MX server.
 
-        Returns None if the worker is not found or has no tensors.
+        Returns None if the worker is not found or has no worker_grpc_endpoint.
+        Tensor manifests are fetched separately from the worker's gRPC server.
         """
         metadata_resp = self._mx_client.get_metadata(
             mx_source_id=mx_source_id,
@@ -533,9 +550,9 @@ class MxModelLoader(BaseModelLoader):
             )
             return None
         worker = metadata_resp.worker
-        if not worker.tensors:
+        if not worker.worker_grpc_endpoint:
             logger.debug(
-                f"[Worker {global_rank}] Worker {worker_id} has no tensors, skipping"
+                f"[Worker {global_rank}] Worker {worker_id} has no worker_grpc_endpoint, skipping"
             )
             return None
         return worker
@@ -567,7 +584,7 @@ class MxModelLoader(BaseModelLoader):
                     continue
                 logger.info(
                     f"[Worker {global_rank}] Trying source worker {worker_id} "
-                    f"({len(source_worker.tensors)} tensors)"
+                    f"(grpc={source_worker.worker_grpc_endpoint})"
                 )
                 self._load_as_target(
                     model, model_config, target_device,
@@ -682,10 +699,16 @@ class MxModelLoader(BaseModelLoader):
         receive_start = time.perf_counter()
         self._register_tensors(model, global_rank, device_id)
 
-        source_tensors = _source_tensors_from_proto(source_worker)
-
+        # Fetch tensor manifest directly from source worker's gRPC server
+        worker_grpc_ep = source_worker.worker_grpc_endpoint
+        logger.info(f"[Worker {global_rank}] Fetching tensor manifest from {worker_grpc_ep}")
+        manifest_start = time.perf_counter()
+        tensor_protos = fetch_tensor_manifest(worker_grpc_ep)
+        manifest_time = time.perf_counter() - manifest_start
+        source_tensors = _tensors_from_proto(tensor_protos)
         logger.info(
-            f"[Worker {global_rank}] Receiving {len(source_tensors)} tensors from source"
+            f"[Worker {global_rank}] [TIMING] Tensor manifest fetched in {manifest_time:.3f}s: "
+            f"{len(source_tensors)} tensors"
         )
 
         coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
@@ -740,7 +763,9 @@ class MxModelLoader(BaseModelLoader):
                         w = self._fetch_worker_metadata(inst.mx_source_id, inst.worker_id, global_rank)
                         if w is not None and w.metadata_endpoint:
                             source_worker = w
-                            source_tensors = _source_tensors_from_proto(source_worker)
+                            # Re-fetch tensor manifest from new source
+                            new_protos = fetch_tensor_manifest(w.worker_grpc_endpoint)
+                            source_tensors = _tensors_from_proto(new_protos)
                             ep = source_worker.metadata_endpoint
                             h, p = ep.rsplit(":", 1)
                             remote_agent = self._nixl_manager.fetch_remote_and_wait(
@@ -861,17 +886,20 @@ class MxModelLoader(BaseModelLoader):
     def _publish_metadata(self, global_rank: int, device_id: int, identity: "p2p_pb2.SourceIdentity") -> None:
         """Publish metadata to the MX server."""
         listen_port = _get_listen_port(device_id)
+        grpc_port = _get_worker_grpc_port(device_id)
         host = _get_worker_host()
         metadata_endpoint = f"{host}:{listen_port}"
+        worker_grpc_endpoint = f"{host}:{grpc_port}"
         agent_name = self._nixl_manager.agent_name
         logger.info(
             f"[Worker {global_rank}] NIXL listen thread at {metadata_endpoint} "
-            f"(agent={agent_name})"
+            f"(agent={agent_name}), worker gRPC at {worker_grpc_endpoint}"
         )
         _publish_metadata_and_ready(
             self._mx_client, self._nixl_manager, self._tensors,
             global_rank, device_id, identity, self._worker_id,
             metadata_endpoint=metadata_endpoint,
+            worker_grpc_endpoint=worker_grpc_endpoint,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -900,3 +928,4 @@ class MxModelLoader(BaseModelLoader):
 # Each device_id maps to exactly one loader, so there are no concurrent writers.
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, "NixlTransferManager"] = {}
+_worker_servers: dict[int, "WorkerGrpcServer"] = {}

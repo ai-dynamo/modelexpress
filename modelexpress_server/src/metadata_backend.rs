@@ -115,21 +115,13 @@ pub struct WorkerRecord {
     pub metadata_endpoint: String,
     /// NIXL agent name for this worker (needed for check_remote_metadata).
     pub agent_name: String,
-    pub tensors: Vec<TensorRecord>,
+    /// Endpoint (host:port) for this worker's gRPC server (WorkerService).
+    /// Targets connect here to fetch the tensor manifest directly.
+    pub worker_grpc_endpoint: String,
     /// Worker lifecycle status (maps to `SourceStatus` proto enum)
     pub status: i32,
     /// Timestamp of last status update (unix millis)
     pub updated_at: i64,
-}
-
-/// Tensor descriptor record
-#[derive(Debug, Clone)]
-pub struct TensorRecord {
-    pub name: String,
-    pub addr: u64,
-    pub size: u64,
-    pub device_id: u32,
-    pub dtype: String,
 }
 
 // Conversions from gRPC types
@@ -150,21 +142,9 @@ impl From<WorkerMetadata> for WorkerRecord {
             backend_metadata,
             metadata_endpoint: meta.metadata_endpoint,
             agent_name: meta.agent_name,
-            tensors: meta.tensors.into_iter().map(TensorRecord::from).collect(),
+            worker_grpc_endpoint: meta.worker_grpc_endpoint,
             status: meta.status,
             updated_at: meta.updated_at,
-        }
-    }
-}
-
-impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
-    fn from(desc: modelexpress_common::grpc::p2p::TensorDescriptor) -> Self {
-        Self {
-            name: desc.name,
-            addr: desc.addr,
-            size: desc.size,
-            device_id: desc.device_id,
-            dtype: desc.dtype,
         }
     }
 }
@@ -180,26 +160,10 @@ impl From<WorkerRecord> for WorkerMetadata {
             worker_rank: record.worker_rank,
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
+            worker_grpc_endpoint: record.worker_grpc_endpoint,
             transfer_engine_session_id,
-            tensors: record
-                .tensors
-                .into_iter()
-                .map(modelexpress_common::grpc::p2p::TensorDescriptor::from)
-                .collect(),
             status: record.status,
             updated_at: record.updated_at,
-        }
-    }
-}
-
-impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
-    fn from(record: TensorRecord) -> Self {
-        Self {
-            name: record.name,
-            addr: record.addr,
-            size: record.size,
-            device_id: record.device_id,
-            dtype: record.dtype,
         }
     }
 }

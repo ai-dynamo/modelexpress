@@ -86,7 +86,6 @@ impl P2pService for P2pServiceImpl {
         let worker_id = req.worker_id.clone();
         let model_name = identity.model_name.clone();
         let worker_rank = worker.worker_rank;
-        let tensor_count = worker.tensors.len();
 
         match self
             .state
@@ -95,14 +94,14 @@ impl P2pService for P2pServiceImpl {
         {
             Ok(()) => {
                 info!(
-                    "PublishMetadata: model='{}' source_id={} worker_id={} worker_rank={} tensors={}",
-                    model_name, source_id, worker_id, worker_rank, tensor_count
+                    "PublishMetadata: model='{}' source_id={} worker_id={} worker_rank={}",
+                    model_name, source_id, worker_id, worker_rank
                 );
                 Ok(Response::new(PublishMetadataResponse {
                     success: true,
                     message: format!(
-                        "Published metadata for '{}' (source_id={}, worker_id={}, worker_rank={}, {} tensors)",
-                        model_name, source_id, worker_id, worker_rank, tensor_count
+                        "Published metadata for '{}' (source_id={}, worker_id={}, worker_rank={})",
+                        model_name, source_id, worker_id, worker_rank
                     ),
                     mx_source_id: source_id,
                     worker_id,
@@ -194,11 +193,8 @@ impl P2pService for P2pServiceImpl {
                 let worker = record.workers.into_iter().next().map(WorkerMetadata::from);
                 let found = worker.is_some();
                 info!(
-                    "GetMetadata '{}' (source_id={}, worker_id={}): {} tensors",
-                    record.model_name,
-                    req.mx_source_id,
-                    req.worker_id,
-                    worker.as_ref().map_or(0, |w| w.tensors.len()),
+                    "GetMetadata '{}' (source_id={}, worker_id={}): found={}",
+                    record.model_name, req.mx_source_id, req.worker_id, found,
                 );
                 Ok(Response::new(GetMetadataResponse {
                     found,
@@ -380,7 +376,7 @@ mod tests {
                     metadata_endpoint: "10.0.1.5:50051".to_string(),
                     agent_name: String::new(),
                     transfer_engine_session_id: String::new(),
-                    tensors: vec![],
+                    worker_grpc_endpoint: String::new(),
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
                 }),
@@ -408,7 +404,7 @@ mod tests {
                 identity: Some(test_identity()),
                 worker: Some(WorkerMetadata {
                     worker_rank: 0,
-                    tensors: vec![],
+                    worker_grpc_endpoint: String::new(),
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
                     ..Default::default()
@@ -454,7 +450,7 @@ mod tests {
                         backend_metadata: BackendMetadataRecord::None,
                         metadata_endpoint: String::new(),
                         agent_name: String::new(),
-                        tensors: vec![],
+                        worker_grpc_endpoint: String::new(),
                         status: SourceStatus::Ready as i32,
                         updated_at: 1234567890000,
                     }],

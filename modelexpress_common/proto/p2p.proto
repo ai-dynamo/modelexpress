@@ -5,11 +5,26 @@ syntax = "proto3";
 
 package model_express.p2p;
 
+// Worker-to-worker service running on each source worker.
+// Targets connect directly to fetch tensor manifests (MB-scale data that
+// should not transit the centralized discovery layer).
+service WorkerService {
+  // Fetch the tensor manifest for this worker's GPU.
+  rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+}
+
+message GetTensorManifestRequest {}
+
+message GetTensorManifestResponse {
+  repeated TensorDescriptor tensors = 1;
+}
+
 // P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
 // The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 // NIXL agent blobs are exchanged directly between peers via NIXL's native listen thread
 // (send_local_metadata / fetch_remote_metadata), never stored centrally.
+// Tensor manifests are served directly by source workers via WorkerService.
 service P2pService {
   // Publish model metadata - called by client after loading model weights
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
@@ -118,12 +133,10 @@ message WorkerMetadata {
   // Worker rank (GPU index within the instance)
   uint32 worker_rank = 1;
 
-  // Reserved: field 2 was nixl_metadata (bytes). NIXL agent blobs are now
-  // exchanged peer-to-peer via NIXL's native listen thread, never stored centrally.
-  reserved 2;
-
-  // Tensor descriptors for this worker's GPU
-  repeated TensorDescriptor tensors = 3;
+  // Reserved: field 2 was nixl_metadata (bytes), field 3 was tensors.
+  // NIXL agent blobs are exchanged via NIXL's native listen thread.
+  // Tensor manifests are served directly by source workers via WorkerService.
+  reserved 2, 3;
 
   // Worker lifecycle status
   SourceStatus status = 4;
@@ -138,6 +151,10 @@ message WorkerMetadata {
   // NIXL agent name for this worker. Targets need this to call
   // check_remote_metadata() after fetching the blob.
   string agent_name = 7;
+
+  // Endpoint (host:port) for this worker's gRPC server (WorkerService).
+  // Targets connect here to fetch the tensor manifest directly.
+  string worker_grpc_endpoint = 8;
 
   // Mooncake TransferEngine session ID ("ip:port").
   // TransferEngine sessions are lightweight and can remain in the centralized store.
