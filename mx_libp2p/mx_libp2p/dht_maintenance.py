@@ -32,6 +32,21 @@ class MaintenanceMixin:
             conn = self.peer_store.get_connection(entry.peer_id)
             if conn is not None and not conn.is_alive:
                 self.routing_table.remove(entry.peer_id)
+            # Also remove peers marked disconnected with no active connection.
+            # These were flagged by failed dials or explicit disconnect signals.
+            elif not entry.connected and conn is None:
+                self.routing_table.remove(entry.peer_id)
+
+    def _quick_prune(self) -> None:
+        """Remove routing table peers that are marked disconnected with no active connection.
+
+        Lighter than _prune_dead_peers - no connection object inspection needed.
+        Called during periodic bootstrap to keep the routing table clean between
+        the longer republish cycles.
+        """
+        for entry in self.routing_table.all_peers():
+            if not entry.connected and self.peer_store.get_connection(entry.peer_id) is None:
+                self.routing_table.remove(entry.peer_id)
 
     async def _periodic_bootstrap_loop(self) -> None:
         """Periodically re-bootstrap to discover new peers and refresh buckets.
@@ -44,6 +59,10 @@ class MaintenanceMixin:
             while True:
                 await asyncio.sleep(BOOTSTRAP_INTERVAL)
                 size = self.routing_table.size()
+
+                # Prune disconnected peers before checking table size so the
+                # sparse-table check reflects actual reachable peers.
+                self._quick_prune()
 
                 if size < K:
                     # Sparse table: re-dial bootstrap peers first

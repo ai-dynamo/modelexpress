@@ -34,12 +34,13 @@ PENDING_ENTRY_TIMEOUT = 60.0  # seconds
 class PeerEntry:
     """A peer in the routing table."""
 
-    __slots__ = ("peer_id", "addrs", "last_seen")
+    __slots__ = ("peer_id", "addrs", "last_seen", "connected")
 
     def __init__(self, peer_id: bytes, addrs: list[bytes], last_seen: float | None = None):
         self.peer_id = peer_id
         self.addrs = addrs
         self.last_seen = last_seen or time.monotonic()
+        self.connected: bool = True
 
 
 def xor_distance(a: bytes, b: bytes) -> int:
@@ -152,6 +153,16 @@ class KBucket:
             self._pending_since = time.monotonic()
             return False  # the new peer is now pending, not yet in bucket
 
+        # If the LRU peer is disconnected, evict it immediately without liveness check.
+        # Dead peers should never block live ones from entering the routing table.
+        if not lru.connected:
+            evicted = self.peers.pop(0)
+            log.debug(
+                f"evicted disconnected peer {evicted.peer_id.hex()[:16]}... from bucket"
+            )
+            self.peers.append(PeerEntry(peer_id, addrs))
+            return True
+
         if self._is_alive is not None:
             if self._is_alive(lru.peer_id):
                 # LRU is alive: refresh it, reject the newcomer but cache it
@@ -198,6 +209,23 @@ class KBucket:
         if self._pending and self._pending.peer_id == peer_id:
             self._pending = None
             self._pending_since = None
+        return False
+
+    def mark_disconnected(self, peer_id: bytes) -> bool:
+        """Mark a peer as disconnected. Returns True if found."""
+        for entry in self.peers:
+            if entry.peer_id == peer_id:
+                entry.connected = False
+                return True
+        return False
+
+    def mark_connected(self, peer_id: bytes) -> bool:
+        """Mark a peer as connected. Returns True if found."""
+        for entry in self.peers:
+            if entry.peer_id == peer_id:
+                entry.connected = True
+                entry.last_seen = time.monotonic()
+                return True
         return False
 
     def get(self, peer_id: bytes) -> PeerEntry | None:
@@ -250,11 +278,29 @@ class RoutingTable:
         idx = self._bucket_index(peer_id)
         return self._buckets[idx].get(peer_id)
 
-    def closest_peers(self, target: bytes, count: int = K) -> list[PeerEntry]:
-        """Return up to `count` peers closest to `target` by XOR distance."""
+    def mark_disconnected(self, peer_id: bytes) -> bool:
+        """Mark a peer as disconnected in the routing table. Returns True if found."""
+        idx = self._bucket_index(peer_id)
+        return self._buckets[idx].mark_disconnected(peer_id)
+
+    def mark_connected(self, peer_id: bytes) -> bool:
+        """Mark a peer as connected in the routing table. Returns True if found."""
+        idx = self._bucket_index(peer_id)
+        return self._buckets[idx].mark_connected(peer_id)
+
+    def closest_peers(
+        self, target: bytes, count: int = K, connected_only: bool = False
+    ) -> list[PeerEntry]:
+        """Return up to `count` peers closest to `target` by XOR distance.
+
+        When connected_only is True, only peers marked as connected are returned.
+        """
         all_peers = []
         for bucket in self._buckets:
             all_peers.extend(bucket.all_peers())
+
+        if connected_only:
+            all_peers = [p for p in all_peers if p.connected]
 
         all_peers.sort(key=lambda p: xor_distance(p.peer_id, target))
         return all_peers[:count]

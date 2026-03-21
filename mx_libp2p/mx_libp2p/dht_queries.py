@@ -119,6 +119,7 @@ class QueryMixin:
             return result
         except Exception as e:
             log.debug(f"find_node to {peer_id.hex()[:16]}... failed: {e}", exc_info=True)
+            self.routing_table.mark_disconnected(peer_id)
             return []
 
     async def _iterative_get_value(self, key: bytes) -> bytes | None:

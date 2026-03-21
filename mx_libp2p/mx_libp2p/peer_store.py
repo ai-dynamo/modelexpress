@@ -90,11 +90,15 @@ class PeerStore:
         identity: Ed25519Identity,
         supported_protocols: list[str] | None = None,
         on_new_connection: Callable | None = None,
+        on_peer_unreachable: Callable | None = None,
+        on_peer_connected: Callable | None = None,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
     ):
         self.identity = identity
         self.supported_protocols = supported_protocols
         self.on_new_connection = on_new_connection
+        self.on_peer_unreachable = on_peer_unreachable
+        self.on_peer_connected = on_peer_connected
         self.max_connections = max_connections
         self._peers: dict[bytes, PeerInfo] = {}
         self._dial_locks: dict[bytes, asyncio.Lock] = {}
@@ -198,6 +202,8 @@ class PeerStore:
                     self.set_connection(peer_id, conn)
                     if self.on_new_connection:
                         self.on_new_connection(conn)
+                    if self.on_peer_connected:
+                        self.on_peer_connected(peer_id)
                     return conn
                 except Exception as e:
                     last_err = e
@@ -210,6 +216,8 @@ class PeerStore:
                         del info.addr_infos[addr]
                         log.debug(f"removed address {host}:{port} after {MAX_DIAL_FAILURES} failures")
 
+            if self.on_peer_unreachable:
+                self.on_peer_unreachable(peer_id)
             raise ConnectionError(
                 f"failed to dial peer {peer_id.hex()[:16]}...: {last_err}"
             )

@@ -89,6 +89,8 @@ class DhtNode(IdentifyMixin, QueryMixin, BootstrapMixin, MaintenanceMixin):
             self.identity,
             supported_protocols=[KADEMLIA_PROTOCOL, IDENTIFY_PROTOCOL, IDENTIFY_PUSH_PROTOCOL],
             on_new_connection=self._on_outbound_connection,
+            on_peer_unreachable=self._on_peer_unreachable,
+            on_peer_connected=self._on_peer_connected,
         )
         # Routing table uses connection liveness to decide eviction
         self.routing_table = RoutingTable(
@@ -394,6 +396,7 @@ class DhtNode(IdentifyMixin, QueryMixin, BootstrapMixin, MaintenanceMixin):
         addresses, avoiding the ephemeral TCP source port problem.
         """
         self.peer_store.set_connection(conn.remote_peer_id, conn)
+        self.routing_table.mark_connected(conn.remote_peer_id)
         self._setup_kad_handler(conn)
         self._setup_identify_handler(conn)
         self._setup_identify_push_handler(conn)
@@ -415,6 +418,16 @@ class DhtNode(IdentifyMixin, QueryMixin, BootstrapMixin, MaintenanceMixin):
         self._setup_kad_handler(conn)
         self._setup_identify_handler(conn)
         self._setup_identify_push_handler(conn)
+
+    def _on_peer_unreachable(self, peer_id: bytes) -> None:
+        """Called by PeerStore when all dial attempts to a peer fail."""
+        if self.routing_table.mark_disconnected(peer_id):
+            log.debug(f"marked peer {peer_id.hex()[:16]}... as disconnected (dial failed)")
+
+    def _on_peer_connected(self, peer_id: bytes) -> None:
+        """Called by PeerStore when a dial to a peer succeeds."""
+        if self.routing_table.mark_connected(peer_id):
+            log.debug(f"marked peer {peer_id.hex()[:16]}... as connected")
 
     # -- Task tracking ---------------------------------------------------------
 
