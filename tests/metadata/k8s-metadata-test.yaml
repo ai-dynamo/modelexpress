@@ -73,7 +73,7 @@ spec:
               memory: 64Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
           readinessProbe:
             tcpSocket:
               port: 4001
@@ -116,7 +116,7 @@ spec:
               memory: 128Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
 ---
 # Test job - runs all test scenarios and exits.
 apiVersion: batch/v1
