@@ -270,29 +270,15 @@ async def run_publisher(host: str, port: int, dns: str | None) -> None:
             worker_rank=0,
             metadata_endpoint="10.0.0.1:5555",
             agent_name="publisher-agent-0",
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="model.embed.weight", addr=0x7FFF00000000, size=67108864,
-                    device_id=0, dtype="torch.bfloat16",
-                ),
-                p2p_pb2.TensorDescriptor(
-                    name="model.layers.0.weight", addr=0x7FFF10000000, size=33554432,
-                    device_id=0, dtype="torch.bfloat16",
-                ),
-            ],
+            worker_grpc_endpoint="10.0.0.1:5556",
             status=p2p_pb2.SOURCE_STATUS_READY,
             updated_at=int(time.time() * 1000),
         ),
         p2p_pb2.WorkerMetadata(
             worker_rank=1,
-            metadata_endpoint="10.0.0.2:5556",
+            metadata_endpoint="10.0.0.2:5555",
             agent_name="publisher-agent-1",
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="model.embed.weight", addr=0x8FFF00000000, size=67108864,
-                    device_id=1, dtype="torch.bfloat16",
-                ),
-            ],
+            worker_grpc_endpoint="10.0.0.2:5556",
             status=p2p_pb2.SOURCE_STATUS_READY,
             updated_at=int(time.time() * 1000),
         ),
@@ -342,19 +328,14 @@ async def test_publish_and_get(node: DhtNode, results: TestResult) -> None:
         worker_rank=0,
         metadata_endpoint="10.1.0.1:5555",
         agent_name="test-agent-0",
-        tensors=[
-            p2p_pb2.TensorDescriptor(
-                name="layer.0.weight", addr=12345678, size=1024,
-                device_id=0, dtype="torch.float16",
-            ),
-        ],
+        worker_grpc_endpoint="10.1.0.1:5556",
         status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
     )
     w1 = p2p_pb2.WorkerMetadata(
         worker_rank=1,
-        metadata_endpoint="10.1.0.2:5556",
+        metadata_endpoint="10.1.0.2:5555",
         agent_name="test-agent-1",
-        tensors=[],
+        worker_grpc_endpoint="10.1.0.2:5556",
         status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
     )
 
@@ -373,10 +354,7 @@ async def test_publish_and_get(node: DhtNode, results: TestResult) -> None:
         results.record("worker rank", resp.worker.worker_rank == 0)
         results.record("worker endpoint", resp.worker.metadata_endpoint == "10.1.0.1:5555")
         results.record("worker agent_name", resp.worker.agent_name == "test-agent-0")
-        results.record("worker tensors", len(resp.worker.tensors) == 1)
-        if resp.worker.tensors:
-            results.record("tensor name", resp.worker.tensors[0].name == "layer.0.weight")
-            results.record("tensor addr preserved", resp.worker.tensors[0].addr == 12345678)
+        results.record("worker grpc_endpoint", resp.worker.worker_grpc_endpoint == "10.1.0.1:5556")
 
     # Check directory has both ranks
     raw = await node.get(_worker_directory_key(sid0, worker_id))

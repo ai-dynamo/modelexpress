@@ -83,12 +83,7 @@ class TestJsonSerialization:
             worker_rank=0,
             metadata_endpoint="10.0.0.1:5555",
             agent_name="mx-auto-worker0-abc",
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="layer.0.weight", addr=0x7FFF00000000, size=1024,
-                    device_id=0, dtype="torch.float16",
-                )
-            ],
+            worker_grpc_endpoint="10.0.0.1:5556",
             status=p2p_pb2.SOURCE_STATUS_READY,
             updated_at=1234567890,
         )
@@ -97,8 +92,8 @@ class TestJsonSerialization:
         assert result["backend_type"] == "nixl"
         assert result["metadata_endpoint"] == "10.0.0.1:5555"
         assert result["agent_name"] == "mx-auto-worker0-abc"
-        assert len(result["tensors"]) == 1
-        assert result["tensors"][0]["addr"] == 0x7FFF00000000
+        assert result["worker_grpc_endpoint"] == "10.0.0.1:5556"
+        assert "tensors" not in result
         assert result["status"] == p2p_pb2.SOURCE_STATUS_READY
 
     def test_worker_to_json_transfer_engine(self):
@@ -122,12 +117,7 @@ class TestJsonSerialization:
             worker_rank=2,
             metadata_endpoint="host:5557",
             agent_name="agent-2",
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="embed.weight", addr=12345678, size=4096,
-                    device_id=2, dtype="torch.bfloat16",
-                )
-            ],
+            worker_grpc_endpoint="host:5558",
             status=p2p_pb2.SOURCE_STATUS_READY,
             updated_at=9999,
         )
@@ -139,20 +129,81 @@ class TestJsonSerialization:
         assert back.worker_rank == 2
         assert back.metadata_endpoint == "host:5557"
         assert back.agent_name == "agent-2"
-        assert len(back.tensors) == 1
-        assert back.tensors[0].name == "embed.weight"
-        assert back.tensors[0].addr == 12345678
+        assert back.worker_grpc_endpoint == "host:5558"
         assert back.status == p2p_pb2.SOURCE_STATUS_READY
         assert back.updated_at == 9999
 
     def test_json_to_worker_metadata_missing_fields(self):
         """Partial JSON (missing optional fields) still deserializes."""
-        record = {"worker_rank": 0, "tensors": []}
+        record = {"worker_rank": 0}
         result = _json_to_worker_metadata(record)
         assert result.worker_rank == 0
         assert result.metadata_endpoint == ""
         assert result.agent_name == ""
+        assert result.worker_grpc_endpoint == ""
         assert result.status == 0
+
+    def test_json_schema_has_no_tensors(self):
+        """DHT JSON must not contain tensor data (served via WorkerService gRPC)."""
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=0,
+            metadata_endpoint="10.0.0.1:5555",
+            agent_name="agent-0",
+            worker_grpc_endpoint="10.0.0.1:5556",
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        )
+        result = _worker_to_json(worker)
+        assert "tensors" not in result, "tensor manifests must not be in DHT records"
+
+    def test_json_schema_has_worker_grpc_endpoint(self):
+        """DHT JSON must include worker_grpc_endpoint for tensor manifest fetching."""
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=0,
+            metadata_endpoint="10.0.0.1:5555",
+            worker_grpc_endpoint="10.0.0.1:5556",
+        )
+        result = _worker_to_json(worker)
+        assert "worker_grpc_endpoint" in result
+        assert result["worker_grpc_endpoint"] == "10.0.0.1:5556"
+
+    def test_json_record_size_under_dht_limit(self):
+        """DHT records must stay well under the 16KB Kademlia message limit."""
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=0,
+            metadata_endpoint="10.0.0.1:5555",
+            agent_name="mx-auto-worker0-" + "a" * 64,
+            worker_grpc_endpoint="10.0.0.1:5556",
+            transfer_engine_session_id="10.0.0.1:12345",
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            updated_at=1234567890000,
+        )
+        record = _worker_to_json(worker)
+        encoded = json.dumps(record).encode()
+        assert len(encoded) < 1024, (
+            f"DHT worker record is {len(encoded)} bytes, expected <1KB "
+            f"(tensor manifests must not be embedded)"
+        )
+
+    def test_worker_to_json_matches_proto_schema(self):
+        """All WorkerMetadata proto fields (except reserved) appear in JSON."""
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=3,
+            metadata_endpoint="host:5555",
+            agent_name="agent-3",
+            worker_grpc_endpoint="host:5556",
+            transfer_engine_session_id="host:12345",
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            updated_at=42,
+        )
+        result = _worker_to_json(worker)
+        expected_keys = {
+            "worker_rank", "backend_type", "metadata_endpoint",
+            "agent_name", "worker_grpc_endpoint",
+            "transfer_engine_session_id", "status", "updated_at",
+        }
+        assert set(result.keys()) == expected_keys, (
+            f"JSON keys {set(result.keys())} != expected {expected_keys}"
+        )
 
 
 # ---------------------------------------------------------------------------
