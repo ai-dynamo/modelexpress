@@ -122,12 +122,31 @@ class PeerStore:
         info.addr_infos = {addr: AddrInfo(addr) for addr in addrs}
 
     def set_connection(self, peer_id: bytes, conn: Connection) -> None:
-        """Register an active connection for a peer (e.g. from an inbound accept)."""
+        """Register an active connection for a peer (e.g. from an inbound accept).
+
+        Attaches a session-close watcher so the peer is marked unreachable
+        immediately when the remote end closes the connection (GO_AWAY, TCP
+        EOF, transport error), without waiting for a failed dial attempt.
+        """
         info = self._peers.get(peer_id)
         if info is None:
             info = PeerInfo(peer_id)
             self._peers[peer_id] = info
         info.connection = conn
+        conn.set_on_closed(self._on_connection_closed)
+
+    def _on_connection_closed(self, peer_id: bytes) -> None:
+        """Called when a peer's Yamux session ends (remote departure or error).
+
+        Clears the stale connection object and fires on_peer_unreachable so
+        the routing table marks the peer disconnected immediately.
+        """
+        info = self._peers.get(peer_id)
+        if info is not None:
+            info.connection = None
+        log.debug(f"connection to {peer_id.hex()[:16]}... closed by remote")
+        if self.on_peer_unreachable:
+            self.on_peer_unreachable(peer_id)
 
     def get_connection(self, peer_id: bytes) -> Connection | None:
         """Return the active connection for a peer, or None."""

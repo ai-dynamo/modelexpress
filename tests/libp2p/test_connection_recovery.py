@@ -419,3 +419,91 @@ async def test_local_addrs_unroutable():
     assert node.local_addrs() == []
 
     await node.stop()
+
+
+# ---------------------------------------------------------------------------
+# Connection close detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_marks_peer_disconnected():
+    """When a peer shuts down gracefully, the other peer should detect it
+    immediately via the Yamux session close callback, not wait for a failed dial."""
+    node_a = DhtNode(rpc_timeout=5.0, dial_timeout=2.0)
+    node_b = DhtNode(rpc_timeout=5.0, dial_timeout=2.0)
+
+    await node_a.start("127.0.0.1", 0)
+    addr_a = _node_multiaddr(node_a)
+    await node_b.start("127.0.0.1", 0, bootstrap_peers=[addr_a])
+
+    # Verify both peers see each other as connected
+    entry = node_a.routing_table.find(node_b.peer_id)
+    assert entry is not None
+    assert entry.connected
+
+    # Shut down node_b gracefully
+    await node_b.stop()
+
+    # Give the event loop a moment to process the Yamux done callback
+    await asyncio.sleep(0.1)
+
+    # node_a should have detected the closure immediately
+    entry = node_a.routing_table.find(node_b.peer_id)
+    assert entry is not None
+    assert not entry.connected, "peer should be marked disconnected after remote shutdown"
+
+    await node_a.stop()
+
+
+@pytest.mark.asyncio
+async def test_connection_close_clears_peer_store_connection():
+    """When a remote peer's connection closes, the peer store should clear
+    the stale connection object so get_connection returns None."""
+    node_a = DhtNode(rpc_timeout=5.0, dial_timeout=2.0)
+    node_b = DhtNode(rpc_timeout=5.0, dial_timeout=2.0)
+
+    await node_a.start("127.0.0.1", 0)
+    addr_a = _node_multiaddr(node_a)
+    await node_b.start("127.0.0.1", 0, bootstrap_peers=[addr_a])
+
+    # node_a should have a connection to node_b (from inbound accept)
+    conn = node_a.peer_store.get_connection(node_b.peer_id)
+    assert conn is not None
+
+    await node_b.stop()
+    await asyncio.sleep(0.1)
+
+    # The stale connection should be cleared
+    conn = node_a.peer_store.get_connection(node_b.peer_id)
+    assert conn is None, "stale connection should be cleared after remote shutdown"
+
+    await node_a.stop()
+
+
+@pytest.mark.asyncio
+async def test_close_callback_not_fired_on_local_close():
+    """When WE close a connection (not the remote), the on_peer_unreachable
+    callback should NOT fire - we don't want to mark a peer disconnected
+    just because we chose to close our end."""
+    node_a = DhtNode(rpc_timeout=5.0, dial_timeout=2.0)
+    node_b = DhtNode(rpc_timeout=5.0, dial_timeout=2.0)
+
+    await node_a.start("127.0.0.1", 0)
+    addr_a = _node_multiaddr(node_a)
+    await node_b.start("127.0.0.1", 0, bootstrap_peers=[addr_a])
+
+    entry = node_b.routing_table.find(node_a.peer_id)
+    assert entry is not None
+    assert entry.connected
+
+    # node_b stops itself - this is a local close, not a remote event
+    await node_b.stop()
+
+    # node_b's own routing table entry for node_a should still show connected
+    # (the callback is suppressed for local closes)
+    entry = node_b.routing_table.find(node_a.peer_id)
+    assert entry is not None
+    assert entry.connected, "local close should not mark peer as disconnected"
+
+    await node_a.stop()

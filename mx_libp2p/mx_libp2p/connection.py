@@ -16,6 +16,7 @@ For a listener, the same sequence but in the responding role.
 
 import asyncio
 import logging
+from typing import Callable
 
 from .crypto import Ed25519Identity
 from .multistream import negotiate_outbound, negotiate_inbound
@@ -50,6 +51,8 @@ class Connection:
         self.remote_addr = remote_addr
         self._protocol_handlers: dict[str, asyncio.Queue] = {}
         self._inbound_task: asyncio.Task | None = None
+        self._closing = False  # True when we initiate close, to suppress the callback
+        self._on_closed: Callable[[bytes], None] | None = None
 
     def register_protocol(self, protocol_id: str) -> asyncio.Queue:
         """Register a protocol for inbound streams. Returns a queue that will
@@ -101,12 +104,34 @@ class Connection:
         await negotiate_outbound(reader, writer, protocol_id)
         return stream, reader, writer
 
+    def set_on_closed(self, callback: Callable[[bytes], None]) -> None:
+        """Register a callback fired when the remote end closes the connection.
+
+        The callback receives the remote peer ID. It is NOT called when we
+        initiate the close ourselves (via close()), only when the session
+        ends due to remote GO_AWAY, TCP EOF, or transport error.
+        """
+        self._on_closed = callback
+        if self.yamux._run_task is not None:
+            self.yamux._run_task.add_done_callback(self._on_session_done)
+
+    def _on_session_done(self, task: asyncio.Task) -> None:
+        """Done callback on the Yamux read loop task."""
+        if self._closing:
+            return
+        if self._on_closed is not None:
+            try:
+                self._on_closed(self.remote_peer_id)
+            except Exception as e:
+                log.warning(f"on_closed callback error: {e}")
+
     @property
     def is_alive(self) -> bool:
         """Check if the connection is still usable."""
         return self.yamux.is_alive
 
     async def close(self) -> None:
+        self._closing = True
         if self._inbound_task:
             self._inbound_task.cancel()
         # Close the underlying transport first so the yamux read loop unblocks
