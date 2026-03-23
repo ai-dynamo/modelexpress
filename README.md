@@ -149,7 +149,7 @@ register_modelexpress_loaders()
 # vllm serve <model> --load-format mx --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
 ```
 
-First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Persistence (HA)](examples/p2p_transfer_k8s/deploy/persistence/README.md).
+First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Deploy guide](examples/p2p_transfer_k8s/README.md).
 
 ### Docker
 
