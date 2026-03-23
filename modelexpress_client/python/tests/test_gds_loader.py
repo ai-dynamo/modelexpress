@@ -262,8 +262,9 @@ class TestMxModelLoaderGdsIntegration:
             loader._load_as_source(
                 model, model_config,
                 target_device=torch.device("cpu"),
+                global_rank=0,
                 device_id=0,
-                model_name="test-model",
+                identity=MagicMock(),
             )
 
         loader._default_loader.load_weights.assert_called_once_with(model, model_config)

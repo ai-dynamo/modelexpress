@@ -64,6 +64,7 @@ kube = { version = "0.98", features = [
 ], default-features = false }
 k8s-openapi = { version = "0.24", features = ["v1_31"] }
 schemars = "0.8"
+sha2 = "0.10"
 base64 = "0.22"
 
 [workspace.lints.clippy]

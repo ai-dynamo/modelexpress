@@ -6,17 +6,77 @@ syntax = "proto3";
 package model_express.p2p;
 
 // P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
-// The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
+// The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
 // Clients query for existing sources and publish their own metadata.
 service P2pService {
   // Publish model metadata - called by client after loading model weights
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
 
-  // Query for existing source with the same model - called at client startup
+  // List available source workers - lightweight, no tensor metadata.
+  // Returns one SourceInstanceRef per worker; clients filter by worker_rank
+  // to find matching peers and then call GetMetadata for the chosen one.
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+
+  // Fetch full tensor metadata for one specific worker (MB-scale).
+  // Call this after filtering ListSources results by worker_rank.
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
 
   // Update source status - called by source after NIXL registration and warmup
   rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
+}
+
+// ============================================================================
+// Source Identity
+// ============================================================================
+
+// Inference backend framework
+enum BackendFramework {
+  BACKEND_FRAMEWORK_UNKNOWN = 0;
+  BACKEND_FRAMEWORK_VLLM = 1;
+  BACKEND_FRAMEWORK_SGLANG = 2;
+  BACKEND_FRAMEWORK_TRT_LLM = 3;
+}
+
+// Type of tensors the source is serving
+enum MxSourceType {
+  MX_SOURCE_TYPE_WEIGHTS = 0;    // Base model weights (default)
+  MX_SOURCE_TYPE_LORA = 1;       // LoRA adapter weights
+  MX_SOURCE_TYPE_CUDA_GRAPH = 2; // CUDA graph artifacts
+}
+
+// All fields that affect weight tensor layout and transfer compatibility.
+// The server computes SHA256(canonical_json(identity)) and takes the first
+// 16 hex chars as the mx_source_id used to key metadata storage.
+message SourceIdentity {
+  // ModelExpress version (e.g., "0.3.0"). Ensures format compatibility across upgrades.
+  string mx_version = 1;
+
+  // Type of tensors being served
+  MxSourceType mx_source_type = 2;
+
+  // Model name (e.g., "deepseek-ai/DeepSeek-V3")
+  string model_name = 3;
+
+  // Inference framework
+  BackendFramework backend_framework = 4;
+
+  // Tensor parallel degree
+  uint32 tensor_parallel_size = 5;
+
+  // Pipeline parallel degree
+  uint32 pipeline_parallel_size = 6;
+
+  // Expert parallel degree (MoE models)
+  uint32 expert_parallel_size = 7;
+
+  // Weight dtype (e.g., "bfloat16", "float8_e4m3fn")
+  string dtype = 8;
+
+  // Quantization method (e.g., "fp8", "awq", "gptq", or empty)
+  string quantization = 9;
+
+  // Escape hatch for framework-specific config
+  map<string, string> extra_parameters = 10;
 }
 
 // ============================================================================
@@ -46,8 +106,8 @@ message TensorDescriptor {
 
 // Source lifecycle status
 enum SourceStatus {
-  SOURCE_STATUS_UNKNOWN = 0;
-  SOURCE_STATUS_INITIALIZING = 1;  // publishing metadata, not yet ready
+  SOURCE_STATUS_UNKNOWN = 0;        // uninitialized (proto3 zero default)
+  SOURCE_STATUS_INITIALIZING = 1;  // publishing metadata
   SOURCE_STATUS_READY = 2;         // ready for transfers
   SOURCE_STATUS_STALE = 3;         // source gone, metadata may be stale
 }
@@ -79,17 +139,59 @@ message WorkerMetadata {
 // ============================================================================
 
 message PublishMetadataRequest {
-  // Model identifier (e.g., "meta-llama/Llama-3.1-70B")
-  // This is the key used to look up existing sources
-  string model_name = 1;
+  // Source identity — the server computes mx_source_id from this
+  SourceIdentity identity = 1;
 
-  // Metadata for each GPU worker in this instance
-  repeated WorkerMetadata workers = 2;
+  // Metadata for this worker (one call per worker)
+  WorkerMetadata worker = 2;
+
+  // Unique identifier for this running instance (UUID).
+  // Differentiates multiple replicas with identical SourceIdentity.
+  // If empty, the server rejects the request.
+  string worker_id = 3;
 }
 
 message PublishMetadataResponse {
   bool success = 1;
   string message = 2;
+  // Computed 16-char hex key returned to client for use in subsequent calls
+  string mx_source_id = 3;
+  // Echoed worker_id for confirmation
+  string worker_id = 4;
+}
+
+// ============================================================================
+// List Sources
+// ============================================================================
+
+// Reference to one worker in one available source instance (lightweight — no tensor metadata).
+// One entry is emitted per worker, so clients can match on worker_rank without calling GetMetadata.
+message SourceInstanceRef {
+  // Computed 16-char hex source ID
+  string mx_source_id = 1;
+
+  // Unique identifier for this running instance
+  string worker_id = 2;
+
+  // Human-readable model name
+  string model_name = 3;
+
+  // Global rank of this worker within the instance.
+  // Clients filter on this field to find a peer with a matching rank.
+  uint32 worker_rank = 4;
+}
+
+message ListSourcesRequest {
+  // Filter by source identity — server computes mx_source_id.
+  // If not set, instances across all sources are returned.
+  SourceIdentity identity = 1;
+
+  // Filter by worker status. Not set = return workers in all statuses.
+  optional SourceStatus status_filter = 2;
+}
+
+message ListSourcesResponse {
+  repeated SourceInstanceRef instances = 1;
 }
 
 // ============================================================================
@@ -97,16 +199,25 @@ message PublishMetadataResponse {
 // ============================================================================
 
 message GetMetadataRequest {
-  // Model name to look up
-  string model_name = 1;
+  // mx_source_id from a ListSourcesResponse or PublishMetadataResponse
+  string mx_source_id = 1;
+
+  // worker_id from a ListSourcesResponse or PublishMetadataResponse
+  string worker_id = 2;
 }
 
 message GetMetadataResponse {
-  // Whether a source was found for this model
+  // Whether the requested worker was found
   bool found = 1;
 
-  // Worker metadata from the source (if found)
-  repeated WorkerMetadata workers = 2;
+  // Metadata for the requested worker (MB-scale; only fetched on demand)
+  WorkerMetadata worker = 2;
+
+  // Echoed mx_source_id
+  string mx_source_id = 3;
+
+  // Echoed worker_id
+  string worker_id = 4;
 }
 
 // ============================================================================
@@ -114,14 +225,17 @@ message GetMetadataResponse {
 // ============================================================================
 
 message UpdateStatusRequest {
-  // Model name
-  string model_name = 1;
+  // mx_source_id returned from PublishMetadata
+  string mx_source_id = 1;
 
   // Worker rank (GPU index)
-  uint32 worker_id = 2;
+  uint32 worker_rank = 2;
 
   // New status
   SourceStatus status = 3;
+
+  // worker_id returned from PublishMetadata
+  string worker_id = 4;
 }
 
 message UpdateStatusResponse {
