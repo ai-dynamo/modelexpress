@@ -56,7 +56,7 @@ service P2pService {
 
 Called once per GPU worker after loading weights and registering with the transfer backend. The server computes `mx_source_id` from `identity` and returns it to the client.
 
-```
+```protobuf
 PublishMetadataRequest {
   identity: SourceIdentity    // Server computes mx_source_id from this
   worker: WorkerMetadata       // One worker per call (rank, backend metadata, tensors)
@@ -68,7 +68,7 @@ PublishMetadataRequest {
 
 Lightweight listing -- returns `SourceInstanceRef` entries (no tensor data). Clients filter by `worker_rank` to find matching peers, then call `GetMetadata` for the chosen one.
 
-```
+```protobuf
 ListSourcesRequest {
   identity: SourceIdentity         // Optional: filter by source identity
   status_filter: SourceStatus      // Optional: e.g., SOURCE_STATUS_READY
@@ -90,7 +90,7 @@ SourceInstanceRef {
 
 Fetches full tensor metadata (MB-scale) for one specific worker. Called on demand after filtering `ListSources` results.
 
-```
+```protobuf
 GetMetadataRequest {
   mx_source_id: string   // From ListSources or PublishMetadata response
   worker_id: string      // From ListSources or PublishMetadata response
@@ -101,7 +101,7 @@ GetMetadataRequest {
 
 Transitions a worker's lifecycle status. Called after publishing metadata to mark the worker as `READY`.
 
-```
+```protobuf
 UpdateStatusRequest {
   mx_source_id: string
   worker_id: string
@@ -112,7 +112,7 @@ UpdateStatusRequest {
 
 ## Source Lifecycle
 
-```
+```text
 INITIALIZING ──> READY ──> STALE
    (publish)    (update)   (TTL expiry or explicit)
 ```
