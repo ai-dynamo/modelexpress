@@ -433,6 +433,7 @@ mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, acquire_env_mutex};
     use serde_json::json;
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
     use tokio::time::Duration;
     use wiremock::matchers::{method, path_regex};
@@ -447,16 +448,16 @@ mod tests {
     /// The hf_hub client writes files into `cache_path` when the resolve endpoints return
     /// successful responses with the headers it expects (ETag, commit, range). This allows
     /// us to simulate a real model download without external network access.
-    struct MockHFServer {
+    struct MockHFServer<'a> {
         /// WireMock instance; keeps the server alive for the lifetime of the test
         _server: MockServer,
         /// Temporary HF cache root that tests pass to `ApiBuilder::with_cache_dir`
         pub cache_path: PathBuf,
         /// Restores HF_ENDPOINT when the mock server is dropped.
-        _hf_endpoint_guard: EnvVarGuard,
+        _hf_endpoint_guard: EnvVarGuard<'a>,
     }
 
-    impl MockHFServer {
+    impl<'a> MockHFServer<'a> {
         /// Start a WireMock server and configure stubs compatible with hf_hub's download flow.
         ///
         /// Notes on headers and status codes expected by hf_hub:
@@ -464,7 +465,7 @@ mod tests {
         /// - `x-repo-commit`: identifies the snapshot commit (must match `info.sha`)
         /// - Range download: GETs may be partial; we return 206 with `accept-ranges`,
         ///   `content-length` and `content-range` to keep the client happy across versions.
-        async fn new() -> Self {
+        async fn new(env_lock: &'a MutexGuard<'static, ()>) -> Self {
             let temp_dir = TempDir::new().expect("Failed to create temporary directory");
             let server = MockServer::start().await;
 
@@ -502,7 +503,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let hf_endpoint_guard = EnvVarGuard::set("HF_ENDPOINT", &server.uri());
+            let hf_endpoint_guard = EnvVarGuard::set(env_lock, "HF_ENDPOINT", &server.uri());
 
             Self {
                 _server: server,
@@ -512,7 +513,7 @@ mod tests {
         }
     }
 
-    impl Drop for MockHFServer {
+    impl Drop for MockHFServer<'_> {
         /// Ensure the temporary cache path is removed even if a test fails.
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.cache_path).unwrap_or_else(|e| {
@@ -550,8 +551,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_delete_model_prefers_explicit_cache_dir_over_env() {
-        let _guard = acquire_env_mutex();
-        let mock_server = MockHFServer::new().await;
+        let env_lock = acquire_env_mutex();
+        let mock_server = MockHFServer::new(&env_lock).await;
         let provider = HuggingFaceProvider;
 
         let explicit_cache = TempDir::new().expect("Failed to create explicit cache directory");
@@ -584,8 +585,8 @@ mod tests {
 
         let env_cache_path = env_cache.path().to_str().expect("Expected env cache path");
         let _model_express_cache_guard =
-            EnvVarGuard::set(MODEL_EXPRESS_CACHE_ENV_VAR, env_cache_path);
-        let _hf_hub_cache_guard = EnvVarGuard::set(HF_HUB_CACHE_ENV_VAR, env_cache_path);
+            EnvVarGuard::set(&env_lock, MODEL_EXPRESS_CACHE_ENV_VAR, env_cache_path);
+        let _hf_hub_cache_guard = EnvVarGuard::set(&env_lock, HF_HUB_CACHE_ENV_VAR, env_cache_path);
 
         let delete_result = provider
             .delete_model("test/model", explicit_cache.path().to_path_buf())
@@ -610,7 +611,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_delete_model_does_not_download_uncached_files() {
-        let _guard = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         let temp_cache = TempDir::new().expect("Failed to create temporary cache directory");
         let server = MockServer::start().await;
         let provider = HuggingFaceProvider;
@@ -653,8 +654,8 @@ mod tests {
 
         let temp_cache_path = temp_cache.path().to_str().expect("Expected cache path");
         let _model_express_cache_guard =
-            EnvVarGuard::set(MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache_path);
-        let _hf_endpoint_guard = EnvVarGuard::set("HF_ENDPOINT", &server.uri());
+            EnvVarGuard::set(&env_lock, MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache_path);
+        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
 
         let result = provider
             .delete_model(model_name, temp_cache.path().to_path_buf())
@@ -666,8 +667,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_get_model_path_trait() {
-        let _guard = acquire_env_mutex();
-        let mock_server = MockHFServer::new().await;
+        let env_lock = acquire_env_mutex();
+        let mock_server = MockHFServer::new(&env_lock).await;
 
         // Construct a temporary cache dir with a model snapshots
         let path = mock_server
@@ -694,8 +695,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_ignore_weights() {
-        let _guard = acquire_env_mutex();
-        let mock_server = MockHFServer::new().await;
+        let env_lock = acquire_env_mutex();
+        let mock_server = MockHFServer::new(&env_lock).await;
         let provider = HuggingFaceProvider;
         let result = provider
             .download_model("test/model", Some(mock_server.cache_path.clone()), false)
@@ -715,8 +716,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_ignores_subdirectories() {
-        let _guard = acquire_env_mutex();
-        let mock_server = MockHFServer::new().await;
+        let env_lock = acquire_env_mutex();
+        let mock_server = MockHFServer::new(&env_lock).await;
         let provider = HuggingFaceProvider;
 
         let result = provider
@@ -733,7 +734,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_ignores_dotfiles() {
-        let _guard = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         // Create a mock server with dotfiles in siblings list but NO endpoint for them.
         // If the code tries to download a dotfile, it will fail since there's no mock.
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
@@ -771,7 +772,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _hf_endpoint_guard = EnvVarGuard::set("HF_ENDPOINT", &server.uri());
+        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
 
         let provider = HuggingFaceProvider;
         let result = provider
@@ -786,19 +787,19 @@ mod tests {
 
     #[test]
     fn test_is_offline_mode() {
-        let _guard = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         {
-            let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "1");
+            let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
             assert!(is_offline_mode());
         }
 
         {
-            let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "0");
+            let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "0");
             assert!(!is_offline_mode());
         }
 
         {
-            let _offline_guard = EnvVarGuard::remove(HF_HUB_OFFLINE_ENV_VAR);
+            let _offline_guard = EnvVarGuard::remove(&env_lock, HF_HUB_OFFLINE_ENV_VAR);
             assert!(!is_offline_mode());
         }
     }
@@ -806,7 +807,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_model_offline_mode_with_cache() {
-        let _guard = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
         let snapshots_path = temp_dir
             .path()
@@ -815,7 +816,7 @@ mod tests {
             .join("abc1234");
         std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
 
-        let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
 
         let result = HuggingFaceProvider
             .download_model("test/model", Some(temp_dir.path().into()), false)
@@ -828,10 +829,10 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_download_model_offline_mode_without_cache() {
-        let _guard = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
 
-        let _offline_guard = EnvVarGuard::set(HF_HUB_OFFLINE_ENV_VAR, "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
 
         let result = HuggingFaceProvider
             .download_model("nonexistent/model", Some(temp_dir.path().into()), false)

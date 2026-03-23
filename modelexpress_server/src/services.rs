@@ -1148,13 +1148,14 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_stream_model_files_hf_first_chunk_includes_commit_hash() {
-        let _env_lock = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
             "MODEL_EXPRESS_CACHE_DIRECTORY",
             temp_dir.path().to_str().expect("Expected temp dir path"),
         );
-        let _offline_guard = EnvVarGuard::set("HF_HUB_OFFLINE", "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
 
         let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");

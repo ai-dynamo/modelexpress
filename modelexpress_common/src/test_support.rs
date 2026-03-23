@@ -20,13 +20,15 @@ pub fn acquire_env_mutex() -> MutexGuard<'static, ()> {
 
 /// Restore a process environment variable to its previous value when dropped.
 #[must_use]
-pub struct EnvVarGuard {
+pub struct EnvVarGuard<'a> {
     key: String,
     previous: Option<String>,
+    _env_lock: &'a MutexGuard<'static, ()>,
 }
 
-impl EnvVarGuard {
-    pub fn set(key: &str, value: &str) -> Self {
+impl<'a> EnvVarGuard<'a> {
+    /// Set an environment variable while holding `env_lock` and restore it on drop.
+    pub fn set(env_lock: &'a MutexGuard<'static, ()>, key: &str, value: &str) -> Self {
         let previous = env::var(key).ok();
         unsafe {
             env::set_var(key, value);
@@ -34,10 +36,12 @@ impl EnvVarGuard {
         Self {
             key: key.to_string(),
             previous,
+            _env_lock: env_lock,
         }
     }
 
-    pub fn remove(key: &str) -> Self {
+    /// Remove an environment variable while holding `env_lock` and restore it on drop.
+    pub fn remove(env_lock: &'a MutexGuard<'static, ()>, key: &str) -> Self {
         let previous = env::var(key).ok();
         unsafe {
             env::remove_var(key);
@@ -45,11 +49,12 @@ impl EnvVarGuard {
         Self {
             key: key.to_string(),
             previous,
+            _env_lock: env_lock,
         }
     }
 }
 
-impl Drop for EnvVarGuard {
+impl Drop for EnvVarGuard<'_> {
     fn drop(&mut self) {
         unsafe {
             match &self.previous {

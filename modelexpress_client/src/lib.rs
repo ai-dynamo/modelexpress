@@ -911,10 +911,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_cache_dir_for_hf_prefers_hf_hub_cache() {
-        let _env_lock = acquire_env_mutex();
+        let env_lock = acquire_env_mutex();
         let hf_cache_dir = TempDir::new().expect("Failed to create HF cache dir");
         let configured_cache_dir = TempDir::new().expect("Failed to create configured cache dir");
         let _hf_cache_guard = EnvVarGuard::set(
+            &env_lock,
             "HF_HUB_CACHE",
             hf_cache_dir
                 .path()
