@@ -15,6 +15,7 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: ["--allow-multiple-documents"]
+        exclude: '^helm/templates/'
       - id: check-toml
       - id: check-json
         exclude: .devcontainer
