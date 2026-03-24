@@ -247,19 +247,31 @@ impl CacheConfig {
         }
 
         for entry in fs::read_dir(&self.local_path)? {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Failed to read cache directory entry: {}", e);
+                    continue;
+                }
+            };
             let path = entry.path();
 
             if path.is_dir() {
-                let size = Self::get_directory_size(&path)?;
                 let folder_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
                 info!("Folder name: {}", folder_name);
-                // Convert folder name back to human-readable model ID
                 let model_name = Self::folder_name_to_model_id(&folder_name);
+
+                let (size, accessible) = match Self::get_directory_size(&path) {
+                    Ok(size) => (size, true),
+                    Err(e) => {
+                        warn!("Model '{}' is inaccessible: {}", model_name, e);
+                        (0, false)
+                    }
+                };
 
                 stats.total_models = stats.total_models.saturating_add(1);
                 stats.total_size = stats.total_size.saturating_add(size);
@@ -267,6 +279,7 @@ impl CacheConfig {
                     name: model_name,
                     size,
                     path: path.to_path_buf(),
+                    accessible,
                 });
             }
         }
@@ -347,6 +360,7 @@ pub struct ModelInfo {
     pub name: String,
     pub size: u64,
     pub path: PathBuf,
+    pub accessible: bool,
 }
 
 impl CacheStats {
@@ -434,11 +448,13 @@ mod tests {
                     name: "model1".to_string(),
                     size: 1024 * 1024 * 2, // 2 MB
                     path: PathBuf::from("/test/model1"),
+                    accessible: true,
                 },
                 ModelInfo {
                     name: "model2".to_string(),
                     size: 1024 * 1024 * 3, // 3 MB
                     path: PathBuf::from("/test/model2"),
+                    accessible: true,
                 },
             ],
         };

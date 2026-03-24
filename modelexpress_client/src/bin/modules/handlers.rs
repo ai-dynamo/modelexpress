@@ -323,15 +323,15 @@ async fn list_models(
 
             println!("Models:");
             for model in &stats.models {
-                if detailed {
-                    println!(
-                        "  {} ({}) - {:?}",
-                        model.name,
-                        stats.format_model_size(model),
-                        model.path
-                    );
+                let size_str = if model.accessible {
+                    stats.format_model_size(model)
                 } else {
-                    println!("  {} ({})", model.name, stats.format_model_size(model));
+                    "inaccessible".red().to_string()
+                };
+                if detailed {
+                    println!("  {} ({}) - {:?}", model.name, size_str, model.path);
+                } else {
+                    println!("  {} ({})", model.name, size_str);
                 }
             }
         }
@@ -340,20 +340,16 @@ async fn list_models(
                 .models
                 .iter()
                 .map(|model| {
+                    let mut obj = serde_json::json!({
+                        "name": model.name,
+                        "size": model.size,
+                        "formatted_size": stats.format_model_size(model),
+                        "accessible": model.accessible
+                    });
                     if detailed {
-                        serde_json::json!({
-                            "name": model.name,
-                            "size": model.size,
-                            "formatted_size": stats.format_model_size(model),
-                            "path": model.path
-                        })
-                    } else {
-                        serde_json::json!({
-                            "name": model.name,
-                            "size": model.size,
-                            "formatted_size": stats.format_model_size(model)
-                        })
+                        obj["path"] = serde_json::json!(model.path);
                     }
+                    obj
                 })
                 .collect();
 
@@ -535,7 +531,12 @@ async fn validate_models(
                 println!("Found {} models in storage", stats.total_models);
 
                 for model in &stats.models {
-                    println!("  {} ({})", model.name, stats.format_model_size(model));
+                    let size_str = if model.accessible {
+                        stats.format_model_size(model)
+                    } else {
+                        "inaccessible".red().to_string()
+                    };
+                    println!("  {} ({})", model.name, size_str);
                 }
             }
             _ => {
@@ -545,7 +546,8 @@ async fn validate_models(
                         serde_json::json!({
                             "name": model.name,
                             "size": model.size,
-                            "formatted_size": stats.format_model_size(model)
+                            "formatted_size": stats.format_model_size(model),
+                            "accessible": model.accessible
                         })
                     }).collect::<Vec<_>>()
                 });
@@ -575,12 +577,16 @@ async fn show_model_stats(
             if detailed && !stats.models.is_empty() {
                 println!("Detailed Statistics:");
                 for model in &stats.models {
-                    println!(
-                        "  {}: {} bytes ({})",
-                        model.name,
-                        model.size,
-                        stats.format_model_size(model)
-                    );
+                    if model.accessible {
+                        println!(
+                            "  {}: {} bytes ({})",
+                            model.name,
+                            model.size,
+                            stats.format_model_size(model)
+                        );
+                    } else {
+                        println!("  {}: {}", model.name, "inaccessible".red());
+                    }
                 }
             }
         }
@@ -594,7 +600,8 @@ async fn show_model_stats(
                             serde_json::json!({
                                 "name": model.name,
                                 "size": model.size,
-                                "formatted_size": stats.format_model_size(model)
+                                "formatted_size": stats.format_model_size(model),
+                                "accessible": model.accessible
                             })
                         })
                         .collect::<Vec<_>>(),
