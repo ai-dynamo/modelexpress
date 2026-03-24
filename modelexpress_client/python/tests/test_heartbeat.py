@@ -78,11 +78,6 @@ class TestHeartbeatSendsReady:
         time.sleep(2.5)
         heartbeat.stop()
 
-        ready_calls = [
-            c for c in mx_client.update_status.call_args_list
-            if c.kwargs.get("status", c[1].get("status") if len(c) > 1 else None) == 2
-            or (c[1] if c[1] else {}).get("status") == 2
-        ]
         # At 1s interval, 2.5s sleep should give at least 2 READY calls
         ready_calls = [
             c for c in mx_client.update_status.call_args_list

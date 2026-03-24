@@ -102,7 +102,11 @@ class HeartbeatThread:
             logger.info(f"[Worker {self._worker_rank}] Marked STALE on shutdown")
             self._started = False
         except Exception:
-            pass
+            logger.debug(
+                f"[Worker {self._worker_rank}] Failed to mark STALE on shutdown",
+                exc_info=True,
+            )
+            self._started = False
 
     def _update_status(self, status: int) -> None:
         """Send UpdateStatus RPC."""

@@ -463,12 +463,9 @@ impl MetadataBackend for RedisBackend {
                 }
 
                 let (status, updated_at) = fields
-                    .values()
-                    .find_map(|v| {
-                        serde_json::from_str::<WorkerRecordJson>(v)
-                            .ok()
-                            .map(|j| (j.status, j.updated_at))
-                    })
+                    .get(&worker_rank.to_string())
+                    .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
+                    .map(|j| (j.status, j.updated_at))
                     .unwrap_or((0, 0));
 
                 result.push(super::SourceInstanceInfo {
@@ -517,21 +514,10 @@ impl MetadataBackend for RedisBackend {
         pipe.hdel(&source_key, worker_id);
         pipe.exec_async(&mut conn).await?;
 
-        // Clean up source index if no workers remain (only __attributes__ left)
-        let remaining: usize = conn.hlen(&source_key).await?;
-        if remaining <= 1 {
-            conn.del::<_, ()>(&source_key).await?;
-            info!(
-                "Removed last worker '{}' and source index for source_id={}",
-                worker_id, source_id
-            );
-        } else {
-            info!(
-                "Removed worker '{}' from source_id={}",
-                worker_id, source_id
-            );
-        }
-
+        info!(
+            "Removed worker '{}' from source_id={}",
+            worker_id, source_id
+        );
         Ok(())
     }
 
