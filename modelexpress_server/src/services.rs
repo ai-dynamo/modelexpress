@@ -348,10 +348,7 @@ impl ModelService for ModelServiceImpl {
 
                     let is_last_chunk = offset.saturating_add(bytes_read as u64) >= *total_size;
 
-                    let first_chunk = is_first_chunk;
-                    if first_chunk {
-                        is_first_chunk = false;
-                    }
+                    let first_chunk = std::mem::replace(&mut is_first_chunk, false);
 
                     let chunk = FileChunk {
                         relative_path: relative_path.to_string_lossy().to_string(),
