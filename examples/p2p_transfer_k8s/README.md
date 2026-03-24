@@ -40,9 +40,17 @@ graph TD
 kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<your-token>
 ```
 
-### 2. Choose a Persistence Backend and Deploy
+### 2. Choose a Metadata Backend and Deploy the Server
 
-See [`deploy/persistence/`](deploy/persistence/) for backend-specific manifests (Redis or Kubernetes CRD).
+See [`server/`](server/) for backend-specific server manifests:
+- **Redis**: [`server/redis_backend/`](server/redis_backend/)
+- **Kubernetes CRD**: [`server/kubernetes_backend/`](server/kubernetes_backend/)
+
+### 3. Deploy vLLM Clients
+
+See [`client/vllm/`](client/vllm/) for vLLM deployment manifests:
+- **Single-node** (TP only): [`client/vllm/vllm-single-node.yaml`](client/vllm/vllm-single-node.yaml)
+- **Multi-node** (TP + PP): [`client/vllm/vllm-multi-node.yaml`](client/vllm/vllm-multi-node.yaml)
 
 The `mx` loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from disk and becomes a source for future nodes.
 

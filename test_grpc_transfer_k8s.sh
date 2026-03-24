@@ -163,7 +163,7 @@ deploy_server() {
     kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
     log_info "Installing ModelMetadata CRD..."
-    kubectl apply -f ./examples/p2p_transfer_k8s/deploy/persistence/crd-modelmetadata.yaml
+    kubectl apply -f ./examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
 
     log_info "Deploying ModelExpress server with local storage (no PVC)..."
     helm upgrade --install "$RELEASE_NAME" ./helm \

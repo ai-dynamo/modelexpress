@@ -1,0 +1,258 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-node vLLM deployment with ModelExpress P2P weight transfer.
+#
+# Deploys Kimi-K2.5 across 2 nodes (16 GPUs total):
+#   - tensor-parallel-size=8 (within each node)
+#   - pipeline-parallel-size=2 (across nodes)
+#   - expert-parallel enabled
+#
+# Uses Ray for multi-node orchestration:
+#   - Head node runs vLLM API server with Ray executor
+#   - Worker node joins the Ray cluster
+#
+# Each GPU worker publishes its metadata independently using its global rank
+# (0-15). Targets discover sources via ListSources and fetch metadata on demand.
+#
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - PVC "model-cache-block" with model weights (or enough space for HF download)
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#
+# Usage:
+#   kubectl apply -f vllm-multi-node.yaml -n <namespace>
+
+# Service for the ray head node
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm-head
+  labels:
+    app: mx-vllm-multinode
+    role: head
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+    - port: 6379
+      targetPort: 6379
+      name: ray-head
+  selector:
+    app: mx-vllm-multinode
+    role: head
+---
+# Ray head node: runs the vLLM API server and PP rank 0 workers
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-head
+  labels:
+    app: mx-vllm-multinode
+    role: head
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-vllm-multinode
+      role: head
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-multinode
+        role: head
+    spec:
+      serviceAccountName: modelexpress
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          # IPC_LOCK required for RDMA memory pinning (NIXL/UCX GPUDirect)
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 6379
+              name: ray-head
+          env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MODEL_NAME
+              value: "moonshotai/Kimi-K2.5"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              ray start --head --port=6379 --num-gpus=8
+              until ray status --address=127.0.0.1:6379 >/dev/null 2>&1; do sleep 1; done
+              RAY_ADDRESS=127.0.0.1:6379 python3 -m vllm.entrypoints.openai.api_server \
+                --model $MODEL_NAME \
+                --load-format mx \
+                --tensor-parallel-size 8 \
+                --pipeline-parallel-size 2 \
+                --enable-expert-parallel \
+                --trust-remote-code \
+                --distributed-executor-backend ray
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache-block
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache-block
+          persistentVolumeClaim:
+            claimName: model-cache-block
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+---
+# Ray worker node: PP rank 1, joins the head's Ray cluster
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-worker
+  labels:
+    app: mx-vllm-multinode
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-vllm-multinode
+      role: worker
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-multinode
+        role: worker
+    spec:
+      serviceAccountName: modelexpress
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          # IPC_LOCK required for RDMA memory pinning (NIXL/UCX GPUDirect)
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: RAY_ADDRESS
+              value: "mx-vllm-head:6379"
+          command: ["ray"]
+          args:
+            - "start"
+            - "--block"
+            - "--address=$(RAY_ADDRESS)"
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache-block
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache-block
+          persistentVolumeClaim:
+            claimName: model-cache-block
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

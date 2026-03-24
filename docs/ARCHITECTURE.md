@@ -81,9 +81,15 @@ ModelExpress/
 │       ├── config.rs                   # ServerConfig, layered loading, validation
 │       ├── database.rs                 # SQLite ModelDatabase, atomic claim
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
-│       ├── state.rs                    # P2pStateManager, Redis + Lua scripts
+│       ├── state.rs                    # P2pStateManager wrapper
 │       ├── services.rs                 # Health, API, Model gRPC services
-│       ├── p2p_service.rs              # P2P gRPC service (publish/get metadata + ready)
+│       ├── p2p_service.rs              # P2P gRPC service implementation
+│       ├── source_identity.rs          # SHA256-based mx_source_id computation
+│       ├── k8s_types.rs               # Kubernetes CRD type definitions
+│       ├── metadata_backend.rs         # MetadataBackend trait + types
+│       ├── metadata_backend/
+│       │   ├── redis.rs               # Redis backend implementation
+│       │   └── kubernetes.rs          # Kubernetes CRD backend implementation
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -108,7 +114,9 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
-│       ├── vllm_loader.py              # MxModelLoader
+│       ├── gds_transfer.py             # GPUDirect Storage transfer support
+│       ├── gds_loader.py               # GDS model loader
+│       ├── vllm_loader.py              # MxModelLoader (auto-detect: RDMA/GDS/disk)
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
@@ -157,10 +165,15 @@ ModelExpress/
 ├── examples/
 │   ├── p2p_transfer_k8s/               # GPU-to-GPU weight transfer example
 │   │   ├── README.md
-│   │   ├── Dockerfile.client           # vLLM + ModelExpress integration
-│   │   ├── vllm.yaml
-│   │   ├── modelexpress-server.yaml    # gRPC server + Redis sidecar
-│   │   └── model-download.yaml
+│   │   ├── Dockerfile.client           # vLLM + ModelExpress client image
+│   │   ├── model-download.yaml         # Model weights download job
+│   │   ├── server/
+│   │   │   ├── kubernetes_backend/     # CRD-based metadata (crd, rbac, server)
+│   │   │   └── redis_backend/          # Redis-based metadata (redis, server)
+│   │   └── client/
+│   │       └── vllm/
+│   │           ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
+│   │           └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
 │   └── aggregated_k8s/                 # Dynamo integration example
 │       ├── README.md
 │       └── agg.yaml
@@ -168,7 +181,8 @@ ModelExpress/
 ├── docs/
 │   ├── ARCHITECTURE.md                 # Architecture reference
 │   ├── CLI.md                          # CLI tool documentation
-│   └── DEPLOYMENT.md                   # Deployment and configuration guide
+│   ├── DEPLOYMENT.md                   # Deployment and configuration guide
+│   └── metadata.md                     # Metadata storage and coordination protocol
 │
 ├── .devcontainer/
 │   ├── devcontainer.json               # VSCode config: rust-analyzer, port 8001
@@ -230,11 +244,14 @@ Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Do
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
-| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes NIXL metadata + tensors |
-| `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Target queries for source metadata |
-| `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Source updates per-worker status (Initializing/Ready/Stale) |
+| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes worker metadata (identity + tensors + backend metadata) |
+| `ListSources` | `ListSourcesRequest` | `ListSourcesResponse` | Lightweight listing of available source workers (no tensor data) |
+| `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Fetch full tensor metadata for one specific worker (MB-scale, on demand) |
+| `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Update per-worker lifecycle status (Initializing/Ready/Stale) |
 
-Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `WorkerMetadata` (rank, nixl_metadata bytes, tensors).
+Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility), `WorkerMetadata` (rank, oneof backend_metadata, tensors, status), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing).
+
+See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
 ## Rust Server
 
@@ -245,7 +262,7 @@ Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `Wor
 3. Initialize structured logging (tracing-subscriber)
 4. Create SQLite database (`ModelDatabase`)
 5. Optionally start `CacheEvictionService` background task
-6. Connect to Redis for P2P state (non-fatal if unavailable)
+6. Connect to metadata backend (Redis or Kubernetes CRD) for P2P state
 7. Register 4 gRPC services with tonic (max message size: 100MB)
 8. Listen on configured address (default `0.0.0.0:8001`)
 9. Graceful shutdown on CTRL+C
@@ -302,17 +319,16 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 2. Count-based: if total > `max_models`, evict oldest excess
 3. Only DOWNLOADED models are eligible for eviction
 
-### P2pStateManager (Redis)
+### P2P Metadata Backends
 
-Redis key patterns:
+The server supports two metadata backends, selected via `MX_METADATA_BACKEND`:
 
-| Pattern | Purpose | TTL |
-|---------|---------|-----|
-| `mx:model:{model_name}` | `ModelMetadataRecord` (JSON) | None |
-| `mx:models` | Set of all registered model names | None |
-| `mx:nixl_ready:{model}:worker:{id}` | `ReadyRecord` | 2 hours |
+- **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). TTL-based expiry.
+- **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection.
 
-The `publish_metadata` operation uses an atomic Lua script to merge workers by rank, preventing lost updates when multiple GPU workers publish concurrently in TP=8 setups. Large u64 values (GPU addresses) are serialized as strings to avoid Lua/cjson precision loss.
+Each worker publishes independently (no Lua merge scripts needed). The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))`. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
+
+See [`metadata.md`](metadata.md) for the full storage layout and schemas.
 
 ### ModelDownloadTracker
 
@@ -405,9 +421,11 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | Module | Purpose |
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
-| `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `GetMetadata`, and `UpdateStatus` RPCs |
+| `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
-| `vllm_loader.py` | `MxModelLoader` - custom vLLM model loader |
+| `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
+| `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
+| `vllm_loader.py` | `MxModelLoader` - auto-detecting model loader (RDMA -> GDS -> disk) |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
@@ -418,9 +436,10 @@ gRPC client wrapping the P2P service stubs:
 
 | Method | Purpose |
 |--------|---------|
-| `publish_metadata(model_name, workers)` | Publish NIXL metadata for GPU workers |
-| `get_metadata(model_name)` | Query source metadata; target polls this until all workers reach `Ready` status |
-| `update_status(model_name, worker_id, status)` | Update a worker's `SourceStatus` (e.g., `Ready`); source calls this after health check and test inference |
+| `publish_metadata(identity, worker, worker_id)` | Publish worker metadata; returns `mx_source_id` |
+| `list_sources(identity, status_filter)` | List available source workers (lightweight, no tensor data) |
+| `get_metadata(mx_source_id, worker_id)` | Fetch full tensor metadata for one worker (on demand) |
+| `update_status(mx_source_id, worker_id, worker_rank, status)` | Update worker lifecycle status (e.g., `READY`) |
 | `close()` | Close the underlying gRPC channel |
 
 ### NixlTransferManager
@@ -437,15 +456,19 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 ### vLLM Loader
 
-**MxModelLoader** (extends `BaseModelLoader`):
-1. Query MX server to detect whether a ready source exists for this model/rank
-2. If source found: create dummy tensors, process dummy weights, receive fully-processed weights via RDMA
-3. If no source: load weights from disk, process weights
-4. Register ALL final tensors with NIXL + publish metadata
+**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
 
-Detection is a one-shot check with no retry loop. If the source is still warming up, this node loads from disk and becomes a source itself. Both paths register with NIXL and publish metadata, so future nodes can discover this one.
+Auto-detects the best loading strategy with a three-tier fallback:
 
-The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_module_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`) are module-level functions used by the loader.
+1. **RDMA**: Call `ListSources(identity, status=READY)`, filter by `worker_rank`, shuffle for load balancing. For each candidate, call `GetMetadata` on demand, attempt RDMA transfer. On failure, mark source `STALE` and try next candidate.
+2. **GDS**: If no RDMA source available and GPUDirect Storage is available, load directly from file to GPU via `MxGdsLoader`.
+3. **Disk**: Standard vLLM `DefaultModelLoader` as final fallback.
+
+After loading by any path, the worker registers ALL final tensors with NIXL and publishes metadata + `READY` status, so future nodes can discover it as an RDMA source.
+
+Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
+
+The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_module_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`, `_build_source_identity`) are module-level functions used by the loader.
 
 ### Tensor Discovery
 
@@ -528,21 +551,17 @@ graph TD
 
 ## Coordination Protocol
 
-### Redis Keys
-
-| Key Pattern | Purpose |
-|-------------|---------|
-| `mx:model:{model_name}` | Model metadata (workers, tensor descriptors, NIXL metadata, per-worker status) |
-| `mx:models` | Set of all registered model names |
-
 ### Flow
 
-1. **Source starts**: Loads weights, registers with NIXL, publishes metadata to gRPC server
-2. **Source warmup**: DeepGemm compilation, CUDA graph capture
-3. **Source publishes ready**: After health check + test inference, calls `UpdateStatus` to set worker status to `Ready`
-4. **Target waits**: Polls `GetMetadata` until all source workers are `Ready`
-5. **Target transfers**: Executes RDMA reads from source
-6. **Target warmup**: Same DeepGemm + CUDA graph as source
+1. **Source loads**: Loads weights from disk (or GDS), runs `process_weights_after_loading()`
+2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id`
+3. **Source goes ready**: Calls `UpdateStatus(mx_source_id, worker_id, rank, READY)`
+4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
+5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate
+6. **Target transfers**: Executes RDMA reads from source; on failure marks source `STALE` and tries next candidate
+7. **Target becomes source**: After receiving weights, publishes own metadata so future nodes can discover it
+
+See [`metadata.md`](metadata.md) for the full storage schema and debugging guide.
 
 ## Environment Variables
 
@@ -553,10 +572,9 @@ graph TD
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
+| `MX_METADATA_BACKEND` | (required) | Metadata backend: `redis` or `kubernetes` |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
-| `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
+| `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 
 ### UCX/NIXL Tuning

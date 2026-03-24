@@ -4,6 +4,16 @@
 # ModelExpress Server with Redis backend (optional).
 # Use when you want metadata to persist across server restarts.
 # Deploy redis-standalone.yaml first, or use the Redis sidecar below.
+
+# ServiceAccount referenced by client manifests.
+# For Redis backend this is an empty SA (no RBAC bindings needed).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  labels:
+    app.kubernetes.io/name: modelexpress
+---
 apiVersion: v1
 kind: Service
 metadata:
