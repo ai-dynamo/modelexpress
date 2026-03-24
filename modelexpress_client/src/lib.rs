@@ -58,7 +58,7 @@ fn prepare_stream_model_dir(
     commit_hash: Option<&str>,
 ) -> CommonResult<(PathBuf, PathBuf)> {
     if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
-        return Err(modelexpress_common::Error::Server(format!(
+        return Err(modelexpress_common::Error::Validation(format!(
             "Failed to resolve model directory: missing required revision for provider {:?}",
             provider
         ))
@@ -67,25 +67,25 @@ fn prepare_stream_model_dir(
 
     let model_dir = resolve_model_path(local_cache_path, provider, model_name, commit_hash)
         .map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to resolve model directory: {e}"))
+            modelexpress_common::Error::Io(format!("Failed to resolve model directory: {e}"))
         })?;
 
     std::fs::create_dir_all(&model_dir).map_err(|e| {
-        modelexpress_common::Error::Server(format!("Failed to create model directory: {e}"))
+        modelexpress_common::Error::Io(format!("Failed to create model directory: {e}"))
     })?;
 
     let canonical_cache_dir = local_cache_path.canonicalize().map_err(|e| {
-        modelexpress_common::Error::Server(format!(
+        modelexpress_common::Error::Io(format!(
             "Failed to canonicalize cache directory {:?}: {e}",
             local_cache_path
         ))
     })?;
     let canonical_model_dir = model_dir.canonicalize().map_err(|e| {
-        modelexpress_common::Error::Server(format!("Failed to canonicalize model directory: {e}"))
+        modelexpress_common::Error::Io(format!("Failed to canonicalize model directory: {e}"))
     })?;
 
     if !canonical_model_dir.starts_with(&canonical_cache_dir) {
-        return Err(modelexpress_common::Error::Server(format!(
+        return Err(modelexpress_common::Error::Validation(format!(
             "Received model directory that resolves outside cache root: {:?}",
             model_dir
         ))
@@ -99,7 +99,7 @@ async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<
     match std::fs::symlink_metadata(file_path) {
         Ok(metadata) => {
             if metadata.is_dir() {
-                return Err(modelexpress_common::Error::Server(format!(
+                return Err(modelexpress_common::Error::Validation(format!(
                     "Refusing to overwrite directory in model directory: {:?}",
                     file_path
                 ))
@@ -107,7 +107,7 @@ async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<
             }
 
             if !metadata.is_file() && !metadata.file_type().is_symlink() {
-                return Err(modelexpress_common::Error::Server(format!(
+                return Err(modelexpress_common::Error::Validation(format!(
                     "Refusing to overwrite unsupported file type in model directory: {:?}",
                     file_path
                 ))
@@ -117,7 +117,7 @@ async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<
             // Existing HF snapshot entries may be symlinks into `blobs/`.
             // Unlink the final path itself so we never follow it when recreating the file.
             std::fs::remove_file(file_path).map_err(|e| {
-                modelexpress_common::Error::Server(format!(
+                modelexpress_common::Error::Io(format!(
                     "Failed to replace existing file {:?}: {e}",
                     file_path
                 ))
@@ -125,7 +125,7 @@ async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return Err(modelexpress_common::Error::Server(format!(
+            return Err(modelexpress_common::Error::Io(format!(
                 "Failed to inspect output file {:?}: {e}",
                 file_path
             ))
@@ -141,11 +141,8 @@ async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<
         .open(file_path)
         .await
         .map_err(|e| {
-            modelexpress_common::Error::Server(format!(
-                "Failed to create file {:?}: {e}",
-                file_path
-            ))
-            .into()
+            modelexpress_common::Error::Io(format!("Failed to create file {:?}: {e}", file_path))
+                .into()
         })
 }
 
@@ -456,7 +453,7 @@ impl Client {
             model_name, local_cache_path, chunk_size
         );
         std::fs::create_dir_all(&local_cache_path).map_err(|e| {
-            modelexpress_common::Error::Server(format!(
+            modelexpress_common::Error::Io(format!(
                 "Failed to create local cache directory {:?}: {e}",
                 local_cache_path
             ))
@@ -508,7 +505,7 @@ impl Client {
             let relative_path = PathBuf::from(&chunk_result.relative_path);
 
             if !is_safe_relative_path(&relative_path) {
-                return Err(Box::new(modelexpress_common::Error::Server(format!(
+                return Err(Box::new(modelexpress_common::Error::Validation(format!(
                     "Received potentially unsafe file path from server: {:?}",
                     chunk_result.relative_path
                 ))));
@@ -521,20 +518,20 @@ impl Client {
             if let Some(parent) = file_path.parent() {
                 if !parent.exists() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        modelexpress_common::Error::Server(format!(
+                        modelexpress_common::Error::Io(format!(
                             "Failed to create parent directory: {e}"
                         ))
                     })?;
                 }
 
                 let canonical_parent = parent.canonicalize().map_err(|e| {
-                    modelexpress_common::Error::Server(format!(
+                    modelexpress_common::Error::Io(format!(
                         "Failed to canonicalize parent directory: {e}"
                     ))
                 })?;
 
                 if !canonical_parent.starts_with(canonical_model_dir_ref) {
-                    return Err(Box::new(modelexpress_common::Error::Server(format!(
+                    return Err(Box::new(modelexpress_common::Error::Validation(format!(
                         "Received file path that resolves outside model directory: {:?}",
                         chunk_result.relative_path
                     ))));
@@ -550,7 +547,7 @@ impl Client {
                 // Close previous file if any
                 if let Some((prev_path, file)) = current_file.take() {
                     file.sync_all().await.map_err(|e| {
-                        modelexpress_common::Error::Server(format!(
+                        modelexpress_common::Error::Io(format!(
                             "Failed to sync file to disk {:?}: {e}",
                             prev_path
                         ))
@@ -573,7 +570,7 @@ impl Client {
             // Write chunk to file
             if let Some((_, ref mut file)) = current_file {
                 file.write_all(&chunk_result.data).await.map_err(|e| {
-                    modelexpress_common::Error::Server(format!("Failed to write to file: {e}"))
+                    modelexpress_common::Error::Io(format!("Failed to write to file: {e}"))
                 })?;
                 bytes_received = bytes_received.saturating_add(chunk_result.data.len() as u64);
             }
@@ -595,7 +592,7 @@ impl Client {
         // Ensure the last file is properly closed
         if let Some((path, file)) = current_file.take() {
             file.sync_all().await.map_err(|e| {
-                modelexpress_common::Error::Server(format!(
+                modelexpress_common::Error::Io(format!(
                     "Failed to sync final file to disk {:?}: {e}",
                     path
                 ))
@@ -1015,10 +1012,54 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache_root = temp_dir.path();
 
-        let result =
-            prepare_stream_model_dir(cache_root, ModelProvider::HuggingFace, "test/model", None);
+        let err =
+            prepare_stream_model_dir(cache_root, ModelProvider::HuggingFace, "test/model", None)
+                .expect_err("Expected missing revision to fail");
 
-        assert!(result.is_err());
+        assert!(
+            matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("missing required revision")),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_stream_model_dir_uses_io_error_for_local_fs_failures() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path().join("cache-root-file");
+        std::fs::write(&cache_root, b"not a directory").expect("Failed to create cache root file");
+
+        let err = prepare_stream_model_dir(
+            &cache_root,
+            ModelProvider::HuggingFace,
+            "test/model",
+            Some("abc123"),
+        )
+        .expect_err("Expected local filesystem failure");
+
+        assert!(
+            matches!(err.as_ref(), modelexpress_common::Error::Io(message) if message.contains("Failed to create model directory")),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_stream_model_dir_rejects_paths_outside_cache_root() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path().join("cache");
+        std::fs::create_dir_all(&cache_root).expect("Failed to create cache root");
+
+        let err = prepare_stream_model_dir(
+            &cache_root,
+            ModelProvider::HuggingFace,
+            "test/model",
+            Some("../../../../outside"),
+        )
+        .expect_err("Expected escaped model directory to fail validation");
+
+        assert!(
+            matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("outside cache root")),
+            "Unexpected error: {err}"
+        );
     }
 
     #[cfg(unix)]
