@@ -72,15 +72,6 @@ impl From<&SourceIdentity> for SourceAttributesJson {
     }
 }
 
-/// Return the TTL to apply to source keys, in seconds.
-/// Reads `MX_STATUS_TTL_SECS` from the environment; defaults to 3600 (1 hour).
-fn get_ttl_secs() -> u64 {
-    std::env::var("MX_STATUS_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3600)
-}
-
 /// Scan Redis for all keys matching `pattern`, iterating through all SCAN cursors.
 async fn scan_keys(conn: &mut ConnectionManager, pattern: &str) -> MetadataResult<Vec<String>> {
     let mut all_keys = Vec::new();
@@ -356,11 +347,6 @@ impl MetadataBackend for RedisBackend {
         pipe.hset(&source_key, keys::ATTRIBUTES_FIELD, &attr_json);
         pipe.hset(&source_key, worker_id, &rank);
 
-        // Refresh TTL on both keys so they expire if the source goes away
-        let ttl = get_ttl_secs();
-        pipe.expire(worker_key.clone(), ttl as i64);
-        pipe.expire(source_key.clone(), ttl as i64);
-
         pipe.exec_async(&mut conn).await?;
 
         let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
@@ -476,11 +462,22 @@ impl MetadataBackend for RedisBackend {
                     }
                 }
 
+                let (status, updated_at) = fields
+                    .values()
+                    .find_map(|v| {
+                        serde_json::from_str::<WorkerRecordJson>(v)
+                            .ok()
+                            .map(|j| (j.status, j.updated_at))
+                    })
+                    .unwrap_or((0, 0));
+
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
                     worker_id: iid.to_string(),
                     model_name: model_name.clone(),
                     worker_rank,
+                    status,
+                    updated_at,
                 });
             }
         }
@@ -507,6 +504,34 @@ impl MetadataBackend for RedisBackend {
 
         pipe.exec_async(&mut conn).await?;
         info!("Removed metadata for source_id={}", source_id);
+        Ok(())
+    }
+
+    async fn remove_worker(&self, source_id: &str, worker_id: &str) -> MetadataResult<()> {
+        let mut conn = self.get_conn().await?;
+        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
+        let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+
+        let mut pipe = redis::pipe();
+        pipe.del(&worker_key);
+        pipe.hdel(&source_key, worker_id);
+        pipe.exec_async(&mut conn).await?;
+
+        // Clean up source index if no workers remain (only __attributes__ left)
+        let remaining: usize = conn.hlen(&source_key).await?;
+        if remaining <= 1 {
+            conn.del::<_, ()>(&source_key).await?;
+            info!(
+                "Removed last worker '{}' and source index for source_id={}",
+                worker_id, source_id
+            );
+        } else {
+            info!(
+                "Removed worker '{}' from source_id={}",
+                worker_id, source_id
+            );
+        }
+
         Ok(())
     }
 
@@ -553,11 +578,7 @@ impl MetadataBackend for RedisBackend {
         record.updated_at = updated_at;
 
         let updated = serde_json::to_string(&record)?;
-        let ttl = get_ttl_secs();
-        let mut pipe = redis::pipe();
-        pipe.hset(&key, &field, &updated);
-        pipe.expire(&key, ttl as i64);
-        pipe.exec_async(&mut conn).await?;
+        conn.hset::<_, _, _, ()>(&key, &field, &updated).await?;
 
         debug!(
             "Updated status for source '{}' worker '{}' rank {} -> {}",

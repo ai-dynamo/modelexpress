@@ -331,12 +331,8 @@ class TestTryLoadFromCandidates:
 
         assert result is True
         assert attempts == ["w-1", "w-2"]
-        loader._mx_client.update_status.assert_called_once_with(
-            mx_source_id=candidates[0].mx_source_id,
-            worker_id="w-1",
-            worker_rank=0,
-            status=p2p_pb2.SOURCE_STATUS_STALE,
-        )
+        # Target no longer marks sources STALE — that's owned by heartbeat + reaper
+        loader._mx_client.update_status.assert_not_called()
 
     def test_returns_false_when_no_candidates(self):
         loader = _make_loader()
@@ -362,7 +358,8 @@ class TestTryLoadFromCandidates:
             )
 
         assert result is False
-        assert loader._mx_client.update_status.call_count == 3
+        # Target no longer marks sources STALE — that's owned by heartbeat + reaper
+        loader._mx_client.update_status.assert_not_called()
 
     def test_get_metadata_not_called_after_first_success(self):
         """Only one GetMetadata RPC is issued when the first worker succeeds."""
@@ -388,12 +385,11 @@ class TestTryLoadFromCandidates:
 
 
 class TestPublishMetadataAndReady:
-    def test_calls_publish_then_update_status_ready(self):
+    def test_calls_publish_and_starts_heartbeat(self):
         from modelexpress.vllm_loader import _publish_metadata_and_ready
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = "abc123def456abcd"
-        mx_client.update_status.return_value = True
 
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"nixl-data"
@@ -408,7 +404,9 @@ class TestPublishMetadataAndReady:
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
+        mock_hb = MagicMock()
+        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
+             patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
             _publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
 
         mx_client.publish_metadata.assert_called_once()
@@ -416,30 +414,17 @@ class TestPublishMetadataAndReady:
         assert call_args.args[0] is identity
         assert call_args.args[2] == "inst-uuid"
 
-        mx_client.update_status.assert_called_once_with(
+        hb_cls.assert_called_once_with(
+            mx_client=mx_client,
             mx_source_id="abc123def456abcd",
             worker_id="inst-uuid",
             worker_rank=2,
-            status=p2p_pb2.SOURCE_STATUS_READY,
+            nixl_manager=nixl_manager,
         )
+        mock_hb.start.assert_called_once()
 
-    def test_update_status_failure_is_logged_not_raised(self):
-        """update_status returning False should not propagate as an exception."""
-        from modelexpress.vllm_loader import _publish_metadata_and_ready
-
-        mx_client = MagicMock()
-        mx_client.publish_metadata.return_value = "abc123def456abcd"
-        mx_client.update_status.return_value = False  # server rejected
-
-        nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
-
-        identity = _make_identity()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
-            _publish_metadata_and_ready(mx_client, nixl_manager, {}, global_rank=0, device_id=0, identity=identity, worker_id="w-1")
-
-    def test_publish_failure_raises(self):
-        """publish_metadata raising should propagate out."""
+    def test_publish_failure_does_not_start_heartbeat(self):
+        """If publish_metadata raises, heartbeat should not be started."""
         from modelexpress.vllm_loader import _publish_metadata_and_ready
 
         mx_client = MagicMock()
@@ -449,6 +434,11 @@ class TestPublishMetadataAndReady:
         nixl_manager.nixl_metadata = b"data"
 
         identity = _make_identity()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
+        mock_hb = MagicMock()
+        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
+             patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(RuntimeError, match="grpc error"):
                 _publish_metadata_and_ready(mx_client, nixl_manager, {}, global_rank=0, device_id=0, identity=identity, worker_id="w-1")
+
+        hb_cls.assert_not_called()
+

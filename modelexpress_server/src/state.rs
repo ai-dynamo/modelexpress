@@ -147,6 +147,14 @@ impl P2pStateManager {
         self.get_backend().await?.remove_metadata(source_id).await
     }
 
+    /// Remove a single worker by source_id and worker_id.
+    pub async fn remove_worker(&self, source_id: &str, worker_id: &str) -> MetadataResult<()> {
+        self.get_backend()
+            .await?
+            .remove_worker(source_id, worker_id)
+            .await
+    }
+
     /// List all registered source IDs and model names.
     pub async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>> {
         self.get_backend().await?.list_sources().await
@@ -501,6 +509,8 @@ mod tests {
                     worker_id: "w1".to_string(),
                     model_name: "my-model".to_string(),
                     worker_rank: 0,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
                 }])
             });
 

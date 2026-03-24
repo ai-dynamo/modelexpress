@@ -534,6 +534,10 @@ class NixlTransferManager:
 
         return coalesced_remote, coalesced_local, coalesced_count
 
+    def is_healthy(self) -> bool:
+        """Check if the NIXL agent is initialized and has registered metadata."""
+        return self._agent is not None and len(self._metadata) > 0
+
     def shutdown(self) -> None:
         """Clean up NIXL resources."""
         self._agent = None

@@ -116,7 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let p2p_service = P2pServiceImpl::new(p2p_state);
+    let p2p_service = P2pServiceImpl::new(p2p_state.clone());
+
+    // Start reaper for stale source detection
+    let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
+    let reaper_state = p2p_state.clone();
+    let reaper_handle = tokio::spawn(async move {
+        modelexpress_server::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
+    });
 
     // Setup graceful shutdown handler
     let shutdown_signal = async move {
@@ -129,6 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Signal cache eviction service to shutdown
         if shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to cache eviction service");
+        }
+
+        // Signal reaper to shutdown
+        if reaper_shutdown_tx.send(()).is_err() {
+            error!("Failed to send shutdown signal to reaper");
         }
     };
 
@@ -146,11 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_shutdown(addr, shutdown_signal)
         .await;
 
-    // Wait for cache service to complete if it was started
+    // Wait for background services to complete
     if let Some(handle) = cache_handle
         && let Err(e) = handle.await
     {
         error!("Cache eviction service join error: {e}");
+    }
+    if let Err(e) = reaper_handle.await {
+        error!("Reaper join error: {e}");
     }
 
     server_result?;

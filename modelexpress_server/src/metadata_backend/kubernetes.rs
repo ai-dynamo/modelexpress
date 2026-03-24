@@ -511,11 +511,30 @@ impl MetadataBackend for KubernetesBackend {
                 }
             }
 
+            let (status, updated_at) = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.workers.first())
+                .map(|w| {
+                    let proto_status =
+                        crate::k8s_types::WorkerStatus::status_proto_from_name(&w.status);
+                    let millis = w
+                        .updated_at
+                        .as_deref()
+                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                        .map(|dt| dt.timestamp_millis())
+                        .unwrap_or(0);
+                    (proto_status, millis)
+                })
+                .unwrap_or((0, 0));
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
                 model_name: cr.spec.model_name,
                 worker_rank,
+                status,
+                updated_at,
             });
         }
 
@@ -564,6 +583,24 @@ impl MetadataBackend for KubernetesBackend {
                     Err(e) => warn!("Failed to delete ConfigMap '{}': {}", name, e),
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn remove_worker(&self, source_id: &str, worker_id: &str) -> MetadataResult<()> {
+        let api = self.model_metadata_api();
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
+
+        match api
+            .delete(&cr_name, &kube::api::DeleteParams::default())
+            .await
+        {
+            Ok(_) => info!("Deleted ModelMetadata CR '{}'", cr_name),
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                debug!("ModelMetadata CR '{}' already gone", cr_name);
+            }
+            Err(e) => return Err(e.into()),
         }
 
         Ok(())

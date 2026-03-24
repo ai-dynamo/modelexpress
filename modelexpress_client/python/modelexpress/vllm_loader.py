@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 
 from .client import MxClient  # All gRPC communication goes through MxClient
+from .heartbeat import HeartbeatThread
 from . import p2p_pb2
 
 from vllm.config import ModelConfig, VllmConfig
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
     from .nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.vllm_loader")
+
+MAX_SOURCE_RETRIES = 3
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
@@ -357,17 +360,16 @@ def _publish_metadata_and_ready(
             f"[Worker {global_rank}] Published metadata to MX server "
             f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
         )
-        success = mx_client.update_status(
+
+        heartbeat = HeartbeatThread(
+            mx_client=mx_client,
             mx_source_id=mx_source_id,
             worker_id=worker_id,
             worker_rank=global_rank,
-            status=p2p_pb2.SOURCE_STATUS_READY,
+            nixl_manager=nixl_manager,
         )
-        if not success:
-            logger.error(
-                f"[Worker {global_rank}] UpdateStatus to READY failed for "
-                f"model '{identity.model_name}' (mx_source_id={mx_source_id})"
-            )
+        heartbeat.start()
+        _heartbeat_threads[global_rank] = heartbeat
 
     except Exception:
         raise
@@ -505,17 +507,28 @@ class MxModelLoader(BaseModelLoader):
         Falls back to disk and returns False if all candidates are exhausted.
         """
         candidates = self._find_source_instances(identity, global_rank)
-        for instance in candidates:
+        for instance in candidates[:MAX_SOURCE_RETRIES]:
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
+
             try:
                 source_worker = self._fetch_worker_metadata(mx_source_id, worker_id, global_rank)
-                if source_worker is None:
-                    continue
-                logger.info(
-                    f"[Worker {global_rank}] Trying source worker {worker_id} "
-                    f"({len(source_worker.tensors)} tensors)"
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {global_rank}] Failed to fetch metadata for worker {worker_id}: {e}. "
+                    f"Trying next candidate."
                 )
+                continue
+
+            if source_worker is None:
+                continue
+
+            logger.info(
+                f"[Worker {global_rank}] Trying source worker {worker_id} "
+                f"({len(source_worker.tensors)} tensors)"
+            )
+
+            try:
                 self._load_as_target(
                     model, model_config, target_device,
                     global_rank, device_id, identity, source_worker, mx_source_id, worker_id,
@@ -523,16 +536,8 @@ class MxModelLoader(BaseModelLoader):
                 return True
             except SourceTransferError as e:
                 logger.warning(
-                    f"[Worker {global_rank}] Source-side failure for worker {worker_id}: {e}. "
-                    f"Marking STALE and trying next. "
-                    f"TODO: heartbeat mechanism will handle STALE marking automatically."
-                )
-                # TODO: heartbeat will mark workers STALE automatically on pod deletion
-                self._mx_client.update_status(
-                    mx_source_id=mx_source_id,
-                    worker_id=worker_id,
-                    worker_rank=global_rank,
-                    status=p2p_pb2.SOURCE_STATUS_STALE,
+                    f"[Worker {global_rank}] Source transfer failed for worker {worker_id}: {e}. "
+                    f"Trying next candidate."
                 )
         if candidates:
             logger.warning(
@@ -794,3 +799,4 @@ class MxModelLoader(BaseModelLoader):
 # Each device_id maps to exactly one loader, so there are no concurrent writers.
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, "NixlTransferManager"] = {}
+_heartbeat_threads: dict[int, HeartbeatThread] = {}
