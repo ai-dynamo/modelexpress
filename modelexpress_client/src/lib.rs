@@ -39,14 +39,12 @@ pub struct Client {
 }
 
 fn is_safe_relative_path(path: &std::path::Path) -> bool {
-    !path.as_os_str().is_empty()
+    path.components()
+        .any(|component| matches!(component, Component::Normal(_)))
         && !path.components().any(|component| {
             matches!(
                 component,
-                Component::CurDir
-                    | Component::ParentDir
-                    | Component::RootDir
-                    | Component::Prefix(_)
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
 }
@@ -1005,6 +1003,24 @@ mod tests {
         .expect("Expected legacy snapshot layout");
 
         assert_eq!(dir, cache_root.join("models--test--model/snapshots/abc123"));
+    }
+
+    #[test]
+    fn test_is_safe_relative_path_allows_leading_curdir() {
+        assert!(is_safe_relative_path(std::path::Path::new("./config.json")));
+        assert!(is_safe_relative_path(std::path::Path::new(
+            "./nested/config.json"
+        )));
+    }
+
+    #[test]
+    fn test_is_safe_relative_path_rejects_empty_and_escape_paths() {
+        assert!(!is_safe_relative_path(std::path::Path::new("")));
+        assert!(!is_safe_relative_path(std::path::Path::new(".")));
+        assert!(!is_safe_relative_path(std::path::Path::new(
+            "../config.json"
+        )));
+        assert!(!is_safe_relative_path(std::path::Path::new("/config.json")));
     }
 
     #[test]
