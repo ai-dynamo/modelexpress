@@ -89,7 +89,7 @@ spec:
               mkdir -p $MODEL_CACHE_PATH
               mkdir -p /model/.model-express
               cat > /model/.model-express/config.yaml << EOF
-              local_path: $MODEL_CACHE_PATH
+              directory: $MODEL_CACHE_PATH
               server_endpoint: http://localhost:8000
               timeout_secs: null
               EOF

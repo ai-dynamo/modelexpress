@@ -32,7 +32,7 @@ static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 fn get_server_cache_dir() -> Option<std::path::PathBuf> {
     // Try to get cache configuration
     if let Ok(config) = CacheConfig::discover() {
-        Some(config.local_path)
+        Some(config.directory)
     } else {
         // Fall back to environment variable
         std::env::var("HF_HUB_CACHE")

@@ -12,8 +12,9 @@ use tracing::{debug, info, warn};
 /// Configuration for model cache management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// Local path where models are cached
-    pub local_path: PathBuf,
+    /// Directory where models are cached
+    #[serde(alias = "local_path")]
+    pub directory: PathBuf,
     /// Server endpoint for model downloads
     pub server_endpoint: String,
     /// Timeout for cache operations
@@ -39,7 +40,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
         Self {
-            local_path: PathBuf::from(home).join(constants::DEFAULT_CACHE_PATH),
+            directory: PathBuf::from(home).join(constants::DEFAULT_CACHE_PATH),
             server_endpoint: format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT),
             timeout_secs: None,
             shared_storage: constants::DEFAULT_SHARED_STORAGE,
@@ -52,16 +53,10 @@ impl CacheConfig {
     /// Discover cache configuration
     pub fn discover() -> Result<Self> {
         // Priority order:
-        // 1. Command line argument (--cache-path)
-        // 2. Environment variable (MODEL_EXPRESS_CACHE_DIRECTORY)
-        // 3. Config file (~/.model-express/config.yaml)
-        // 4. Auto-detection (common paths)
-        // 5. Default fallback
-
-        // Try command line args first
-        if let Some(path) = Self::get_cache_path_from_args() {
-            return Self::from_path(path);
-        }
+        // 1. Environment variable (MODEL_EXPRESS_CACHE_DIRECTORY)
+        // 2. Config file (~/.model-express/config.yaml)
+        // 3. Auto-detection (common paths)
+        // 4. Default fallback
 
         // Try environment variable
         if let Ok(path) = env::var("MODEL_EXPRESS_CACHE_DIRECTORY") {
@@ -84,13 +79,13 @@ impl CacheConfig {
     }
 
     /// Create a cache configuration with explicit parameters
-    pub fn new(local_path: PathBuf, server_endpoint: Option<String>) -> Result<Self> {
+    pub fn new(directory: PathBuf, server_endpoint: Option<String>) -> Result<Self> {
         // Ensure the directory exists
-        fs::create_dir_all(&local_path)
-            .with_context(|| format!("Failed to create cache directory: {local_path:?}"))?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("Failed to create cache directory: {directory:?}"))?;
 
         Ok(Self {
-            local_path,
+            directory,
             server_endpoint: server_endpoint.unwrap_or_else(Self::get_default_server_endpoint),
             timeout_secs: None,
             shared_storage: constants::DEFAULT_SHARED_STORAGE,
@@ -100,14 +95,14 @@ impl CacheConfig {
 
     /// Create config from a specific path
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let local_path = path.as_ref().to_path_buf();
+        let directory = path.as_ref().to_path_buf();
 
         // Ensure the directory exists
-        fs::create_dir_all(&local_path)
-            .with_context(|| format!("Failed to create cache directory: {local_path:?}"))?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("Failed to create cache directory: {directory:?}"))?;
 
         Ok(Self {
-            local_path,
+            directory,
             server_endpoint: Self::get_default_server_endpoint(),
             timeout_secs: None,
             shared_storage: constants::DEFAULT_SHARED_STORAGE,
@@ -165,7 +160,7 @@ impl CacheConfig {
         for path in common_paths {
             if path.exists() && path.is_dir() {
                 return Ok(Self {
-                    local_path: path,
+                    directory: path,
                     server_endpoint: Self::get_default_server_endpoint(),
                     timeout_secs: None,
                     shared_storage: constants::DEFAULT_SHARED_STORAGE,
@@ -184,21 +179,6 @@ impl CacheConfig {
         // This would typically make an HTTP request to the server
         // For now, we'll return an error to indicate server is not available
         Err(anyhow::anyhow!("Server not available for cache discovery"))
-    }
-
-    /// Get cache path from command line arguments
-    fn get_cache_path_from_args() -> Option<String> {
-        let args: Vec<String> = env::args().collect();
-
-        for (i, arg) in args.iter().enumerate() {
-            if arg == "--cache-path"
-                && let Some(next_arg) = args.get(i.saturating_add(1))
-            {
-                return Some(next_arg.clone());
-            }
-        }
-
-        None
     }
 
     /// Get default server endpoint
@@ -242,11 +222,11 @@ impl CacheConfig {
             models: Vec::new(),
         };
 
-        if !self.local_path.exists() {
+        if !self.directory.exists() {
             return Ok(stats);
         }
 
-        for entry in fs::read_dir(&self.local_path)? {
+        for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
             let path = entry.path();
 
@@ -294,7 +274,7 @@ impl CacheConfig {
 
     /// Clear specific model from cache
     pub fn clear_model(&self, model_name: &str) -> Result<()> {
-        let model_path = self.local_path.join(model_name);
+        let model_path = self.directory.join(model_name);
 
         if model_path.exists() {
             fs::remove_dir_all(&model_path)
@@ -309,12 +289,12 @@ impl CacheConfig {
 
     /// Clear entire cache
     pub fn clear_all(&self) -> Result<()> {
-        if self.local_path.exists() {
-            for entry in fs::read_dir(&self.local_path)
-                .with_context(|| format!("Failed to read cache directory: {:?}", self.local_path))?
+        if self.directory.exists() {
+            for entry in fs::read_dir(&self.directory)
+                .with_context(|| format!("Failed to read cache directory: {:?}", self.directory))?
             {
                 let entry = entry
-                    .with_context(|| format!("Failed to read entry in: {:?}", self.local_path))?;
+                    .with_context(|| format!("Failed to read entry in: {:?}", self.directory))?;
                 let path = entry.path();
                 if path.is_dir() {
                     fs::remove_dir_all(&path)
@@ -388,7 +368,7 @@ mod tests {
         let config =
             CacheConfig::from_path(temp_dir.path()).expect("Failed to create config from path");
 
-        assert_eq!(config.local_path, temp_dir.path());
+        assert_eq!(config.directory, temp_dir.path());
     }
 
     #[test]
@@ -396,7 +376,7 @@ mod tests {
     fn test_cache_config_save_and_load() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let original_config = CacheConfig {
-            local_path: temp_dir.path().join("cache"),
+            directory: temp_dir.path().join("cache"),
             server_endpoint: "http://localhost:8001".to_string(),
             timeout_secs: Some(30),
             shared_storage: false,
@@ -411,7 +391,7 @@ mod tests {
         // Load config
         let loaded_config = CacheConfig::from_config_file().expect("Failed to load config");
 
-        assert_eq!(loaded_config.local_path, original_config.local_path);
+        assert_eq!(loaded_config.directory, original_config.directory);
         assert_eq!(
             loaded_config.server_endpoint,
             original_config.server_endpoint
@@ -454,7 +434,7 @@ mod tests {
 
         let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
         assert_eq!(
-            config.local_path,
+            config.directory,
             PathBuf::from(&home).join(constants::DEFAULT_CACHE_PATH)
         );
         assert_eq!(
@@ -551,7 +531,7 @@ mod tests {
         fs::write(cache_path.join("test_file.txt"), "test").expect("Failed to write file");
 
         let config = CacheConfig {
-            local_path: cache_path.clone(),
+            directory: cache_path.clone(),
             server_endpoint: "http://localhost:8001".to_string(),
             timeout_secs: None,
             shared_storage: false,
@@ -579,7 +559,7 @@ mod tests {
         let cache_path = temp_dir.path().join("nonexistent_cache");
 
         let config = CacheConfig {
-            local_path: cache_path.clone(),
+            directory: cache_path.clone(),
             server_endpoint: "http://localhost:8001".to_string(),
             timeout_secs: None,
             shared_storage: false,
@@ -607,7 +587,7 @@ mod tests {
         fs::write(deep_path.join("deep_file.txt"), "deep").expect("Failed to write file");
 
         let config = CacheConfig {
-            local_path: cache_path.clone(),
+            directory: cache_path.clone(),
             server_endpoint: "http://localhost:8001".to_string(),
             timeout_secs: None,
             shared_storage: false,

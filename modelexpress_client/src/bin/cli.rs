@@ -8,7 +8,7 @@
 //! This CLI uses a layered argument structure:
 //!
 //! - **`ClientArgs`** (in `modelexpress_common/src/client_config.rs`):
-//!   Shared arguments like `--endpoint`, `--timeout`, `--cache-path`, etc.
+//!   Shared arguments like `--endpoint`, `--timeout`, `--cache-directory`, etc.
 //!   These support environment variables (e.g., `MODEL_EXPRESS_ENDPOINT`).
 //!   Add new shared arguments there.
 //!
@@ -71,7 +71,7 @@ async fn main() {
             debug!("Executing model command");
             handle_model_command(
                 command,
-                cli.client_args.cache_path.clone(),
+                cli.client_args.cache_directory.clone(),
                 config,
                 &cli.format,
             )
@@ -152,17 +152,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_with_cache_path() {
+    fn test_cli_with_cache_directory() {
         let cli = Cli::try_parse_from([
             "modelexpress-cli",
-            "--cache-path",
+            "--cache-directory",
             "/custom/cache/path",
             "health",
         ])
-        .expect("Failed to parse CLI with cache path");
+        .expect("Failed to parse CLI with cache directory");
 
         assert_eq!(
-            cli.client_args.cache_path,
+            cli.client_args.cache_directory,
             Some(std::path::PathBuf::from("/custom/cache/path"))
         );
     }

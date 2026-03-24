@@ -83,6 +83,7 @@ async fn test_integration_direct_download_invalid_model() {
         "definitely-not-a-real-model-name-12345",
         ModelProvider::HuggingFace,
         false,
+        None,
     )
     .await;
 
@@ -102,6 +103,7 @@ async fn test_integration_small_model_download() {
         "prajjwal1/bert-tiny", // A very small BERT model for testing
         ModelProvider::HuggingFace,
         false,
+        None,
     )
     .await;
 
@@ -153,6 +155,7 @@ async fn test_integration_offline_mode_without_cache() {
         "nonexistent-model-for-offline-test",
         ModelProvider::HuggingFace,
         false,
+        None,
     )
     .await;
 

@@ -71,7 +71,7 @@ test_cache_cli() {
 
     # Test cache initialization
     print_status "Testing cache initialization..."
-    cargo run --bin cache_cli init --cache-path "$TEST_CACHE_PATH" || {
+    cargo run --bin cache_cli init --cache-directory "$TEST_CACHE_PATH" || {
         print_error "Cache initialization failed"
         return 1
     }
@@ -167,7 +167,7 @@ test_error_handling() {
 
     # Test with non-existent cache path
     print_status "Testing with non-existent cache path..."
-    cargo run --bin cache_cli --cache-path "/non/existent/path" list || {
+    cargo run --bin cache_cli --cache-directory "/non/existent/path" list || {
         print_success "Correctly handled non-existent cache path"
     }
 
@@ -184,7 +184,7 @@ test_cache_discovery() {
 
     # Test command line argument discovery
     print_status "Testing command line argument discovery..."
-    cargo run --bin cache_cli --cache-path "$TEST_CACHE_PATH" list || {
+    cargo run --bin cache_cli --cache-directory "$TEST_CACHE_PATH" list || {
         print_error "Command line argument discovery failed"
         return 1
     }
@@ -202,7 +202,7 @@ test_cache_discovery() {
     print_status "Testing config file discovery..."
     mkdir -p ~/.model-express
     cat > ~/.model-express/config.yaml << EOF
-local_path: $TEST_CACHE_PATH
+directory: $TEST_CACHE_PATH
 server_endpoint: $SERVER_ENDPOINT
 timeout_secs: 30
 EOF

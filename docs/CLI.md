@@ -42,7 +42,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 - `-f, --format <FORMAT>`: Output format: `human`, `json`, `json-pretty` (default: human)
 - `-v, -vv, -vvv`: Verbose mode (info, debug, trace)
 - `-q, --quiet`: Quiet mode (suppress all output except errors)
-- `--cache-path <PATH>`: Model storage path override
+- `--cache-directory <CACHE_DIRECTORY>`: Cache directory override
 - `--no-shared-storage`: Disable shared storage mode (will transfer files from server to client)
 - `--transfer-chunk-size <SIZE>`: Chunk size in bytes for file transfer when shared storage is disabled (default: 32768)
 - `-h, --help`: Print help information
@@ -50,7 +50,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 
 **Environment Variables:**
 - `MODEL_EXPRESS_ENDPOINT`: Set the default server endpoint
-- `MODEL_EXPRESS_CACHE_DIRECTORY`: Set the default model storage path
+- `MODEL_EXPRESS_CACHE_DIRECTORY`: Set the default cache directory
 - `MODEL_EXPRESS_NO_SHARED_STORAGE`: Disable shared storage mode (set to 'true' to enable file transfers)
 - `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE`: Set the chunk size in bytes for file transfers
 
@@ -102,9 +102,8 @@ modelexpress-cli --no-shared-storage --transfer-chunk-size 65536 \
 modelexpress-cli model init
 
 # Initialize with custom settings
-modelexpress-cli model init \
-  --storage-path /path/to/your/models \
-  --server-endpoint http://localhost:8001
+modelexpress-cli --cache-directory /path/to/your/models \
+  model init --server-endpoint http://localhost:8001
 
 # List downloaded models
 modelexpress-cli model list
@@ -233,8 +232,8 @@ modelexpress-cli --endpoint https://my-server.com:8001 \
 modelexpress-cli -vv model download microsoft/DialoGPT-small \
   --strategy server-only
 
-# Download model with custom storage path
-modelexpress-cli --cache-path /custom/storage/path \
+# Download model with custom cache directory
+modelexpress-cli --cache-directory /custom/cache/path \
   model download google-t5/t5-small
 
 # Send API request with file payload and JSON output
@@ -365,10 +364,10 @@ Set default values using environment variables:
 # Set default server endpoint
 export MODEL_EXPRESS_ENDPOINT="https://my-server.com:8001"
 
-# Set default cache path
+# Set default cache directory
 export MODEL_EXPRESS_CACHE_DIRECTORY="/path/to/storage"
 
-# Use the CLI without specifying endpoint or storage path
+# Use the CLI without specifying endpoint or cache directory
 modelexpress-cli health
 modelexpress-cli model status
 ```

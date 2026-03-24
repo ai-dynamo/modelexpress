@@ -46,9 +46,9 @@ pub struct ClientArgs {
     #[arg(short, long, env = "MODEL_EXPRESS_TIMEOUT")]
     pub timeout: Option<u64>,
 
-    /// Cache path override
+    /// Cache directory override
     #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
-    pub cache_path: Option<PathBuf>,
+    pub cache_directory: Option<PathBuf>,
 
     /// Log level (no short flag to avoid conflict with CLI's -v/--verbose)
     #[arg(long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
@@ -144,8 +144,8 @@ impl ClientConfig {
         }
 
         // Cache settings
-        if let Some(cache_path) = args.cache_path {
-            config.cache.local_path = cache_path;
+        if let Some(cache_directory) = args.cache_directory {
+            config.cache.directory = cache_directory;
         }
 
         if args.no_shared_storage {
@@ -196,12 +196,12 @@ impl ClientConfig {
         }
 
         // Validate cache path exists or can be created
-        if !self.cache.local_path.exists()
-            && let Err(e) = std::fs::create_dir_all(&self.cache.local_path)
+        if !self.cache.directory.exists()
+            && let Err(e) = std::fs::create_dir_all(&self.cache.directory)
         {
             return Err(ConfigError::Message(format!(
                 "Cannot create cache directory {:?}: {}",
-                self.cache.local_path, e
+                self.cache.directory, e
             )));
         }
 
@@ -227,10 +227,10 @@ impl ClientConfig {
         }
     }
 
-    /// Apply cache path override if provided
-    pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
-        if let Some(path) = cache_path {
-            self.cache.local_path = path;
+    /// Apply cache directory override if provided
+    pub fn with_cache_directory(mut self, cache_directory: Option<PathBuf>) -> Self {
+        if let Some(path) = cache_directory {
+            self.cache.directory = path;
         }
         self
     }
@@ -324,7 +324,7 @@ mod tests {
 
         assert!(args.endpoint.is_none());
         assert!(args.timeout.is_none());
-        assert!(args.cache_path.is_none());
+        assert!(args.cache_directory.is_none());
         assert!(!args.quiet);
         assert!(!args.no_shared_storage);
         assert!(args.transfer_chunk_size.is_none());
@@ -381,7 +381,7 @@ mod tests {
             config: None,
             endpoint: Some("http://cli-override:7777".to_string()),
             timeout: Some(120),
-            cache_path: None,
+            cache_directory: None,
             log_level: None,
             log_format: None,
             quiet: true,
