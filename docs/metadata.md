@@ -112,9 +112,11 @@ UpdateStatusRequest {
 
 ## Source Lifecycle
 
-```text
-INITIALIZING ──> READY ──> STALE
-   (publish)    (update)   (TTL expiry or explicit)
+```mermaid
+stateDiagram-v2
+    [*] --> INITIALIZING : PublishMetadata
+    INITIALIZING --> READY : UpdateStatus
+    READY --> STALE : TTL expiry or explicit
 ```
 
 - **INITIALIZING**: Worker has published metadata but is not yet ready for transfers
