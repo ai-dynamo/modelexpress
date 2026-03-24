@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM Instance with ModelExpress P2P weight transfer support.
-# Uses Redis backend for metadata (legacy/alternative to Kubernetes CRD backend).
-# For Kubernetes-native deployments, use vllm-kubernetes.yaml (CRD backend) instead.
+# Single-node vLLM deployment with ModelExpress P2P weight transfer.
+# Deploys DeepSeek-V3 on 1 node (8 GPUs, TP=8).
+#
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - PVC with model weights pre-downloaded
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #
 # On startup, the mx loader queries the MX server:
 #   - If a ready source exists for this model -> receive weights via RDMA
@@ -41,6 +45,7 @@ spec:
       labels:
         app: mx-vllm
     spec:
+      serviceAccountName: modelexpress
       containers:
         - name: vllm
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
@@ -117,7 +122,7 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
-            - name: model-cache
+            - name: model-cache-block
               mountPath: /models
 
       volumes:
@@ -125,9 +130,8 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        # Model cache PVC - needed in case this node loads from disk
-        - name: model-cache
+        - name: model-cache-block
           persistentVolumeClaim:
-            claimName: deepseek-v3-block
+            claimName: model-cache-block
       imagePullSecrets:
         - name: nvcr-imagepullsecret

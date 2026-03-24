@@ -225,21 +225,18 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL for P2P state storage |
+| `MX_METADATA_BACKEND` | (required on server) | `redis` or `kubernetes` |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
-| `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
+| `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
+| `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
+| `VLLM_PLUGINS` | - | Set to `modelexpress` to register the mx loader |
 
-vLLM instances must use the custom worker class for loader registration in spawned processes:
-
-```bash
---worker-cls=modelexpress.vllm_worker.ModelExpressWorker
-```
+Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
 ### UCX/NIXL Tuning
 
@@ -253,19 +250,32 @@ vLLM instances must use the custom worker class for loader registration in spawn
 
 ### P2P Kubernetes Deployment
 
-Deploy multiple identical instances - the first one loads from disk and subsequent ones receive via RDMA:
+Deploy multiple identical instances - the first one loads from disk and subsequent ones receive via RDMA.
+
+#### Redis Backend
 
 ```bash
 NAMESPACE=my-namespace
 
-# Deploy server + Redis
-kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/modelexpress-server.yaml
+# Deploy server with Redis sidecar
+kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/server/redis_backend/modelexpress-server-redis.yaml
 
-# Deploy vLLM instances with mx loader
-kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/vllm.yaml
+# Deploy single-node vLLM (TP=8, 1 node)
+kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-single-node.yaml
+```
 
-# Monitor
-watch kubectl -n $NAMESPACE get pods -l app=mx-vllm
+#### Kubernetes CRD Backend
+
+```bash
+# Install CRD and RBAC
+kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
+kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml
+
+# Deploy server with CRD backend
+kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/modelexpress-server-kubernetes.yaml
+
+# Deploy multi-node vLLM (TP=8, PP=2, 2 nodes)
+kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-node.yaml
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
@@ -280,10 +290,16 @@ kubectl -n $NAMESPACE logs -f deploy/modelexpress-server
 kubectl -n $NAMESPACE logs -f deploy/mx-vllm
 
 # Check Redis state (P2P metadata)
-kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS '*'
+kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli KEYS 'mx:source:*'
+
+# Inspect a source index (identity + worker list)
+kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli HGETALL 'mx:source:<source_id>'
 
 # Flush Redis (clear stale metadata - do this on redeploy)
 kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
+
+# Check Kubernetes CRD state
+kubectl -n $NAMESPACE get modelmetadatas
 
 # Test inference
 kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/completions \
