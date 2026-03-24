@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::args::{CliModelProvider, DownloadStrategy, ModelCommands, OutputFormat};
+use super::args::{DownloadStrategy, ModelCommands, OutputFormat};
 use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
@@ -12,17 +12,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing::{debug, error, info};
 
-fn format_model_provider(provider: ModelProvider) -> &'static str {
-    match provider {
-        ModelProvider::HuggingFace => "hugging-face",
-    }
-}
-
 fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> String {
     if detailed {
         format!(
             "  [{}] {} ({}) - {:?}",
-            format_model_provider(model.provider),
+            model.provider,
             model.name,
             stats.format_model_size(model),
             model.path
@@ -30,7 +24,7 @@ fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> S
     } else {
         format!(
             "  [{}] {} ({})",
-            format_model_provider(model.provider),
+            model.provider,
             model.name,
             stats.format_model_size(model)
         )
@@ -40,7 +34,7 @@ fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> S
 fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_json::Value {
     if detailed {
         serde_json::json!({
-            "provider": format_model_provider(model.provider),
+            "provider": model.provider.to_string(),
             "name": model.name,
             "size": model.size,
             "formatted_size": stats.format_model_size(model),
@@ -48,7 +42,7 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
         })
     } else {
         serde_json::json!({
-            "provider": format_model_provider(model.provider),
+            "provider": model.provider.to_string(),
             "name": model.name,
             "size": model.size,
             "formatted_size": stats.format_model_size(model)
@@ -126,15 +120,7 @@ pub async fn handle_model_command(
         ModelCommands::Clear {
             provider,
             model_name,
-        } => {
-            clear_model(
-                storage_path_override,
-                ModelProvider::from(provider),
-                &model_name,
-                format,
-            )
-            .await
-        }
+        } => clear_model(storage_path_override, provider, &model_name, format).await,
         ModelCommands::ClearAll { yes } => {
             clear_all_models(storage_path_override, yes, format).await
         }
@@ -150,13 +136,11 @@ pub async fn handle_model_command(
 async fn download_model(
     storage_path_override: Option<PathBuf>,
     model_name: String,
-    provider: CliModelProvider,
+    provider: ModelProvider,
     strategy: DownloadStrategy,
     config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let provider: ModelProvider = provider.into();
-
     debug!(
         "Starting model download: {} with provider {:?} and strategy {:?}",
         model_name, provider, strategy
@@ -165,7 +149,7 @@ async fn download_model(
     if let OutputFormat::Human = format {
         println!("{}", "Model Download".green().bold());
         println!("  {}: {}", "Model".cyan().bold(), model_name);
-        println!("  {}: {:?}", "Provider".cyan().bold(), provider);
+        println!("  {}: {}", "Provider".cyan().bold(), provider);
         println!("  {}: {:?}", "Strategy".cyan().bold(), strategy);
         println!();
     }
@@ -236,7 +220,7 @@ async fn download_model(
                         "success": true,
                         "message": success_msg,
                         "model_name": model_name,
-                        "provider": provider,
+                        "provider": provider.to_string(),
                         "strategy": format!("{:?}", strategy)
                     });
                     print_output(&output, format);
@@ -256,7 +240,7 @@ async fn download_model(
                         "success": false,
                         "error": error_msg,
                         "model_name": model_name,
-                        "provider": provider,
+                        "provider": provider.to_string(),
                         "strategy": format!("{:?}", strategy)
                     });
                     print_output(&output, format);
@@ -463,7 +447,7 @@ async fn clear_model(
         OutputFormat::Human => {
             println!(
                 "✅ Model '{model_name}' cleared from storage for provider {}",
-                format_model_provider(provider)
+                provider
             );
         }
         _ => {
@@ -471,7 +455,7 @@ async fn clear_model(
                 "success": true,
                 "message": format!("Model '{}' cleared from storage", model_name),
                 "model_name": model_name,
-                "provider": format_model_provider(provider)
+                "provider": provider.to_string()
             });
             print_output(&output, format);
         }
@@ -607,7 +591,7 @@ async fn show_model_stats(
                 for model in &stats.models {
                     println!(
                         "  [{}] {}: {} bytes ({})",
-                        format_model_provider(model.provider),
+                        model.provider,
                         model.name,
                         model.size,
                         stats.format_model_size(model)

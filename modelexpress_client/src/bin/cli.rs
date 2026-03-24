@@ -114,15 +114,29 @@ async fn main() {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::modules::args::{Cli, CliModelProvider, Commands};
+    use super::modules::args::{Cli, Commands};
     use clap::Parser;
     use modelexpress_client::ModelProvider;
 
     #[test]
-    fn test_cli_model_provider_conversion() {
-        let provider = CliModelProvider::HuggingFace;
-        let converted: ModelProvider = provider.into();
-        assert_eq!(converted, ModelProvider::HuggingFace);
+    fn test_cli_model_provider_parsing() {
+        let parsed = Cli::try_parse_from([
+            "modelexpress-cli",
+            "model",
+            "download",
+            "--provider",
+            "hugging-face",
+            "google-t5/t5-small",
+        ])
+        .expect("Failed to parse CLI model provider");
+
+        let Commands::Model { command } = parsed.command else {
+            panic!("Expected model command");
+        };
+        let super::modules::args::ModelCommands::Download { provider, .. } = command else {
+            panic!("Expected download subcommand");
+        };
+        assert_eq!(provider, ModelProvider::HuggingFace);
     }
 
     #[test]
@@ -211,7 +225,7 @@ mod tests {
         else {
             panic!("Expected clear subcommand");
         };
-        assert_eq!(ModelProvider::from(provider), ModelProvider::HuggingFace);
+        assert_eq!(provider, ModelProvider::HuggingFace);
         assert_eq!(model_name, "dev/bake/qwen/rev123");
     }
 }
