@@ -540,9 +540,10 @@ class MxModelLoader(BaseModelLoader):
                     f"Trying next candidate."
                 )
         if candidates:
+            tried = min(len(candidates), MAX_SOURCE_RETRIES)
             logger.warning(
-                f"[Worker {global_rank}] All {len(candidates)} source workers failed, "
-                f"loading from disk"
+                f"[Worker {global_rank}] Tried {tried} of {len(candidates)} source workers "
+                f"(max retries={MAX_SOURCE_RETRIES}), loading from disk"
             )
         else:
             logger.info(f"[Worker {global_rank}] No source worker found - loading from disk")

@@ -85,6 +85,7 @@ ModelExpress/
 │       ├── services.rs                 # Health, API, Model gRPC services
 │       ├── p2p_service.rs              # P2P gRPC service implementation
 │       ├── source_identity.rs          # SHA256-based mx_source_id computation
+│       ├── reaper.rs                   # Server-side stale source detection and GC
 │       ├── k8s_types.rs               # Kubernetes CRD type definitions
 │       ├── metadata_backend.rs         # MetadataBackend trait + types
 │       ├── metadata_backend/
@@ -113,6 +114,7 @@ ModelExpress/
 │   └── modelexpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
+│       ├── heartbeat.py                # Client-side heartbeat for source liveness
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader
@@ -263,9 +265,10 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 4. Create SQLite database (`ModelDatabase`)
 5. Optionally start `CacheEvictionService` background task
 6. Connect to metadata backend (Redis or Kubernetes CRD) for P2P state
-7. Register 4 gRPC services with tonic (max message size: 100MB)
-8. Listen on configured address (default `0.0.0.0:8001`)
-9. Graceful shutdown on CTRL+C
+7. Start reaper background task for stale source detection and GC
+8. Register 4 gRPC services with tonic (max message size: 100MB)
+9. Listen on configured address (default `0.0.0.0:8001`)
+10. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
 
 ### ServerConfig
 
@@ -323,8 +326,8 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 
 The server supports two metadata backends, selected via `MX_METADATA_BACKEND`:
 
-- **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). TTL-based expiry.
-- **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection.
+- **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). Stale detection and cleanup handled by the server-side reaper.
+- **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection. Stale detection handled by the server-side reaper.
 
 Each worker publishes independently (no Lua merge scripts needed). The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))`. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
 
@@ -422,6 +425,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
+| `heartbeat.py` | `HeartbeatThread` - background thread sending periodic `UpdateStatus(READY)` and `STALE` on shutdown |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -460,11 +464,11 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 Auto-detects the best loading strategy with a three-tier fallback:
 
-1. **RDMA**: Call `ListSources(identity, status=READY)`, filter by `worker_rank`, shuffle for load balancing. For each candidate, call `GetMetadata` on demand, attempt RDMA transfer. On failure, mark source `STALE` and try next candidate.
+1. **RDMA**: Call `ListSources(identity, status=READY)`, filter by `worker_rank`, shuffle for load balancing. For each candidate (max `MAX_SOURCE_RETRIES`), call `GetMetadata` on demand, attempt RDMA transfer. On `SourceTransferError`, try next candidate.
 2. **GDS**: If no RDMA source available and GPUDirect Storage is available, load directly from file to GPU via `MxGdsLoader`.
 3. **Disk**: Standard vLLM `DefaultModelLoader` as final fallback.
 
-After loading by any path, the worker registers ALL final tensors with NIXL and publishes metadata + `READY` status, so future nodes can discover it as an RDMA source.
+After loading by any path, the worker registers ALL final tensors with NIXL, publishes metadata, and starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler.
 
 Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
 
@@ -554,12 +558,13 @@ graph TD
 ### Flow
 
 1. **Source loads**: Loads weights from disk (or GDS), runs `process_weights_after_loading()`
-2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id`
-3. **Source goes ready**: Calls `UpdateStatus(mx_source_id, worker_id, rank, READY)`
+2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING)
+3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
 5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate
-6. **Target transfers**: Executes RDMA reads from source; on failure marks source `STALE` and tries next candidate
-7. **Target becomes source**: After receiving weights, publishes own metadata so future nodes can discover it
+6. **Target transfers**: Executes RDMA reads from source; on `SourceTransferError` tries next candidate (max 3)
+7. **Target becomes source**: After receiving weights, publishes own metadata and starts its own heartbeat
+8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; GC deletes after 1 hour
 
 See [`metadata.md`](metadata.md) for the full storage schema and debugging guide.
 
@@ -574,7 +579,10 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_METADATA_BACKEND` | (required) | Metadata backend: `redis` or `kubernetes` |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
-| `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
+| `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
+| `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
+| `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 
 ### UCX/NIXL Tuning
