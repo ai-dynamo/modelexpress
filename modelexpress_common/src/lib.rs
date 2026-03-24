@@ -123,16 +123,23 @@ impl From<&models::Status> for grpc::health::HealthResponse {
             version: status.version.clone(),
             status: status.status.clone(),
             uptime: status.uptime,
+            cache_directory: status.cache_directory.clone().unwrap_or_default(),
         }
     }
 }
 
 impl From<grpc::health::HealthResponse> for models::Status {
     fn from(response: grpc::health::HealthResponse) -> Self {
+        let cache_directory = if response.cache_directory.is_empty() {
+            None
+        } else {
+            Some(response.cache_directory)
+        };
         Self {
             version: response.version,
             status: response.status,
             uptime: response.uptime,
+            cache_directory,
         }
     }
 }
@@ -209,6 +216,7 @@ mod tests {
             version: "1.0.0".to_string(),
             status: "ok".to_string(),
             uptime: 3600,
+            cache_directory: Some("/tmp/cache".to_string()),
         };
 
         let grpc_response: grpc::health::HealthResponse = (&status).into();
@@ -216,6 +224,7 @@ mod tests {
         assert_eq!(grpc_response.version, status.version);
         assert_eq!(grpc_response.status, status.status);
         assert_eq!(grpc_response.uptime, status.uptime);
+        assert_eq!(grpc_response.cache_directory, "/tmp/cache");
     }
 
     #[test]
@@ -224,6 +233,7 @@ mod tests {
             version: "1.0.0".to_string(),
             status: "ok".to_string(),
             uptime: 3600,
+            cache_directory: "/tmp/cache".to_string(),
         };
 
         let status: models::Status = grpc_response.into();
@@ -231,6 +241,7 @@ mod tests {
         assert_eq!(status.version, "1.0.0");
         assert_eq!(status.status, "ok");
         assert_eq!(status.uptime, 3600);
+        assert_eq!(status.cache_directory, Some("/tmp/cache".to_string()));
     }
 
     #[test]

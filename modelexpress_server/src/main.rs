@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create service implementations
-    let health_service = HealthServiceImpl;
+    let health_service = HealthServiceImpl::new(config.cache.directory.display().to_string());
     let api_service = ApiServiceImpl;
     let model_service = ModelServiceImpl;
 

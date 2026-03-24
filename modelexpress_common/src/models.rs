@@ -11,6 +11,7 @@ pub struct Status {
     pub version: String,
     pub status: String,
     pub uptime: u64,
+    pub cache_directory: Option<String>,
 }
 
 /// Status of a model download
@@ -115,6 +116,7 @@ mod tests {
             version: "1.0.0".to_string(),
             status: "ok".to_string(),
             uptime: 3600,
+            cache_directory: Some("/tmp/cache".to_string()),
         };
 
         let serialized = serde_json::to_string(&status).expect("Failed to serialize Status");
@@ -124,6 +126,7 @@ mod tests {
         assert_eq!(status.version, deserialized.version);
         assert_eq!(status.status, deserialized.status);
         assert_eq!(status.uptime, deserialized.uptime);
+        assert_eq!(status.cache_directory, deserialized.cache_directory);
     }
 
     #[test]
