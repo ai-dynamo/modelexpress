@@ -311,5 +311,5 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 | Model | Total Data | Transfer Time | Per-Worker Speed |
 |-------|-----------|---------------|------------------|
-| DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | 60-112 Gbps |
-| Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~112 Gbps |
+| DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
+| Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
