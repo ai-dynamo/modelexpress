@@ -18,8 +18,8 @@ ModelExpress is a Rust-based model cache management service and GPU-to-GPU model
 
 | Model | Status | Transfer Time | Notes |
 |-------|--------|---------------|-------|
-| DeepSeek-V3 (671B, FP8) | Working | ~15s | 681GB across 8 GPUs @ ~112 Gbps per link |
-| Llama 3.3 70B | Working | ~5s | 140GB across 8 GPUs @ ~112 Gbps |
+| DeepSeek-V3 (671B, FP8) | Working | ~15s | 681GB across 8 GPUs @ ~45 Gbps per link |
+| Llama 3.3 70B | Working | ~5s | 140GB across 8 GPUs @ ~28 Gbps per link |
 
 ## Architecture
 
@@ -615,8 +615,8 @@ DeepSeek-V3 takes ~40 minutes to warm up (loading + DeepGemm + CUDA graphs). Tar
 |--------|-------|
 | Model | DeepSeek-V3 (671B, FP8) |
 | Total Data | 681 GB (8 workers x 85 GB) |
-| Transfer Time | ~15 seconds (8 parallel RDMA streams @ 112 Gbps each) |
-| Per-Worker Speed | 60-112 Gbps |
+| Transfer Time | ~15 seconds (8 parallel RDMA streams @ ~45 Gbps each) |
+| Per-Worker Speed | ~45 Gbps |
 | Theoretical Max | 400 Gbps per NIC |
 
 Optimization opportunities: contiguous regions (blocked), warm source pool, DeepGemm kernel caching, multi-rail RDMA (`UCX_IB_NUM_PATHS=2`).
