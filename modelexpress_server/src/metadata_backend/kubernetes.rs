@@ -3,13 +3,12 @@
 
 //! Kubernetes CRD backend for P2P model metadata storage.
 //!
-//! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
+//! Uses ModelMetadata CRD for P2P transfer coordination state.
+//! NIXL agent blobs are exchanged peer-to-peer via NIXL's native listen thread, never stored in K8s.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
-use crate::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, WorkerRecord};
+use crate::k8s_types::{ModelMetadata, ModelMetadataSpec, WorkerStatus};
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
@@ -17,7 +16,7 @@ use kube::{
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
 use serde_json::json;
 use std::collections::BTreeMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Kubernetes backend for metadata storage
 pub struct KubernetesBackend {
@@ -38,132 +37,6 @@ impl KubernetesBackend {
     /// Get the API handle for ModelMetadata CRD
     fn model_metadata_api(&self) -> Api<ModelMetadata> {
         Api::namespaced(self.client.clone(), &self.namespace)
-    }
-
-    /// Get the API handle for ConfigMaps
-    fn configmap_api(&self) -> Api<ConfigMap> {
-        Api::namespaced(self.client.clone(), &self.namespace)
-    }
-
-    /// Create or update a ConfigMap with tensor descriptors for a worker.
-    /// If `owner_uid` and `owner_name` are provided, sets ownerReferences
-    /// so K8s garbage-collects ConfigMaps when the parent CR is deleted.
-    async fn upsert_tensor_configmap(
-        &self,
-        source_id: &str,
-        worker_id: &str,
-        worker_rank: u32,
-        tensors: &[TensorRecord],
-        owner_name: Option<&str>,
-        owner_uid: Option<&str>,
-    ) -> MetadataResult<String> {
-        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
-        let cm_name = format!("{}-tensors-worker-{}", cr_name, worker_rank);
-
-        // Convert tensors to JSON
-        let tensor_json: Vec<TensorDescriptorJson> = tensors
-            .iter()
-            .map(|t| TensorDescriptorJson {
-                name: t.name.clone(),
-                addr: t.addr.to_string(),
-                size: t.size.to_string(),
-                device_id: t.device_id,
-                dtype: t.dtype.clone(),
-            })
-            .collect();
-
-        let tensors_data = serde_json::to_string_pretty(&tensor_json)?;
-
-        let mut data = BTreeMap::new();
-        data.insert("tensors.json".to_string(), tensors_data);
-
-        let mut labels = BTreeMap::new();
-        labels.insert(
-            "modelexpress.nvidia.com/mx-source-id".to_string(),
-            source_id.to_string(),
-        );
-        labels.insert(
-            "modelexpress.nvidia.com/worker".to_string(),
-            worker_rank.to_string(),
-        );
-
-        let owner_references = match (owner_name, owner_uid) {
-            (Some(name), Some(uid)) => Some(vec![
-                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                    api_version: "modelexpress.nvidia.com/v1alpha1".to_string(),
-                    kind: "ModelMetadata".to_string(),
-                    name: name.to_string(),
-                    uid: uid.to_string(),
-                    controller: Some(true),
-                    block_owner_deletion: Some(true),
-                },
-            ]),
-            _ => None,
-        };
-
-        let cm = ConfigMap {
-            metadata: kube::api::ObjectMeta {
-                name: Some(cm_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(labels),
-                owner_references,
-                ..Default::default()
-            },
-            data: Some(data),
-            ..Default::default()
-        };
-
-        let api = self.configmap_api();
-
-        // Try to create, if exists then patch
-        match api.create(&PostParams::default(), &cm).await {
-            Ok(_) => {
-                debug!("Created ConfigMap {} for worker {}", cm_name, worker_rank);
-            }
-            Err(kube::Error::Api(err)) if err.code == 409 => {
-                // Already exists — use merge patch to avoid SSA field manager conflicts
-                api.patch(&cm_name, &PatchParams::default(), &Patch::Merge(&cm))
-                    .await?;
-                debug!("Updated ConfigMap {} for worker {}", cm_name, worker_rank);
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        Ok(cm_name)
-    }
-
-    /// Read tensor descriptors from a ConfigMap
-    async fn read_tensor_configmap(&self, cm_name: &str) -> MetadataResult<Vec<TensorRecord>> {
-        let api = self.configmap_api();
-        let cm = api.get(cm_name).await?;
-
-        let tensors_json = cm
-            .data
-            .and_then(|d| d.get("tensors.json").cloned())
-            .ok_or("ConfigMap missing tensors.json")?;
-
-        let tensor_descs: Vec<TensorDescriptorJson> = serde_json::from_str(&tensors_json)?;
-
-        let tensors = tensor_descs
-            .into_iter()
-            .map(|t| {
-                let addr = t.addr.parse::<u64>().map_err(|e| {
-                    format!("Invalid tensor addr '{}' for '{}': {}", t.addr, t.name, e)
-                })?;
-                let size = t.size.parse::<u64>().map_err(|e| {
-                    format!("Invalid tensor size '{}' for '{}': {}", t.size, t.name, e)
-                })?;
-                Ok(TensorRecord {
-                    name: t.name,
-                    addr,
-                    size,
-                    device_id: t.device_id,
-                    dtype: t.dtype,
-                })
-            })
-            .collect::<MetadataResult<Vec<_>>>()?;
-
-        Ok(tensors)
     }
 }
 
@@ -239,41 +112,25 @@ impl MetadataBackend for KubernetesBackend {
             }
         }
 
-        // Get CR UID for ownerReferences on ConfigMaps
-        let cr = api.get(&cr_name).await?;
-        let owner_uid = cr.metadata.uid.as_deref();
-        let owner_name = cr.metadata.name.as_deref();
-
-        // Build worker status updates and create ConfigMaps
+        // Build worker status updates
         let mut worker_statuses = Vec::new();
         for worker in &worker_records {
-            let cm_name = self
-                .upsert_tensor_configmap(
-                    source_id,
-                    worker_id,
-                    worker.worker_rank,
-                    &worker.tensors,
-                    owner_name,
-                    owner_uid,
-                )
-                .await?;
-
             let backend_type = worker.backend_metadata.backend_type_str().to_string();
-            let (nixl_metadata, transfer_engine_session_id) = match &worker.backend_metadata {
-                super::BackendMetadataRecord::Nixl(data) => (BASE64.encode(data), None),
-                super::BackendMetadataRecord::TransferEngine(sid) => {
-                    (String::new(), Some(sid.clone()))
-                }
-                super::BackendMetadataRecord::None => (String::new(), None),
+            let metadata_endpoint = super::none_if_empty(worker.metadata_endpoint.clone());
+            let agent_name = super::none_if_empty(worker.agent_name.clone());
+            let worker_grpc_endpoint = super::none_if_empty(worker.worker_grpc_endpoint.clone());
+            let transfer_engine_session_id = match &worker.backend_metadata {
+                super::BackendMetadataRecord::TransferEngine(sid) => Some(sid.clone()),
+                _ => None,
             };
 
             worker_statuses.push(WorkerStatus {
                 worker_rank: worker.worker_rank as i32,
                 backend_type: Some(backend_type),
-                nixl_metadata,
+                metadata_endpoint,
+                agent_name,
                 transfer_engine_session_id,
-                tensor_count: worker.tensors.len() as i32,
-                tensor_config_map: Some(cm_name),
+                worker_grpc_endpoint,
                 status: WorkerStatus::status_name_from_proto(worker.status),
                 updated_at: Some(now.clone()),
             });
@@ -346,14 +203,12 @@ impl MetadataBackend for KubernetesBackend {
             .into());
         }
 
-        let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for '{}' (source_id={}, worker_id={}): {} workers ({} tensors)",
+            "Published metadata for '{}' (source_id={}, worker_id={}): {} workers",
             model_name,
             source_id,
             worker_id,
             worker_records.len(),
-            total_tensors
         );
 
         Ok(())
@@ -388,33 +243,10 @@ impl MetadataBackend for KubernetesBackend {
 
         let mut workers = Vec::new();
         for worker_status in status.workers {
-            let nixl_bytes = if !worker_status.nixl_metadata.is_empty() {
-                BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
-                    format!(
-                        "Failed to decode NIXL metadata for worker {}: {}",
-                        worker_status.worker_rank, e
-                    )
-                })?
-            } else {
-                Vec::new()
-            };
             let backend_metadata = super::BackendMetadataRecord::from_flat(
-                nixl_bytes,
                 worker_status.transfer_engine_session_id.clone(),
                 worker_status.backend_type.as_deref(),
             );
-
-            let tensors = if let Some(cm_name) = &worker_status.tensor_config_map {
-                match self.read_tensor_configmap(cm_name).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("Failed to read tensor ConfigMap '{}': {}", cm_name, e);
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            };
 
             let status = WorkerStatus::status_proto_from_name(&worker_status.status);
             let updated_at = worker_status
@@ -427,7 +259,9 @@ impl MetadataBackend for KubernetesBackend {
             workers.push(WorkerRecord {
                 worker_rank: worker_status.worker_rank as u32,
                 backend_metadata,
-                tensors,
+                metadata_endpoint: worker_status.metadata_endpoint.unwrap_or_default(),
+                agent_name: worker_status.agent_name.unwrap_or_default(),
+                worker_grpc_endpoint: worker_status.worker_grpc_endpoint.unwrap_or_default(),
                 status,
                 updated_at,
             });
@@ -499,8 +333,7 @@ impl MetadataBackend for KubernetesBackend {
                 .unwrap_or(0);
 
             if let Some(required_status) = status_filter {
-                let required_name =
-                    crate::k8s_types::WorkerStatus::status_name_from_proto(required_status as i32);
+                let required_name = WorkerStatus::status_name_from_proto(required_status as i32);
                 let matches = cr
                     .status
                     .as_ref()
@@ -545,27 +378,6 @@ impl MetadataBackend for KubernetesBackend {
             }
         }
 
-        // ConfigMaps are garbage-collected via ownerReferences; also sweep by label
-        let cm_api = self.configmap_api();
-        let cms = cm_api
-            .list(&ListParams::default().labels(&format!(
-                "modelexpress.nvidia.com/mx-source-id={}",
-                source_id
-            )))
-            .await?;
-
-        for cm in cms {
-            if let Some(name) = cm.metadata.name {
-                match cm_api
-                    .delete(&name, &kube::api::DeleteParams::default())
-                    .await
-                {
-                    Ok(_) => debug!("Deleted ConfigMap '{}'", name),
-                    Err(e) => warn!("Failed to delete ConfigMap '{}': {}", name, e),
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -574,7 +386,7 @@ impl MetadataBackend for KubernetesBackend {
         let crs = api.list(&ListParams::default()).await?;
 
         // De-duplicate by source_id (multiple instances share the same source_id)
-        let mut seen = std::collections::BTreeMap::new();
+        let mut seen = BTreeMap::new();
         for cr in crs.items {
             let source_id = cr
                 .metadata

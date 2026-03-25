@@ -22,7 +22,7 @@ pip install -e ".[dev]"
 - Python >= 3.10
 - NVIDIA GPUs with RDMA/InfiniBand support
 - [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
-- A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
+- A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis or Kubernetes CRDs)
 
 ## Quick Start with vLLM
 
@@ -37,8 +37,8 @@ vllm serve deepseek-ai/DeepSeek-V3 \
     --worker-cls modelexpress.vllm_worker.ModelExpressWorker
 ```
 
-Starting the vLLM engine with `mx` loader on the source worker will load the weights from disk and register/publish the NIXL and tensor metadata to the MX server.
-And on the target worker, it will retrieve these metadata from MX serverand stream weights over RDMA from GPU to GPU.
+Starting the vLLM engine with `mx` loader on the source worker will load the weights from disk, register tensors with NIXL, start a per-worker gRPC server for tensor manifests, and publish lightweight metadata to the MX server.
+On the target worker, it will discover the source via the MX server, fetch the tensor manifest directly from the source worker, and stream weights over RDMA from GPU to GPU.
 
 ## Programmatic Usage
 
@@ -51,18 +51,16 @@ from modelexpress import MxClient
 
 client = MxClient(server_url="modelexpress-server:8001")
 
-# Query for a source model
-response = client.get_metadata("deepseek-ai/DeepSeek-V3")
-if response.found:
-    for worker in response.workers:
-        print(f"Worker rank {worker.worker_rank}: {len(worker.tensors)} tensors")
+# List available sources for a model identity
+sources = client.list_sources(identity)
+for src in sources:
+    print(f"Source {src.mx_source_id} worker {src.worker_rank}")
 
-# Wait for source readiness (blocks until ready or timeout)
-success, session_id, metadata_hash = client.wait_for_ready(
-    model_name="deepseek-ai/DeepSeek-V3",
-    worker_id=0,
-    timeout_seconds=7200,
-)
+# Get metadata for a specific worker
+response = client.get_metadata(mx_source_id="abc123...", worker_id="uuid-...")
+if response.found:
+    worker = response.worker
+    print(f"Worker rank {worker.worker_rank}, endpoint: {worker.metadata_endpoint}")
 
 client.close()
 ```
@@ -83,10 +81,9 @@ register_modelexpress_loaders()
 | `MODEL_EXPRESS_URL` | `localhost:8001` | ModelExpress gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compatible alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register `mx` loader with vLLM |
-| `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
-| `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
-| `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
-| `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
+| `MX_METADATA_PORT` | `5555` | Base port for NIXL P2P metadata exchange (per-worker: base + rank) |
+| `MX_WORKER_ADDRESS` | (auto-detect) | Worker IP/hostname for NIXL listen thread and gRPC endpoint |
+| `MX_WORKER_GRPC_PORT` | `6555` | Base port for per-worker gRPC server (per-worker: base + rank) |
 
 ### UCX/NIXL Tuning
 
@@ -109,11 +106,11 @@ register_modelexpress_loaders()
 
 ## How It Works
 
-1. **Source** loads weights from disk, registers raw tensors with NIXL *before* FP8 processing, and publishes metadata to the ModelExpress server.
-2. **Target** creates dummy weights, waits for the source ready flag, then pulls raw tensors via RDMA read.
-3. Both source and target run `process_weights_after_loading()` independently, producing identical FP8-transformed weights.
+1. **Source** loads weights from disk, runs `process_weights_after_loading()`, registers the fully-processed tensors with NIXL, starts a per-worker gRPC server for tensor manifests, and publishes lightweight metadata to the ModelExpress server.
+2. **Target** creates dummy weights, runs `process_weights_after_loading()` on dummies to establish the correct tensor layout, then discovers a ready source via the MX server.
+3. **Target** fetches the tensor manifest directly from the source worker's gRPC server, fetches the NIXL agent blob via native P2P exchange, and pulls processed weights via RDMA.
 
-This pre-processing transfer strategy is critical for FP8 models (e.g., DeepSeek-V3) where `weight_scale_inv` tensors are renamed and transformed during processing.
+This post-processing transfer strategy is critical for FP8 models (e.g., DeepSeek-V3) where `weight_scale_inv` tensors are renamed and transformed during processing. Transferring after processing avoids ~50GB/worker of wasted GPU memory from pinned pre-processing tensors.
 
 ## License
 

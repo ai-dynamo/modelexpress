@@ -14,6 +14,11 @@ Supports a three-tier loading strategy:
     2. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
     3. Disk (vLLM DefaultModelLoader) - standard CPU-staged loading
 
+NIXL agent blobs are exchanged peer-to-peer via NIXL's native listen thread
+(fetch_remote_metadata / check_remote_metadata). The centralized MX server
+only stores lightweight directory entries (endpoints + agent names + tensor
+layouts).
+
 Usage:
     --load-format mx  (auto-detect: RDMA -> GDS -> disk)
 """
@@ -26,8 +31,6 @@ import os
 import random
 import time
 import uuid
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn as nn
 
@@ -49,9 +52,7 @@ from .gds_loader import MxGdsLoader
 from .gds_transfer import is_gds_available
 from .nixl_transfer import NixlTransferManager, is_nixl_available
 from .types import TensorDescriptor
-
-if TYPE_CHECKING:
-    from .nixl_transfer import NixlTransferManager
+from .worker_server import WorkerGrpcServer, fetch_tensor_manifest
 
 logger = logging.getLogger("modelexpress.vllm_loader")
 
@@ -112,11 +113,38 @@ class SourceTransferError(Exception):
     so they propagate without poisoning a healthy source.
     """
 
+_MX_METADATA_PORT_DEFAULT = 5555
+_MX_WORKER_GRPC_PORT_DEFAULT = 6555
 
 # ---------------------------------------------------------------------------
 # Shared helpers used by multiple loaders
 # ---------------------------------------------------------------------------
 
+
+def _get_listen_port(device_id: int) -> int:
+    """Compute the NIXL listen port for a given device/rank."""
+    base_port = int(os.environ.get("MX_METADATA_PORT", str(_MX_METADATA_PORT_DEFAULT)))
+    return base_port + device_id
+
+
+def _get_worker_grpc_port(device_id: int) -> int:
+    """Compute the worker gRPC port for a given device/rank."""
+    base_port = int(os.environ.get("MX_WORKER_GRPC_PORT", str(_MX_WORKER_GRPC_PORT_DEFAULT)))
+    return base_port + device_id
+
+
+def _tensors_from_proto(tensor_protos) -> list[TensorDescriptor]:
+    """Convert a list of TensorDescriptor protos to TensorDescriptor dataclasses."""
+    return [
+        TensorDescriptor(
+            name=t.name,
+            addr=t.addr,
+            size=t.size,
+            device_id=t.device_id,
+            dtype=t.dtype,
+        )
+        for t in tensor_protos
+    ]
 
 
 def _iter_module_tensors(
@@ -231,13 +259,24 @@ def _collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _init_nixl_manager(global_rank: int, device_id: int, role: str) -> NixlTransferManager:
-    """Create and initialize a NIXL transfer manager."""
+def _init_nixl_manager(
+    global_rank: int, device_id: int, role: str, listen_port: int | None = None,
+) -> NixlTransferManager:
+    """Create and initialize a NIXL transfer manager.
+
+    Args:
+        global_rank: Global rank for agent naming.
+        device_id: GPU device ID for this worker.
+        role: Role string for agent naming (e.g., "auto").
+        listen_port: If specified, enables the NIXL listen thread on this port
+            for native peer-to-peer metadata exchange.
+    """
     agent_name = f"mx-{role}-worker{global_rank}-{uuid.uuid4().hex[:8]}"
     logger.debug(f"[Worker {global_rank}] Initializing NIXL manager with agent_name={agent_name}")
     manager = NixlTransferManager(
         agent_name=agent_name,
         device_id=device_id,
+        listen_port=listen_port,
     )
     manager.initialize()
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
@@ -264,6 +303,24 @@ def _log_tensor_summary(
                 f"[Worker {global_rank}] Sample tensor '{name}': "
                 f"shape={t.shape}, dtype={t.dtype}, checksum={checksum}"
             )
+
+
+def _get_worker_host() -> str:
+    """Get the host address for this worker's NIXL listen thread."""
+    import socket
+    host = os.environ.get(
+        "MX_WORKER_ADDRESS",
+        os.environ.get("POD_IP"),
+    )
+    if host:
+        return host
+    host = socket.getfqdn()
+    if host and host not in ("localhost", "localhost.localdomain"):
+        return host
+    raise RuntimeError(
+        "Unable to determine a routable worker address. "
+        "Set MX_WORKER_ADDRESS or POD_IP."
+    )
 
 
 def _build_source_identity(
@@ -307,70 +364,60 @@ def _publish_metadata_and_ready(
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
+    metadata_endpoint: str = "",
+    worker_grpc_endpoint: str = "",
 ) -> None:
-    """Publish tensor metadata and ready flag to the ModelExpress server."""
+    """Start a per-worker gRPC server for the tensor manifest, then publish
+    lightweight metadata and ready flag to the ModelExpress server.
+
+    Tensor descriptors are served directly by the worker's gRPC server.
+    The centralized MX server only stores endpoints and agent names.
+    """
     logger.info(
-        f"[Worker {global_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {global_rank}] Publishing metadata for model '{identity.model_name}' "
+        f"({len(tensors)} tensors served at {worker_grpc_endpoint})"
     )
 
-    try:
-        use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
-
-        if use_contiguous:
-            region_descriptors = nixl_manager.get_registered_descriptors()
-            tensor_protos = [
-                p2p_pb2.TensorDescriptor(
-                    name=desc.name,
-                    addr=desc.addr,
-                    size=desc.size,
-                    device_id=desc.device_id,
-                    dtype=desc.dtype,
-                )
-                for desc in region_descriptors
-            ]
-            logger.info(
-                f"[Worker {global_rank}] Built {len(tensor_protos)} REGION descriptors "
-                f"(MX_CONTIGUOUS_REG=1)"
-            )
-        else:
-            tensor_protos = [
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=t.data_ptr(),
-                    size=t.numel() * t.element_size(),
-                    device_id=device_id,
-                    dtype=str(t.dtype),
-                )
-                for name, t in tensors.items()
-            ]
-
-        nixl_metadata = nixl_manager.nixl_metadata
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=global_rank,
-            nixl_metadata=nixl_metadata,
-            tensors=tensor_protos,
+    tensor_protos = [
+        p2p_pb2.TensorDescriptor(
+            name=name,
+            addr=t.data_ptr(),
+            size=t.numel() * t.element_size(),
+            device_id=device_id,
+            dtype=str(t.dtype),
         )
+        for name, t in tensors.items()
+    ]
 
-        mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
-        logger.info(
-            f"[Worker {global_rank}] Published metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
-        )
-        success = mx_client.update_status(
-            mx_source_id=mx_source_id,
-            worker_id=worker_id,
-            worker_rank=global_rank,
-            status=p2p_pb2.SOURCE_STATUS_READY,
-        )
-        if not success:
-            logger.error(
-                f"[Worker {global_rank}] UpdateStatus to READY failed for "
-                f"model '{identity.model_name}' (mx_source_id={mx_source_id})"
-            )
+    # Start per-worker gRPC server to serve tensor manifest
+    grpc_port = _get_worker_grpc_port(device_id)
+    server = WorkerGrpcServer(tensor_protos, port=grpc_port, alloc_ends=nixl_manager.alloc_ends)
+    server.start()
+    _worker_servers[device_id] = server
 
-    except Exception:
-        raise
+    worker = p2p_pb2.WorkerMetadata(
+        worker_rank=global_rank,
+        metadata_endpoint=metadata_endpoint,
+        agent_name=nixl_manager.agent_name,
+        worker_grpc_endpoint=worker_grpc_endpoint,
+    )
+
+    mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
+    logger.info(
+        f"[Worker {global_rank}] Published metadata to MX server "
+        f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+    )
+    success = mx_client.update_status(
+        mx_source_id=mx_source_id,
+        worker_id=worker_id,
+        worker_rank=global_rank,
+        status=p2p_pb2.SOURCE_STATUS_READY,
+    )
+    if not success:
+        logger.error(
+            f"[Worker {global_rank}] UpdateStatus to READY failed for "
+            f"model '{identity.model_name}' (mx_source_id={mx_source_id})"
+        )
 
 
 @register_model_loader("mx")
@@ -466,9 +513,10 @@ class MxModelLoader(BaseModelLoader):
         worker_id: str,
         global_rank: int,
     ) -> p2p_pb2.WorkerMetadata | None:
-        """Fetch tensor metadata for one worker.
+        """Fetch lightweight metadata for one worker from the MX server.
 
-        Returns None if the worker is not found or has no tensors.
+        Returns None if the worker is not found or has no worker_grpc_endpoint.
+        Tensor manifests are fetched separately from the worker's gRPC server.
         """
         metadata_resp = self._mx_client.get_metadata(
             mx_source_id=mx_source_id,
@@ -480,9 +528,9 @@ class MxModelLoader(BaseModelLoader):
             )
             return None
         worker = metadata_resp.worker
-        if not worker.tensors:
+        if not worker.worker_grpc_endpoint:
             logger.debug(
-                f"[Worker {global_rank}] Worker {worker_id} has no tensors, skipping"
+                f"[Worker {global_rank}] Worker {worker_id} has no worker_grpc_endpoint, skipping"
             )
             return None
         return worker
@@ -514,7 +562,7 @@ class MxModelLoader(BaseModelLoader):
                     continue
                 logger.info(
                     f"[Worker {global_rank}] Trying source worker {worker_id} "
-                    f"({len(source_worker.tensors)} tensors)"
+                    f"(grpc={source_worker.worker_grpc_endpoint})"
                 )
                 self._load_as_target(
                     model, model_config, target_device,
@@ -524,8 +572,7 @@ class MxModelLoader(BaseModelLoader):
             except SourceTransferError as e:
                 logger.warning(
                     f"[Worker {global_rank}] Source-side failure for worker {worker_id}: {e}. "
-                    f"Marking STALE and trying next. "
-                    f"TODO: heartbeat mechanism will handle STALE marking automatically."
+                        f"Marking STALE and trying next."
                 )
                 # TODO: heartbeat will mark workers STALE automatically on pod deletion
                 self._mx_client.update_status(
@@ -608,7 +655,7 @@ class MxModelLoader(BaseModelLoader):
 
         # RDMA receive (fully-processed tensors, no post-processing needed)
         # Raises SourceTransferError on source-side failures
-        self._receive_from_peer(model, global_rank, device_id, source_worker)
+        self._receive_from_peer(model, global_rank, device_id, source_worker, identity)
 
         # Publish metadata so future nodes can discover us
         self._publish_metadata(global_rank, device_id, identity)
@@ -619,6 +666,7 @@ class MxModelLoader(BaseModelLoader):
         global_rank: int,
         device_id: int,
         source_worker,
+        identity: "p2p_pb2.SourceIdentity",
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source.
 
@@ -628,44 +676,56 @@ class MxModelLoader(BaseModelLoader):
         receive_start = time.perf_counter()
         self._register_tensors(model, global_rank, device_id)
 
-        # Build source tensor descriptors
-        source_tensors = [
-            TensorDescriptor(
-                name=t.name,
-                addr=t.addr,
-                size=t.size,
-                device_id=t.device_id,
-                dtype=t.dtype,
-            )
-            for t in source_worker.tensors
-        ]
-
+        # Fetch tensor manifest directly from source worker's gRPC server
+        worker_grpc_ep = source_worker.worker_grpc_endpoint
+        logger.info(f"[Worker {global_rank}] Fetching tensor manifest from {worker_grpc_ep}")
+        manifest_start = time.perf_counter()
+        tensor_protos, source_alloc_ends = fetch_tensor_manifest(worker_grpc_ep)
+        manifest_time = time.perf_counter() - manifest_start
+        source_tensors = _tensors_from_proto(tensor_protos)
         logger.info(
-            f"[Worker {global_rank}] Receiving {len(source_tensors)} tensors from source"
+            f"[Worker {global_rank}] [TIMING] Tensor manifest fetched in {manifest_time:.3f}s: "
+            f"{len(source_tensors)} tensors, {len(source_alloc_ends)} alloc_ends"
         )
 
-        coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
+        # Parse source endpoint and agent name for NIXL native P2P exchange
+        source_endpoint = source_worker.metadata_endpoint
+        source_agent_name = source_worker.agent_name
+        host, port_str = source_endpoint.rsplit(":", 1)
+        source_port = int(port_str)
 
-        transfer_start = time.perf_counter()
+        # Fetch remote metadata via NIXL native P2P
+        fetch_start = time.perf_counter()
+        remote_agent = self._nixl_manager.fetch_remote_and_wait(
+            agent_name=source_agent_name,
+            ip=host,
+            port=source_port,
+        )
+        fetch_time = time.perf_counter() - fetch_start
+        logger.info(f"[Worker {global_rank}] [TIMING] NIXL metadata fetched in {fetch_time:.3f}s")
+
         try:
+            transfer_start = time.perf_counter()
             bytes_transferred, tensor_count, _ = self._nixl_manager.receive_from_source(
-                source_metadata=source_worker.nixl_metadata,
+                source_metadata=None,
                 source_tensors=source_tensors,
                 timeout_seconds=300.0,
-                coalesce_transfers=coalesce,
+                coalesce_transfers=True,
+                remote_agent_name=remote_agent,
+                source_alloc_ends=source_alloc_ends,
             )
-        except Exception as e:
-            raise SourceTransferError(f"RDMA receive failed: {e}") from e
-        transfer_time = time.perf_counter() - transfer_start
+            transfer_time = time.perf_counter() - transfer_start
 
-        bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
-        logger.info(
-            f"[Worker {global_rank}] [TIMING] RDMA transfer complete: "
-            f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
-            f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
-        )
-
-        torch.cuda.synchronize()
+            bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
+            logger.info(
+                f"[Worker {global_rank}] [TIMING] RDMA transfer complete: "
+                f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
+                f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
+            )
+        except Exception as transfer_err:
+            raise SourceTransferError(
+                f"RDMA transfer failed: {transfer_err}"
+            ) from transfer_err
 
         total_time = time.perf_counter() - receive_start
         logger.info(f"[Worker {global_rank}] [TIMING] Total receive time: {total_time:.2f}s")
@@ -750,8 +810,12 @@ class MxModelLoader(BaseModelLoader):
         self._tensors = _collect_module_tensors(model)
         _log_tensor_summary(self._tensors, global_rank, "Registering tensors")
 
+        listen_port = _get_listen_port(device_id)
+
         if self._nixl_manager is None:
-            self._nixl_manager = _init_nixl_manager(global_rank, device_id, "auto")
+            self._nixl_manager = _init_nixl_manager(
+                global_rank, device_id, "auto", listen_port=listen_port,
+            )
 
         if not self._nixl_manager.tensor_descriptors:
             logger.debug(f"[Worker {global_rank}] Registering tensors with NIXL...")
@@ -763,9 +827,21 @@ class MxModelLoader(BaseModelLoader):
 
     def _publish_metadata(self, global_rank: int, device_id: int, identity: "p2p_pb2.SourceIdentity") -> None:
         """Publish metadata to the MX server."""
+        listen_port = _get_listen_port(device_id)
+        grpc_port = _get_worker_grpc_port(device_id)
+        host = _get_worker_host()
+        metadata_endpoint = f"{host}:{listen_port}"
+        worker_grpc_endpoint = f"{host}:{grpc_port}"
+        agent_name = self._nixl_manager.agent_name
+        logger.info(
+            f"[Worker {global_rank}] NIXL listen thread at {metadata_endpoint} "
+            f"(agent={agent_name}), worker gRPC at {worker_grpc_endpoint}"
+        )
         _publish_metadata_and_ready(
             self._mx_client, self._nixl_manager, self._tensors,
-            global_rank, device_id, identity, self._worker_id
+            global_rank, device_id, identity, self._worker_id,
+            metadata_endpoint=metadata_endpoint,
+            worker_grpc_endpoint=worker_grpc_endpoint,
         )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -794,3 +870,4 @@ class MxModelLoader(BaseModelLoader):
 # Each device_id maps to exactly one loader, so there are no concurrent writers.
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, "NixlTransferManager"] = {}
+_worker_servers: dict[int, "WorkerGrpcServer"] = {}

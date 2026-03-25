@@ -224,7 +224,7 @@ cargo bench
 - **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
 - **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
 - **Large model gRPC stream** — May not close automatically; use client timeout.
-- **MX_CONTIGUOUS_REG=1** — Blocked; use `0`.
+- **Pool-based NIXL registration** — Memory pools are detected and registered automatically; per-tensor registration is no longer used.
 
 ---
 

@@ -64,10 +64,12 @@ spec:
             # Server address for metadata publishing
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            # Baseline: individual tensor registration (stable and tested)
-            # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
-            - name: MX_CONTIGUOUS_REG
-              value: "0"
+            # Base port for NIXL P2P metadata exchange (per-worker: base + rank)
+            - name: MX_METADATA_PORT
+              value: "5555"
+            # Base port for per-worker gRPC server serving tensor manifests (per-worker: base + rank)
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
             # Logging (set to DEBUG for troubleshooting)
             - name: NIXL_LOG_LEVEL
               value: "INFO"

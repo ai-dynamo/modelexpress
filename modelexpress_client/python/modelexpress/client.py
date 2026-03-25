@@ -4,9 +4,10 @@
 """
 ModelExpress Client for P2P GPU Weight Transfers.
 
-Orchestrates NIXL/RDMA transfers between vLLM workers. The client fetches
-NIXL metadata from workers via ZMQ, queries the ModelExpress server for
-existing sources, and instructs workers to receive weights if found.
+Lightweight gRPC client that talks to the ModelExpress server. Workers
+discover each other through the server (metadata endpoints, agent names,
+status) and exchange NIXL agent blobs peer-to-peer. Tensor manifests
+are served directly by source workers via WorkerService gRPC.
 
 NIXL agents live in vLLM workers (not here) because GPU memory must be
 registered by the owning process for GPUDirect RDMA.

@@ -1,0 +1,191 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# NIXL registration count diagnostic on nScale.
+# Deploys src + tgt pods on separate nodes, runs the sweep script.
+#
+# Usage:
+#   # Build and push the image first (or use an existing NIXL image):
+#   kubectl apply -f nixl_reg_count_k8s.yaml
+#   kubectl logs -f pod/nixl-diag-tgt -n nnoble-mx-repro
+#   kubectl delete -f nixl_reg_count_k8s.yaml
+#
+# To test with UCX rcache disabled, add to both containers' env:
+#   - name: UCX_RCACHE_ENABLE
+#     value: "n"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nnoble-mx-repro
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-diag-src
+  namespace: nnoble-mx-repro
+  labels:
+    app: nixl-diag
+    role: source
+spec:
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-B200
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: nixl-diag
+          topologyKey: kubernetes.io/hostname
+  restartPolicy: Never
+  containers:
+    - name: diag
+      image: nnoble447/modelexpress-client:pool-reg-v2
+      command:
+        - /bin/bash
+        - -c
+        - |
+          ulimit -l unlimited
+          echo "Source ready, waiting for target..."
+          python3 /scripts/nixl_reg_count_diagnostic.py --role source --mode ${DIAG_MODE:-whole-alloc}
+      env:
+        - name: UCX_TLS
+          value: "rc_x,rc,dc_x,dc,cuda_copy"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+        requests:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+          memory: "16Gi"
+          cpu: "2"
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: scripts
+          mountPath: /scripts
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
+    - name: scripts
+      configMap:
+        name: nixl-diag-scripts
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-diag-tgt
+  namespace: nnoble-mx-repro
+  labels:
+    app: nixl-diag
+    role: target
+spec:
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-B200
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: nixl-diag
+          topologyKey: kubernetes.io/hostname
+  restartPolicy: Never
+  containers:
+    - name: diag
+      image: nnoble447/modelexpress-client:pool-reg-v2
+      command:
+        - /bin/bash
+        - -c
+        - |
+          ulimit -l unlimited
+          echo "Waiting for source pod IP..."
+          while true; do
+            SRC_IP=$(python3 -c "
+          import socket
+          try:
+              ip = socket.gethostbyname('nixl-diag-src.nnoble-mx-repro.svc.cluster.local')
+              print(ip)
+          except:
+              pass
+          " 2>/dev/null)
+            if [ -n "$SRC_IP" ]; then
+              echo "Source IP: $SRC_IP"
+              break
+            fi
+            sleep 2
+          done
+          sleep 5
+          python3 /scripts/nixl_reg_count_diagnostic.py --role target --mode ${DIAG_MODE:-whole-alloc} --peer-ip $SRC_IP
+      env:
+        - name: UCX_TLS
+          value: "rc_x,rc,dc_x,dc,cuda_copy"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+        requests:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+          memory: "16Gi"
+          cpu: "2"
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: scripts
+          mountPath: /scripts
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
+    - name: scripts
+      configMap:
+        name: nixl-diag-scripts
+---
+# Headless service for pod DNS resolution
+apiVersion: v1
+kind: Service
+metadata:
+  name: nixl-diag-src
+  namespace: nnoble-mx-repro
+spec:
+  clusterIP: None
+  selector:
+    app: nixl-diag
+    role: source
+  ports:
+    - name: nixl
+      port: 5580
+    - name: coord
+      port: 9998

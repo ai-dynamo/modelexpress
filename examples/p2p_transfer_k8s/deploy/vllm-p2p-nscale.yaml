@@ -1,0 +1,255 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# vLLM P2P weight transfer with pool-based NIXL registration on nScale B200.
+# Tests pool registration + NIXL native P2P metadata exchange + RDMA transfer.
+#
+# Uses Llama-3.1-8B (single GPU, ~16 GB).
+# 3 replicas across different nodes: first loads from disk, others receive via NIXL/RDMA.
+#
+# Prerequisites:
+#   - CRD applied: kubectl apply -f ../persistence/crd-modelmetadata.yaml
+#   - HF token secret: kubectl create secret generic hf-token-secret \
+#       --from-literal=HF_TOKEN=<token> -n nnoble-mx-p2p
+#   - Images pushed:
+#       nnoble447/modelexpress-server:pool-reg-v2
+#       nnoble447/modelexpress-client:pool-reg-v2
+#
+# Usage:
+#   kubectl apply -f ../persistence/crd-modelmetadata.yaml
+#   kubectl apply -f vllm-p2p-nscale.yaml
+#   kubectl logs -f deployment/mx-vllm -n nnoble-mx-p2p
+#   kubectl delete ns nnoble-mx-p2p
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nnoble-mx-p2p
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  namespace: nnoble-mx-p2p
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: modelexpress-metadata
+  namespace: nnoble-mx-p2p
+rules:
+  - apiGroups: [modelexpress.nvidia.com]
+    resources: [modelmetadatas, modelmetadatas/status]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: modelexpress-metadata
+  namespace: nnoble-mx-p2p
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: modelexpress-metadata
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+    namespace: nnoble-mx-p2p
+---
+# ModelExpress gRPC server (CRD backend) for source discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+  namespace: nnoble-mx-p2p
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: grpc
+  selector:
+    app: modelexpress-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  namespace: nnoble-mx-p2p
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      serviceAccountName: modelexpress
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: server
+          image: nnoble447/modelexpress-server:pool-reg-v2
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+# vLLM workers with P2P metadata exchange + pool-based NIXL registration
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm
+  namespace: nnoble-mx-p2p
+  labels:
+    app: mx-vllm
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mx-vllm
+  template:
+    metadata:
+      labels:
+        app: mx-vllm
+    spec:
+      serviceAccountName: modelexpress
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-vllm
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      containers:
+        - name: vllm
+          image: nnoble447/modelexpress-client:pool-reg-v2
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          command: ["/bin/bash", "-c", "ulimit -l unlimited && exec python3 -m vllm.entrypoints.openai.api_server \"$@\"", "--"]
+          args:
+            - --model
+            - meta-llama/Llama-3.1-8B
+            - --load-format
+            - mx
+            - --gpu-memory-utilization
+            - "0.9"
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.nnoble-mx-p2p.svc.cluster.local:8001"
+            # Worker address for NIXL listen thread + gRPC
+            - name: MX_WORKER_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # NIXL P2P metadata exchange port
+            - name: MX_METADATA_PORT
+              value: "5555"
+            # Worker gRPC port for tensor manifest
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            # Single GPU, single worker
+            - name: MX_EXPECTED_WORKERS
+              value: "1"
+            - name: MX_SYNC_PUBLISH
+              value: "1"
+            - name: MX_SYNC_START
+              value: "1"
+            # UCX transport: GPUDirect RDMA over InfiniBand
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            # Logging
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: 8000
+            - containerPort: 5555
+            - containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "32Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 32Gi

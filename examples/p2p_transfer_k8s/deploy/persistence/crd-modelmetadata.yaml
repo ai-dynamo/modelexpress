@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # ModelMetadata CRD for ModelExpress P2P transfers
-# This CRD stores NIXL metadata and coordination state as an alternative to Redis
+# This CRD stores P2P transfer coordination state as an alternative to Redis
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -35,7 +35,7 @@ spec:
               properties:
                 workers:
                   type: array
-                  description: Per-worker NIXL metadata and readiness state
+                  description: Per-worker P2P transfer metadata and lifecycle state
                   items:
                     type: object
                     required:
@@ -51,19 +51,18 @@ spec:
                           - nixl
                           - transfer_engine
                           - none
-                      nixlMetadata:
+                      metadataEndpoint:
                         type: string
-                        format: byte
-                        description: Base64-encoded NIXL agent metadata blob
+                        description: Endpoint (host:port) where the worker's NIXL listen thread serves metadata
+                      agentName:
+                        type: string
+                        description: NIXL agent name for this worker
                       transferEngineSessionId:
                         type: string
                         description: Mooncake TransferEngine session ID (ip:port)
-                      tensorCount:
-                        type: integer
-                        description: Number of tensors registered by this worker
-                      tensorConfigMap:
+                      workerGrpcEndpoint:
                         type: string
-                        description: Name of ConfigMap containing tensor descriptors
+                        description: Endpoint (host:port) for this worker's gRPC server (WorkerService)
                       status:
                         type: string
                         description: Worker lifecycle status
@@ -90,7 +89,6 @@ spec:
                         type: string
                         description: Condition type
                         enum:
-                          - AllWorkersPublished
                           - Ready
                       status:
                         type: string

@@ -3,7 +3,7 @@
 
 """Tests for the shared helpers and MxModelLoader detection logic."""
 
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -34,12 +34,13 @@ def _make_identity(model_name="test-model"):
     return p2p_pb2.SourceIdentity(model_name=model_name)
 
 
-def _make_worker(rank=0, n_tensors=3):
-    tensors = [
-        p2p_pb2.TensorDescriptor(name=f"t{i}", addr=0x1000 + i, size=1024, device_id=rank, dtype="bfloat16")
-        for i in range(n_tensors)
-    ]
-    return p2p_pb2.WorkerMetadata(worker_rank=rank, tensors=tensors)
+def _make_worker(rank=0, worker_grpc_endpoint="10.0.0.1:60051"):
+    return p2p_pb2.WorkerMetadata(
+        worker_rank=rank,
+        worker_grpc_endpoint=worker_grpc_endpoint,
+        metadata_endpoint="10.0.0.1:5555",
+        agent_name="mx-auto-worker0-abc12345",
+    )
 
 
 def _make_instance_ref(mx_source_id="abc123def456abcd", worker_id="inst-1", model_name="test-model", worker_rank=0):
@@ -52,7 +53,7 @@ def _make_instance_ref(mx_source_id="abc123def456abcd", worker_id="inst-1", mode
 
 
 def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", worker_id="inst-1"):
-    worker = _make_worker(rank=rank) if found else None
+    worker = _make_worker(rank=rank, worker_grpc_endpoint="10.0.0.1:60051") if found else None
     return p2p_pb2.GetMetadataResponse(
         found=found,
         worker=worker,
@@ -262,9 +263,9 @@ class TestFetchWorkerMetadata:
         result = loader._fetch_worker_metadata("src", "w-1", global_rank=0)
         assert result is None
 
-    def test_returns_none_when_worker_has_no_tensors(self):
+    def test_returns_none_when_worker_has_no_grpc_endpoint(self):
         loader = _make_loader()
-        empty_worker = p2p_pb2.WorkerMetadata(worker_rank=0, tensors=[])
+        empty_worker = p2p_pb2.WorkerMetadata(worker_rank=0, worker_grpc_endpoint="")
         loader._mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
             found=True, worker=empty_worker,
         )
@@ -396,7 +397,7 @@ class TestPublishMetadataAndReady:
         mx_client.update_status.return_value = True
 
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"nixl-data"
+        nixl_manager.agent_name = "mx-auto-worker2-abc12345"
 
         tensors = {}
         for i in range(3):
@@ -408,13 +409,25 @@ class TestPublishMetadataAndReady:
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
-            _publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
+        with patch("modelexpress.vllm_loader.WorkerGrpcServer") as mock_server_cls:
+            mock_server = MagicMock()
+            mock_server_cls.return_value = mock_server
+            _publish_metadata_and_ready(
+                mx_client, nixl_manager, tensors, global_rank=2, device_id=0,
+                identity=identity, worker_id="inst-uuid",
+                worker_grpc_endpoint="10.0.0.1:6555",
+            )
+
+        # Worker gRPC server should be started
+        mock_server.start.assert_called_once()
 
         mx_client.publish_metadata.assert_called_once()
         call_args = mx_client.publish_metadata.call_args
         assert call_args.args[0] is identity
         assert call_args.args[2] == "inst-uuid"
+        # Published worker should have worker_grpc_endpoint, not tensors
+        worker_proto = call_args.args[1]
+        assert worker_proto.worker_grpc_endpoint == "10.0.0.1:6555"
 
         mx_client.update_status.assert_called_once_with(
             mx_source_id="abc123def456abcd",
@@ -432,11 +445,14 @@ class TestPublishMetadataAndReady:
         mx_client.update_status.return_value = False  # server rejected
 
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
+        nixl_manager.agent_name = "mx-auto-worker0-abc12345"
 
         identity = _make_identity()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
-            _publish_metadata_and_ready(mx_client, nixl_manager, {}, global_rank=0, device_id=0, identity=identity, worker_id="w-1")
+        with patch("modelexpress.vllm_loader.WorkerGrpcServer"):
+            _publish_metadata_and_ready(
+                mx_client, nixl_manager, {}, global_rank=0, device_id=0,
+                identity=identity, worker_id="w-1",
+            )
 
     def test_publish_failure_raises(self):
         """publish_metadata raising should propagate out."""
@@ -446,9 +462,116 @@ class TestPublishMetadataAndReady:
         mx_client.publish_metadata.side_effect = RuntimeError("grpc error")
 
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
+        nixl_manager.agent_name = "mx-auto-worker0-abc12345"
 
         identity = _make_identity()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}):
+        with patch("modelexpress.vllm_loader.WorkerGrpcServer"):
             with pytest.raises(RuntimeError, match="grpc error"):
-                _publish_metadata_and_ready(mx_client, nixl_manager, {}, global_rank=0, device_id=0, identity=identity, worker_id="w-1")
+                _publish_metadata_and_ready(
+                    mx_client, nixl_manager, {}, global_rank=0, device_id=0,
+                    identity=identity, worker_id="w-1",
+                )
+
+
+# ---------------------------------------------------------------------------
+# fetch_remote_and_wait
+# ---------------------------------------------------------------------------
+
+
+class TestFetchRemoteAndWait:
+    """Tests for NixlTransferManager.fetch_remote_and_wait."""
+
+    def test_timeout_raises(self):
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        manager = NixlTransferManager.__new__(NixlTransferManager)
+        agent = MagicMock()
+        agent.check_remote_metadata.return_value = False
+        manager._agent = agent
+
+        with pytest.raises(TimeoutError, match="Timed out"):
+            manager.fetch_remote_and_wait(
+                agent_name="remote-agent",
+                ip="10.0.0.1",
+                port=5555,
+                timeout=0.05,
+            )
+
+        agent.fetch_remote_metadata.assert_called_once_with("remote-agent", "10.0.0.1", 5555)
+
+    def test_successful_poll_returns_agent_name(self):
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        manager = NixlTransferManager.__new__(NixlTransferManager)
+        agent = MagicMock()
+        # Succeed on the second check
+        agent.check_remote_metadata.side_effect = [False, True]
+        manager._agent = agent
+
+        result = manager.fetch_remote_and_wait(
+            agent_name="remote-agent",
+            ip="10.0.0.1",
+            port=5555,
+            timeout=5.0,
+        )
+        assert result == "remote-agent"
+
+
+# ---------------------------------------------------------------------------
+# _get_worker_host
+# ---------------------------------------------------------------------------
+
+
+class TestGetWorkerHost:
+    """Tests for _get_worker_host env var priority."""
+
+    def test_mx_worker_address_takes_priority(self):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        with patch.dict("os.environ", {
+            "MX_WORKER_ADDRESS": "explicit-host",
+            "POD_IP": "10.0.0.99",
+        }):
+            assert _get_worker_host() == "explicit-host"
+
+    def test_pod_ip_fallback(self):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        env = {"POD_IP": "10.0.0.99"}
+        with patch.dict("os.environ", env, clear=False):
+            # Remove MX_WORKER_ADDRESS if present
+            import os
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            assert _get_worker_host() == "10.0.0.99"
+
+    @patch("socket.getfqdn", return_value="worker-node.local")
+    def test_fqdn_fallback(self, _mock_fqdn):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            os.environ.pop("POD_IP", None)
+            assert _get_worker_host() == "worker-node.local"
+
+    @patch("socket.getfqdn", return_value="localhost")
+    def test_localhost_fqdn_raises(self, _mock_fqdn):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            os.environ.pop("POD_IP", None)
+            with pytest.raises(RuntimeError, match="routable worker address"):
+                _get_worker_host()
+
+    @patch("socket.getfqdn", return_value="localhost.localdomain")
+    def test_localhost_localdomain_raises(self, _mock_fqdn):
+        from modelexpress.vllm_loader import _get_worker_host
+
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MX_WORKER_ADDRESS", None)
+            os.environ.pop("POD_IP", None)
+            with pytest.raises(RuntimeError, match="routable worker address"):
+                _get_worker_host()

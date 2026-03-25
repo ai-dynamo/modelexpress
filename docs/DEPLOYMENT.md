@@ -229,10 +229,9 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
-| `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
-| `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
+| `MX_METADATA_PORT` | `5555` | Base port for NIXL P2P metadata exchange (per-worker: base + rank) |
+| `MX_WORKER_ADDRESS` | (auto-detect) | Worker IP/hostname for NIXL listen thread endpoint. Falls back to `POD_IP`, then FQDN. |
+| `MX_WORKER_GRPC_PORT` | `6555` | Base port for per-worker gRPC server (WorkerService, per-worker: base + rank) |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
 
 vLLM instances must use the custom worker class for loader registration in spawned processes:

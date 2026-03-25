@@ -4,8 +4,12 @@
 //! State management for P2P model metadata.
 //!
 //! `P2pStateManager` wraps a metadata backend (Redis or Kubernetes CRD).
-//! All state — model metadata and source status — is persisted to the backend,
+//! All state -- model metadata and source status -- is persisted to the backend,
 //! making the server stateless and horizontally scalable.
+//!
+//! NIXL agent blobs are NOT stored here. Workers exchange them peer-to-peer
+//! via NIXL's native listen thread. The backend only holds lightweight directory
+//! entries: endpoints, agent names, and status.
 
 use crate::metadata_backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
 use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
@@ -14,9 +18,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
-pub use crate::metadata_backend::{
-    BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
-};
+pub use crate::metadata_backend::{BackendMetadataRecord, ModelMetadataRecord, WorkerRecord};
 
 /// State manager that handles P2P metadata operations.
 ///
@@ -118,7 +120,7 @@ impl P2pStateManager {
             .await
     }
 
-    /// Get full tensor metadata for one specific instance.
+    /// Get metadata for one specific instance.
     pub async fn get_metadata(
         &self,
         source_id: &str,
@@ -184,9 +186,7 @@ mod tests {
     use super::*;
     use crate::metadata_backend::MockMetadataBackend;
     use mockall::predicate::eq;
-    use modelexpress_common::grpc::p2p::{
-        MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor,
-    };
+    use modelexpress_common::grpc::p2p::{MxSourceType, SourceIdentity, SourceStatus};
 
     fn test_identity() -> SourceIdentity {
         SourceIdentity {
@@ -204,38 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn test_tensor_record_conversion() {
-        let desc = TensorDescriptor {
-            name: "model.layers.0.weight".to_string(),
-            addr: 0x7f0000000000,
-            size: 1024 * 1024 * 1024,
-            device_id: 0,
-            dtype: "bfloat16".to_string(),
-        };
-
-        let record = TensorRecord::from(desc.clone());
-        assert_eq!(record.name, "model.layers.0.weight");
-        assert_eq!(record.size, 1024 * 1024 * 1024);
-
-        let back: TensorDescriptor = record.into();
-        assert_eq!(back.name, desc.name);
-        assert_eq!(back.addr, desc.addr);
-    }
-
-    #[test]
-    fn test_worker_record_conversion() {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
-
+    fn test_worker_record_conversion_nixl() {
         let meta = WorkerMetadata {
             worker_rank: 3,
-            backend_metadata: Some(BackendMetadata::NixlMetadata(vec![1, 2, 3, 4, 5])),
-            tensors: vec![TensorDescriptor {
-                name: "test.weight".to_string(),
-                addr: 0x1000,
-                size: 4096,
-                device_id: 3,
-                dtype: "float16".to_string(),
-            }],
+            metadata_endpoint: "10.0.1.5:50051".to_string(),
+            agent_name: "mx-source-worker3-abc12345".to_string(),
+            worker_grpc_endpoint: "10.0.1.5:60051".to_string(),
+            transfer_engine_session_id: String::new(),
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
         };
@@ -244,33 +219,29 @@ mod tests {
         assert_eq!(record.worker_rank, 3);
         assert!(matches!(
             &record.backend_metadata,
-            BackendMetadataRecord::Nixl(d) if d == &vec![1, 2, 3, 4, 5]
+            BackendMetadataRecord::Nixl
         ));
-        assert_eq!(record.tensors.len(), 1);
+        assert_eq!(record.metadata_endpoint, "10.0.1.5:50051");
+        assert_eq!(record.agent_name, "mx-source-worker3-abc12345");
+        assert_eq!(record.worker_grpc_endpoint, "10.0.1.5:60051");
         assert_eq!(record.status, SourceStatus::Initializing as i32);
         assert_eq!(record.updated_at, 1234567890000);
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
-        assert_eq!(back.backend_metadata, meta.backend_metadata);
+        assert_eq!(back.metadata_endpoint, meta.metadata_endpoint);
+        assert_eq!(back.agent_name, meta.agent_name);
+        assert_eq!(back.worker_grpc_endpoint, meta.worker_grpc_endpoint);
     }
 
     #[test]
     fn test_worker_record_transfer_engine_roundtrip() {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
-
         let meta = WorkerMetadata {
             worker_rank: 1,
-            backend_metadata: Some(BackendMetadata::TransferEngineSessionId(
-                "192.168.1.10:12345".to_string(),
-            )),
-            tensors: vec![TensorDescriptor {
-                name: "test.weight".to_string(),
-                addr: 0x2000,
-                size: 8192,
-                device_id: 0,
-                dtype: "float16".to_string(),
-            }],
+            metadata_endpoint: String::new(),
+            agent_name: String::new(),
+            worker_grpc_endpoint: String::new(),
+            transfer_engine_session_id: "192.168.1.10:12345".to_string(),
             status: 0,
             updated_at: 0,
         };
@@ -288,37 +259,57 @@ mod tests {
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
-        assert_eq!(back.backend_metadata, meta.backend_metadata);
+        assert_eq!(
+            back.transfer_engine_session_id,
+            meta.transfer_engine_session_id
+        );
+    }
+
+    #[test]
+    fn test_worker_record_none_backend_roundtrip() {
+        let meta = WorkerMetadata {
+            worker_rank: 0,
+            metadata_endpoint: String::new(),
+            agent_name: String::new(),
+            worker_grpc_endpoint: String::new(),
+            transfer_engine_session_id: String::new(),
+            status: 0,
+            updated_at: 0,
+        };
+
+        let record = WorkerRecord::from(meta);
+        assert!(matches!(
+            &record.backend_metadata,
+            BackendMetadataRecord::None
+        ));
+        assert_eq!(record.backend_metadata.backend_type_str(), "none");
+
+        let back: WorkerMetadata = record.into();
+        assert!(back.metadata_endpoint.is_empty());
+        assert!(back.transfer_engine_session_id.is_empty());
     }
 
     #[test]
     fn test_backend_metadata_from_flat_with_discriminator() {
         // Explicit backend_type takes precedence
-        let te = BackendMetadataRecord::from_flat(
-            Vec::new(),
-            Some("10.0.0.1:5000".into()),
-            Some("transfer_engine"),
-        );
+        let te =
+            BackendMetadataRecord::from_flat(Some("10.0.0.1:5000".into()), Some("transfer_engine"));
         assert!(matches!(te, BackendMetadataRecord::TransferEngine(ref s) if s == "10.0.0.1:5000"));
 
-        let nixl = BackendMetadataRecord::from_flat(vec![1, 2, 3], None, Some("nixl"));
-        assert!(matches!(nixl, BackendMetadataRecord::Nixl(ref d) if d == &vec![1, 2, 3]));
+        let nixl = BackendMetadataRecord::from_flat(None, Some("nixl"));
+        assert!(matches!(nixl, BackendMetadataRecord::Nixl));
 
-        let none = BackendMetadataRecord::from_flat(Vec::new(), None, Some("none"));
+        let none = BackendMetadataRecord::from_flat(None, Some("none"));
         assert!(matches!(none, BackendMetadataRecord::None));
 
         // Backwards compat: missing backend_type infers from fields
-        let inferred_te =
-            BackendMetadataRecord::from_flat(Vec::new(), Some("10.0.0.1:5000".into()), None);
+        let inferred_te = BackendMetadataRecord::from_flat(Some("10.0.0.1:5000".into()), None);
         assert!(matches!(
             inferred_te,
             BackendMetadataRecord::TransferEngine(_)
         ));
 
-        let inferred_nixl = BackendMetadataRecord::from_flat(vec![1, 2], None, None);
-        assert!(matches!(inferred_nixl, BackendMetadataRecord::Nixl(_)));
-
-        let inferred_none = BackendMetadataRecord::from_flat(Vec::new(), None, None);
+        let inferred_none = BackendMetadataRecord::from_flat(None, None);
         assert!(matches!(inferred_none, BackendMetadataRecord::None));
     }
 
@@ -331,27 +322,19 @@ mod tests {
             workers: vec![
                 WorkerRecord {
                     worker_rank: 0,
-                    backend_metadata: BackendMetadataRecord::Nixl(vec![10, 20, 30]),
-                    tensors: vec![TensorRecord {
-                        name: "layer.0.weight".to_string(),
-                        addr: 0x7f00_0000_0000,
-                        size: 1_000_000,
-                        device_id: 0,
-                        dtype: "bfloat16".to_string(),
-                    }],
+                    backend_metadata: BackendMetadataRecord::Nixl,
+                    metadata_endpoint: "10.0.1.5:50051".to_string(),
+                    agent_name: "mx-auto-worker0-aaa11111".to_string(),
+                    worker_grpc_endpoint: "10.0.1.5:60051".to_string(),
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                 },
                 WorkerRecord {
                     worker_rank: 1,
-                    backend_metadata: BackendMetadataRecord::Nixl(vec![40, 50, 60]),
-                    tensors: vec![TensorRecord {
-                        name: "layer.0.weight".to_string(),
-                        addr: 0x7f00_0000_0000,
-                        size: 1_000_000,
-                        device_id: 1,
-                        dtype: "bfloat16".to_string(),
-                    }],
+                    backend_metadata: BackendMetadataRecord::Nixl,
+                    metadata_endpoint: "10.0.1.5:50052".to_string(),
+                    agent_name: "mx-auto-worker1-bbb22222".to_string(),
+                    worker_grpc_endpoint: "10.0.1.5:60052".to_string(),
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                 },
@@ -414,10 +397,10 @@ mod tests {
                 "a1b2c3d4",
                 vec![WorkerMetadata {
                     worker_rank: 3,
-                    backend_metadata: None,
-                    tensors: vec![],
+                    worker_grpc_endpoint: String::new(),
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
+                    ..Default::default()
                 }],
             )
             .await

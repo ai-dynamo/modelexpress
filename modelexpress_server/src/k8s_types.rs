@@ -30,7 +30,7 @@ pub struct ModelMetadataSpec {
 /// ModelMetadata status - the observed state
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ModelMetadataStatus {
-    /// Per-worker NIXL metadata and readiness state
+    /// Per-worker P2P transfer metadata and lifecycle state
     #[serde(default)]
     pub workers: Vec<WorkerStatus>,
 
@@ -58,21 +58,21 @@ pub struct WorkerStatus {
     #[serde(rename = "backendType", default)]
     pub backend_type: Option<String>,
 
-    /// Base64-encoded NIXL agent metadata blob
-    #[serde(rename = "nixlMetadata", default)]
-    pub nixl_metadata: String,
+    /// Endpoint (host:port) where this worker's NIXL listen thread serves metadata.
+    #[serde(rename = "metadataEndpoint", default)]
+    pub metadata_endpoint: Option<String>,
+
+    /// NIXL agent name for this worker
+    #[serde(rename = "agentName", default)]
+    pub agent_name: Option<String>,
 
     /// Mooncake TransferEngine session ID
     #[serde(rename = "transferEngineSessionId", default)]
     pub transfer_engine_session_id: Option<String>,
 
-    /// Number of tensors registered by this worker
-    #[serde(rename = "tensorCount", default)]
-    pub tensor_count: i32,
-
-    /// Name of ConfigMap containing tensor descriptors
-    #[serde(rename = "tensorConfigMap", default)]
-    pub tensor_config_map: Option<String>,
+    /// Endpoint (host:port) for this worker's gRPC server (WorkerService)
+    #[serde(rename = "workerGrpcEndpoint", default)]
+    pub worker_grpc_endpoint: Option<String>,
 
     /// Worker lifecycle status (Initializing, Ready, Stale)
     #[serde(default)]
@@ -130,31 +130,6 @@ pub struct Condition {
     pub last_transition_time: Option<String>,
 }
 
-/// Tensor descriptor stored in ConfigMap
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct TensorDescriptorJson {
-    pub name: String,
-    /// Serialized as string to avoid precision loss
-    pub addr: String,
-    /// Serialized as string to avoid precision loss
-    pub size: String,
-    pub device_id: u32,
-    pub dtype: String,
-}
-
-/// Sanitize model name to be a valid Kubernetes resource name
-/// e.g., "deepseek-ai/DeepSeek-V3" -> "deepseek-ai-deepseek-v3"
-pub fn sanitize_model_name(model_name: &str) -> String {
-    model_name
-        .to_lowercase()
-        .replace(['/', '_'], "-")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.')
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -199,78 +174,5 @@ mod tests {
         assert_eq!(WorkerStatus::status_proto_from_name("Unknown"), 0);
         assert_eq!(WorkerStatus::status_proto_from_name(""), 0);
         assert_eq!(WorkerStatus::status_proto_from_name("ready"), 0);
-    }
-
-    #[test]
-    fn test_sanitize_model_name() {
-        assert_eq!(
-            sanitize_model_name("deepseek-ai/DeepSeek-V3"),
-            "deepseek-ai-deepseek-v3"
-        );
-        assert_eq!(
-            sanitize_model_name("meta-llama/Llama-3.1-70B"),
-            "meta-llama-llama-3.1-70b"
-        );
-        assert_eq!(sanitize_model_name("simple-model"), "simple-model");
-    }
-
-    #[test]
-    fn test_sanitize_model_name_special_chars() {
-        assert_eq!(sanitize_model_name("Llama@3.1+8B"), "llama3.18b");
-        assert_eq!(sanitize_model_name("model with spaces"), "modelwithspaces");
-        assert_eq!(
-            sanitize_model_name("org_name/model_v2"),
-            "org-name-model-v2"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_model_name_edge_cases() {
-        assert_eq!(sanitize_model_name(""), "");
-        assert_eq!(sanitize_model_name("///"), "");
-        assert_eq!(sanitize_model_name("---"), "");
-        assert_eq!(sanitize_model_name("-model-"), "model");
-    }
-
-    #[test]
-    fn test_tensor_descriptor_json_roundtrip() {
-        let original = TensorDescriptorJson {
-            name: "model.layers.0.weight".to_string(),
-            addr: "139948187451390".to_string(),
-            size: "134217728".to_string(),
-            device_id: 0,
-            dtype: "bfloat16".to_string(),
-        };
-
-        let json = serde_json::to_string(&original).expect("serialize");
-        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(parsed.name, original.name);
-        assert_eq!(parsed.addr, original.addr);
-        assert_eq!(parsed.size, original.size);
-        assert_eq!(parsed.device_id, original.device_id);
-        assert_eq!(parsed.dtype, original.dtype);
-
-        let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
-        assert_eq!(addr, 139948187451390);
-        let size: u64 = parsed.size.parse().expect("size should parse as u64");
-        assert_eq!(size, 134217728);
-    }
-
-    #[test]
-    fn test_tensor_descriptor_json_large_values() {
-        let desc = TensorDescriptorJson {
-            name: "test".to_string(),
-            addr: u64::MAX.to_string(),
-            size: u64::MAX.to_string(),
-            device_id: 7,
-            dtype: "float16".to_string(),
-        };
-
-        let json = serde_json::to_string(&desc).expect("serialize");
-        let parsed: TensorDescriptorJson = serde_json::from_str(&json).expect("deserialize");
-
-        let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
-        assert_eq!(addr, u64::MAX);
     }
 }

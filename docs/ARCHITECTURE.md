@@ -41,7 +41,7 @@ graph TD
         end
         A -->|gRPC metadata| S2[ModelExpress Server]
         B -->|gRPC metadata| S2
-        S2 --> R[(Redis)]
+        S2 --> R[(Metadata Backend)]
         A -- "RDMA via NIXL" --> B
     end
 ```
@@ -81,9 +81,9 @@ ModelExpress/
 │       ├── config.rs                   # ServerConfig, layered loading, validation
 │       ├── database.rs                 # SQLite ModelDatabase, atomic claim
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
-│       ├── state.rs                    # P2pStateManager, Redis + Lua scripts
+│       ├── state.rs                    # P2pStateManager, metadata backend wrapper
 │       ├── services.rs                 # Health, API, Model gRPC services
-│       ├── p2p_service.rs              # P2P gRPC service (publish/get metadata + ready)
+│       ├── p2p_service.rs              # P2P gRPC service (publish/get/list metadata + status)
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -110,6 +110,7 @@ ModelExpress/
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── vllm_loader.py              # MxModelLoader
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
+│       ├── worker_server.py              # WorkerGrpcServer (per-worker tensor manifest service)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
 │       └── p2p_pb2_grpc.py             # Generated gRPC stubs
@@ -230,11 +231,12 @@ Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Do
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
-| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes NIXL metadata + tensors |
-| `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Target queries for source metadata |
+| `PublishMetadata` | `PublishMetadataRequest` | `PublishMetadataResponse` | Source publishes lightweight directory entry (endpoints, agent name) |
+| `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Target queries for source worker metadata |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Source updates per-worker status (Initializing/Ready/Stale) |
+| `ListSources` | `ListSourcesRequest` | `ListSourcesResponse` | List available source workers (lightweight, no tensor metadata) |
 
-Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `WorkerMetadata` (rank, nixl_metadata bytes, tensors).
+Key message types: `WorkerMetadata` (rank, metadata_endpoint, agent_name, worker_grpc_endpoint, transfer_engine_session_id, status, updated_at), `TensorDescriptor` (name, addr, size, device_id, dtype - served via WorkerService, not stored on MX server). NIXL agent blobs are exchanged peer-to-peer via NIXL's native listen thread, never stored on the MX server. Tensor manifests are served directly by source workers via the `WorkerService` gRPC service.
 
 ## Rust Server
 
@@ -245,7 +247,7 @@ Key message types: `TensorDescriptor` (name, addr, size, device_id, dtype), `Wor
 3. Initialize structured logging (tracing-subscriber)
 4. Create SQLite database (`ModelDatabase`)
 5. Optionally start `CacheEvictionService` background task
-6. Connect to Redis for P2P state (non-fatal if unavailable)
+6. Connect to metadata backend for P2P state (non-fatal if unavailable)
 7. Register 4 gRPC services with tonic (max message size: 100MB)
 8. Listen on configured address (default `0.0.0.0:8001`)
 9. Graceful shutdown on CTRL+C
@@ -302,17 +304,9 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 2. Count-based: if total > `max_models`, evict oldest excess
 3. Only DOWNLOADED models are eligible for eviction
 
-### P2pStateManager (Redis)
+### P2pStateManager
 
-Redis key patterns:
-
-| Pattern | Purpose | TTL |
-|---------|---------|-----|
-| `mx:model:{model_name}` | `ModelMetadataRecord` (JSON) | None |
-| `mx:models` | Set of all registered model names | None |
-| `mx:nixl_ready:{model}:worker:{id}` | `ReadyRecord` | 2 hours |
-
-The `publish_metadata` operation uses an atomic Lua script to merge workers by rank, preventing lost updates when multiple GPU workers publish concurrently in TP=8 setups. Large u64 values (GPU addresses) are serialized as strings to avoid Lua/cjson precision loss.
+Wraps the `MetadataBackend` trait. Backend selection via `MX_METADATA_BACKEND` env var (`redis` or `kubernetes`). All state is persisted to the backend, making the server stateless and horizontally scalable.
 
 ### ModelDownloadTracker
 
@@ -418,10 +412,21 @@ gRPC client wrapping the P2P service stubs:
 
 | Method | Purpose |
 |--------|---------|
-| `publish_metadata(model_name, workers)` | Publish NIXL metadata for GPU workers |
-| `get_metadata(model_name)` | Query source metadata; target polls this until all workers reach `Ready` status |
-| `update_status(model_name, worker_id, status)` | Update a worker's `SourceStatus` (e.g., `Ready`); source calls this after health check and test inference |
+| `publish_metadata(identity, worker, worker_id)` | Publish lightweight metadata for one GPU worker |
+| `get_metadata(mx_source_id, worker_id)` | Query source worker metadata |
+| `update_status(mx_source_id, worker_id, worker_rank, status)` | Update worker status (Initializing/Ready/Stale) |
+| `list_sources(identity, status_filter)` | List available source workers |
 | `close()` | Close the underlying gRPC channel |
+
+### WorkerService (per-worker gRPC)
+
+Each source worker runs a `WorkerGrpcServer` serving its tensor manifest directly to targets:
+
+| Method | Purpose |
+|--------|---------|
+| `GetTensorManifest()` | Returns the list of TensorDescriptor protos for this worker's GPU |
+
+Port allocation: `MX_WORKER_GRPC_PORT` base (default 6555) + worker rank.
 
 ### NixlTransferManager
 
@@ -429,10 +434,10 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 | Method | Purpose |
 |--------|---------|
-| `__init__(agent_name, device_id)` | Create NIXL agent with UCX backend |
-| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata |
-| `get_registered_descriptors()` | Return region descriptors (`MX_CONTIGUOUS_REG=1`) or tensor descriptors |
-| `receive_from_source(source_metadata, source_tensors, ...)` | Execute RDMA read transfer with optional coalescing |
+| `__init__(agent_name, device_id, listen_port=None)` | Create manager. If `listen_port` is set, enables the NIXL listen thread for native P2P metadata exchange. |
+| `register_tensors(tensors)` | Detect memory pools, register with NIXL, return serialized metadata |
+| `fetch_remote_and_wait(agent_name, ip, port, timeout)` | Fetch remote agent metadata via NIXL native P2P and poll until loaded |
+| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer with optional coalescing. Pass `remote_agent_name` when the remote agent was loaded via `fetch_remote_and_wait()`. |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 ### vLLM Loader
@@ -528,12 +533,9 @@ graph TD
 
 ## Coordination Protocol
 
-### Redis Keys
+### Metadata Storage
 
-| Key Pattern | Purpose |
-|-------------|---------|
-| `mx:model:{model_name}` | Model metadata (workers, tensor descriptors, NIXL metadata, per-worker status) |
-| `mx:models` | Set of all registered model names |
+Backend selection via `MX_METADATA_BACKEND` (`redis` or `kubernetes`). See [`metadata.md`](metadata.md) for backend-specific key patterns and CRD schema.
 
 ### Flow
 
@@ -553,10 +555,9 @@ graph TD
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
-| `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
-| `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
-| `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
+| `MX_METADATA_PORT` | `5555` | Base port for NIXL P2P metadata exchange (per-worker: base + rank) |
+| `MX_WORKER_ADDRESS` | (auto-detect) | Worker IP/hostname for NIXL listen thread and gRPC endpoint |
+| `MX_WORKER_GRPC_PORT` | `6555` | Base port for worker gRPC server (per-worker: base + rank) |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 
 ### UCX/NIXL Tuning
@@ -574,10 +575,6 @@ graph TD
 ### NIXL_ERR_REMOTE_DISCONNECT
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
-
-### Contiguous Region Failures
-
-When `MX_CONTIGUOUS_REG=1`, transfers fail even when source is stable. Current workaround: use baseline mode (`MX_CONTIGUOUS_REG=0`).
 
 ### Long Source Warmup
 

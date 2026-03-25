@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress client for nScale RDMA testing.
+# Based on the dynamo vLLM runtime (has NIXL/UCX/RDMA support).
+FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+
+# Base image runs as user 'dynamo' - switch to root for pip installs
+USER root
+
+# Install ModelExpress Python client
+COPY modelexpress_client/python /tmp/modelexpress_client
+RUN pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
+    pip install /tmp/modelexpress_client && rm -rf /tmp/modelexpress_client
+
+# Switch back to dynamo user
+USER dynamo
+WORKDIR /workspace
