@@ -207,7 +207,7 @@ pub trait MetadataBackend: Send + Sync {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        workers: Vec<WorkerMetadata>,
+        worker: WorkerMetadata,
     ) -> MetadataResult<()>;
 
     /// Get full tensor metadata for one specific worker.

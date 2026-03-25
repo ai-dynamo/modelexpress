@@ -318,44 +318,34 @@ impl MetadataBackend for RedisBackend {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        workers: Vec<WorkerMetadata>,
+        worker: WorkerMetadata,
     ) -> MetadataResult<()> {
         let source_id = crate::source_identity::compute_mx_source_id(identity);
         let mut conn = self.get_conn().await?;
         let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
 
-        // Each worker is stored as an independent hash field — no merge needed.
-        let worker_records: Vec<WorkerRecord> =
-            workers.into_iter().map(WorkerRecord::from).collect();
-
+        let worker_record = WorkerRecord::from(worker);
         let attr_json = serde_json::to_string(&SourceAttributesJson::from(identity))?;
+        let json = WorkerRecordJson::from_worker_record(worker_record.clone());
+        let value = serde_json::to_string(&json)?;
 
         let mut pipe = redis::pipe();
-        for worker in &worker_records {
-            let json = WorkerRecordJson::from_worker_record(worker.clone());
-            let field = worker.worker_rank.to_string();
-            let value = serde_json::to_string(&json)?;
-            pipe.hset(worker_key.clone(), field, value);
-        }
-        // Store identity attributes once per source.
-        // Register each instance with its global rank as the value for fast rank lookup.
-        let rank = worker_records
-            .first()
-            .map(|w| w.worker_rank.to_string())
-            .unwrap_or_default();
+        pipe.hset(&worker_key, worker_record.worker_rank.to_string(), &value);
         pipe.hset(&source_key, keys::ATTRIBUTES_FIELD, &attr_json);
-        pipe.hset(&source_key, worker_id, &rank);
-
+        pipe.hset(
+            &source_key,
+            worker_id,
+            worker_record.worker_rank.to_string(),
+        );
         pipe.exec_async(&mut conn).await?;
 
-        let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for '{}' (source_id={source_id}, worker_id={}): {} workers ({} tensors)",
+            "Published metadata for '{}' (source_id={source_id}, worker_id={}): rank {} ({} tensors)",
             identity.model_name,
             worker_id,
-            worker_records.len(),
-            total_tensors
+            worker_record.worker_rank,
+            worker_record.tensors.len(),
         );
         Ok(())
     }

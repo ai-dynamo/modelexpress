@@ -110,11 +110,11 @@ impl P2pStateManager {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        workers: Vec<WorkerMetadata>,
+        worker: WorkerMetadata,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .publish_metadata(identity, worker_id, workers)
+            .publish_metadata(identity, worker_id, worker)
             .await
     }
 
@@ -405,12 +405,11 @@ mod tests {
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|identity, worker_id, workers| {
+            .withf(|identity, worker_id, worker| {
                 identity.model_name == "my-model"
                     && identity.tensor_parallel_size == 8
                     && worker_id == "a1b2c3d4"
-                    && workers.len() == 1
-                    && workers[0].worker_rank == 3
+                    && worker.worker_rank == 3
             })
             .once()
             .returning(|_, _, _| Ok(()));
@@ -420,13 +419,13 @@ mod tests {
             .publish_metadata(
                 &test_identity(),
                 "a1b2c3d4",
-                vec![WorkerMetadata {
+                WorkerMetadata {
                     worker_rank: 3,
                     backend_metadata: None,
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
-                }],
+                },
             )
             .await
             .expect("publish_metadata failed");
@@ -442,7 +441,7 @@ mod tests {
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .publish_metadata(&test_identity(), "a1b2c3d4", vec![])
+                .publish_metadata(&test_identity(), "a1b2c3d4", WorkerMetadata::default())
                 .await
                 .is_err()
         );

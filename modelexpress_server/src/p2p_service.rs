@@ -88,7 +88,7 @@ impl P2pService for P2pServiceImpl {
 
         match self
             .state
-            .publish_metadata(&identity, &worker_id, vec![worker])
+            .publish_metadata(&identity, &worker_id, worker)
             .await
         {
             Ok(()) => {
