@@ -10,7 +10,7 @@
 //! All tests are `#[ignore]` and require:
 //! - A multi-node Kubernetes cluster (at least 2 nodes)
 //! - The `modelexpress:multinode-test` image available on all nodes
-//! - Valid kubeconfig (in-cluster or ~/.kube/config)
+//! - KUBECONFIG pointing at the target cluster (or valid ~/.kube/config)
 //!
 //! Run via: `./test_multinode_k8s.sh` (builds image + runs tests)
 //! Or directly: `cargo test --test k8s_multinode_tests -- --ignored`
@@ -24,6 +24,7 @@ use k8s_openapi::api::{
 use kube::{
     Client,
     api::{Api, AttachParams, DeleteParams, ListParams, PostParams},
+    config::{KubeConfigOptions, Kubeconfig},
 };
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -37,6 +38,26 @@ const TIMEOUT: Duration = Duration::from_secs(300);
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build a kube client, explicitly honoring `KUBECONFIG` when set.
+///
+/// `Client::try_default()` is supposed to respect the env var, but cargo test
+/// subprocesses don't always inherit it reliably (e.g. through TunnelExec or
+/// nested shells). This helper reads the var and loads the kubeconfig from the
+/// specified path, falling back to the default discovery chain otherwise.
+async fn kube_client() -> Result<Client> {
+    if let Ok(path) = std::env::var("KUBECONFIG") {
+        let kubeconfig = Kubeconfig::read_from(&path)
+            .with_context(|| format!("failed to read kubeconfig from {path}"))?;
+        let config =
+            kube::Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default())
+                .await
+                .with_context(|| format!("failed to build client config from {path}"))?;
+        Ok(Client::try_from(config)?)
+    } else {
+        Ok(Client::try_default().await?)
+    }
+}
 
 /// Pick two different schedulable nodes from the cluster.
 async fn select_nodes(client: &Client) -> Result<(String, String)> {
@@ -505,7 +526,7 @@ async fn count_files_in_pod(
 #[tokio::test]
 #[ignore = "requires multi-node k8s cluster with modelexpress:multinode-test image"]
 async fn cross_node_transfer_default_chunks() -> Result<()> {
-    let client = Client::try_default().await?;
+    let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-default";
     let _guard = create_namespace(&client, ns).await?;
@@ -528,7 +549,7 @@ async fn cross_node_transfer_default_chunks() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires multi-node k8s cluster with modelexpress:multinode-test image"]
 async fn cross_node_transfer_small_chunks() -> Result<()> {
-    let client = Client::try_default().await?;
+    let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-small";
     let _guard = create_namespace(&client, ns).await?;
@@ -559,7 +580,7 @@ async fn cross_node_transfer_small_chunks() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires multi-node k8s cluster with modelexpress:multinode-test image"]
 async fn cross_node_transfer_large_chunks() -> Result<()> {
-    let client = Client::try_default().await?;
+    let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-large";
     let _guard = create_namespace(&client, ns).await?;
@@ -592,7 +613,7 @@ async fn cross_node_transfer_large_chunks() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires multi-node k8s cluster with modelexpress:multinode-test image"]
 async fn cross_node_transfer_integrity() -> Result<()> {
-    let client = Client::try_default().await?;
+    let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-integrity";
     let _guard = create_namespace(&client, ns).await?;
@@ -628,7 +649,7 @@ async fn cross_node_transfer_integrity() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires multi-node k8s cluster with modelexpress:multinode-test image"]
 async fn multi_replica_independent_caches() -> Result<()> {
-    let client = Client::try_default().await?;
+    let client = kube_client().await?;
     let (node_a, node_b) = select_nodes(&client).await?;
     let ns = "mx-test-replica";
     let _guard = create_namespace(&client, ns).await?;
