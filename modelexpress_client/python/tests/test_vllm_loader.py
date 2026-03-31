@@ -442,3 +442,112 @@ class TestPublishMetadataAndReady:
 
         hb_cls.assert_not_called()
 
+
+# ---------------------------------------------------------------------------
+# _storage_view / _collect_module_tensors tests
+# ---------------------------------------------------------------------------
+
+_skip_no_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for storage view tests"
+)
+
+
+class TestStorageView:
+    """Verify that _storage_view creates usable flat byte views (CPU tensors OK)."""
+
+    def test_contiguous_tensor(self):
+        from modelexpress.vllm_loader import _storage_view
+        t = torch.randn(4, 8)
+        view = _storage_view(t)
+        assert view.data_ptr() == t.data_ptr()
+        assert view.numel() == t.numel() * t.element_size()
+
+    def test_dense_noncontiguous(self):
+        """A transposed tensor that densely covers its storage."""
+        from modelexpress.vllm_loader import _storage_view
+        t = torch.randn(4, 8).t()
+        assert not t.is_contiguous()
+        view = _storage_view(t)
+        assert view.data_ptr() == t.data_ptr()
+
+    def test_partial_view_gets_full_storage(self):
+        """A partial view (like MLA's W_UV) gets the full storage block."""
+        from modelexpress.vllm_loader import _storage_view
+        full = torch.randn(8, 8)
+        partial = full[:4]
+        view = _storage_view(partial)
+        assert view.data_ptr() == full.data_ptr()
+        assert view.numel() == full.numel() * full.element_size()
+
+    def test_shared_storage_same_data_ptr(self):
+        """Two views into the same storage produce views with the same data_ptr."""
+        from modelexpress.vllm_loader import _storage_view
+        full = torch.randn(8, 8)
+        view_a = _storage_view(full[:4])
+        view_b = _storage_view(full[4:])
+        assert view_a.data_ptr() == view_b.data_ptr()
+
+
+@_skip_no_cuda
+class TestCollectModuleTensorsStorageViews:
+    """Verify that _collect_module_tensors handles non-contiguous tensors
+    via storage views instead of silently dropping them."""
+
+    def test_noncontiguous_tensor_included(self):
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                raw = torch.randn(4, 8, device="cuda")
+                self.scale = nn.Parameter(raw.t())
+        m = M()
+        assert not m.scale.is_contiguous()
+        result = _collect_module_tensors(m)
+        assert "scale.__storage" in result
+        assert result["scale.__storage"].data_ptr() == m.scale.data_ptr()
+
+    def test_contiguous_tensor_registered_directly(self):
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(4, 8, device="cuda"))
+        m = M()
+        result = _collect_module_tensors(m)
+        assert "weight" in result
+        assert "weight.__storage" not in result
+
+    def test_shared_storage_deduped(self):
+        """Two views into the same storage are registered once."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Simulate MLA: two views from same dequantized intermediate
+                full = torch.randn(8, 8, device="cuda")
+                self.w_uv = nn.Parameter(full[:4].t())
+                self.w_uk_t = nn.Parameter(full[4:].permute(1, 0))
+        m = M()
+        result = _collect_module_tensors(m)
+        # Both share storage, so only one __storage entry
+        storage_keys = [k for k in result if ".__storage" in k]
+        assert len(storage_keys) == 1
+
+    def test_source_target_name_symmetry(self):
+        """Both source and target produce the same tensor names."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        def make_model():
+            class M(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.weight = nn.Parameter(torch.randn(4, 8, device="cuda"))
+                    self.scale = nn.Parameter(torch.randn(4, 8, device="cuda").t())
+            return M()
+
+        source = _collect_module_tensors(make_model())
+        target = _collect_module_tensors(make_model())
+        assert set(source.keys()) == set(target.keys())
