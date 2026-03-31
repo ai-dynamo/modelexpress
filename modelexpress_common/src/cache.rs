@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Utils, constants};
+use crate::{
+    Utils, constants, models::ModelProvider, providers::huggingface::HuggingFaceProviderCache,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -214,97 +216,39 @@ impl CacheConfig {
         Ok(PathBuf::from(home).join(constants::DEFAULT_CONFIG_PATH))
     }
 
-    /// Convert a Hugging Face folder name back to the original model ID
-    /// Examples:
-    /// - "models--google-t5--t5-small" -> "google-t5/t5-small"
-    pub fn folder_name_to_model_id(folder_name: &str) -> String {
-        // Handle models
-        if let Some(stripped) = folder_name.strip_prefix("models--") {
-            // Convert models--owner--repo to owner/repo
-            stripped.replace("--", "/")
-        } else if folder_name.starts_with("datasets--") {
-            // TODO: Handle datasets names conversion
-            folder_name.to_string()
-        } else if folder_name.starts_with("spaces--") {
-            // TODO: Handle spaces names conversion
-            folder_name.to_string()
-        } else {
-            // If it doesn't match the expected pattern, return as-is
-            folder_name.to_string()
-        }
-    }
-
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> Result<CacheStats> {
-        let mut stats = CacheStats {
-            total_models: 0,
-            total_size: 0,
-            models: Vec::new(),
-        };
+        let mut models = Vec::new();
 
         if !self.local_path.exists() {
-            return Ok(stats);
+            return Ok(CacheStats {
+                total_models: 0,
+                total_size: 0,
+                models,
+            });
         }
 
-        for entry in fs::read_dir(&self.local_path)? {
-            let entry = entry?;
-            let path = entry.path();
+        let provider = ModelProvider::HuggingFace;
+        models.extend(cache_for_provider(provider).list_models(&self.local_path)?);
 
-            if path.is_dir() {
-                let size = Self::get_directory_size(&path)?;
-                let folder_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                info!("Folder name: {}", folder_name);
-                // Convert folder name back to human-readable model ID
-                let model_name = Self::folder_name_to_model_id(&folder_name);
+        models.sort_by(|left, right| {
+            provider_sort_key(left.provider)
+                .cmp(&provider_sort_key(right.provider))
+                .then_with(|| left.name.cmp(&right.name))
+        });
 
-                stats.total_models = stats.total_models.saturating_add(1);
-                stats.total_size = stats.total_size.saturating_add(size);
-                stats.models.push(ModelInfo {
-                    name: model_name,
-                    size,
-                    path: path.to_path_buf(),
-                });
-            }
-        }
+        let total_size = models.iter().map(|model| model.size).sum();
 
-        Ok(stats)
+        Ok(CacheStats {
+            total_models: models.len(),
+            total_size,
+            models,
+        })
     }
 
-    /// Get directory size recursively
-    fn get_directory_size(path: &Path) -> Result<u64> {
-        let mut size: u64 = 0;
-
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                size = size.saturating_add(fs::metadata(&path)?.len());
-            } else if path.is_dir() {
-                size = size.saturating_add(Self::get_directory_size(&path)?);
-            }
-        }
-
-        Ok(size)
-    }
-
-    /// Clear specific model from cache
-    pub fn clear_model(&self, model_name: &str) -> Result<()> {
-        let model_path = self.local_path.join(model_name);
-
-        if model_path.exists() {
-            fs::remove_dir_all(&model_path)
-                .with_context(|| format!("Failed to remove model: {model_path:?}"))?;
-            info!("Cleared model: {}", model_name);
-        } else {
-            warn!("Model not found in cache: {}", model_name);
-        }
-
-        Ok(())
+    /// Clear specific model from cache for a given provider.
+    pub fn clear_model(&self, model_name: &str, provider: ModelProvider) -> Result<()> {
+        cache_for_provider(provider).clear_model(&self.local_path, model_name)
     }
 
     /// Clear entire cache
@@ -344,6 +288,7 @@ pub struct CacheStats {
 /// Model information
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
+    pub provider: ModelProvider,
     pub name: String,
     pub size: u64,
     pub path: PathBuf,
@@ -375,7 +320,57 @@ impl CacheStats {
     }
 }
 
+pub(crate) trait ProviderCache: Send + Sync {
+    fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()>;
+    fn resolve_model_path(
+        &self,
+        cache_root: &Path,
+        model_name: &str,
+        revision: Option<&str>,
+    ) -> Result<PathBuf>;
+    fn list_models(&self, cache_root: &Path) -> Result<Vec<ModelInfo>>;
+}
+
+pub(crate) fn cache_for_provider(provider: ModelProvider) -> &'static dyn ProviderCache {
+    match provider {
+        ModelProvider::HuggingFace => &HuggingFaceProviderCache,
+    }
+}
+
+pub fn resolve_model_path(
+    cache_root: &Path,
+    provider: ModelProvider,
+    model_name: &str,
+    revision: Option<&str>,
+) -> Result<PathBuf> {
+    cache_for_provider(provider).resolve_model_path(cache_root, model_name, revision)
+}
+
+pub(crate) fn directory_size(path: &Path) -> Result<u64> {
+    let mut size: u64 = 0;
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() {
+            size = size.saturating_add(fs::metadata(&path)?.len());
+        } else if path.is_dir() {
+            size = size.saturating_add(directory_size(&path)?);
+        }
+    }
+
+    Ok(size)
+}
+
+fn provider_sort_key(provider: ModelProvider) -> u8 {
+    match provider {
+        ModelProvider::HuggingFace => 0,
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::Utils;
@@ -431,11 +426,13 @@ mod tests {
             total_size: 1024 * 1024 * 5, // 5 MB
             models: vec![
                 ModelInfo {
+                    provider: ModelProvider::HuggingFace,
                     name: "model1".to_string(),
                     size: 1024 * 1024 * 2, // 2 MB
                     path: PathBuf::from("/test/model1"),
                 },
                 ModelInfo {
+                    provider: ModelProvider::HuggingFace,
                     name: "model2".to_string(),
                     size: 1024 * 1024 * 3, // 3 MB
                     path: PathBuf::from("/test/model2"),
@@ -482,63 +479,80 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_name_to_model_id() {
-        // Test models conversion
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("models--google-t5--t5-small"),
-            "google-t5/t5-small"
-        );
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("models--microsoft--DialoGPT-medium"),
-            "microsoft/DialoGPT-medium"
-        );
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("models--huggingface--CodeBERTa-small-v1"),
-            "huggingface/CodeBERTa-small-v1"
-        );
+    fn test_resolve_model_path_huggingface_uses_snapshot_layout() {
+        let cache_root = Path::new("/tmp/cache");
 
-        // Test single name models (no organization)
         assert_eq!(
-            CacheConfig::folder_name_to_model_id("models--bert-base-uncased"),
-            "bert-base-uncased"
-        );
-
-        // Test datasets (TODO - should return as-is for now)
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("datasets--squad"),
-            "datasets--squad"
-        );
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("datasets--huggingface--squad"),
-            "datasets--huggingface--squad"
-        );
-
-        // Test spaces (TODO - should return as-is for now)
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("spaces--gradio--hello-world"),
-            "spaces--gradio--hello-world"
-        );
-
-        // Test unrecognized patterns (should return as-is)
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("random-folder-name"),
-            "random-folder-name"
-        );
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("some--other--format"),
-            "some--other--format"
-        );
-
-        // Test edge cases
-        assert_eq!(CacheConfig::folder_name_to_model_id("models--"), "");
-        assert_eq!(
-            CacheConfig::folder_name_to_model_id("models--single"),
-            "single"
+            resolve_model_path(
+                cache_root,
+                ModelProvider::HuggingFace,
+                "google/t5-small",
+                Some("abc123"),
+            )
+            .expect("Expected HF model path"),
+            PathBuf::from("/tmp/cache/models--google--t5-small/snapshots/abc123")
         );
     }
 
+    fn create_test_cache_config(local_path: PathBuf) -> CacheConfig {
+        CacheConfig {
+            local_path,
+            server_endpoint: "http://localhost:8001".to_string(),
+            timeout_secs: None,
+            shared_storage: false,
+            transfer_chunk_size: 64 * 1024,
+        }
+    }
+
     #[test]
-    #[allow(clippy::expect_used)]
+    fn test_get_cache_stats_supports_hf_layout() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+        fs::create_dir_all(&cache_path).expect("Failed to create cache directory");
+
+        let hf_model_dir = cache_path.join("models--google--t5-small");
+        fs::create_dir_all(&hf_model_dir).expect("Failed to create HF model directory");
+        fs::write(hf_model_dir.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let ignored_dir = cache_path.join("tmp");
+        fs::create_dir_all(&ignored_dir).expect("Failed to create ignored directory");
+        fs::write(ignored_dir.join("scratch.txt"), b"ignore")
+            .expect("Failed to write ignored file");
+
+        let stats = create_test_cache_config(cache_path)
+            .get_cache_stats()
+            .expect("Failed to get cache stats");
+
+        assert_eq!(stats.total_models, 1);
+        assert_eq!(stats.total_size, 2);
+        assert_eq!(stats.models.len(), 1);
+
+        assert_eq!(stats.models[0].provider, ModelProvider::HuggingFace);
+        assert_eq!(stats.models[0].name, "google/t5-small");
+        assert_eq!(stats.models[0].size, 2);
+        assert_eq!(stats.models[0].path, hf_model_dir);
+        assert!(stats.models.iter().all(|model| model.name != "tmp"));
+    }
+
+    #[test]
+    fn test_clear_model_removes_only_requested_layout() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+        fs::create_dir_all(&cache_path).expect("Failed to create cache directory");
+
+        let hf_model_dir = cache_path.join("models--google--t5-small");
+        fs::create_dir_all(&hf_model_dir).expect("Failed to create HF model directory");
+        fs::write(hf_model_dir.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let config = create_test_cache_config(cache_path);
+
+        config
+            .clear_model("google/t5-small", ModelProvider::HuggingFace)
+            .expect("Failed to clear HF model");
+        assert!(!hf_model_dir.exists(), "HF model should be removed");
+    }
+
+    #[test]
     fn test_clear_all_removes_contents_but_keeps_directory() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let cache_path = temp_dir.path().join("cache");
@@ -550,13 +564,7 @@ mod tests {
         fs::write(model_dir.join("config.json"), "{}").expect("Failed to write file");
         fs::write(cache_path.join("test_file.txt"), "test").expect("Failed to write file");
 
-        let config = CacheConfig {
-            local_path: cache_path.clone(),
-            server_endpoint: "http://localhost:8001".to_string(),
-            timeout_secs: None,
-            shared_storage: false,
-            transfer_chunk_size: 64 * 1024,
-        };
+        let config = create_test_cache_config(cache_path.clone());
 
         // Clear cache
         config.clear_all().expect("Failed to clear cache");
@@ -573,18 +581,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_clear_all_handles_nonexistent_directory() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let cache_path = temp_dir.path().join("nonexistent_cache");
 
-        let config = CacheConfig {
-            local_path: cache_path.clone(),
-            server_endpoint: "http://localhost:8001".to_string(),
-            timeout_secs: None,
-            shared_storage: false,
-            transfer_chunk_size: 64 * 1024,
-        };
+        let config = create_test_cache_config(cache_path.clone());
 
         // Should succeed without error even if directory doesn't exist
         config
@@ -595,7 +596,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_clear_all_removes_nested_directories() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let cache_path = temp_dir.path().join("cache");
@@ -606,13 +606,7 @@ mod tests {
         fs::create_dir_all(&deep_path).expect("Failed to create nested directories");
         fs::write(deep_path.join("deep_file.txt"), "deep").expect("Failed to write file");
 
-        let config = CacheConfig {
-            local_path: cache_path.clone(),
-            server_endpoint: "http://localhost:8001".to_string(),
-            timeout_secs: None,
-            shared_storage: false,
-            transfer_chunk_size: 64 * 1024,
-        };
+        let config = create_test_cache_config(cache_path.clone());
 
         config.clear_all().expect("Failed to clear cache");
 
