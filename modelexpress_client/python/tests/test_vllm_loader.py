@@ -445,6 +445,7 @@ class TestPublishMetadataAndReady:
 
 # ---------------------------------------------------------------------------
 # _storage_view / _collect_module_tensors tests
+# These tests require CUDA tensors since the loader only collects CUDA tensors.
 # ---------------------------------------------------------------------------
 
 _skip_no_cuda = pytest.mark.skipif(
