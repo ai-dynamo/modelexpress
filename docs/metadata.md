@@ -99,7 +99,7 @@ GetMetadataRequest {
 
 ### UpdateStatus
 
-Transitions a worker's lifecycle status. Called after publishing metadata to mark the worker as `READY`.
+Transitions a worker's lifecycle status. Called periodically by the client-side heartbeat thread to refresh `updated_at`, and on shutdown to mark `STALE`.
 
 ```protobuf
 UpdateStatusRequest {
@@ -115,13 +115,17 @@ UpdateStatusRequest {
 ```mermaid
 stateDiagram-v2
     [*] --> INITIALIZING : PublishMetadata
-    INITIALIZING --> READY : UpdateStatus
-    READY --> STALE : TTL expiry or explicit
+    INITIALIZING --> READY : Heartbeat (NIXL healthy)
+    READY --> READY : Heartbeat refreshes updated_at
+    READY --> STALE : atexit or reaper timeout
+    INITIALIZING --> STALE : Reaper timeout
+    STALE --> Deleted : Reaper GC
 ```
 
-- **INITIALIZING**: Worker has published metadata but is not yet ready for transfers
-- **READY**: Worker is fully initialized and accepting RDMA connections
-- **STALE**: Worker is no longer available (TTL expiry or explicit marking)
+- **INITIALIZING**: Worker has published metadata but heartbeat hasn't confirmed NIXL health yet
+- **READY**: Worker is healthy and accepting RDMA connections. Heartbeat refreshes `updated_at` every `MX_HEARTBEAT_INTERVAL_SECS` (default 30s)
+- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown (SIGTERM), or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s)
+- **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
 
 ## Backend Implementations
 
@@ -153,7 +157,7 @@ Two types of Redis keys per source:
 
 Global listing uses `SCAN` with pattern `mx:source:????????????????` (exactly 16 hex chars) to enumerate source index keys without a secondary index.
 
-Both key types have a configurable TTL (`MX_STATUS_TTL_SECS`, default 3600s) refreshed on publish and status update.
+No Redis TTL is applied to keys. Stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above).
 
 #### Example Redis State
 
@@ -246,10 +250,13 @@ sequenceDiagram
     W->>W: Collect all post-processed tensors
     W->>W: Initialize NIXL agent, register tensors
     W->>MX: PublishMetadata(identity, worker, worker_id)
-    MX->>Backend: Store worker metadata
+    MX->>Backend: Store worker metadata (status=INITIALIZING)
     MX-->>W: mx_source_id
-    W->>MX: UpdateStatus(mx_source_id, worker_id, rank, READY)
-    MX->>Backend: Patch status field
+    W->>W: Start HeartbeatThread
+    loop Every MX_HEARTBEAT_INTERVAL_SECS
+        W->>MX: UpdateStatus(mx_source_id, worker_id, rank, READY)
+        MX->>Backend: Patch status + updated_at
+    end
 ```
 
 ### Target Path (receive via RDMA)
@@ -263,13 +270,12 @@ sequenceDiagram
     MX-->>W: [SourceInstanceRef, ...]
     W->>W: Filter by worker_rank, shuffle for load balancing
     W->>W: Load dummy weights, initialize NIXL agent
-    loop For each candidate (until success)
+    loop For each candidate (max MAX_SOURCE_RETRIES)
         W->>MX: GetMetadata(mx_source_id, worker_id)
         MX-->>W: WorkerMetadata (tensors, nixl_metadata)
         W->>W: Add remote NIXL agent
         W->>W: Execute RDMA transfers
-        alt Transfer fails
-            W->>MX: UpdateStatus(source, STALE)
+        alt Transfer fails (SourceTransferError)
             W->>W: Try next candidate
         end
     end
@@ -308,7 +314,10 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |
 | `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | `default` | K8s namespace for CRD backend |
-| `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis keys (seconds) |
+| `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
+| `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
+| `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `MX_CONTIGUOUS_REG` | `0` | Use contiguous region registration (experimental) |
 
 ## Debugging
@@ -340,8 +349,8 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | Symptom | Likely Cause |
 |---------|-------------|
 | `ListSources` returns empty | No source has published + updated status to READY yet |
-| `GetMetadata` returns `found: false` | Worker TTL expired, or wrong `mx_source_id`/`worker_id` |
+| `GetMetadata` returns `found: false` | Worker was garbage-collected by reaper, or wrong `mx_source_id`/`worker_id` |
 | Target stuck waiting | Source still loading (check source pod logs for progress) |
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions |
-| Stale metadata after redeploy | Flush Redis (`FLUSHDB`) -- stale metadata causes transfer failures |
-| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. Target should try next candidate |
+| Stale metadata after redeploy | Reaper marks stale within 90s. For immediate cleanup: `FLUSHDB` |
+| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. Target retries next candidate (max 3) |

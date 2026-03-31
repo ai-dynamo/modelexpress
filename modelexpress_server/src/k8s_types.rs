@@ -30,9 +30,9 @@ pub struct ModelMetadataSpec {
 /// ModelMetadata status - the observed state
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 pub struct ModelMetadataStatus {
-    /// Per-worker NIXL metadata and readiness state
+    /// Single worker NIXL metadata and readiness state (one CR per worker)
     #[serde(default)]
-    pub workers: Vec<WorkerStatus>,
+    pub worker: Option<WorkerStatus>,
 
     /// Conditions for ModelMetadata lifecycle
     #[serde(default)]

@@ -184,7 +184,7 @@ impl MetadataBackend for KubernetesBackend {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        workers: Vec<WorkerMetadata>,
+        worker: WorkerMetadata,
     ) -> MetadataResult<()> {
         let source_id = crate::source_identity::compute_mx_source_id(identity);
         let source_id = source_id.as_str();
@@ -193,9 +193,7 @@ impl MetadataBackend for KubernetesBackend {
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Convert workers to internal format
-        let worker_records: Vec<WorkerRecord> =
-            workers.into_iter().map(WorkerRecord::from).collect();
+        let worker_record = WorkerRecord::from(worker);
 
         // First, ensure the CR exists
         let existing = api.get_opt(&cr_name).await?;
@@ -244,67 +242,47 @@ impl MetadataBackend for KubernetesBackend {
         let owner_uid = cr.metadata.uid.as_deref();
         let owner_name = cr.metadata.name.as_deref();
 
-        // Build worker status updates and create ConfigMaps
-        let mut worker_statuses = Vec::new();
-        for worker in &worker_records {
-            let cm_name = self
-                .upsert_tensor_configmap(
-                    source_id,
-                    worker_id,
-                    worker.worker_rank,
-                    &worker.tensors,
-                    owner_name,
-                    owner_uid,
-                )
-                .await?;
+        let cm_name = self
+            .upsert_tensor_configmap(
+                source_id,
+                worker_id,
+                worker_record.worker_rank,
+                &worker_record.tensors,
+                owner_name,
+                owner_uid,
+            )
+            .await?;
 
-            let backend_type = worker.backend_metadata.backend_type_str().to_string();
-            let (nixl_metadata, transfer_engine_session_id) = match &worker.backend_metadata {
-                super::BackendMetadataRecord::Nixl(data) => (BASE64.encode(data), None),
-                super::BackendMetadataRecord::TransferEngine(sid) => {
-                    (String::new(), Some(sid.clone()))
-                }
-                super::BackendMetadataRecord::None => (String::new(), None),
-            };
+        let backend_type = worker_record
+            .backend_metadata
+            .backend_type_str()
+            .to_string();
+        let (nixl_metadata, transfer_engine_session_id) = match &worker_record.backend_metadata {
+            super::BackendMetadataRecord::Nixl(data) => (BASE64.encode(data), None),
+            super::BackendMetadataRecord::TransferEngine(sid) => (String::new(), Some(sid.clone())),
+            super::BackendMetadataRecord::None => (String::new(), None),
+        };
 
-            worker_statuses.push(WorkerStatus {
-                worker_rank: worker.worker_rank as i32,
-                backend_type: Some(backend_type),
-                nixl_metadata,
-                transfer_engine_session_id,
-                tensor_count: worker.tensors.len() as i32,
-                tensor_config_map: Some(cm_name),
-                status: WorkerStatus::status_name_from_proto(worker.status),
-                updated_at: Some(now.clone()),
-            });
-        }
+        let worker_status = WorkerStatus {
+            worker_rank: worker_record.worker_rank as i32,
+            backend_type: Some(backend_type),
+            nixl_metadata,
+            transfer_engine_session_id,
+            tensor_count: worker_record.tensors.len() as i32,
+            tensor_config_map: Some(cm_name),
+            status: WorkerStatus::status_name_from_proto(worker_record.status),
+            updated_at: Some(now.clone()),
+        };
 
-        // Merge with existing workers in status (retry on conflict)
         let max_retries: u32 = 5;
         let mut status_updated = false;
         for attempt in 0..max_retries {
             let current = api.get(&cr_name).await?;
-            let mut all_workers: Vec<WorkerStatus> =
-                current.status.map(|s| s.workers).unwrap_or_default();
-
-            for new_worker in &worker_statuses {
-                if let Some(existing) = all_workers
-                    .iter_mut()
-                    .find(|w| w.worker_rank == new_worker.worker_rank)
-                {
-                    *existing = new_worker.clone();
-                } else {
-                    all_workers.push(new_worker.clone());
-                }
-            }
-
-            all_workers.sort_by_key(|w| w.worker_rank);
-
             let resource_version = current.metadata.resource_version.unwrap_or_default();
             let status_patch = json!({
                 "metadata": { "resourceVersion": resource_version },
                 "status": {
-                    "workers": all_workers,
+                    "worker": worker_status,
                     "publishedAt": now
                 }
             });
@@ -346,14 +324,13 @@ impl MetadataBackend for KubernetesBackend {
             .into());
         }
 
-        let total_tensors: usize = worker_records.iter().map(|w| w.tensors.len()).sum();
         info!(
-            "Published metadata for '{}' (source_id={}, worker_id={}): {} workers ({} tensors)",
+            "Published metadata for '{}' (source_id={}, worker_id={}): rank {} ({} tensors)",
             model_name,
             source_id,
             worker_id,
-            worker_records.len(),
-            total_tensors
+            worker_record.worker_rank,
+            worker_record.tensors.len(),
         );
 
         Ok(())
@@ -387,7 +364,7 @@ impl MetadataBackend for KubernetesBackend {
         };
 
         let mut workers = Vec::new();
-        for worker_status in status.workers {
+        if let Some(worker_status) = status.worker {
             let nixl_bytes = if !worker_status.nixl_metadata.is_empty() {
                 BASE64.decode(&worker_status.nixl_metadata).map_err(|e| {
                     format!(
@@ -494,7 +471,7 @@ impl MetadataBackend for KubernetesBackend {
             let worker_rank = cr
                 .status
                 .as_ref()
-                .and_then(|s| s.workers.first())
+                .and_then(|s| s.worker.as_ref())
                 .map(|w| w.worker_rank as u32)
                 .unwrap_or(0);
 
@@ -504,18 +481,37 @@ impl MetadataBackend for KubernetesBackend {
                 let matches = cr
                     .status
                     .as_ref()
-                    .map(|s| s.workers.iter().any(|w| w.status == required_name))
+                    .map(|s| s.worker.as_ref().is_some_and(|w| w.status == required_name))
                     .unwrap_or(false);
                 if !matches {
                     continue;
                 }
             }
 
+            let (status, updated_at) = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| {
+                    let proto_status =
+                        crate::k8s_types::WorkerStatus::status_proto_from_name(&w.status);
+                    let millis = w
+                        .updated_at
+                        .as_deref()
+                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                        .map(|dt| dt.timestamp_millis())
+                        .unwrap_or(0);
+                    (proto_status, millis)
+                })
+                .unwrap_or((0, 0));
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
                 model_name: cr.spec.model_name,
                 worker_rank,
+                status,
+                updated_at,
             });
         }
 
@@ -569,6 +565,24 @@ impl MetadataBackend for KubernetesBackend {
         Ok(())
     }
 
+    async fn remove_worker(&self, source_id: &str, worker_id: &str) -> MetadataResult<()> {
+        let api = self.model_metadata_api();
+        let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
+
+        match api
+            .delete(&cr_name, &kube::api::DeleteParams::default())
+            .await
+        {
+            Ok(_) => info!("Deleted ModelMetadata CR '{}'", cr_name),
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                debug!("ModelMetadata CR '{}' already gone", cr_name);
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        Ok(())
+    }
+
     async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>> {
         let api = self.model_metadata_api();
         let crs = api.list(&ListParams::default()).await?;
@@ -608,26 +622,20 @@ impl MetadataBackend for KubernetesBackend {
         let max_retries: u32 = 5;
         for attempt in 0..max_retries {
             let current = api.get(&cr_name).await?;
-            let mut workers: Vec<WorkerStatus> =
-                current.status.map(|s| s.workers).unwrap_or_default();
-
-            if workers.is_empty() {
-                return Err(format!(
-                    "update_status: no workers in source '{}' worker '{}'",
+            let mut worker = current.status.and_then(|s| s.worker).ok_or_else(|| {
+                format!(
+                    "update_status: no worker in source '{}' worker '{}'",
                     source_id, worker_id
                 )
-                .into());
-            }
+            })?;
 
-            for w in &mut workers {
-                w.status = status_name.clone();
-                w.updated_at = Some(updated_at_rfc3339.clone());
-            }
+            worker.status = status_name.clone();
+            worker.updated_at = Some(updated_at_rfc3339.clone());
 
             let resource_version = current.metadata.resource_version.unwrap_or_default();
             let status_patch = serde_json::json!({
                 "metadata": { "resourceVersion": resource_version },
-                "status": { "workers": workers }
+                "status": { "worker": worker }
             });
 
             match api

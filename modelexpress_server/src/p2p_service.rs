@@ -88,7 +88,7 @@ impl P2pService for P2pServiceImpl {
 
         match self
             .state
-            .publish_metadata(&identity, &worker_id, vec![worker])
+            .publish_metadata(&identity, &worker_id, worker)
             .await
         {
             Ok(()) => {
@@ -598,12 +598,16 @@ mod tests {
                     worker_id: "w1".to_string(),
                     model_name: "my-model".to_string(),
                     worker_rank: 0,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
                     worker_id: "w2".to_string(),
                     model_name: "my-model".to_string(),
                     worker_rank: 1,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
                 },
             ])
         });

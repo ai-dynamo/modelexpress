@@ -41,6 +41,10 @@ pub struct SourceInstanceInfo {
     pub model_name: String,
     /// Global rank of this worker.
     pub worker_rank: u32,
+    /// Worker lifecycle status (maps to `SourceStatus` proto enum).
+    pub status: i32,
+    /// Timestamp of last status update (unix millis).
+    pub updated_at: i64,
 }
 
 /// Backend-specific metadata for a worker
@@ -203,7 +207,7 @@ pub trait MetadataBackend: Send + Sync {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        workers: Vec<WorkerMetadata>,
+        worker: WorkerMetadata,
     ) -> MetadataResult<()>;
 
     /// Get full tensor metadata for one specific worker.
@@ -225,6 +229,10 @@ pub trait MetadataBackend: Send + Sync {
 
     /// Remove all workers of a source by mx_source_id
     async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()>;
+
+    /// Remove a single worker by source_id and worker_id.
+    /// Used by the reaper to garbage-collect individual stale entries.
+    async fn remove_worker(&self, source_id: &str, worker_id: &str) -> MetadataResult<()>;
 
     /// List all registered source IDs and their model names
     async fn list_sources(&self) -> MetadataResult<Vec<(String, String)>>;
