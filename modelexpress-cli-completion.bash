@@ -12,7 +12,7 @@ _model_express_cli_completions() {
 
     # Main commands
     local commands="health model api help"
-    local global_opts="--endpoint --timeout --format --verbose --quiet --cache-path --help --version"
+    local global_opts="--endpoint --timeout --format --verbose --quiet --cache-directory --help --version"
     local formats="human json json-pretty"
 
     case "${COMP_CWORD}" in
@@ -42,7 +42,7 @@ _model_express_cli_completions() {
                     COMPREPLY=($(compgen -f -- "$cur"))
                     return 0
                     ;;
-                --cache-path)
+                --cache-directory)
                     COMPREPLY=($(compgen -d -- "$cur"))
                     return 0
                     ;;
@@ -90,15 +90,12 @@ _model_express_cli_completions() {
                 esac
             elif [[ "${words[i+1]}" == "init" ]]; then
                 case "${prev}" in
-                    --storage-path)
-                        COMPREPLY=($(compgen -d -- "$cur"))
-                        ;;
                     --server-endpoint)
                         COMPREPLY=($(compgen -W "http://localhost:8001 https://" -- "$cur"))
                         ;;
                     *)
                         if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "--storage-path --server-endpoint --help" -- "$cur"))
+                            COMPREPLY=($(compgen -W "--server-endpoint --help" -- "$cur"))
                         fi
                         ;;
                 esac

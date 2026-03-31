@@ -181,7 +181,8 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
     info!("Testing direct download (bypassing server)...");
     let start_direct = Instant::now();
 
-    match Client::download_model_directly(model_name, ModelProvider::HuggingFace, false).await {
+    match Client::download_model_directly(model_name, ModelProvider::HuggingFace, false, None).await
+    {
         Ok(()) => {
             info!("Model downloaded directly in {:?}", start_direct.elapsed());
         }

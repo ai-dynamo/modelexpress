@@ -130,13 +130,13 @@ impl Client {
         }
         // Use client's cache config if available
         if let Some(cache_config) = &self.cache_config {
-            return cache_config.local_path.clone();
+            return cache_config.directory.clone();
         }
 
         // Fall back to discovery
         CacheConfig::discover()
-            .map(|config| config.local_path)
-            .unwrap_or_else(|_| CacheConfig::default().local_path)
+            .map(|config| config.directory)
+            .unwrap_or_else(|_| CacheConfig::default().directory)
     }
 
     pub async fn get_model_path(&self, model_name: &str) -> anyhow::Result<PathBuf> {
@@ -191,7 +191,7 @@ impl Client {
                     "Server unavailable, pre-loading model {} directly. Error: {}",
                     model_name, e
                 );
-                Self::download_model_directly(model_name, provider, ignore_weights).await
+                Self::download_model_directly(model_name, provider, ignore_weights, None).await
             }
         }
     }
@@ -297,7 +297,7 @@ impl Client {
                     );
 
                     // Fallback to direct download
-                    let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
+                    let cache_dir = CacheConfig::discover().ok().map(|config| config.directory);
                     match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
                         Ok(_) => {
                             info!(
@@ -332,7 +332,7 @@ impl Client {
         })?;
 
         let chunk_size = cache_config.transfer_chunk_size as u32;
-        let local_cache_path = cache_config.local_path.clone();
+        let local_cache_path = cache_config.directory.clone();
 
         info!(
             "Streaming model {} files to {:?} with chunk size {} bytes",
@@ -629,7 +629,7 @@ impl Client {
             Err(e) => {
                 // If we can't even connect to the server, go straight to direct download
                 info!("Cannot connect to server ({}), downloading directly...", e);
-                Client::download_model_directly(&model_name, provider, ignore_weights).await
+                Client::download_model_directly(&model_name, provider, ignore_weights, None).await
             }
         }
     }
@@ -640,6 +640,7 @@ impl Client {
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
+        cache_dir: Option<PathBuf>,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
         info!(
@@ -647,8 +648,9 @@ impl Client {
             model_name, provider
         );
 
-        // Try to get cache configuration, but don't fail if not available
-        let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
+        // Use provided cache dir, or try to discover one
+        let cache_dir =
+            cache_dir.or_else(|| CacheConfig::discover().ok().map(|config| config.directory));
 
         download::download_model(&model_name, provider, cache_dir, ignore_weights)
             .await
@@ -707,7 +709,7 @@ mod tests {
     fn test_cache_config_endpoint_override() {
         // Test that cache config can be created with a specific endpoint
         let mut cache_config = CacheConfig {
-            local_path: std::path::PathBuf::from("/test/path"),
+            directory: std::path::PathBuf::from("/test/path"),
             server_endpoint: "http://original-endpoint:1234".to_string(),
             timeout_secs: None,
             shared_storage: true,
@@ -742,6 +744,7 @@ mod tests {
             "definitely-not-a-real-model-name-12345",
             ModelProvider::HuggingFace,
             false,
+            None,
         )
         .await;
 

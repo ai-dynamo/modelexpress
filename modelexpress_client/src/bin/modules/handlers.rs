@@ -51,7 +51,7 @@ pub async fn handle_health_command(
 /// Handle model commands (unified model management)
 pub async fn handle_model_command(
     command: ModelCommands,
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     server_config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -62,7 +62,7 @@ pub async fn handle_model_command(
             strategy,
         } => {
             download_model(
-                storage_path_override,
+                cache_dir_override,
                 model_name,
                 provider,
                 strategy,
@@ -71,31 +71,26 @@ pub async fn handle_model_command(
             )
             .await
         }
-        ModelCommands::Init {
-            storage_path,
-            server_endpoint,
-        } => init_model_storage(storage_path, server_endpoint, format).await,
-        ModelCommands::List { detailed } => {
-            list_models(storage_path_override, detailed, format).await
+        ModelCommands::Init { server_endpoint } => {
+            init_model_storage(cache_dir_override, server_endpoint, format).await
         }
-        ModelCommands::Status => show_model_status(storage_path_override, format).await,
+        ModelCommands::List { detailed } => list_models(cache_dir_override, detailed, format).await,
+        ModelCommands::Status => show_model_status(cache_dir_override, format).await,
         ModelCommands::Clear { model_name } => {
-            clear_model(storage_path_override, &model_name, format).await
+            clear_model(cache_dir_override, &model_name, format).await
         }
-        ModelCommands::ClearAll { yes } => {
-            clear_all_models(storage_path_override, yes, format).await
-        }
+        ModelCommands::ClearAll { yes } => clear_all_models(cache_dir_override, yes, format).await,
         ModelCommands::Validate { model_name } => {
-            validate_models(storage_path_override, model_name, format).await
+            validate_models(cache_dir_override, model_name, format).await
         }
         ModelCommands::Stats { detailed } => {
-            show_model_stats(storage_path_override, detailed, format).await
+            show_model_stats(cache_dir_override, detailed, format).await
         }
     }
 }
 
 async fn download_model(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     model_name: String,
     provider: CliModelProvider,
     strategy: DownloadStrategy,
@@ -120,7 +115,7 @@ async fn download_model(
     info!("Downloading model: {}", model_name);
 
     // Get cache config if available, applying settings from ClientConfig
-    let cache_config = if let Some(path) = storage_path_override {
+    let cache_config = if let Some(ref path) = cache_dir_override {
         Some(CacheConfig::from_path(path)?)
     } else {
         CacheConfig::discover().ok()
@@ -165,7 +160,8 @@ async fn download_model(
         }
         DownloadStrategy::Direct => {
             debug!("Using direct download strategy");
-            Client::download_model_directly(model_name.clone(), provider, false).await
+            Client::download_model_directly(model_name.clone(), provider, false, cache_dir_override)
+                .await
         }
     };
 
@@ -260,11 +256,11 @@ pub async fn handle_api_send(
 }
 
 async fn init_model_storage(
-    storage_path: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     server_endpoint: Option<String>,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = if let Some(path) = storage_path {
+    let config = if let Some(path) = cache_dir_override {
         CacheConfig::from_path(path)?
     } else {
         // Use default configuration instead of prompting
@@ -285,13 +281,13 @@ async fn init_model_storage(
             println!("{}", "ModelExpress Storage Configuration".green().bold());
             println!("{}", "===================================".green().bold());
             println!("Configuration saved successfully!");
-            println!("Storage path: {:?}", config.local_path);
+            println!("Cache directory: {:?}", config.directory);
             println!("Server endpoint: {}", config.server_endpoint);
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
-                "storage_path": config.local_path,
+                "cache_directory": config.directory,
                 "server_endpoint": config.server_endpoint,
             });
             print_output(&output, format);
@@ -302,11 +298,11 @@ async fn init_model_storage(
 }
 
 async fn list_models(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     detailed: bool,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let storage_config = get_storage_config(storage_path_override)?;
+    let storage_config = get_storage_config(cache_dir_override)?;
     let stats = storage_config.get_cache_stats()?;
 
     match format {
@@ -370,13 +366,13 @@ async fn list_models(
 }
 
 async fn show_model_status(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let storage_config = get_storage_config(storage_path_override)?;
+    let storage_config = get_storage_config(cache_dir_override)?;
     let stats = storage_config.get_cache_stats()?;
 
-    let storage_accessible = storage_config.local_path.exists();
+    let storage_accessible = storage_config.directory.exists();
     let server_available = Client::new(ClientConfig::for_testing(&storage_config.server_endpoint))
         .await
         .is_ok();
@@ -385,7 +381,7 @@ async fn show_model_status(
         OutputFormat::Human => {
             println!("{}", "Model Storage Status".green().bold());
             println!("{}", "====================".green().bold());
-            println!("Storage path: {:?}", storage_config.local_path);
+            println!("Cache directory: {:?}", storage_config.directory);
             println!("Server endpoint: {}", storage_config.server_endpoint);
             println!("Total models: {}", stats.total_models);
             println!("Total size: {}", stats.format_total_size());
@@ -406,7 +402,7 @@ async fn show_model_status(
         }
         _ => {
             let output = serde_json::json!({
-                "storage_path": storage_config.local_path,
+                "cache_directory": storage_config.directory,
                 "server_endpoint": storage_config.server_endpoint,
                 "total_models": stats.total_models,
                 "total_size": stats.format_total_size(),
@@ -421,11 +417,11 @@ async fn show_model_status(
 }
 
 async fn clear_model(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     model_name: &str,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let storage_config = get_storage_config(storage_path_override)?;
+    let storage_config = get_storage_config(cache_dir_override)?;
 
     storage_config.clear_model(model_name)?;
 
@@ -447,11 +443,11 @@ async fn clear_model(
 }
 
 async fn clear_all_models(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     yes: bool,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let storage_config = get_storage_config(storage_path_override)?;
+    let storage_config = get_storage_config(cache_dir_override)?;
 
     if !yes && matches!(format, OutputFormat::Human) {
         print!("Are you sure you want to clear all models from storage? [y/N]: ");
@@ -485,15 +481,15 @@ async fn clear_all_models(
 }
 
 async fn validate_models(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     model_name: Option<String>,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let storage_config = get_storage_config(storage_path_override)?;
+    let storage_config = get_storage_config(cache_dir_override)?;
 
     if let Some(name) = model_name {
         // Validate specific model
-        let model_path = storage_config.local_path.join(&name);
+        let model_path = storage_config.directory.join(&name);
         let exists = model_path.exists();
 
         match format {
@@ -558,11 +554,11 @@ async fn validate_models(
 }
 
 async fn show_model_stats(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
     detailed: bool,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let storage_config = get_storage_config(storage_path_override)?;
+    let storage_config = get_storage_config(cache_dir_override)?;
     let stats = storage_config.get_cache_stats()?;
 
     match format {
@@ -620,10 +616,10 @@ async fn show_model_stats(
 }
 
 fn get_storage_config(
-    storage_path_override: Option<PathBuf>,
+    cache_dir_override: Option<PathBuf>,
 ) -> Result<CacheConfig, Box<dyn std::error::Error>> {
     // If storage path is provided via CLI, use it
-    if let Some(path) = storage_path_override {
+    if let Some(path) = cache_dir_override {
         return Ok(CacheConfig::from_path(path)?);
     }
 

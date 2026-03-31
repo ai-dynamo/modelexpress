@@ -3,7 +3,6 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use modelexpress_client::{ClientArgs, ModelProvider};
-use std::path::PathBuf;
 
 /// CLI argument structure for the modelexpress-cli binary.
 ///
@@ -85,10 +84,6 @@ pub enum ModelCommands {
 
     /// Initialize model storage configuration
     Init {
-        /// Storage path for models
-        #[arg(long, value_name = "PATH")]
-        storage_path: Option<PathBuf>,
-
         /// Server endpoint
         #[arg(long, value_name = "ENDPOINT")]
         server_endpoint: Option<String>,
