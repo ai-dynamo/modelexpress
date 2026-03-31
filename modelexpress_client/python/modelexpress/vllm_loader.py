@@ -267,13 +267,50 @@ def _collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _init_nixl_manager(global_rank: int, device_id: int, role: str) -> NixlTransferManager:
+def _is_p2p_metadata_enabled() -> bool:
+    """Check if P2P metadata exchange is enabled via env var."""
+    return os.environ.get("MX_P2P_METADATA", "0") == "1"
+
+
+def _get_worker_host() -> str:
+    """Get the routable hostname/IP for this worker.
+
+    Priority: MX_WORKER_HOST env var, then pod IP via socket.
+    Falls back to FQDN. Rejects localhost variants.
+    """
+    import socket
+    explicit = os.environ.get("MX_WORKER_HOST", "")
+    if explicit:
+        return explicit
+    # Try to get routable IP (works in K8s pods)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    fqdn = socket.getfqdn()
+    if fqdn in ("localhost", "localhost.localdomain"):
+        raise RuntimeError(
+            "Cannot determine routable address for P2P metadata exchange. "
+            "Set MX_WORKER_HOST or configure DNS."
+        )
+    return fqdn
+
+
+def _init_nixl_manager(
+    global_rank: int, device_id: int, role: str, listen_port: int = 0,
+) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     agent_name = f"mx-{role}-worker{global_rank}-{uuid.uuid4().hex[:8]}"
     logger.debug(f"[Worker {global_rank}] Initializing NIXL manager with agent_name={agent_name}")
     manager = NixlTransferManager(
         agent_name=agent_name,
         device_id=device_id,
+        listen_port=listen_port,
     )
     manager.initialize()
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
@@ -335,6 +372,45 @@ def _build_source_identity(
     )
 
 
+def _build_tensor_protos(
+    nixl_manager: NixlTransferManager,
+    tensors: dict[str, torch.Tensor],
+    device_id: int,
+    global_rank: int,
+) -> list["p2p_pb2.TensorDescriptor"]:
+    """Build tensor descriptor protos from registered tensors."""
+    use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
+
+    if use_contiguous:
+        region_descriptors = nixl_manager.get_registered_descriptors()
+        protos = [
+            p2p_pb2.TensorDescriptor(
+                name=desc.name,
+                addr=desc.addr,
+                size=desc.size,
+                device_id=desc.device_id,
+                dtype=desc.dtype,
+            )
+            for desc in region_descriptors
+        ]
+        logger.info(
+            f"[Worker {global_rank}] Built {len(protos)} REGION descriptors "
+            f"(MX_CONTIGUOUS_REG=1)"
+        )
+    else:
+        protos = [
+            p2p_pb2.TensorDescriptor(
+                name=name,
+                addr=t.data_ptr(),
+                size=t.numel() * t.element_size(),
+                device_id=device_id,
+                dtype=str(t.dtype),
+            )
+            for name, t in tensors.items()
+        ]
+    return protos
+
+
 def _publish_metadata_and_ready(
     mx_client: MxClient,
     nixl_manager: NixlTransferManager,
@@ -349,55 +425,81 @@ def _publish_metadata_and_ready(
         f"[Worker {global_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
-    use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
+    tensor_protos = _build_tensor_protos(
+        nixl_manager, tensors, device_id, global_rank,
+    )
 
-    if use_contiguous:
-        region_descriptors = nixl_manager.get_registered_descriptors()
-        tensor_protos = [
-            p2p_pb2.TensorDescriptor(
-                name=desc.name,
-                addr=desc.addr,
-                size=desc.size,
-                device_id=desc.device_id,
-                dtype=desc.dtype,
-            )
-            for desc in region_descriptors
-        ]
+    if _is_p2p_metadata_enabled():
+        from .worker_server import WorkerGrpcServer
+
+        host = _get_worker_host()
+
+        # Publish lightweight metadata (no nixl_metadata blob, no tensors)
+        # and start a worker gRPC server for tensor manifest serving.
+        # Each worker gets base_port + device_id to avoid collisions.
+        grpc_base = int(os.environ.get("MX_WORKER_GRPC_PORT", "6555"))
+        worker_grpc_port = grpc_base + device_id
+
+        # Publish first to get mx_source_id, then start worker server
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=global_rank,
+            metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
+            agent_name=nixl_manager.agent_name,
+            worker_grpc_endpoint="",  # will update after server starts
+        )
+        mx_source_id = _publish_metadata_to_server(
+            mx_client=mx_client,
+            identity=identity,
+            worker=worker,
+            worker_id=worker_id,
+            global_rank=global_rank,
+        )
+
+        # Start worker gRPC server
+        grpc_server = WorkerGrpcServer(
+            tensor_protos=tensor_protos,
+            mx_source_id=mx_source_id,
+            port=worker_grpc_port,
+        )
+        actual_port = grpc_server.start()
+        _worker_servers[device_id] = grpc_server
+
+        # Re-publish with the actual worker_grpc_endpoint
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=global_rank,
+            metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
+            agent_name=nixl_manager.agent_name,
+            worker_grpc_endpoint=f"{host}:{actual_port}",
+        )
+        mx_source_id = _publish_metadata_to_server(
+            mx_client=mx_client,
+            identity=identity,
+            worker=worker,
+            worker_id=worker_id,
+            global_rank=global_rank,
+        )
         logger.info(
-            f"[Worker {global_rank}] Built {len(tensor_protos)} REGION descriptors "
-            f"(MX_CONTIGUOUS_REG=1)"
+            f"[Worker {global_rank}] Published P2P metadata to MX server "
+            f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
         )
     else:
-        tensor_protos = [
-            p2p_pb2.TensorDescriptor(
-                name=name,
-                addr=t.data_ptr(),
-                size=t.numel() * t.element_size(),
-                device_id=device_id,
-                dtype=str(t.dtype),
-            )
-            for name, t in tensors.items()
-        ]
-
-    nixl_metadata = nixl_manager.nixl_metadata
-
-    worker = p2p_pb2.WorkerMetadata(
-        worker_rank=global_rank,
-        nixl_metadata=nixl_metadata,
-        tensors=tensor_protos,
-    )
-
-    mx_source_id = _publish_metadata_to_server(
-        mx_client=mx_client,
-        identity=identity,
-        worker=worker,
-        worker_id=worker_id,
-        global_rank=global_rank,
-    )
-    logger.info(
-        f"[Worker {global_rank}] Published metadata to MX server "
-        f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
-    )
+        # Centralized mode: publish full metadata (blobs + tensors)
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=global_rank,
+            nixl_metadata=nixl_manager.nixl_metadata,
+            tensors=tensor_protos,
+        )
+        mx_source_id = _publish_metadata_to_server(
+            mx_client=mx_client,
+            identity=identity,
+            worker=worker,
+            worker_id=worker_id,
+            global_rank=global_rank,
+        )
+        logger.info(
+            f"[Worker {global_rank}] Published metadata to MX server "
+            f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+        )
 
     heartbeat = HeartbeatThread(
         mx_client=mx_client,
@@ -544,6 +646,7 @@ class MxModelLoader(BaseModelLoader):
 
         Returns None if the worker is not found or has no tensors.
         """
+        fetch_start = time.perf_counter()
         metadata_resp = self._mx_client.get_metadata(
             mx_source_id=mx_source_id,
             worker_id=worker_id,
@@ -554,11 +657,19 @@ class MxModelLoader(BaseModelLoader):
             )
             return None
         worker = metadata_resp.worker
-        if not worker.tensors:
+        if not worker.tensors and not worker.worker_grpc_endpoint:
             logger.debug(
-                f"[Worker {global_rank}] Worker {worker_id} has no tensors, skipping"
+                f"[Worker {global_rank}] Worker {worker_id} has no tensors "
+                f"and no P2P endpoint, skipping"
             )
             return None
+        fetch_time = time.perf_counter() - fetch_start
+        mode = "P2P (lightweight)" if worker.worker_grpc_endpoint else "centralized"
+        tensor_count = len(worker.tensors)
+        logger.info(
+            f"[Worker {global_rank}] [TIMING] GetMetadata ({mode}): "
+            f"{fetch_time:.3f}s, {tensor_count} tensors"
+        )
         return worker
 
     def _try_load_from_candidates(
@@ -690,7 +801,7 @@ class MxModelLoader(BaseModelLoader):
 
         # RDMA receive (fully-processed tensors, no post-processing needed)
         # Raises SourceTransferError on source-side failures
-        self._receive_from_peer(model, global_rank, device_id, source_worker)
+        self._receive_from_peer(model, global_rank, device_id, source_worker, mx_source_id)
 
         # Publish metadata so future nodes can discover us
         self._publish_metadata(global_rank, device_id, identity)
@@ -701,8 +812,14 @@ class MxModelLoader(BaseModelLoader):
         global_rank: int,
         device_id: int,
         source_worker,
+        mx_source_id: str = "",
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source.
+
+        Auto-detects P2P vs centralized mode based on whether the source
+        published P2P endpoint fields. In P2P mode, fetches tensor manifest
+        from the source worker's gRPC server and NIXL metadata via the
+        listen thread. In centralized mode, uses metadata from the server.
 
         Raises SourceTransferError if the RDMA receive fails, indicating a
         proven source-side problem. Other exceptions propagate normally.
@@ -710,20 +827,63 @@ class MxModelLoader(BaseModelLoader):
         receive_start = time.perf_counter()
         self._register_tensors(model, global_rank, device_id)
 
-        # Build source tensor descriptors
-        source_tensors = [
-            TensorDescriptor(
-                name=t.name,
-                addr=t.addr,
-                size=t.size,
-                device_id=t.device_id,
-                dtype=t.dtype,
+        is_p2p = bool(source_worker.worker_grpc_endpoint)
+        remote_agent_name_override = None
+
+        if is_p2p:
+            # P2P mode: fetch tensors from source worker directly
+            from .worker_server import fetch_tensor_manifest
+
+            manifest_start = time.perf_counter()
+            logger.info(
+                f"[Worker {global_rank}] P2P mode: fetching tensor manifest from "
+                f"{source_worker.worker_grpc_endpoint}"
             )
-            for t in source_worker.tensors
-        ]
+            tensor_protos = fetch_tensor_manifest(
+                endpoint=source_worker.worker_grpc_endpoint,
+                mx_source_id=mx_source_id,
+            )
+            manifest_time = time.perf_counter() - manifest_start
+            source_tensors = [
+                TensorDescriptor(
+                    name=t.name, addr=t.addr, size=t.size,
+                    device_id=t.device_id, dtype=t.dtype,
+                )
+                for t in tensor_protos
+            ]
+            logger.info(
+                f"[Worker {global_rank}] [TIMING] P2P tensor manifest: "
+                f"{manifest_time:.3f}s ({len(source_tensors)} tensors)"
+            )
+
+            # Fetch NIXL metadata via P2P listen thread
+            nixl_fetch_start = time.perf_counter()
+            ep = source_worker.metadata_endpoint
+            host, port_str = ep.rsplit(":", 1)
+            self._nixl_manager.fetch_remote_and_wait(
+                remote_agent_name=source_worker.agent_name,
+                ip=host,
+                port=int(port_str),
+            )
+            nixl_fetch_time = time.perf_counter() - nixl_fetch_start
+            logger.info(
+                f"[Worker {global_rank}] [TIMING] P2P NIXL metadata fetch: "
+                f"{nixl_fetch_time:.3f}s"
+            )
+            remote_agent_name_override = source_worker.agent_name
+        else:
+            # Centralized mode: tensors and NIXL blob from server
+            source_tensors = [
+                TensorDescriptor(
+                    name=t.name, addr=t.addr, size=t.size,
+                    device_id=t.device_id, dtype=t.dtype,
+                )
+                for t in source_worker.tensors
+            ]
 
         logger.info(
             f"[Worker {global_rank}] Receiving {len(source_tensors)} tensors from source"
+            f"{' (P2P)' if is_p2p else ''}"
         )
 
         coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
@@ -735,6 +895,7 @@ class MxModelLoader(BaseModelLoader):
                 source_tensors=source_tensors,
                 timeout_seconds=300.0,
                 coalesce_transfers=coalesce,
+                remote_agent_name=remote_agent_name_override,
             )
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e
@@ -836,7 +997,13 @@ class MxModelLoader(BaseModelLoader):
         _log_tensor_summary(self._tensors, global_rank, "Registering tensors")
 
         if self._nixl_manager is None:
-            self._nixl_manager = _init_nixl_manager(global_rank, device_id, "auto")
+            # Always enable the NIXL listen thread: targets need it to call
+            # fetch_remote_metadata on P2P sources, and every node becomes a
+            # source after receiving weights. Each worker needs a unique port
+            # (base + device_id) to avoid collisions in multi-GPU setups.
+            base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+            listen_port = base_port + device_id
+            self._nixl_manager = _init_nixl_manager(global_rank, device_id, "auto", listen_port)
 
         if not self._nixl_manager.tensor_descriptors:
             logger.debug(f"[Worker {global_rank}] Registering tensors with NIXL...")
@@ -880,3 +1047,4 @@ class MxModelLoader(BaseModelLoader):
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, "NixlTransferManager"] = {}
 _heartbeat_threads: dict[int, HeartbeatThread] = {}
+_worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only

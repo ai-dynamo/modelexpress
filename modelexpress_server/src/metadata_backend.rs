@@ -111,6 +111,12 @@ pub struct WorkerRecord {
     pub status: i32,
     /// Timestamp of last status update (unix millis)
     pub updated_at: i64,
+    /// P2P: NIXL listen thread endpoint (host:port)
+    pub metadata_endpoint: String,
+    /// P2P: NIXL agent name for remote identification
+    pub agent_name: String,
+    /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
+    pub worker_grpc_endpoint: String,
 }
 
 /// Tensor descriptor record
@@ -140,6 +146,9 @@ impl From<WorkerMetadata> for WorkerRecord {
             tensors: meta.tensors.into_iter().map(TensorRecord::from).collect(),
             status: meta.status,
             updated_at: meta.updated_at,
+            metadata_endpoint: meta.metadata_endpoint,
+            agent_name: meta.agent_name,
+            worker_grpc_endpoint: meta.worker_grpc_endpoint,
         }
     }
 }
@@ -177,6 +186,9 @@ impl From<WorkerRecord> for WorkerMetadata {
                 .collect(),
             status: record.status,
             updated_at: record.updated_at,
+            metadata_endpoint: record.metadata_endpoint,
+            agent_name: record.agent_name,
+            worker_grpc_endpoint: record.worker_grpc_endpoint,
         }
     }
 }

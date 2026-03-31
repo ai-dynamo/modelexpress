@@ -205,6 +205,15 @@ struct WorkerRecordJson {
     pub status: i32,
     #[serde(default)]
     pub updated_at: i64,
+    /// P2P: NIXL listen thread endpoint
+    #[serde(default)]
+    pub metadata_endpoint: String,
+    /// P2P: NIXL agent name
+    #[serde(default)]
+    pub agent_name: String,
+    /// P2P: Worker gRPC endpoint for tensor manifest
+    #[serde(default)]
+    pub worker_grpc_endpoint: String,
 }
 
 impl WorkerRecordJson {
@@ -227,6 +236,9 @@ impl WorkerRecordJson {
                 .collect(),
             status: record.status,
             updated_at: record.updated_at,
+            metadata_endpoint: record.metadata_endpoint,
+            agent_name: record.agent_name,
+            worker_grpc_endpoint: record.worker_grpc_endpoint,
         }
     }
 }
@@ -243,6 +255,9 @@ impl From<WorkerRecordJson> for WorkerRecord {
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
             status: json.status,
             updated_at: json.updated_at,
+            metadata_endpoint: json.metadata_endpoint,
+            agent_name: json.agent_name,
+            worker_grpc_endpoint: json.worker_grpc_endpoint,
         }
     }
 }
@@ -636,6 +651,9 @@ mod tests {
             }],
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,
+            metadata_endpoint: String::new(),
+            agent_name: String::new(),
+            worker_grpc_endpoint: String::new(),
         };
 
         let json_record = WorkerRecordJson::from_worker_record(record.clone());

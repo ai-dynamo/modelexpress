@@ -50,7 +50,7 @@ class HeartbeatThread:
         worker_id: str,
         worker_rank: int,
         nixl_manager: NixlTransferManager,
-        
+
     ):
         self._mx_client = mx_client
         self._mx_source_id = mx_source_id

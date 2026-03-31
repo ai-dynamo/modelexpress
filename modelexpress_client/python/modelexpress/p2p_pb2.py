@@ -27,7 +27,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tp2p.proto\x12\x11model_express.p2p\"\xbc\x03\n\x0eSourceIdentity\x12\x12\n\nmx_version\x18\x01 \x01(\t\x12\x37\n\x0emx_source_type\x18\x02 \x01(\x0e\x32\x1f.model_express.p2p.MxSourceType\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12>\n\x11\x62\x61\x63kend_framework\x18\x04 \x01(\x0e\x32#.model_express.p2p.BackendFramework\x12\x1c\n\x14tensor_parallel_size\x18\x05 \x01(\r\x12\x1e\n\x16pipeline_parallel_size\x18\x06 \x01(\r\x12\x1c\n\x14\x65xpert_parallel_size\x18\x07 \x01(\r\x12\r\n\x05\x64type\x18\x08 \x01(\t\x12\x14\n\x0cquantization\x18\t \x01(\t\x12P\n\x10\x65xtra_parameters\x18\n \x03(\x0b\x32\x36.model_express.p2p.SourceIdentity.ExtraParametersEntry\x1a\x36\n\x14\x45xtraParametersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"^\n\x10TensorDescriptor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04\x61\x64\x64r\x18\x02 \x01(\x04\x12\x0c\n\x04size\x18\x03 \x01(\x04\x12\x11\n\tdevice_id\x18\x04 \x01(\r\x12\r\n\x05\x64type\x18\x05 \x01(\t\"\xf3\x01\n\x0eWorkerMetadata\x12\x13\n\x0bworker_rank\x18\x01 \x01(\r\x12\x17\n\rnixl_metadata\x18\x02 \x01(\x0cH\x00\x12$\n\x1atransfer_engine_session_id\x18\n \x01(\tH\x00\x12\x34\n\x07tensors\x18\x03 \x03(\x0b\x32#.model_express.p2p.TensorDescriptor\x12/\n\x06status\x18\x04 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatus\x12\x12\n\nupdated_at\x18\x05 \x01(\x03\x42\x12\n\x10\x62\x61\x63kend_metadata\"\x93\x01\n\x16PublishMetadataRequest\x12\x33\n\x08identity\x18\x01 \x01(\x0b\x32!.model_express.p2p.SourceIdentity\x12\x31\n\x06worker\x18\x02 \x01(\x0b\x32!.model_express.p2p.WorkerMetadata\x12\x11\n\tworker_id\x18\x03 \x01(\t\"d\n\x17PublishMetadataResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x14\n\x0cmx_source_id\x18\x03 \x01(\t\x12\x11\n\tworker_id\x18\x04 \x01(\t\"e\n\x11SourceInstanceRef\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\t\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12\x13\n\x0bworker_rank\x18\x04 \x01(\r\"\x98\x01\n\x12ListSourcesRequest\x12\x33\n\x08identity\x18\x01 \x01(\x0b\x32!.model_express.p2p.SourceIdentity\x12;\n\rstatus_filter\x18\x02 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatusH\x00\x88\x01\x01\x42\x10\n\x0e_status_filter\"N\n\x13ListSourcesResponse\x12\x37\n\tinstances\x18\x01 \x03(\x0b\x32$.model_express.p2p.SourceInstanceRef\"=\n\x12GetMetadataRequest\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\t\"\x80\x01\n\x13GetMetadataResponse\x12\r\n\x05\x66ound\x18\x01 \x01(\x08\x12\x31\n\x06worker\x18\x02 \x01(\x0b\x32!.model_express.p2p.WorkerMetadata\x12\x14\n\x0cmx_source_id\x18\x03 \x01(\t\x12\x11\n\tworker_id\x18\x04 \x01(\t\"\x84\x01\n\x13UpdateStatusRequest\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\x12\x13\n\x0bworker_rank\x18\x02 \x01(\r\x12/\n\x06status\x18\x03 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatus\x12\x11\n\tworker_id\x18\x04 \x01(\t\"8\n\x14UpdateStatusResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t*\x8a\x01\n\x10\x42\x61\x63kendFramework\x12\x1d\n\x19\x42\x41\x43KEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n\x16\x42\x41\x43KEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n\x18\x42\x41\x43KEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n\x19\x42\x41\x43KEND_FRAMEWORK_TRT_LLM\x10\x03*b\n\x0cMxSourceType\x12\x1a\n\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02*{\n\x0cSourceStatus\x12\x19\n\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n\x13SOURCE_STATUS_READY\x10\x02\x12\x17\n\x13SOURCE_STATUS_STALE\x10\x03\x32\x93\x03\n\nP2pService\x12h\n\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n\x0bListSources\x12%.model_express.p2p.ListSourcesRequest\x1a&.model_express.p2p.ListSourcesResponse\x12\\\n\x0bGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n\x0cUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a\'.model_express.p2p.UpdateStatusResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tp2p.proto\x12\x11model_express.p2p\"\xbc\x03\n\x0eSourceIdentity\x12\x12\n\nmx_version\x18\x01 \x01(\t\x12\x37\n\x0emx_source_type\x18\x02 \x01(\x0e\x32\x1f.model_express.p2p.MxSourceType\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12>\n\x11\x62\x61\x63kend_framework\x18\x04 \x01(\x0e\x32#.model_express.p2p.BackendFramework\x12\x1c\n\x14tensor_parallel_size\x18\x05 \x01(\r\x12\x1e\n\x16pipeline_parallel_size\x18\x06 \x01(\r\x12\x1c\n\x14\x65xpert_parallel_size\x18\x07 \x01(\r\x12\r\n\x05\x64type\x18\x08 \x01(\t\x12\x14\n\x0cquantization\x18\t \x01(\t\x12P\n\x10\x65xtra_parameters\x18\n \x03(\x0b\x32\x36.model_express.p2p.SourceIdentity.ExtraParametersEntry\x1a\x36\n\x14\x45xtraParametersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"^\n\x10TensorDescriptor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x0c\n\x04\x61\x64\x64r\x18\x02 \x01(\x04\x12\x0c\n\x04size\x18\x03 \x01(\x04\x12\x11\n\tdevice_id\x18\x04 \x01(\r\x12\r\n\x05\x64type\x18\x05 \x01(\t\"\xc0\x02\n\x0eWorkerMetadata\x12\x13\n\x0bworker_rank\x18\x01 \x01(\r\x12\x17\n\rnixl_metadata\x18\x02 \x01(\x0cH\x00\x12$\n\x1atransfer_engine_session_id\x18\n \x01(\tH\x00\x12\x34\n\x07tensors\x18\x03 \x03(\x0b\x32#.model_express.p2p.TensorDescriptor\x12/\n\x06status\x18\x04 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatus\x12\x12\n\nupdated_at\x18\x05 \x01(\x03\x12\x19\n\x11metadata_endpoint\x18\x06 \x01(\t\x12\x12\n\nagent_name\x18\x07 \x01(\t\x12\x1c\n\x14worker_grpc_endpoint\x18\x08 \x01(\tB\x12\n\x10\x62\x61\x63kend_metadata\"0\n\x18GetTensorManifestRequest\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\"g\n\x19GetTensorManifestResponse\x12\x34\n\x07tensors\x18\x01 \x03(\x0b\x32#.model_express.p2p.TensorDescriptor\x12\x14\n\x0cmx_source_id\x18\x02 \x01(\t\"\x93\x01\n\x16PublishMetadataRequest\x12\x33\n\x08identity\x18\x01 \x01(\x0b\x32!.model_express.p2p.SourceIdentity\x12\x31\n\x06worker\x18\x02 \x01(\x0b\x32!.model_express.p2p.WorkerMetadata\x12\x11\n\tworker_id\x18\x03 \x01(\t\"d\n\x17PublishMetadataResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x14\n\x0cmx_source_id\x18\x03 \x01(\t\x12\x11\n\tworker_id\x18\x04 \x01(\t\"e\n\x11SourceInstanceRef\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\t\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12\x13\n\x0bworker_rank\x18\x04 \x01(\r\"\x98\x01\n\x12ListSourcesRequest\x12\x33\n\x08identity\x18\x01 \x01(\x0b\x32!.model_express.p2p.SourceIdentity\x12;\n\rstatus_filter\x18\x02 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatusH\x00\x88\x01\x01\x42\x10\n\x0e_status_filter\"N\n\x13ListSourcesResponse\x12\x37\n\tinstances\x18\x01 \x03(\x0b\x32$.model_express.p2p.SourceInstanceRef\"=\n\x12GetMetadataRequest\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\t\"\x80\x01\n\x13GetMetadataResponse\x12\r\n\x05\x66ound\x18\x01 \x01(\x08\x12\x31\n\x06worker\x18\x02 \x01(\x0b\x32!.model_express.p2p.WorkerMetadata\x12\x14\n\x0cmx_source_id\x18\x03 \x01(\t\x12\x11\n\tworker_id\x18\x04 \x01(\t\"\x84\x01\n\x13UpdateStatusRequest\x12\x14\n\x0cmx_source_id\x18\x01 \x01(\t\x12\x13\n\x0bworker_rank\x18\x02 \x01(\r\x12/\n\x06status\x18\x03 \x01(\x0e\x32\x1f.model_express.p2p.SourceStatus\x12\x11\n\tworker_id\x18\x04 \x01(\t\"8\n\x14UpdateStatusResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t*\x8a\x01\n\x10\x42\x61\x63kendFramework\x12\x1d\n\x19\x42\x41\x43KEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n\x16\x42\x41\x43KEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n\x18\x42\x41\x43KEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n\x19\x42\x41\x43KEND_FRAMEWORK_TRT_LLM\x10\x03*b\n\x0cMxSourceType\x12\x1a\n\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02*{\n\x0cSourceStatus\x12\x19\n\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n\x13SOURCE_STATUS_READY\x10\x02\x12\x17\n\x13SOURCE_STATUS_STALE\x10\x03\x32\x93\x03\n\nP2pService\x12h\n\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n\x0bListSources\x12%.model_express.p2p.ListSourcesRequest\x1a&.model_express.p2p.ListSourcesResponse\x12\\\n\x0bGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n\x0cUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a\'.model_express.p2p.UpdateStatusResponse2\x7f\n\rWorkerService\x12n\n\x11GetTensorManifest\x12+.model_express.p2p.GetTensorManifestRequest\x1a,.model_express.p2p.GetTensorManifestResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,12 +36,12 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_SOURCEIDENTITY_EXTRAPARAMETERSENTRY']._loaded_options = None
   _globals['_SOURCEIDENTITY_EXTRAPARAMETERSENTRY']._serialized_options = b'8\001'
-  _globals['_BACKENDFRAMEWORK']._serialized_start=1799
-  _globals['_BACKENDFRAMEWORK']._serialized_end=1937
-  _globals['_MXSOURCETYPE']._serialized_start=1939
-  _globals['_MXSOURCETYPE']._serialized_end=2037
-  _globals['_SOURCESTATUS']._serialized_start=2039
-  _globals['_SOURCESTATUS']._serialized_end=2162
+  _globals['_BACKENDFRAMEWORK']._serialized_start=2031
+  _globals['_BACKENDFRAMEWORK']._serialized_end=2169
+  _globals['_MXSOURCETYPE']._serialized_start=2171
+  _globals['_MXSOURCETYPE']._serialized_end=2269
+  _globals['_SOURCESTATUS']._serialized_start=2271
+  _globals['_SOURCESTATUS']._serialized_end=2394
   _globals['_SOURCEIDENTITY']._serialized_start=33
   _globals['_SOURCEIDENTITY']._serialized_end=477
   _globals['_SOURCEIDENTITY_EXTRAPARAMETERSENTRY']._serialized_start=423
@@ -49,25 +49,31 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TENSORDESCRIPTOR']._serialized_start=479
   _globals['_TENSORDESCRIPTOR']._serialized_end=573
   _globals['_WORKERMETADATA']._serialized_start=576
-  _globals['_WORKERMETADATA']._serialized_end=819
-  _globals['_PUBLISHMETADATAREQUEST']._serialized_start=822
-  _globals['_PUBLISHMETADATAREQUEST']._serialized_end=969
-  _globals['_PUBLISHMETADATARESPONSE']._serialized_start=971
-  _globals['_PUBLISHMETADATARESPONSE']._serialized_end=1071
-  _globals['_SOURCEINSTANCEREF']._serialized_start=1073
-  _globals['_SOURCEINSTANCEREF']._serialized_end=1174
-  _globals['_LISTSOURCESREQUEST']._serialized_start=1177
-  _globals['_LISTSOURCESREQUEST']._serialized_end=1329
-  _globals['_LISTSOURCESRESPONSE']._serialized_start=1331
-  _globals['_LISTSOURCESRESPONSE']._serialized_end=1409
-  _globals['_GETMETADATAREQUEST']._serialized_start=1411
-  _globals['_GETMETADATAREQUEST']._serialized_end=1472
-  _globals['_GETMETADATARESPONSE']._serialized_start=1475
-  _globals['_GETMETADATARESPONSE']._serialized_end=1603
-  _globals['_UPDATESTATUSREQUEST']._serialized_start=1606
-  _globals['_UPDATESTATUSREQUEST']._serialized_end=1738
-  _globals['_UPDATESTATUSRESPONSE']._serialized_start=1740
-  _globals['_UPDATESTATUSRESPONSE']._serialized_end=1796
-  _globals['_P2PSERVICE']._serialized_start=2165
-  _globals['_P2PSERVICE']._serialized_end=2568
+  _globals['_WORKERMETADATA']._serialized_end=896
+  _globals['_GETTENSORMANIFESTREQUEST']._serialized_start=898
+  _globals['_GETTENSORMANIFESTREQUEST']._serialized_end=946
+  _globals['_GETTENSORMANIFESTRESPONSE']._serialized_start=948
+  _globals['_GETTENSORMANIFESTRESPONSE']._serialized_end=1051
+  _globals['_PUBLISHMETADATAREQUEST']._serialized_start=1054
+  _globals['_PUBLISHMETADATAREQUEST']._serialized_end=1201
+  _globals['_PUBLISHMETADATARESPONSE']._serialized_start=1203
+  _globals['_PUBLISHMETADATARESPONSE']._serialized_end=1303
+  _globals['_SOURCEINSTANCEREF']._serialized_start=1305
+  _globals['_SOURCEINSTANCEREF']._serialized_end=1406
+  _globals['_LISTSOURCESREQUEST']._serialized_start=1409
+  _globals['_LISTSOURCESREQUEST']._serialized_end=1561
+  _globals['_LISTSOURCESRESPONSE']._serialized_start=1563
+  _globals['_LISTSOURCESRESPONSE']._serialized_end=1641
+  _globals['_GETMETADATAREQUEST']._serialized_start=1643
+  _globals['_GETMETADATAREQUEST']._serialized_end=1704
+  _globals['_GETMETADATARESPONSE']._serialized_start=1707
+  _globals['_GETMETADATARESPONSE']._serialized_end=1835
+  _globals['_UPDATESTATUSREQUEST']._serialized_start=1838
+  _globals['_UPDATESTATUSREQUEST']._serialized_end=1970
+  _globals['_UPDATESTATUSRESPONSE']._serialized_start=1972
+  _globals['_UPDATESTATUSRESPONSE']._serialized_end=2028
+  _globals['_P2PSERVICE']._serialized_start=2397
+  _globals['_P2PSERVICE']._serialized_end=2800
+  _globals['_WORKERSERVICE']._serialized_start=2802
+  _globals['_WORKERSERVICE']._serialized_end=2929
 # @@protoc_insertion_point(module_scope)

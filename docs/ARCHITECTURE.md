@@ -251,7 +251,15 @@ Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Do
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Fetch full tensor metadata for one specific worker (MB-scale, on demand) |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Update per-worker lifecycle status (Initializing/Ready/Stale) |
 
-Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility), `WorkerMetadata` (rank, oneof backend_metadata, tensors, status), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing).
+Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility), `WorkerMetadata` (rank, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing).
+
+### p2p.proto - WorkerService (P2P, opt-in)
+
+| RPC | Request | Response | Purpose |
+|-----|---------|----------|---------|
+| `GetTensorManifest` | `GetTensorManifestRequest` | `GetTensorManifestResponse` | Fetch tensor descriptors directly from a source worker |
+
+Per-worker gRPC service started when `MX_P2P_METADATA=1`. Targets call this instead of fetching tensor descriptors from the central server. Validates `mx_source_id` to catch stale discovery.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
@@ -430,6 +438,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `vllm_loader.py` | `MxModelLoader` - auto-detecting model loader (RDMA -> GDS -> disk) |
+| `worker_server.py` | `WorkerGrpcServer` - per-worker gRPC server for P2P tensor manifest exchange |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
@@ -452,10 +461,11 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 | Method | Purpose |
 |--------|---------|
-| `__init__(agent_name, device_id)` | Create NIXL agent with UCX backend |
+| `__init__(agent_name, device_id, listen_port)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread |
 | `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata |
 | `get_registered_descriptors()` | Return region descriptors (`MX_CONTIGUOUS_REG=1`) or tensor descriptors |
-| `receive_from_source(source_metadata, source_tensors, ...)` | Execute RDMA read transfer with optional coalescing |
+| `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
+| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 ### vLLM Loader
@@ -558,10 +568,10 @@ graph TD
 ### Flow
 
 1. **Source loads**: Loads weights from disk (or GDS), runs `process_weights_after_loading()`
-2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING)
+2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifest serving.
 3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
-5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate
+5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Auto-detects P2P mode if `worker_grpc_endpoint` is populated - fetches tensors from the source worker's `WorkerService` and NIXL metadata via the listen thread instead of from the central server.
 6. **Target transfers**: Executes RDMA reads from source; on `SourceTransferError` tries next candidate (max 3)
 7. **Target becomes source**: After receiving weights, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; GC deletes after 1 hour
@@ -579,6 +589,10 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_METADATA_BACKEND` | (required) | Metadata backend: `redis` or `kubernetes` |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers |
+| `MX_METADATA_PORT` | `0` | NIXL listen thread port for P2P metadata exchange |
+| `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
+| `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |

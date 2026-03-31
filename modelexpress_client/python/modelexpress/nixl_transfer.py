@@ -53,15 +53,21 @@ class NixlTransferManager:
         device_id: GPU device ID for this worker
     """
 
-    def __init__(self, agent_name: str, device_id: int):
+    def __init__(self, agent_name: str, device_id: int, listen_port: int | None = None):
         self._agent_name = agent_name
         self._device_id = device_id
+        self._listen_port = listen_port
 
         self._agent: Any = None
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
         self._registered_regions: list[tuple[int, int]] | None = None
+
+    @property
+    def agent_name(self) -> str:
+        """Get NIXL agent name."""
+        return self._agent_name
 
     @property
     def nixl_metadata(self) -> bytes:
@@ -83,7 +89,19 @@ class NixlTransferManager:
 
         torch.cuda.set_device(self._device_id)
 
-        config = nixl_agent_config(backends=["UCX"]) if nixl_agent_config else None
+        if self._listen_port is not None and nixl_agent_config:
+            config = nixl_agent_config(
+                backends=["UCX"],
+                enable_listen_thread=True,
+                listen_port=self._listen_port,
+            )
+            logger.info(
+                f"NIXL listen thread enabled on port {self._listen_port}"
+            )
+        elif nixl_agent_config:
+            config = nixl_agent_config(backends=["UCX"])
+        else:
+            config = None
         self._agent = NixlAgent(self._agent_name, config)
         logger.info(f"NIXL agent '{self._agent_name}' created on device {self._device_id}")
 
@@ -227,21 +245,59 @@ class NixlTransferManager:
 
         return regions
 
+    def fetch_remote_and_wait(
+        self,
+        remote_agent_name: str,
+        ip: str,
+        port: int,
+        timeout_seconds: float = 120.0,
+    ) -> None:
+        """Fetch remote NIXL agent metadata via the P2P listen thread.
+
+        Initiates an async fetch and polls until the remote agent's metadata
+        is loaded locally. Used in P2P mode instead of add_remote_agent().
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        logger.info(
+            f"Fetching remote metadata from {remote_agent_name} at {ip}:{port}"
+        )
+        self._agent.fetch_remote_metadata(remote_agent_name, ip, port)
+
+        start = time.perf_counter()
+        while True:
+            if time.perf_counter() - start >= timeout_seconds:
+                raise TimeoutError(
+                    f"Timed out waiting for remote metadata from "
+                    f"{remote_agent_name} at {ip}:{port}"
+                )
+            if self._agent.check_remote_metadata(remote_agent_name):
+                logger.info(
+                    f"Remote metadata loaded for {remote_agent_name} "
+                    f"({time.perf_counter() - start:.2f}s)"
+                )
+                return
+            time.sleep(0.01)
+
     def receive_from_source(
         self,
         source_metadata: bytes,
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
         coalesce_transfers: bool = True,
+        remote_agent_name: str | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
 
         Args:
-            source_metadata: NIXL metadata from the source agent
+            source_metadata: NIXL metadata from the source agent (unused if remote_agent_name set)
             source_tensors: Tensor descriptors from the source
             timeout_seconds: Maximum time to wait for transfer (None for no timeout)
             coalesce_transfers: If True, coalesce contiguous memory regions (optimization)
+            remote_agent_name: If set, use this pre-loaded agent (P2P mode) instead of
+                calling add_remote_agent with source_metadata (centralized mode)
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -252,9 +308,16 @@ class NixlTransferManager:
         start_time = time.perf_counter()
         torch.cuda.set_device(self._device_id)
 
-        # Add remote agent
-        remote_agent_name = self._agent.add_remote_agent(source_metadata)
-        logger.info(f"Added remote agent {remote_agent_name}")
+        if remote_agent_name is None:
+            add_start = time.perf_counter()
+            remote_agent_name = self._agent.add_remote_agent(source_metadata)
+            add_time = time.perf_counter() - add_start
+            logger.info(
+                f"[TIMING] add_remote_agent: {add_time:.3f}s "
+                f"(agent={remote_agent_name}, blob={len(source_metadata)} bytes)"
+            )
+        else:
+            logger.info(f"Using pre-loaded remote agent {remote_agent_name}")
 
         # Check if source is sending region descriptors (MX_CONTIGUOUS_REG=1 on source)
         is_region_transfer = (

@@ -272,6 +272,9 @@ impl MetadataBackend for KubernetesBackend {
             tensor_config_map: Some(cm_name),
             status: WorkerStatus::status_name_from_proto(worker_record.status),
             updated_at: Some(now.clone()),
+            metadata_endpoint: worker_record.metadata_endpoint.clone(),
+            agent_name: worker_record.agent_name.clone(),
+            worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
         };
 
         let max_retries: u32 = 5;
@@ -407,6 +410,9 @@ impl MetadataBackend for KubernetesBackend {
                 tensors,
                 status,
                 updated_at,
+                metadata_endpoint: worker_status.metadata_endpoint.clone(),
+                agent_name: worker_status.agent_name.clone(),
+                worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
             });
         }
 
