@@ -188,49 +188,72 @@ def _iter_module_tensors(
     return results
 
 
+def _storage_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a flat contiguous uint8 view of a tensor's underlying storage.
+
+    For RDMA we transfer raw storage bytes. Both source and target run
+    the same post-processing on the same model architecture, so they
+    produce identical storage layouts (same sizes, strides, offsets).
+    Transferring the full storage block ensures all views into it
+    (including partial views like MLA's W_UV and W_UK_T which share
+    storage from a dequantized intermediate) get correct data.
+
+    Multiple tensors sharing the same storage are deduplicated by
+    data_ptr() in the caller, so only one transfer per storage block.
+    """
+    return torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+        tensor.untyped_storage()
+    )
+
+
 def _collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Collect all contiguous CUDA tensors from a module tree into a flat dict.
+    """Collect all CUDA tensors from a module tree into a flat dict.
 
     Uses _iter_module_tensors to find parameters, buffers, and tensor
     attributes, then returns them as a name -> tensor mapping suitable
     for NIXL registration.
 
-    Non-contiguous tensors (e.g. transposed views like W_UK_T) are skipped
-    because they are views over contiguous tensors that are already in the
-    module tree. Transferring the underlying contiguous tensor automatically
-    updates the view.
-
-    Deduplicates by data_ptr() to avoid registering the same GPU memory
-    twice (e.g. tied weights where embed_tokens.weight and lm_head.weight
-    share the same tensor).
+    Contiguous tensors are registered directly. Non-contiguous tensors
+    (DeepGemm TMA-aligned FP8 scales, MLA dequantized projections)
+    are registered as a flat byte view of their full underlying storage,
+    named as ``name.__storage``. This transfers the raw bytes correctly
+    because both source and target have identical storage layouts.
+    Multiple views into the same storage (e.g. W_UV and W_UK_T sharing
+    a dequantized intermediate) are deduplicated by data_ptr so the
+    storage is transferred only once.
     """
     tensors: dict[str, torch.Tensor] = {}
     seen_ptrs: set[int] = set()
-    skipped_noncontiguous = 0
+    storage_view_count = 0
     skipped_duplicate = 0
     for name, tensor, _tensor_type in _iter_module_tensors(model):
         t = tensor.data if hasattr(tensor, "data") else tensor
 
-        if not t.is_contiguous():
-            logger.debug(f"Skipping non-contiguous tensor '{name}' (view of another tensor)")
-            skipped_noncontiguous += 1
-            continue
+        if t.is_contiguous():
+            ptr = t.data_ptr()
+            if ptr in seen_ptrs:
+                logger.debug(f"Skipping duplicate tensor '{name}' (same data_ptr)")
+                skipped_duplicate += 1
+                continue
+            seen_ptrs.add(ptr)
+            tensors[name] = t
+        else:
+            sv = _storage_view(t)
+            ptr = sv.data_ptr()
+            if ptr in seen_ptrs:
+                skipped_duplicate += 1
+                continue
+            seen_ptrs.add(ptr)
+            tensors[f"{name}.__storage"] = sv
+            storage_view_count += 1
 
-        ptr = t.data_ptr()
-        if ptr in seen_ptrs:
-            logger.debug(f"Skipping duplicate tensor '{name}' (same data_ptr as already registered tensor)")
-            skipped_duplicate += 1
-            continue
-        seen_ptrs.add(ptr)
-
-        tensors[name] = t
-
-    if skipped_noncontiguous:
+    if storage_view_count:
         logger.info(
-            f"Skipped {skipped_noncontiguous} non-contiguous tensors (views of contiguous tensors already registered)"
+            f"Registered {storage_view_count} non-contiguous tensors "
+            f"via storage-level byte transfer"
         )
     if skipped_duplicate:
-        logger.info(f"Skipped {skipped_duplicate} duplicate tensors (tied weights sharing the same memory)")
+        logger.info(f"Skipped {skipped_duplicate} duplicate tensors (tied weights)")
     return tensors
 
 
