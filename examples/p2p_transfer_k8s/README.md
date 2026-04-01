@@ -62,7 +62,7 @@ kubectl apply -f vllm-source.yaml
 Wait for it to be ready and client to publish metadata:
 
 ```bash
-kubectl logs deployment/mx-source -c client -f
+kubectl logs deployment/mx-source -c vllm -f
 ```
 
 ### 4. Deploy Target vLLM Instance
@@ -80,7 +80,7 @@ The client will automatically:
 4. Publish its own metadata (becomes another source)
 
 ```bash
-kubectl logs deployment/mx-target -c client -f
+kubectl logs deployment/mx-target -c vllm -f
 ```
 
 ## Environment Variables
@@ -114,11 +114,11 @@ With TP=4, this creates sockets: `/tmp/mx/vllm-0.sock`, `/tmp/mx/vllm-1.sock`, e
 kubectl exec -it deployment/mx-source -c vllm -- ls -la /tmp/mx/
 ```
 
-### Check client logs
+### Check vLLM logs
 
 ```bash
-kubectl logs deployment/mx-source -c client
-kubectl logs deployment/mx-target -c client
+kubectl logs deployment/mx-source -c vllm
+kubectl logs deployment/mx-target -c vllm
 ```
 
 ### Check Redis connectivity
@@ -130,13 +130,13 @@ kubectl exec -it deployment/modelexpress-server -- redis-cli -h modelexpress-red
 ### Verify InfiniBand is working
 
 ```bash
-kubectl exec -it deployment/mx-source -c client -- ibstat
+kubectl exec -it deployment/mx-source -c vllm -- ibstat
 ```
 
 ### Check UCX configuration
 
 ```bash
-kubectl exec -it deployment/mx-source -c client -- ucx_info -d
+kubectl exec -it deployment/mx-source -c vllm -- ucx_info -d
 ```
 
 ## License
