@@ -42,8 +42,8 @@ const TIMEOUT: Duration = Duration::from_secs(300);
 /// Build a kube client, explicitly honoring `KUBECONFIG` when set.
 ///
 /// `Client::try_default()` is supposed to respect the env var, but cargo test
-/// subprocesses don't always inherit it reliably (e.g. through TunnelExec or
-/// nested shells). This helper reads the var and loads the kubeconfig from the
+/// subprocesses don't always inherit it reliably (e.g. through nested shells).
+/// This helper reads the var and loads the kubeconfig from the
 /// specified path, falling back to the default discovery chain otherwise.
 async fn kube_client() -> Result<Client> {
     if let Ok(path) = std::env::var("KUBECONFIG") {
