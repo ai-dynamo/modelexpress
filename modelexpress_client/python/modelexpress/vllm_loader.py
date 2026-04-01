@@ -31,6 +31,7 @@ import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import grpc
 import torch
 import torch.nn as nn
 
@@ -62,6 +63,10 @@ logger = logging.getLogger("modelexpress.vllm_loader")
 MAX_SOURCE_RETRIES = 3
 PUBLISH_METADATA_MAX_ATTEMPTS = 3
 PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS = 1.0
+PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+}
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
@@ -413,12 +418,15 @@ def _publish_metadata_to_server(
     global_rank: int,
 ) -> str:
     """Publish metadata with bounded retries and exponential backoff."""
-    last_error: Exception | None = None
+    last_error: grpc.RpcError | None = None
 
     for attempt in range(1, PUBLISH_METADATA_MAX_ATTEMPTS + 1):
         try:
             return mx_client.publish_metadata(identity, worker, worker_id)
-        except Exception as exc:
+        except grpc.RpcError as exc:
+            if exc.code() not in PUBLISH_METADATA_RETRYABLE_STATUS_CODES:
+                raise
+
             last_error = exc
             if attempt == PUBLISH_METADATA_MAX_ATTEMPTS:
                 break
@@ -426,8 +434,8 @@ def _publish_metadata_to_server(
             backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
             logger.warning(
                 f"[Worker {global_rank}] Publish metadata attempt {attempt}/"
-                f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed: {exc}. "
-                f"Retrying in {backoff_seconds:.1f}s"
+                f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed with retryable gRPC status "
+                f"{exc.code().name}: {exc}. Retrying in {backoff_seconds:.1f}s"
             )
             time.sleep(backoff_seconds)
 

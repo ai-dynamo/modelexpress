@@ -5,6 +5,7 @@
 
 from unittest.mock import MagicMock, patch, call
 
+import grpc
 import pytest
 import torch
 import torch.nn as nn
@@ -59,6 +60,22 @@ def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", wor
         mx_source_id=mx_source_id,
         worker_id=worker_id,
     )
+
+
+class _FakeRpcError(grpc.RpcError):
+    def __init__(self, status_code: grpc.StatusCode, details: str):
+        super().__init__()
+        self._status_code = status_code
+        self._details = details
+
+    def code(self):
+        return self._status_code
+
+    def details(self):
+        return self._details
+
+    def __str__(self):
+        return self._details
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +445,8 @@ class TestPublishMetadataAndReady:
 
         mx_client = MagicMock()
         mx_client.publish_metadata.side_effect = [
-            RuntimeError("grpc error 1"),
-            RuntimeError("grpc error 2"),
+            _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "grpc error 1"),
+            _FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED, "grpc error 2"),
             "abc123def456abcd",
         ]
 
@@ -452,7 +469,7 @@ class TestPublishMetadataAndReady:
             )
 
         assert mx_client.publish_metadata.call_count == 3
-        sleep_mock.assert_has_calls([call(1.0), call(2.0)])
+        assert sleep_mock.call_args_list == [call(1.0), call(2.0)]
         hb_cls.assert_called_once_with(
             mx_client=mx_client,
             mx_source_id="abc123def456abcd",
@@ -468,9 +485,9 @@ class TestPublishMetadataAndReady:
 
         mx_client = MagicMock()
         mx_client.publish_metadata.side_effect = [
-            RuntimeError("grpc error 1"),
-            RuntimeError("grpc error 2"),
-            RuntimeError("grpc error 3"),
+            _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "grpc error 1"),
+            _FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED, "grpc error 2"),
+            _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "grpc error 3"),
         ]
 
         nixl_manager = MagicMock()
@@ -493,9 +510,40 @@ class TestPublishMetadataAndReady:
                 )
 
         assert mx_client.publish_metadata.call_count == 3
-        sleep_mock.assert_has_calls([call(1.0), call(2.0)])
+        assert sleep_mock.call_args_list == [call(1.0), call(2.0)]
         hb_cls.assert_not_called()
 
+    def test_non_retryable_grpc_failure_fails_immediately(self):
+        from modelexpress.vllm_loader import _publish_metadata_and_ready
+
+        mx_client = MagicMock()
+        mx_client.publish_metadata.side_effect = _FakeRpcError(
+            grpc.StatusCode.PERMISSION_DENIED,
+            "permission denied",
+        )
+
+        nixl_manager = MagicMock()
+        nixl_manager.nixl_metadata = b"data"
+
+        identity = _make_identity()
+        mock_hb = MagicMock()
+        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
+             patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
+             patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
+            with pytest.raises(_FakeRpcError, match="permission denied"):
+                _publish_metadata_and_ready(
+                    mx_client,
+                    nixl_manager,
+                    {},
+                    global_rank=0,
+                    device_id=0,
+                    identity=identity,
+                    worker_id="w-1",
+                )
+
+        assert mx_client.publish_metadata.call_count == 1
+        assert sleep_mock.call_args_list == []
+        hb_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
