@@ -247,6 +247,7 @@ mod tests {
             }],
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
+            ..Default::default()
         };
 
         let record = WorkerRecord::from(meta.clone());
@@ -282,6 +283,7 @@ mod tests {
             }],
             status: 0,
             updated_at: 0,
+            ..Default::default()
         };
 
         let record = WorkerRecord::from(meta.clone());
@@ -350,6 +352,9 @@ mod tests {
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    metadata_endpoint: String::new(),
+                    agent_name: String::new(),
+                    worker_grpc_endpoint: String::new(),
                 },
                 WorkerRecord {
                     worker_rank: 1,
@@ -363,6 +368,9 @@ mod tests {
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    metadata_endpoint: String::new(),
+                    agent_name: String::new(),
+                    worker_grpc_endpoint: String::new(),
                 },
             ],
             published_at: 1234567890,
@@ -426,6 +434,7 @@ mod tests {
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
+                    ..Default::default()
                 },
             )
             .await

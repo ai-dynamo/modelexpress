@@ -180,8 +180,8 @@ async fn deploy_server(
                             { "name": "MODEL_EXPRESS_LOG_LEVEL", "value": "debug" },
                             { "name": "MODEL_EXPRESS_DATABASE_PATH", "value": "/tmp/models.db" },
                             { "name": "MODEL_EXPRESS_CACHE_DIRECTORY", "value": "/root" },
+                            { "name": "MX_METADATA_BACKEND", "value": "kubernetes" },
                             { "name": "HOME", "value": "/root" },
-                            { "name": "REDIS_URL", "value": "redis://127.0.0.1:1" },
                         ],
                         "readinessProbe": {
                             "tcpSocket": { "port": 8001 },

@@ -381,6 +381,7 @@ mod tests {
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
+                    ..Default::default()
                 }),
                 worker_id: "worker-uuid-1".to_string(),
             }))
@@ -410,6 +411,7 @@ mod tests {
                     tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
+                    ..Default::default()
                 }),
                 worker_id: "worker-uuid-1".to_string(),
             }))
@@ -453,6 +455,9 @@ mod tests {
                         tensors: vec![],
                         status: SourceStatus::Ready as i32,
                         updated_at: 1234567890000,
+                        metadata_endpoint: String::new(),
+                        agent_name: String::new(),
+                        worker_grpc_endpoint: String::new(),
                     }],
                     published_at: 1234567890,
                 }))

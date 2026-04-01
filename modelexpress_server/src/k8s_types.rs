@@ -81,6 +81,18 @@ pub struct WorkerStatus {
     /// Timestamp of last status update (RFC3339)
     #[serde(rename = "updatedAt", default)]
     pub updated_at: Option<String>,
+
+    /// P2P: NIXL listen thread endpoint (host:port)
+    #[serde(rename = "metadataEndpoint", default)]
+    pub metadata_endpoint: String,
+
+    /// P2P: NIXL agent name
+    #[serde(rename = "agentName", default)]
+    pub agent_name: String,
+
+    /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
+    #[serde(rename = "workerGrpcEndpoint", default)]
+    pub worker_grpc_endpoint: String,
 }
 
 impl WorkerStatus {

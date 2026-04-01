@@ -132,6 +132,42 @@ message WorkerMetadata {
 
   // Timestamp of last status update (unix millis)
   int64 updated_at = 5;
+
+  // P2P metadata exchange fields (opt-in via MX_P2P_METADATA=1).
+  // When populated, targets fetch NIXL metadata and tensor manifests
+  // directly from the source worker instead of from the central server.
+
+  // host:port where NIXL listen thread accepts incoming metadata fetches
+  string metadata_endpoint = 6;
+
+  // NIXL agent name (used by targets to identify the remote agent)
+  string agent_name = 7;
+
+  // host:port for the worker's gRPC WorkerService (tensor manifest)
+  string worker_grpc_endpoint = 8;
+}
+
+// ============================================================================
+// Worker Service (P2P tensor manifest exchange)
+// ============================================================================
+
+// Per-worker gRPC service for direct tensor manifest retrieval.
+// Sources start this service when MX_P2P_METADATA=1. Targets call
+// GetTensorManifest to fetch tensor descriptors directly from the
+// source worker instead of from the central metadata server.
+service WorkerService {
+  rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+}
+
+message GetTensorManifestRequest {
+  // mx_source_id for validation (catches stale discovery)
+  string mx_source_id = 1;
+}
+
+message GetTensorManifestResponse {
+  repeated TensorDescriptor tensors = 1;
+  // Echoed mx_source_id for confirmation
+  string mx_source_id = 2;
 }
 
 // ============================================================================

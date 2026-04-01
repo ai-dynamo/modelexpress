@@ -51,7 +51,6 @@ spec:
                         - none
                     nixlMetadata:
                       type: string
-                      format: byte
                       description: Base64-encoded NIXL agent metadata blob
                     transferEngineSessionId:
                       type: string
@@ -62,6 +61,15 @@ spec:
                     tensorConfigMap:
                       type: string
                       description: Name of ConfigMap containing tensor descriptors
+                    metadataEndpoint:
+                      type: string
+                      description: P2P NIXL listen thread endpoint (host:port)
+                    agentName:
+                      type: string
+                      description: P2P NIXL agent name for remote identification
+                    workerGrpcEndpoint:
+                      type: string
+                      description: P2P worker gRPC endpoint for tensor manifest (host:port)
                     status:
                       type: string
                       description: Worker lifecycle status

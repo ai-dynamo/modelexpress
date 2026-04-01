@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node vLLM deployment with P2P metadata exchange enabled.
+# Same as vllm-single-node.yaml but with MX_P2P_METADATA=1 on source workers.
+#
+# With P2P enabled, source workers exchange NIXL metadata and tensor manifests
+# directly with targets instead of routing through the central server. The
+# central server stores only lightweight endpoint pointers.
+#
+# Targets auto-detect P2P sources and need no special configuration.
+#
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - PVC with model weights pre-downloaded
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm-p2p
+  labels:
+    app: mx-vllm-p2p
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-vllm-p2p
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-p2p
+  labels:
+    app: mx-vllm-p2p
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-vllm-p2p
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-p2p
+    spec:
+      serviceAccountName: modelexpress
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            # P2P metadata exchange: source workers serve NIXL metadata and
+            # tensor manifests directly to targets instead of via the server.
+            - name: MX_P2P_METADATA
+              value: "1"
+            # Fixed ports for NIXL listen thread and worker gRPC server.
+            # Use fixed ports in K8s so they can be reached across pods.
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "8"
+            - --enable-expert-parallel
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache-block
+              mountPath: /models
+
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache-block
+          persistentVolumeClaim:
+            claimName: model-cache-block
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

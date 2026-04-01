@@ -230,6 +230,10 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
+| `MX_METADATA_PORT` | `0` | NIXL listen thread port for P2P metadata exchange |
+| `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
+| `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
@@ -237,6 +241,18 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `VLLM_PLUGINS` | - | Set to `modelexpress` to register the mx loader |
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### P2P Metadata Exchange (Opt-In)
+
+By default, source workers publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server. With `MX_P2P_METADATA=1`, source workers instead publish lightweight endpoint pointers and exchange metadata directly with targets:
+
+- **NIXL agent blobs** exchanged via NIXL's native listen thread (`MX_METADATA_PORT`)
+- **Tensor descriptors** served by a per-worker gRPC `WorkerService` (`MX_WORKER_GRPC_PORT`)
+- **Central server** stores only endpoint addresses, not MB-scale metadata
+
+Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the metadata. No configuration needed on the target side.
+
+Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
 ### UCX/NIXL Tuning
 

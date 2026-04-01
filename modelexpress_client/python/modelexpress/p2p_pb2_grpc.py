@@ -243,3 +243,99 @@ class P2pService(object):
             timeout,
             metadata,
             _registered_method=True)
+
+
+class WorkerServiceStub(object):
+    """============================================================================
+    Worker Service (P2P tensor manifest exchange)
+    ============================================================================
+
+    Per-worker gRPC service for direct tensor manifest retrieval.
+    Sources start this service when MX_P2P_METADATA=1. Targets call
+    GetTensorManifest to fetch tensor descriptors directly from the
+    source worker instead of from the central metadata server.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.GetTensorManifest = channel.unary_unary(
+                '/model_express.p2p.WorkerService/GetTensorManifest',
+                request_serializer=p2p__pb2.GetTensorManifestRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetTensorManifestResponse.FromString,
+                _registered_method=True)
+
+
+class WorkerServiceServicer(object):
+    """============================================================================
+    Worker Service (P2P tensor manifest exchange)
+    ============================================================================
+
+    Per-worker gRPC service for direct tensor manifest retrieval.
+    Sources start this service when MX_P2P_METADATA=1. Targets call
+    GetTensorManifest to fetch tensor descriptors directly from the
+    source worker instead of from the central metadata server.
+    """
+
+    def GetTensorManifest(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_WorkerServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'GetTensorManifest': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTensorManifest,
+                    request_deserializer=p2p__pb2.GetTensorManifestRequest.FromString,
+                    response_serializer=p2p__pb2.GetTensorManifestResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'model_express.p2p.WorkerService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('model_express.p2p.WorkerService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class WorkerService(object):
+    """============================================================================
+    Worker Service (P2P tensor manifest exchange)
+    ============================================================================
+
+    Per-worker gRPC service for direct tensor manifest retrieval.
+    Sources start this service when MX_P2P_METADATA=1. Targets call
+    GetTensorManifest to fetch tensor descriptors directly from the
+    source worker instead of from the central metadata server.
+    """
+
+    @staticmethod
+    def GetTensorManifest(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/GetTensorManifest',
+            p2p__pb2.GetTensorManifestRequest.SerializeToString,
+            p2p__pb2.GetTensorManifestResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
