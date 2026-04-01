@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p2p_state = Arc::new(P2pStateManager::new());
 
     match tokio::time::timeout(std::time::Duration::from_secs(10), p2p_state.connect()).await {
-        Ok(Ok(())) => info!("P2P state manager connected to metadata backend"),
+        Ok(Ok(backend)) => info!("P2P state manager connected (backend: {backend})"),
         Ok(Err(e)) => {
             error!("Failed to connect to P2P metadata backend: {}", e);
             return Err(e);

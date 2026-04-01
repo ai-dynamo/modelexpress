@@ -63,18 +63,19 @@ impl P2pStateManager {
         }
     }
 
-    /// Initialize the backend connection.
-    pub async fn connect(&self) -> MetadataResult<()> {
+    /// Initialize the backend connection. Returns the backend type name on success.
+    pub async fn connect(&self) -> MetadataResult<String> {
         let config = self.config.clone().ok_or(
             "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
         )?;
 
-        let backend = create_backend(config.clone()).await?;
+        let backend_name = config.to_string();
+        let backend = create_backend(config).await?;
         let mut guard = self.backend.write().await;
         *guard = Some(backend);
 
-        info!("P2pStateManager connected with {:?}", config);
-        Ok(())
+        info!("P2pStateManager connected (backend: {})", backend_name);
+        Ok(backend_name)
     }
 
     /// Get the backend, connecting lazily if not yet connected.
