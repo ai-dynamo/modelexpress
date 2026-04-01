@@ -1,16 +1,54 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::args::{CliModelProvider, DownloadStrategy, ModelCommands, OutputFormat};
+use super::args::{DownloadStrategy, ModelCommands, OutputFormat};
 use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
 use modelexpress_client::{Client, ClientConfig, ModelProvider};
-use modelexpress_common::cache::CacheConfig;
+use modelexpress_common::cache::{CacheConfig, CacheStats, ModelInfo};
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
 use tracing::{debug, error, info};
+
+fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> String {
+    if detailed {
+        format!(
+            "  [{}] {} ({}) - {:?}",
+            model.provider,
+            model.name,
+            stats.format_model_size(model),
+            model.path
+        )
+    } else {
+        format!(
+            "  [{}] {} ({})",
+            model.provider,
+            model.name,
+            stats.format_model_size(model)
+        )
+    }
+}
+
+fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_json::Value {
+    if detailed {
+        serde_json::json!({
+            "provider": model.provider.to_string(),
+            "name": model.name,
+            "size": model.size,
+            "formatted_size": stats.format_model_size(model),
+            "path": model.path
+        })
+    } else {
+        serde_json::json!({
+            "provider": model.provider.to_string(),
+            "name": model.name,
+            "size": model.size,
+            "formatted_size": stats.format_model_size(model)
+        })
+    }
+}
 
 /// Handle the health check command
 pub async fn handle_health_command(
@@ -79,9 +117,10 @@ pub async fn handle_model_command(
             list_models(storage_path_override, detailed, format).await
         }
         ModelCommands::Status => show_model_status(storage_path_override, format).await,
-        ModelCommands::Clear { model_name } => {
-            clear_model(storage_path_override, &model_name, format).await
-        }
+        ModelCommands::Clear {
+            provider,
+            model_name,
+        } => clear_model(storage_path_override, provider, &model_name, format).await,
         ModelCommands::ClearAll { yes } => {
             clear_all_models(storage_path_override, yes, format).await
         }
@@ -97,13 +136,11 @@ pub async fn handle_model_command(
 async fn download_model(
     storage_path_override: Option<PathBuf>,
     model_name: String,
-    provider: CliModelProvider,
+    provider: ModelProvider,
     strategy: DownloadStrategy,
     config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let provider: ModelProvider = provider.into();
-
     debug!(
         "Starting model download: {} with provider {:?} and strategy {:?}",
         model_name, provider, strategy
@@ -112,7 +149,7 @@ async fn download_model(
     if let OutputFormat::Human = format {
         println!("{}", "Model Download".green().bold());
         println!("  {}: {}", "Model".cyan().bold(), model_name);
-        println!("  {}: {:?}", "Provider".cyan().bold(), provider);
+        println!("  {}: {}", "Provider".cyan().bold(), provider);
         println!("  {}: {:?}", "Strategy".cyan().bold(), strategy);
         println!();
     }
@@ -183,7 +220,7 @@ async fn download_model(
                         "success": true,
                         "message": success_msg,
                         "model_name": model_name,
-                        "provider": provider,
+                        "provider": provider.to_string(),
                         "strategy": format!("{:?}", strategy)
                     });
                     print_output(&output, format);
@@ -203,7 +240,7 @@ async fn download_model(
                         "success": false,
                         "error": error_msg,
                         "model_name": model_name,
-                        "provider": provider,
+                        "provider": provider.to_string(),
                         "strategy": format!("{:?}", strategy)
                     });
                     print_output(&output, format);
@@ -323,38 +360,14 @@ async fn list_models(
 
             println!("Models:");
             for model in &stats.models {
-                if detailed {
-                    println!(
-                        "  {} ({}) - {:?}",
-                        model.name,
-                        stats.format_model_size(model),
-                        model.path
-                    );
-                } else {
-                    println!("  {} ({})", model.name, stats.format_model_size(model));
-                }
+                println!("{}", format_model_line(&stats, model, detailed));
             }
         }
         _ => {
             let models_json: Vec<serde_json::Value> = stats
                 .models
                 .iter()
-                .map(|model| {
-                    if detailed {
-                        serde_json::json!({
-                            "name": model.name,
-                            "size": model.size,
-                            "formatted_size": stats.format_model_size(model),
-                            "path": model.path
-                        })
-                    } else {
-                        serde_json::json!({
-                            "name": model.name,
-                            "size": model.size,
-                            "formatted_size": stats.format_model_size(model)
-                        })
-                    }
-                })
+                .map(|model| model_json(&stats, model, detailed))
                 .collect();
 
             let output = serde_json::json!({
@@ -422,22 +435,27 @@ async fn show_model_status(
 
 async fn clear_model(
     storage_path_override: Option<PathBuf>,
+    provider: ModelProvider,
     model_name: &str,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
 
-    storage_config.clear_model(model_name)?;
+    storage_config.clear_model(model_name, provider)?;
 
     match format {
         OutputFormat::Human => {
-            println!("✅ Model '{model_name}' cleared from storage");
+            println!(
+                "✅ Model '{model_name}' cleared from storage for provider {}",
+                provider
+            );
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
                 "message": format!("Model '{}' cleared from storage", model_name),
-                "model_name": model_name
+                "model_name": model_name,
+                "provider": provider.to_string()
             });
             print_output(&output, format);
         }
@@ -535,18 +553,14 @@ async fn validate_models(
                 println!("Found {} models in storage", stats.total_models);
 
                 for model in &stats.models {
-                    println!("  {} ({})", model.name, stats.format_model_size(model));
+                    println!("{}", format_model_line(&stats, model, false));
                 }
             }
             _ => {
                 let output = serde_json::json!({
                     "total_models": stats.total_models,
                     "models": stats.models.iter().map(|model| {
-                        serde_json::json!({
-                            "name": model.name,
-                            "size": model.size,
-                            "formatted_size": stats.format_model_size(model)
-                        })
+                        model_json(&stats, model, false)
                     }).collect::<Vec<_>>()
                 });
                 print_output(&output, format);
@@ -576,7 +590,8 @@ async fn show_model_stats(
                 println!("Detailed Statistics:");
                 for model in &stats.models {
                     println!(
-                        "  {}: {} bytes ({})",
+                        "  [{}] {}: {} bytes ({})",
+                        model.provider,
                         model.name,
                         model.size,
                         stats.format_model_size(model)
@@ -590,13 +605,7 @@ async fn show_model_stats(
                     stats
                         .models
                         .iter()
-                        .map(|model| {
-                            serde_json::json!({
-                                "name": model.name,
-                                "size": model.size,
-                                "formatted_size": stats.format_model_size(model)
-                            })
-                        })
+                        .map(|model| model_json(&stats, model, false))
                         .collect::<Vec<_>>(),
                 )
             } else {

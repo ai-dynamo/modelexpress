@@ -1,598 +1,356 @@
 # ModelExpress Metadata Architecture
 
-This document describes the metadata storage layer for ModelExpress P2P transfers, covering both the current Redis-based implementation and the proposed Kubernetes CRD alternative.
+This document describes the metadata storage and coordination layer for ModelExpress P2P transfers.
 
 ## Overview
 
-ModelExpress P2P transfers require coordination between source and target instances:
-1. **Source** publishes NIXL metadata (agent info + tensor descriptors) after loading model weights
-2. **Target** queries for source metadata to establish RDMA connections
-3. **Coordination** signals ensure targets wait for sources to be fully ready
+ModelExpress P2P transfers require coordination between source and target GPU workers:
 
-## Current Redis-Based Implementation
+1. **Source** loads model weights, registers tensors with a transfer backend (NIXL or Mooncake), and publishes metadata to the MX server
+2. **Target** queries the MX server for available sources, fetches tensor metadata on demand, and executes RDMA transfers
+3. **Status** transitions (`INITIALIZING` -> `READY` -> `STALE`) signal when sources are available for transfers
 
-### Redis Keys and Data Structures
+## Key Concepts
 
-| Key Pattern | Type | Purpose | TTL |
-|-------------|------|---------|-----|
-| `mx:model:{model_name}` | String (JSON) | Model metadata with all workers | None |
-| `mx:models` | Set | Index of all registered model names | None |
-| `mx:nixl_ready:{model}:worker:{id}` | String (JSON) | Source readiness signal per worker | 4 hours |
+### Source Identity and Content-Addressed Keys
 
-### Data Schemas
+Every source is identified by a `SourceIdentity` proto containing all fields that affect tensor layout compatibility:
 
-#### ModelMetadataRecord (`mx:model:{model_name}`)
+| Field | Example | Purpose |
+|-------|---------|---------|
+| `mx_version` | `"0.3.0"` | Format compatibility across upgrades |
+| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH` | Type of tensors being served |
+| `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
+| `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
+| `tensor_parallel_size` | `8` | TP degree |
+| `pipeline_parallel_size` | `2` | PP degree |
+| `expert_parallel_size` | `4` | EP degree (MoE models) |
+| `dtype` | `"bfloat16"` | Weight data type |
+| `quantization` | `"fp8"`, `""` | Quantization method |
+| `extra_parameters` | `{}` | Framework-specific config |
 
-```json
-{
-  "model_name": "deepseek-ai/DeepSeek-V3",
-  "workers": [
-    {
-      "worker_rank": 0,
-      "nixl_metadata": "<base64-encoded NIXL agent blob>",
-      "tensors": [
-        {
-          "name": "model.layers.0.self_attn.q_proj.weight",
-          "addr": "139948187451390",
-          "size": "134217728",
-          "device_id": 0,
-          "dtype": "float8_e4m3fn"
-        }
-      ]
-    }
-  ],
-  "published_at": 1769568000
-}
-```
+The server computes `mx_source_id = SHA256(canonical_json(identity))[:16]` -- a 16-char hex key used to address all metadata for sources with identical configuration. This is content-addressed: two sources with the same identity hash to the same `mx_source_id`, enabling automatic peer discovery.
 
-**Notes:**
-- `addr` and `size` are serialized as strings to avoid JSON precision loss with large u64 values
-- Workers are merged atomically via Lua script to handle concurrent publishing from multiple workers
-- Sorted by `worker_rank` after merge
+### Multi-Instance Support
 
-#### NIXL Ready Signal (`mx:nixl_ready:{model}:worker:{id}`)
+Multiple replicas of the same model (same `SourceIdentity`) can coexist. Each GPU worker process generates a unique `worker_id` (`uuid4().hex[:8]`) at startup. The combination `(mx_source_id, worker_id)` uniquely identifies one worker's metadata.
 
-```json
-{
-  "session_id": "0e2dcc70-1234-5678-90ab-cdef12345678",
-  "nixl_ready": true,
-  "stability_verified": true
-}
-```
+Each worker publishes independently -- no inter-worker coordination or barriers required.
 
-**Purpose:** Prevents targets from connecting before sources are fully initialized. Published by source after:
-1. vLLM health endpoint returns 200
-2. 30-second grace period
-3. Successful test inference
+### Worker Rank
 
-### Workflow: Redis
+Workers use `torch.distributed.get_rank()` as their global rank, which captures both tensor-parallel and pipeline-parallel position. This is stored as `worker_rank` in metadata so targets can find a peer with a matching rank.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            SOURCE INSTANCE                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. Load model weights from disk                                              │
-│ 2. Register tensors with NIXL                                                │
-│ 3. Publish metadata via gRPC → Server → Redis                                │
-│    - Server receives PublishMetadata(model_name, workers)                    │
-│    - Server runs atomic Lua merge: mx:model:{model_name}                     │
-│ 4. Wait for health check + warmup                                            │
-│ 5. Publish NIXL ready flag directly to Redis:                                │
-│    - mx:nixl_ready:{model}:worker:{id} (for each worker)                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            TARGET INSTANCE                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. Initialize dummy model structure                                          │
-│ 2. Register target tensors with NIXL                                         │
-│ 3. Poll Redis for NIXL ready flag:                                           │
-│    - mx:nixl_ready:{model}:worker:{id}                                       │
-│    - Wait until nixl_ready=true AND stability_verified=true                  │
-│ 4. Query metadata via gRPC → Server → Redis                                  │
-│    - Server receives GetMetadata(model_name)                                 │
-│    - Server returns workers from mx:model:{model_name}                       │
-│ 5. Add remote NIXL agents using nixl_metadata                                │
-│ 6. Execute RDMA transfers (get_zcopy)                                        │
-│ 7. Run FP8 processing on received weights                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### gRPC API (Current)
+## gRPC API
 
 ```protobuf
 service P2pService {
   rpc PublishMetadata(PublishMetadataRequest) returns (PublishMetadataResponse);
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
-}
-
-message WorkerMetadata {
-  uint32 worker_rank = 1;
-  bytes nixl_metadata = 2;           // Serialized NIXL agent blob
-  repeated TensorDescriptor tensors = 3;
-}
-
-message TensorDescriptor {
-  string name = 1;
-  uint64 addr = 2;
-  uint64 size = 3;
-  uint32 device_id = 4;
-  string dtype = 5;
+  rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
 }
 ```
 
-### Limitations of Redis Approach
+### PublishMetadata
 
-1. **External Dependency**: Requires Redis sidecar container
-2. **No Native K8s Integration**: Doesn't leverage Kubernetes APIs for discovery
-3. **Session Management**: TTL-based cleanup can be unreliable
-4. **Observability**: Redis state is opaque to K8s tooling (kubectl, dashboards)
-5. **Scaling**: Single Redis instance can become a bottleneck
+Called once per GPU worker after loading weights and registering with the transfer backend. The server computes `mx_source_id` from `identity` and returns it to the client.
 
----
-
-## Layered Architecture (Recommended)
-
-The recommended production architecture uses a layered approach: an **in-memory cache** for fast reads, with optional **write-through persistence** to Redis or Kubernetes CRDs for high availability.
-
-### Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ MX Server                                                             │
-│                                                                       │
-│  gRPC Request                                                         │
-│       │                                                               │
-│       ▼                                                               │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │              In-Memory Cache (always present)                    │ │
-│  │  HashMap<String, ModelMetadataRecord> behind RwLock              │ │
-│  │  - Nanosecond reads (no network hop)                            │ │
-│  │  - Atomic merge for concurrent workers                          │ │
-│  │  - Ready flags stored here (always ephemeral)                   │ │
-│  └────────────────────────┬────────────────────────────────────────┘ │
-│                           │ write-through (if configured)            │
-│                           ▼                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │              Persistent Backend (optional)                       │ │
-│  │                                                                  │ │
-│  │  Redis:      mx:model:{name} → JSON (Lua atomic merge)          │ │
-│  │  Kubernetes: ModelMetadata CRD + ConfigMap (tensor descriptors)  │ │
-│  │                                                                  │ │
-│  │  On startup: hydrates in-memory cache from persistent backend    │ │
-│  │  On write:   write-through (best-effort, warns on failure)       │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-└──────────────────────────────────────────────────────────────────────┘
+```protobuf
+PublishMetadataRequest {
+  identity: SourceIdentity    // Server computes mx_source_id from this
+  worker: WorkerMetadata       // One worker per call (rank, backend metadata, tensors)
+  worker_id: string            // Unique per GPU process (uuid4 hex[:8])
+}
 ```
 
-### Backend Modes
+### ListSources
+
+Lightweight listing -- returns `SourceInstanceRef` entries (no tensor data). Clients filter by `worker_rank` to find matching peers, then call `GetMetadata` for the chosen one.
+
+```protobuf
+ListSourcesRequest {
+  identity: SourceIdentity         // Optional: filter by source identity
+  status_filter: SourceStatus      // Optional: e.g., SOURCE_STATUS_READY
+}
+
+ListSourcesResponse {
+  instances: [SourceInstanceRef]   // One entry per worker
+}
+
+SourceInstanceRef {
+  mx_source_id: string    // 16-char hex
+  worker_id: string       // Unique worker identifier
+  model_name: string      // Human-readable
+  worker_rank: uint32     // Global rank for peer matching
+}
+```
+
+### GetMetadata
+
+Fetches full tensor metadata (MB-scale) for one specific worker. Called on demand after filtering `ListSources` results.
+
+```protobuf
+GetMetadataRequest {
+  mx_source_id: string   // From ListSources or PublishMetadata response
+  worker_id: string      // From ListSources or PublishMetadata response
+}
+```
+
+### UpdateStatus
+
+Transitions a worker's lifecycle status. Called periodically by the client-side heartbeat thread to refresh `updated_at`, and on shutdown to mark `STALE`.
+
+```protobuf
+UpdateStatusRequest {
+  mx_source_id: string
+  worker_id: string
+  worker_rank: uint32
+  status: SourceStatus   // INITIALIZING -> READY -> STALE
+}
+```
+
+## Source Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> INITIALIZING : PublishMetadata
+    INITIALIZING --> READY : Heartbeat (NIXL healthy)
+    READY --> READY : Heartbeat refreshes updated_at
+    READY --> STALE : atexit or reaper timeout
+    INITIALIZING --> STALE : Reaper timeout
+    STALE --> Deleted : Reaper GC
+```
+
+- **INITIALIZING**: Worker has published metadata but heartbeat hasn't confirmed NIXL health yet
+- **READY**: Worker is healthy and accepting RDMA connections. Heartbeat refreshes `updated_at` every `MX_HEARTBEAT_INTERVAL_SECS` (default 30s)
+- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown (SIGTERM), or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s)
+- **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
+
+## Backend Implementations
 
 Configured via `MX_METADATA_BACKEND` environment variable:
 
-| Mode | Env Value | In-Memory | Persistent | Use Case |
-|------|-----------|-----------|------------|----------|
-| **Standalone** | `memory` (default) | Primary | None | Dev, testing, single-server |
-| **Redis HA** | `redis` | Cache | Redis write-through | Production with Redis sidecar |
-| **K8s Native** | `kubernetes` | Cache | CRD write-through | K8s-native deployments |
-| **Redis Only** | `redis-only` | None | Redis direct | Legacy / backward compat |
-| **K8s Only** | `kubernetes-only` | None | CRD direct | Minimal memory footprint |
+| Value | Backend | Use Case |
+|-------|---------|----------|
+| `redis` | Redis | Production with Redis |
+| `kubernetes` / `k8s` / `crd` | Kubernetes CRDs | K8s-native deployments |
 
-### Startup Hydration
+### Redis Backend
 
-When using a layered mode (`redis` or `kubernetes`), the server hydrates the in-memory cache from the persistent backend on startup:
+#### Storage Layout
 
-1. Server starts, connects to persistent backend
-2. Lists all model names from persistent store
-3. Loads each model's metadata into in-memory cache
-4. Subsequent reads hit only the cache (no backend round-trip)
+Two types of Redis keys per source:
 
-This means the server recovers its state after a restart **without** requiring sources to re-publish.
+**Source index key** -- `mx:source:{source_id}` (Redis Hash)
 
-### Ready Coordination
+| Field | Value | Purpose |
+|-------|-------|---------|
+| `__attributes__` | JSON of all `SourceIdentity` fields | Stored once per source, avoids duplication |
+| `{worker_id}` | `"{global_rank}"` | Presence marker with rank for fast listing |
 
-Ready flags (`PublishReady` / `GetReady`) are **always stored in-memory** regardless of backend mode. This is because:
+**Worker data key** -- `mx:source:{source_id}:{worker_id}` (Redis Hash)
 
-- Ready flags are tied to running GPU processes (ephemeral by nature)
-- GPU memory addresses become invalid after source pod restart
-- Sub-millisecond latency is important for coordination polling
-- No benefit from persisting stale ready state
+| Field | Value | Purpose |
+|-------|-------|---------|
+| `"{worker_rank}"` | JSON `WorkerRecordJson` | Full tensor metadata for one rank |
 
-### Implementation
+Global listing uses `SCAN` with pattern `mx:source:????????????????` (exactly 16 hex chars) to enumerate source index keys without a secondary index.
 
-```rust
-// Backend trait (all backends implement this)
-#[async_trait]
-pub trait MetadataBackend: Send + Sync {
-    async fn connect(&self) -> MetadataResult<()>;
-    async fn publish_metadata(&self, model_name: &str, workers: Vec<WorkerMetadata>) -> MetadataResult<()>;
-    async fn get_metadata(&self, model_name: &str) -> MetadataResult<Option<ModelMetadataRecord>>;
-    async fn remove_metadata(&self, model_name: &str) -> MetadataResult<()>;
-    async fn list_models(&self) -> MetadataResult<Vec<String>>;
-}
+No Redis TTL is applied to keys. Stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above).
 
-// Layered backend (in-memory + optional persistent)
-pub struct LayeredBackend {
-    cache: InMemoryBackend,                        // Always present
-    persistent: Option<Arc<dyn MetadataBackend>>,  // Redis or K8s
+#### Example Redis State
+
+```
+# Source index -- identity stored once, workers as presence markers
+mx:source:a1b2c3d4e5f67890
+  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.3.0",...}
+  f3a2b1c4        ->  "0"    # worker_id f3a2b1c4, global rank 0
+  e7d6c5b8        ->  "1"    # worker_id e7d6c5b8, global rank 1
+
+# Worker data -- full tensor metadata
+mx:source:a1b2c3d4e5f67890:f3a2b1c4
+  "0"  ->  {"worker_rank":0,"backend_type":"nixl","nixl_metadata":[...],"tensors":[...],"status":2,...}
+
+mx:source:a1b2c3d4e5f67890:e7d6c5b8
+  "1"  ->  {"worker_rank":1,"backend_type":"nixl","nixl_metadata":[...],"tensors":[...],"status":2,...}
+```
+
+#### JSON Schemas
+
+**WorkerRecordJson** (stored per rank in worker data hash):
+```json
+{
+  "worker_rank": 0,
+  "backend_type": "nixl",
+  "nixl_metadata": [222, 173, 190, 239],
+  "transfer_engine_session_id": null,
+  "tensors": [
+    {
+      "name": "model.layers.0.self_attn.q_proj.weight",
+      "addr": "139948187451390",
+      "size": "134217728",
+      "device_id": 0,
+      "dtype": "bfloat16"
+    }
+  ],
+  "status": 2,
+  "updated_at": 1700000000000
 }
 ```
 
----
+`addr` and `size` are serialized as strings to avoid JSON precision loss with large u64 values.
 
-## Kubernetes CRD Alternative
+### Kubernetes CRD Backend
 
-### Design Goals
+Uses `ModelMetadata` CRDs for metadata and `ConfigMap`s for tensor descriptors (to avoid etcd size limits).
 
-1. **Native K8s Integration**: Use CRDs for metadata storage
-2. **No External Dependencies**: Eliminate Redis sidecar
-3. **kubectl-Friendly**: Inspect state with `kubectl get modelmetadata`
-4. **Built-in Lifecycle**: Use owner references for automatic cleanup
-5. **Watch-Based**: Use K8s watch for efficient polling
+**CRD name format**: `mx-source-{source_id}-{worker_id}`
 
-### Custom Resource Definitions
+**ConfigMap name format**: `mx-source-{source_id}-{worker_id}-tensors-worker-{rank}`
 
-#### ModelMetadata CRD
+ConfigMaps use `ownerReferences` pointing to the parent CRD so they are garbage-collected automatically.
+
+#### Example CRD
+
+```bash
+kubectl get modelmetadatas -n <namespace>
+kubectl get modelmetadata mx-source-a1b2c3d4e5f67890-f3a2b1c4 -n <namespace> -o yaml
+```
 
 ```yaml
 apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
-  name: deepseek-ai-deepseek-v3  # Sanitized model name
-  namespace: default  # Change to your target namespace
+  name: mx-source-a1b2c3d4e5f67890-f3a2b1c4
   labels:
-    modelexpress.nvidia.com/model: deepseek-ai/DeepSeek-V3
-  ownerReferences:
-    - apiVersion: apps/v1
-      kind: Deployment
-      name: mx-source
-      uid: <source-deployment-uid>
+    modelexpress.nvidia.com/mx-source-id: a1b2c3d4e5f67890
 spec:
   modelName: deepseek-ai/DeepSeek-V3
-  expectedWorkers: 8
 status:
-  phase: Ready  # Pending | Initializing | Ready | Stale
   workers:
     - workerRank: 0
-      nixlMetadata: <base64-encoded blob>
+      nixlMetadata: <base64>
       tensorCount: 1327
-      publishedAt: "2026-01-27T18:02:47Z"
-      ready: true
-      stabilityVerified: true
-    - workerRank: 1
-      # ...
-  conditions:
-    - type: AllWorkersPublished
-      status: "True"
-      lastTransitionTime: "2026-01-27T18:02:50Z"
-    - type: StabilityVerified
-      status: "True"
-      lastTransitionTime: "2026-01-27T18:03:27Z"
-  observedGeneration: 1
-  publishedAt: "2026-01-27T18:02:47Z"
+      status: Ready
 ```
 
-#### TensorDescriptors ConfigMap (Large Data)
+## Client Workflow
 
-To avoid hitting etcd size limits (~1.5MB), tensor descriptors are stored in a separate ConfigMap:
+### Source Path (load from disk, publish metadata)
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: deepseek-ai-deepseek-v3-tensors-worker-0
-  namespace: default  # Change to your target namespace
-  labels:
-    modelexpress.nvidia.com/model: deepseek-ai/DeepSeek-V3
-    modelexpress.nvidia.com/worker: "0"
-  ownerReferences:
-    - apiVersion: modelexpress.nvidia.com/v1alpha1
-      kind: ModelMetadata
-      name: deepseek-ai-deepseek-v3
-data:
-  tensors.json: |
-    [
-      {"name": "model.embed_tokens.weight", "addr": "139948187451390", "size": "134217728", "device_id": 0, "dtype": "bfloat16"},
-      {"name": "model.layers.0.self_attn.q_proj.weight", ...}
-    ]
+```mermaid
+sequenceDiagram
+    participant W as GPU Worker
+    participant MX as MX Server
+    participant Backend as Redis / K8s
+
+    W->>W: Load weights from disk (or GDS)
+    W->>W: process_weights_after_loading()
+    W->>W: Collect all post-processed tensors
+    W->>W: Initialize NIXL agent, register tensors
+    W->>MX: PublishMetadata(identity, worker, worker_id)
+    MX->>Backend: Store worker metadata (status=INITIALIZING)
+    MX-->>W: mx_source_id
+    W->>W: Start HeartbeatThread
+    loop Every MX_HEARTBEAT_INTERVAL_SECS
+        W->>MX: UpdateStatus(mx_source_id, worker_id, rank, READY)
+        MX->>Backend: Patch status + updated_at
+    end
 ```
 
-### Workflow: CRD-Based
+### Target Path (receive via RDMA)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            SOURCE INSTANCE                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. Load model weights from disk                                              │
-│ 2. Register tensors with NIXL                                                │
-│ 3. Check if ModelMetadata CR exists:                                         │
-│    - If not: Create ModelMetadata CR with ownerRef to source Deployment      │
-│    - If exists: Patch status.workers[rank]                                   │
-│ 4. Create/Update ConfigMap with tensor descriptors                           │
-│ 5. Wait for health check + warmup                                            │
-│ 6. Patch ModelMetadata status:                                               │
-│    - status.workers[rank].ready = true                                       │
-│    - status.workers[rank].stabilityVerified = true                           │
-│ 7. Controller reconciles and updates conditions                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant W as GPU Worker
+    participant MX as MX Server
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            TARGET INSTANCE                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│ 1. Initialize dummy model structure                                          │
-│ 2. Register target tensors with NIXL                                         │
-│ 3. Watch/Poll ModelMetadata CR for status:                                   │
-│    - Wait for condition: StabilityVerified=True                              │
-│    - Wait for all workers: status.workers[*].ready=true                      │
-│ 4. Read ConfigMaps for tensor descriptors:                                   │
-│    - Get deepseek-ai-deepseek-v3-tensors-worker-{rank}                       │
-│ 5. Add remote NIXL agents using status.workers[rank].nixlMetadata            │
-│ 6. Execute RDMA transfers (get_zcopy)                                        │
-│ 7. Run FP8 processing on received weights                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
+    W->>MX: ListSources(identity, status=READY)
+    MX-->>W: [SourceInstanceRef, ...]
+    W->>W: Filter by worker_rank, shuffle for load balancing
+    W->>W: Load dummy weights, initialize NIXL agent
+    loop For each candidate (max MAX_SOURCE_RETRIES)
+        W->>MX: GetMetadata(mx_source_id, worker_id)
+        MX-->>W: WorkerMetadata (tensors, nixl_metadata)
+        W->>W: Add remote NIXL agent
+        W->>W: Execute RDMA transfers
+        alt Transfer fails (SourceTransferError)
+            W->>W: Try next candidate
+        end
+    end
+    W->>W: process_weights_after_loading()
+    W->>W: Register and publish own metadata (become a source)
 ```
 
-### Implementation Components
+### Three-Tier Loading Strategy
 
-#### 1. CRD Definition
+The `MxModelLoader` (`--load-format mx`) auto-detects the best loading strategy:
 
-```yaml
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: modelmetadatas.modelexpress.nvidia.com
-spec:
-  group: modelexpress.nvidia.com
-  versions:
-    - name: v1alpha1
-      served: true
-      storage: true
-      subresources:
-        status: {}
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec:
-              type: object
-              required: [modelName]
-              properties:
-                modelName:
-                  type: string
-                expectedWorkers:
-                  type: integer
-            status:
-              type: object
-              properties:
-                phase:
-                  type: string
-                  enum: [Pending, Initializing, Ready, Stale]
-                workers:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      workerRank:
-                        type: integer
-                      nixlMetadata:
-                        type: string
-                        format: byte
-                      tensorCount:
-                        type: integer
-                      ready:
-                        type: boolean
-                      stabilityVerified:
-                        type: boolean
-                      publishedAt:
-                        type: string
-                        format: date-time
-                conditions:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      type:
-                        type: string
-                      status:
-                        type: string
-                      lastTransitionTime:
-                        type: string
-                        format: date-time
-      additionalPrinterColumns:
-        - name: Model
-          type: string
-          jsonPath: .spec.modelName
-        - name: Phase
-          type: string
-          jsonPath: .status.phase
-        - name: Workers
-          type: integer
-          jsonPath: .status.workers[*].workerRank
-        - name: Age
-          type: date
-          jsonPath: .metadata.creationTimestamp
-  scope: Namespaced
-  names:
-    plural: modelmetadatas
-    singular: modelmetadata
-    kind: ModelMetadata
-    shortNames:
-      - mxmeta
-```
+1. **RDMA** -- If `ListSources` returns READY instances with matching rank, receive weights via NIXL/Mooncake
+2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU
+3. **Disk** -- Standard vLLM `DefaultModelLoader` as final fallback
 
-#### 2. Server Changes
+After loading by any path, the worker registers its tensors and publishes metadata so future workers can discover it as an RDMA source.
 
-The ModelExpress server will support both backends via configuration:
+## Transfer Backends
 
-```rust
-pub enum MetadataBackend {
-    Redis { url: String },
-    Kubernetes { namespace: String },
-}
+`WorkerMetadata` uses a `oneof backend_metadata` field supporting multiple transfer backends:
 
-impl P2pStateManager {
-    pub async fn publish_metadata(&self, model_name: &str, workers: Vec<WorkerMetadata>) {
-        match &self.backend {
-            MetadataBackend::Redis { url } => self.publish_to_redis(model_name, workers).await,
-            MetadataBackend::Kubernetes { namespace } => {
-                self.publish_to_crd(namespace, model_name, workers).await
-            }
-        }
-    }
-}
-```
+| Backend | Field | Description |
+|---------|-------|-------------|
+| NIXL | `nixl_metadata` (bytes) | Serialized NIXL agent blob for RDMA connections |
+| Mooncake | `transfer_engine_session_id` (string) | TransferEngine session ID (`"ip:port"`) |
 
-#### 3. Client Changes (Python)
+The `backend_type` discriminator is persisted in storage for unambiguous deserialization.
 
-```python
-class MetadataClient:
-    """Unified client for Redis or CRD backend."""
-    
-    def __init__(self):
-        self.backend = os.environ.get("MX_METADATA_BACKEND", "redis")
-        
-    def wait_for_source_ready(self, model_name: str, worker_id: int) -> bool:
-        if self.backend == "kubernetes":
-            return self._wait_for_crd_ready(model_name, worker_id)
-        else:
-            return self._wait_for_redis_ready(model_name, worker_id)
-    
-    def _wait_for_crd_ready(self, model_name: str, worker_id: int) -> bool:
-        """Watch ModelMetadata CR for readiness."""
-        from kubernetes import client, watch
-        
-        api = client.CustomObjectsApi()
-        w = watch.Watch()
-        
-        cr_name = self._sanitize_model_name(model_name)
-        for event in w.stream(
-            api.list_namespaced_custom_object,
-            group="modelexpress.nvidia.com",
-            version="v1alpha1",
-            namespace=os.environ.get("POD_NAMESPACE", "default"),
-            plural="modelmetadatas",
-            field_selector=f"metadata.name={cr_name}",
-            timeout_seconds=7200
-        ):
-            cr = event["object"]
-            workers = cr.get("status", {}).get("workers", [])
-            for w in workers:
-                if w["workerRank"] == worker_id:
-                    if w.get("ready") and w.get("stabilityVerified"):
-                        return True
-        return False
-```
+## Configuration
 
-### Comparison: Redis vs CRD
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` |
+| `MX_SERVER_ADDRESS` | `modelexpress-server:8001` | gRPC server address |
+| `MX_REDIS_HOST` / `REDIS_HOST` | `localhost` | Redis host |
+| `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |
+| `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | `default` | K8s namespace for CRD backend |
+| `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
+| `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
+| `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
+| `MX_CONTIGUOUS_REG` | `0` | Use contiguous region registration (experimental) |
 
-| Aspect | Redis | CRD |
-|--------|-------|-----|
-| **External Dependency** | Requires Redis sidecar | None (uses K8s API) |
-| **Observability** | `redis-cli KEYS "mx:*"` | `kubectl get mxmeta` |
-| **Lifecycle** | TTL-based cleanup | Owner references |
-| **Consistency** | Lua atomic scripts | K8s optimistic concurrency |
-| **Large Data** | Native JSON | ConfigMaps (1MB limit) |
-| **Scalability** | Redis replication | etcd (K8s control plane) |
-| **Access Control** | Network/auth | RBAC |
-| **Complexity** | Simple | Requires CRD + controller |
+## Debugging
 
-### Migration Path
-
-1. **Phase 1**: Implement CRD backend alongside Redis (feature flag)
-2. **Phase 2**: Validate CRD backend in staging
-3. **Phase 3**: Default to CRD for new deployments
-4. **Phase 4**: Deprecate Redis backend
-
-### Configuration
-
-```yaml
-# Environment variables
-MX_METADATA_BACKEND: "kubernetes"  # or "redis" (default)
-MX_METADATA_NAMESPACE: "default"   # For CRD backend — change to your namespace
-MX_REDIS_HOST: "modelexpress-server"  # For Redis backend
-MX_REDIS_PORT: "6379"
-```
-
----
-
-## Debugging the metadata feature
-
-Use this checklist to confirm that metadata and ready coordination still work end-to-end (gRPC or K8s backend).
-
-### Prerequisites
-
-| Component | Check |
-|-----------|--------|
-| **Client backend** | `MX_METADATA_BACKEND` is `grpc` or `memory` (or unset) so the client talks to the ModelExpress server. For K8s-native, use `kubernetes` / `k8s` / `crd`. |
-| **Server address** | Clients reach the server: `MX_SERVER_ADDRESS` or `MODEL_EXPRESS_URL` (default `modelexpress-server:8001`). |
-| **Server backend** | Server `MX_METADATA_BACKEND` (or equivalent) set to `memory`, `redis`, or `kubernetes` as intended. Ready is always in-memory on the server. |
-| **Namespace (K8s backend)** | `MX_METADATA_NAMESPACE` or `POD_NAMESPACE` set where the ModelMetadata CRs live. |
-
-### 1. Verify server is reachable
-
-From a pod that can reach the server (or with port-forward):
+### Verify server connectivity
 
 ```bash
-# Health (if your server exposes it on the same port)
 grpcurl -plaintext <server_host>:8001 list
-
-# P2P gRPC: check that metadata for a model is absent (before source publishes) or present (after)
-grpcurl -plaintext -d '{"model_name":"Qwen/Qwen2.5-0.5B"}' <server_host>:8001 model_express.p2p.P2pService/GetMetadata
-
-# After source is ready, check ready flag for worker 0
-grpcurl -plaintext -d '{"model_name":"Qwen/Qwen2.5-0.5B","worker_id":0}' <server_host>:8001 model_express.p2p.P2pService/GetReady
+grpcurl -plaintext -d '{}' <server_host>:8001 model_express.p2p.P2pService/ListSources
 ```
 
-If using **Kubernetes backend**, also inspect CRs:
+### Inspect Redis state
+
+```bash
+redis-cli KEYS "mx:source:*"
+redis-cli HGETALL "mx:source:<source_id>"
+redis-cli HGETALL "mx:source:<source_id>:<worker_id>"
+```
+
+### Inspect K8s state
 
 ```bash
 kubectl get modelmetadatas -n <namespace>
-kubectl get modelmetadata <sanitized-model-name> -n <namespace> -o yaml
+kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <namespace>
 ```
 
-### 2. Verify source path
+### Common failures
 
-Source must: (1) publish metadata, (2) run warmup, (3) publish ready.
-
-- **Logs**: In the **source** pod logs, look for:
-  - Success from publishing metadata (e.g. `publish_metadata` success or no exception after `_publish_metadata_to_server`).
-  - Success from publishing ready (e.g. after warmup, `PublishReady` or ready-signal success).
-- **Server state**: After source is up, call `GetMetadata` and `GetReady` as above; `found: true` and `ready: true` (with `worker_id` matching) mean the server has metadata and ready.
-
-### 3. Verify target path
-
-Target must: (1) wait for ready, (2) get metadata, (3) run RDMA transfer.
-
-- **Logs**: In the **target** pod logs, look for:
-  - `modelexpress.vllm_loader` messages: `MxTargetModelLoader.load_model() STARTING`, then `[TIMING] ... Receiving raw tensors via RDMA`, then `Source NIXL ready` or `ALL ... source workers are ready`, then `RDMA TRANSFER COMPLETE` / `Bandwidth: ... Gbps`.
-  - If you see `Waiting for source` or repeated GetReady polling with no success, the target is blocked on ready (source not ready or server not returning ready).
-  - If you see `get_metadata` returning no workers or an error, the server has no metadata for that model (or wrong model name).
-- **Quick log grep** (see also `docs/troubleshooting_p2p_target_logs.md`):
-  ```bash
-  kubectl logs -n <namespace> -l app=mx-target 2>&1 | grep -iE "modelexpress|TIMING|wait_for_ready|get_metadata|NIXL|Source.*ready"
-  ```
-
-### 4. Common failures
-
-| Symptom | Likely cause |
-|--------|----------------|
-| Target never sees "Source NIXL ready" / "ALL source workers ready" | Source has not published ready yet; or client backend is not gRPC so target is not polling the server; or server not reachable / wrong port. |
-| GetMetadata returns `found: false` | Source has not published metadata; or wrong `model_name` (e.g. casing, slash); or server backend misconfigured / not persisting. |
-| GetReady returns `found: false` or `ready: false` | Source has not called PublishReady yet (still loading or warming up); or ready stored only in-memory and server was restarted. |
-| K8s: CR or ConfigMaps missing | Source failed to create/patch ModelMetadata or ConfigMaps (check source logs and RBAC). |
-| "NIXL not available" on target | NIXL not installed or not loadable in the target image; metadata/ready can still work, but RDMA transfer will not. |
-
-### 5. End-to-end sanity check
-
-1. Start server (e.g. in-memory backend).
-2. Start source with `--load-format mx-source`, wait until vLLM is healthy and warmup completes.
-3. Check server: `GetMetadata(model_name)` has workers, `GetReady(model_name, 0)` is ready.
-4. Start target with `--load-format mx-target`.
-5. In target logs, confirm: `wait_for_ready` succeeds, `get_metadata` returns workers, then RDMA/TIMING lines.
-6. Run an inference request against the target to confirm full path.
-
----
-
-## Summary
-
-The current Redis-based implementation provides a simple, functional solution for metadata coordination. The proposed CRD alternative offers native Kubernetes integration, better observability, and automatic lifecycle management. Both backends can coexist, allowing gradual migration based on deployment requirements.
+| Symptom | Likely Cause |
+|---------|-------------|
+| `ListSources` returns empty | No source has published + updated status to READY yet |
+| `GetMetadata` returns `found: false` | Worker was garbage-collected by reaper, or wrong `mx_source_id`/`worker_id` |
+| Target stuck waiting | Source still loading (check source pod logs for progress) |
+| K8s CRs missing | RBAC issue -- check source logs and service account permissions |
+| Stale metadata after redeploy | Reaper marks stale within 90s. For immediate cleanup: `FLUSHDB` |
+| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. Target retries next candidate (max 3) |

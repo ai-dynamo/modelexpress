@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM Source Instance - loads real model weights and serves them to target via P2P
-# Uses Redis backend for metadata (legacy/alternative)
-# For Kubernetes-native deployments, use vllm-source.yaml (CRD backend) instead
+# Single-node vLLM deployment with ModelExpress P2P weight transfer.
+# Deploys DeepSeek-V3 on 1 node (8 GPUs, TP=8).
 #
-# - vLLM exposes weights via ZMQ (one socket per TP rank)
-# - ModelExpress client handles NIXL transfers and server communication
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - PVC with model weights pre-downloaded
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#
+# On startup, the mx loader queries the MX server:
+#   - If a ready source exists for this model -> receive weights via RDMA
+#   - If no source is available -> load weights from disk
+# Either way, the node registers with NIXL and publishes metadata so
+# future nodes can discover it as a source.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-source
+  name: mx-vllm
   labels:
-    app: mx-source
+    app: mx-vllm
 spec:
   type: ClusterIP
   ports:
@@ -20,63 +27,48 @@ spec:
       targetPort: 8000
       name: http
   selector:
-    app: mx-source
+    app: mx-vllm
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-source
+  name: mx-vllm
   labels:
-    app: mx-source
+    app: mx-vllm
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-source
+      app: mx-vllm
   template:
     metadata:
       labels:
-        app: mx-source
+        app: mx-vllm
     spec:
+      serviceAccountName: modelexpress
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:k8s-backend
-          imagePullPolicy: Always
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
           # Needed for GPUDirect RDMA to work.
           securityContext:
             capabilities:
               add:
                 - IPC_LOCK
           env:
-            - name: VLLM_SERVER_DEV_MODE
-              value: "1"
             # Increase startup timeout to allow DeepGemm warmup to complete (2 hours)
             - name: VLLM_RPC_TIMEOUT
               value: "7200000"
             - name: HF_HUB_CACHE
               value: "/models"
-            - name: MX_ZMQ_ADDRESS
-              value: "ipc:///tmp/mx/vllm.sock"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
-            # Register ModelExpress custom loaders for FP8 support
-            - name: MX_REGISTER_LOADERS
-              value: "1"
+            # Register ModelExpress loaders via vLLM plugin system
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
             # Server address for metadata publishing
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            # OPTIMIZATION: Synchronized publish - wait for all workers before publishing
-            # This reduces the staggered window and allows targets to start simultaneously
-            - name: MX_SYNC_PUBLISH
-              value: "1"
-            - name: MX_EXPECTED_WORKERS
-              value: "8"
-            # Metadata backend: Redis
-            - name: MX_METADATA_BACKEND
-              value: "redis"
-            # Redis backend configuration
-            - name: MX_REDIS_HOST
-              value: "modelexpress-server"
             # Baseline: individual tensor registration (stable and tested)
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
@@ -110,27 +102,14 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
-          command: ["/bin/bash", "-c"]
           args:
-            - |
-              set -ex
-              # Background task: warmup inference to pre-warm CUDA graphs.
-              # Ready signal is published by the source loader internally
-              # (vllm_loader.py line 355) immediately after metadata — no need to wait for warmup.
-              (
-                sleep 5
-                while ! curl -sf http://127.0.0.1:8000/health; do sleep 5; done
-                sleep 30
-                # Warmup inference (pre-warms CUDA graphs, not required for P2P transfer)
-                curl -sf -X POST http://127.0.0.1:8000/v1/completions \
-                  -H 'Content-Type: application/json' \
-                  -d '{"model":"'"$MODEL_NAME"'","prompt":"1+1=","max_tokens":3}' || true
-              ) &
-              exec python3 -m vllm.entrypoints.openai.api_server \
-                --model $MODEL_NAME \
-                --load-format mx-source \
-                --tensor-parallel-size 8 \
-                --enable-expert-parallel
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "8"
+            - --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"
@@ -143,7 +122,7 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
-            - name: model-cache
+            - name: model-cache-block
               mountPath: /models
 
       volumes:
@@ -151,8 +130,8 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        - name: model-cache
+        - name: model-cache-block
           persistentVolumeClaim:
-            claimName: deepseek-v3-block
+            claimName: model-cache-block
       imagePullSecrets:
         - name: nvcr-imagepullsecret

@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-node vLLM StatefulSet with ModelExpress P2P weight transfer.
+#
+# Deploys Kimi-K2.5 as a single StatefulSet across 2 nodes (8 GPUs total):
+#   - tensor-parallel-size=4 (within each node)
+#   - pipeline-parallel-size=2 (across nodes)
+#   - expert-parallel enabled
+#
+# Pod roles are determined by ordinal index:
+#   - pod-0: Ray head node + vLLM API server
+#   - pod-1: Ray worker node (joins pod-0's Ray cluster)
+#
+# The headless Service gives each pod a stable DNS name so pod-1 reliably
+# connects to pod-0 regardless of scheduling. Scaling to 2 StatefulSet
+# instances (different names) supports P2P transfer testing.
+#
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - PVC "model-cache-block" with model weights (or enough space for HF download)
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#
+# Usage (single instance):
+#   kubectl apply -f vllm-multi-node.yaml -n <namespace>
+#
+# Usage (two P2P instances):
+#   kubectl apply -f vllm-multi-node.yaml -n <namespace>
+#   # Rename StatefulSet to mx-vllm-target and apply again for second instance
+
+# Headless Service: gives each pod stable DNS (pod-N.mx-vllm.<ns>.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm
+  labels:
+    app: mx-vllm
+spec:
+  clusterIP: None
+  selector:
+    app: mx-vllm
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: ray-gcs
+    - port: 8000
+      targetPort: 8000
+      name: http
+---
+# StatefulSet: 2 pods per instance (pod-0 = head + vLLM, pod-1 = Ray worker)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mx-vllm
+  labels:
+    app: mx-vllm
+spec:
+  serviceName: mx-vllm
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-vllm
+  template:
+    metadata:
+      labels:
+        app: mx-vllm
+    spec:
+      serviceAccountName: modelexpress
+      # Spread pods across different nodes for true multi-node Ray
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-vllm
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          # IPC_LOCK required for RDMA memory pinning (NIXL/UCX GPUDirect)
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 6379
+              name: ray-gcs
+          env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            - name: MODEL_NAME
+              value: "moonshotai/Kimi-K2.5"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              ORDINAL=${HOSTNAME##*-}
+              STS_NAME=${HOSTNAME%-*}
+              HEAD_ADDR=${STS_NAME}-0.${STS_NAME}:6379
+
+              if [ "$ORDINAL" = "0" ]; then
+                ray start --head --port=6379 --num-gpus=4
+                until ray status --address=127.0.0.1:6379 >/dev/null 2>&1; do sleep 1; done
+                RAY_ADDRESS=127.0.0.1:6379 python3 -m vllm.entrypoints.openai.api_server \
+                  --model $MODEL_NAME \
+                  --load-format mx \
+                  --tensor-parallel-size 4 \
+                  --pipeline-parallel-size 2 \
+                  --enable-expert-parallel \
+                  --trust-remote-code \
+                  --distributed-executor-backend ray
+              else
+                ray start --block --address=${HEAD_ADDR} --num-gpus=4
+              fi
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+              rdma/ib: "4"
+            requests:
+              nvidia.com/gpu: "4"
+              rdma/ib: "4"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache-block
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache-block
+          persistentVolumeClaim:
+            claimName: model-cache-block
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

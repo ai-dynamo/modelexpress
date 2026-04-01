@@ -30,7 +30,7 @@ if _version_not_supported:
 
 class P2pServiceStub(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
-    The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
+    The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
     Clients query for existing sources and publish their own metadata.
     """
 
@@ -45,26 +45,26 @@ class P2pServiceStub(object):
                 request_serializer=p2p__pb2.PublishMetadataRequest.SerializeToString,
                 response_deserializer=p2p__pb2.PublishMetadataResponse.FromString,
                 _registered_method=True)
+        self.ListSources = channel.unary_unary(
+                '/model_express.p2p.P2pService/ListSources',
+                request_serializer=p2p__pb2.ListSourcesRequest.SerializeToString,
+                response_deserializer=p2p__pb2.ListSourcesResponse.FromString,
+                _registered_method=True)
         self.GetMetadata = channel.unary_unary(
                 '/model_express.p2p.P2pService/GetMetadata',
                 request_serializer=p2p__pb2.GetMetadataRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetMetadataResponse.FromString,
                 _registered_method=True)
-        self.PublishReady = channel.unary_unary(
-                '/model_express.p2p.P2pService/PublishReady',
-                request_serializer=p2p__pb2.PublishReadyRequest.SerializeToString,
-                response_deserializer=p2p__pb2.PublishReadyResponse.FromString,
-                _registered_method=True)
-        self.GetReady = channel.unary_unary(
-                '/model_express.p2p.P2pService/GetReady',
-                request_serializer=p2p__pb2.GetReadyRequest.SerializeToString,
-                response_deserializer=p2p__pb2.GetReadyResponse.FromString,
+        self.UpdateStatus = channel.unary_unary(
+                '/model_express.p2p.P2pService/UpdateStatus',
+                request_serializer=p2p__pb2.UpdateStatusRequest.SerializeToString,
+                response_deserializer=p2p__pb2.UpdateStatusResponse.FromString,
                 _registered_method=True)
 
 
 class P2pServiceServicer(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
-    The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
+    The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
     Clients query for existing sources and publish their own metadata.
     """
 
@@ -75,22 +75,25 @@ class P2pServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListSources(self, request, context):
+        """List available source workers - lightweight, no tensor metadata.
+        Returns one SourceInstanceRef per worker; clients filter by worker_rank
+        to find matching peers and then call GetMetadata for the chosen one.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetMetadata(self, request, context):
-        """Query for existing source with the same model - called at client startup
+        """Fetch full tensor metadata for one specific worker (MB-scale).
+        Call this after filtering ListSources results by worker_rank.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PublishReady(self, request, context):
-        """Publish ready flag - called by source after NIXL registration and warmup
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GetReady(self, request, context):
-        """Get ready status - called by target to check if source is ready
+    def UpdateStatus(self, request, context):
+        """Update source status - called by source after NIXL registration and warmup
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -104,20 +107,20 @@ def add_P2pServiceServicer_to_server(servicer, server):
                     request_deserializer=p2p__pb2.PublishMetadataRequest.FromString,
                     response_serializer=p2p__pb2.PublishMetadataResponse.SerializeToString,
             ),
+            'ListSources': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSources,
+                    request_deserializer=p2p__pb2.ListSourcesRequest.FromString,
+                    response_serializer=p2p__pb2.ListSourcesResponse.SerializeToString,
+            ),
             'GetMetadata': grpc.unary_unary_rpc_method_handler(
                     servicer.GetMetadata,
                     request_deserializer=p2p__pb2.GetMetadataRequest.FromString,
                     response_serializer=p2p__pb2.GetMetadataResponse.SerializeToString,
             ),
-            'PublishReady': grpc.unary_unary_rpc_method_handler(
-                    servicer.PublishReady,
-                    request_deserializer=p2p__pb2.PublishReadyRequest.FromString,
-                    response_serializer=p2p__pb2.PublishReadyResponse.SerializeToString,
-            ),
-            'GetReady': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetReady,
-                    request_deserializer=p2p__pb2.GetReadyRequest.FromString,
-                    response_serializer=p2p__pb2.GetReadyResponse.SerializeToString,
+            'UpdateStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateStatus,
+                    request_deserializer=p2p__pb2.UpdateStatusRequest.FromString,
+                    response_serializer=p2p__pb2.UpdateStatusResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -129,7 +132,7 @@ def add_P2pServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class P2pService(object):
     """P2P Metadata Service for coordinating NIXL/RDMA transfers between vLLM instances.
-    The server stores model metadata (NIXL agent info + tensor descriptors) keyed by model name.
+    The server stores model metadata keyed by mx_source_id (a hash of SourceIdentity).
     Clients query for existing sources and publish their own metadata.
     """
 
@@ -150,6 +153,33 @@ class P2pService(object):
             '/model_express.p2p.P2pService/PublishMetadata',
             p2p__pb2.PublishMetadataRequest.SerializeToString,
             p2p__pb2.PublishMetadataResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListSources(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/ListSources',
+            p2p__pb2.ListSourcesRequest.SerializeToString,
+            p2p__pb2.ListSourcesResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -188,7 +218,7 @@ class P2pService(object):
             _registered_method=True)
 
     @staticmethod
-    def PublishReady(request,
+    def UpdateStatus(request,
             target,
             options=(),
             channel_credentials=None,
@@ -201,36 +231,9 @@ class P2pService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/model_express.p2p.P2pService/PublishReady',
-            p2p__pb2.PublishReadyRequest.SerializeToString,
-            p2p__pb2.PublishReadyResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def GetReady(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/model_express.p2p.P2pService/GetReady',
-            p2p__pb2.GetReadyRequest.SerializeToString,
-            p2p__pb2.GetReadyResponse.FromString,
+            '/model_express.p2p.P2pService/UpdateStatus',
+            p2p__pb2.UpdateStatusRequest.SerializeToString,
+            p2p__pb2.UpdateStatusResponse.FromString,
             options,
             channel_credentials,
             insecure,

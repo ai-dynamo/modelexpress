@@ -6,6 +6,7 @@ ModelExpress - High-performance GPU-to-GPU model weight transfers.
 
 This package provides:
 - NIXL-based RDMA transfers for GPU tensors
+- GPUDirect Storage (GDS) for direct file-to-GPU loading
 - vLLM worker extension for serving model weights
 - Custom model loaders for FP8 model support (DeepSeek-V3, etc.)
 
@@ -14,8 +15,8 @@ Quick Start:
     from modelexpress import register_modelexpress_loaders
     register_modelexpress_loaders()
 
-    # Source: vllm serve model --load-format mx-source
-    # Target: vllm serve model --load-format mx-target
+    # vllm serve model --load-format mx
+    # Auto-detects: RDMA -> GDS -> disk
 """
 
 import logging
@@ -32,8 +33,7 @@ def register_modelexpress_loaders():
     multiple times safely (idempotent).
 
     Enables:
-        --load-format mx-source  (for source - loads from disk, registers raw tensors)
-        --load-format mx-target  (for target - receives raw tensors via RDMA)
+        --load-format mx  (auto-detect: RDMA -> GDS -> disk)
     """
     global _loaders_registered
     if _loaders_registered:
@@ -43,12 +43,18 @@ def register_modelexpress_loaders():
     from . import vllm_loader  # noqa: F401
 
     _loaders_registered = True
-    _logger.debug("ModelExpress loaders registered: mx-source, mx-target")
+    _logger.debug("ModelExpress loader registered: mx")
 
 
 from .client import MxClient  # noqa: F401
+from .gds_loader import MxGdsLoader  # noqa: F401
+from .gds_transfer import GdsTransferManager  # noqa: F401
+from .heartbeat import HeartbeatThread  # noqa: F401
 
 __all__ = [
+    "GdsTransferManager",
+    "HeartbeatThread",
     "MxClient",
+    "MxGdsLoader",
     "register_modelexpress_loaders",
 ]

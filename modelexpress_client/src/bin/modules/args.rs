@@ -75,8 +75,8 @@ pub enum ModelCommands {
         model_name: String,
 
         /// Model provider
-        #[arg(long, short = 'p', value_enum, default_value = "hugging-face")]
-        provider: CliModelProvider,
+        #[arg(long, short = 'p', value_enum, default_value_t = ModelProvider::HuggingFace)]
+        provider: ModelProvider,
 
         /// Download strategy
         #[arg(long, short = 's', value_enum, default_value = "smart-fallback")]
@@ -106,6 +106,10 @@ pub enum ModelCommands {
 
     /// Clear specific model from storage
     Clear {
+        /// Model provider
+        #[arg(long, short = 'p', value_enum, default_value_t = ModelProvider::HuggingFace)]
+        provider: ModelProvider,
+
         /// Model name to clear
         model_name: String,
     },
@@ -156,20 +160,6 @@ pub enum OutputFormat {
     Json,
     /// Pretty-printed JSON
     JsonPretty,
-}
-
-#[derive(ValueEnum, Clone, Debug)]
-pub enum CliModelProvider {
-    #[value(name = "hugging-face")]
-    HuggingFace,
-}
-
-impl From<CliModelProvider> for ModelProvider {
-    fn from(provider: CliModelProvider) -> Self {
-        match provider {
-            CliModelProvider::HuggingFace => ModelProvider::HuggingFace,
-        }
-    }
 }
 
 #[derive(ValueEnum, Clone, Debug)]

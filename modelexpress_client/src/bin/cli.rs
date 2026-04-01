@@ -114,15 +114,29 @@ async fn main() {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::modules::args::{Cli, CliModelProvider};
+    use super::modules::args::{Cli, Commands};
     use clap::Parser;
     use modelexpress_client::ModelProvider;
 
     #[test]
-    fn test_cli_model_provider_conversion() {
-        let provider = CliModelProvider::HuggingFace;
-        let converted: ModelProvider = provider.into();
-        assert_eq!(converted, ModelProvider::HuggingFace);
+    fn test_cli_model_provider_parsing() {
+        let parsed = Cli::try_parse_from([
+            "modelexpress-cli",
+            "model",
+            "download",
+            "--provider",
+            "hugging-face",
+            "google-t5/t5-small",
+        ])
+        .expect("Failed to parse CLI model provider");
+
+        let Commands::Model { command } = parsed.command else {
+            panic!("Expected model command");
+        };
+        let super::modules::args::ModelCommands::Download { provider, .. } = command else {
+            panic!("Expected download subcommand");
+        };
+        assert_eq!(provider, ModelProvider::HuggingFace);
     }
 
     #[test]
@@ -183,5 +197,35 @@ mod tests {
 
         assert_eq!(cli.format, super::modules::args::OutputFormat::Json);
         assert_eq!(cli.verbose, 3);
+    }
+
+    #[test]
+    fn test_cli_model_clear_defaults_to_hugging_face_provider() {
+        let parsed = Cli::try_parse_from([
+            "modelexpress-cli",
+            "model",
+            "clear",
+            "--provider",
+            "hugging-face",
+            "dev/bake/qwen/rev123",
+        ]);
+        assert!(parsed.is_ok());
+
+        let missing_provider =
+            Cli::try_parse_from(["modelexpress-cli", "model", "clear", "dev/bake/qwen/rev123"])
+                .expect("Expected clear command to parse without provider");
+
+        let Commands::Model { command } = missing_provider.command else {
+            panic!("Expected model command");
+        };
+        let super::modules::args::ModelCommands::Clear {
+            provider,
+            model_name,
+        } = command
+        else {
+            panic!("Expected clear subcommand");
+        };
+        assert_eq!(provider, ModelProvider::HuggingFace);
+        assert_eq!(model_name, "dev/bake/qwen/rev123");
     }
 }

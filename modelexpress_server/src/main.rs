@@ -16,7 +16,7 @@ use modelexpress_server::{
 };
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
@@ -74,7 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create cache eviction service
-    let cache_service = CacheEvictionService::new(database.clone(), config.cache.eviction.clone());
+    let cache_service = CacheEvictionService::new(
+        database.clone(),
+        config.cache.eviction.clone(),
+        config.cache.directory.clone(),
+    );
 
     // Create shutdown channels
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -97,24 +101,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_service = ApiServiceImpl;
     let model_service = ModelServiceImpl;
 
-    // Initialize P2P state manager with Redis (optional)
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let p2p_state = Arc::new(P2pStateManager::new(&redis_url));
+    // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
+    let p2p_state = Arc::new(P2pStateManager::new());
 
-    // Try to connect to Redis (non-fatal if unavailable)
-    match tokio::time::timeout(std::time::Duration::from_secs(5), p2p_state.connect()).await {
-        Ok(Ok(())) => info!("P2P state manager connected to Redis"),
-        Ok(Err(e)) => warn!(
-            "P2P state manager could not connect to Redis: {} - P2P features may be unavailable",
-            e
-        ),
-        Err(_) => warn!(
-            "P2P state manager timed out connecting to Redis - P2P features may be unavailable"
-        ),
+    match tokio::time::timeout(std::time::Duration::from_secs(10), p2p_state.connect()).await {
+        Ok(Ok(())) => info!("P2P state manager connected to metadata backend"),
+        Ok(Err(e)) => {
+            error!("Failed to connect to P2P metadata backend: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            error!("Timed out connecting to P2P metadata backend");
+            return Err("P2P metadata backend connection timed out".into());
+        }
     }
 
-    let p2p_service = P2pServiceImpl::new(p2p_state);
+    let p2p_service = P2pServiceImpl::new(p2p_state.clone());
+
+    // Start reaper for stale source detection
+    let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
+    let reaper_state = p2p_state.clone();
+    let reaper_handle = tokio::spawn(async move {
+        modelexpress_server::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
+    });
 
     // Setup graceful shutdown handler
     let shutdown_signal = async move {
@@ -127,6 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Signal cache eviction service to shutdown
         if shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to cache eviction service");
+        }
+
+        // Signal reaper to shutdown
+        if reaper_shutdown_tx.send(()).is_err() {
+            error!("Failed to send shutdown signal to reaper");
         }
     };
 
@@ -144,11 +158,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_shutdown(addr, shutdown_signal)
         .await;
 
-    // Wait for cache service to complete if it was started
+    // Wait for background services to complete
     if let Some(handle) = cache_handle
         && let Err(e) = handle.await
     {
         error!("Cache eviction service join error: {e}");
+    }
+    if let Err(e) = reaper_handle.await {
+        error!("Reaper join error: {e}");
     }
 
     server_result?;
