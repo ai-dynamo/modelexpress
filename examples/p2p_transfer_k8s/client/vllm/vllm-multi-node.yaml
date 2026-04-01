@@ -18,7 +18,7 @@
 #
 # Prerequisites:
 #   - ModelExpress server deployed (see ../../server/)
-#   - PVC "model-cache-block" with model weights (or enough space for HF download)
+#   - PVC "model-cache" with model weights (or enough space for HF download)
 #   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #
 # Usage (single instance):
@@ -161,15 +161,15 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
-            - name: model-cache-block
+            - name: model-cache
               mountPath: /models
       volumes:
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        - name: model-cache-block
+        - name: model-cache
           persistentVolumeClaim:
-            claimName: model-cache-block
+            claimName: model-cache
       imagePullSecrets:
         - name: nvcr-imagepullsecret
