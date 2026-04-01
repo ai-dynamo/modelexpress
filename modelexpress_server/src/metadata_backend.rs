@@ -139,6 +139,15 @@ pub enum BackendConfig {
     LayeredKubernetes { namespace: String },
 }
 
+impl std::fmt::Display for BackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redis { .. } => write!(f, "redis"),
+            Self::Kubernetes { .. } => write!(f, "kubernetes"),
+        }
+    }
+}
+
 impl BackendConfig {
     /// Create backend from environment variables.
     ///

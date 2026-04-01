@@ -102,15 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let p2p_state = Arc::new(P2pStateManager::new(&redis_url));
 
-    // Try to connect to Redis (non-fatal if unavailable)
+    // Try to connect to metadata backend (non-fatal if unavailable)
     match tokio::time::timeout(std::time::Duration::from_secs(5), p2p_state.connect()).await {
-        Ok(Ok(())) => info!("P2P state manager connected to Redis"),
+        Ok(Ok(backend)) => info!("P2P state manager connected (backend: {backend})"),
         Ok(Err(e)) => warn!(
-            "P2P state manager could not connect to Redis: {} - P2P features may be unavailable",
+            "P2P state manager could not connect to metadata backend: {} - P2P features may be unavailable",
             e
         ),
         Err(_) => warn!(
-            "P2P state manager timed out connecting to Redis - P2P features may be unavailable"
+            "P2P state manager timed out connecting to metadata backend - P2P features may be unavailable"
         ),
     }
 

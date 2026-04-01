@@ -80,15 +80,16 @@ impl P2pStateManager {
         }
     }
 
-    /// Initialize the backend connection
-    pub async fn connect(&self) -> MetadataResult<()> {
+    /// Initialize the backend connection. Returns the backend type name on success.
+    pub async fn connect(&self) -> MetadataResult<String> {
+        let backend_name = self.config.to_string();
         let backend = create_backend(self.config.clone()).await?;
 
         let mut guard = self.backend.write().await;
         *guard = Some(backend);
 
-        info!("P2pStateManager connected with {:?}", self.config);
-        Ok(())
+        info!("P2pStateManager connected (backend: {})", backend_name);
+        Ok(backend_name)
     }
 
     /// Get the backend, connecting if necessary.
