@@ -122,7 +122,7 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
-            - name: model-cache-block
+            - name: model-cache
               mountPath: /models
 
       volumes:
@@ -130,8 +130,8 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
-        - name: model-cache-block
+        - name: model-cache
           persistentVolumeClaim:
-            claimName: model-cache-block
+            claimName: model-cache
       imagePullSecrets:
         - name: nvcr-imagepullsecret
