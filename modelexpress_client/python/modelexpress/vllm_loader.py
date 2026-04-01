@@ -31,6 +31,7 @@ import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import grpc
 import torch
 import torch.nn as nn
 
@@ -60,6 +61,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress.vllm_loader")
 
 MAX_SOURCE_RETRIES = 3
+PUBLISH_METADATA_MAX_ATTEMPTS = 3
+PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS = 1.0
+PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+}
 
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
@@ -342,63 +349,102 @@ def _publish_metadata_and_ready(
         f"[Worker {global_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
-    try:
-        use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
+    use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
 
-        if use_contiguous:
-            region_descriptors = nixl_manager.get_registered_descriptors()
-            tensor_protos = [
-                p2p_pb2.TensorDescriptor(
-                    name=desc.name,
-                    addr=desc.addr,
-                    size=desc.size,
-                    device_id=desc.device_id,
-                    dtype=desc.dtype,
-                )
-                for desc in region_descriptors
-            ]
-            logger.info(
-                f"[Worker {global_rank}] Built {len(tensor_protos)} REGION descriptors "
-                f"(MX_CONTIGUOUS_REG=1)"
+    if use_contiguous:
+        region_descriptors = nixl_manager.get_registered_descriptors()
+        tensor_protos = [
+            p2p_pb2.TensorDescriptor(
+                name=desc.name,
+                addr=desc.addr,
+                size=desc.size,
+                device_id=desc.device_id,
+                dtype=desc.dtype,
             )
-        else:
-            tensor_protos = [
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=t.data_ptr(),
-                    size=t.numel() * t.element_size(),
-                    device_id=device_id,
-                    dtype=str(t.dtype),
-                )
-                for name, t in tensors.items()
-            ]
-
-        nixl_metadata = nixl_manager.nixl_metadata
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=global_rank,
-            nixl_metadata=nixl_metadata,
-            tensors=tensor_protos,
-        )
-
-        mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
+            for desc in region_descriptors
+        ]
         logger.info(
-            f"[Worker {global_rank}] Published metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+            f"[Worker {global_rank}] Built {len(tensor_protos)} REGION descriptors "
+            f"(MX_CONTIGUOUS_REG=1)"
         )
+    else:
+        tensor_protos = [
+            p2p_pb2.TensorDescriptor(
+                name=name,
+                addr=t.data_ptr(),
+                size=t.numel() * t.element_size(),
+                device_id=device_id,
+                dtype=str(t.dtype),
+            )
+            for name, t in tensors.items()
+        ]
 
-        heartbeat = HeartbeatThread(
-            mx_client=mx_client,
-            mx_source_id=mx_source_id,
-            worker_id=worker_id,
-            worker_rank=global_rank,
-            nixl_manager=nixl_manager,
-        )
-        heartbeat.start()
-        _heartbeat_threads[global_rank] = heartbeat
+    nixl_metadata = nixl_manager.nixl_metadata
 
-    except Exception:
-        raise
+    worker = p2p_pb2.WorkerMetadata(
+        worker_rank=global_rank,
+        nixl_metadata=nixl_metadata,
+        tensors=tensor_protos,
+    )
+
+    mx_source_id = _publish_metadata_to_server(
+        mx_client=mx_client,
+        identity=identity,
+        worker=worker,
+        worker_id=worker_id,
+        global_rank=global_rank,
+    )
+    logger.info(
+        f"[Worker {global_rank}] Published metadata to MX server "
+        f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+    )
+
+    heartbeat = HeartbeatThread(
+        mx_client=mx_client,
+        mx_source_id=mx_source_id,
+        worker_id=worker_id,
+        worker_rank=global_rank,
+        nixl_manager=nixl_manager,
+    )
+    heartbeat.start()
+    _heartbeat_threads[global_rank] = heartbeat
+
+
+def _publish_metadata_to_server(
+    mx_client: MxClient,
+    identity: "p2p_pb2.SourceIdentity",
+    worker: "p2p_pb2.WorkerMetadata",
+    worker_id: str,
+    global_rank: int,
+) -> str:
+    """Publish metadata with bounded retries and exponential backoff."""
+    last_error: grpc.RpcError | None = None
+
+    for attempt in range(1, PUBLISH_METADATA_MAX_ATTEMPTS + 1):
+        try:
+            return mx_client.publish_metadata(identity, worker, worker_id)
+        except grpc.RpcError as exc:
+            if exc.code() not in PUBLISH_METADATA_RETRYABLE_STATUS_CODES:
+                raise
+
+            last_error = exc
+            if attempt == PUBLISH_METADATA_MAX_ATTEMPTS:
+                break
+
+            backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                f"[Worker {global_rank}] Publish metadata attempt {attempt}/"
+                f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed with retryable gRPC status "
+                f"{exc.code().name}: {exc}. Retrying in {backoff_seconds:.1f}s"
+            )
+            time.sleep(backoff_seconds)
+
+    message = (
+        f"[Worker {global_rank}] Failed to publish metadata after "
+        f"{PUBLISH_METADATA_MAX_ATTEMPTS} attempts"
+    )
+    logger.error("%s: %s", message, last_error)
+    raise RuntimeError(f"{message}: {last_error}") from last_error
 
 
 @register_model_loader("mx")
