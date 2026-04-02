@@ -99,8 +99,6 @@ spec:
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            - name: MX_CONTIGUOUS_REG
-              value: "0"
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL

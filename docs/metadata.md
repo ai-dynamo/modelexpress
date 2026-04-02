@@ -318,7 +318,6 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
-| `MX_CONTIGUOUS_REG` | `0` | Use contiguous region registration (experimental) |
 
 ## Debugging
 

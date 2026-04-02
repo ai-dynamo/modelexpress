@@ -422,8 +422,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity("my-model")
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
+        with patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
             _publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
 
         mx_client.publish_metadata.assert_called_once()
@@ -455,8 +454,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
+        with patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
              patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
             _publish_metadata_and_ready(
                 mx_client,
@@ -495,8 +493,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
+        with patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
              patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
                 _publish_metadata_and_ready(
@@ -527,8 +524,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
+        with patch("modelexpress.vllm_loader.time.sleep") as sleep_mock, \
              patch("modelexpress.vllm_loader.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(_FakeRpcError, match="permission denied"):
                 _publish_metadata_and_ready(

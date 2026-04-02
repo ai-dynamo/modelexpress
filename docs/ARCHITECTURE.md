@@ -462,10 +462,9 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | Method | Purpose |
 |--------|---------|
 | `__init__(agent_name, device_id, listen_port)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread |
-| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata |
-| `get_registered_descriptors()` | Return region descriptors (`MX_CONTIGUOUS_REG=1`) or tensor descriptors |
+| `register_tensors(tensors)` | Detect memory pools, register with NIXL, return serialized metadata |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
-| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
+| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name, source_alloc_ends)` | Execute RDMA read transfer with allocation-aware coalescing |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 ### vLLM Loader
@@ -588,7 +587,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_METADATA_BACKEND` | (required) | Metadata backend: `redis` or `kubernetes` |
-| `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers |
 | `MX_METADATA_PORT` | `0` | NIXL listen thread port for P2P metadata exchange |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
@@ -614,10 +612,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 ### NIXL_ERR_REMOTE_DISCONNECT
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
-
-### Contiguous Region Failures
-
-When `MX_CONTIGUOUS_REG=1`, transfers fail even when source is stable. Current workaround: use baseline mode (`MX_CONTIGUOUS_REG=0`).
 
 ### Long Source Warmup
 

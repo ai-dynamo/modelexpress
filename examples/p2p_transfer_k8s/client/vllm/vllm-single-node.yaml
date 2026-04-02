@@ -69,10 +69,6 @@ spec:
             # Server address for metadata publishing
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            # Baseline: individual tensor registration (stable and tested)
-            # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
-            - name: MX_CONTIGUOUS_REG
-              value: "0"
             # Logging (set to DEBUG for troubleshooting)
             - name: NIXL_LOG_LEVEL
               value: "INFO"

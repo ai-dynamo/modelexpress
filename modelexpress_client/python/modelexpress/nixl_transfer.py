@@ -62,7 +62,7 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
-        self._registered_regions: list[tuple[int, int]] | None = None
+        self._alloc_ends: list[int] = []
 
     @property
     def agent_name(self) -> str:
@@ -78,6 +78,11 @@ class NixlTransferManager:
     def tensor_descriptors(self) -> list[TensorDescriptor]:
         """Get tensor descriptors for registered tensors."""
         return self._tensor_descriptors
+
+    @property
+    def alloc_ends(self) -> list[int]:
+        """Get CUDA allocation end addresses (for coalescing boundaries)."""
+        return self._alloc_ends
 
     def initialize(self) -> None:
         """Initialize the NIXL agent."""
@@ -109,11 +114,15 @@ class NixlTransferManager:
         """
         Register tensors with NIXL for RDMA access.
 
-        CRITICAL: We must ensure self._tensors contains the SAME tensor objects
-        that are registered with NIXL, so receive_from_source uses correct memory.
+        Detects CUDA allocation boundaries using cuMemGetAddressRange and
+        registers each unique allocation as a single block, minimizing NIXL
+        registration overhead (kernel calls, rkeys, metadata blob size).
+        Per-tensor descriptors are always preserved for application-level
+        name-based matching during transfers.
 
-        If MX_CONTIGUOUS_REG=1, detects and registers contiguous memory regions
-        as single blocks, reducing descriptor overhead significantly.
+        CRITICAL: self._tensors must hold the SAME tensor objects as
+        param.data in vLLM. Do NOT call .contiguous() - that would create
+        copies and RDMA writes would go to the wrong memory.
 
         Args:
             tensors: Dictionary of tensor name -> tensor
@@ -121,14 +130,9 @@ class NixlTransferManager:
         Returns:
             NIXL metadata bytes for this agent
         """
-        import os
-
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        # CRITICAL: Do NOT call .contiguous() here!
-        # The tensors must be the exact same objects as param.data in vLLM,
-        # otherwise RDMA writes to copies and vLLM uses originals = garbage.
         self._tensors = tensors
         tensor_descriptors = []
 
@@ -148,102 +152,78 @@ class NixlTransferManager:
 
         self._tensor_descriptors = tensor_descriptors
 
-        # Check if contiguous region registration is enabled
-        use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
-
-        if use_contiguous:
-            # Register contiguous memory regions as single blocks
-            regions = self._find_contiguous_regions(tensor_descriptors)
-            logger.info(
-                f"[Contiguous Registration] Found {len(regions)} contiguous regions "
-                f"from {len(tensor_descriptors)} tensors "
-                f"({(1 - len(regions)/len(tensor_descriptors))*100:.1f}% reduction)"
-            )
-
-            # Register regions using raw address tuples
-            # Format: (addr, size, device_id, mem_type) - 4-tuple required by NIXL API
-            region_tuples = [(r[0], r[1], self._device_id, "cuda") for r in regions]
-            self._agent.register_memory(region_tuples, mem_type="cuda", backends=["UCX"])
-            self._registered_regions = regions
-            logger.info(f"Registered {len(regions)} contiguous regions with NIXL")
-            # Debug: Log first few registered region addresses
-            if len(regions) > 0:
-                logger.info(f"[Contiguous Registration] DEBUG - First 3 regions: {[(hex(r[0]), r[1]) for r in regions[:3]]}")
+        # Register memory at CUDA allocation boundaries to reduce NIXL
+        # registration overhead. Uses cuMemGetAddressRange to discover actual
+        # cudaMalloc blocks and registers each as a whole unit via raw tuples.
+        # This matches UCX's rcache granularity (one rkey per cudaMalloc block).
+        allocations = self._find_cuda_allocations(tensor_descriptors)
+        if allocations:
+            alloc_tuples = [
+                (base, size, self._device_id, "")
+                for base, size in allocations
+            ]
+            self._agent.register_memory(alloc_tuples, mem_type="cuda", backends=["UCX"])
+            self._alloc_ends = sorted(base + size for base, size in allocations)
+            reg_count = len(allocations)
         else:
-            # Traditional: register individual tensors
+            # Fallback: per-tensor registration (e.g. all tensors have addr 0)
             tensor_list = list(tensors.values())
             self._agent.register_memory(tensor_list, backends=["UCX"])
-            self._registered_regions = None
-            logger.info(f"Registered {len(tensor_list)} individual tensors with NIXL")
+            self._alloc_ends = []
+            reg_count = len(tensor_list)
+
+        reduction = (1 - reg_count / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
+        logger.info(
+            f"Registered {reg_count} regions from {len(tensor_descriptors)} tensors "
+            f"({reduction:.1f}% reduction in NIXL registrations)"
+        )
 
         self._metadata = self._agent.get_agent_metadata()
         return self._metadata
 
-    def get_registered_descriptors(self) -> list[TensorDescriptor]:
-        """
-        Get the descriptors that were actually registered with NIXL.
-
-        When MX_CONTIGUOUS_REG=1, returns contiguous region descriptors.
-        Otherwise, returns individual tensor descriptors.
-
-        This is important for publishing to the server - we must publish
-        what was actually registered, not the original tensors.
-        """
-        if self._registered_regions is not None:
-            # Return region descriptors with synthetic names
-            return [
-                TensorDescriptor(
-                    name=f"__region_{i}__",
-                    addr=addr,
-                    size=size,
-                    device_id=self._device_id,
-                    dtype="contiguous_region",
-                )
-                for i, (addr, size) in enumerate(self._registered_regions)
-            ]
-        else:
-            # Return original tensor descriptors
-            return self._tensor_descriptors
-
-    def _find_contiguous_regions(
-        self, descriptors: list[TensorDescriptor]
+    @staticmethod
+    def _find_cuda_allocations(
+        descriptors: list[TensorDescriptor],
     ) -> list[tuple[int, int]]:
         """
-        Find contiguous memory regions from tensor descriptors.
+        Find unique CUDA allocations backing the tensor descriptors.
 
-        Sorts tensors by address and merges adjacent ones into larger regions.
-        This reduces the number of NIXL registrations significantly.
+        Uses cuMemGetAddressRange to discover the actual cudaMalloc block
+        boundaries for each tensor. This is critical for correct NIXL pool
+        registration: UCX's rcache produces broken rkeys when a registered
+        region spans multiple cudaMalloc allocations, even if they happen
+        to be adjacent in virtual address space.
 
         Args:
             descriptors: List of tensor descriptors
 
         Returns:
-            List of (start_addr, total_size) tuples for contiguous regions
+            List of (alloc_base, alloc_size) tuples for unique CUDA allocations
         """
         if not descriptors:
             return []
 
-        # Sort by address
-        sorted_descs = sorted(descriptors, key=lambda d: d.addr)
+        import ctypes
 
-        regions = []
-        current_start = sorted_descs[0].addr
-        current_end = current_start + sorted_descs[0].size
+        cuda = ctypes.CDLL("libcuda.so")
+        seen: dict[int, int] = {}  # alloc_base -> alloc_size
 
-        for desc in sorted_descs[1:]:
-            if desc.addr == current_end:
-                # Contiguous - extend region
-                current_end = desc.addr + desc.size
-            else:
-                # Gap - save current region and start new one
-                regions.append((current_start, current_end - current_start))
-                current_start = desc.addr
-                current_end = desc.addr + desc.size
+        for desc in descriptors:
+            base = ctypes.c_uint64()
+            alloc_size = ctypes.c_size_t()
+            ret = cuda.cuMemGetAddressRange_v2(
+                ctypes.byref(base), ctypes.byref(alloc_size), ctypes.c_uint64(desc.addr)
+            )
+            if ret != 0:
+                raise RuntimeError(
+                    f"cuMemGetAddressRange_v2 failed (error {ret}) for tensor "
+                    f"at 0x{desc.addr:x}. Is the tensor on a CUDA device?"
+                )
+            alloc_base = base.value
+            if alloc_base not in seen:
+                seen[alloc_base] = alloc_size.value
 
-        # Don't forget the last region
-        regions.append((current_start, current_end - current_start))
-
-        return regions
+        return sorted(seen.items())
 
     def fetch_remote_and_wait(
         self,
@@ -266,19 +246,22 @@ class NixlTransferManager:
         self._agent.fetch_remote_metadata(remote_agent_name, ip, port)
 
         start = time.perf_counter()
+        poll_interval = 0.01  # start at 10ms, cap at 100ms
         while True:
-            if time.perf_counter() - start >= timeout_seconds:
+            elapsed = time.perf_counter() - start
+            if elapsed >= timeout_seconds:
                 raise TimeoutError(
                     f"Timed out waiting for remote metadata from "
-                    f"{remote_agent_name} at {ip}:{port}"
+                    f"{remote_agent_name} at {ip}:{port} after {timeout_seconds:.1f}s"
                 )
             if self._agent.check_remote_metadata(remote_agent_name):
                 logger.info(
                     f"Remote metadata loaded for {remote_agent_name} "
-                    f"({time.perf_counter() - start:.2f}s)"
+                    f"({elapsed:.2f}s)"
                 )
                 return
-            time.sleep(0.01)
+            time.sleep(poll_interval)
+            poll_interval = min(poll_interval * 2, 0.1)
 
     def receive_from_source(
         self,
@@ -287,9 +270,15 @@ class NixlTransferManager:
         timeout_seconds: float | None = None,
         coalesce_transfers: bool = True,
         remote_agent_name: str | None = None,
+        source_alloc_ends: list[int] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
+
+        Matches source tensors to local tensors by name, optionally coalesces
+        contiguous regions to reduce RDMA descriptor overhead, then executes
+        the transfer. Both sides must have registered memory pools that cover
+        the tensor address ranges (handled by register_tensors).
 
         Args:
             source_metadata: NIXL metadata from the source agent (unused if remote_agent_name set)
@@ -298,6 +287,9 @@ class NixlTransferManager:
             coalesce_transfers: If True, coalesce contiguous memory regions (optimization)
             remote_agent_name: If set, use this pre-loaded agent (P2P mode) instead of
                 calling add_remote_agent with source_metadata (centralized mode)
+            source_alloc_ends: CUDA allocation end addresses from the source, used
+                to constrain coalescing so merged regions don't span multiple
+                cudaMalloc blocks.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -319,106 +311,45 @@ class NixlTransferManager:
         else:
             logger.info(f"Using pre-loaded remote agent {remote_agent_name}")
 
-        # Check if source is sending region descriptors (MX_CONTIGUOUS_REG=1 on source)
-        is_region_transfer = (
-            len(source_tensors) > 0 and
-            source_tensors[0].name.startswith("__region_")
-        )
+        # Match source tensors to local tensors by name
+        remote_descs: list[tuple[int, int, int]] = []
+        local_tensor_list: list[torch.Tensor] = []
+        total_bytes = 0
 
-        if is_region_transfer:
-            # REGION-BASED TRANSFER: Source registered contiguous regions
-            # We must also have registered regions and match by index
-            if self._registered_regions is None:
-                logger.error("Source sent region descriptors but we didn't register regions!")
-                logger.error("Set MX_CONTIGUOUS_REG=1 on target to enable region transfer")
-                raise RuntimeError("Region transfer mismatch: target must also use MX_CONTIGUOUS_REG=1")
+        for src_tensor in source_tensors:
+            if src_tensor.name not in self._tensors:
+                continue
+            local_tensor = self._tensors[src_tensor.name]
+            remote_descs.append((src_tensor.addr, src_tensor.size, src_tensor.device_id))
+            local_tensor_list.append(local_tensor)
+            total_bytes += src_tensor.size
 
-            logger.info(f"Region-based transfer: {len(source_tensors)} source regions -> {len(self._registered_regions)} local regions")
+        matched_tensors = len(remote_descs)
+        if not remote_descs:
+            logger.warning("No matching tensors found for transfer")
+            return 0, 0, 0.0
 
-            # Validate region counts match
-            if len(source_tensors) != len(self._registered_regions):
-                logger.warning(
-                    f"Region count mismatch: source has {len(source_tensors)}, "
-                    f"local has {len(self._registered_regions)}. Proceeding with min."
-                )
-
-            # Build transfer lists by region index
-            remote_descs = []
-            local_descs = []  # Will be (addr, size, device_id) tuples
-            total_bytes = 0
-            matched_count = min(len(source_tensors), len(self._registered_regions))
-
-            for i in range(matched_count):
-                src_region = source_tensors[i]
-                local_addr, local_size = self._registered_regions[i]
-
-                # Verify sizes match (regions should be same size)
-                if src_region.size != local_size:
-                    logger.warning(f"Region {i} size mismatch: source={src_region.size}, local={local_size}")
-
-                remote_descs.append((src_region.addr, src_region.size, src_region.device_id))
-                local_descs.append((local_addr, local_size, self._device_id))
-                total_bytes += src_region.size
-
-            matched_tensors = matched_count
-            use_raw_descriptors = True
-            coalesced_count = matched_count
-
-            logger.info(f"[Region Transfer] Matched {matched_count} regions, {total_bytes / 1e9:.2f} GB")
-
-            # Debug: Log first few region addresses for comparison
-            if matched_count > 0:
-                logger.info(f"[Region Transfer] DEBUG - First 3 source regions: {[(hex(r[0]), r[1]) for r in remote_descs[:3]]}")
-                logger.info(f"[Region Transfer] DEBUG - First 3 local regions: {[(hex(r[0]), r[1]) for r in local_descs[:3]]}")
-
-        else:
-            # TENSOR-BASED TRANSFER: Match by tensor name (baseline)
-            remote_descs = []
-            local_tensor_list = []
-            total_bytes = 0
-            matched_tensors = 0
-
-            for src_tensor in source_tensors:
-                if src_tensor.name not in self._tensors:
-                    continue
-                local_tensor = self._tensors[src_tensor.name]
-                remote_descs.append((src_tensor.addr, src_tensor.size, src_tensor.device_id))
-                local_tensor_list.append(local_tensor)
-                total_bytes += src_tensor.size
-                matched_tensors += 1
-
-            if not remote_descs:
-                logger.warning("No matching tensors found for transfer")
-                return 0, 0, 0.0
-
-            # For tensor-based, we might still coalesce if enabled
-            local_descs = local_tensor_list
-            use_raw_descriptors = False
-            coalesced_count = matched_tensors
-
-        # OPTIMIZATION: Coalesce contiguous memory regions to reduce descriptor overhead
-        # Skip if we're doing region-based transfer (already optimized at registration time)
-        if is_region_transfer:
-            # Region transfer already has optimal descriptors, skip coalescing
-            logger.info(f"[Region Transfer] Skipping coalesce - already optimized with {coalesced_count} regions")
-        elif coalesce_transfers:
-            logger.info(f"[Coalesce] Starting coalescing of {len(remote_descs)} descriptors...")
+        # Coalesce contiguous regions to reduce RDMA descriptor overhead.
+        # This is a pure transfer-time optimization, independent of how
+        # memory pools were registered.
+        if coalesce_transfers:
             remote_descs, local_descs, coalesced_count = self._coalesce_transfers(
-                remote_descs, local_tensor_list
+                remote_descs, local_tensor_list, source_alloc_ends
             )
-            reduction_pct = (1 - coalesced_count / matched_tensors) * 100 if matched_tensors > 0 else 0
-            logger.info(
-                f"[Coalesce] Reduced {matched_tensors} descriptors -> {coalesced_count} regions "
-                f"({reduction_pct:.1f}% reduction)"
-            )
-            # local_descs are now (addr, size, device_id) tuples, not tensors
+            if coalesced_count < matched_tensors:
+                reduction_pct = (1 - coalesced_count / matched_tensors) * 100
+                logger.info(
+                    f"Coalesced {matched_tensors} tensors -> {coalesced_count} transfer regions "
+                    f"({reduction_pct:.1f}% reduction)"
+                )
             use_raw_descriptors = True
         else:
-            logger.info(f"[Coalesce] DISABLED - transferring {matched_tensors} individual tensors")
-            # Fall back to tensor list
-            local_descs = local_tensor_list
-            use_raw_descriptors = False
+            local_descs = [
+                (t.data_ptr(), t.numel() * t.element_size(), self._device_id)
+                for t in local_tensor_list
+            ]
             coalesced_count = matched_tensors
+            use_raw_descriptors = True
 
         # Prepare transfer
         src_prepped = self._agent.prep_xfer_dlist(
@@ -428,22 +359,12 @@ class NixlTransferManager:
             backends=["UCX"],
         )
 
-        if use_raw_descriptors:
-            # Use raw address descriptors for coalesced regions
-            dst_prepped = self._agent.prep_xfer_dlist(
-                agent_name="",
-                xfer_list=local_descs,
-                mem_type="cuda",
-                backends=["UCX"],
-            )
-        else:
-            # Use tensor objects
-            dst_prepped = self._agent.prep_xfer_dlist(
-                agent_name="",
-                xfer_list=local_descs,
-                mem_type="cuda",
-                backends=["UCX"],
-            )
+        dst_prepped = self._agent.prep_xfer_dlist(
+            agent_name="",
+            xfer_list=local_descs,
+            mem_type="cuda",
+            backends=["UCX"],
+        )
 
         indices = list(range(len(remote_descs)))
 
@@ -474,14 +395,13 @@ class NixlTransferManager:
                 raise RuntimeError(f"Transfer failed with status {status}")
             time.sleep(0.001)
 
-        # CRITICAL: Synchronize CUDA to ensure RDMA writes are visible
-        # GPUDirect RDMA writes bypass CUDA streams, so we must sync
+        # GPUDirect RDMA writes bypass CUDA streams
         torch.cuda.synchronize(self._device_id)
 
         duration = time.perf_counter() - start_time
         bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
 
-        if coalesce_transfers and coalesced_count < matched_tensors:
+        if coalesced_count < matched_tensors:
             logger.info(
                 f"Transfer complete: {matched_tensors} tensors ({coalesced_count} regions), "
                 f"{total_bytes / 1e9:.2f} GB in {duration:.2f}s "
@@ -500,6 +420,7 @@ class NixlTransferManager:
         self,
         remote_descs: list[tuple[int, int, int]],
         local_tensors: list[torch.Tensor],
+        source_alloc_ends: list[int] | None = None,
     ) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, int]], int]:
         """
         Coalesce contiguous memory regions into larger transfer blocks.
@@ -514,6 +435,8 @@ class NixlTransferManager:
         Args:
             remote_descs: List of (addr, size, device_id) tuples
             local_tensors: List of local tensors
+            source_alloc_ends: Sorted list of CUDA allocation end addresses from source.
+                Coalescing will not merge regions that would span multiple source allocations.
 
         Returns:
             Tuple of (coalesced_remote_descs, coalesced_local_descs, count)
@@ -562,12 +485,25 @@ class NixlTransferManager:
                 next_device = indexed[j][0][2]
 
                 # Check if both remote AND local are contiguous
-                # Strict check: no gaps allowed for RDMA correctness
                 remote_contiguous = (next_remote_addr == current_remote_end)
                 local_contiguous = (next_local_addr == current_local_end)
                 same_device = (next_device == device_id)
 
-                if remote_contiguous and local_contiguous and same_device:
+                # Don't merge across the source's CUDA allocation boundaries.
+                # UCX's rcache produces broken rkeys when a registered region
+                # spans multiple cudaMalloc blocks. Each coalesced transfer
+                # region must be coverable by a single source registration.
+                crosses_alloc = False
+                if remote_contiguous and source_alloc_ends:
+                    from bisect import bisect_right
+                    idx = bisect_right(source_alloc_ends, start_remote_addr)
+                    if idx < len(source_alloc_ends):
+                        alloc_end = source_alloc_ends[idx]
+                        merged_end = next_remote_addr + next_remote_size
+                        if merged_end > alloc_end:
+                            crosses_alloc = True
+
+                if remote_contiguous and local_contiguous and same_device and not crosses_alloc:
                     # Extend region
                     current_remote_end = next_remote_addr + next_remote_size
                     current_local_end = next_local_addr + next_local_size

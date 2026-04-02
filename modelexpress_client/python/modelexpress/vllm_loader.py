@@ -378,37 +378,22 @@ def _build_tensor_protos(
     device_id: int,
     global_rank: int,
 ) -> list["p2p_pb2.TensorDescriptor"]:
-    """Build tensor descriptor protos from registered tensors."""
-    use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
+    """Build tensor descriptor protos from registered tensors.
 
-    if use_contiguous:
-        region_descriptors = nixl_manager.get_registered_descriptors()
-        protos = [
-            p2p_pb2.TensorDescriptor(
-                name=desc.name,
-                addr=desc.addr,
-                size=desc.size,
-                device_id=desc.device_id,
-                dtype=desc.dtype,
-            )
-            for desc in region_descriptors
-        ]
-        logger.info(
-            f"[Worker {global_rank}] Built {len(protos)} REGION descriptors "
-            f"(MX_CONTIGUOUS_REG=1)"
+    Always builds per-tensor descriptors (not region descriptors).
+    Pool-based registration is transparent at the NIXL level and does not
+    affect the tensor manifest served to targets.
+    """
+    return [
+        p2p_pb2.TensorDescriptor(
+            name=name,
+            addr=t.data_ptr(),
+            size=t.numel() * t.element_size(),
+            device_id=device_id,
+            dtype=str(t.dtype),
         )
-    else:
-        protos = [
-            p2p_pb2.TensorDescriptor(
-                name=name,
-                addr=t.data_ptr(),
-                size=t.numel() * t.element_size(),
-                device_id=device_id,
-                dtype=str(t.dtype),
-            )
-            for name, t in tensors.items()
-        ]
-    return protos
+        for name, t in tensors.items()
+    ]
 
 
 def _publish_metadata_and_ready(
@@ -455,11 +440,12 @@ def _publish_metadata_and_ready(
             global_rank=global_rank,
         )
 
-        # Start worker gRPC server
+        # Start worker gRPC server (includes alloc_ends for pool-based coalescing)
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
             mx_source_id=mx_source_id,
             port=worker_grpc_port,
+            alloc_ends=nixl_manager.alloc_ends,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
@@ -829,6 +815,7 @@ class MxModelLoader(BaseModelLoader):
 
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name_override = None
+        source_alloc_ends: list[int] | None = None
 
         if is_p2p:
             # P2P mode: fetch tensors from source worker directly
@@ -839,7 +826,7 @@ class MxModelLoader(BaseModelLoader):
                 f"[Worker {global_rank}] P2P mode: fetching tensor manifest from "
                 f"{source_worker.worker_grpc_endpoint}"
             )
-            tensor_protos = fetch_tensor_manifest(
+            tensor_protos, source_alloc_ends = fetch_tensor_manifest(
                 endpoint=source_worker.worker_grpc_endpoint,
                 mx_source_id=mx_source_id,
             )
@@ -853,7 +840,8 @@ class MxModelLoader(BaseModelLoader):
             ]
             logger.info(
                 f"[Worker {global_rank}] [TIMING] P2P tensor manifest: "
-                f"{manifest_time:.3f}s ({len(source_tensors)} tensors)"
+                f"{manifest_time:.3f}s ({len(source_tensors)} tensors, "
+                f"{len(source_alloc_ends)} alloc_ends)"
             )
 
             # Fetch NIXL metadata via P2P listen thread
@@ -886,16 +874,15 @@ class MxModelLoader(BaseModelLoader):
             f"{' (P2P)' if is_p2p else ''}"
         )
 
-        coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
-
         transfer_start = time.perf_counter()
         try:
             bytes_transferred, tensor_count, _ = self._nixl_manager.receive_from_source(
                 source_metadata=source_worker.nixl_metadata,
                 source_tensors=source_tensors,
                 timeout_seconds=300.0,
-                coalesce_transfers=coalesce,
+                coalesce_transfers=True,
                 remote_agent_name=remote_agent_name_override,
+                source_alloc_ends=source_alloc_ends,
             )
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e

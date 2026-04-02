@@ -168,6 +168,12 @@ message GetTensorManifestResponse {
   repeated TensorDescriptor tensors = 1;
   // Echoed mx_source_id for confirmation
   string mx_source_id = 2;
+
+  // CUDA allocation end addresses on the source GPU.
+  // Used by the target to constrain transfer coalescing so that merged
+  // regions don't span multiple cudaMalloc blocks (which would break
+  // UCX's rcache and produce invalid rkeys for RDMA).
+  repeated uint64 alloc_ends = 3;
 }
 
 // ============================================================================

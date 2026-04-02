@@ -30,9 +30,11 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
+        alloc_ends: list[int] | None = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
+        self._alloc_ends = alloc_ends or []
 
     def GetTensorManifest(self, request, context):
         if request.mx_source_id and request.mx_source_id != self._mx_source_id:
@@ -41,9 +43,14 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
                 f"mx_source_id mismatch: expected {self._mx_source_id}, "
                 f"got {request.mx_source_id}",
             )
+        logger.info(
+            f"Serving tensor manifest: {len(self._tensor_protos)} tensors, "
+            f"{len(self._alloc_ends)} alloc_ends"
+        )
         return p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
             mx_source_id=self._mx_source_id,
+            alloc_ends=self._alloc_ends,
         )
 
 
@@ -55,9 +62,11 @@ class WorkerGrpcServer:
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
         port: int = 0,
+        alloc_ends: list[int] | None = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
+        self._alloc_ends = alloc_ends
         self._requested_port = port
         self._server: grpc.Server | None = None
         self._port: int | None = None
@@ -69,7 +78,9 @@ class WorkerGrpcServer:
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-        servicer = WorkerServiceServicer(self._tensor_protos, self._mx_source_id)
+        servicer = WorkerServiceServicer(
+            self._tensor_protos, self._mx_source_id, self._alloc_ends
+        )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, self._server)
 
         if self._requested_port:
@@ -95,14 +106,20 @@ def fetch_tensor_manifest(
     endpoint: str,
     mx_source_id: str,
     timeout: float = 30.0,
-) -> list[p2p_pb2.TensorDescriptor]:
-    """Fetch tensor descriptors directly from a source worker's WorkerService."""
+) -> tuple[list[p2p_pb2.TensorDescriptor], list[int]]:
+    """Fetch tensor descriptors and allocation boundaries from a source worker.
+
+    Returns:
+        Tuple of (tensor descriptors, source allocation end addresses).
+    """
     channel = grpc.insecure_channel(endpoint)
     stub = p2p_pb2_grpc.WorkerServiceStub(channel)
     request = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
     response = stub.GetTensorManifest(request, timeout=timeout)
     channel.close()
+    alloc_ends = list(response.alloc_ends)
     logger.info(
-        f"Fetched {len(response.tensors)} tensors from worker at {endpoint}"
+        f"Fetched {len(response.tensors)} tensors, {len(alloc_ends)} alloc_ends "
+        f"from worker at {endpoint}"
     )
-    return list(response.tensors)
+    return list(response.tensors), alloc_ends
