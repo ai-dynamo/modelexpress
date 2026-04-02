@@ -980,8 +980,14 @@ class MxModelLoader(BaseModelLoader):
             logger.warning(f"[Worker {global_rank}] NIXL not available, skipping registration")
             return
 
+        collect_start = time.perf_counter()
         self._tensors = _collect_module_tensors(model)
+        collect_time = time.perf_counter() - collect_start
         _log_tensor_summary(self._tensors, global_rank, "Registering tensors")
+        logger.info(
+            f"[Worker {global_rank}] [TIMING] Tensor collection: {collect_time:.3f}s "
+            f"({len(self._tensors)} tensors)"
+        )
 
         if self._nixl_manager is None:
             # Always enable the NIXL listen thread: targets need it to call
@@ -990,12 +996,20 @@ class MxModelLoader(BaseModelLoader):
             # (base + device_id) to avoid collisions in multi-GPU setups.
             base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
             listen_port = base_port + device_id
+            init_start = time.perf_counter()
             self._nixl_manager = _init_nixl_manager(global_rank, device_id, "auto", listen_port)
+            init_time = time.perf_counter() - init_start
+            logger.info(
+                f"[Worker {global_rank}] [TIMING] NIXL agent init: {init_time:.3f}s"
+            )
 
         if not self._nixl_manager.tensor_descriptors:
-            logger.debug(f"[Worker {global_rank}] Registering tensors with NIXL...")
+            reg_start = time.perf_counter()
             self._nixl_manager.register_tensors(self._tensors)
-            logger.debug(f"[Worker {global_rank}] Tensors registered with NIXL")
+            reg_time = time.perf_counter() - reg_start
+            logger.info(
+                f"[Worker {global_rank}] [TIMING] Full registration pipeline: {reg_time:.3f}s"
+            )
 
         _tensor_registry[device_id] = self._tensors
         _nixl_managers[device_id] = self._nixl_manager

@@ -152,11 +152,13 @@ class NixlTransferManager:
 
         self._tensor_descriptors = tensor_descriptors
 
-        # Register memory at CUDA allocation boundaries to reduce NIXL
-        # registration overhead. Uses cuMemGetAddressRange to discover actual
-        # cudaMalloc blocks and registers each as a whole unit via raw tuples.
-        # This matches UCX's rcache granularity (one rkey per cudaMalloc block).
+        # Phase 1: Discover CUDA allocation boundaries
+        alloc_discovery_start = time.perf_counter()
         allocations = self._find_cuda_allocations(tensor_descriptors)
+        alloc_discovery_time = time.perf_counter() - alloc_discovery_start
+
+        # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
+        nixl_reg_start = time.perf_counter()
         if allocations:
             alloc_tuples = [
                 (base, size, self._device_id, "")
@@ -171,14 +173,28 @@ class NixlTransferManager:
             self._agent.register_memory(tensor_list, backends=["UCX"])
             self._alloc_ends = []
             reg_count = len(tensor_list)
+        nixl_reg_time = time.perf_counter() - nixl_reg_start
 
+        # Phase 3: Get agent metadata blob
+        metadata_start = time.perf_counter()
+        self._metadata = self._agent.get_agent_metadata()
+        metadata_time = time.perf_counter() - metadata_start
+
+        total_time = alloc_discovery_time + nixl_reg_time + metadata_time
         reduction = (1 - reg_count / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
+        total_bytes = sum(d.size for d in tensor_descriptors)
+
+        logger.info(
+            f"[TIMING] register_tensors: {total_time:.3f}s total "
+            f"(alloc_discovery={alloc_discovery_time:.3f}s, "
+            f"nixl_register={nixl_reg_time:.3f}s [{reg_count} regions], "
+            f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
+        )
         logger.info(
             f"Registered {reg_count} regions from {len(tensor_descriptors)} tensors "
-            f"({reduction:.1f}% reduction in NIXL registrations)"
+            f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
         )
 
-        self._metadata = self._agent.get_agent_metadata()
         return self._metadata
 
     @staticmethod
