@@ -1,0 +1,186 @@
+# Pool registration smoke test with DeepSeek-V2-Lite-Chat-FP8.
+# Deploys MX server (CRD backend) + 2 vLLM replicas with P2P metadata.
+# First replica loads from HF, second receives via NIXL P2P.
+#
+# Usage:
+#   kubectl apply -f pool-reg-smoke-test.yaml
+#   kubectl logs -f deployment/mx-vllm -n nnoble-pool-reg-test
+#   kubectl delete ns nnoble-pool-reg-test
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nnoble-pool-reg-test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  namespace: nnoble-pool-reg-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: modelexpress-metadata
+  namespace: nnoble-pool-reg-test
+rules:
+  - apiGroups: [modelexpress.nvidia.com]
+    resources: [modelmetadatas, modelmetadatas/status]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: modelexpress-metadata
+  namespace: nnoble-pool-reg-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: modelexpress-metadata
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+    namespace: nnoble-pool-reg-test
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+  namespace: nnoble-pool-reg-test
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: grpc
+  selector:
+    app: modelexpress-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  namespace: nnoble-pool-reg-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      serviceAccountName: modelexpress
+      containers:
+        - name: server
+          image: nnoble447/modelexpress-server:pool-reg-v2
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+---
+# 2 vLLM replicas: first loads from HF, second receives via P2P RDMA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm
+  namespace: nnoble-pool-reg-test
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-vllm
+  template:
+    metadata:
+      labels:
+        app: mx-vllm
+    spec:
+      serviceAccountName: modelexpress
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-vllm
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: nnoble447/modelexpress-client:pool-reg-v2
+          imagePullPolicy: Never
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          command: ["/bin/bash", "-c", "ulimit -l unlimited && exec python3 -m vllm.entrypoints.openai.api_server \"$@\"", "--"]
+          args:
+            - --model
+            - gaunernst/DeepSeek-V2-Lite-Chat-FP8
+            - --load-format
+            - mx
+            - --gpu-memory-utilization
+            - "0.9"
+            - --worker-cls
+            - modelexpress.vllm_worker.ModelExpressWorker
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.nnoble-pool-reg-test.svc.cluster.local:8001"
+            - name: MX_P2P_METADATA
+              value: "1"
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: MX_EXPECTED_WORKERS
+              value: "1"
+            - name: MX_SYNC_PUBLISH
+              value: "1"
+            - name: MX_SYNC_START
+              value: "1"
+            - name: UCX_TLS
+              value: "tcp,cuda_copy"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+                  optional: true
+          ports:
+            - containerPort: 8000
+            - containerPort: 5555
+            - containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "32Gi"
+              cpu: "4"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
