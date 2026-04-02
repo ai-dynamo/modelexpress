@@ -255,13 +255,12 @@ Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in 
 
 ### UCX/NIXL Tuning
 
-| Variable | Recommended | Description |
-|----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand |
-| `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
-| `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
+UCX autodetects the best available transports (InfiniBand, TCP, shared memory). Do not override `UCX_TLS`, `UCX_RNDV_SCHEME`, or `UCX_RNDV_THRESH` unless you are debugging a specific transport issue - forcing transports can break pool-based memory registration.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `NIXL_LOG_LEVEL` | `INFO` | NIXL logging (DEBUG for troubleshooting) |
-| `UCX_LOG_LEVEL` | `WARN` | UCX logging (DEBUG for troubleshooting) |
+| `UCX_LOG_LEVEL` | `WARN` | UCX logging (DEBUG for transport diagnostics) |
 
 ### P2P Kubernetes Deployment
 

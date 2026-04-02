@@ -74,13 +74,6 @@ spec:
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "INFO"
-            # UCX transport settings for GPUDirect RDMA
-            - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,cuda_copy"
-            - name: UCX_RNDV_SCHEME
-              value: "get_zcopy"
-            - name: UCX_RNDV_THRESH
-              value: "0"
             - name: POD_IP
               valueFrom:
                 fieldRef:

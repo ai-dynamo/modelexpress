@@ -89,12 +89,12 @@ register_modelexpress_loaders()
 
 ### UCX/NIXL Tuning
 
-| Variable | Recommended | Description |
-|----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand |
-| `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
-| `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
+UCX autodetects the best available transports. Do not override `UCX_TLS` unless debugging a specific transport issue.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `NIXL_LOG_LEVEL` | `INFO` | NIXL logging level |
+| `UCX_LOG_LEVEL` | `WARN` | UCX logging (DEBUG for transport diagnostics) |
 
 ## Package Structure
 

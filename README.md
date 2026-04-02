@@ -170,7 +170,6 @@ docker-compose up --build
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
 | `MX_METADATA_BACKEND` | `memory` | `memory` \| `redis` \| `kubernetes` |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server (P2P) |
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | InfiniBand transports |
 
 ```bash
 cargo run --bin config_gen -- --output model-express.yaml
