@@ -1,0 +1,179 @@
+# DHT P2P transfer test on nScale B200 with InfiniBand RDMA.
+# Model: gaunernst/DeepSeek-V2-Lite-Chat-FP8 (15.7B, ~18GB, TP=1)
+# Regression test for PR #188 (non-contiguous tensor transfers).
+#
+# Source loads from HuggingFace, publishes metadata via DHT, serves tensors P2P.
+# Target discovers source via DHT, fetches tensors via NIXL/RDMA.
+#
+# Usage:
+#   kubectl apply -f nscale-dht-dsv2lite.yaml -n nnoble-mx-tensor-walk
+#   kubectl logs -f deployment/mx-vllm-dht -n nnoble-mx-tensor-walk
+#   kubectl delete -f nscale-dht-dsv2lite.yaml -n nnoble-mx-tensor-walk
+---
+# Headless service for DHT peer discovery.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-dht
+spec:
+  clusterIP: None
+  selector:
+    app: mx-vllm-dht
+  ports:
+    - name: dht
+      port: 4001
+      targetPort: 4001
+      protocol: TCP
+    - name: nixl
+      port: 5555
+      targetPort: 5555
+      protocol: TCP
+    - name: worker-grpc
+      port: 6555
+      targetPort: 6555
+      protocol: TCP
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-dht
+  labels:
+    app: mx-vllm-dht
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-vllm-dht
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-dht
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-B200
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: dra
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: mx-vllm-dht
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: nnoble447/modelexpress-client:dht-nscale-v1
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          command: ["/bin/bash", "-c", "ulimit -l unlimited 2>/dev/null; exec python3 -m vllm.entrypoints.openai.api_server \"$@\"", "--"]
+          args:
+            - --model
+            - gaunernst/DeepSeek-V2-Lite-Chat-FP8
+            - --load-format
+            - mx
+            - --gpu-memory-utilization
+            - "0.85"
+            - --max-model-len
+            - "4096"
+          env:
+            # ModelExpress loader registration
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            # DHT metadata backend - no centralized server
+            - name: MX_METADATA_BACKEND
+              value: "dht"
+            # P2P metadata exchange - lightweight endpoints + worker gRPC
+            - name: MX_P2P_METADATA
+              value: "1"
+            # DHT configuration
+            - name: MX_DHT_LISTEN
+              value: "0.0.0.0:4001"
+            - name: MX_DHT_BOOTSTRAP_DNS
+              value: "mx-dht.nnoble-mx-tensor-walk.svc.cluster.local"
+            - name: MX_DHT_RECORD_TTL
+              value: "600"
+            # Worker address for NIXL + worker gRPC
+            - name: MX_WORKER_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            # Single GPU (TP=1)
+            - name: MX_EXPECTED_WORKERS
+              value: "1"
+            - name: MX_SYNC_PUBLISH
+              value: "1"
+            - name: MX_SYNC_START
+              value: "1"
+            # Baseline tensor registration (pool-reg not needed for this test)
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            # FP8 kernel config
+            - name: VLLM_USE_DEEP_GEMM
+              value: "1"
+            - name: VLLM_USE_FLASHINFER_MOE_FP8
+              value: "0"
+            # Logging
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            # Model cache
+            - name: HF_HUB_CACHE
+              value: "/models"
+            # vLLM timeouts
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            # Pod identity
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: 8000
+            - containerPort: 4001
+            - containerPort: 5555
+            - containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+              memory: "64Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 32Gi

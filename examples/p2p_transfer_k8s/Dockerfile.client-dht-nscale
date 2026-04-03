@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# vLLM + ModelExpress client with DHT metadata backend support for nScale.
+# Base image has NIXL 0.8.0 for InfiniBand RDMA.
+FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+
+USER root
+
+# Install mx_libp2p (pure Python DHT library)
+COPY mx_libp2p /opt/modelexpress/mx_libp2p
+RUN pip install /opt/modelexpress/mx_libp2p
+
+# Install ModelExpress Python client (includes DhtMetadataClient)
+COPY modelexpress_client/python /opt/modelexpress/client
+WORKDIR /opt/modelexpress/client
+RUN pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
+    pip install .
+
+WORKDIR /workspace
