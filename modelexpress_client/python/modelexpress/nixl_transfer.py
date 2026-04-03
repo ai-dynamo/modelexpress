@@ -336,7 +336,8 @@ class NixlTransferManager:
         else:
             logger.info(f"Using pre-loaded remote agent {remote_agent_name}")
 
-        # Match source tensors to local tensors by name
+        # Phase A: Match source tensors to local tensors by name
+        match_start = time.perf_counter()
         remote_descs: list[tuple[int, int, int]] = []
         local_tensor_list: list[torch.Tensor] = []
         total_bytes = 0
@@ -350,13 +351,13 @@ class NixlTransferManager:
             total_bytes += src_tensor.size
 
         matched_tensors = len(remote_descs)
+        match_time = time.perf_counter() - match_start
         if not remote_descs:
             logger.warning("No matching tensors found for transfer")
             return 0, 0, 0.0
 
-        # Coalesce contiguous regions to reduce RDMA descriptor overhead.
-        # This is a pure transfer-time optimization, independent of how
-        # memory pools were registered. Disabled when MX_POOL_REG=0.
+        # Phase B: Coalesce contiguous regions (or build raw descriptors)
+        coalesce_start = time.perf_counter()
         if coalesce_transfers and POOL_REG_ENABLED:
             remote_descs, local_descs, coalesced_count = self._coalesce_transfers(
                 remote_descs, local_tensor_list, source_alloc_ends
@@ -375,8 +376,10 @@ class NixlTransferManager:
             ]
             coalesced_count = matched_tensors
             use_raw_descriptors = True
+        coalesce_time = time.perf_counter() - coalesce_start
 
-        # Prepare transfer
+        # Phase C: Prepare transfer descriptors
+        prep_start = time.perf_counter()
         src_prepped = self._agent.prep_xfer_dlist(
             agent_name=remote_agent_name,
             xfer_list=remote_descs,
@@ -393,7 +396,6 @@ class NixlTransferManager:
 
         indices = list(range(len(remote_descs)))
 
-        # Execute transfer
         handle = self._agent.make_prepped_xfer(
             operation="READ",
             local_xfer_side=dst_prepped,
@@ -402,9 +404,14 @@ class NixlTransferManager:
             remote_indices=indices,
             backends=["UCX"],
         )
-        self._agent.transfer(handle)
+        prep_time = time.perf_counter() - prep_start
 
-        # Wait for completion
+        # Phase D: Execute transfer
+        xfer_start = time.perf_counter()
+        self._agent.transfer(handle)
+        dispatch_time = time.perf_counter() - xfer_start
+
+        # Phase E: Wait for completion
         start_wait = time.perf_counter()
         while True:
             if timeout_seconds is not None and time.perf_counter() - start_wait >= timeout_seconds:
@@ -419,9 +426,20 @@ class NixlTransferManager:
                 self._agent.release_xfer_handle(handle)
                 raise RuntimeError(f"Transfer failed with status {status}")
             time.sleep(0.001)
+        wait_time = time.perf_counter() - start_wait
 
-        # GPUDirect RDMA writes bypass CUDA streams
+        # Phase F: CUDA sync (GPUDirect RDMA writes bypass CUDA streams)
+        sync_start = time.perf_counter()
         torch.cuda.synchronize(self._device_id)
+        sync_time = time.perf_counter() - sync_start
+
+        logger.info(
+            f"[TIMING] transfer phases: match={match_time:.3f}s, "
+            f"coalesce={coalesce_time:.3f}s, prep={prep_time:.3f}s, "
+            f"dispatch={dispatch_time:.3f}s, wait={wait_time:.3f}s, "
+            f"cuda_sync={sync_time:.3f}s "
+            f"({coalesced_count} descs, {total_bytes / 1e9:.2f} GB)"
+        )
 
         duration = time.perf_counter() - start_time
         bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
