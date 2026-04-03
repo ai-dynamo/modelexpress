@@ -14,6 +14,7 @@ a single NIXL agent for that worker's GPU.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -22,6 +23,10 @@ import torch
 from .types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
+
+# MX_POOL_REG=0 disables allocation-level registration and transfer coalescing,
+# falling back to per-tensor registration for baseline benchmarking.
+POOL_REG_ENABLED = os.environ.get("MX_POOL_REG", "1") != "0"
 
 NIXL_AVAILABLE = False
 NixlAgent = None
@@ -154,7 +159,11 @@ class NixlTransferManager:
 
         # Phase 1: Discover CUDA allocation boundaries
         alloc_discovery_start = time.perf_counter()
-        allocations = self._find_cuda_allocations(tensor_descriptors)
+        if POOL_REG_ENABLED:
+            allocations = self._find_cuda_allocations(tensor_descriptors)
+        else:
+            allocations = None
+            logger.info("Pool registration disabled (MX_POOL_REG=0), using per-tensor registration")
         alloc_discovery_time = time.perf_counter() - alloc_discovery_start
 
         # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
@@ -168,7 +177,7 @@ class NixlTransferManager:
             self._alloc_ends = sorted(base + size for base, size in allocations)
             reg_count = len(allocations)
         else:
-            # Fallback: per-tensor registration (e.g. all tensors have addr 0)
+            # Per-tensor registration (baseline mode or all tensors have addr 0)
             tensor_list = list(tensors.values())
             self._agent.register_memory(tensor_list, backends=["UCX"])
             self._alloc_ends = []
@@ -347,8 +356,8 @@ class NixlTransferManager:
 
         # Coalesce contiguous regions to reduce RDMA descriptor overhead.
         # This is a pure transfer-time optimization, independent of how
-        # memory pools were registered.
-        if coalesce_transfers:
+        # memory pools were registered. Disabled when MX_POOL_REG=0.
+        if coalesce_transfers and POOL_REG_ENABLED:
             remote_descs, local_descs, coalesced_count = self._coalesce_transfers(
                 remote_descs, local_tensor_list, source_alloc_ends
             )
