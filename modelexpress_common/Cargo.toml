@@ -35,10 +35,10 @@ google-cloud-storage = { workspace = true }
 rustls = { workspace = true }
 crc32c = { workspace = true }
 futures = { workspace = true }
-fd-lock = "4.0.4"
+fd-lock = { workspace = true }
 
 [dev-dependencies]
-google-cloud-gax = "1.8.0"
+google-cloud-gax = { workspace = true }
 mockall = "0.13"
 tempfile = "3.20"
 tokio-test = "0.4"
