@@ -6,6 +6,16 @@
 from dataclasses import dataclass
 
 
+class ManifestMismatchError(Exception):
+    """Raised when source and target tensor manifests are incompatible.
+
+    This is NOT a source-side failure - both sides are healthy, but their
+    runtime environments produce different tensor structures. The transfer
+    would silently produce incorrect inference results, so we abort and
+    fall back to disk loading.
+    """
+
+
 @dataclass
 class TensorDescriptor:
     """Descriptor for a tensor in GPU memory."""

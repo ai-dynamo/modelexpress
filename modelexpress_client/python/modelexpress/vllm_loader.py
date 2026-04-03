@@ -53,6 +53,11 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from .gds_loader import MxGdsLoader
 from .gds_transfer import is_gds_available
 from .nixl_transfer import NixlTransferManager, is_nixl_available
+from .transfer_safety import (
+    TransferFingerprint,
+    check_transfer_allowed,
+    detect_model_features,
+)
 from .types import TensorDescriptor
 
 if TYPE_CHECKING:
@@ -124,6 +129,9 @@ class SourceTransferError(Exception):
     (OOM, process_weights_after_loading, warmup) are left as plain exceptions
     so they propagate without poisoning a healthy source.
     """
+
+
+from .types import ManifestMismatchError  # noqa: E402 (after SourceTransferError for grouping)
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +377,9 @@ def _build_source_identity(
         expert_parallel_size=ep_size,
         dtype=dtype,
         quantization=quantization,
+        extra_parameters={
+            f"feature.{k}": v for k, v in detect_model_features(model_config).items()
+        },
     )
 
 
@@ -613,15 +624,25 @@ class MxModelLoader(BaseModelLoader):
 
         logger.info(f"[Worker {global_rank}] MxModelLoader starting (model={identity.model_name})")
 
+        # Check if model features are safe for RDMA transfer
+        transfer_allowed, allow_reason = check_transfer_allowed(model_config)
+
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(
                     vllm_config=vllm_config, model_config=model_config
                 )
 
-            loaded_as_target = self._try_load_from_candidates(
-                model, model_config, target_device, global_rank, device_id, identity
-            )
+            loaded_as_target = False
+            if transfer_allowed:
+                loaded_as_target = self._try_load_from_candidates(
+                    model, model_config, target_device, global_rank, device_id, identity
+                )
+            else:
+                logger.info(
+                    f"[Worker {global_rank}] RDMA transfer disabled: {allow_reason}"
+                )
+
             if not loaded_as_target:
                 self._load_as_source(model, model_config, target_device, global_rank, device_id, identity)
 
@@ -722,6 +743,11 @@ class MxModelLoader(BaseModelLoader):
                     f"[Worker {global_rank}] Source transfer failed for worker {worker_id}: {e}. "
                     f"Trying next candidate."
                 )
+            except ManifestMismatchError as e:
+                logger.warning(
+                    f"[Worker {global_rank}] Manifest mismatch with worker {worker_id}: {e}. "
+                    f"Trying next candidate."
+                )
         if candidates:
             tried = min(len(candidates), MAX_SOURCE_RETRIES)
             logger.warning(
@@ -798,6 +824,16 @@ class MxModelLoader(BaseModelLoader):
         # in named_buffers() and get included in the RDMA manifest.
         with _capture_tensor_attrs():
             process_weights_after_loading(model, model_config, target_device)
+
+        # Log transfer fingerprint for debugging environment mismatches.
+        target_fp = TransferFingerprint.from_environment(self._tensors)
+        logger.info(
+            f"[Worker {global_rank}] Transfer fingerprint: "
+            f"vllm={target_fp.vllm_version}, cuda={target_fp.cuda_version}, "
+            f"attn={target_fp.attention_backend}, "
+            f"deepgemm={target_fp.deep_gemm_version}, "
+            f"manifest={target_fp.manifest_hash[:12]}... ({target_fp.tensor_count} tensors)"
+        )
 
         # RDMA receive (fully-processed tensors, no post-processing needed)
         # Raises SourceTransferError on source-side failures
@@ -947,6 +983,17 @@ class MxModelLoader(BaseModelLoader):
 
         # Register tensors + publish metadata
         self._register_tensors(model, global_rank, device_id)
+
+        # Log transfer fingerprint so targets can compare
+        source_fp = TransferFingerprint.from_environment(self._tensors)
+        logger.info(
+            f"[Worker {global_rank}] Source fingerprint: "
+            f"vllm={source_fp.vllm_version}, cuda={source_fp.cuda_version}, "
+            f"attn={source_fp.attention_backend}, "
+            f"deepgemm={source_fp.deep_gemm_version}, "
+            f"manifest={source_fp.manifest_hash[:12]}... ({source_fp.tensor_count} tensors)"
+        )
+
         self._publish_metadata(global_rank, device_id, identity)
 
     def _try_gds_load(

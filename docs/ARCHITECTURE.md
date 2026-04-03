@@ -471,11 +471,12 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 **MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
 
-Auto-detects the best loading strategy with a three-tier fallback:
+Auto-detects the best loading strategy with a four-tier fallback:
 
-1. **RDMA**: Call `ListSources(identity, status=READY)`, filter by `worker_rank`, shuffle for load balancing. For each candidate (max `MAX_SOURCE_RETRIES`), call `GetMetadata` on demand, attempt RDMA transfer. On `SourceTransferError`, try next candidate.
-2. **GDS**: If no RDMA source available and GPUDirect Storage is available, load directly from file to GPU via `MxGdsLoader`.
-3. **Disk**: Standard vLLM `DefaultModelLoader` as final fallback.
+1. **Safety check**: Verify the model's features are validated for P2P transfer (see [Transfer Safety](#transfer-safety) below). If not, skip directly to GDS/disk.
+2. **P2P transfer**: Call `ListSources(identity, status=READY)`, filter by `worker_rank`, shuffle for load balancing. For each candidate (max `MAX_SOURCE_RETRIES`), call `GetMetadata` on demand, validate manifest compatibility, attempt transfer. On `SourceTransferError` or `ManifestMismatchError`, try next candidate or fall back.
+3. **GDS**: If no P2P source available and GPUDirect Storage is available, load directly from file to GPU via `MxGdsLoader`.
+4. **Disk**: Standard vLLM `DefaultModelLoader` as final fallback.
 
 After loading by any path, the worker registers ALL final tensors with NIXL, publishes metadata, and starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler.
 
@@ -494,6 +495,40 @@ The loader uses `_iter_module_tensors()` to walk the full PyTorch module tree an
 | Tensor attributes | `dir(module)` scan | FP8 `weight_scale`, `_k_scale` |
 
 This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. transposed views like `W_UK_T`) are skipped because they are views over contiguous tensors already in the module tree. Tensors are deduplicated by `data_ptr()` so tied weights (e.g. `embed_tokens.weight` and `lm_head.weight` sharing the same memory) are only registered and transferred once.
+
+### Transfer Safety
+
+P2P weight transfer works by loading dummy weights on the target, running `process_weights_after_loading()` to establish the final tensor layout, then overwriting the tensor data via RDMA. This requires that the dummy-load path produces an identical tensor structure to the real-load path. Some model architectures create derived state during post-processing that the byte-level overwrite cannot correctly replicate (e.g. DeepSeek MLA's dequantized `kv_b_proj` intermediates).
+
+Three safety mechanisms prevent silent transfer failures:
+
+**1. Model feature allow-list** (`transfer_safety.py`): Before attempting P2P transfer, the loader checks the model's architecture, quantization method, dtype, and attention type against strict allow-lists. Only explicitly validated combinations are permitted. Unknown model architectures, quantization methods, or attention types cause automatic fallback to disk loading. Set `MX_SKIP_FEATURE_CHECK=1` to bypass (for testing only).
+
+Currently validated (tested on nScale B200 cluster):
+
+| Model | Architecture | Quantization | P2P Transfer |
+|-------|-------------|--------------|--------------|
+| Llama-3.1-8B-Instruct | llama (GQA) | none (BF16) | PASS |
+| Llama-3.1-8B-Instruct-FP8 | llama (GQA) | fp8 | PASS |
+| Llama-3-8B-Instruct-AWQ | llama (GQA) | awq | PASS |
+| Llama-3-8B-Instruct-GPTQ | llama (GQA) | gptq | PASS |
+| Mistral-7B-Instruct-v0.3 | mistral (GQA) | none (BF16) | PASS |
+| Qwen2-7B-Instruct | qwen2 (GQA) | none (BF16) | PASS |
+| Phi-3.5-mini-instruct | phi3 (GQA) | none (BF16) | PASS |
+| Gemma-2-2b-it | gemma2 (GQA) | none (BF16) | PASS |
+| DeepSeek-V2-Lite-Chat-FP8 | deepseek_v2 (MLA) | fp8 | **FAIL** |
+
+Blocked features:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| DeepSeek MLA | **Blocked** | Dequantized KV projections not transferable |
+| Other quantization methods | **Blocked** | Not yet validated (bitsandbytes, compressed-tensors, etc.) |
+| Unknown model architectures | **Blocked** | Must be explicitly added to allow-list after validation |
+
+**2. Manifest mismatch detection** (`nixl_transfer.py`): During the transfer, the receiver validates that every source tensor has a matching local tensor (by name) and that sizes match. Any mismatch raises `ManifestMismatchError`, which skips that source and tries the next candidate. This is important during rolling updates and canary deployments where the fleet temporarily has pods running different image versions. A target on v2 may encounter a v1 source with a different tensor structure, reject it, then find a compatible v2 source and transfer successfully. Only after all candidates are exhausted does the loader fall back to disk. This also catches environment divergences (different vLLM versions, different attention backends, different CUDA versions) that produce different tensor structures.
+
+**3. Transfer fingerprint** (`transfer_safety.py`): Both source and target log a fingerprint containing the vLLM version, CUDA version, DeepGemm version, attention backend, and a SHA256 hash of the tensor manifest (names + shapes + dtypes, excluding addresses). This aids debugging when transfers produce incorrect results.
 
 ## NIXL Integration
 
@@ -613,6 +648,12 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 ### NIXL_ERR_REMOTE_DISCONNECT
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
+
+### DeepSeek MLA P2P Transfer
+
+P2P weight transfer does not work with DeepSeek models that use Multi-head Latent Attention (MLA). During `process_weights_after_loading()`, the MLA attention layer dequantizes `kv_b_proj` into BF16 and creates `W_UV` and `W_UK_T` as views into the dequantized intermediate. These derived tensors depend on the actual weight values, not just tensor shapes. The target's dummy-load-then-overwrite pattern runs post-processing on dummy data, creating dummy-derived intermediates that the RDMA byte overwrite cannot correctly replace. The transfer safety allow-list automatically blocks MLA models and falls back to disk loading. Set `MX_SKIP_FEATURE_CHECK=1` to bypass (for debugging only).
+
+Affected models: DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V3, and any model with `model_type` in `{deepseek_v2, deepseek_v3, deepseek_v32, deepseek_mtp}` or with `kv_lora_rank` in its config.
 
 ### Contiguous Region Failures
 
