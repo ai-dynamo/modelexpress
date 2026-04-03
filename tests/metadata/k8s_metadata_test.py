@@ -271,6 +271,10 @@ async def run_publisher(host: str, port: int, dns: str | None) -> None:
             metadata_endpoint="10.0.0.1:5555",
             agent_name="publisher-agent-0",
             worker_grpc_endpoint="10.0.0.1:5556",
+            tensors=[
+                p2p_pb2.TensorDescriptor(name="layer.0.weight", addr=0x7FFF00000000, size=1024, device_id=0, dtype="float16"),
+                p2p_pb2.TensorDescriptor(name="layer.0.bias", addr=0x7FFF00001000, size=128, device_id=0, dtype="float16"),
+            ],
             status=p2p_pb2.SOURCE_STATUS_READY,
             updated_at=int(time.time() * 1000),
         ),
@@ -279,6 +283,9 @@ async def run_publisher(host: str, port: int, dns: str | None) -> None:
             metadata_endpoint="10.0.0.2:5555",
             agent_name="publisher-agent-1",
             worker_grpc_endpoint="10.0.0.2:5556",
+            tensors=[
+                p2p_pb2.TensorDescriptor(name="layer.1.weight", addr=0x7FFF00002000, size=1024, device_id=1, dtype="float16"),
+            ],
             status=p2p_pb2.SOURCE_STATUS_READY,
             updated_at=int(time.time() * 1000),
         ),
