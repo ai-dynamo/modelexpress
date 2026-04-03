@@ -107,6 +107,7 @@ impl ModelDatabase {
 
             let provider = match provider_str.as_str() {
                 "HuggingFace" => ModelProvider::HuggingFace,
+                "Gcs" => ModelProvider::Gcs,
                 _ => ModelProvider::HuggingFace, // Default fallback
             };
 
@@ -167,6 +168,7 @@ impl ModelDatabase {
 
         let provider_str = match provider {
             ModelProvider::HuggingFace => "HuggingFace",
+            ModelProvider::Gcs => "Gcs",
         };
 
         let status_str = match status {
@@ -237,6 +239,7 @@ impl ModelDatabase {
 
             let provider = match provider_str.as_str() {
                 "HuggingFace" => ModelProvider::HuggingFace,
+                "Gcs" => ModelProvider::Gcs,
                 _ => ModelProvider::HuggingFace,
             };
 
@@ -328,6 +331,7 @@ impl ModelDatabase {
 
         let provider_str = match provider {
             ModelProvider::HuggingFace => "HuggingFace",
+            ModelProvider::Gcs => "Gcs",
         };
 
         // Use INSERT OR IGNORE to atomically create the record only if it doesn't exist
@@ -617,6 +621,20 @@ mod tests {
             .expect("Failed to get record")
             .expect("Record should be present");
         assert_eq!(record.provider, ModelProvider::HuggingFace);
+
+        db.set_status(
+            "test-model-gcs",
+            ModelProvider::Gcs,
+            ModelStatus::DOWNLOADED,
+            None,
+        )
+        .expect("Failed to set status");
+
+        let record = db
+            .get_model_record("test-model-gcs")
+            .expect("Failed to get record")
+            .expect("Record should be present");
+        assert_eq!(record.provider, ModelProvider::Gcs);
     }
 
     #[test]

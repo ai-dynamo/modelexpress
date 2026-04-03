@@ -4,39 +4,21 @@
 #![allow(clippy::expect_used)]
 
 use modelexpress_client::{Client, ClientConfig, ModelProvider};
-use tracing::{error, info};
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
     tracing_subscriber::fmt::init();
 
-    info!("Testing model download with server fallback...");
+    info!("Testing smart fallback with unavailable server...");
 
-    let model_name = "google-t5/t5-small";
-
-    // Test smart fallback - this should work whether server is running or not
-    info!("Attempting to download model with smart fallback...");
-
-    match Client::request_model_with_smart_fallback(
-        model_name,
+    Client::request_model_with_smart_fallback(
+        "google-t5/t5-small",
         ModelProvider::HuggingFace,
-        ClientConfig::default(),
+        ClientConfig::for_testing("http://127.0.0.1:54321"),
         false,
     )
-    .await
-    {
-        Ok(()) => {
-            info!("✅ SUCCESS: Model '{model_name}' downloaded successfully!");
-            info!(
-                "The download worked either via server (if running) or direct download (if server unavailable)"
-            );
-        }
-        Err(e) => {
-            error!("❌ FAILED: Could not download model '{model_name}': {e}");
-            return Err(e.into());
-        }
-    }
+    .await?;
 
     Ok(())
 }

@@ -31,8 +31,14 @@ chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 jiff = { workspace = true }
+google-cloud-storage = { workspace = true }
+rustls = { workspace = true }
+crc32c = { workspace = true }
+futures = { workspace = true }
+fd-lock = "4.0.4"
 
 [dev-dependencies]
+google-cloud-gax = "1.8.0"
 mockall = "0.13"
 tempfile = "3.20"
 tokio-test = "0.4"

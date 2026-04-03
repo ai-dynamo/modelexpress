@@ -24,6 +24,11 @@ pub trait ModelProviderTrait: Send + Sync {
     /// Returns the path if found, or an error if not found
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf>;
 
+    /// Return the canonical model name for this provider.
+    fn canonical_model_name(&self, model_name: &str) -> Result<String> {
+        Ok(model_name.to_string())
+    }
+
     /// Get the provider name for logging
     fn provider_name(&self) -> &'static str;
 
@@ -73,11 +78,15 @@ pub trait ModelProviderTrait: Send + Sync {
             || filename.ends_with(".h5")
             || filename.ends_with(".msgpack")
             || filename.ends_with(".ckpt.index")
+            || filename.ends_with(".iop")
+            || filename.ends_with(".gas")
     }
 }
 
+pub mod gcs;
 pub mod huggingface;
 
+pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 
 #[cfg(test)]
@@ -129,9 +138,35 @@ mod tests {
         assert!(HuggingFaceProvider::is_weight_file("model.h5"));
         assert!(HuggingFaceProvider::is_weight_file("model.msgpack"));
         assert!(HuggingFaceProvider::is_weight_file("model.ckpt.index"));
+        assert!(HuggingFaceProvider::is_weight_file("model.iop"));
+        assert!(HuggingFaceProvider::is_weight_file("model.gas"));
 
         assert!(!HuggingFaceProvider::is_weight_file("tokenizer.json"));
         assert!(!HuggingFaceProvider::is_weight_file("config.json"));
         assert!(!HuggingFaceProvider::is_weight_file("README.md"));
+    }
+
+    #[test]
+    fn test_canonical_model_name_default_preserves_input() {
+        let provider = HuggingFaceProvider;
+        let canonical = provider.canonical_model_name("test/model");
+        assert!(
+            canonical
+                .as_ref()
+                .is_ok_and(|model_name| model_name == "test/model"),
+            "Expected canonical model name, got {canonical:?}"
+        );
+    }
+
+    #[test]
+    fn test_canonical_model_name_gcs_trims_trailing_slash() {
+        let provider = GcsProvider;
+        let canonical = provider.canonical_model_name("gs://test-bucket/org/model/rev-1/");
+        assert!(
+            canonical
+                .as_ref()
+                .is_ok_and(|model_name| model_name == "gs://test-bucket/org/model/rev-1"),
+            "Expected canonical model name, got {canonical:?}"
+        );
     }
 }

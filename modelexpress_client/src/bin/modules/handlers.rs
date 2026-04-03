@@ -6,7 +6,10 @@ use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
 use modelexpress_client::{Client, ClientConfig, ModelProvider};
-use modelexpress_common::cache::{CacheConfig, CacheStats, ModelInfo};
+use modelexpress_common::{
+    cache::{CacheConfig, CacheStats, ModelInfo},
+    download,
+};
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
@@ -174,20 +177,13 @@ async fn download_model(
     let result = match strategy {
         DownloadStrategy::SmartFallback => {
             debug!("Using smart fallback strategy");
+            let mut config = config.clone();
             if let Some(cache_config) = cache_config {
-                let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
-                client
-                    .preload_model_to_cache(&model_name, provider, false)
-                    .await
-            } else {
-                Client::request_model_with_smart_fallback(
-                    model_name.clone(),
-                    provider,
-                    config,
-                    false,
-                )
-                .await
+                config.cache = cache_config;
             }
+            Client::request_model_with_smart_fallback(model_name.clone(), provider, config, false)
+                .await
+                .map(|_| ())
         }
         DownloadStrategy::ServerOnly => {
             debug!("Using server-only strategy");
@@ -197,12 +193,23 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model_with_provider(&model_name, provider, false)
+                .request_model(&model_name, provider, false)
                 .await
+                .map(|_| ())
         }
         DownloadStrategy::Direct => {
             debug!("Using direct download strategy");
-            Client::download_model_directly(model_name.clone(), provider, false).await
+            download::download_model(
+                &model_name,
+                provider,
+                cache_config.map(|config| config.local_path),
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                modelexpress_common::Error::Server(format!("Direct download failed: {e}")).into()
+            })
         }
     };
 
@@ -246,7 +253,7 @@ async fn download_model(
                     print_output(&output, format);
                 }
             }
-            return Err(Box::new(e));
+            return Err(e);
         }
     }
 

@@ -227,32 +227,20 @@ impl Client {
         })
     }
 
-    /// Get the cache directory path for the requested provider, using the
-    /// provider's environment overrides first and then falling back to the
-    /// client's configured cache root.
-    fn get_cache_dir(&self, provider: ModelProvider) -> PathBuf {
-        use std::env;
-        if provider == ModelProvider::HuggingFace
-            && let Ok(cache_path) = env::var("HF_HUB_CACHE")
-        {
-            return PathBuf::from(cache_path);
-        }
-
-        if let Some(cache_config) = self.cache_config.as_ref() {
-            return cache_config.local_path.clone();
-        }
-
-        CacheConfig::discover()
-            .map(|config| config.local_path)
-            .unwrap_or_else(|_| CacheConfig::default().local_path)
-    }
-
     pub async fn get_model_path(
         &self,
         model_name: &str,
         provider: ModelProvider,
     ) -> anyhow::Result<PathBuf> {
-        let cache_dir = self.get_cache_dir(provider);
+        let cache_dir = self
+            .cache_config
+            .as_ref()
+            .map(|config| config.local_path.clone())
+            .unwrap_or_else(|| {
+                CacheConfig::discover()
+                    .map(|config| config.local_path)
+                    .unwrap_or_else(|_| CacheConfig::default().local_path)
+            });
         let model_path = download::get_provider(provider)
             .get_model_path(model_name, cache_dir)
             .await
@@ -260,52 +248,6 @@ impl Client {
 
         debug!("Found model path at {:?}", model_path);
         Ok(model_path)
-    }
-
-    /// Pre-download model to cache
-    /// When shared_storage is disabled, files will be streamed from server to client.
-    pub async fn preload_model_to_cache(
-        &mut self,
-        model_name: &str,
-        provider: ModelProvider,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        info!("Pre-loading model {} to cache", model_name);
-
-        // First try to download via server
-        match self
-            .request_model_with_provider(model_name, provider, ignore_weights)
-            .await
-        {
-            Ok(()) => {
-                info!("Model {} pre-loaded successfully via server", model_name);
-
-                // Check if we need to stream files from server (no shared storage)
-                let needs_streaming = self
-                    .cache_config
-                    .as_ref()
-                    .is_some_and(|c| !c.shared_storage);
-
-                if needs_streaming {
-                    info!(
-                        "Shared storage disabled, streaming files from server for model {}",
-                        model_name
-                    );
-                    self.stream_model_files_from_server(model_name, provider)
-                        .await?;
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                // Fallback to direct download
-                info!(
-                    "Server unavailable, pre-loading model {} directly. Error: {}",
-                    model_name, e
-                );
-                Self::download_model_directly(model_name, provider, ignore_weights).await
-            }
-        }
     }
 
     /// Get the server health status
@@ -363,76 +305,9 @@ impl Client {
         Ok(data)
     }
 
-    /// Request a model from the server with a specific provider and automatic fallback
-    /// This function will first try to use the server for streaming downloads.
-    /// If the server is unavailable, it will fallback to downloading directly.
-    /// When shared_storage is disabled, files will be streamed from server to client.
-    pub async fn request_model_with_provider_and_fallback(
-        &mut self,
-        model_name: impl Into<String>,
-        provider: ModelProvider,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        let model_name = model_name.into();
-
-        // First try the server-based approach
-        match self
-            .request_model_with_provider(&model_name, provider, ignore_weights)
-            .await
-        {
-            Ok(()) => {
-                info!("Model {} downloaded successfully via server", model_name);
-
-                // Check if we need to stream files from server (no shared storage)
-                let needs_streaming = self
-                    .cache_config
-                    .as_ref()
-                    .is_some_and(|c| !c.shared_storage);
-
-                if needs_streaming {
-                    info!(
-                        "Shared storage disabled, streaming files from server for model {}",
-                        model_name
-                    );
-                    self.stream_model_files_from_server(&model_name, provider)
-                        .await?;
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                // Check if it's a connection error (server not available)
-                if let modelexpress_common::Error::Transport(_) = *e {
-                    info!(
-                        "Server unavailable, falling back to direct download for model: {}",
-                        model_name
-                    );
-
-                    // Fallback to direct download
-                    let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
-                    match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
-                        Ok(_) => {
-                            info!(
-                                "Model {} downloaded successfully via direct download",
-                                model_name
-                            );
-                            Ok(())
-                        }
-                        Err(download_err) => Err(modelexpress_common::Error::Server(format!(
-                            "Both server and direct download failed. Server error: {e}. Download error: {download_err}"
-                        )).into()),
-                    }
-                } else {
-                    // For other types of errors, don't fallback
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    /// Stream model files from the server to the local cache
-    /// This is used when shared storage is disabled
-    pub async fn stream_model_files_from_server(
+    /// Stream model files from the server to the local cache.
+    /// This is an internal helper used when shared storage is disabled.
+    async fn stream_model_files_from_server(
         &mut self,
         model_name: &str,
         provider: ModelProvider,
@@ -607,9 +482,8 @@ impl Client {
         Ok(())
     }
 
-    /// Request a model from the server with a specific provider
-    /// This function will wait until the model is downloaded using streaming updates
-    pub async fn request_model_with_provider(
+    /// Request a model on the server.
+    pub async fn request_model_on_server(
         &mut self,
         model_name: impl Into<String>,
         provider: ModelProvider,
@@ -676,34 +550,43 @@ impl Client {
         .into())
     }
 
-    /// Request a model from the server using the default provider (Hugging Face) with automatic fallback
-    /// This function will first try to use the server, then fallback to direct download if needed
+    /// Request a model through the client, using the server as the source of truth.
+    /// When shared_storage is disabled, files will be streamed from server to client.
+    ///
     pub async fn request_model(
         &mut self,
         model_name: impl Into<String>,
+        provider: ModelProvider,
         ignore_weights: bool,
     ) -> CommonResult<()> {
-        self.request_model_with_provider_and_fallback(
-            model_name,
-            ModelProvider::default(),
-            ignore_weights,
-        )
-        .await
+        let model_name = model_name.into();
+
+        self.request_model_on_server(&model_name, provider, ignore_weights)
+            .await?;
+
+        info!("Model {} downloaded successfully via server", model_name);
+
+        // Check if we need to stream files from server (no shared storage)
+        let needs_streaming = self
+            .cache_config
+            .as_ref()
+            .is_some_and(|c| !c.shared_storage);
+
+        if needs_streaming {
+            info!(
+                "Shared storage disabled, streaming files from server for model {}",
+                model_name
+            );
+            self.stream_model_files_from_server(&model_name, provider)
+                .await?;
+        }
+
+        Ok(())
     }
 
-    /// Request a model from the server only (no fallback)
-    /// This function will wait until the model is downloaded using streaming updates from the server
-    pub async fn request_model_server_only(
-        &mut self,
-        model_name: impl Into<String>,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        self.request_model_with_provider(model_name, ModelProvider::default(), ignore_weights)
-            .await
-    }
-
-    /// Request a model with automatic server fallback, creating client connection only if needed
+    /// Request a model with automatic server fallback, creating client connection only if needed.
     /// This function will try to download via server if possible, otherwise download directly
+    /// only if the initial client connection cannot be established.
     pub async fn request_model_with_smart_fallback(
         model_name: impl Into<String>,
         provider: ModelProvider,
@@ -712,46 +595,29 @@ impl Client {
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
-        // First try to create a client and use server-based download
         match Client::new(config.clone()).await {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
-                    .request_model_with_provider_and_fallback(&model_name, provider, ignore_weights)
+                    .request_model(&model_name, provider, ignore_weights)
                     .await
             }
             Err(e) => {
-                // If we can't even connect to the server, go straight to direct download
                 info!("Cannot connect to server ({}), downloading directly...", e);
-                Client::download_model_directly(&model_name, provider, ignore_weights).await
+                download::download_model(
+                    &model_name,
+                    provider,
+                    Some(config.cache.local_path.clone()),
+                    ignore_weights,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    modelexpress_common::Error::Server(format!("Direct download failed: {e}"))
+                        .into()
+                })
             }
         }
-    }
-
-    /// Download a model directly without using the server
-    /// This bypasses the server entirely and downloads the model using the specified provider
-    pub async fn download_model_directly(
-        model_name: impl Into<String>,
-        provider: ModelProvider,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        let model_name = model_name.into();
-        info!(
-            "Downloading model {} directly using provider: {:?}",
-            model_name, provider
-        );
-
-        // Try to get cache configuration, but don't fail if not available
-        let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
-
-        download::download_model(&model_name, provider, cache_dir, ignore_weights)
-            .await
-            .map_err(|e| {
-                modelexpress_common::Error::Server(format!("Direct download failed: {e}"))
-            })?;
-
-        info!("Model {} downloaded successfully", model_name);
-        Ok(())
     }
 }
 
@@ -766,16 +632,21 @@ mod tests {
             FileChunk, ModelDownloadRequest, ModelFileList, ModelFilesRequest, ModelStatusUpdate,
             model_service_server::{ModelService, ModelServiceServer},
         },
-        test_support::{EnvVarGuard, acquire_env_mutex},
     };
     use std::collections::HashMap;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tonic::{Request, Response, Status, transport::Server};
 
     struct EmptyFileStreamModelService;
+    struct UnavailableModelService;
+    struct RecordingModelService {
+        seen_model_name: Arc<Mutex<Option<String>>>,
+    }
+    struct ZeroByteGcsMarkerStreamModelService;
 
     #[tonic::async_trait]
     impl ModelService for EmptyFileStreamModelService {
@@ -797,6 +668,134 @@ mod tests {
             _request: Request<ModelFilesRequest>,
         ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
             Ok(Response::new(Box::pin(futures::stream::empty())))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for UnavailableModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            _request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            Err(Status::unavailable("test server unavailable"))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            Err(Status::unimplemented(
+                "stream_model_files is not used in this test",
+            ))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for RecordingModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            let request = request.into_inner();
+            *self
+                .seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name") = Some(request.model_name);
+            let update = ModelStatusUpdate {
+                model_name: "gs://envbucket/dev/bake/qwen/rev123".to_string(),
+                status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
+                message: None,
+                provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            };
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                update,
+            )]))))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            Err(Status::unimplemented(
+                "stream_model_files is not used in this test",
+            ))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for ZeroByteGcsMarkerStreamModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            let request = request.into_inner();
+            let update = ModelStatusUpdate {
+                model_name: request.model_name,
+                status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
+                message: None,
+                provider: request.provider,
+            };
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                update,
+            )]))))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            let chunk = FileChunk {
+                relative_path: ".mx-model".to_string(),
+                data: vec![],
+                offset: 0,
+                total_size: 0,
+                is_last_chunk: true,
+                is_last_file: true,
+                commit_hash: None,
+            };
+
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                chunk,
+            )]))))
         }
 
         async fn list_model_files(
@@ -840,17 +839,6 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig::for_testing("http://test-endpoint:1234")
-    }
-
-    fn create_test_client(cache_config: Option<CacheConfig>) -> Client {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-
-        Client {
-            health_client: HealthServiceClient::new(channel.clone()),
-            api_client: ApiServiceClient::new(channel.clone()),
-            model_client: ModelServiceClient::new(channel),
-            cache_config,
-        }
     }
 
     #[test]
@@ -904,35 +892,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_get_cache_dir_for_hf_prefers_hf_hub_cache() {
-        let env_lock = acquire_env_mutex();
-        let hf_cache_dir = TempDir::new().expect("Failed to create HF cache dir");
-        let configured_cache_dir = TempDir::new().expect("Failed to create configured cache dir");
-        let _hf_cache_guard = EnvVarGuard::set(
-            &env_lock,
-            "HF_HUB_CACHE",
-            hf_cache_dir
-                .path()
-                .to_str()
-                .expect("Expected HF cache path"),
-        );
-
-        let cache_config = CacheConfig {
-            local_path: configured_cache_dir.path().to_path_buf(),
-            server_endpoint: "http://localhost:8001".to_string(),
-            timeout_secs: None,
-            shared_storage: true,
-            transfer_chunk_size: modelexpress_common::constants::DEFAULT_TRANSFER_CHUNK_SIZE,
-        };
-        let client = create_test_client(Some(cache_config));
-
-        assert_eq!(
-            client.get_cache_dir(ModelProvider::HuggingFace),
-            hf_cache_dir.path()
-        );
-    }
-
     // Note: Most client tests require a running server, so they would be integration tests
     // These unit tests focus on the configuration and setup logic
 
@@ -945,12 +904,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_model_directly_invalid_model() {
+    async fn test_direct_download_invalid_model() {
         // This test may fail if network is available and HF is accessible
         // In a real test environment, you might want to mock the download function
-        let result = Client::download_model_directly(
+        let result = download::download_model(
             "definitely-not-a-real-model-name-12345",
             ModelProvider::HuggingFace,
+            Some(ClientConfig::default().cache.local_path.clone()),
             false,
         )
         .await;
@@ -963,6 +923,9 @@ mod tests {
     fn test_model_provider_enum() {
         let provider = ModelProvider::HuggingFace;
         assert_eq!(provider, ModelProvider::HuggingFace);
+
+        let provider = ModelProvider::Gcs;
+        assert_eq!(provider, ModelProvider::Gcs);
 
         let default_provider = ModelProvider::default();
         assert_eq!(default_provider, ModelProvider::HuggingFace);
@@ -1078,6 +1041,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_prepare_stream_model_dir_uses_gcs_layout_without_commit_hash() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path();
+
+        let (dir, _) = prepare_stream_model_dir(
+            cache_root,
+            ModelProvider::Gcs,
+            "gs://envbucket/dev/bake/qwen/rev123",
+            None,
+        )
+        .expect("Expected GCS cache layout");
+
+        assert_eq!(dir, cache_root.join("gcs/envbucket/dev/bake/qwen/rev123"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_create_stream_output_file_replaces_symlink_without_following_it() {
@@ -1146,8 +1125,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_model_streaming_creates_zero_byte_gcs_marker() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(ZeroByteGcsMarkerStreamModelService).await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        config.cache.shared_storage = false;
+
+        let model_name = "gs://test-bucket/org/model/rev-1";
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        client
+            .request_model(model_name, ModelProvider::Gcs, false)
+            .await
+            .expect("Expected streamed model request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let model_dir = resolve_model_path(cache_dir.path(), ModelProvider::Gcs, model_name, None)
+            .expect("Expected resolved GCS model dir");
+        let marker_path = model_dir.join(".mx-model");
+        assert!(
+            marker_path.is_file(),
+            "Expected marker file at {:?}",
+            marker_path
+        );
+        assert_eq!(
+            std::fs::metadata(&marker_path)
+                .expect("Expected marker metadata")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn test_request_model_with_smart_fallback_no_server() {
-        // Test the smart fallback when server is not available
         let config = Config::for_testing("http://127.0.0.1:99999"); // Invalid port
 
         let result = Client::request_model_with_smart_fallback(
@@ -1158,9 +1174,7 @@ mod tests {
         )
         .await;
 
-        // Should fail because the model doesn't exist, but we should get past the connection attempt
         assert!(result.is_err());
-        // The error should indicate it tried to connect to the server but failed
         let error_msg = result.expect_err("Result should be an error").to_string();
         assert!(
             error_msg.contains("Direct download failed")
@@ -1168,6 +1182,70 @@ mod tests {
                 || error_msg.contains("gRPC error")
                 || error_msg.contains("h2 protocol error")
                 || error_msg.contains("connection")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_model_with_smart_fallback_does_not_direct_download_midflight() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(UnavailableModelService).await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+
+        let result = Client::request_model_with_smart_fallback(
+            "definitely-not-a-real-model-name-12345",
+            ModelProvider::HuggingFace,
+            config,
+            false,
+        )
+        .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let err = result.expect_err("Expected server request failure");
+        let error_msg = err.to_string();
+        assert!(
+            !error_msg.contains("Direct download failed"),
+            "Smart fallback should not switch to direct download after the server path starts: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("gRPC error") || error_msg.contains("unavailable"),
+            "Expected a server-side availability error, got: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_model_with_smart_fallback_accepts_full_gcs_url() {
+        let seen_model_name = Arc::new(Mutex::new(None));
+        let (addr, server_handle) = spawn_model_service(RecordingModelService {
+            seen_model_name: Arc::clone(&seen_model_name),
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.shared_storage = true;
+
+        Client::request_model_with_smart_fallback(
+            "gs://envbucket/dev/bake/qwen/rev123",
+            ModelProvider::Gcs,
+            config,
+            false,
+        )
+        .await
+        .expect("Expected smart fallback request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        assert_eq!(
+            seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name")
+                .clone(),
+            "gs://envbucket/dev/bake/qwen/rev123".to_string().into()
         );
     }
 }
@@ -1242,7 +1320,11 @@ mod integration_tests {
             // Use a very small model for testing to avoid long download times
             // Note: This test might still take time and requires network access
             let result = client
-                .request_model_server_only("sentence-transformers/all-MiniLM-L6-v2", false)
+                .request_model_on_server(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    ModelProvider::default(),
+                    false,
+                )
                 .await;
 
             // We don't assert success here because it depends on network availability

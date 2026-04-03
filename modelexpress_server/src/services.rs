@@ -3,7 +3,7 @@
 
 use crate::database::ModelDatabase;
 use modelexpress_common::{
-    cache::CacheConfig,
+    cache::{CacheConfig, resolve_model_path},
     constants, download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
@@ -181,13 +181,14 @@ impl ModelService for ModelServiceImpl {
         info!("Starting model download stream");
         let model_request = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let model_name = model_request.model_name.clone();
 
         // Convert gRPC provider to our enum
         let provider: ModelProvider =
             modelexpress_common::grpc::model::ModelProvider::try_from(model_request.provider)
                 .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
                 .into();
+        let model_name = download::canonical_model_name(&model_request.model_name, provider)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let ignore_weights = model_request.ignore_weights;
 
         // Spawn a task to handle the streaming download updates
@@ -248,7 +249,6 @@ impl ModelService for ModelServiceImpl {
         request: Request<ModelFilesRequest>,
     ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
         let files_request = request.into_inner();
-        let model_name = files_request.model_name.clone();
         let chunk_size = if files_request.chunk_size == 0 {
             constants::DEFAULT_TRANSFER_CHUNK_SIZE
         } else {
@@ -257,6 +257,9 @@ impl ModelService for ModelServiceImpl {
 
         // Convert gRPC provider to our enum
         let provider = convert_provider(files_request.provider);
+        let model_name = download::canonical_model_name(&files_request.model_name, provider)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let provider_impl = download::get_provider(provider);
 
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
@@ -268,7 +271,6 @@ impl ModelService for ModelServiceImpl {
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request
-        let provider_impl = download::get_provider(provider);
         let model_path = provider_impl
             .get_model_path(&model_name, cache_dir.clone())
             .await
@@ -289,6 +291,19 @@ impl ModelService for ModelServiceImpl {
             return Err(Status::internal(
                 "Resolved Hugging Face model path did not contain a revision",
             ));
+        }
+
+        let expected_model_path =
+            resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref()).map_err(
+                |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
+            )?;
+
+        if model_path != expected_model_path {
+            return Err(Status::internal(format!(
+                "Resolved model path '{}' does not match expected cache layout '{}'",
+                model_path.display(),
+                expected_model_path.display()
+            )));
         }
 
         // Collect all files to stream
@@ -332,6 +347,30 @@ impl ModelService for ModelServiceImpl {
 
                 let mut reader = tokio::io::BufReader::new(file);
                 let mut offset: u64 = 0;
+
+                if *total_size == 0 {
+                    let first_chunk = std::mem::replace(&mut is_first_chunk, false);
+                    let chunk = FileChunk {
+                        relative_path: relative_path.to_string_lossy().to_string(),
+                        data: Vec::new(),
+                        offset: 0,
+                        total_size: 0,
+                        is_last_chunk: true,
+                        is_last_file,
+                        commit_hash: if first_chunk {
+                            commit_hash.clone()
+                        } else {
+                            None
+                        },
+                    };
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        debug!("Client disconnected during file stream");
+                        return;
+                    }
+
+                    continue;
+                }
 
                 loop {
                     let bytes_read = match reader.read(&mut buffer).await {
@@ -384,10 +423,12 @@ impl ModelService for ModelServiceImpl {
         request: Request<ModelFilesRequest>,
     ) -> Result<Response<ModelFileList>, Status> {
         let files_request = request.into_inner();
-        let model_name = files_request.model_name.clone();
 
         // Convert gRPC provider to our enum
         let provider = convert_provider(files_request.provider);
+        let model_name = download::canonical_model_name(&files_request.model_name, provider)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let provider_impl = download::get_provider(provider);
 
         info!("Listing files for model: {}", model_name);
 
@@ -396,7 +437,6 @@ impl ModelService for ModelServiceImpl {
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request
-        let provider_impl = download::get_provider(provider);
         let model_path = provider_impl
             .get_model_path(&model_name, cache_dir)
             .await
@@ -917,6 +957,44 @@ mod tests {
         MODEL_TRACKER.delete_status(&model_name);
     }
 
+    #[tokio::test]
+    async fn test_model_service_already_downloaded_gcs_trailing_slash_uses_canonical_name() {
+        let service = ModelServiceImpl;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos();
+        let canonical_model_name = format!("gs://test-bucket-{timestamp}/org/model/rev-1");
+
+        MODEL_TRACKER.set_status(
+            canonical_model_name.clone(),
+            ModelStatus::DOWNLOADED,
+            ModelProvider::Gcs,
+        );
+
+        let request = Request::new(ModelDownloadRequest {
+            model_name: format!("{canonical_model_name}/"),
+            provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            ignore_weights: false,
+        });
+
+        let response = service.ensure_model_downloaded(request).await;
+        assert!(response.is_ok());
+
+        let mut stream = response.expect("Response should be ok").into_inner();
+        let update = stream.next().await.expect("Update should be present");
+        assert!(update.is_ok());
+
+        let status_update = update.expect("Status update should be ok");
+        assert_eq!(status_update.model_name, canonical_model_name);
+        assert_eq!(
+            status_update.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloaded as i32
+        );
+
+        MODEL_TRACKER.delete_status(&canonical_model_name);
+    }
+
     #[test]
     fn test_model_download_tracker_set_status_and_notify() {
         let _temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1178,6 +1256,49 @@ mod tests {
             .expect("Expected first chunk");
 
         assert_eq!(first_chunk.relative_path, "config.json");
+        assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
+        assert!(first_chunk.is_last_chunk);
+        assert!(first_chunk.is_last_file);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_hf_emits_chunk_for_zero_byte_file() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("empty.bin"), []).expect("Failed to write empty file");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+        });
+
+        let response = service
+            .stream_model_files(request)
+            .await
+            .expect("Expected stream response");
+        let mut stream = response.into_inner();
+        let first_chunk = stream
+            .next()
+            .await
+            .expect("Expected stream item")
+            .expect("Expected first chunk");
+
+        assert_eq!(first_chunk.relative_path, "empty.bin");
+        assert_eq!(first_chunk.total_size, 0);
+        assert_eq!(first_chunk.data.len(), 0);
+        assert_eq!(first_chunk.offset, 0);
         assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
         assert!(first_chunk.is_last_chunk);
         assert!(first_chunk.is_last_file);
