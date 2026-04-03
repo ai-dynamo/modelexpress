@@ -483,6 +483,17 @@ def _worker_to_json(worker: p2p_pb2.WorkerMetadata) -> dict[str, Any]:
     else:
         backend_type = "none"
 
+    tensors = [
+        {
+            "name": t.name,
+            "addr": t.addr,
+            "size": t.size,
+            "device_id": t.device_id,
+            "dtype": t.dtype,
+        }
+        for t in worker.tensors
+    ]
+
     return {
         "worker_rank": worker.worker_rank,
         "backend_type": backend_type,
@@ -490,6 +501,7 @@ def _worker_to_json(worker: p2p_pb2.WorkerMetadata) -> dict[str, Any]:
         "agent_name": worker.agent_name or None,
         "worker_grpc_endpoint": worker.worker_grpc_endpoint or None,
         "transfer_engine_session_id": worker.transfer_engine_session_id or None,
+        "tensors": tensors,
         "status": worker.status,
         "updated_at": worker.updated_at,
     }
@@ -497,12 +509,23 @@ def _worker_to_json(worker: p2p_pb2.WorkerMetadata) -> dict[str, Any]:
 
 def _json_to_worker_metadata(record: dict) -> p2p_pb2.WorkerMetadata:
     """Convert a DHT JSON record back to a WorkerMetadata proto."""
+    tensors = [
+        p2p_pb2.TensorDescriptor(
+            name=t.get("name", ""),
+            addr=t.get("addr", 0),
+            size=t.get("size", 0),
+            device_id=t.get("device_id", 0),
+            dtype=t.get("dtype", ""),
+        )
+        for t in record.get("tensors", [])
+    ]
     return p2p_pb2.WorkerMetadata(
         worker_rank=record.get("worker_rank", 0),
         metadata_endpoint=record.get("metadata_endpoint") or "",
         agent_name=record.get("agent_name") or "",
         worker_grpc_endpoint=record.get("worker_grpc_endpoint") or "",
         transfer_engine_session_id=record.get("transfer_engine_session_id") or "",
+        tensors=tensors,
         status=record.get("status", 0),
         updated_at=record.get("updated_at", 0),
     )

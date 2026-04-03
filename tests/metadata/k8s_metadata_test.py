@@ -502,7 +502,7 @@ async def test_cross_pod_discovery(node: DhtNode, results: TestResult) -> None:
                                   w.status == 2)  # SOURCE_STATUS_READY
                 elif rank == 1:
                     results.record("cross-pod: w1 endpoint",
-                                  w.metadata_endpoint == "10.0.0.2:5556",
+                                  w.metadata_endpoint == "10.0.0.2:5555",
                                   w.metadata_endpoint)
                     results.record("cross-pod: w1 tensors", len(w.tensors) == 1,
                                   f"got {len(w.tensors)}")
