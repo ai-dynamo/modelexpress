@@ -70,6 +70,12 @@ spec:
                     workerGrpcEndpoint:
                       type: string
                       description: P2P worker gRPC endpoint for tensor manifest (host:port)
+                    allocEnds:
+                      type: array
+                      items:
+                        type: integer
+                        format: int64
+                      description: CUDA allocation end addresses for pool-based transfer coalescing
                     status:
                       type: string
                       description: Worker lifecycle status
