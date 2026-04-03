@@ -296,11 +296,15 @@ impl ModelService for ModelServiceImpl {
             )?;
 
         if model_path != expected_model_path {
-            return Err(Status::internal(format!(
-                "Resolved model path '{}' does not match expected cache layout '{}'",
+            error!(
+                "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
                 model_path.display(),
-                expected_model_path.display()
-            )));
+                expected_model_path.display(),
+                model_name
+            );
+            return Err(Status::internal(
+                "Resolved model path does not match expected cache layout",
+            ));
         }
 
         // Collect all files to stream
