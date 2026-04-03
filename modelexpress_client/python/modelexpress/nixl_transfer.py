@@ -378,6 +378,20 @@ class NixlTransferManager:
             use_raw_descriptors = True
         coalesce_time = time.perf_counter() - coalesce_start
 
+        # Log actual wire bytes vs tensor bytes to detect bloat from coalescing gaps
+        wire_bytes = sum(d[1] for d in remote_descs)
+        if wire_bytes != total_bytes:
+            logger.info(
+                f"[TIMING] wire bytes mismatch: tensor_bytes={total_bytes / 1e9:.3f} GB, "
+                f"wire_bytes={wire_bytes / 1e9:.3f} GB, "
+                f"overhead={((wire_bytes - total_bytes) / total_bytes) * 100:.1f}%"
+            )
+        else:
+            logger.info(
+                f"[TIMING] wire bytes match tensor bytes: {total_bytes / 1e9:.3f} GB "
+                f"({coalesced_count} descs)"
+            )
+
         # Phase C: Prepare transfer descriptors
         prep_start = time.perf_counter()
         src_prepped = self._agent.prep_xfer_dlist(
