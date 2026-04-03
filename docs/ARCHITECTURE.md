@@ -90,7 +90,8 @@ ModelExpress/
 │       ├── metadata_backend.rs         # MetadataBackend trait + types
 │       ├── metadata_backend/
 │       │   ├── redis.rs               # Redis backend implementation
-│       │   └── kubernetes.rs          # Kubernetes CRD backend implementation
+│       │   ├── kubernetes.rs          # Kubernetes CRD backend implementation
+│       │   └── dht.rs                 # Kademlia DHT backend (rust-libp2p)
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -114,6 +115,7 @@ ModelExpress/
 │   └── modelexpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
+│       ├── dht_client.py              # DhtMetadataClient (DHT-based metadata, no server)
 │       ├── heartbeat.py                # Client-side heartbeat for source liveness
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
@@ -433,6 +435,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
+| `dht_client.py` | `DhtMetadataClient` - DHT-based metadata client using `mx_libp2p`, same interface as `MxClient` |
 | `heartbeat.py` | `HeartbeatThread` - background thread sending periodic `UpdateStatus(READY)` and `STALE` on shutdown |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |

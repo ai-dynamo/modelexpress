@@ -35,7 +35,7 @@ import grpc
 import torch
 import torch.nn as nn
 
-from .client import MxClient  # All gRPC communication goes through MxClient
+from .client import MxClient
 from .heartbeat import HeartbeatThread
 from . import p2p_pb2
 
@@ -59,6 +59,22 @@ if TYPE_CHECKING:
     from .nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.vllm_loader")
+
+
+def _create_metadata_client():
+    """Create the appropriate metadata client based on MX_METADATA_BACKEND env var.
+
+    Returns a DhtMetadataClient when set to 'dht', otherwise an MxClient (gRPC).
+    Both expose the same duck-typed interface: publish_metadata, get_metadata, update_status.
+    """
+    backend = os.environ.get("MX_METADATA_BACKEND", "").lower()
+    if backend == "dht":
+        from .dht_client import DhtMetadataClient
+        logger.info("Using DHT metadata backend")
+        return DhtMetadataClient()
+    logger.debug("Using gRPC metadata backend (MxClient)")
+    return MxClient()
+
 
 MAX_SOURCE_RETRIES = 3
 PUBLISH_METADATA_MAX_ATTEMPTS = 3
@@ -574,7 +590,7 @@ class MxModelLoader(BaseModelLoader):
         super().__init__(load_config)
         self._nixl_manager: NixlTransferManager | None = None
         self._tensors: dict[str, torch.Tensor] = {}
-        self._mx_client = MxClient()
+        self._mx_client = _create_metadata_client()
         self._worker_id = uuid.uuid4().hex[:8]
         logger.debug("MxModelLoader initialized (worker_id=%s)", self._worker_id)
 

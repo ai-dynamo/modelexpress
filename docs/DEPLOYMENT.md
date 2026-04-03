@@ -240,6 +240,20 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
 | `VLLM_PLUGINS` | - | Set to `modelexpress` to register the mx loader |
 
+#### DHT Backend (Decentralized, No Server)
+
+Set `MX_METADATA_BACKEND=dht` to use Kademlia DHT for metadata discovery instead of a centralized MX server. Workers exchange metadata directly through the DHT network.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_METADATA_BACKEND` | - | Set to `dht` to enable DHT backend |
+| `MX_DHT_LISTEN` | `0.0.0.0:4001` | DHT node listen address (host:port) |
+| `MX_DHT_BOOTSTRAP_PEERS` | (none) | Comma-separated multiaddrs for bootstrap |
+| `MX_DHT_BOOTSTRAP_DNS` | (none) | K8s headless service hostname for DNS-based peer discovery |
+| `MX_DHT_RECORD_TTL` | `300` | Record TTL in seconds |
+
+For Kubernetes, use a headless service for zero-config bootstrap.
+
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
 ### P2P Metadata Exchange (Opt-In)

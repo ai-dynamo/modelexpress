@@ -13,8 +13,15 @@ use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
 use std::sync::Arc;
 
+pub mod dht;
 pub mod kubernetes;
 pub mod redis;
+
+/// Convert an empty string to `None`, non-empty to `Some`.
+/// Used by backends when serializing optional string fields.
+pub fn none_if_empty(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
 
 /// Result type for metadata operations
 pub type MetadataResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -263,10 +270,12 @@ pub trait MetadataBackend: Send + Sync {
 /// Configuration for metadata backends
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
-    /// Redis backend — persistent, horizontally scalable
+    /// Redis backend - persistent, horizontally scalable
     Redis { url: String },
-    /// Kubernetes CRD backend — native K8s integration
+    /// Kubernetes CRD backend - native K8s integration
     Kubernetes { namespace: String },
+    /// DHT backend - decentralized Kademlia, no centralized server
+    Dht(dht::DhtConfig),
 }
 
 impl std::fmt::Display for BackendConfig {
@@ -274,6 +283,7 @@ impl std::fmt::Display for BackendConfig {
         match self {
             Self::Redis { .. } => write!(f, "redis"),
             Self::Kubernetes { .. } => write!(f, "kubernetes"),
+            Self::Dht(_) => write!(f, "dht"),
         }
     }
 }
@@ -304,8 +314,9 @@ impl BackendConfig {
             "kubernetes" | "k8s" | "crd" => Ok(Self::Kubernetes {
                 namespace: k8s_namespace.to_string(),
             }),
+            "dht" => Ok(Self::Dht(dht::DhtConfig::from_env())),
             other => Err(format!(
-                "MX_METADATA_BACKEND='{}' is not valid. Use 'redis' or 'kubernetes'.",
+                "MX_METADATA_BACKEND='{}' is not valid. Use 'redis', 'kubernetes', or 'dht'.",
                 other
             )),
         }
@@ -341,6 +352,11 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesBackend::new(&namespace).await?;
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
+        }
+        BackendConfig::Dht(dht_config) => {
+            let backend = dht::DhtBackend::new(dht_config).await?;
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }

@@ -51,7 +51,13 @@ from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .heartbeat import HeartbeatThread  # noqa: F401
 
+try:
+    from .dht_client import DhtMetadataClient  # noqa: F401
+except ImportError:
+    pass
+
 __all__ = [
+    "DhtMetadataClient",
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",

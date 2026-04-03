@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# vLLM P2P weight transfer test with DHT metadata backend.
+# No centralized MX server or Redis needed - workers discover each other
+# through a Kademlia DHT network using a headless Service for bootstrap.
+#
+# Functional test using NIXL over TCP (no RDMA hardware required).
+# Uses tiny-random-gpt2 (~12MB) for fast iteration.
+#
+# First instance loads from HuggingFace, publishes metadata via DHT.
+# Second instance discovers the source via DHT, receives weights via NIXL/TCP.
+#
+# Usage:
+#   kubectl apply -f vllm-dht.yaml
+#   kubectl logs -f deployment/mx-vllm-dht -n dht-transfer-test
+#   kubectl delete ns dht-transfer-test
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dht-transfer-test
+---
+# Headless service for DHT peer discovery.
+# All vLLM pods register here. DhtMetadataClient resolves this
+# hostname to discover peers - no manual bootstrap needed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-dht
+  namespace: dht-transfer-test
+spec:
+  clusterIP: None
+  selector:
+    app: mx-vllm-dht
+  ports:
+    - name: dht
+      port: 4001
+      targetPort: 4001
+      protocol: TCP
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-dht
+  namespace: dht-transfer-test
+  labels:
+    app: mx-vllm-dht
+spec:
+  # Start with 1 replica (source). Scale to 2 to trigger P2P transfer.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-vllm-dht
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-dht
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: mx-vllm-dht
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: localhost:32000/modelexpress-client-dht:latest
+          imagePullPolicy: Always
+          env:
+            # Register ModelExpress loaders via vLLM plugin system
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            # DHT metadata backend - no server needed
+            - name: MX_METADATA_BACKEND
+              value: "dht"
+            # DHT configuration
+            - name: MX_DHT_LISTEN
+              value: "0.0.0.0:4001"
+            - name: MX_DHT_BOOTSTRAP_DNS
+              value: "mx-dht.dht-transfer-test.svc.cluster.local"
+            - name: MX_DHT_RECORD_TTL
+              value: "600"
+            # Worker address for NIXL listen thread
+            - name: MX_WORKER_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # NIXL metadata exchange port (per-worker: base + rank)
+            - name: MX_METADATA_PORT
+              value: "5555"
+            # Single GPU, single worker
+            - name: MX_EXPECTED_WORKERS
+              value: "1"
+            - name: MX_SYNC_PUBLISH
+              value: "1"
+            - name: MX_SYNC_START
+              value: "1"
+            # Baseline tensor registration
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            # NIXL over TCP (no RDMA hardware on test cluster)
+            # cuda_copy is required so UCX keeps CUDA memory domains alive
+            - name: UCX_TLS
+              value: "tcp,cuda_copy"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            # Model cache
+            - name: HF_HUB_CACHE
+              value: "/models"
+            # Pod identity
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          args:
+            - --model
+            - hf-internal-testing/tiny-random-gpt2
+            - --load-format
+            - mx
+            - --gpu-memory-utilization
+            - "0.3"
+          ports:
+            - containerPort: 8000
+            - containerPort: 4001
+            - containerPort: 5555
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "4Gi"
+              cpu: "2"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 2Gi
