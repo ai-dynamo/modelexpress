@@ -19,10 +19,12 @@ async fn download_model_directly(
     provider: ModelProvider,
     ignore_weights: bool,
 ) -> Result<(), modelexpress_common::Error> {
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+
     download::download_model(
         model_name,
         provider,
-        Some(ClientConfig::default().cache.local_path.clone()),
+        Some(cache_dir.path().to_path_buf()),
         ignore_weights,
     )
     .await
