@@ -24,9 +24,15 @@ from .types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
 
-# MX_POOL_REG=0 disables allocation-level registration and transfer coalescing,
-# falling back to per-tensor registration for baseline benchmarking.
+# MX_POOL_REG=0 disables allocation-level registration,
+# falling back to per-tensor registration.
 POOL_REG_ENABLED = os.environ.get("MX_POOL_REG", "1") != "0"
+
+# MX_COALESCE_TRANSFERS=0 disables transfer coalescing,
+# issuing per-tensor RDMA READs instead of merged regions.
+# Independent of MX_POOL_REG - pool registration can reduce
+# registration overhead while transfers remain per-tensor.
+COALESCE_ENABLED = os.environ.get("MX_COALESCE_TRANSFERS", "1") != "0"
 
 NIXL_AVAILABLE = False
 NixlAgent = None
@@ -358,7 +364,7 @@ class NixlTransferManager:
 
         # Phase B: Coalesce contiguous regions (or build raw descriptors)
         coalesce_start = time.perf_counter()
-        if coalesce_transfers and POOL_REG_ENABLED:
+        if coalesce_transfers and COALESCE_ENABLED:
             remote_descs, local_descs, coalesced_count = self._coalesce_transfers(
                 remote_descs, local_tensor_list, source_alloc_ends
             )
