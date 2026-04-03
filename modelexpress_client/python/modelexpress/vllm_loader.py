@@ -469,11 +469,12 @@ def _publish_metadata_and_ready(
             f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
         )
     else:
-        # Centralized mode: publish full metadata (blobs + tensors)
+        # Centralized mode: publish full metadata (blobs + tensors + alloc_ends)
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=global_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensors=tensor_protos,
+            alloc_ends=nixl_manager.alloc_ends,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,
@@ -860,7 +861,7 @@ class MxModelLoader(BaseModelLoader):
             )
             remote_agent_name_override = source_worker.agent_name
         else:
-            # Centralized mode: tensors and NIXL blob from server
+            # Centralized mode: tensors, NIXL blob, and alloc_ends from server
             source_tensors = [
                 TensorDescriptor(
                     name=t.name, addr=t.addr, size=t.size,
@@ -868,6 +869,8 @@ class MxModelLoader(BaseModelLoader):
                 )
                 for t in source_worker.tensors
             ]
+            if source_worker.alloc_ends:
+                source_alloc_ends = list(source_worker.alloc_ends)
 
         logger.info(
             f"[Worker {global_rank}] Receiving {len(source_tensors)} tensors from source"

@@ -145,6 +145,10 @@ message WorkerMetadata {
 
   // host:port for the worker's gRPC WorkerService (tensor manifest)
   string worker_grpc_endpoint = 8;
+
+  // CUDA allocation end addresses for pool-based transfer coalescing.
+  // Constrains coalescing so merged regions don't span cudaMalloc blocks.
+  repeated uint64 alloc_ends = 9;
 }
 
 // ============================================================================

@@ -93,6 +93,10 @@ pub struct WorkerStatus {
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     #[serde(rename = "workerGrpcEndpoint", default)]
     pub worker_grpc_endpoint: String,
+
+    /// CUDA allocation end addresses for pool-based transfer coalescing
+    #[serde(rename = "allocEnds", default)]
+    pub alloc_ends: Vec<u64>,
 }
 
 impl WorkerStatus {

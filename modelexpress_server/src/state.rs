@@ -355,6 +355,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    alloc_ends: Vec::new(),
                 },
                 WorkerRecord {
                     worker_rank: 1,
@@ -371,6 +372,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    alloc_ends: Vec::new(),
                 },
             ],
             published_at: 1234567890,

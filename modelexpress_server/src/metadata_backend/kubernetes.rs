@@ -275,6 +275,7 @@ impl MetadataBackend for KubernetesBackend {
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            alloc_ends: worker_record.alloc_ends.clone(),
         };
 
         let max_retries: u32 = 5;
@@ -413,6 +414,7 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                alloc_ends: worker_status.alloc_ends.clone(),
             });
         }
 

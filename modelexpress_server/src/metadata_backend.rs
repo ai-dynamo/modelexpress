@@ -117,6 +117,8 @@ pub struct WorkerRecord {
     pub agent_name: String,
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     pub worker_grpc_endpoint: String,
+    /// CUDA allocation end addresses for pool-based transfer coalescing
+    pub alloc_ends: Vec<u64>,
 }
 
 /// Tensor descriptor record
@@ -149,6 +151,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             metadata_endpoint: meta.metadata_endpoint,
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
+            alloc_ends: meta.alloc_ends,
         }
     }
 }
@@ -189,6 +192,7 @@ impl From<WorkerRecord> for WorkerMetadata {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            alloc_ends: record.alloc_ends,
         }
     }
 }
