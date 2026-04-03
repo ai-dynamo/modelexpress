@@ -1,0 +1,24 @@
+// libp2p crypto.proto - peer identity keys
+// Reference: https://github.com/libp2p/specs/blob/master/peer-ids/peer-ids.md
+
+syntax = "proto3";
+package crypto;
+
+option java_package = "io.libp2p.crypto.pb";
+
+enum KeyType {
+    RSA = 0;
+    Ed25519 = 1;
+    Secp256k1 = 2;
+    ECDSA = 3;
+}
+
+message PublicKey {
+    KeyType Type = 1;
+    bytes Data = 2;
+}
+
+message PrivateKey {
+    KeyType Type = 1;
+    bytes Data = 2;
+}
