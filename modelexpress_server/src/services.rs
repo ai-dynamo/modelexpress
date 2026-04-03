@@ -183,10 +183,7 @@ impl ModelService for ModelServiceImpl {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         // Convert gRPC provider to our enum
-        let provider: ModelProvider =
-            modelexpress_common::grpc::model::ModelProvider::try_from(model_request.provider)
-                .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
-                .into();
+        let provider = convert_provider(model_request.provider);
         let model_name = download::canonical_model_name(&model_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let ignore_weights = model_request.ignore_weights;
