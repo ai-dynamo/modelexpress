@@ -28,11 +28,11 @@ logger = logging.getLogger("modelexpress.nixl_transfer")
 # falling back to per-tensor registration.
 POOL_REG_ENABLED = os.environ.get("MX_POOL_REG", "1") != "0"
 
-# MX_COALESCE_TRANSFERS=0 disables transfer coalescing,
-# issuing per-tensor RDMA READs instead of merged regions.
-# Independent of MX_POOL_REG - pool registration can reduce
-# registration overhead while transfers remain per-tensor.
-COALESCE_ENABLED = os.environ.get("MX_COALESCE_TRANSFERS", "1") != "0"
+# MX_COALESCE_TRANSFERS=1 enables transfer coalescing,
+# merging adjacent per-tensor RDMA READs into larger regions.
+# Disabled by default: benchmarks show per-tensor transfers are
+# faster due to better UCX pipelining. Independent of MX_POOL_REG.
+COALESCE_ENABLED = os.environ.get("MX_COALESCE_TRANSFERS", "0") == "1"
 
 NIXL_AVAILABLE = False
 NixlAgent = None
