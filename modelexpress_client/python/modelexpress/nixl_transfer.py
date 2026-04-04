@@ -513,7 +513,7 @@ class NixlTransferManager:
                 break
             if status in ("ERR", "ERROR", "FAIL"):
                 self._agent.release_xfer_handle(handle)
-                raise ManifestMismatchError(f"Transfer failed with status {status}")
+                raise RuntimeError(f"NIXL transfer failed with status {status}")
             time.sleep(0.001)
 
         # CRITICAL: Synchronize CUDA to ensure RDMA writes are visible

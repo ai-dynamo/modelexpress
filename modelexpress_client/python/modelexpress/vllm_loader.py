@@ -57,6 +57,10 @@ from .transfer_safety import (
     TransferFingerprint,
     check_transfer_allowed,
     detect_model_features,
+    get_cuda_version,
+    get_deep_gemm_version,
+    get_torch_version,
+    get_vllm_version,
 )
 from .types import TensorDescriptor
 
@@ -378,7 +382,11 @@ def _build_source_identity(
         dtype=dtype,
         quantization=quantization,
         extra_parameters={
-            f"feature.{k}": v for k, v in detect_model_features(model_config).items()
+            **{f"feature.{k}": v for k, v in detect_model_features(model_config).items()},
+            "runtime.vllm_version": get_vllm_version(),
+            "runtime.torch_version": get_torch_version(),
+            "runtime.cuda_version": get_cuda_version(),
+            "runtime.deep_gemm_version": get_deep_gemm_version(),
         },
     )
 
@@ -825,7 +833,12 @@ class MxModelLoader(BaseModelLoader):
         with _capture_tensor_attrs():
             process_weights_after_loading(model, model_config, target_device)
 
+        # RDMA receive (fully-processed tensors, no post-processing needed)
+        # Raises SourceTransferError on source-side failures
+        self._receive_from_peer(model, global_rank, device_id, source_worker, mx_source_id)
+
         # Log transfer fingerprint for debugging environment mismatches.
+        # Must be after _receive_from_peer which calls _register_tensors.
         target_fp = TransferFingerprint.from_environment(self._tensors)
         logger.info(
             f"[Worker {global_rank}] Transfer fingerprint: "
@@ -834,10 +847,6 @@ class MxModelLoader(BaseModelLoader):
             f"deepgemm={target_fp.deep_gemm_version}, "
             f"manifest={target_fp.manifest_hash[:12]}... ({target_fp.tensor_count} tensors)"
         )
-
-        # RDMA receive (fully-processed tensors, no post-processing needed)
-        # Raises SourceTransferError on source-side failures
-        self._receive_from_peer(model, global_rank, device_id, source_worker, mx_source_id)
 
         # Publish metadata so future nodes can discover us
         self._publish_metadata(global_rank, device_id, identity)
@@ -933,6 +942,8 @@ class MxModelLoader(BaseModelLoader):
                 coalesce_transfers=coalesce,
                 remote_agent_name=remote_agent_name_override,
             )
+        except ManifestMismatchError:
+            raise
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e
         transfer_time = time.perf_counter() - transfer_start

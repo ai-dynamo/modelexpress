@@ -198,14 +198,19 @@ class TestTransferFingerprint:
         assert compatible
         assert len(mismatches) == 0
 
-    def test_validate_vllm_mismatch(self):
+    def test_validate_version_mismatches_ignored(self):
+        # vLLM, CUDA, torch, and deep_gemm version mismatches are caught at
+        # source-selection time via extra_parameters in SourceIdentity, not
+        # by the fingerprint.
         source = TransferFingerprint(vllm_version="0.17.1", cuda_version="12.9",
+                                     torch_version="2.10.0",
                                      attention_backend="X", deep_gemm_version="1.0")
-        target = TransferFingerprint(vllm_version="0.12.0", cuda_version="12.9",
-                                     attention_backend="X", deep_gemm_version="1.0")
+        target = TransferFingerprint(vllm_version="0.12.0", cuda_version="12.8",
+                                     torch_version="2.9.0",
+                                     attention_backend="X", deep_gemm_version="2.0")
         compatible, mismatches = target.validate_against(source)
-        assert not compatible
-        assert any("vLLM" in m for m in mismatches)
+        assert compatible
+        assert len(mismatches) == 0
 
     def test_validate_backend_mismatch(self):
         source = TransferFingerprint(vllm_version="0.12.0", cuda_version="12.9",

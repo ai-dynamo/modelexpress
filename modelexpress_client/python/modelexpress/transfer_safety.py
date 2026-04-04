@@ -164,7 +164,7 @@ def check_transfer_allowed(model_config) -> tuple[bool, str]:
 # Transfer fingerprint
 # ---------------------------------------------------------------------------
 
-def _get_vllm_version() -> str:
+def get_vllm_version() -> str:
     try:
         import vllm
         return getattr(vllm, "__version__", "unknown")
@@ -172,11 +172,11 @@ def _get_vllm_version() -> str:
         return "unknown"
 
 
-def _get_torch_version() -> str:
+def get_torch_version() -> str:
     return torch.__version__
 
 
-def _get_cuda_version() -> str:
+def get_cuda_version() -> str:
     return getattr(torch.version, "cuda", "unknown") or "unknown"
 
 
@@ -194,7 +194,7 @@ def _get_attention_backend() -> str:
     return os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
 
 
-def _get_deep_gemm_version() -> str:
+def get_deep_gemm_version() -> str:
     try:
         from importlib.metadata import version
         return version("deep-gemm")
@@ -221,10 +221,10 @@ class TransferFingerprint:
     def from_environment(cls, tensors: dict[str, torch.Tensor] | None = None) -> TransferFingerprint:
         """Build a fingerprint from the current runtime environment."""
         fp = cls(
-            vllm_version=_get_vllm_version(),
-            torch_version=_get_torch_version(),
-            cuda_version=_get_cuda_version(),
-            deep_gemm_version=_get_deep_gemm_version(),
+            vllm_version=get_vllm_version(),
+            torch_version=get_torch_version(),
+            cuda_version=get_cuda_version(),
+            deep_gemm_version=get_deep_gemm_version(),
             attention_backend=_get_attention_backend(),
         )
         if tensors is not None:
@@ -258,22 +258,13 @@ class TransferFingerprint:
         """
         mismatches: list[str] = []
 
-        # Hard requirements: these MUST match
-        if self.vllm_version != source.vllm_version:
-            mismatches.append(
-                f"vLLM version: source={source.vllm_version}, target={self.vllm_version}"
-            )
-        if self.cuda_version != source.cuda_version:
-            mismatches.append(
-                f"CUDA version: source={source.cuda_version}, target={self.cuda_version}"
-            )
+        # vllm_version, cuda_version, torch_version, and deep_gemm_version
+        # are checked at source-selection time via extra_parameters in
+        # SourceIdentity (hashed into mx_source_id).
+        # Only runtime-resolved properties are validated here.
         if self.attention_backend != source.attention_backend:
             mismatches.append(
                 f"attention backend: source={source.attention_backend}, target={self.attention_backend}"
-            )
-        if self.deep_gemm_version != source.deep_gemm_version:
-            mismatches.append(
-                f"DeepGemm version: source={source.deep_gemm_version}, target={self.deep_gemm_version}"
             )
 
         # Manifest structure: tensor names, sizes, dtypes must match
