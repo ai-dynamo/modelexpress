@@ -59,6 +59,7 @@ from .transfer_safety import (
     detect_model_features,
     get_cuda_version,
     get_deep_gemm_version,
+    get_gpu_capability,
     get_torch_version,
     get_vllm_version,
 )
@@ -387,6 +388,7 @@ def _build_source_identity(
             "runtime.torch_version": get_torch_version(),
             "runtime.cuda_version": get_cuda_version(),
             "runtime.deep_gemm_version": get_deep_gemm_version(),
+            "runtime.gpu_capability": get_gpu_capability(),
         },
     )
 

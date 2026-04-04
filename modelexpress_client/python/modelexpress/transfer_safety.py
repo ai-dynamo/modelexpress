@@ -239,6 +239,25 @@ def get_deep_gemm_version() -> str:
         return "unknown"
 
 
+def get_gpu_capability() -> str:
+    """Get the GPU compute capability as 'major.minor' (e.g. '9.0', '10.0').
+
+    Different GPU architectures can trigger different post-processing paths
+    (e.g. DeepGemm TMA scale packing differs between SM90 and SM100).
+    Including this in SourceIdentity ensures heterogeneous clusters don't
+    attempt cross-architecture transfers.
+
+    Returns 'unknown' if CUDA is not available.
+    """
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            return f"{props.major}.{props.minor}"
+    except Exception:
+        pass
+    return "unknown"
+
+
 @dataclass
 class TransferFingerprint:
     """Captures runtime environment and tensor manifest structure.
@@ -250,6 +269,7 @@ class TransferFingerprint:
     torch_version: str = ""
     cuda_version: str = ""
     deep_gemm_version: str = ""
+    gpu_capability: str = ""
     attention_backend: str = ""
     manifest_hash: str = ""
     tensor_count: int = 0
@@ -262,6 +282,7 @@ class TransferFingerprint:
             torch_version=get_torch_version(),
             cuda_version=get_cuda_version(),
             deep_gemm_version=get_deep_gemm_version(),
+            gpu_capability=get_gpu_capability(),
             attention_backend=_get_attention_backend(),
         )
         if tensors is not None:
@@ -276,6 +297,7 @@ class TransferFingerprint:
             "torch_version": self.torch_version,
             "cuda_version": self.cuda_version,
             "deep_gemm_version": self.deep_gemm_version,
+            "gpu_capability": self.gpu_capability,
             "attention_backend": self.attention_backend,
             "manifest_hash": self.manifest_hash,
             "tensor_count": self.tensor_count,
