@@ -9,7 +9,7 @@ of fully-processed model tensors. Registration happens AFTER
 process_weights_after_loading() so that all final tensors are captured.
 Tensor discovery uses named_parameters() and named_buffers(); bare tensor
 attributes created during post-processing (e.g. FP8 scales, MLA projections)
-are auto-promoted to non-persistent buffers via _capture_tensor_attrs().
+are discovered via deep walk of the module tree in _iter_module_tensors().
 
 Supports a three-tier loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
@@ -28,7 +28,6 @@ import os
 import random
 import time
 import uuid
-from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import grpc
@@ -132,66 +131,63 @@ class SourceTransferError(Exception):
 
 
 
-@contextmanager
-def _capture_tensor_attrs():
-    """Intercept bare CUDA tensor assignments during process_weights_after_loading.
-
-    vLLM's post-processing (quant methods, attention backends) may create
-    tensor attributes via plain setattr (e.g. self.W_UV = tensor) instead
-    of register_buffer. These are invisible to named_parameters/named_buffers
-    and would be missing from the RDMA manifest.
-
-    This context manager patches nn.Module.__setattr__ to auto-promote such
-    tensors to non-persistent buffers, making them discoverable by
-    named_buffers() and thus included in the manifest.
-    """
-    original_setattr = nn.Module.__setattr__
-
-    def capturing_setattr(self, name, value):
-        if (isinstance(value, torch.Tensor)
-                and not isinstance(value, nn.Parameter)
-                and value.is_cuda
-                and name not in self._parameters
-                and name not in self._buffers
-                and name not in self._modules):
-            if hasattr(self, name):
-                try:
-                    delattr(self, name)
-                except AttributeError:
-                    pass
-            self.register_buffer(name, value, persistent=False)
-        else:
-            original_setattr(self, name, value)
-
-    nn.Module.__setattr__ = capturing_setattr
-    try:
-        yield
-    finally:
-        nn.Module.__setattr__ = original_setattr
-
-
 def _iter_module_tensors(
-    module: nn.Module,
+    model: nn.Module,
 ) -> list[tuple[str, torch.Tensor, str]]:
     """Iterate over all CUDA tensors in a module tree.
 
-    Uses named_parameters() and named_buffers() to discover tensors.
-    When used with _capture_tensor_attrs() wrapping process_weights_after_loading,
-    bare tensor attributes (e.g. W_UV, W_UK_T) are auto-promoted to
-    non-persistent buffers and thus included in named_buffers().
+    Finds tensors in three places:
+    1. Named parameters (nn.Parameter instances)
+    2. Named buffers (registered via register_buffer)
+    3. Bare tensor attributes on non-Module sub-objects (e.g. W_UV, W_UK_T
+       on vLLM's MLACommonImpl which inherits from ABC, not nn.Module)
 
-    Returns:
-        List of (qualified_name, tensor, tensor_type) tuples for each CUDA tensor.
+    The third category is critical for MLA models where
+    process_weights_after_loading creates derived weight matrices on
+    impl objects that aren't part of the nn.Module hierarchy.
     """
     results: list[tuple[str, torch.Tensor, str]] = []
+    seen_ids: set[int] = set()
 
-    for name, param in module.named_parameters():
+    # 1. Named parameters
+    for name, param in model.named_parameters():
         if param.is_cuda:
+            seen_ids.add(id(param))
             results.append((name, param, "parameter"))
 
-    for name, buf in module.named_buffers():
+    # 2. Named buffers
+    for name, buf in model.named_buffers():
         if buf.is_cuda:
+            seen_ids.add(id(buf))
             results.append((name, buf, "buffer"))
+
+    # 3. Bare tensor attributes on modules and their non-Module sub-objects.
+    # vLLM's post-processing creates tensors via plain setattr in two places:
+    # (a) Directly on nn.Module instances (e.g. FP8 scales from quant methods)
+    # (b) On non-Module impl objects (e.g. W_UV, W_UK_T on MLACommonImpl
+    #     which inherits from ABC, not nn.Module)
+    # Both are invisible to named_parameters/named_buffers.
+    for mod_name, module in model.named_modules():
+        for attr_name, attr_val in vars(module).items():
+            if isinstance(attr_val, (nn.Module, nn.Parameter)):
+                continue
+            if isinstance(attr_val, torch.Tensor):
+                if attr_val.is_cuda and id(attr_val) not in seen_ids:
+                    seen_ids.add(id(attr_val))
+                    qname = f"{mod_name}.{attr_name}" if mod_name else attr_name
+                    results.append((qname, attr_val, "attribute"))
+                continue
+            # Check one level deeper for non-Module sub-objects
+            sub_dict = getattr(attr_val, "__dict__", None)
+            if sub_dict is None:
+                continue
+            prefix = f"{mod_name}.{attr_name}" if mod_name else attr_name
+            for sub_name, sub_val in sub_dict.items():
+                if (isinstance(sub_val, torch.Tensor)
+                        and sub_val.is_cuda
+                        and id(sub_val) not in seen_ids):
+                    seen_ids.add(id(sub_val))
+                    results.append((f"{prefix}.{sub_name}", sub_val, "attribute"))
 
     return results
 
@@ -217,11 +213,9 @@ def _storage_view(tensor: torch.Tensor) -> torch.Tensor:
 def _collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
     """Collect all CUDA tensors from a module tree into a flat dict.
 
-    Uses _iter_module_tensors (named_parameters + named_buffers) to find
-    tensors, then returns them as a name -> tensor mapping suitable for
-    NIXL registration. Bare tensor attributes created during
-    process_weights_after_loading are captured as non-persistent buffers
-    by the _capture_tensor_attrs context manager.
+    Uses _iter_module_tensors to find tensors via named_parameters,
+    named_buffers, and a deep walk of non-Module sub-objects (e.g. MLA
+    impl objects that hold derived weight matrices like W_UV, W_UK_T).
 
     Contiguous tensors are registered directly. Non-contiguous tensors
     (DeepGemm TMA-aligned FP8 scales, MLA dequantized projections)
@@ -793,11 +787,9 @@ class MxModelLoader(BaseModelLoader):
         self._dummy_loader.load_weights(model, model_config)
 
         # Process dummy weights to establish final tensor layout.
-        # _capture_tensor_attrs promotes bare CUDA tensor assignments
-        # (e.g. W_UV, W_UK_T) to non-persistent buffers so they appear
-        # in named_buffers() and get included in the RDMA manifest.
-        with _capture_tensor_attrs():
-            process_weights_after_loading(model, model_config, target_device)
+        # This creates derived tensors (e.g. W_UV, W_UK_T on MLA impl
+        # objects) that _iter_module_tensors will discover via deep walk.
+        process_weights_after_loading(model, model_config, target_device)
 
         # RDMA receive (fully-processed tensors, no post-processing needed)
         # Raises SourceTransferError on source-side failures
@@ -940,10 +932,9 @@ class MxModelLoader(BaseModelLoader):
             logger.info(f"[Worker {device_id}] Weights loaded from disk")
 
         # Process weights FIRST, then register final tensors.
-        # _capture_tensor_attrs promotes bare CUDA tensor assignments
-        # to non-persistent buffers for manifest discovery.
-        with _capture_tensor_attrs():
-            process_weights_after_loading(model, model_config, target_device)
+        # Derived tensors (e.g. W_UV, W_UK_T) are discovered by
+        # _iter_module_tensors' deep walk of the module tree.
+        process_weights_after_loading(model, model_config, target_device)
 
         # Register tensors + publish metadata
         self._register_tensors(model, global_rank, device_id)

@@ -159,6 +159,58 @@ class TestCollectModuleTensors:
         assert "w_alias" not in result
         assert len(result) == 1
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_non_module_sub_object_tensors(self):
+        """Tensors on non-Module sub-objects (like MLA impl) are discovered."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        # Simulate vLLM's MLA pattern: module.impl is a plain object
+        # with CUDA tensor attributes (W_UV, W_UK_T)
+        class PlainImpl:
+            pass
+
+        model = nn.Module()
+        layer = nn.Module()
+        impl = PlainImpl()
+        impl.W_UV = torch.randn(16, 512, 128, device="cuda")
+        impl.W_UK_T = torch.randn(16, 128, 512, device="cuda")
+        layer.impl = impl
+        model.layer = layer
+
+        result = _collect_module_tensors(model)
+        # Both tensors should be found via the deep walk
+        found_names = list(result.keys())
+        assert any("W_UV" in n for n in found_names), f"W_UV not found in {found_names}"
+        assert any("W_UK_T" in n for n in found_names), f"W_UK_T not found in {found_names}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_non_module_shared_storage_dedup(self):
+        """Non-contiguous tensors on sub-objects sharing storage are deduplicated."""
+        from modelexpress.vllm_loader import _collect_module_tensors
+
+        class PlainImpl:
+            pass
+
+        # Simulate the MLA pattern: W_UV and W_UK_T are views into the
+        # same dequantized intermediate storage
+        intermediate = torch.randn(512, 16, 256, device="cuda")
+        W_UK, W_UV = intermediate.split([128, 128], dim=-1)
+
+        model = nn.Module()
+        layer = nn.Module()
+        impl = PlainImpl()
+        impl.W_UV = W_UV.transpose(0, 1)   # non-contiguous
+        impl.W_UK_T = W_UK.permute(1, 2, 0)  # non-contiguous, same storage
+        layer.impl = impl
+        model.layer = layer
+
+        result = _collect_module_tensors(model)
+        # One should be registered, the other deduplicated (same storage)
+        storage_keys = [k for k in result if ".__storage" in k]
+        assert len(storage_keys) == 1, (
+            f"Expected 1 storage entry (deduplicated), got {len(storage_keys)}: {storage_keys}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Abstract method completeness
