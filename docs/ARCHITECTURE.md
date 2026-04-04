@@ -516,13 +516,14 @@ Currently validated (tested on nScale B200 cluster):
 | Qwen2-7B-Instruct | qwen2 (GQA) | none (BF16) | PASS |
 | Phi-3.5-mini-instruct | phi3 (GQA) | none (BF16) | PASS |
 | Gemma-2-2b-it | gemma2 (GQA) | none (BF16) | PASS |
-| DeepSeek-V2-Lite-Chat-FP8 | deepseek_v2 (MLA) | fp8 | **FAIL** |
+| DeepSeek-V2-Lite-Chat-FP8 | deepseek_v2 (MLA) | fp8 | vLLM >= 0.16.0 only |
 
 Blocked features:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| DeepSeek MLA | **Blocked** | Dequantized KV projections not transferable |
+| DeepSeek MLA on vLLM < 0.16.0 | **Blocked** | Derived tensors on non-Module ABC, invisible to tensor capture |
+| DeepSeek MLA on vLLM >= 0.16.0 | **Allowed** | vLLM PR #33284 moved post-processing onto nn.Module |
 | Other quantization methods | **Blocked** | Not yet validated (bitsandbytes, compressed-tensors, etc.) |
 | Unknown model architectures | **Blocked** | Must be explicitly added to allow-list after validation |
 
@@ -651,9 +652,11 @@ Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source cr
 
 ### DeepSeek MLA P2P Transfer
 
-P2P weight transfer does not work with DeepSeek models that use Multi-head Latent Attention (MLA). During `process_weights_after_loading()`, the MLA attention layer dequantizes `kv_b_proj` into BF16 and creates `W_UV` and `W_UK_T` as views into the dequantized intermediate. These derived tensors depend on the actual weight values, not just tensor shapes. The target's dummy-load-then-overwrite pattern runs post-processing on dummy data, creating dummy-derived intermediates that the RDMA byte overwrite cannot correctly replace. The transfer safety allow-list automatically blocks MLA models and falls back to disk loading. Set `MX_SKIP_FEATURE_CHECK=1` to bypass (for debugging only).
+P2P weight transfer for DeepSeek models using Multi-head Latent Attention (MLA) is version-gated on vLLM >= 0.16.0. On older vLLM versions, `process_weights_after_loading()` runs on `MLACommonBaseImpl`, an ABC that does not inherit from `nn.Module`. The derived tensors `W_UV` and `W_UK_T` are assigned as bare Python attributes on this non-Module object, making them invisible to `named_buffers()` and the `nn.Module.__setattr__` patch used for tensor capture. vLLM PR #33284 (included in v0.16.0) moved this logic onto `MLAAttention` (an `nn.Module`), making the tensors visible through standard PyTorch mechanisms.
 
-Affected models: DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V3, and any model with `model_type` in `{deepseek_v2, deepseek_v3, deepseek_v32, deepseek_mtp}` or with `kv_lora_rank` in its config.
+The transfer safety check automatically blocks MLA models on vLLM < 0.16.0 and falls back to disk loading. On vLLM >= 0.16.0, MLA models are allowed for P2P transfer. Set `MX_SKIP_FEATURE_CHECK=1` to bypass the check (for debugging only).
+
+Affected models: DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V3, Kimi K2/K2.5, and any model with `model_type` in `{deepseek_v2, deepseek_v3, deepseek_v32, deepseek_mtp, kimi_k2, kimi_k25}` or with `kv_lora_rank` in its config.
 
 ### Contiguous Region Failures
 

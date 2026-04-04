@@ -5,7 +5,7 @@
 
 import json
 import os
-from unittest.mock import MagicMock
+import unittest.mock
 
 import pytest
 import torch
@@ -14,6 +14,7 @@ from modelexpress.transfer_safety import (
     ALLOWED_MODEL_TYPES,
     TransferFingerprint,
     _compute_manifest_hash,
+    _parse_version,
     check_transfer_allowed,
     detect_model_features,
 )
@@ -102,14 +103,50 @@ class TestCheckTransferAllowed:
         allowed, reason = check_transfer_allowed(config)
         assert allowed
 
-    def test_deepseek_mla_denied(self):
+    def test_deepseek_mla_denied_old_vllm(self):
         config = FakeConfig(
             model_type="deepseek_v2",
             kv_lora_rank=512,
         )
-        allowed, reason = check_transfer_allowed(config)
+        with unittest.mock.patch(
+            "modelexpress.transfer_safety.get_vllm_version", return_value="0.12.0"
+        ):
+            allowed, reason = check_transfer_allowed(config)
         assert not allowed
         assert "mla" in reason.lower()
+
+    def test_deepseek_mla_allowed_new_vllm(self):
+        config = FakeConfig(
+            model_type="deepseek_v2",
+            kv_lora_rank=512,
+        )
+        with unittest.mock.patch(
+            "modelexpress.transfer_safety.get_vllm_version", return_value="0.17.1"
+        ):
+            allowed, reason = check_transfer_allowed(config)
+        assert allowed
+
+    def test_kimi_k2_mla_allowed_new_vllm(self):
+        config = FakeConfig(
+            model_type="kimi_k2",
+            kv_lora_rank=512,
+        )
+        with unittest.mock.patch(
+            "modelexpress.transfer_safety.get_vllm_version", return_value="0.16.0"
+        ):
+            allowed, reason = check_transfer_allowed(config)
+        assert allowed
+
+    def test_mla_denied_at_boundary(self):
+        config = FakeConfig(
+            model_type="deepseek_v3",
+            kv_lora_rank=512,
+        )
+        with unittest.mock.patch(
+            "modelexpress.transfer_safety.get_vllm_version", return_value="0.15.9"
+        ):
+            allowed, reason = check_transfer_allowed(config)
+        assert not allowed
 
     def test_fp8_llama_allowed(self):
         config = FakeConfig(
@@ -154,6 +191,32 @@ class TestCheckTransferAllowed:
             assert reason == "bypassed"
         finally:
             del os.environ["MX_SKIP_FEATURE_CHECK"]
+
+
+# ---------------------------------------------------------------------------
+# Version parsing
+# ---------------------------------------------------------------------------
+
+class TestParseVersion:
+    def test_simple_version(self):
+        assert _parse_version("0.16.0") == (0, 16, 0)
+
+    def test_dev_suffix(self):
+        assert _parse_version("0.16.0.dev123") == (0, 16, 0)
+
+    def test_rc_suffix(self):
+        assert _parse_version("0.17.0rc1") == (0, 17, 0)
+
+    def test_comparison(self):
+        assert _parse_version("0.17.1") >= (0, 16, 0)
+        assert _parse_version("0.12.0") < (0, 16, 0)
+        assert _parse_version("0.16.0") >= (0, 16, 0)
+        assert _parse_version("0.15.9") < (0, 16, 0)
+
+    def test_unknown(self):
+        assert _parse_version("unknown") == (0,)
+        # "unknown" should fail safe (< any real version)
+        assert _parse_version("unknown") < (0, 16, 0)
 
 
 # ---------------------------------------------------------------------------

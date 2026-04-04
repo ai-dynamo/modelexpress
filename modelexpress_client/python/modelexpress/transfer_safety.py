@@ -7,8 +7,11 @@ Transfer safety checks for ModelExpress GPU-to-GPU weight transfer.
 Two independent safety mechanisms:
 
 1. Feature allow-list: checks model config before attempting P2P transfer.
-   Models with unsupported post-processing features (MLA, FP8 TMA scales)
-   are rejected early and fall back to disk loading.
+   Models with unsupported features are rejected early and fall back to
+   disk loading. MLA attention is version-gated: blocked on vLLM < 0.16.0
+   (where process_weights_after_loading runs on a non-Module ABC and derived
+   tensors are invisible to PyTorch), allowed on >= 0.16.0 (where vLLM PR
+   #33284 moved the logic onto nn.Module).
 
 2. Transfer fingerprint: captures the runtime environment and tensor
    manifest structure. Source publishes its fingerprint; target computes
@@ -51,19 +54,22 @@ ALLOWED_MODEL_TYPES: set[str] = {
     "opt",
     "falcon",
     "codellama",
+    "deepseek_v2",   # MLA - version-gated (requires vLLM >= 0.16.0)
+    "deepseek_v3",   # MLA - version-gated
+    "deepseek_v32",  # MLA - version-gated
+    "deepseek_mtp",  # MLA - version-gated
+    "AXK1",          # MLA variant - version-gated
+    "kimi_k2",       # MLA (Moonshot Kimi K2) - version-gated
+    "kimi_k25",      # MLA (Moonshot Kimi K2.5) - version-gated
 }
 
-# Model types known to be unsafe for P2P transfer.
-# Listed for documentation; anything not in ALLOWED_MODEL_TYPES is denied.
-BLOCKED_MODEL_TYPES: set[str] = {
-    "deepseek_v2",   # MLA
-    "deepseek_v3",   # MLA
-    "deepseek_v32",  # MLA
-    "deepseek_mtp",  # MLA
-    "AXK1",          # MLA variant
-    "kimi_k2",       # MLA (Moonshot Kimi K2)
-    "kimi_k25",      # MLA (Moonshot Kimi K2.5)
-}
+# Minimum vLLM version for MLA P2P transfers.
+# vLLM PR #33284 (v0.16.0) moved process_weights_after_loading from
+# MLACommonBaseImpl (ABC, not nn.Module) into MLAAttention (nn.Module).
+# Before this change, derived tensors W_UV and W_UK_T are bare attributes
+# on a non-Module object, invisible to named_buffers() and the
+# nn.Module.__setattr__ patch used for tensor capture.
+MLA_MIN_VLLM_VERSION: tuple[int, ...] = (0, 16, 0)
 
 # Quantization methods validated for P2P transfer.
 ALLOWED_QUANTIZATIONS: set[str | None] = {
@@ -83,6 +89,32 @@ ALLOWED_DTYPES: set[str] = {
     "float32",
     "float8_e4m3fn",  # FP8 quantized weights
 }
+
+
+def _parse_version(version_str: str) -> tuple[int, ...]:
+    """Parse a version string like '0.16.0' into a comparable tuple.
+
+    Strips dev/rc/post suffixes (e.g. '0.16.0.dev123' -> (0, 16, 0)).
+    Returns (0,) for unparseable strings so comparisons fail safe (deny).
+    """
+    try:
+        # Strip everything after the numeric portion
+        parts = []
+        for part in version_str.split("."):
+            # Stop at first non-numeric segment
+            digits = ""
+            for ch in part:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            if digits:
+                parts.append(int(digits))
+            else:
+                break
+        return tuple(parts) if parts else (0,)
+    except Exception:
+        return (0,)
 
 
 def detect_model_features(model_config) -> dict[str, str]:
@@ -145,7 +177,12 @@ def check_transfer_allowed(model_config) -> tuple[bool, str]:
         reasons.append(f"quantization '{quant}' is not validated for P2P transfer")
 
     if features["attention"] == "mla":
-        reasons.append("MLA attention creates derived tensors incompatible with P2P transfer")
+        vllm_ver = _parse_version(get_vllm_version())
+        if vllm_ver < MLA_MIN_VLLM_VERSION:
+            reasons.append(
+                f"MLA attention requires vLLM >= {'.'.join(str(v) for v in MLA_MIN_VLLM_VERSION)} "
+                f"for P2P transfer (found {get_vllm_version()})"
+            )
 
     if reasons:
         reason_str = "; ".join(reasons)
