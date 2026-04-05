@@ -69,6 +69,35 @@ fleet: once from disk, once over the wire.
 Today this doesn't work because NIXL can't efficiently register or
 transfer sub-regions of a VMM range (see investigation results below).
 
+### Active integration effort
+
+MX-GMS integration is actively being designed (Hyunjae Woo, "MX-GMS
+Integration Design", Jan 2026, revised Apr 2026). The current design
+proposes running MX as a sidecar or library dependency of the GMS
+loader. A POC exists (`hwoo/gms-integration` branch).
+
+The integration faces a design tension around **raw vs processed
+weight transfer**. The POC transfers raw (pre-post-processing) tensors
+so that the target can run its own `process_weights_after_loading`.
+This has two costs:
+
+1. **Post-processing time on every target.** For compressed-tensors
+   models (Hermes 405B FP8), `process_weights_after_loading` is 30+
+   minutes of CPU-bound dequantization. Each target pays this
+   independently. The current standalone MX loader transfers
+   fully-processed tensors, so targets skip post-processing entirely.
+
+2. **2x VRAM on source during inference.** The source must keep raw
+   weights in GPU memory for NIXL to serve to targets AND hold
+   processed weights for local inference. For DSV3 FP8 TP8 that's
+   86 GB raw + derived tensors on a 192 GB B200, leaving minimal
+   headroom for KV cache and activations. With processed transfer,
+   raw weights are freed after post-processing.
+
+The proposed changes in this document address the performance layer
+underneath any MX-GMS architecture: NIXL registration speed,
+external memory tensor stability, and allocation hook formalization.
+
 ## Current State and Workarounds
 
 ### Pool Registration (MX, shipping)
@@ -93,6 +122,13 @@ Weights are in VMM from the start.
   in a single contiguous VMM range (see investigation below)
 - VMM compaction (MX) is post-hoc; GMS allocator is upfront but
   requires the GMS daemon
+- Tensor collection must include both `named_parameters()` AND
+  `named_buffers()` to capture all transferable weights. Non-persistent
+  buffers (MLA projections from `_capture_tensor_attrs`) and
+  non-contiguous FP8 scale tensors (requiring `__storage` byte views)
+  account for up to 40% of tensors on FP8 models. The MX-GMS POC
+  currently only collects `named_parameters()`, which would silently
+  produce incorrect inference on targets for affected models.
 
 ## Investigation Results
 
