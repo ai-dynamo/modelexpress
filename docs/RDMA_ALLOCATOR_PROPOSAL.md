@@ -15,55 +15,152 @@ size. For large models, this dominates cold start time:
 | DeepSeek-V3 FP8 TP8 EP8 | 1386 | 86 GB | 3.0s | 4.6-17s |
 | Kimi K2.5 NVFP4 TP8 (Nebius) | 2644 | 77 GB | 27s | 2.2s |
 
-All numbers are per-tensor baseline (no pool-reg or VMM). Registration
-time scales roughly linearly with tensor count x region size. The Nebius
+All numbers are per-tensor baseline (no pool-reg or VMM). The Nebius
 numbers (27s) are from a customer deployment on different hardware; the
 nScale B200 numbers (2.6-3.0s) reflect faster IB NICs.
 
-Registration takes 27 seconds for Kimi K2.5 while the actual RDMA transfer
-takes 2.2 seconds. The registration overhead comes from PyTorch's memory
-layout: the caching allocator spreads tensors across hundreds of `cudaMalloc`
-segments, each requiring a separate `ibv_reg_mr` call.
+The root cause: PyTorch's caching allocator spreads tensors across
+hundreds of `cudaMalloc` segments. Each segment requires a separate
+`ibv_reg_mr` call. A single contiguous allocation would need exactly one.
 
-## Current Workarounds (ModelExpress)
+## Two Systems, Same Problem
 
-### Pool Registration (shipping)
-Discover `cudaMalloc` segment boundaries via `cuMemGetAddressRange_v2` and
-register one region per segment instead of one per tensor. Reduces
-registrations by ~80% (e.g., 1386 tensors -> 298 allocations). Speedup:
-~2.8x on registration. Limited by PyTorch's allocation fragmentation.
+Two NVIDIA projects independently need control over GPU weight memory
+layout for efficient external access:
 
-### VMM Compaction (prototype)
+**ModelExpress (MX)** - cross-node RDMA weight transfer. Source loads
+model, registers GPU memory with NIXL, serves weights to target nodes
+over InfiniBand. Per-tensor `ibv_reg_mr` overhead dominates target
+cold start.
+
+**dynamo GPU Memory Service (GMS)** - same-node cross-process weight
+sharing. First process loads model into VMM-backed memory, exports VMM
+handles via POSIX FDs, subsequent processes import the same physical
+GPU pages (zero copy). Uses `CUDAPluggableAllocator` to direct all
+weight allocations into a VMM arena during loading.
+
+Both systems solve "don't repeat expensive weight loading" at different
+scales. Both need the same foundation: contiguous, externally-managed
+GPU memory that PyTorch tensors can alias.
+
+### Why GMS and MX should converge
+
+GMS already allocates weights into VMM arenas. If MX could register a
+GMS VMM arena with NIXL in one `ibv_reg_mr` call, you'd get both
+same-node sharing AND cross-node RDMA from the same memory:
+
+```
+Node A:
+  GMS loads weights into VMM arena (one allocation)
+  Local replicas import same physical pages (GMS sharing, zero copy)
+  MX registers VMM range with NIXL (one ibv_reg_mr)
+  RDMA serves weights to Node B
+
+Node B:
+  GMS creates VMM arena
+  MX RDMA receives into GMS arena (one ibv_reg_mr)
+  Local replicas import same pages (GMS sharing, zero copy)
+```
+
+One disk load total. One RDMA transfer between nodes. Zero copies within
+each node. Weight data touches memory exactly twice across the entire
+fleet: once from disk, once over the wire.
+
+Today this doesn't work because NIXL can't efficiently register or
+transfer sub-regions of a VMM range (see investigation results below).
+
+## Current State and Workarounds
+
+### Pool Registration (MX, shipping)
+Discover `cudaMalloc` segment boundaries via `cuMemGetAddressRange_v2`,
+register one region per segment. Reduces `ibv_reg_mr` calls by ~60-80%.
+Speedup: ~2x on registration time. Limited by allocator fragmentation.
+
+### VMM Compaction (MX, prototype)
 After weight loading, compact all tensors into a single contiguous CUDA
-Virtual Memory range (`cuMemAddressReserve` / `cuMemCreate` / `cuMemMap`).
-Uses segment-ordered freeing to limit peak VRAM overhead to one
-`cudaMalloc` segment (~2-256 MB). Handles non-contiguous tensors (FP8
-scales, MLA projections) via storage repointing.
+VMM range. Handles non-contiguous tensors (FP8 scales, MLA projections)
+via storage repointing. Segment-ordered freeing limits peak VRAM overhead
+to one `cudaMalloc` segment (~2-256 MB).
 
-**Limitations of both approaches:**
-- Post-hoc: weights are loaded into fragmented memory, then moved or
-  discovered. The fragmentation happens because vLLM and PyTorch don't
-  know about RDMA at allocation time.
-- Relies on `torch._C._construct_storage_from_data_pointer` (private API)
-  to create tensors at arbitrary CUDA addresses.
-- VMM compaction moves tensors to new VA addresses. NIXL requires
-  per-tensor registration even when all tensors reside in a single
-  contiguous VMM range (see benchmark results below).
+### GMS VMM Allocator (dynamo, shipping)
+`CUDAPluggableAllocator` + `use_mem_pool` directs weight allocations
+into VMM during `load_weights()`. No post-hoc compaction needed.
+Weights are in VMM from the start.
+
+### Limitations shared by all approaches
+- Rely on `torch._C._construct_storage_from_data_pointer` (private API)
+- NIXL requires per-tensor registration even when all tensors reside
+  in a single contiguous VMM range (see investigation below)
+- VMM compaction (MX) is post-hoc; GMS allocator is upfront but
+  requires the GMS daemon
+
+## Investigation Results
+
+### NIXL registration codepath
+
+We traced the full path from Python to `ibv_reg_mr`:
+
+```
+register_memory([tensor_list])
+  -> nixlLocalSection::addDescList()     // loops per descriptor
+    -> for each of N tensors:
+      -> nixlUcxEngine::registerMem()    // per-descriptor
+        -> ucp_mem_map()                 // explicit API, NO rcache
+          -> ibv_reg_mr()                // kernel call, ~2ms each
+        -> ucp_rkey_pack()               // per-tensor rkey
+```
+
+Key finding: `ucp_mem_map` is UCX's explicit registration API. It does
+NOT go through UCX's rcache (registration cache). The rcache only applies
+to implicit registrations during zero-copy transfer operations. Every
+`register_memory` call results in a fresh `ibv_reg_mr` kernel call.
+
+### Range cache prototype (NIXL fork)
+
+We implemented a range cache in NIXL's UCX backend
+(`nicolasnoble/nixl`, branch `nnoble/range-aware-registration`):
+when a new descriptor falls within an already-registered range, reuse
+the existing `ucp_mem_h` and rkey instead of calling `ucp_mem_map`.
+
+Results (Hermes 405B FP8 TP8, 1264 tensors, 51 GB/worker):
+
+| Phase | Without cache | With cache |
+|---|---|---|
+| Range registration (1 call) | 0.008s | 0.008s |
+| Per-tensor descriptors (1264) | 2.4s | **0.009s** |
+| Total registration | 2.4s | **0.017s** |
+
+**Registration: 140x faster.** The range cache eliminates per-tensor
+`ibv_reg_mr` calls entirely. Each tensor descriptor gets a shared
+reference to the range's `ucp_mem_h` + rkey.
+
+### Transfer failure with shared memh
+
+RDMA transfers fail with "Local protection error" when using the shared
+`ucp_mem_h`. The IB HCA rejects the lkey for addresses that ARE within
+the registered range. This blocks the full end-to-end optimization.
+
+The failure needs investigation at the UCX/nvidia-peermem level. It may
+be related to how VMM memory (`cuMemCreate`/`cuMemMap`) is handled by
+the IB driver vs regular `cudaMalloc` memory, or a UCX assumption about
+memh-to-address correspondence.
+
+Details: `docs/NIXL_RANGE_REGISTRATION_INVESTIGATION.md`
 
 ## Benchmark Results
 
-All benchmarks on nScale B200 cluster with InfiniBand, pinned source/target
-nodes (identical NVIDIA driver 590.48.01, OFED upgrade-done), 3 runs per
-configuration, steady-state (R2+R3) medians reported.
+All benchmarks on nScale B200 cluster with InfiniBand, pinned nodes,
+3 runs per configuration, steady-state medians.
 
-### Hermes 405B FP8, TP8 (1264 tensors, 51.32 GB/worker, 504 non-contiguous)
+### Hermes 405B FP8, TP8 (1264 tensors, 51.32 GB/worker)
 
-| Config | Compaction | Registration | Regions | Metadata | Total |
-|---|---|---|---|---|---|
-| Per-tensor | - | 2.6s | 1264 | 454 KB | 2.6s |
-| Pool-reg | - | 1.65s | 524 | 189 KB | 1.65s |
-| VMM + per-tensor reg | 0.39s | 3.0s | 1264 | 454 KB | 3.4s |
-| VMM + range reg (projected) | 0.39s | ~0.005s | 1 | ~1 KB | **0.4s** |
+| Config | Compaction | Registration | Regions | Transfer |
+|---|---|---|---|---|
+| Per-tensor | - | 2.6s | 1264 | 1.9-12s |
+| Pool-reg | - | 1.65s | 524 | 1.9-12s |
+| VMM + per-tensor reg | 0.39s | 3.0s | 1264 | 1.9-12s |
+| VMM + range cache | 0.39s | **0.017s** | 1265 | **FAILS** |
+| GMS + range cache (projected) | 0s | **0.017s** | 1265 | pending fix |
 
 ### DeepSeek-V3 FP8, TP8 EP8 (1386 tensors, 85.80 GB/worker)
 
@@ -74,58 +171,62 @@ configuration, steady-state (R2+R3) medians reported.
 
 ### Key findings
 
-1. **Pool-reg provides 1.6-2.1x registration speedup.** Consistent across
-   models and runs. Reduces `ibv_reg_mr` calls by ~60-80% by registering
-   cudaMalloc segments instead of individual tensors.
+1. **Pool-reg: 1.6-2.1x registration speedup.** Consistent across models.
+   Reduces `ibv_reg_mr` calls by 60-80%.
 
-2. **VMM compaction works but doesn't improve registration time.** The
-   compaction itself is fast (0.39s for 51 GB), and storage repointing
-   handles non-contiguous tensors correctly. But NIXL requires per-tensor
-   registration because `prep_xfer_dlist` does exact descriptor matching,
-   not range containment. Per-tensor registration in VMM takes the same
-   time as per-tensor registration in cudaMalloc because UCX's rcache
-   keys on the tensor's device address, and compacted VMM addresses are
-   new (uncached).
+2. **VMM compaction works but needs NIXL changes to help.** Compaction
+   is fast (0.39s for 51 GB) and handles non-contiguous tensors. But
+   without NIXL range support, registration time is unchanged.
 
-3. **NIXL range-based matching is the critical enabler.** We tested a
-   two-phase registration strategy: register the full VMM range first
-   (one `ibv_reg_mr`, 0.008s), then register individual tensors hoping
-   UCX's rcache would return cached rkeys. Result: per-tensor registration
-   still took 2.4s - NIXL calls `ibv_reg_mr` per tensor internally,
-   bypassing the rcache. This confirms the 0.008s floor is achievable
-   by the hardware, but requires NIXL API changes to exploit it. With
-   range-based `prep_xfer_dlist`, registration would be **0.008s + 0.39s
-   compaction = 0.4s total** - a **4x improvement over pool-reg**.
+3. **Range cache: 140x registration speedup, transfer broken.** The
+   0.017s registration proves the approach works. The transfer failure
+   is the remaining blocker.
 
-4. **Transfer speed is independent of registration mode.** All configs
+4. **GMS eliminates compaction entirely.** If MX integrates with GMS's
+   VMM allocator, the 0.39s compaction overhead disappears. Weights
+   start in VMM, no post-hoc movement needed.
+
+5. **Transfer speed is independent of registration mode.** All configs
    achieve the same RDMA bandwidth (35-215 Gbps per worker, variance
-   from PCIe topology). Registration mode affects startup time, not
-   steady-state transfer performance.
+   from PCIe topology and NIC health).
 
 ## Proposed Changes
 
-### 1. PyTorch: Public External Memory Tensor API
+### 1. NIXL: Sub-region transfer support (CRITICAL BLOCKER)
+
+**What:** Allow RDMA transfers using a `ucp_mem_h` that covers a
+superset of the transfer address range.
+
+**Why:** This is the single blocker preventing both VMM compaction and
+GMS+MX integration from achieving O(1) registration. We've proven that
+registration drops from 2.4s to 0.017s with the range cache, but
+transfers fail because the shared `ucp_mem_h` triggers IB protection
+errors on sub-region access.
+
+**Scope:** The IB spec explicitly supports sub-region access within a
+Memory Region (MR). The lkey from `ibv_reg_mr` is valid for any address
+within `[base, base+length]`. The fix is likely in how NIXL/UCX passes
+the memh to `ucp_get_nbx` or how nvidia-peermem handles VMM-backed MRs.
+
+**Prototype:** `nicolasnoble/nixl`, branch `nnoble/range-aware-registration`.
+Registration works. Transfer investigation documented in
+`NIXL_RANGE_REGISTRATION_INVESTIGATION.md`.
+
+### 2. PyTorch: Public External Memory Tensor API
 
 **What:** A public API for creating CUDA tensors backed by externally
 managed device memory.
 
 **Why:** `_construct_storage_from_data_pointer` is used in production by
-multiple NVIDIA projects (ModelExpress, dynamo GPU Memory Service) but has
-no stability guarantee. The need is legitimate and growing: RDMA frameworks,
-GPU memory pools, cross-process shared memory, and custom allocators all
-need to wrap external device pointers as tensors.
-
-**API surface:**
+GMS and ModelExpress but has no stability guarantee.
 
 ```python
-# Create a storage from a raw device pointer (does not take ownership)
 storage = torch.cuda.ExternalStorage(
     data_ptr: int,
     size_bytes: int,
     device: torch.device,
 )
 
-# Create a tensor from external storage
 tensor = torch.as_tensor_from_storage(
     storage,
     shape: tuple[int, ...],
@@ -136,310 +237,97 @@ tensor = torch.as_tensor_from_storage(
 ```
 
 **Requirements:**
-- Must support all CUDA dtypes including `float8_e4m3fn`, `bfloat16`
-  (rules out `__cuda_array_interface__` and DLPack which lack FP8 support)
-- Storage must NOT free the underlying memory on garbage collection
-- Must work with autograd (tensors are used as `nn.Parameter.data`)
-- Should integrate with `torch.cuda.memory_stats()` for accounting
-  (external memory tracked separately from the caching allocator)
-
-**Existing usage (private API):**
-- `torch._C._construct_storage_from_data_pointer` - used by:
-  - NVIDIA dynamo GPU Memory Service (`lib/gpu_memory_service/client/torch/tensor.py`)
-  - NVIDIA ModelExpress VMM compaction (`modelexpress/vmm_compact.py`)
-- `torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata` - dynamo GMS
-
-### 2. PyTorch: CUDA Pluggable Allocator for Weight Loading
-
-**What:** Extend `torch.cuda.CUDAPluggableAllocator` to support scoped
-allocation contexts, enabling inference frameworks to direct weight
-allocations into RDMA-friendly memory.
-
-**Why:** The current `CUDAPluggableAllocator` replaces the allocator
-globally. For RDMA weight loading, we only want to control allocations
-during `load_weights()` and `process_weights_after_loading()`, not
-during inference (KV cache, activations, etc.).
-
-**API surface:**
-
-```python
-class CUDAAllocationContext:
-    """Scoped context that redirects CUDA allocations to a custom allocator."""
-
-    def __init__(
-        self,
-        alloc_fn: Callable[[int, int, int], int],  # (size, device, stream) -> ptr
-        free_fn: Callable[[int, int, int], None],   # (ptr, size, device) -> None
-    ): ...
-
-    def __enter__(self) -> "CUDAAllocationContext": ...
-    def __exit__(self, *args) -> None: ...
-```
-
-**Usage by inference frameworks:**
-
-```python
-# VMM-backed allocator
-arena = VmmArena(total_model_size, granularity, device_id)
-
-def vmm_alloc(size, device, stream):
-    return arena.allocate(size)  # returns VA within the contiguous range
-
-def vmm_free(ptr, size, device):
-    pass  # VMM arena manages lifetime, not per-tensor
-
-with CUDAAllocationContext(vmm_alloc, vmm_free):
-    model.load_weights(...)       # all allocations go to VMM arena
-    process_weights_after_loading(model)  # derived tensors too
-
-# After context: model weights are in one contiguous RDMA-registerable range
-# KV cache and activations use the default caching allocator
-nixl_agent.register_memory([(arena.base, arena.size)], ...)  # one call
-```
-
-**Key property:** Allocations made inside the context go to the custom
-allocator. Allocations outside (before/after) use the default caching
-allocator. This eliminates the entire post-hoc compaction step.
+- All CUDA dtypes including `float8_e4m3fn`, `bfloat16`
+- Storage must NOT free underlying memory on GC
+- Must work with autograd (`nn.Parameter.data` replacement)
 
 ### 3. vLLM: Weight Allocation Hook
 
-**What:** A hook in vLLM's model loading pipeline that lets external
-libraries control how weight memory is allocated.
-
-**Why:** vLLM currently allocates weight memory through PyTorch's default
-allocator, which fragments across hundreds of `cudaMalloc` segments.
-External model delivery systems (ModelExpress, dynamo GMS) need contiguous
-RDMA-friendly memory but can only intervene after the fact.
-
-**Integration point:** The `ModelLoader` base class, specifically around
-`load_weights()` and `process_weights_after_loading()`.
-
-**API surface:**
+**What:** Formalize the pattern GMS already uses (`GMSModelLoader`) as
+a vLLM extension point.
 
 ```python
 class WeightAllocatorHook:
-    """Hook for controlling weight memory allocation."""
-
-    def pre_allocate(self, model: nn.Module, model_config: ModelConfig) -> ContextManager:
-        """Return a context manager that controls allocation during weight loading.
-
-        Called before load_weights(). The returned context wraps both
-        load_weights() and process_weights_after_loading() so that all
-        weight tensors (including derived tensors like MLA projections)
-        are allocated through the hook.
-
-        Return nullcontext() to use default allocation.
-        """
+    def pre_allocate(self, model, model_config) -> ContextManager:
+        """Wrap load_weights + process_weights_after_loading."""
         return contextlib.nullcontext()
 
-    def post_load(self, model: nn.Module, tensors: dict[str, torch.Tensor]) -> None:
-        """Called after all weights are loaded and post-processed.
-
-        Opportunity to register memory, publish metadata, etc.
-        The tensors dict contains all weight tensors in their final state.
-        """
+    def post_load(self, model, tensors: dict[str, torch.Tensor]) -> None:
+        """Register memory, publish metadata, etc."""
         pass
 ```
 
-**Registration:**
-
+GMS's vLLM integration already implements this pattern:
 ```python
-# In vLLM config or via environment variable
-vllm_config.weight_allocator_hook = ModelExpressAllocatorHook(
-    server_address="mx-server:8001",
-    use_vmm=True,
-)
-```
-
-**vLLM implementation changes:**
-
-```python
-# In model loading pipeline (simplified)
-hook = vllm_config.weight_allocator_hook or DefaultHook()
-
-with hook.pre_allocate(model, model_config):
-    loader.load_weights(model, model_config)
-    process_weights_after_loading(model, model_config, device)
-
-tensors = collect_module_tensors(model)
-hook.post_load(model, tensors)
-```
-
-### 4. NIXL: Range-Based Descriptor Matching
-
-**What:** Support sub-region transfers within a registered memory range.
-
-**Why:** Currently, `prep_xfer_dlist` requires exact address+size matches
-against registered descriptors. This forces RDMA libraries to register
-every individual tensor even when they all live in a single registered
-region. With range-based matching, registering one large region would
-enable transfers of arbitrary sub-regions within it.
-
-**Current behavior:**
-```
-register_memory([(0x1000, 4096)])     # register one 4KB region
-prep_xfer_dlist([(0x1000, 4096)])     # OK - exact match
-prep_xfer_dlist([(0x1000, 1024)])     # FAIL - no exact match for sub-region
-prep_xfer_dlist([(0x1400, 512)])      # FAIL - no exact match
-```
-
-**Proposed behavior:**
-```
-register_memory([(0x1000, 4096)])     # register one 4KB region
-prep_xfer_dlist([(0x1000, 4096)])     # OK - exact match
-prep_xfer_dlist([(0x1000, 1024)])     # OK - within registered range
-prep_xfer_dlist([(0x1400, 512)])      # OK - within registered range
-```
-
-**Impact:** This single change would make VMM compaction fully effective.
-Register the one VMM range, transfer individual tensors as sub-regions.
-No need for per-tensor registration. Registration goes from O(N) to O(1)
-regardless of tensor count.
-
-## Combined Flow (All Changes Integrated)
-
-```
-Source (disk load):
-  1. MX creates VMM arena sized to model
-  2. vLLM hook wraps load_weights() with VMM allocator context
-  3. All weight tensors allocated directly in VMM arena
-  4. process_weights_after_loading() derived tensors also in arena
-  5. hook.post_load() registers one range with NIXL, publishes metadata
-  -> Total registration: 1 ibv_reg_mr call, <1ms
-
-Target (RDMA receive):
-  1. MX creates VMM arena sized to source model
-  2. Registers one range with NIXL
-  3. NIXL RDMA READ of all tensors (sub-region matching)
-  4. vLLM hook wraps model init with VMM allocator context
-  5. Dummy weights allocated in same arena layout as source
-  6. RDMA overwrites in-place, no post-processing needed
-  -> Total registration: 1 ibv_reg_mr call, <1ms
-  -> No compaction step, no copies, no repointing
-```
-
-## Priority Order
-
-1. **NIXL range-based matching** (highest impact, smallest change,
-   **benchmarks confirm this is the bottleneck**) - enables single-region
-   registration for VMM-compacted memory. Without this, VMM compaction
-   provides zero registration benefit because per-tensor registration is
-   still required. With this, projected 4-6x speedup over pool-reg on
-   Hermes 405B (0.4s vs 1.65s). The MX-side VMM compaction code is
-   already built and validated - NIXL is the gate.
-2. **PyTorch external memory API** (removes private API dependency) -
-   stabilizes the foundation all other work builds on. Currently using
-   `_construct_storage_from_data_pointer` in production (GMS, ModelExpress).
-3. **vLLM weight allocation hook** (eliminates compaction entirely) -
-   the endgame, but requires #1 and #2 first. Would remove the 0.39s
-   compaction overhead and the storage repointing complexity.
-4. **PyTorch scoped allocator** (ergonomic improvement) - makes #3
-   cleaner but not strictly necessary (can use VMM arena + pointer
-   arithmetic directly)
-
-## Existing Prior Art: dynamo GPU Memory Service
-
-The dynamo inference framework's GPU Memory Service (GMS) already implements
-most of these patterns using today's private APIs. This section documents
-exactly what GMS depends on, to motivate why these APIs should be promoted
-to first-class public interfaces.
-
-### Private API: `_construct_storage_from_data_pointer`
-
-GMS creates tensors from raw CUDA pointers in
-`lib/gpu_memory_service/client/torch/tensor.py`:
-
-```python
-# line 75 - creates PyTorch storage aliasing a raw device pointer
-storage = torch._C._construct_storage_from_data_pointer(
-    data_ptr, device, storage_size_bytes
-)
-# line 87 - builds typed tensor with shape/stride metadata
-return torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata(metadata, storage)
-```
-
-This is used by `GMSTensorSpec.materialize()` to reconstruct model tensors
-from GMS-managed VMM memory. Every RO-mode model load (the common case in
-multi-replica deployments) flows through this path.
-
-### CUDAPluggableAllocator for Weight Loading
-
-GMS uses PyTorch's `CUDAPluggableAllocator` to redirect weight allocations
-to VMM-managed memory during model loading. The allocator is a C++ extension
-(`client/torch/extensions/allocator.cpp`) that routes `malloc`/`free` to
-Python callbacks:
-
-```python
-# allocator.py - routes weight allocation to GMS VMM memory
-_pluggable_alloc = CUDAPluggableAllocator(
-    cumem.__file__, "my_malloc", "my_free"
-)
-
-def _gms_malloc(size, device, stream):
-    return _manager.create_mapping(size=int(size), tag=_tag)  # returns VMM VA
-
-def _gms_free(ptr, size, device, stream):
-    _manager.destroy_mapping(int(ptr))
-```
-
-The scoped allocation pattern this proposal describes is already implemented
-in GMS's vLLM integration (`integrations/vllm/model_loader.py`):
-
-```python
-# model_loader.py lines 142-151 - allocate weights via GMS pool
 with use_mem_pool(pool, device=target_device):
-    with target_device:
-        model = initialize_model(vllm_config=vllm_config, model_config=model_config)
+    model = initialize_model(vllm_config=vllm_config, model_config=model_config)
     default_loader.load_weights(model, model_config)
     process_weights_after_loading(model, model_config, target_device)
 ```
 
-The `use_mem_pool` context manager directs all CUDA allocations during weight
-loading to the GMS-backed VMM arena. After the context exits, subsequent
-allocations (KV cache, activations) use the default caching allocator.
+Formalizing it benefits all external weight delivery systems.
 
-### CUDA VMM API
+### 4. PyTorch: Scoped Allocator Context
 
-GMS wraps the full VMM lifecycle in `client/cuda_vmm_utils.py`:
-- `reserve_va()` -> `cuMemAddressReserve`
-- `map_to_va()` -> `cuMemMap`
-- `set_access()` -> `cuMemSetAccess`
-- `unmap()` -> `cuMemUnmap`
-- `import_handle_from_fd()` -> `cuMemImportFromShareableHandle`
-  (for cross-process memory sharing via DMA-buf file descriptors)
+**What:** Make `CUDAPluggableAllocator` + `use_mem_pool` a first-class
+pattern with cleaner ergonomics.
 
-### SGLang Integration
+GMS already uses this via a C++ extension shim (`allocator.cpp`) that
+routes `malloc`/`free` through Python callbacks to the VMM manager.
+A cleaner API would reduce the boilerplate and make the pattern
+accessible without writing C++ extensions.
 
-GMS also integrates with SGLang (`integrations/sglang/`) using the same
-patterns, demonstrating that the allocator hook approach works across
-multiple inference frameworks, not just vLLM.
+## Deployment Tiers
 
-### What This Means for the Proposal
+The proposed changes enable a tiered deployment model where each tier
+is a fallback for when the tier above isn't available:
 
-The proposed changes are not speculative - they codify patterns that are
-already in production:
+| Tier | MX + GMS | MX + VMM compaction | MX + pool-reg |
+|---|---|---|---|
+| Prerequisite | GMS daemon on node | MX_VMM_COMPACT=1 | (default) |
+| Allocation | VMM from start | cudaMalloc, then compact | cudaMalloc |
+| Registration* | 1 call, 0.008s | 1 call, 0.008s | ~500 calls, 1.5s |
+| Compaction | none | 0.39s | none |
+| Same-node sharing | zero copy | no | no |
+| Total overhead* | 0.008s | 0.4s | 1.5s |
+
+*Registration numbers assume NIXL sub-region transfer fix (#1).
+Without it, all tiers fall back to per-tensor registration (~2.5s).
+
+VMM compaction exists as a standalone option for deployments that want
+near-optimal registration without the GMS daemon dependency. GMS+MX is
+the optimal path but requires both systems running.
+
+## Existing Prior Art: dynamo GPU Memory Service
+
+GMS already implements most of these patterns using today's private APIs:
 
 | Proposed API | Current Private API | Used By |
 |---|---|---|
-| `torch.cuda.ExternalStorage` | `torch._C._construct_storage_from_data_pointer` | GMS, ModelExpress |
-| Scoped allocator context | `torch.cuda.memory.use_mem_pool` + `CUDAPluggableAllocator` | GMS (vLLM, SGLang) |
+| `torch.cuda.ExternalStorage` | `torch._C._construct_storage_from_data_pointer` | GMS, MX |
+| Scoped allocator context | `CUDAPluggableAllocator` + `use_mem_pool` | GMS (vLLM, SGLang) |
 | Weight allocation hook | GMS `GMSModelLoader` pattern | GMS (vLLM, SGLang) |
 
-The difference is that GMS does cross-process sharing (one process loads,
-others import via shared VMM handles), while ModelExpress does cross-node
-RDMA transfer. Both need the same foundation: control over where weight
-memory lives so it can be efficiently registered for external access.
+### GMS code references
 
-Promoting these to public APIs eliminates the private-API fragility for
-both projects simultaneously, and opens the pattern to every RDMA/sharing
-framework in the ecosystem.
+- Tensor from pointer: `lib/gpu_memory_service/client/torch/tensor.py:75`
+- Pluggable allocator: `lib/gpu_memory_service/client/torch/allocator.py:57`
+- C++ allocator shim: `lib/gpu_memory_service/client/torch/extensions/allocator.cpp`
+- vLLM loader integration: `lib/gpu_memory_service/integrations/vllm/model_loader.py:142`
+- SGLang integration: `lib/gpu_memory_service/integrations/sglang/`
+- VMM utilities: `lib/gpu_memory_service/client/cuda_vmm_utils.py`
+- Cross-process sharing: `cuMemImportFromShareableHandle` via DMA-buf FDs
+
+The proposed changes codify patterns already in production across two
+independent systems (GMS for same-node sharing, MX for cross-node RDMA),
+demonstrating that the need is real and the APIs are proven.
 
 ## Who Benefits
 
-- **ModelExpress** - zero-overhead RDMA registration, no post-hoc hacks
-- **dynamo GPU Memory Service** - stabilizes existing production code paths
+- **ModelExpress** - O(1) RDMA registration, GMS integration for zero-copy local sharing
+- **dynamo GPU Memory Service** - stabilizes existing private API dependencies
 - **NCCL / Gloo** - any collective that needs ibv_reg_mr on torch tensors
-- **vLLM** - clean extension point for custom model delivery (replaces ad-hoc loader patterns)
-- **SGLang** - same benefits as vLLM, GMS already integrates
+- **vLLM** - clean extension point for custom model delivery
+- **SGLang** - same benefits, GMS already integrates
 - **TensorRT-LLM** - same weight loading patterns
 - **Cloud providers** - faster cold start for serverless inference
