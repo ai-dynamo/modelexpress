@@ -40,7 +40,7 @@ fd-lock = { workspace = true }
 [dev-dependencies]
 google-cloud-gax = { workspace = true }
 mockall = "0.13"
-tempfile = "3.20"
+tempfile = { workspace = true }
 tokio-test = "0.4"
 wiremock = "0.6.5"
 

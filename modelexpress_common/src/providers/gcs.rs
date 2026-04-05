@@ -351,27 +351,15 @@ impl<'a> ModelDir<'a> {
 
         fs::write(&temp_path, payload)
             .with_context(|| format!("Failed to write manifest '{}'", temp_path.display()))?;
-        match fs::remove_file(&manifest_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(anyhow::anyhow!(
-                    "Failed to replace manifest '{}': could not remove existing file: {}",
-                    manifest_path.display(),
-                    err
-                ));
-            }
-        }
-
-        if let Err(err) = fs::rename(&temp_path, &manifest_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(anyhow::anyhow!(
-                "Failed to move manifest '{}' into '{}': {}",
+        if let Err(err) = fs::rename(&temp_path, &manifest_path).with_context(|| {
+            format!(
+                "Failed to move manifest '{}' into '{}'",
                 temp_path.display(),
-                manifest_path.display(),
-                err
-            ));
+                manifest_path.display()
+            )
+        }) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err);
         }
 
         Ok(())
@@ -2377,6 +2365,10 @@ mod tests {
             )
             .expect("Expected manifest JSON");
             assert_eq!(parsed, final_manifest, "scenario={name}");
+            assert!(
+                !model_dir_state.manifest_temp_path().exists(),
+                "scenario={name}"
+            );
         }
     }
 
