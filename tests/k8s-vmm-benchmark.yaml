@@ -1,0 +1,179 @@
+# VMM compaction benchmark: Qwen2.5-3B on nScale B200 IB.
+#
+# Source loads from disk, target loads via RDMA.
+# Uses the existing MX server (modelexpress-server:8001).
+#
+# Deploy source first, wait for READY, then deploy target with desired config:
+#   MX_POOL_REG=0, MX_VMM_COMPACT=0  -> per-tensor baseline
+#   MX_POOL_REG=1, MX_VMM_COMPACT=0  -> pool-reg
+#   MX_VMM_COMPACT=1                  -> VMM compaction
+#   MX_VMM_COMPACT=1, MX_COALESCE_TRANSFERS=1 -> VMM + coalesce
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-source
+  namespace: nnoble-mx-tensor-walk
+  labels:
+    app: bench-source
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: dra
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: vllm
+      image: nnoble447/modelexpress-client:vmm-compact
+      imagePullPolicy: Always
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK, SYS_RESOURCE]
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          python3 -m vllm.entrypoints.openai.api_server \
+            --model Qwen/Qwen2.5-3B \
+            --download-dir /model-cache \
+            --load-format mx \
+            --tensor-parallel-size 1 \
+            --port 8080 \
+            --max-model-len 128
+      env:
+        - name: MX_SERVER_ADDRESS
+          value: "modelexpress-server.nnoble-mx-tensor-walk.svc.cluster.local:8001"
+        - name: MX_P2P_METADATA
+          value: "1"
+        - name: MX_METADATA_PORT
+          value: "5555"
+        - name: MX_POOL_REG
+          value: "1"
+        - name: MX_VMM_COMPACT
+          value: "0"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: MODEL_EXPRESS_LOG_LEVEL
+          value: "INFO"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: HF_TOKEN
+      ports:
+        - containerPort: 8080
+        - containerPort: 5555
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+        requests:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+          memory: "32Gi"
+          cpu: "8"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: model-cache
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-target
+  namespace: nnoble-mx-tensor-walk
+  labels:
+    app: bench-target
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: dra
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: bench-source
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: vllm
+      image: nnoble447/modelexpress-client:vmm-compact
+      imagePullPolicy: Always
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK, SYS_RESOURCE]
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          python3 -m vllm.entrypoints.openai.api_server \
+            --model Qwen/Qwen2.5-3B \
+            --download-dir /model-cache \
+            --load-format mx \
+            --tensor-parallel-size 1 \
+            --port 8080 \
+            --max-model-len 128
+      env:
+        - name: MX_SERVER_ADDRESS
+          value: "modelexpress-server.nnoble-mx-tensor-walk.svc.cluster.local:8001"
+        - name: MX_P2P_METADATA
+          value: "1"
+        - name: MX_METADATA_PORT
+          value: "5555"
+        # --- TOGGLE THESE FOR EACH BENCHMARK RUN ---
+        - name: MX_POOL_REG
+          value: "0"
+        - name: MX_VMM_COMPACT
+          value: "0"
+        - name: MX_COALESCE_TRANSFERS
+          value: "0"
+        # -------------------------------------------
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: MODEL_EXPRESS_LOG_LEVEL
+          value: "INFO"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: HF_TOKEN
+      ports:
+        - containerPort: 8080
+        - containerPort: 5555
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+        requests:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+          memory: "32Gi"
+          cpu: "8"
+      volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+        - name: shm
+          mountPath: /dev/shm
+  volumes:
+    - name: model-cache
+      persistentVolumeClaim:
+        claimName: model-cache
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi

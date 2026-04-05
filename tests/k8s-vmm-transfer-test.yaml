@@ -1,0 +1,206 @@
+# End-to-end RDMA transfer test with VMM-compacted source memory.
+#
+# Deploys two pods on separate nodes with B200 GPUs + InfiniBand:
+#   - vmm-source: creates test tensors, compacts into VMM, registers with NIXL
+#   - vmm-target: receives via RDMA READ, verifies data integrity
+#
+# Usage:
+#   kubectl apply -f k8s-vmm-transfer-test.yaml
+#   kubectl -n nnoble-mx-tensor-walk logs -f job/vmm-target
+#
+# Cleanup:
+#   kubectl delete ns nnoble-mx-tensor-walk
+---
+# Headless service for source pod DNS resolution.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmm-source
+  namespace: nnoble-mx-tensor-walk
+spec:
+  clusterIP: None
+  selector:
+    app: vmm-source
+  ports:
+    - port: 5555
+      targetPort: 5555
+      name: nixl
+      protocol: TCP
+    - port: 7777
+      targetPort: 7777
+      name: coord
+      protocol: TCP
+---
+# Source pod: VMM compaction + NIXL registration + serve via RDMA.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vmm-source
+  namespace: nnoble-mx-tensor-walk
+  labels:
+    app: vmm-source
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: dra
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: vmm-target
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: source
+      image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+      command: ["python3", "/test/test_vmm_transfer.py"]
+      args:
+        - --role
+        - source
+        - --listen-port
+        - "5555"
+        - --coord-port
+        - "7777"
+      ports:
+        - containerPort: 5555
+          name: nixl
+        - containerPort: 7777
+          name: coord
+      env:
+        - name: UCX_LOG_LEVEL
+          value: "INFO"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+        requests:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+          memory: "16Gi"
+          cpu: "4"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: test-script
+          mountPath: /test
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
+    - name: test-script
+      configMap:
+        name: vmm-transfer-test
+        defaultMode: 0755
+---
+# Target pod: RDMA READ from source, verify data.
+# Uses an init container to wait for source DNS to resolve.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vmm-target
+  namespace: nnoble-mx-tensor-walk
+  labels:
+    app: vmm-target
+spec:
+  restartPolicy: Never
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: dra
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: vmm-source
+          topologyKey: kubernetes.io/hostname
+  initContainers:
+    - name: wait-source
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "Waiting for vmm-source DNS to resolve..."
+          while true; do
+            ip=$(nslookup vmm-source.nnoble-mx-tensor-walk.svc.cluster.local 2>/dev/null | grep 'Address:' | tail -1 | awk '{print $2}')
+            if [ -n "$ip" ] && [ "$ip" != "#53" ]; then
+              echo "vmm-source resolved to $ip"
+              break
+            fi
+            echo "  Not ready yet, retrying..."
+            sleep 2
+          done
+          echo "Waiting 5s for source to finish NIXL setup..."
+          sleep 5
+  containers:
+    - name: target
+      image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.8.0
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+      command: ["python3", "/test/test_vmm_transfer.py"]
+      args:
+        - --role
+        - target
+        - --peer-ip
+        - vmm-source.nnoble-mx-tensor-walk.svc.cluster.local
+        - --peer-port
+        - "5555"
+        - --coord-port
+        - "7777"
+      env:
+        - name: UCX_LOG_LEVEL
+          value: "INFO"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+        requests:
+          nvidia.com/gpu: "1"
+          rdma/ib: "1"
+          memory: "16Gi"
+          cpu: "4"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: test-script
+          mountPath: /test
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
+    - name: test-script
+      configMap:
+        name: vmm-transfer-test
+        defaultMode: 0755
