@@ -198,14 +198,40 @@ class NixlTransferManager:
         # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
         nixl_reg_start = time.perf_counter()
         if vmm_range is not None:
-            # VMM: register individual tensors. They all live in one VMM
-            # allocation, so UCX calls ibv_reg_mr once for the range and
-            # caches the rkey. The per-tensor registration adds NIXL
-            # descriptors that prep_xfer_dlist can match by address.
+            # VMM two-phase registration:
+            # 1. Register the full VMM range as one tensor -> one ibv_reg_mr
+            #    call, populates UCX rcache for the entire VA range.
+            # 2. Register individual tensors -> NIXL creates per-tensor
+            #    descriptors for prep_xfer_dlist matching, but UCX returns
+            #    cached rkeys (no additional ibv_reg_mr kernel calls).
+            # This mirrors how __storage views work: one underlying
+            # registered region, multiple logical tensors inside it.
+            import torch
+            vmm_base, vmm_size = vmm_range
+            device = torch.device("cuda", self._device_id)
+            vmm_storage = torch._C._construct_storage_from_data_pointer(
+                vmm_base, device, vmm_size
+            )
+            vmm_tensor = torch.empty(0, dtype=torch.uint8, device=device)
+            vmm_tensor.set_(vmm_storage, 0, (vmm_size,))
+            self._vmm_tensor = vmm_tensor  # prevent GC
+
+            range_start = time.perf_counter()
+            self._agent.register_memory([vmm_tensor], backends=["UCX"])
+            range_time = time.perf_counter() - range_start
+
             tensor_list = list(tensors.values())
+            per_tensor_start = time.perf_counter()
             self._agent.register_memory(tensor_list, backends=["UCX"])
-            self._alloc_ends = [vmm_range[0] + vmm_range[1]]
-            reg_count = len(tensor_list)
+            per_tensor_time = time.perf_counter() - per_tensor_start
+
+            logger.info(
+                f"VMM two-phase registration: range={range_time:.3f}s (1 ibv_reg_mr), "
+                f"per-tensor={per_tensor_time:.3f}s ({len(tensor_list)} descriptors, "
+                f"rcache hits expected)"
+            )
+            self._alloc_ends = [vmm_base + vmm_size]
+            reg_count = len(tensor_list) + 1
         elif allocations:
             alloc_tuples = [
                 (base, size, self._device_id, "")
