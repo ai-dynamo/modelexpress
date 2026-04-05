@@ -288,15 +288,16 @@ def compact_tensors(
     if not tensors:
         return 0, 0, tensors, None  # type: ignore[return-value]
 
-    # Guard: storage views require reconstructing non-contiguous views
-    # after moving, which is not yet supported.
-    storage_views = [n for n in tensors if n.endswith(".__storage")]
-    if storage_views:
-        logger.warning(
-            f"VMM compaction skipped: {len(storage_views)} storage-view tensors "
-            f"present (non-contiguous weights). Falling back to pool registration."
+    # Identify __storage view tensors (flat byte views of non-contiguous
+    # tensor storages). These are compacted like regular tensors, but
+    # additionally require repointing the original non-contiguous model
+    # parameters to use the new VMM-backed storage.
+    storage_view_names = {n for n in tensors if n.endswith(".__storage")}
+    if storage_view_names:
+        logger.info(
+            f"VMM compaction: {len(storage_view_names)} storage-view tensors "
+            f"will be compacted with storage repointing"
         )
-        return 0, 0, tensors, None  # type: ignore[return-value]
 
     torch.cuda.set_device(device_id)
     total_start = time.perf_counter()
@@ -350,14 +351,31 @@ def compact_tensors(
     reserve_time = time.perf_counter() - reserve_start
     logger.info(f"[TIMING] VA reserve: {reserve_time:.3f}s, base=0x{arena.va_base:x}")
 
-    # Build reverse map: data_ptr -> model refs for repointing
+    # Build reverse maps for repointing.
+    # ptr_to_model_refs: data_ptr -> refs for contiguous tensors (simple .data= repoint)
+    # storage_to_model_refs: storage data_ptr -> refs for non-contiguous tensors
+    #   that share a storage (need set_ with original offset/shape/stride)
     ptr_to_model_refs: dict[int, list[tuple[str, nn.Parameter | torch.Tensor]]] = {}
+    storage_to_model_refs: dict[int, list[tuple[str, nn.Parameter | torch.Tensor, int, tuple, tuple]]] = {}
+
     for pname, param in model.named_parameters():
-        ptr = param.data.data_ptr()
+        t = param.data
+        ptr = t.data_ptr()
         ptr_to_model_refs.setdefault(ptr, []).append((pname, param))
+        if not t.is_contiguous() or t.storage_offset() != 0:
+            storage_ptr = t.untyped_storage().data_ptr()
+            storage_to_model_refs.setdefault(storage_ptr, []).append(
+                (pname, param, t.storage_offset(), tuple(t.shape), tuple(t.stride()))
+            )
     for bname, buf in model.named_buffers():
-        ptr = buf.data_ptr()
+        t = buf
+        ptr = t.data_ptr()
         ptr_to_model_refs.setdefault(ptr, []).append((bname, buf))
+        if not t.is_contiguous() or t.storage_offset() != 0:
+            storage_ptr = t.untyped_storage().data_ptr()
+            storage_to_model_refs.setdefault(storage_ptr, []).append(
+                (bname, buf, t.storage_offset(), tuple(t.shape), tuple(t.stride()))
+            )
 
     # Phase 4: Move tensors segment-by-segment.
     # For each cudaMalloc segment:
@@ -409,13 +427,20 @@ def compact_tensors(
                 )
                 new_tensors[name] = new_t
 
-                # Repoint model parameters AND buffers. tensor.data = x
-                # replaces the underlying storage in-place, so the module's
-                # reference (whether in _parameters or _buffers) now points
-                # at VMM memory without changing the object identity.
-                if old_ptr in ptr_to_model_refs:
-                    for _qname, ref in ptr_to_model_refs[old_ptr]:
-                        ref.data = new_t
+                # Repoint model parameters/buffers to VMM memory.
+                if name in storage_view_names:
+                    # __storage view: the flat byte blob was moved to VMM.
+                    # Repoint all model tensors sharing this storage using
+                    # set_ to preserve their original shape/stride/offset.
+                    if old_ptr in storage_to_model_refs:
+                        new_storage = new_t.untyped_storage()
+                        for _qname, ref, stor_offset, shape, stride in storage_to_model_refs[old_ptr]:
+                            ref.data.set_(new_storage, stor_offset, shape, stride)
+                else:
+                    # Contiguous tensor: simple .data replacement.
+                    if old_ptr in ptr_to_model_refs:
+                        for _qname, ref in ptr_to_model_refs[old_ptr]:
+                            ref.data = new_t
 
                 moved_bytes += data_bytes
 
