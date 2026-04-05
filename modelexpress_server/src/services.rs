@@ -10,7 +10,8 @@ use modelexpress_common::{
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
         model::{
             FileChunk, ModelDownloadRequest, ModelFileInfo, ModelFileList, ModelFilesRequest,
-            ModelStatusUpdate, model_service_server::ModelService,
+            ModelProvider as GrpcModelProvider, ModelStatusUpdate,
+            model_service_server::ModelService,
         },
     },
     models::{ModelProvider, ModelStatus},
@@ -38,23 +39,6 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
         std::env::var("HF_HUB_CACHE")
             .ok()
             .map(std::path::PathBuf::from)
-    }
-}
-
-/// Convert gRPC provider to internal ModelProvider enum
-///
-/// Falls back to HuggingFace provider if the conversion fails or an invalid
-/// provider value is provided. A warning is logged when fallback occurs.
-fn convert_provider(grpc_provider: i32) -> ModelProvider {
-    match modelexpress_common::grpc::model::ModelProvider::try_from(grpc_provider) {
-        Ok(provider) => provider.into(),
-        Err(_) => {
-            tracing::warn!(
-                "Invalid provider value {}, falling back to HuggingFace",
-                grpc_provider
-            );
-            ModelProvider::HuggingFace
-        }
     }
 }
 
@@ -183,7 +167,13 @@ impl ModelService for ModelServiceImpl {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         // Convert gRPC provider to our enum
-        let provider = convert_provider(model_request.provider);
+        let grpc_provider = GrpcModelProvider::try_from(model_request.provider).map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid provider value: {}",
+                model_request.provider
+            ))
+        })?;
+        let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&model_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let ignore_weights = model_request.ignore_weights;
@@ -202,8 +192,7 @@ impl ModelService for ModelServiceImpl {
                             Some("Previous download failed - retrying".to_string())
                         }
                     },
-                    provider: modelexpress_common::grpc::model::ModelProvider::from(provider)
-                        as i32,
+                    provider: grpc_provider as i32,
                 };
 
                 if tx.send(Ok(update)).await.is_err() {
@@ -232,7 +221,7 @@ impl ModelService for ModelServiceImpl {
                     ModelStatus::ERROR => Some("Model download failed".to_string()),
                     ModelStatus::DOWNLOADING => Some("Download still in progress".to_string()),
                 },
-                provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
+                provider: grpc_provider as i32,
             };
 
             let _ = tx.send(Ok(final_update)).await;
@@ -253,7 +242,13 @@ impl ModelService for ModelServiceImpl {
         };
 
         // Convert gRPC provider to our enum
-        let provider = convert_provider(files_request.provider);
+        let grpc_provider = GrpcModelProvider::try_from(files_request.provider).map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid provider value: {}",
+                files_request.provider
+            ))
+        })?;
+        let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let provider_impl = download::get_provider(provider);
@@ -426,7 +421,13 @@ impl ModelService for ModelServiceImpl {
         let files_request = request.into_inner();
 
         // Convert gRPC provider to our enum
-        let provider = convert_provider(files_request.provider);
+        let grpc_provider = GrpcModelProvider::try_from(files_request.provider).map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid provider value: {}",
+                files_request.provider
+            ))
+        })?;
+        let provider = ModelProvider::from(grpc_provider);
         let model_name = download::canonical_model_name(&files_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let provider_impl = download::get_provider(provider);
@@ -549,7 +550,7 @@ impl ModelDownloadTracker {
                 model_name: model_name.clone(),
                 status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
                 message,
-                provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
+                provider: GrpcModelProvider::from(provider) as i32,
             };
 
             for channel in channels {
@@ -619,8 +620,7 @@ impl ModelDownloadTracker {
                     status: modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
                         as i32,
                     message: Some("Database error occurred".to_string()),
-                    provider: modelexpress_common::grpc::model::ModelProvider::from(provider)
-                        as i32,
+                    provider: GrpcModelProvider::from(provider) as i32,
                 };
                 let _ = tx.send(Ok(error_update)).await;
                 return ModelStatus::ERROR;
@@ -636,7 +636,7 @@ impl ModelDownloadTracker {
                 ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
                 ModelStatus::ERROR => Some("Previous download failed - retrying".to_string()),
             },
-            provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
+            provider: GrpcModelProvider::from(provider) as i32,
         };
 
         let _ = tx.send(Ok(update)).await;
@@ -1219,6 +1219,57 @@ mod tests {
         assert!(result.is_err());
         let status = result.expect_err("Should return error");
         assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_model_downloaded_rejects_invalid_provider() {
+        let service = ModelServiceImpl;
+
+        let request = Request::new(ModelDownloadRequest {
+            model_name: "test/model".to_string(),
+            provider: 99,
+            ignore_weights: false,
+        });
+
+        let result = service.ensure_model_downloaded(request).await;
+        assert!(result.is_err());
+        let status = result.expect_err("Should return error");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Invalid provider value"));
+    }
+
+    #[tokio::test]
+    async fn test_list_model_files_rejects_invalid_provider() {
+        let service = ModelServiceImpl;
+
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: 99,
+            chunk_size: 0,
+        });
+
+        let result = service.list_model_files(request).await;
+        assert!(result.is_err());
+        let status = result.expect_err("Should return error");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Invalid provider value"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_model_files_rejects_invalid_provider() {
+        let service = ModelServiceImpl;
+
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: 99,
+            chunk_size: 1024,
+        });
+
+        let result = service.stream_model_files(request).await;
+        assert!(result.is_err());
+        let status = result.expect_err("Should return error");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("Invalid provider value"));
     }
 
     #[tokio::test]
