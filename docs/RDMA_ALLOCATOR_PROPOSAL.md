@@ -7,12 +7,18 @@ GPU memory with the InfiniBand HCA via `ibv_reg_mr`. This is a kernel call
 into the IB driver that takes 0.1-10ms per registration depending on region
 size. For large models, this dominates cold start time:
 
-| Model | Tensors | Registration Time | Transfer Time |
-|---|---|---|---|
-| Qwen2.5-3B (6 GB) | 255 | 0.06s | 0.23s |
-| DeepSeek-V2-Lite FP8 (16 GB) | 539 | 0.29s | 0.58s |
-| Kimi K2.5 NVFP4 (77 GB) | 2644 | 27s | 2.2s |
-| DeepSeek-V3 FP8 TP8 (86 GB/worker) | 1386 | 5.6s | 4.6-15.6s |
+| Model | Tensors/worker | Size/worker | Registration | Transfer |
+|---|---|---|---|---|
+| Qwen2.5-3B (6 GB) | 255 | 6 GB | 0.06s | 0.23s |
+| DeepSeek-V2-Lite FP8 (16 GB) | 539 | 16 GB | 0.29s | 0.58s |
+| Hermes 405B FP8 TP8 | 1264 | 51 GB | 2.6s | 1.9-12s |
+| DeepSeek-V3 FP8 TP8 EP8 | 1386 | 86 GB | 3.0s | 4.6-17s |
+| Kimi K2.5 NVFP4 TP8 (Nebius) | 2644 | 77 GB | 27s | 2.2s |
+
+All numbers are per-tensor baseline (no pool-reg or VMM). Registration
+time scales roughly linearly with tensor count x region size. The Nebius
+numbers (27s) are from a customer deployment on different hardware; the
+nScale B200 numbers (2.6-3.0s) reflect faster IB NICs.
 
 Registration takes 27 seconds for Kimi K2.5 while the actual RDMA transfer
 takes 2.2 seconds. The registration overhead comes from PyTorch's memory
@@ -30,8 +36,9 @@ registrations by ~80% (e.g., 1386 tensors -> 298 allocations). Speedup:
 ### VMM Compaction (prototype)
 After weight loading, compact all tensors into a single contiguous CUDA
 Virtual Memory range (`cuMemAddressReserve` / `cuMemCreate` / `cuMemMap`).
-One `ibv_reg_mr` call total. Uses segment-ordered freeing to limit peak
-VRAM overhead to one `cudaMalloc` segment (~2-256 MB).
+Uses segment-ordered freeing to limit peak VRAM overhead to one
+`cudaMalloc` segment (~2-256 MB). Handles non-contiguous tensors (FP8
+scales, MLA projections) via storage repointing.
 
 **Limitations of both approaches:**
 - Post-hoc: weights are loaded into fragmented memory, then moved or
@@ -39,10 +46,57 @@ VRAM overhead to one `cudaMalloc` segment (~2-256 MB).
   know about RDMA at allocation time.
 - Relies on `torch._C._construct_storage_from_data_pointer` (private API)
   to create tensors at arbitrary CUDA addresses.
-- Non-contiguous tensors (FP8 TMA scales, MLA projections) require
-  special handling as flat byte views.
-- Any component that captures raw GPU pointers before compaction gets
-  stale references.
+- VMM compaction moves tensors to new VA addresses. NIXL requires
+  per-tensor registration even when all tensors reside in a single
+  contiguous VMM range (see benchmark results below).
+
+## Benchmark Results
+
+All benchmarks on nScale B200 cluster with InfiniBand, pinned source/target
+nodes (identical NVIDIA driver 590.48.01, OFED upgrade-done), 3 runs per
+configuration, steady-state (R2+R3) medians reported.
+
+### Hermes 405B FP8, TP8 (1264 tensors, 51.32 GB/worker, 504 non-contiguous)
+
+| Config | Compaction | Registration | Regions | Metadata | Total |
+|---|---|---|---|---|---|
+| Per-tensor | - | 2.6s | 1264 | 454 KB | 2.6s |
+| Pool-reg | - | 1.65s | 524 | 189 KB | 1.65s |
+| VMM + per-tensor reg | 0.39s | 3.0s | 1264 | 454 KB | 3.4s |
+| VMM + range reg (projected) | 0.39s | ~0.005s | 1 | ~1 KB | **0.4s** |
+
+### DeepSeek-V3 FP8, TP8 EP8 (1386 tensors, 85.80 GB/worker)
+
+| Config | Registration (median) | Registration (best) |
+|---|---|---|
+| Per-tensor | 3.0s | 2.4s |
+| Pool-reg | 1.5s | 0.9s |
+
+### Key findings
+
+1. **Pool-reg provides 1.6-2.1x registration speedup.** Consistent across
+   models and runs. Reduces `ibv_reg_mr` calls by ~60-80% by registering
+   cudaMalloc segments instead of individual tensors.
+
+2. **VMM compaction works but doesn't improve registration time.** The
+   compaction itself is fast (0.39s for 51 GB), and storage repointing
+   handles non-contiguous tensors correctly. But NIXL requires per-tensor
+   registration because `prep_xfer_dlist` does exact descriptor matching,
+   not range containment. Per-tensor registration in VMM takes the same
+   time as per-tensor registration in cudaMalloc because UCX's rcache
+   keys on the tensor's device address, and compacted VMM addresses are
+   new (uncached).
+
+3. **NIXL range-based matching is the critical enabler.** With a single
+   VMM range registered and range-based `prep_xfer_dlist`, registration
+   drops from 1264 calls to 1. Projected registration: ~5ms instead of
+   2.6s. Combined with 0.39s compaction overhead, total would be **0.4s**
+   - a **4x improvement over pool-reg and 6.5x over baseline**.
+
+4. **Transfer speed is independent of registration mode.** All configs
+   achieve the same RDMA bandwidth (35-215 Gbps per worker, variance
+   from PCIe topology). Registration mode affects startup time, not
+   steady-state transfer performance.
 
 ## Proposed Changes
 
@@ -262,12 +316,19 @@ Target (RDMA receive):
 
 ## Priority Order
 
-1. **NIXL range-based matching** (highest impact, smallest change) -
-   enables single-registration VMM without per-tensor workaround
+1. **NIXL range-based matching** (highest impact, smallest change,
+   **benchmarks confirm this is the bottleneck**) - enables single-region
+   registration for VMM-compacted memory. Without this, VMM compaction
+   provides zero registration benefit because per-tensor registration is
+   still required. With this, projected 4-6x speedup over pool-reg on
+   Hermes 405B (0.4s vs 1.65s). The MX-side VMM compaction code is
+   already built and validated - NIXL is the gate.
 2. **PyTorch external memory API** (removes private API dependency) -
-   stabilizes the foundation all other work builds on
+   stabilizes the foundation all other work builds on. Currently using
+   `_construct_storage_from_data_pointer` in production (GMS, ModelExpress).
 3. **vLLM weight allocation hook** (eliminates compaction entirely) -
-   the endgame, but requires #1 and #2 first
+   the endgame, but requires #1 and #2 first. Would remove the 0.39s
+   compaction overhead and the storage repointing complexity.
 4. **PyTorch scoped allocator** (ergonomic improvement) - makes #3
    cleaner but not strictly necessary (can use VMM arena + pointer
    arithmetic directly)
