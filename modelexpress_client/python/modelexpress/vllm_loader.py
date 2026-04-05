@@ -581,6 +581,7 @@ class MxModelLoader(BaseModelLoader):
         except AttributeError:
             object.__setattr__(dummy_config, "load_format", "dummy")
         self._dummy_loader = DummyModelLoader(dummy_config)
+        self._vmm_arena = None  # VmmArena, kept alive to hold physical pages
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig
@@ -978,7 +979,7 @@ class MxModelLoader(BaseModelLoader):
     # ------------------------------------------------------------------
 
     def _register_tensors(self, model: nn.Module, global_rank: int, device_id: int) -> None:
-        """Collect model tensors and register them with NIXL."""
+        """Collect model tensors, optionally compact via VMM, and register with NIXL."""
         if not is_nixl_available():
             logger.warning(f"[Worker {global_rank}] NIXL not available, skipping registration")
             return
@@ -991,6 +992,21 @@ class MxModelLoader(BaseModelLoader):
             f"[Worker {global_rank}] [TIMING] Tensor collection: {collect_time:.3f}s "
             f"({len(self._tensors)} tensors)"
         )
+
+        # VMM compaction: move all tensors into a single contiguous VA range
+        # so NIXL only needs one ibv_reg_mr call instead of thousands.
+        from .vmm_compact import VMM_COMPACT_ENABLED, compact_tensors
+
+        if VMM_COMPACT_ENABLED:
+            compact_start = time.perf_counter()
+            va_base, va_size, self._tensors, self._vmm_arena = compact_tensors(
+                model, self._tensors, device_id
+            )
+            compact_time = time.perf_counter() - compact_start
+            logger.info(
+                f"[Worker {global_rank}] [TIMING] VMM compaction: {compact_time:.3f}s "
+                f"(VA=0x{va_base:x}, {va_size / 1e9:.2f} GB)"
+            )
 
         if self._nixl_manager is None:
             # Always enable the NIXL listen thread: targets need it to call
@@ -1007,8 +1023,11 @@ class MxModelLoader(BaseModelLoader):
             )
 
         if not self._nixl_manager.tensor_descriptors:
+            vmm_range = None
+            if self._vmm_arena is not None:
+                vmm_range = (self._vmm_arena.va_base, self._vmm_arena.total_size)
             reg_start = time.perf_counter()
-            self._nixl_manager.register_tensors(self._tensors)
+            self._nixl_manager.register_tensors(self._tensors, vmm_range=vmm_range)
             reg_time = time.perf_counter() - reg_start
             logger.info(
                 f"[Worker {global_rank}] [TIMING] Full registration pipeline: {reg_time:.3f}s"
