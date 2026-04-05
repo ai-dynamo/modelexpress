@@ -87,11 +87,15 @@ configuration, steady-state (R2+R3) medians reported.
    keys on the tensor's device address, and compacted VMM addresses are
    new (uncached).
 
-3. **NIXL range-based matching is the critical enabler.** With a single
-   VMM range registered and range-based `prep_xfer_dlist`, registration
-   drops from 1264 calls to 1. Projected registration: ~5ms instead of
-   2.6s. Combined with 0.39s compaction overhead, total would be **0.4s**
-   - a **4x improvement over pool-reg and 6.5x over baseline**.
+3. **NIXL range-based matching is the critical enabler.** We tested a
+   two-phase registration strategy: register the full VMM range first
+   (one `ibv_reg_mr`, 0.008s), then register individual tensors hoping
+   UCX's rcache would return cached rkeys. Result: per-tensor registration
+   still took 2.4s - NIXL calls `ibv_reg_mr` per tensor internally,
+   bypassing the rcache. This confirms the 0.008s floor is achievable
+   by the hardware, but requires NIXL API changes to exploit it. With
+   range-based `prep_xfer_dlist`, registration would be **0.008s + 0.39s
+   compaction = 0.4s total** - a **4x improvement over pool-reg**.
 
 4. **Transfer speed is independent of registration mode.** All configs
    achieve the same RDMA bandwidth (35-215 Gbps per worker, variance
