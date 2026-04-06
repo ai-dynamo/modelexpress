@@ -32,6 +32,7 @@
 .env.local
 *.local.toml
 .cargo/
+.claude/skills/
 
 # Backup files
 *~
@@ -52,3 +53,9 @@ models.db
 **/__pycache__/
 docs/FEEDBACK.md
 docs/optimization-comparison.md
+docs/tmp
+
+# Python
+.venv/
+*.egg-info/
+modelexpress_client/python/modelexpress.egg-info

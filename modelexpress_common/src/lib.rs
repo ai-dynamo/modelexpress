@@ -10,6 +10,9 @@ pub mod config;
 pub mod download;
 pub mod models;
 pub mod providers;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 
 // Generated gRPC code
 #[allow(clippy::similar_names)]
@@ -47,6 +50,12 @@ pub enum Error {
 
     #[error("Server returned error: {0}")]
     Server(String),
+
+    #[error("I/O error: {0}")]
+    Io(String),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
 
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -293,6 +302,12 @@ mod tests {
 
         let server_error = Error::Server("Internal error".to_string());
         assert!(server_error.to_string().contains("Server returned error"));
+
+        let io_error = Error::Io("Permission denied".to_string());
+        assert!(io_error.to_string().contains("I/O error"));
+
+        let validation_error = Error::Validation("Unsafe path".to_string());
+        assert!(validation_error.to_string().contains("Validation error"));
 
         let serialization_error = Error::Serialization("JSON parse error".to_string());
         assert!(

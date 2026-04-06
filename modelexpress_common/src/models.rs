@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use clap::{ValueEnum, builder::PossibleValue};
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 
 /// Status model for server health checks
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,11 +25,36 @@ pub enum ModelStatus {
 }
 
 /// Supported model providers
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ModelProvider {
     /// Hugging Face model hub
     #[default]
     HuggingFace,
+}
+
+impl ModelProvider {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HuggingFace => "hugging-face",
+        }
+    }
+}
+
+impl Display for ModelProvider {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ValueEnum for ModelProvider {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::HuggingFace]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(PossibleValue::new(self.as_str()))
+    }
 }
 
 /// Response for model status request
@@ -66,6 +93,20 @@ mod tests {
     fn test_model_provider_default() {
         let provider = ModelProvider::default();
         assert_eq!(provider, ModelProvider::HuggingFace);
+    }
+
+    #[test]
+    fn test_model_provider_display() {
+        assert_eq!(ModelProvider::HuggingFace.to_string(), "hugging-face");
+    }
+
+    #[test]
+    fn test_model_provider_value_enum_matches_display() {
+        let provider = ModelProvider::HuggingFace;
+        let parsed = ModelProvider::from_str(provider.as_str(), false)
+            .expect("Failed to parse ModelProvider from clap value");
+
+        assert_eq!(parsed, provider);
     }
 
     #[test]

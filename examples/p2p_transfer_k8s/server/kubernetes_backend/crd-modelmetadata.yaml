@@ -30,58 +30,59 @@ spec:
                 modelName:
                   type: string
                   description: Full model name (e.g., deepseek-ai/DeepSeek-V3)
-                expectedWorkers:
-                  type: integer
-                  description: Number of GPU workers expected to publish metadata
-                  default: 8
             status:
               type: object
               properties:
-                phase:
-                  type: string
-                  description: Current phase of the model metadata
-                  enum:
-                    - Pending
-                    - Initializing
-                    - Ready
-                    - Stale
-                  default: Pending
-                workers:
-                  type: array
-                  description: Per-worker NIXL metadata and readiness state
-                  items:
-                    type: object
-                    required:
-                      - workerRank
-                    properties:
-                      workerRank:
-                        type: integer
-                        description: Worker rank (0-indexed)
-                      nixlMetadata:
-                        type: string
-                        format: byte
-                        description: Base64-encoded NIXL agent metadata blob
-                      tensorCount:
-                        type: integer
-                        description: Number of tensors registered by this worker
-                      tensorConfigMap:
-                        type: string
-                        description: Name of ConfigMap containing tensor descriptors
-                      ready:
-                        type: boolean
-                        description: Whether worker has completed NIXL registration
-                        default: false
-                      stabilityVerified:
-                        type: boolean
-                        description: Whether worker has passed stability verification
-                        default: false
-                      sessionId:
-                        type: string
-                        description: Unique session ID for detecting source restarts
-                      publishedAt:
-                        type: string
-                        format: date-time
-                        description: Timestamp when worker metadata was published
+                worker:
+                  type: object
+                  description: Single worker NIXL metadata and readiness state (one CR per worker)
+                  required:
+                    - workerRank
+                  properties:
+                    workerRank:
+                      type: integer
+                      description: Worker rank (0-indexed)
+                    backendType:
+                      type: string
+                      description: Backend type discriminator (nixl, transfer_engine, none)
+                      enum:
+                        - nixl
+                        - transfer_engine
+                        - none
+                    nixlMetadata:
+                      type: string
+                      description: Base64-encoded NIXL agent metadata blob
+                    transferEngineSessionId:
+                      type: string
+                      description: Mooncake TransferEngine session ID (ip:port)
+                    tensorCount:
+                      type: integer
+                      description: Number of tensors registered by this worker
+                    tensorConfigMap:
+                      type: string
+                      description: Name of ConfigMap containing tensor descriptors
+                    metadataEndpoint:
+                      type: string
+                      description: P2P NIXL listen thread endpoint (host:port)
+                    agentName:
+                      type: string
+                      description: P2P NIXL agent name for remote identification
+                    workerGrpcEndpoint:
+                      type: string
+                      description: P2P worker gRPC endpoint for tensor manifest (host:port)
+                    status:
+                      type: string
+                      description: Worker lifecycle status
+                      enum:
+                        - Unknown
+                        - Initializing
+                        - Ready
+                        - Stale
+                      default: Unknown
+                    updatedAt:
+                      type: string
+                      format: date-time
+                      description: Timestamp of last status update (RFC3339)
                 conditions:
                   type: array
                   description: Conditions for ModelMetadata lifecycle
@@ -96,7 +97,6 @@ spec:
                         description: Condition type
                         enum:
                           - AllWorkersPublished
-                          - StabilityVerified
                           - Ready
                       status:
                         type: string
@@ -126,18 +126,6 @@ spec:
           type: string
           description: Model name
           jsonPath: .spec.modelName
-        - name: Phase
-          type: string
-          description: Current phase
-          jsonPath: .status.phase
-        - name: Workers
-          type: integer
-          description: Number of workers ready
-          jsonPath: .spec.expectedWorkers
-        - name: Ready
-          type: string
-          description: Ready condition
-          jsonPath: .status.conditions[?(@.type=="Ready")].status
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp

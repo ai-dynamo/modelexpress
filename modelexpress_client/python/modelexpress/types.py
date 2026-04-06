@@ -20,8 +20,13 @@ class TensorDescriptor:
 class WorkerMetadata:
     """Metadata for a single GPU worker."""
     worker_rank: int
-    nixl_metadata: bytes
     tensors: list[TensorDescriptor]
+    nixl_metadata: bytes = b""
+    transfer_engine_session_id: str = ""
+    # P2P metadata exchange fields (opt-in via MX_P2P_METADATA=1)
+    metadata_endpoint: str = ""
+    agent_name: str = ""
+    worker_grpc_endpoint: str = ""
 
 
 @dataclass
@@ -29,4 +34,3 @@ class GetMetadataResponse:
     """Response from GetMetadata RPC."""
     found: bool
     workers: list[WorkerMetadata]
-

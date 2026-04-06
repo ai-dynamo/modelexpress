@@ -4,6 +4,16 @@
 # ModelExpress Server with Redis backend (optional).
 # Use when you want metadata to persist across server restarts.
 # Deploy redis-standalone.yaml first, or use the Redis sidecar below.
+
+# ServiceAccount referenced by client manifests.
+# For Redis backend this is an empty SA (no RBAC bindings needed).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  labels:
+    app.kubernetes.io/name: modelexpress
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -65,7 +75,7 @@ spec:
 
       containers:
         - name: modelexpress-server
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:k8s-backend
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8001
@@ -78,7 +88,10 @@ spec:
               value: "redis://localhost:6379"
           resources:
             requests:
-              cpu: 4
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "4"
               memory: 8Gi
           livenessProbe:
             tcpSocket:
