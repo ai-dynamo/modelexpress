@@ -65,7 +65,6 @@ spec:
       labels:
         app: mx-vllm
     spec:
-      serviceAccountName: modelexpress
       # Spread pods across different nodes for true multi-node Ray
       affinity:
         podAntiAffinity:

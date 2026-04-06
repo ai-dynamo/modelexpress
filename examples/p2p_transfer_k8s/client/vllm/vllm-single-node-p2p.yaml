@@ -45,7 +45,6 @@ spec:
       labels:
         app: mx-vllm-p2p
     spec:
-      serviceAccountName: modelexpress
       containers:
         - name: vllm
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
