@@ -110,10 +110,18 @@ class MxModelLoader(BaseModelLoader):
 
             chain = LoadStrategyChain.build(ctx)
 
+            loaded = False
             for strategy in chain:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
                 if strategy.load(model, ctx):
+                    loaded = True
                     break
+
+            if not loaded:
+                raise RuntimeError(
+                    f"[Worker {ctx.global_rank}] No loading strategy succeeded "
+                    f"for model '{ctx.identity.model_name}'"
+                )
 
             # Update global registries
             _tensor_registry[ctx.device_id] = ctx.tensors

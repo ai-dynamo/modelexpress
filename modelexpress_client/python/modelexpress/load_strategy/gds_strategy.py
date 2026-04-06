@@ -41,13 +41,6 @@ class GdsStrategy(LoadStrategy):
             )
             model.load_weights(weights_iter)
             logger.info(f"[Worker {ctx.global_rank}] GDS weight loading complete")
-
-            with capture_tensor_attrs():
-                process_weights_after_loading(model, ctx.model_config, ctx.target_device)
-
-            register_tensors(model, ctx)
-            publish_metadata(ctx)
-            return True
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] GDS loading failed, falling through: {e}"
@@ -55,3 +48,10 @@ class GdsStrategy(LoadStrategy):
             return False
         finally:
             gds_loader.shutdown()
+
+        with capture_tensor_attrs():
+            process_weights_after_loading(model, ctx.model_config, ctx.target_device)
+
+        register_tensors(model, ctx)
+        publish_metadata(ctx)
+        return True

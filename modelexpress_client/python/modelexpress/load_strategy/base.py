@@ -40,7 +40,14 @@ class SourceTransferError(Exception):
 
 @dataclass
 class LoadContext:
-    """Shared state passed to all loading strategies."""
+    """Shared state passed to all loading strategies.
+
+    Rank semantics:
+        global_rank: unique rank across all TP/PP groups (torch.distributed.get_rank()).
+            Used for WorkerMetadata.worker_rank and source/target matching in RDMA.
+        device_id: local CUDA device ordinal / TP rank (get_tensor_model_parallel_rank()).
+            Used for CUDA device selection, port offsets (metadata_port + device_id).
+    """
 
     vllm_config: VllmConfig
     model_config: ModelConfig
