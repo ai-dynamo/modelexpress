@@ -28,7 +28,11 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 config = { version = "0.15", features = ["yaml", "toml", "json"] }
+crc32c = "0.6.8"
 colored = "3.0.0"
+fd-lock = "4.0.4"
+google-cloud-gax = "1.8.0"
+google-cloud-storage = { version = "1.9.0", default-features = false }
 hf-hub = { version = "0.4.3", default-features = false, features = [
     "tokio",
     "rustls-tls",
@@ -39,6 +43,7 @@ modelexpress-client = { path = "modelexpress_client", version = "0.3.0" }
 modelexpress-server = { path = "modelexpress_server", version = "0.3.0" }
 once_cell = "1.21.3"
 prost = "0.13"
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
