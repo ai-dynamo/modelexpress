@@ -301,12 +301,17 @@ def _get_worker_host() -> str:
     return fqdn
 
 
-def _init_nixl_manager(
-    global_rank: int, device_id: int, role: str, listen_port: int = 0,
-) -> NixlTransferManager:
+def _init_nixl_manager(global_rank: int, device_id: int, role: str) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     agent_name = f"mx-{role}-worker{global_rank}-{uuid.uuid4().hex[:8]}"
     logger.debug(f"[Worker {global_rank}] Initializing NIXL manager with agent_name={agent_name}")
+
+    listen_port = None
+    if _is_p2p_metadata_enabled():
+        base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+        listen_port = base_port + device_id
+        logger.info(f"[Worker {global_rank}] P2P metadata exchange enabled, listening on port {listen_port}")
+
     manager = NixlTransferManager(
         agent_name=agent_name,
         device_id=device_id,
@@ -431,6 +436,12 @@ def _publish_metadata_and_ready(
 
     if _is_p2p_metadata_enabled():
         from .worker_server import WorkerGrpcServer
+
+        if nixl_manager._listen_port is None:
+            raise RuntimeError(
+                "P2P metadata exchange requires a NIXL listen port, "
+                "but the NIXL manager was initialized without one."
+            )
 
         host = _get_worker_host()
 
@@ -997,13 +1008,7 @@ class MxModelLoader(BaseModelLoader):
         _log_tensor_summary(self._tensors, global_rank, "Registering tensors")
 
         if self._nixl_manager is None:
-            # Always enable the NIXL listen thread: targets need it to call
-            # fetch_remote_metadata on P2P sources, and every node becomes a
-            # source after receiving weights. Each worker needs a unique port
-            # (base + device_id) to avoid collisions in multi-GPU setups.
-            base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
-            listen_port = base_port + device_id
-            self._nixl_manager = _init_nixl_manager(global_rank, device_id, "auto", listen_port)
+            self._nixl_manager = _init_nixl_manager(global_rank, device_id, "auto")
 
         if not self._nixl_manager.tensor_descriptors:
             logger.debug(f"[Worker {global_rank}] Registering tensors with NIXL...")
