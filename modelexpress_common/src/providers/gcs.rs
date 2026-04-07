@@ -5,6 +5,7 @@ use crate::providers::ModelProviderTrait;
 use anyhow::{Context, Result};
 use google_cloud_storage::client::{Storage, StorageControl};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -46,16 +47,19 @@ impl GcsProvider {
     fn matches_request_path(path: &Path, ignore_weights: bool) -> bool {
         !ignore_weights || !Self::is_weight_file(path.to_string_lossy().as_ref())
     }
-}
 
-#[async_trait::async_trait]
-impl ModelProviderTrait for GcsProvider {
-    async fn download_model(
+    async fn download_with_clients<BuildClients, BuildFuture, S>(
         &self,
         model_name: &str,
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
-    ) -> Result<PathBuf> {
+        build_clients: BuildClients,
+    ) -> Result<PathBuf>
+    where
+        BuildClients: FnOnce() -> BuildFuture,
+        BuildFuture: Future<Output = Result<(Storage<S>, StorageControl)>>,
+        S: google_cloud_storage::stub::Storage + 'static,
+    {
         let cache_dir = cache_dir
             .ok_or_else(|| anyhow::anyhow!("GCS download requires cache_dir to be provided"))?;
         fs::create_dir_all(&cache_dir).with_context(|| {
@@ -75,17 +79,9 @@ impl ModelProviderTrait for GcsProvider {
             return Ok(model_dir);
         }
 
-        (ModelDir::new(&cache_dir, &model_dir)).ensure_available()?;
+        current_model_dir.ensure_available()?;
 
-        ensure_crypto_provider()?;
-        let storage = Storage::builder()
-            .build()
-            .await
-            .context("Failed to initialize Google Cloud Storage data client")?;
-        let control = StorageControl::builder()
-            .build()
-            .await
-            .context("Failed to initialize Google Cloud Storage control client")?;
+        let (storage, control) = build_clients().await?;
         let downloader = Downloader::new(&storage, &control, &model, current_model_dir);
         let manifest = current_model_dir
             .ensure_manifest(&model, &downloader)
@@ -124,6 +120,30 @@ impl ModelProviderTrait for GcsProvider {
         );
 
         Ok(model_dir)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProviderTrait for GcsProvider {
+    async fn download_model(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+        ignore_weights: bool,
+    ) -> Result<PathBuf> {
+        self.download_with_clients(model_name, cache_dir, ignore_weights, || async {
+            ensure_crypto_provider()?;
+            let storage = Storage::builder()
+                .build()
+                .await
+                .context("Failed to initialize Google Cloud Storage data client")?;
+            let control = StorageControl::builder()
+                .build()
+                .await
+                .context("Failed to initialize Google Cloud Storage control client")?;
+            Ok((storage, control))
+        })
+        .await
     }
 
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
@@ -405,12 +425,38 @@ mod test_support {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::test_support::{
-        expected_model_dir, manifest_entry, write_cached_model, write_incomplete_cached_model,
-        write_manifest_with_payloads,
+        TestStorageControlStub, expected_model_dir, gcs_object, manifest_entry, write_cached_model,
+        write_incomplete_cached_model, write_manifest_with_payloads,
     };
     use super::*;
     use crate::providers::ModelProviderTrait;
+    use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+    use google_cloud_storage::model::ListObjectsResponse;
     use tempfile::TempDir;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn mount_gcs_read_object(
+        server: &MockServer,
+        object_name: &str,
+        generation: i64,
+        body: &'static [u8],
+    ) {
+        let encoded_object_name = object_name.replace('/', "%2F");
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/storage/v1/b/test-bucket/o/{encoded_object_name}"
+            )))
+            .and(query_param("alt", "media"))
+            .and(query_param("generation", generation.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("x-goog-generation", generation.to_string()),
+            )
+            .mount(server)
+            .await;
+    }
 
     #[test]
     fn test_download_model_validation_cases() {
@@ -567,5 +613,89 @@ mod tests {
                 .expect("Expected successful delete");
             assert!(!model_dir.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn test_download_model_with_wiremock_gcs_data_client() {
+        let provider = GcsProvider;
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let server = MockServer::start().await;
+        let model_name = "gs://test-bucket/org/model/rev123";
+        let object_prefix = "org/model/rev123";
+
+        mount_gcs_read_object(&server, &format!("{object_prefix}/config.json"), 21, b"{}").await;
+        mount_gcs_read_object(
+            &server,
+            &format!("{object_prefix}/tokenizer.json"),
+            22,
+            b"{\"tokenizer\":true}",
+        )
+        .await;
+        mount_gcs_read_object(
+            &server,
+            &format!("{object_prefix}/weights/model.bin"),
+            23,
+            b"weights",
+        )
+        .await;
+
+        let control_stub = TestStorageControlStub::new([ListObjectsResponse::new().set_objects([
+            gcs_object(&format!("{object_prefix}/config.json"), b"{}", 21),
+            gcs_object(
+                &format!("{object_prefix}/tokenizer.json"),
+                b"{\"tokenizer\":true}",
+                22,
+            ),
+            gcs_object(
+                &format!("{object_prefix}/weights/model.bin"),
+                b"weights",
+                23,
+            ),
+            gcs_object(&format!("{object_prefix}/README.md"), b"ignored", 24),
+            gcs_object(&format!("{object_prefix}/image.png"), b"ignored", 25),
+        ])]);
+        let control = StorageControl::from_stub(control_stub.clone());
+
+        let result = provider
+            .download_with_clients(
+                model_name,
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                || async {
+                    ensure_crypto_provider()?;
+                    let storage = Storage::builder()
+                        .with_endpoint(server.uri())
+                        .with_credentials(Anonymous::new().build())
+                        .build()
+                        .await
+                        .context("Failed to initialize WireMock GCS data client")?;
+                    Ok((storage, control))
+                },
+            )
+            .await
+            .expect("Expected WireMock GCS download to succeed");
+
+        let model_dir = expected_model_dir(temp_dir.path(), model_name);
+        assert_eq!(result, model_dir);
+        assert_eq!(
+            fs::read(model_dir.join("config.json")).expect("Expected config.json"),
+            b"{}"
+        );
+        assert_eq!(
+            fs::read(model_dir.join("tokenizer.json")).expect("Expected tokenizer.json"),
+            b"{\"tokenizer\":true}"
+        );
+        assert_eq!(
+            fs::read(model_dir.join("weights/model.bin")).expect("Expected weights/model.bin"),
+            b"weights"
+        );
+        assert!(!model_dir.join("README.md").exists());
+        assert!(!model_dir.join("image.png").exists());
+        assert!(model_dir.join(".mx/manifest.json").is_file());
+
+        let list_requests = control_stub.list_requests();
+        assert_eq!(list_requests.len(), 1);
+        assert_eq!(list_requests[0].parent, "projects/_/buckets/test-bucket");
+        assert_eq!(list_requests[0].prefix, format!("{object_prefix}/"));
     }
 }

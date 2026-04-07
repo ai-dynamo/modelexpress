@@ -2442,6 +2442,7 @@ dependencies = [
  "crc32c",
  "fd-lock",
  "futures",
+ "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-storage",
  "hf-hub",

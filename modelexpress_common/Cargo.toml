@@ -39,6 +39,7 @@ crc32c = { workspace = true }
 fd-lock = { workspace = true }
 
 [dev-dependencies]
+google-cloud-auth = { version = "1.7.0", default-features = false }
 google-cloud-gax = { workspace = true }
 mockall = "0.13"
 tempfile = { workspace = true }
