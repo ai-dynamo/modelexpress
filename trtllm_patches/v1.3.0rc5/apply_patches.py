@@ -8,11 +8,13 @@ Run inside container:
 
 Patches 3 files to add LoadFormat.PRESHARDED support for ModelExpress P2P.
 """
+import importlib.util
 import re
 import sys
 from pathlib import Path
 
-SITE = Path("/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm")
+spec = importlib.util.find_spec("tensorrt_llm")
+SITE = Path(spec.submodule_search_locations[0]) if spec else Path("/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm")
 
 def patch_llm_args():
     """Add PRESHARDED = 3 to LoadFormat enum."""

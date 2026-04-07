@@ -468,15 +468,16 @@ def publish_from_worker(worker: Any) -> None:
         model_name, mpi_rank, device_id, len(param_tensors), total_bytes / 1e9,
     )
 
-    for name, tensor in list(param_tensors.items())[:5]:
-        val = tensor.to(torch.float32)
-        cksum = val.sum().item()
-        nonzero = (tensor != 0).sum().item()
-        logger.info(
-            "SOURCE CHECKSUM rank %d: %s shape=%s dtype=%s sum=%.4f nonzero=%d/%d",
-            mpi_rank, name, list(tensor.shape), tensor.dtype,
-            cksum, nonzero, tensor.numel(),
-        )
+    if logger.isEnabledFor(logging.DEBUG):
+        for name, tensor in list(param_tensors.items())[:5]:
+            val = tensor.to(torch.float32)
+            cksum = val.sum().item()
+            nonzero = (tensor != 0).sum().item()
+            logger.debug(
+                "SOURCE CHECKSUM rank %d: %s shape=%s dtype=%s sum=%.4f nonzero=%d/%d",
+                mpi_rank, name, list(tensor.shape), tensor.dtype,
+                cksum, nonzero, tensor.numel(),
+            )
 
     nixl_mgr = NixlTransferManager(
         agent_name=f"trtllm-live-source-rank{mpi_rank}-{os.getpid()}",
@@ -717,15 +718,15 @@ class MxLiveWeightLoader:
 
         # 8. Load any size-mismatched tensors from PVC checkpoint as fallback
         fallback_weights = {}
-        size_mismatched = [
+        size_mismatched = {
             src_name for src_name, src_desc in source_descs.items()
             if src_name in target_params
             and src_desc.size != target_params[src_name].numel() * target_params[src_name].element_size()
-        ]
+        }
         if size_mismatched:
             logger.info(
                 "Loading %d size-mismatched tensors from PVC fallback: %s...",
-                len(size_mismatched), size_mismatched[:3],
+                len(size_mismatched), list(size_mismatched)[:3],
             )
             try:
                 from safetensors import safe_open
@@ -736,7 +737,7 @@ class MxLiveWeightLoader:
                         for key in f.keys():
                             if key in size_mismatched:
                                 fallback_weights[key] = f.get_tensor(key)
-                                size_mismatched.remove(key)
+                                size_mismatched.discard(key)
                     if not size_mismatched:
                         break
                 if size_mismatched:

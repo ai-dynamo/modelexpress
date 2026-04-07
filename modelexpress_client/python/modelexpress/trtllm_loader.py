@@ -306,7 +306,7 @@ class MxTrtllmSourcePublisher:
         try:
             import safetensors.torch
         except ImportError:
-            raise ImportError("safetensors required. Install with: pip install safetensors")
+            raise ImportError("safetensors required. Install with: pip install safetensors") from None
 
         weights: dict[str, torch.Tensor] = {}
 
@@ -537,7 +537,7 @@ class MxTrtllmSourcePublisher:
         try:
             import safetensors.torch
         except ImportError:
-            raise ImportError("safetensors not installed. Install with: pip install safetensors")
+            raise ImportError("safetensors not installed. Install with: pip install safetensors") from None
         
         with torch.cuda.device(device_id):
             weights = safetensors.torch.load_file(
@@ -781,7 +781,7 @@ class MxTrtllmTargetLoader:
             
             # Receive via RDMA
             t0 = time.perf_counter()
-            bytes_received, _, duration = nixl_manager.receive_from_source(
+            bytes_received, _, _duration = nixl_manager.receive_from_source(
                 source_metadata=worker.nixl_metadata,
                 source_tensors=source_tensors,
                 timeout_seconds=600,
@@ -824,7 +824,7 @@ class MxTrtllmTargetLoader:
         try:
             import safetensors.torch
         except ImportError:
-            raise ImportError("safetensors required. Install with: pip install safetensors")
+            raise ImportError("safetensors required. Install with: pip install safetensors") from None
         
         # Move to CPU for saving
         cpu_weights = {k: v.cpu() for k, v in weights.items()}
@@ -973,7 +973,7 @@ class MxTrtllmTargetLoader:
             
             # Receive via RDMA
             t0 = time.perf_counter()
-            bytes_received, _, duration = nixl_manager.receive_from_source(
+            bytes_received, _, _duration = nixl_manager.receive_from_source(
                 source_metadata=worker.nixl_metadata,
                 source_tensors=source_tensors,
                 timeout_seconds=600,  # 10 minute timeout per rank
@@ -1100,7 +1100,7 @@ class MxTrtllmTargetLoader:
         try:
             from safetensors.torch import save_file
         except ImportError:
-            raise ImportError("safetensors required. Install with: pip install safetensors")
+            raise ImportError("safetensors required. Install with: pip install safetensors") from None
         
         # Save as single model.safetensors file
         weights_path = self.checkpoint_dir / "model.safetensors"
@@ -1171,7 +1171,7 @@ class MxTrtllmTargetLoader:
         try:
             import safetensors.torch
         except ImportError:
-            raise ImportError("safetensors not installed. Install with: pip install safetensors")
+            raise ImportError("safetensors not installed. Install with: pip install safetensors") from None
         
         # Move to CPU for saving
         cpu_weights = {k: v.cpu() for k, v in weights.items()}

@@ -217,7 +217,7 @@ spec:
           - name: infiniband
             hostPath:
               path: /dev/infiniband
-              type: DirectoryOrCreate
+              type: Directory
           - name: model-cache
             persistentVolumeClaim:
               claimName: shared-model-cache

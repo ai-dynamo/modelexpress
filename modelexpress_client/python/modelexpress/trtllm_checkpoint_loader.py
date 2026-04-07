@@ -109,7 +109,10 @@ _DTYPE_MAP = {
 }
 
 def _parse_dtype(dtype_str: str) -> torch.dtype:
-    return _DTYPE_MAP.get(dtype_str, torch.float16)
+    if dtype_str in _DTYPE_MAP:
+        return _DTYPE_MAP[dtype_str]
+    logger.warning("Unrecognized dtype '%s', defaulting to float16", dtype_str)
+    return torch.float16
 
 def _dtype_size(dtype: torch.dtype) -> int:
     return torch.tensor([], dtype=dtype).element_size()
@@ -281,38 +284,39 @@ class MxWeightLoader:
             ("grpc.max_receive_message_length", 200 * 1024 * 1024),
         ]
         channel = grpc.insecure_channel(server_addr, options=options)
-        stub = p2p_pb2_grpc.P2pServiceStub(channel)
+        try:
+            stub = p2p_pb2_grpc.P2pServiceStub(channel)
 
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                resp = stub.GetMetadata(
-                    p2p_pb2.GetMetadataRequest(model_name=model_name)
-                )
-                if resp.found and len(resp.workers) > 0:
-                    logger.info(
-                        "Found source: %d workers", len(resp.workers)
+            start = time.time()
+            while time.time() - start < timeout:
+                try:
+                    resp = stub.GetMetadata(
+                        p2p_pb2.GetMetadataRequest(model_name=model_name)
                     )
-                    # Log a few tensor shapes to verify metadata freshness
-                    w0 = resp.workers[0]
-                    for t in w0.tensors[:5]:
+                    if resp.found and len(resp.workers) > 0:
                         logger.info(
-                            "  Metadata tensor: %s size=%d shape=%s",
-                            t.name, t.size, list(t.shape),
+                            "Found source: %d workers", len(resp.workers)
                         )
-                    # Store for config loader to use
-                    self._source_meta = resp
-                    channel.close()
-                    return resp
-            except Exception as e:
-                logger.warning("Query failed: %s, retrying...", e)
+                        # Log a few tensor shapes to verify metadata freshness
+                        w0 = resp.workers[0]
+                        for t in w0.tensors[:5]:
+                            logger.info(
+                                "  Metadata tensor: %s size=%d shape=%s",
+                                t.name, t.size, list(t.shape),
+                            )
+                        # Store for config loader to use
+                        self._source_meta = resp
+                        return resp
+                except Exception as e:
+                    logger.warning("Query failed: %s, retrying...", e)
 
-            time.sleep(5)
+                time.sleep(5)
 
-        channel.close()
-        raise TimeoutError(
-            f"Source for '{model_name}' not found after {timeout}s"
-        )
+            raise TimeoutError(
+                f"Source for '{model_name}' not found after {timeout}s"
+            )
+        finally:
+            channel.close()
 
     def _allocate_tensors(
         self, tensor_protos, device_id: int
