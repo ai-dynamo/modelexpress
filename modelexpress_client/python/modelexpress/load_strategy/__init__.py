@@ -41,8 +41,8 @@ class LoadStrategyChain:
     and runs them until one succeeds.
     """
 
-    @classmethod
-    def run(cls, model: nn.Module, ctx: LoadContext) -> None:
+    @staticmethod
+    def run(model: nn.Module, ctx: LoadContext) -> None:
         """Build the chain and execute strategies until one succeeds.
 
         Raises RuntimeError if no strategy succeeds.
