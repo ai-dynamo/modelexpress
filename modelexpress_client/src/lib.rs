@@ -144,6 +144,23 @@ async fn create_stream_output_file(file_path: &std::path::Path) -> CommonResult<
         })
 }
 
+struct StreamedFileState {
+    path: PathBuf,
+    file: tokio::fs::File,
+    expected_size: u64,
+    bytes_written: u64,
+    saw_last_chunk: bool,
+}
+
+async fn sync_streamed_file(state: StreamedFileState) -> CommonResult<()> {
+    state.file.sync_all().await.map_err(|e| {
+        modelexpress_common::Error::Io(format!("Failed to sync file to disk {:?}: {e}", state.path))
+    })?;
+    drop(state.file);
+    debug!("Finished writing file: {:?}", state.path);
+    Ok(())
+}
+
 impl Client {
     /// Create a new client with the given configuration
     pub async fn new(config: Config) -> CommonResult<Self> {
@@ -227,32 +244,20 @@ impl Client {
         })
     }
 
-    /// Get the cache directory path for the requested provider, using the
-    /// provider's environment overrides first and then falling back to the
-    /// client's configured cache root.
-    fn get_cache_dir(&self, provider: ModelProvider) -> PathBuf {
-        use std::env;
-        if provider == ModelProvider::HuggingFace
-            && let Ok(cache_path) = env::var("HF_HUB_CACHE")
-        {
-            return PathBuf::from(cache_path);
-        }
-
-        if let Some(cache_config) = self.cache_config.as_ref() {
-            return cache_config.local_path.clone();
-        }
-
-        CacheConfig::discover()
-            .map(|config| config.local_path)
-            .unwrap_or_else(|_| CacheConfig::default().local_path)
-    }
-
     pub async fn get_model_path(
         &self,
         model_name: &str,
         provider: ModelProvider,
     ) -> anyhow::Result<PathBuf> {
-        let cache_dir = self.get_cache_dir(provider);
+        let cache_dir = self
+            .cache_config
+            .as_ref()
+            .map(|config| config.local_path.clone())
+            .unwrap_or_else(|| {
+                CacheConfig::discover()
+                    .map(|config| config.local_path)
+                    .unwrap_or_else(|_| CacheConfig::default().local_path)
+            });
         let model_path = download::get_provider(provider)
             .get_model_path(model_name, cache_dir)
             .await
@@ -260,52 +265,6 @@ impl Client {
 
         debug!("Found model path at {:?}", model_path);
         Ok(model_path)
-    }
-
-    /// Pre-download model to cache
-    /// When shared_storage is disabled, files will be streamed from server to client.
-    pub async fn preload_model_to_cache(
-        &mut self,
-        model_name: &str,
-        provider: ModelProvider,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        info!("Pre-loading model {} to cache", model_name);
-
-        // First try to download via server
-        match self
-            .request_model_with_provider(model_name, provider, ignore_weights)
-            .await
-        {
-            Ok(()) => {
-                info!("Model {} pre-loaded successfully via server", model_name);
-
-                // Check if we need to stream files from server (no shared storage)
-                let needs_streaming = self
-                    .cache_config
-                    .as_ref()
-                    .is_some_and(|c| !c.shared_storage);
-
-                if needs_streaming {
-                    info!(
-                        "Shared storage disabled, streaming files from server for model {}",
-                        model_name
-                    );
-                    self.stream_model_files_from_server(model_name, provider)
-                        .await?;
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                // Fallback to direct download
-                info!(
-                    "Server unavailable, pre-loading model {} directly. Error: {}",
-                    model_name, e
-                );
-                Self::download_model_directly(model_name, provider, ignore_weights).await
-            }
-        }
     }
 
     /// Get the server health status
@@ -363,76 +322,9 @@ impl Client {
         Ok(data)
     }
 
-    /// Request a model from the server with a specific provider and automatic fallback
-    /// This function will first try to use the server for streaming downloads.
-    /// If the server is unavailable, it will fallback to downloading directly.
-    /// When shared_storage is disabled, files will be streamed from server to client.
-    pub async fn request_model_with_provider_and_fallback(
-        &mut self,
-        model_name: impl Into<String>,
-        provider: ModelProvider,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        let model_name = model_name.into();
-
-        // First try the server-based approach
-        match self
-            .request_model_with_provider(&model_name, provider, ignore_weights)
-            .await
-        {
-            Ok(()) => {
-                info!("Model {} downloaded successfully via server", model_name);
-
-                // Check if we need to stream files from server (no shared storage)
-                let needs_streaming = self
-                    .cache_config
-                    .as_ref()
-                    .is_some_and(|c| !c.shared_storage);
-
-                if needs_streaming {
-                    info!(
-                        "Shared storage disabled, streaming files from server for model {}",
-                        model_name
-                    );
-                    self.stream_model_files_from_server(&model_name, provider)
-                        .await?;
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                // Check if it's a connection error (server not available)
-                if let modelexpress_common::Error::Transport(_) = *e {
-                    info!(
-                        "Server unavailable, falling back to direct download for model: {}",
-                        model_name
-                    );
-
-                    // Fallback to direct download
-                    let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
-                    match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
-                        Ok(_) => {
-                            info!(
-                                "Model {} downloaded successfully via direct download",
-                                model_name
-                            );
-                            Ok(())
-                        }
-                        Err(download_err) => Err(modelexpress_common::Error::Server(format!(
-                            "Both server and direct download failed. Server error: {e}. Download error: {download_err}"
-                        )).into()),
-                    }
-                } else {
-                    // For other types of errors, don't fallback
-                    Err(e)
-                }
-            }
-        }
-    }
-
-    /// Stream model files from the server to the local cache
-    /// This is used when shared storage is disabled
-    pub async fn stream_model_files_from_server(
+    /// Stream model files from the server to the local cache.
+    /// This is an internal helper used when shared storage is disabled.
+    async fn stream_model_files_from_server(
         &mut self,
         model_name: &str,
         provider: ModelProvider,
@@ -473,12 +365,21 @@ impl Client {
         let mut model_dir: Option<PathBuf> = None;
         let mut canonical_model_dir: Option<PathBuf> = None;
 
-        let mut current_file: Option<(PathBuf, tokio::fs::File)> = None;
+        let mut current_file: Option<StreamedFileState> = None;
         let mut files_received: u64 = 0;
         let mut bytes_received: u64 = 0;
         let mut saw_chunk = false;
+        let mut saw_final_chunk = false;
 
         while let Some(chunk_result) = stream.message().await? {
+            if saw_final_chunk {
+                return Err(modelexpress_common::Error::Validation(format!(
+                    "Received extra file chunk after the final stream marker for model {}",
+                    model_name
+                ))
+                .into());
+            }
+
             saw_chunk = true;
             if model_dir.is_none() {
                 let (dir, canonical_dir) = prepare_stream_model_dir(
@@ -511,6 +412,14 @@ impl Client {
 
             let file_path = model_dir_ref.join(&relative_path);
 
+            if chunk_result.offset > chunk_result.total_size {
+                return Err(modelexpress_common::Error::Validation(format!(
+                    "Received chunk with offset {} beyond total size {} for file {:?}",
+                    chunk_result.offset, chunk_result.total_size, chunk_result.relative_path
+                ))
+                .into());
+            }
+
             // Verify that the resolved path is still within model_dir
             // Create parent directory first if it doesn't exist to enable proper validation
             if let Some(parent) = file_path.parent() {
@@ -539,22 +448,31 @@ impl Client {
             // If this is a new file (different path or first chunk)
             let need_new_file = current_file
                 .as_ref()
-                .is_none_or(|(path, _)| path != &file_path);
+                .is_none_or(|state| state.path != file_path);
 
             if need_new_file {
                 // Close previous file if any
-                if let Some((prev_path, file)) = current_file.take() {
-                    file.sync_all().await.map_err(|e| {
-                        modelexpress_common::Error::Io(format!(
-                            "Failed to sync file to disk {:?}: {e}",
-                            prev_path
+                if let Some(previous_file) = current_file.take() {
+                    if !previous_file.saw_last_chunk
+                        || previous_file.bytes_written != previous_file.expected_size
+                    {
+                        return Err(modelexpress_common::Error::Validation(format!(
+                            "Received new file {:?} before previous file {:?} completed",
+                            chunk_result.relative_path, previous_file.path
                         ))
-                    })?;
-                    drop(file);
-                    debug!("Finished writing file: {:?}", prev_path);
+                        .into());
+                    }
+                    sync_streamed_file(previous_file).await?;
                 }
 
                 // Create new file (parent directory was already created during validation)
+                if chunk_result.offset != 0 {
+                    return Err(modelexpress_common::Error::Validation(format!(
+                        "Received first chunk for file {:?} with non-zero offset {}",
+                        chunk_result.relative_path, chunk_result.offset
+                    ))
+                    .into());
+                }
                 let file = create_stream_output_file(&file_path).await?;
 
                 debug!(
@@ -562,20 +480,80 @@ impl Client {
                     relative_path, chunk_result.total_size
                 );
                 files_received = files_received.saturating_add(1);
-                current_file = Some((file_path.clone(), file));
+                current_file = Some(StreamedFileState {
+                    path: file_path.clone(),
+                    file,
+                    expected_size: chunk_result.total_size,
+                    bytes_written: 0,
+                    saw_last_chunk: false,
+                });
             }
 
             // Write chunk to file
-            if let Some((_, ref mut file)) = current_file {
-                file.write_all(&chunk_result.data).await.map_err(|e| {
-                    modelexpress_common::Error::Io(format!("Failed to write to file: {e}"))
-                })?;
-                bytes_received = bytes_received.saturating_add(chunk_result.data.len() as u64);
+            if let Some(ref mut state) = current_file {
+                if state.saw_last_chunk {
+                    return Err(modelexpress_common::Error::Validation(format!(
+                        "Received extra chunk for completed file {:?}",
+                        chunk_result.relative_path
+                    ))
+                    .into());
+                }
+                if chunk_result.total_size != state.expected_size {
+                    return Err(modelexpress_common::Error::Validation(format!(
+                        "Received inconsistent total size for file {:?}: expected {}, got {}",
+                        chunk_result.relative_path, state.expected_size, chunk_result.total_size
+                    ))
+                    .into());
+                }
+                if chunk_result.offset != state.bytes_written {
+                    return Err(modelexpress_common::Error::Validation(format!(
+                        "Received unexpected offset {} for file {:?}; expected {}",
+                        chunk_result.offset, chunk_result.relative_path, state.bytes_written
+                    ))
+                    .into());
+                }
+
+                let chunk_len = chunk_result.data.len() as u64;
+                let next_size = state.bytes_written.saturating_add(chunk_len);
+                if next_size > state.expected_size {
+                    return Err(modelexpress_common::Error::Validation(format!(
+                        "Received chunk for file {:?} that exceeds the advertised size {}",
+                        chunk_result.relative_path, state.expected_size
+                    ))
+                    .into());
+                }
+
+                state
+                    .file
+                    .write_all(&chunk_result.data)
+                    .await
+                    .map_err(|e| {
+                        modelexpress_common::Error::Io(format!("Failed to write to file: {e}"))
+                    })?;
+                state.bytes_written = next_size;
+                bytes_received = bytes_received.saturating_add(chunk_len);
+
+                if chunk_result.is_last_chunk {
+                    if state.bytes_written != state.expected_size {
+                        return Err(modelexpress_common::Error::Validation(format!(
+                            "Received final chunk for file {:?} with {} bytes written; expected {}",
+                            chunk_result.relative_path, state.bytes_written, state.expected_size
+                        ))
+                        .into());
+                    }
+                    state.saw_last_chunk = true;
+                } else if state.bytes_written == state.expected_size {
+                    return Err(modelexpress_common::Error::Validation(format!(
+                        "Received non-final chunk that completed file {:?}",
+                        chunk_result.relative_path
+                    ))
+                    .into());
+                }
             }
 
             // Check if we're done with all files
             if chunk_result.is_last_file && chunk_result.is_last_chunk {
-                break;
+                saw_final_chunk = true;
             }
         }
 
@@ -587,16 +565,24 @@ impl Client {
             .into());
         }
 
+        if !saw_final_chunk {
+            return Err(modelexpress_common::Error::Server(format!(
+                "Server stream ended before the final file marker for model {}",
+                model_name
+            ))
+            .into());
+        }
+
         // Ensure the last file is properly closed
-        if let Some((path, file)) = current_file.take() {
-            file.sync_all().await.map_err(|e| {
-                modelexpress_common::Error::Io(format!(
-                    "Failed to sync final file to disk {:?}: {e}",
-                    path
+        if let Some(final_file) = current_file.take() {
+            if !final_file.saw_last_chunk || final_file.bytes_written != final_file.expected_size {
+                return Err(modelexpress_common::Error::Validation(format!(
+                    "Final streamed file {:?} ended incomplete",
+                    final_file.path
                 ))
-            })?;
-            drop(file);
-            debug!("Finished writing final file: {:?}", path);
+                .into());
+            }
+            sync_streamed_file(final_file).await?;
         }
 
         info!(
@@ -607,9 +593,8 @@ impl Client {
         Ok(())
     }
 
-    /// Request a model from the server with a specific provider
-    /// This function will wait until the model is downloaded using streaming updates
-    pub async fn request_model_with_provider(
+    /// Request a model on the server.
+    pub async fn request_model_on_server(
         &mut self,
         model_name: impl Into<String>,
         provider: ModelProvider,
@@ -676,34 +661,43 @@ impl Client {
         .into())
     }
 
-    /// Request a model from the server using the default provider (Hugging Face) with automatic fallback
-    /// This function will first try to use the server, then fallback to direct download if needed
+    /// Request a model through the client, using the server as the source of truth.
+    /// When shared_storage is disabled, files will be streamed from server to client.
+    ///
     pub async fn request_model(
         &mut self,
         model_name: impl Into<String>,
+        provider: ModelProvider,
         ignore_weights: bool,
     ) -> CommonResult<()> {
-        self.request_model_with_provider_and_fallback(
-            model_name,
-            ModelProvider::default(),
-            ignore_weights,
-        )
-        .await
+        let model_name = model_name.into();
+
+        self.request_model_on_server(&model_name, provider, ignore_weights)
+            .await?;
+
+        info!("Model {} downloaded successfully via server", model_name);
+
+        // Check if we need to stream files from server (no shared storage)
+        let needs_streaming = self
+            .cache_config
+            .as_ref()
+            .is_some_and(|c| !c.shared_storage);
+
+        if needs_streaming {
+            info!(
+                "Shared storage disabled, streaming files from server for model {}",
+                model_name
+            );
+            self.stream_model_files_from_server(&model_name, provider)
+                .await?;
+        }
+
+        Ok(())
     }
 
-    /// Request a model from the server only (no fallback)
-    /// This function will wait until the model is downloaded using streaming updates from the server
-    pub async fn request_model_server_only(
-        &mut self,
-        model_name: impl Into<String>,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        self.request_model_with_provider(model_name, ModelProvider::default(), ignore_weights)
-            .await
-    }
-
-    /// Request a model with automatic server fallback, creating client connection only if needed
+    /// Request a model with automatic server fallback, creating client connection only if needed.
     /// This function will try to download via server if possible, otherwise download directly
+    /// only if the initial client connection cannot be established.
     pub async fn request_model_with_smart_fallback(
         model_name: impl Into<String>,
         provider: ModelProvider,
@@ -712,46 +706,29 @@ impl Client {
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
-        // First try to create a client and use server-based download
         match Client::new(config.clone()).await {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
-                    .request_model_with_provider_and_fallback(&model_name, provider, ignore_weights)
+                    .request_model(&model_name, provider, ignore_weights)
                     .await
             }
             Err(e) => {
-                // If we can't even connect to the server, go straight to direct download
                 info!("Cannot connect to server ({}), downloading directly...", e);
-                Client::download_model_directly(&model_name, provider, ignore_weights).await
+                download::download_model(
+                    &model_name,
+                    provider,
+                    Some(config.cache.local_path.clone()),
+                    ignore_weights,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    modelexpress_common::Error::Generic(format!("Direct download failed: {e}"))
+                        .into()
+                })
             }
         }
-    }
-
-    /// Download a model directly without using the server
-    /// This bypasses the server entirely and downloads the model using the specified provider
-    pub async fn download_model_directly(
-        model_name: impl Into<String>,
-        provider: ModelProvider,
-        ignore_weights: bool,
-    ) -> CommonResult<()> {
-        let model_name = model_name.into();
-        info!(
-            "Downloading model {} directly using provider: {:?}",
-            model_name, provider
-        );
-
-        // Try to get cache configuration, but don't fail if not available
-        let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
-
-        download::download_model(&model_name, provider, cache_dir, ignore_weights)
-            .await
-            .map_err(|e| {
-                modelexpress_common::Error::Server(format!("Direct download failed: {e}"))
-            })?;
-
-        info!("Model {} downloaded successfully", model_name);
-        Ok(())
     }
 }
 
@@ -766,7 +743,6 @@ mod tests {
             FileChunk, ModelDownloadRequest, ModelFileList, ModelFilesRequest, ModelStatusUpdate,
             model_service_server::{ModelService, ModelServiceServer},
         },
-        test_support::{EnvVarGuard, acquire_env_mutex},
     };
     use std::collections::HashMap;
     #[cfg(unix)]
@@ -776,6 +752,11 @@ mod tests {
     use tonic::{Request, Response, Status, transport::Server};
 
     struct EmptyFileStreamModelService;
+    #[derive(Clone)]
+    struct ChunkSequenceModelService {
+        chunks: Vec<FileChunk>,
+    }
+    struct UnavailableModelService;
 
     #[tonic::async_trait]
     impl ModelService for EmptyFileStreamModelService {
@@ -797,6 +778,72 @@ mod tests {
             _request: Request<ModelFilesRequest>,
         ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
             Ok(Response::new(Box::pin(futures::stream::empty())))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for UnavailableModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            _request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            Err(Status::unavailable("test server unavailable"))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            Err(Status::unimplemented(
+                "stream_model_files is not used in this test",
+            ))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for ChunkSequenceModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            _request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            Err(Status::unimplemented(
+                "ensure_model_downloaded is not used in this test",
+            ))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            Ok(Response::new(Box::pin(futures::stream::iter(
+                self.chunks.clone().into_iter().map(Ok),
+            ))))
         }
 
         async fn list_model_files(
@@ -840,17 +887,6 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig::for_testing("http://test-endpoint:1234")
-    }
-
-    fn create_test_client(cache_config: Option<CacheConfig>) -> Client {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-
-        Client {
-            health_client: HealthServiceClient::new(channel.clone()),
-            api_client: ApiServiceClient::new(channel.clone()),
-            model_client: ModelServiceClient::new(channel),
-            cache_config,
-        }
     }
 
     #[test]
@@ -904,35 +940,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_get_cache_dir_for_hf_prefers_hf_hub_cache() {
-        let env_lock = acquire_env_mutex();
-        let hf_cache_dir = TempDir::new().expect("Failed to create HF cache dir");
-        let configured_cache_dir = TempDir::new().expect("Failed to create configured cache dir");
-        let _hf_cache_guard = EnvVarGuard::set(
-            &env_lock,
-            "HF_HUB_CACHE",
-            hf_cache_dir
-                .path()
-                .to_str()
-                .expect("Expected HF cache path"),
-        );
-
-        let cache_config = CacheConfig {
-            local_path: configured_cache_dir.path().to_path_buf(),
-            server_endpoint: "http://localhost:8001".to_string(),
-            timeout_secs: None,
-            shared_storage: true,
-            transfer_chunk_size: modelexpress_common::constants::DEFAULT_TRANSFER_CHUNK_SIZE,
-        };
-        let client = create_test_client(Some(cache_config));
-
-        assert_eq!(
-            client.get_cache_dir(ModelProvider::HuggingFace),
-            hf_cache_dir.path()
-        );
-    }
-
     // Note: Most client tests require a running server, so they would be integration tests
     // These unit tests focus on the configuration and setup logic
 
@@ -945,12 +952,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_model_directly_invalid_model() {
+    async fn test_direct_download_invalid_model() {
         // This test may fail if network is available and HF is accessible
         // In a real test environment, you might want to mock the download function
-        let result = Client::download_model_directly(
+        let result = download::download_model(
             "definitely-not-a-real-model-name-12345",
             ModelProvider::HuggingFace,
+            Some(ClientConfig::default().cache.local_path.clone()),
             false,
         )
         .await;
@@ -1146,8 +1154,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_model_files_from_server_requires_final_marker() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(ChunkSequenceModelService {
+            chunks: vec![FileChunk {
+                relative_path: "config.json".to_string(),
+                data: br#"{}"#.to_vec(),
+                offset: 0,
+                total_size: 2,
+                is_last_chunk: true,
+                is_last_file: false,
+                commit_hash: Some("abc123".to_string()),
+            }],
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        let result = client
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let err = result.expect_err("Expected missing final marker to fail");
+        assert!(
+            err.to_string().contains("final file marker"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_model_files_from_server_rejects_unexpected_offsets() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(ChunkSequenceModelService {
+            chunks: vec![
+                FileChunk {
+                    relative_path: "config.json".to_string(),
+                    data: b"{".to_vec(),
+                    offset: 0,
+                    total_size: 2,
+                    is_last_chunk: false,
+                    is_last_file: true,
+                    commit_hash: Some("abc123".to_string()),
+                },
+                FileChunk {
+                    relative_path: "config.json".to_string(),
+                    data: b"}".to_vec(),
+                    offset: 0,
+                    total_size: 2,
+                    is_last_chunk: true,
+                    is_last_file: true,
+                    commit_hash: None,
+                },
+            ],
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        let result = client
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let err = result.expect_err("Expected invalid offsets to fail");
+        assert!(
+            err.to_string().contains("unexpected offset"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_model_files_from_server_rejects_incomplete_previous_file() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(ChunkSequenceModelService {
+            chunks: vec![
+                FileChunk {
+                    relative_path: "config.json".to_string(),
+                    data: b"{".to_vec(),
+                    offset: 0,
+                    total_size: 2,
+                    is_last_chunk: false,
+                    is_last_file: false,
+                    commit_hash: Some("abc123".to_string()),
+                },
+                FileChunk {
+                    relative_path: "tokenizer.json".to_string(),
+                    data: b"a".to_vec(),
+                    offset: 0,
+                    total_size: 1,
+                    is_last_chunk: true,
+                    is_last_file: true,
+                    commit_hash: None,
+                },
+            ],
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        let result = client
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let err = result.expect_err("Expected incomplete previous file to fail");
+        assert!(
+            err.to_string().contains("before previous file"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_request_model_with_smart_fallback_no_server() {
-        // Test the smart fallback when server is not available
         let config = Config::for_testing("http://127.0.0.1:99999"); // Invalid port
 
         let result = Client::request_model_with_smart_fallback(
@@ -1158,9 +1295,7 @@ mod tests {
         )
         .await;
 
-        // Should fail because the model doesn't exist, but we should get past the connection attempt
         assert!(result.is_err());
-        // The error should indicate it tried to connect to the server but failed
         let error_msg = result.expect_err("Result should be an error").to_string();
         assert!(
             error_msg.contains("Direct download failed")
@@ -1168,6 +1303,37 @@ mod tests {
                 || error_msg.contains("gRPC error")
                 || error_msg.contains("h2 protocol error")
                 || error_msg.contains("connection")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_model_with_smart_fallback_does_not_direct_download_midflight() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(UnavailableModelService).await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+
+        let result = Client::request_model_with_smart_fallback(
+            "definitely-not-a-real-model-name-12345",
+            ModelProvider::HuggingFace,
+            config,
+            false,
+        )
+        .await;
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let err = result.expect_err("Expected server request failure");
+        let error_msg = err.to_string();
+        assert!(
+            !error_msg.contains("Direct download failed"),
+            "Smart fallback should not switch to direct download after the server path starts: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("gRPC error") || error_msg.contains("unavailable"),
+            "Expected a server-side availability error, got: {error_msg}"
         );
     }
 }
@@ -1242,7 +1408,11 @@ mod integration_tests {
             // Use a very small model for testing to avoid long download times
             // Note: This test might still take time and requires network access
             let result = client
-                .request_model_server_only("sentence-transformers/all-MiniLM-L6-v2", false)
+                .request_model_on_server(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    ModelProvider::default(),
+                    false,
+                )
                 .await;
 
             // We don't assert success here because it depends on network availability
