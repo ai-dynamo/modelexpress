@@ -45,27 +45,27 @@ Targets load weights in seconds instead of 15-24 minutes from PVC.
 tsh kube login dynamo-gcp-dev-01
 
 # 2. Dynamo platform (etcd + NATS) must be running
-kubectl -n kavin get pods  # verify etcd-0, nats-0
+kubectl -n default get pods  # verify etcd-0, nats-0
 
 # 3. Secrets
-kubectl -n kavin get secret hf-token-secret
-kubectl -n kavin get secret nvcr-imagepullsecret
+kubectl -n default get secret hf-token-secret
+kubectl -n default get secret nvcr-imagepullsecret
 
 # 4. ComputeDomain (creates IMEX channels for GPU allocation)
-cat <<EOF | kubectl -n kavin apply -f -
+cat <<EOF | kubectl -n default apply -f -
 apiVersion: resource.nvidia.com/v1beta1
 kind: ComputeDomain
 metadata:
-  name: kavin-compute-domain
+  name: my-compute-domain
 spec:
   numNodes: 0
   channel:
     resourceClaimTemplate:
-      name: kavin-compute-domain-channel
+      name: my-compute-domain-channel
 EOF
 
 # 5. Shared PVC with model files
-kubectl -n kavin get pvc shared-model-cache
+kubectl -n default get pvc shared-model-cache
 ```
 
 ---
@@ -77,33 +77,33 @@ Single worker type — serves both prefill and decode. Fastest to validate.
 ### Step 1: Deploy infrastructure
 
 ```bash
-kubectl -n kavin apply -f mx-infra-decode.yaml
+kubectl -n default apply -f mx-infra-decode.yaml
 # Creates: modelexpress-server-decode + redis-decode
 ```
 
 ### Step 2: Deploy source (loads from PVC, publishes via RDMA)
 
 ```bash
-kubectl -n kavin apply -f kimi-source-decode-dgd.yaml
+kubectl -n default apply -f kimi-source-decode-dgd.yaml
 # TP=8 across 2 nodes, loads ~15 min from PVC
-# Watch: kubectl -n kavin logs -f <source-leader-pod> | grep "published ALL"
+# Watch: kubectl -n default logs -f <source-leader-pod> | grep "published ALL"
 ```
 
 ### Step 3: Deploy target (receives weights via P2P)
 
 ```bash
 # After source publishes:
-kubectl -n kavin apply -f kimi-target-agg-tp8-dgd.yaml
+kubectl -n default apply -f kimi-target-agg-tp8-dgd.yaml
 # TP=8, loads via RDMA in ~2 seconds
-# Watch: kubectl -n kavin logs -f <target-leader-pod> | grep "Gbps"
+# Watch: kubectl -n default logs -f <target-leader-pod> | grep "Gbps"
 ```
 
 ### Step 4: Test inference
 
 ```bash
-FRONTEND=$(kubectl -n kavin get pod -l app.kubernetes.io/part-of=kimi-target-agg-tp8 \
+FRONTEND=$(kubectl -n default get pod -l app.kubernetes.io/part-of=kimi-target-agg-tp8 \
   -l nvidia.com/dynamo-component=frontend -o name | head -1)
-kubectl -n kavin exec $FRONTEND -- curl -s http://localhost:8000/v1/chat/completions \
+kubectl -n default exec $FRONTEND -- curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3",
        "messages":[{"role":"user","content":"What is the capital of France?"}],
@@ -120,15 +120,15 @@ weights via P2P from the same MX source.
 ### Step 1: Deploy infrastructure + source
 
 ```bash
-kubectl -n kavin apply -f mx-infra-decode.yaml
-kubectl -n kavin apply -f kimi-source-decode-dgd.yaml
+kubectl -n default apply -f mx-infra-decode.yaml
+kubectl -n default apply -f kimi-source-decode-dgd.yaml
 # Wait for source to publish (~15 min)
 ```
 
 ### Step 2: Deploy disagg targets
 
 ```bash
-kubectl -n kavin apply -f kimi-disagg-mx-tp8-dgd.yaml
+kubectl -n default apply -f kimi-disagg-mx-tp8-dgd.yaml
 # Creates: Frontend (KV router) + Prefill (MX target) + Decode (MX target)
 # Both load via P2P concurrently
 ```
@@ -136,9 +136,9 @@ kubectl -n kavin apply -f kimi-disagg-mx-tp8-dgd.yaml
 ### Step 3: Test inference
 
 ```bash
-FRONTEND_IP=$(kubectl -n kavin get pod -l app.kubernetes.io/part-of=kimi-disagg-mx-tp8 \
+FRONTEND_IP=$(kubectl -n default get pod -l app.kubernetes.io/part-of=kimi-disagg-mx-tp8 \
   -l nvidia.com/dynamo-component=frontend -o jsonpath='{.items[0].status.podIP}')
-kubectl -n kavin exec <any-worker-pod> -- curl -s http://${FRONTEND_IP}:8000/v1/chat/completions \
+kubectl -n default exec <any-worker-pod> -- curl -s http://${FRONTEND_IP}:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3",
        "messages":[{"role":"user","content":"What is the capital of France?"}],
@@ -150,7 +150,7 @@ kubectl -n kavin exec <any-worker-pod> -- curl -s http://${FRONTEND_IP}:8000/v1/
 To validate disagg works without P2P (both workers load from PVC):
 
 ```bash
-kubectl -n kavin apply -f kimi-disagg-baseline-dgd.yaml
+kubectl -n default apply -f kimi-disagg-baseline-dgd.yaml
 # No MX source needed — loads directly from shared-model-cache PVC
 ```
 
@@ -225,13 +225,13 @@ env:
 
 ```bash
 # Delete all workloads
-kubectl -n kavin delete dgd --all
+kubectl -n default delete dgd --all
 
 # Delete compute domain (releases IMEX channels)
-kubectl -n kavin delete computedomain kavin-compute-domain
+kubectl -n default delete computedomain my-compute-domain
 
 # Keep infra running for next deployment
-# kubectl -n kavin delete -f mx-infra-decode.yaml  # if needed
+# kubectl -n default delete -f mx-infra-decode.yaml  # if needed
 ```
 
 ---
@@ -245,16 +245,16 @@ Dynamo TRT-LLM base image.
 
 | Repo | Branch | What it provides |
 |------|--------|-----------------|
-| `modelexpress` | `kavink/trtllm` | MX client, NIXL transfer, TRT-LLM patches |
-| `dynamo` | `kavink/trtllm-p2p` | Engine P2P hooks (`--model-express-url`) |
-| `TensorRT-LLM` | `kavink/presharded-weight-loading` | `LoadFormat.PRESHARDED` (applied via patches) |
+| `modelexpress` | your modelexpress branch | MX client, NIXL transfer, TRT-LLM patches |
+| `dynamo` | the Dynamo branch with P2P support | Engine P2P hooks (`--model-express-url`) |
+| `TensorRT-LLM` | your TRT-LLM branch | `LoadFormat.PRESHARDED` (applied via patches) |
 
 ### Directory layout
 
 ```
 ~/work/github/
-├── modelexpress/   (kavink/trtllm branch)
-└── dynamo/         (kavink/trtllm-p2p branch)
+├── modelexpress/   (your modelexpress branch)
+└── dynamo/         (the Dynamo branch with P2P support)
 ```
 
 ### Build command
@@ -265,7 +265,7 @@ cd ~/work/github/modelexpress
 docker buildx build --platform linux/arm64 --no-cache \
     -f examples/p2p_transfer_trtllm/Dockerfile.ph3-gcp-gb200 \
     --build-context dynamo=../dynamo \
-    -t nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.8.0 \
+    -t <REGISTRY>/dynamo-trtllm-mx:<TAG> \
     --push .
 ```
 
@@ -297,5 +297,5 @@ base image instead of `karenc:dynamo-trtllm-v1.0.0-a9b6f95`.
 ### Current image
 
 ```
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.8.0
+<REGISTRY>/dynamo-trtllm-mx:<TAG>
 ```

@@ -11,13 +11,13 @@
 # - ARM64 (aarch64)
 # - Dynamo worker (python3 -m dynamo.trtllm)
 #
-# Requires dynamo fork at ../dynamo (kavink/trtllm-p2p branch)
+# Requires dynamo fork at ../dynamo (the Dynamo branch with P2P support)
 #
 # Build (from modelexpress repo root):
 #   docker buildx build --platform linux/arm64 --no-cache \
 #       -f examples/p2p_transfer_trtllm/Dockerfile.ph3-gcp-gb200 \
 #       --build-context dynamo=../dynamo \
-#       -t nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-latest \
+#       -t <REGISTRY>/dynamo-trtllm-mx:<TAG> \
 #       --push .
 FROM nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
 
@@ -42,7 +42,7 @@ RUN cd /tmp/modelexpress_client && \
     rm -rf /tmp/modelexpress_client /tmp/proto
 
 # Apply Dynamo P2P hooks (--model-express-url support)
-# From kavink/trtllm-p2p branch: backend_args.py, engine.py, llm_worker.py
+# From the Dynamo branch with P2P support: backend_args.py, engine.py, llm_worker.py
 COPY --from=dynamo components/src/dynamo/trtllm/backend_args.py /tmp/dynamo_p2p/backend_args.py
 COPY --from=dynamo components/src/dynamo/trtllm/engine.py /tmp/dynamo_p2p/engine.py
 COPY --from=dynamo components/src/dynamo/trtllm/workers/llm_worker.py /tmp/dynamo_p2p/llm_worker.py

@@ -4,7 +4,7 @@
 # Kimi K2.5 decode source — DGD with multinode TP=8 (2 nodes × 4 GPUs)
 # Publishes weights via NIXL to modelexpress-server-decode
 # Phase 2: provides TP=8 weights for decode targets
-# Namespace: kavin
+# Namespace: default
 #
 # Prerequisites:
 #   - modelexpress-server-decode + redis-decode running (mx-infra-decode.yaml)
@@ -66,6 +66,7 @@ spec:
         dnsPolicy: ClusterFirstWithHostNet
         securityContext: {}
         affinity:
+          # Update node pool names for your cluster
           nodeAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
               nodeSelectorTerms:
@@ -73,8 +74,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - customer-gpu-w0e
-                  - customer-gpu-o7v
+                  - <GPU_NODE_POOL>
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -88,7 +88,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.13.0
+          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -105,7 +105,7 @@ spec:
             - --extra-engine-args
             - /config/source-decode.yaml
             - --model-express-url
-            - modelexpress-server-decode.kavin.svc.cluster.local:8001
+            - modelexpress-server-decode.default.svc.cluster.local:8001
             - --model-express-role
             - source
             - --tensor-parallel-size
@@ -116,11 +116,11 @@ spec:
                 fieldRef:
                   fieldPath: metadata.uid
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.kavin.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.default.svc.cluster.local:8001"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: MODEL_EXPRESS_SOURCE
@@ -212,7 +212,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: kavin-compute-domain-channel
+            resourceClaimTemplateName: my-compute-domain-channel
         volumes:
           - name: infiniband
             hostPath:
