@@ -95,7 +95,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 *Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
 
-- **modelexpress_server**: gRPC server with configurable metadata backends (in-memory, Redis, Kubernetes CRD). Layered in-memory with persistence is recommended for high availability.
+- **modelexpress_server**: gRPC server with configurable metadata backends (Redis, Kubernetes CRD).
 - **modelexpress_client**: Rust CLI for cache management; Python package with vLLM loaders and `MxClient` for gRPC.
 - **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
 
@@ -105,14 +105,17 @@ See [Architecture](docs/ARCHITECTURE.md).
 
 ## Quick Start
 
-**Requirements:** Rust 1.90+, `protoc`, Docker (optional)
+**Requirements:** Rust 1.90+, `protoc`, Docker
 
 ```bash
 git clone https://github.com/ai-dynamo/modelexpress.git
 cd modelexpress
 
+# Start a local Redis instance for metadata storage
+docker run -d --name redis -p 6379:6379 redis:8-alpine
+
 cargo build
-cargo run --bin modelexpress-server
+MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server
 ```
 
 Server listens on `0.0.0.0:8001`. In another terminal:
@@ -155,7 +158,6 @@ First instance loads from disk; subsequent instances receive via RDMA. [P2P guid
 
 ```bash
 docker-compose up --build
-# Or: docker build -t modelexpress . && docker run -p 8001:8001 modelexpress
 ```
 
 ---
@@ -168,7 +170,8 @@ docker-compose up --build
 |----------|---------|-------------|
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
-| `MX_METADATA_BACKEND` | `memory` | `memory` \| `redis` \| `kubernetes` |
+| `MX_METADATA_BACKEND` | (required) | `redis` \| `kubernetes` |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (`redis` backend only) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server (P2P) |
 | `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | InfiniBand transports |
 
