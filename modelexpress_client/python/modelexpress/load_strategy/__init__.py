@@ -11,7 +11,8 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+
+import torch.nn as nn
 
 from .base import (
     LoadContext,
@@ -20,9 +21,6 @@ from .base import (
     register_tensors,
     publish_metadata,
 )
-
-if TYPE_CHECKING:
-    pass
 
 __all__ = [
     "LoadContext",
@@ -37,11 +35,18 @@ logger = logging.getLogger("modelexpress.load_strategy")
 
 
 class LoadStrategyChain:
-    """Build a prioritized chain of eligible loading strategies."""
+    """Prioritized chain of model loading strategies.
 
-    @staticmethod
-    def build(ctx: LoadContext) -> list[LoadStrategy]:
-        """Return strategies ordered by priority, filtered to available ones."""
+    Detects the environment, builds an ordered list of eligible loaders,
+    and runs them until one succeeds.
+    """
+
+    @classmethod
+    def run(cls, model: nn.Module, ctx: LoadContext) -> None:
+        """Build the chain and execute strategies until one succeeds.
+
+        Raises RuntimeError if no strategy succeeds.
+        """
         from .rdma_strategy import RdmaStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
@@ -53,4 +58,13 @@ class LoadStrategyChain:
         ]
         eligible = [s for s in all_strategies if s.is_available(ctx)]
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
-        return eligible
+
+        for strategy in eligible:
+            logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
+            if strategy.load(model, ctx):
+                return
+
+        raise RuntimeError(
+            f"[Worker {ctx.global_rank}] No loading strategy succeeded "
+            f"for model '{ctx.identity.model_name}'"
+        )

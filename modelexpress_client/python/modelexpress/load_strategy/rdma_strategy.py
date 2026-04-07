@@ -169,7 +169,6 @@ class RdmaStrategy(LoadStrategy):
 
         self._receive_from_peer(model, ctx, source_worker, mx_source_id)
 
-        register_tensors(model, ctx)
         publish_metadata(ctx)
 
     def _receive_from_peer(
