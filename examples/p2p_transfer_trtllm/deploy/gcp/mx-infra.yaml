@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress server + Redis for GCP GB200 cluster
+# Deploys on customer-cpu nodes (amd64) — reachable from GPU pods
+# Namespace: kavin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: customer-cpu
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: user-workload
+          effect: NoExecute
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "0.5"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: customer-cpu
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: user-workload
+          effect: NoExecute
+      containers:
+        - name: server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+spec:
+  selector:
+    app: modelexpress-server
+  ports:
+    - port: 8001
+      targetPort: 8001

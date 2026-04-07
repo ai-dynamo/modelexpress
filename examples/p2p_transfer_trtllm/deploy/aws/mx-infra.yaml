@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress server + Redis for AWS GB200 cluster
+# Namespace: kavin
+#
+# Redis and MX server already deployed via existing service objects.
+# This file creates the model-cache PVC (FSx/Lustre RWX) and the MX server pod.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: dgxc-enterprise-file
+  resources:
+    requests:
+      storage: 1200Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  labels:
+    app: modelexpress-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: system-workload
+          effect: NoSchedule
+        - key: dedicated
+          operator: Equal
+          value: system-workload
+          effect: NoExecute
+      containers:
+        - name: server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            - name: REDIS_URL
+              value: "redis://redis.kavin.svc.cluster.local:6379"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

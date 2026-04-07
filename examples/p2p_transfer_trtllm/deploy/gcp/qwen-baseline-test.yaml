@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen 0.5B TP=2 on karenc's base image — NCCL baseline test
+# No ModelExpress patches, no publish_from_worker
+# If this works, our patches break NCCL
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen-baseline-config
+data:
+  aggregated.yaml: |
+    max_num_tokens: 2048
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: false
+    cuda_graph_config: null
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.75
+      tokens_per_block: 32
+    max_batch_size: 8
+    max_seq_len: 4096
+    num_postprocess_workers: 1
+    print_iter_log: true
+    tensor_parallel_size: 2
+    trust_remote_code: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-baseline
+  labels:
+    app: qwen-baseline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-baseline
+  template:
+    metadata:
+      labels:
+        app: qwen-baseline
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoExecute
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - effect: NoSchedule
+          key: kubernetes.io/arch
+          operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - customer-gpu-w0e
+                - customer-gpu-o7v
+      containers:
+        - name: source
+          image: nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          command: ["python3", "-m", "dynamo.trtllm"]
+          args:
+            - --model-path
+            - Qwen/Qwen2.5-0.5B
+            - --served-model-name
+            - Qwen/Qwen2.5-0.5B
+            - --extra-engine-args
+            - /config/aggregated.yaml
+          env:
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: HF_HOME
+              value: /model-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+          startupProbe:
+            failureThreshold: 30
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+            requests:
+              nvidia.com/gpu: "2"
+              memory: "16Gi"
+              cpu: "4"
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+          workingDir: /workspace/
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: trtllm-config
+          configMap:
+            name: qwen-baseline-config
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

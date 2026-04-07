@@ -1,0 +1,268 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi K2.5 aggregated TP=8 — loads from PVC (no MX P2P)
+# Baseline to verify engine config produces correct output
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-target-pvc-tp8-config
+data:
+  aggregated.yaml: |
+    max_num_tokens: 8192
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    cuda_graph_config:
+      max_batch_size: 8
+      enable_padding: true
+    enable_attention_dp: true
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.75
+      tokens_per_block: 32
+    max_batch_size: 8
+    max_seq_len: 256000
+    model_kwargs:
+      num_hidden_layers: 61
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 8
+    num_postprocess_workers: 4
+    print_iter_log: true
+    stream_interval: 10
+    tensor_parallel_size: 8
+    trust_remote_code: true
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: kimi-target-pvc-tp8
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.2
+          command:
+            - python3
+          args:
+            - -m
+            - dynamo.frontend
+            - --http-port
+            - "8000"
+            - --request-plane
+            - nats
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: HF_HOME
+              value: /model-cache
+          volumeMounts:
+            - mountPath: /model-cache
+              name: model-cache
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        volumes:
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+    worker:
+      componentType: worker
+      subComponentType: decode
+      envFromSecret: hf-token-secret
+      multinode:
+        nodeCount: 2
+      replicas: 1
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 9090
+        periodSeconds: 10
+        timeoutSeconds: 30
+        failureThreshold: 60
+      resources:
+        limits:
+          gpu: "4"
+        claims:
+          - name: compute-domain-channel
+      extraPodSpec:
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
+        securityContext: {}
+        terminationGracePeriodSeconds: 600
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-nodepool
+                  operator: In
+                  values:
+                  - customer-gpu-o7v
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/part-of
+                  operator: In
+                  values:
+                  - kimi-target-pvc-tp8
+              topologyKey: nvidia.com/gpu.clique
+        containers: null
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.7.2
+          imagePullPolicy: Always
+          workingDir: /workspace/
+          securityContext:
+            privileged: true
+          command:
+            - python3
+            - -m
+            - dynamo.trtllm
+          args:
+            - --model-path
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --served-model-name
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --extra-engine-args
+            - /config/aggregated.yaml
+            - --tensor-parallel-size
+            - "8"
+            - --publish-events-and-metrics
+            - --request-plane
+            - nats
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: WORLD_SIZE
+              value: "8"
+            - name: HOME
+              value: "/root"
+            - name: HF_HOME
+              value: /model-cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: HF_MODULES_CACHE
+              value: /tmp/hf_modules
+            - name: TRITON_CACHE_DIR
+              value: /tmp/.triton-cache
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NVIDIA_GDRCOPY
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_MAX_NCHANNELS
+              value: "2"
+            - name: TRTLLM_FORCE_COMM_METHOD
+              value: NVLINK_TWO_SIDED
+            - name: ENABLE_CONFIGURABLE_MOE
+              value: "1"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+          volumeMounts:
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
+        volumes:
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: DirectoryOrCreate
+          - name: model-cache
+            persistentVolumeClaim:
+              claimName: shared-model-cache
+          - name: trtllm-config
+            configMap:
+              name: kimi-target-pvc-tp8-config

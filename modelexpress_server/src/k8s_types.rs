@@ -152,6 +152,8 @@ pub struct TensorDescriptorJson {
     pub size: String,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub shape: Vec<i64>,
 }
 
 /// Sanitize model name to be a valid Kubernetes resource name
@@ -252,6 +254,7 @@ mod tests {
             size: "134217728".to_string(),
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            shape: vec![1, 4096, 8192],
         };
 
         let json = serde_json::to_string(&original).expect("serialize");
@@ -262,6 +265,7 @@ mod tests {
         assert_eq!(parsed.size, original.size);
         assert_eq!(parsed.device_id, original.device_id);
         assert_eq!(parsed.dtype, original.dtype);
+        assert_eq!(parsed.shape, original.shape);
 
         let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
         assert_eq!(addr, 139948187451390);
@@ -277,6 +281,7 @@ mod tests {
             size: u64::MAX.to_string(),
             device_id: 7,
             dtype: "float16".to_string(),
+            shape: vec![],
         };
 
         let json = serde_json::to_string(&desc).expect("serialize");

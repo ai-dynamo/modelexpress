@@ -1,0 +1,181 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen 0.5B source — fast Dynamo engine test with TP=2
+# Tests full publish_from_worker path (MPI gather, NIXL, gRPC)
+# Loads in ~1 min instead of 75 min
+# Namespace: kavin
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen-source-trtllm-config
+data:
+  aggregated.yaml: |
+    max_num_tokens: 2048
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    enable_attention_dp: false
+    cuda_graph_config: null
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.75
+      tokens_per_block: 32
+    max_batch_size: 8
+    max_seq_len: 4096
+    num_postprocess_workers: 1
+    print_iter_log: true
+    tensor_parallel_size: 2
+    trust_remote_code: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen-source-deploy
+  labels:
+    app: qwen-source-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen-source-deploy
+  template:
+    metadata:
+      labels:
+        app: qwen-source-deploy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoExecute
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - effect: NoSchedule
+          key: kubernetes.io/arch
+          operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - customer-gpu-w0e
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - qwen-source-deploy
+            topologyKey: nvidia.com/gpu.clique
+      containers:
+        - name: source
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.5.0
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          command: ["python3", "-m", "dynamo.trtllm"]
+          args:
+            - --model-path
+            - Qwen/Qwen2.5-0.5B
+            - --served-model-name
+            - Qwen/Qwen2.5-0.5B
+            - --extra-engine-args
+            - /config/aggregated.yaml
+            - --model-express-url
+            - modelexpress-server.kavin.svc.cluster.local:8001
+            - --model-express-role
+            - source
+          env:
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "Qwen/Qwen2.5-0.5B"
+            - name: MODEL_EXPRESS_SOURCE
+              value: "1"
+            - name: WORLD_SIZE
+              value: "2"
+            - name: HF_HOME
+              value: /model-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: NIXL_LOG_LEVEL
+              value: "DEBUG"
+            - name: UCX_LOG_LEVEL
+              value: "DEBUG"
+            - name: UCX_PROTO_INFO
+              value: "y"
+            - name: UCX_TLS
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "eth0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "eth0"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+            requests:
+              nvidia.com/gpu: "2"
+              memory: "16Gi"
+              cpu: "4"
+            claims:
+              - name: compute-domain-channel
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+          workingDir: /workspace/
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: DirectoryOrCreate
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: trtllm-config
+          configMap:
+            name: qwen-source-trtllm-config
+      resourceClaims:
+        - name: compute-domain-channel
+          resourceClaimTemplateName: kavin-compute-domain-channel
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

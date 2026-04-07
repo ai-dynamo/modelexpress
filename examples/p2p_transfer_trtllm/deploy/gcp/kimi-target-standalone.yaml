@@ -1,0 +1,294 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi K2.5 standalone target — validates P2P weight transfer from kimi-source
+# Creates model structure, receives weights via NIXL RDMA, validates checksums
+# Namespace: kavin
+#
+# Prerequisites:
+#   - kimi-source published (all 4 ranks)
+#   - modelexpress-server + redis running
+#   - model-cache PVC (for HF config only — no weight loading from disk)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-target
+  labels:
+    app: kimi-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kimi-target
+  template:
+    metadata:
+      labels:
+        app: kimi-target
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoExecute
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - effect: NoSchedule
+          key: kubernetes.io/arch
+          operator: Exists
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - kimi-source
+            topologyKey: kubernetes.io/hostname
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - kimi-source
+            topologyKey: nvidia.com/gpu.clique
+      containers:
+        - name: target
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.0.0
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          env:
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server:8001"
+            - name: HF_HOME
+              value: "/model-cache"
+            - name: WORLD_SIZE
+              value: "4"
+            - name: MOE_EP_SIZE
+              value: "4"
+            - name: NIXL_LOG_LEVEL
+              value: "DEBUG"
+            - name: UCX_LOG_LEVEL
+              value: "DEBUG"
+            - name: UCX_PROTO_INFO
+              value: "y"
+            - name: UCX_TLS
+              value: "rc_v,rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: NCCL_SOCKET_IFNAME
+              value: eth0
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["bash", "-c"]
+          args:
+            - |
+              cat > /tmp/target_kimi.py << 'PYEOF'
+              import os, sys, time, logging, torch, hashlib
+              from mpi4py import MPI
+
+              comm = MPI.COMM_WORLD
+              rank = comm.Get_rank()
+              world_size = comm.Get_size()
+
+              logging.basicConfig(
+                  level=logging.INFO,
+                  format=f'%(asctime)s [rank{rank}] %(name)s %(levelname)s %(message)s'
+              )
+              logger = logging.getLogger("kimi-target")
+              torch.cuda.set_device(rank)
+
+              os.environ["MASTER_ADDR"] = "127.0.0.1"
+              os.environ["MASTER_PORT"] = "29500"
+              import torch.distributed as dist
+              dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+              logger.info("torch.distributed initialized (NCCL) for rank %d/%d", rank, world_size)
+
+              model_name = os.environ["MODEL_NAME"]
+              mx_server = os.environ["MODEL_EXPRESS_URL"]
+              moe_ep_size = int(os.environ.get("MOE_EP_SIZE", world_size))
+
+              # Resolve model path (need config.json for model creation)
+              if rank == 0:
+                  from huggingface_hub import snapshot_download
+                  local_path = snapshot_download(
+                      model_name,
+                      cache_dir=os.environ.get("HF_HOME", "/model-cache")
+                  )
+                  logger.info("Model config resolved to: %s", local_path)
+              else:
+                  local_path = None
+              local_path = comm.bcast(local_path, root=0)
+
+              from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+              from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+              from tensorrt_llm._torch.models.checkpoints.hf.config_loader import HfConfigLoader
+              from tensorrt_llm.mapping import Mapping
+              from modelexpress.trtllm_live_transfer import MxLiveWeightLoader
+
+              t0 = time.perf_counter()
+
+              mapping = Mapping(
+                  world_size=world_size,
+                  tp_size=world_size,
+                  rank=rank,
+                  moe_ep_size=moe_ep_size,
+                  moe_tp_size=1,
+                  enable_attention_dp=True,
+              )
+              logger.info(
+                  "Creating model structure (rank %d/%d, ep_rank=%d) on GPU %d",
+                  rank, world_size, rank, rank
+              )
+
+              # Step 1: Load config (same as source)
+              logger.info("Step 1: Loading config...")
+              config = HfConfigLoader().load(
+                  local_path, mapping=mapping, trust_remote_code=True
+              )
+
+              # Step 2: Create model with meta tensors (no weights)
+              logger.info("Step 2: Creating model (MetaInitMode)...")
+              with MetaInitMode():
+                  model = AutoModelForCausalLM.from_config(config)
+
+              # Step 3: Materialize meta tensors to GPU
+              logger.info("Step 3: Materializing tensors to GPU...")
+              def _init_meta(t, dev=rank):
+                  if t.device == torch.device('meta'):
+                      return torch.empty_like(t, device=f'cuda:{dev}')
+                  return t
+
+              model._apply(_init_meta)
+              model.to(f'cuda:{rank}')
+
+              model_create_time = time.perf_counter() - t0
+              params = list(model.named_parameters())
+              total_bytes = sum(p.numel() * p.element_size() for _, p in params)
+              logger.info(
+                  "Step 4: Model on GPU %d — %d params (%.2f GB) in %.1fs",
+                  rank, len(params), total_bytes / 1e9, model_create_time
+              )
+
+              # Step 5: Compute checksums BEFORE transfer (should be random/zero)
+              logger.info("Step 5: Computing pre-transfer checksums...")
+              pre_checksums = {}
+              for name, p in params[:3]:
+                  data = p.data.float().cpu().numpy().tobytes()
+                  pre_checksums[name] = hashlib.md5(data).hexdigest()[:12]
+                  logger.info("  PRE  %s: %s (shape=%s, dtype=%s)",
+                              name, pre_checksums[name], p.shape, p.dtype)
+
+              # Step 6: RDMA transfer from source
+              logger.info("Step 6: Starting RDMA transfer from source...")
+              transfer_start = time.perf_counter()
+
+              # Patch transfer timeout: default 300s is too short for TCP fallback
+              import modelexpress.nixl_transfer as _nt
+              _orig_recv = _nt.NixlTransferManager.receive_from_source
+              def _recv_with_timeout(self, *a, **kw):
+                  kw['timeout_seconds'] = 3600
+                  return _orig_recv(self, *a, **kw)
+              _nt.NixlTransferManager.receive_from_source = _recv_with_timeout
+
+              loader = MxLiveWeightLoader()
+              loader.load_weights(
+                  checkpoint_dir=local_path,
+                  mapping=mapping,
+                  model=model,
+              )
+
+              transfer_time = time.perf_counter() - transfer_start
+              logger.info(
+                  "Step 7: RDMA transfer complete in %.2fs", transfer_time
+              )
+
+              # Step 8: Compute checksums AFTER transfer (should differ from pre)
+              logger.info("Step 8: Computing post-transfer checksums...")
+              post_checksums = {}
+              changed = 0
+              for name, p in params[:3]:
+                  data = p.data.float().cpu().numpy().tobytes()
+                  post_checksums[name] = hashlib.md5(data).hexdigest()[:12]
+                  did_change = post_checksums[name] != pre_checksums[name]
+                  if did_change:
+                      changed += 1
+                  logger.info("  POST %s: %s (changed=%s)",
+                              name, post_checksums[name], did_change)
+
+              # Step 9: Summary
+              total_time = time.perf_counter() - t0
+              logger.info("=" * 60)
+              logger.info("RESULT: Rank %d", rank)
+              logger.info("  Model create: %.1fs", model_create_time)
+              logger.info("  RDMA transfer: %.1fs", transfer_time)
+              logger.info("  Total: %.1fs", total_time)
+              logger.info("  Params: %d (%.2f GB)", len(params), total_bytes / 1e9)
+              logger.info("  Checksums changed: %d/%d sampled", changed, len(pre_checksums))
+              if changed == len(pre_checksums):
+                  logger.info("  STATUS: PASS — weights transferred successfully")
+              else:
+                  logger.info("  STATUS: WARN — some checksums unchanged")
+              logger.info("=" * 60)
+
+              # Keep running for inspection
+              logger.info("Target rank %d complete. Sleeping for inspection...", rank)
+              while True:
+                  time.sleep(3600)
+              PYEOF
+
+              /opt/hpcx/ompi/bin/mpirun --allow-run-as-root -np 4 \
+                --output-filename /tmp/mpi_logs \
+                /opt/dynamo/venv/bin/python3 -u /tmp/target_kimi.py
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+            requests:
+              nvidia.com/gpu: "4"
+              memory: "64Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /model-cache
+            - name: infiniband
+              mountPath: /dev/infiniband
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 100Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: DirectoryOrCreate
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

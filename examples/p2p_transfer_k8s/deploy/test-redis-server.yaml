@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MX server with Redis sidecar for write-through persistence testing.
+# Image: metadata-test (same as current deployment).
+# MX_METADATA_BACKEND=redis → LayeredRedis (in-memory cache + Redis write-through).
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+  namespace: metadata
+  labels:
+    app: modelexpress-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8001
+      targetPort: 8001
+      name: grpc
+    - port: 6379
+      targetPort: 6379
+      name: redis
+  selector:
+    app: modelexpress-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  namespace: metadata
+  labels:
+    app: modelexpress-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      initContainers:
+        - name: redis
+          image: redis:7-alpine
+          restartPolicy: Always
+          ports:
+            - containerPort: 6379
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          startupProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            periodSeconds: 10
+      containers:
+        - name: modelexpress-server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:metadata-test
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            - name: REDIS_URL
+              value: "redis://localhost:6379"
+          resources:
+            requests:
+              cpu: 2
+              memory: 4Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

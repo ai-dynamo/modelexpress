@@ -1,0 +1,209 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi K2.5 source — plain Deployment with RoCE P2P (AWS GB200)
+# Runs python3 -m dynamo.trtllm as source, publishes weights via NIXL
+# TP=4, single node per pod
+# Namespace: kavin
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kimi-source-deploy-trtllm-config
+data:
+  aggregated.yaml: |
+    max_num_tokens: 8192
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    cuda_graph_config:
+      max_batch_size: 8
+      enable_padding: true
+    enable_attention_dp: true
+    kv_cache_config:
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.75
+      tokens_per_block: 32
+    max_batch_size: 8
+    max_seq_len: 256000
+    model_kwargs:
+      num_hidden_layers: 61
+    moe_config:
+      backend: TRTLLM
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 4
+    num_postprocess_workers: 4
+    print_iter_log: true
+    stream_interval: 10
+    tensor_parallel_size: 4
+    trust_remote_code: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-source-deploy
+  labels:
+    app: kimi-source-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kimi-source-deploy
+  template:
+    metadata:
+      labels:
+        app: kimi-source-deploy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.kubernetes.io/customer-gpu: ""
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoExecute
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - effect: NoSchedule
+          key: kubernetes.io/arch
+          operator: Exists
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - kimi-source-deploy
+            topologyKey: nvidia.com/gpu.clique
+      containers:
+        - name: source
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v1.6.0
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          command: ["python3", "-m", "dynamo.trtllm"]
+          args:
+            - --model-path
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --served-model-name
+            - baseten-admin/Kimi-2.5-text-nvfp4-v3
+            - --extra-engine-args
+            - /config/aggregated.yaml
+            - --model-express-url
+            - modelexpress-server.kavin.svc.cluster.local:8001
+            - --model-express-role
+            - source
+            - --tensor-parallel-size
+            - "4"
+          env:
+            - name: NATS_SERVER
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
+            - name: ETCD_ENDPOINTS
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: MODEL_NAME
+              value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
+            - name: MODEL_EXPRESS_SOURCE
+              value: "1"
+            - name: WORLD_SIZE
+              value: "4"
+            - name: HF_HOME
+              value: /model-cache
+            - name: TRITON_CACHE_DIR
+              value: /model-cache/.triton-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "WARN"
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self,vader"
+            - name: OMPI_MCA_btl_tcp_if_include
+              value: "enp4s0,enp5s0"
+            - name: OMPI_MCA_oob_tcp_if_include
+              value: "enp4s0,enp5s0"
+            - name: NCCL_CUMEM_ENABLE
+              value: "1"
+            - name: NCCL_NVLS_ENABLE
+              value: "1"
+            - name: NVIDIA_GDRCOPY
+              value: "1"
+            - name: NCCL_SOCKET_IFNAME
+              value: enp4s0
+            - name: GLOO_SOCKET_IFNAME
+              value: enp4s0
+            - name: NCCL_STORE_TIMEOUT
+              value: "7200"
+            - name: TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER
+              value: "1"
+            - name: TRTLLM_ENABLE_PDL
+              value: "1"
+            - name: TRTLLM_SERVER_DISABLE_GC
+              value: "1"
+            - name: TRTLLM_WORKER_DISABLE_GC
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "0"
+            - name: NCCL_MAX_NCHANNELS
+              value: "2"
+            - name: ENABLE_CONFIGURABLE_MOE
+              value: "1"
+            - name: TLLM_LOG_LEVEL
+              value: "INFO"
+            - name: TLLM_OVERRIDE_LAYER_NUM
+              value: "61"
+          resources:
+            limits:
+              nvidia.com/gpu: "4"
+            requests:
+              nvidia.com/gpu: "4"
+              memory: "64Gi"
+              cpu: "8"
+            claims:
+              - name: compute-domain-channel
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /dev/infiniband
+              name: infiniband
+            - mountPath: /model-cache
+              name: model-cache
+            - mountPath: /config
+              name: trtllm-config
+              readOnly: true
+          workingDir: /workspace/
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 100Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: DirectoryOrCreate
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: trtllm-config
+          configMap:
+            name: kimi-source-deploy-trtllm-config
+      resourceClaims:
+        - name: compute-domain-channel
+          resourceClaimTemplateName: kavin-compute-domain-channel
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

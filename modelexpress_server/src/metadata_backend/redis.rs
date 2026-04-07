@@ -111,6 +111,8 @@ struct TensorRecordJson {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub shape: Vec<i64>,
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -173,6 +175,7 @@ impl From<TensorRecord> for TensorRecordJson {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            shape: record.shape,
         }
     }
 }
@@ -185,6 +188,7 @@ impl From<TensorRecordJson> for TensorRecord {
             size: json.size,
             device_id: json.device_id,
             dtype: json.dtype,
+            shape: json.shape,
         }
     }
 }
@@ -594,6 +598,7 @@ mod tests {
             size: 1_073_741_824,
             device_id: 3,
             dtype: "bfloat16".to_string(),
+            shape: vec![4096, 8192],
         };
         let json_record = TensorRecordJson::from(record.clone());
         let json = serde_json::to_string(&json_record).expect("serialize");
@@ -608,6 +613,7 @@ mod tests {
         assert_eq!(back.size, record.size);
         assert_eq!(back.device_id, record.device_id);
         assert_eq!(back.dtype, record.dtype);
+        assert_eq!(back.shape, record.shape);
     }
 
     #[test]
@@ -648,6 +654,7 @@ mod tests {
                 size: 512,
                 device_id: 2,
                 dtype: "float16".to_string(),
+                shape: vec![],
             }],
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,

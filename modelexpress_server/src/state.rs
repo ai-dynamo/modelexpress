@@ -220,6 +220,7 @@ mod tests {
             size: 1024 * 1024 * 1024,
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            shape: vec![],
         };
 
         let record = TensorRecord::from(desc.clone());
@@ -244,6 +245,7 @@ mod tests {
                 size: 4096,
                 device_id: 3,
                 dtype: "float16".to_string(),
+                shape: vec![],
             }],
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
@@ -280,6 +282,7 @@ mod tests {
                 size: 8192,
                 device_id: 0,
                 dtype: "float16".to_string(),
+                shape: vec![],
             }],
             status: 0,
             updated_at: 0,
@@ -349,6 +352,7 @@ mod tests {
                         size: 1_000_000,
                         device_id: 0,
                         dtype: "bfloat16".to_string(),
+                        shape: vec![],
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
@@ -365,6 +369,7 @@ mod tests {
                         size: 1_000_000,
                         device_id: 1,
                         dtype: "bfloat16".to_string(),
+                        shape: vec![],
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
