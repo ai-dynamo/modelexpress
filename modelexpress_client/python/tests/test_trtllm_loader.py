@@ -75,7 +75,7 @@ class TestMxTrtllmSourcePublisher:
             )
             
             with pytest.raises(FileNotFoundError, match="Config not found"):
-                publisher.initialize()
+                publisher.initialize(build_if_needed=False)
     
     def test_missing_weights_raises_error(self):
         """Test that missing weights file raises FileNotFoundError."""
