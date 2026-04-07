@@ -95,7 +95,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 *Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
 
-- **modelexpress_server**: gRPC server with configurable metadata backends (in-memory, Redis, Kubernetes CRD). Layered in-memory with persistence is recommended for high availability.
+- **modelexpress_server**: gRPC server with configurable metadata backends (Redis, Kubernetes CRD).
 - **modelexpress_client**: Rust CLI for cache management; Python package with vLLM loaders and `MxClient` for gRPC.
 - **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
 
@@ -112,7 +112,7 @@ git clone https://github.com/ai-dynamo/modelexpress.git
 cd modelexpress
 
 # Start a local Redis instance for metadata storage
-docker run -d --name redis -p 6379:6379 redis:latest
+docker run -d --name redis -p 6379:6379 redis:8-alpine
 
 cargo build
 MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server

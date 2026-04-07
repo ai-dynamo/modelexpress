@@ -3,9 +3,14 @@
 
 services:
   redis:
-    image: redis:latest
+    image: redis:8-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
 
   model-express-server:
@@ -20,5 +25,6 @@ services:
       - MX_METADATA_BACKEND=redis
       - REDIS_URL=redis://redis:6379
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
