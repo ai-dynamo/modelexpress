@@ -252,6 +252,24 @@ Targets auto-detect which mode a source is using based on whether `worker_grpc_e
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
+### ModelStreamer (S3 Object Storage)
+
+ModelStreamer enables streaming safetensors directly from S3/S3-compatible storage to GPU memory without writing to disk. The first pod streams from S3; subsequent pods use P2P RDMA from the first pod's GPU memory.
+
+**Prerequisites:** Install `pip install modelexpress[streamer]` (adds `runai-model-streamer[s3]`).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_S3_URI` | (none) | S3 model location (e.g., `s3://bucket/path/to/model`). When set, enables the ModelStreamer strategy. |
+| `AWS_ACCESS_KEY_ID` | (none) | S3 credentials (read by boto3 and runai-model-streamer) |
+| `AWS_SECRET_ACCESS_KEY` | (none) | S3 credentials |
+| `AWS_DEFAULT_REGION` | (none) | AWS region (required by some backends) |
+| `AWS_ENDPOINT_URL` | (none) | Custom endpoint for S3-compatible storage (MinIO, Ceph, etc.) |
+| `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
+| `RUNAI_STREAMER_MEMORY_LIMIT` | (default) | CPU staging buffer size. `0` reuses a single-tensor buffer. |
+
+Credentials are injected via standard AWS mechanisms (EKS Pod Identity, IRSA, or K8s secrets mounted as env vars). No credentials flow through the MX server or gRPC.
+
 ### UCX/NIXL Tuning
 
 | Variable | Recommended | Description |

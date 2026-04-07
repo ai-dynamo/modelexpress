@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
+from modelexpress.nixl_transfer import NixlTransferManager
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,166 @@ class TestAbstractMethodCompleteness:
         with patch("modelexpress.vllm_loader.DefaultModelLoader") as mock_cls:
             loader.load_weights(model, cfg)
             mock_cls.return_value.load_weights.assert_called_once_with(model, cfg)
+
+
+# ---------------------------------------------------------------------------
+# register_tensors (load_strategy.base)
+# ---------------------------------------------------------------------------
+
+
+class TestInitNixlManager:
+    """Verify _init_nixl_manager passes listen_port to NixlTransferManager."""
+
+    def test_default_listen_port_is_zero(self):
+        from modelexpress.load_strategy.base import _init_nixl_manager
+
+        with patch.object(NixlTransferManager, "initialize"):
+            mgr = _init_nixl_manager(global_rank=0, device_id=0, role="auto")
+
+        assert mgr._listen_port == 0
+
+    def test_explicit_listen_port(self):
+        from modelexpress.load_strategy.base import _init_nixl_manager
+
+        with patch.object(NixlTransferManager, "initialize"):
+            mgr = _init_nixl_manager(global_rank=0, device_id=2, role="auto", listen_port=6002)
+
+        assert mgr._listen_port == 6002
+
+
+class TestRegisterTensorsErrorHandling:
+    """Verify register_tensors never raises — failures are logged as warnings."""
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=False)
+    def test_skips_when_nixl_unavailable(self, _mock):
+        from modelexpress.load_strategy.base import register_tensors
+        ctx = _make_load_context()
+        model = MagicMock()
+        register_tensors(model, ctx)
+        assert ctx.nixl_manager is None
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base.collect_module_tensors", return_value={})
+    @patch(
+        "modelexpress.load_strategy.base._init_nixl_manager",
+        side_effect=RuntimeError("NIXL_ERR_BACKEND"),
+    )
+    def test_nixl_init_failure_does_not_raise(self, _init, _collect, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+        ctx = _make_load_context()
+        model = MagicMock()
+        register_tensors(model, ctx)
+        assert ctx.nixl_manager is None
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base.collect_module_tensors", return_value={"t": MagicMock()})
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_tensor_registration_failure_does_not_raise(self, mock_init, _collect, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_mgr.register_tensors.side_effect = RuntimeError("memory registration failed")
+        mock_init.return_value = mock_mgr
+        ctx = _make_load_context()
+        model = MagicMock()
+        register_tensors(model, ctx)
+
+
+class TestPublishMetadataErrorHandling:
+    """Verify publish_metadata never raises."""
+
+    def test_skips_when_no_nixl_manager(self):
+        from modelexpress.load_strategy.base import publish_metadata
+        ctx = _make_load_context()
+        ctx.nixl_manager = None
+        publish_metadata(ctx)
+
+    @patch("modelexpress.load_strategy.base.publish_metadata_and_ready", side_effect=RuntimeError("gRPC fail"))
+    def test_publish_failure_does_not_raise(self, _mock):
+        from modelexpress.load_strategy.base import publish_metadata
+        ctx = _make_load_context()
+        ctx.nixl_manager = MagicMock()
+        publish_metadata(ctx)
+
+
+class TestLoadStrategyChainRunErrorHandling:
+    """Verify LoadStrategyChain.run catches exceptions from strategy.load()."""
+
+    def test_strategy_exception_falls_through_to_next(self):
+        from modelexpress.load_strategy import LoadStrategyChain
+
+        call_order = []
+
+        def exploding_load(self_or_model, *args, **kwargs):
+            call_order.append("exploding")
+            raise RuntimeError("unexpected crash")
+
+        def fallback_load(self_or_model, *args, **kwargs):
+            call_order.append("fallback")
+            return True
+
+        ctx = _make_load_context()
+        model = MagicMock()
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.load",
+            exploding_load,
+        ), patch(
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
+            fallback_load,
+        ):
+            LoadStrategyChain.run(model, ctx)
+
+        assert call_order == ["exploding", "fallback"]
+
+
+class TestRdmaStrategyAvailability:
+    """Verify RdmaStrategy.is_available checks for MX server config."""
+
+    def _make_strategy(self):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+        return RdmaStrategy()
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_unavailable_when_no_server_address(self, _mock):
+        strategy = self._make_strategy()
+        ctx = _make_load_context()
+        with patch.dict("os.environ", {}, clear=True):
+            assert strategy.is_available(ctx) is False
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_available_when_mx_server_address_set(self, _mock):
+        strategy = self._make_strategy()
+        ctx = _make_load_context()
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert strategy.is_available(ctx) is True
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_available_when_model_express_url_set(self, _mock):
+        strategy = self._make_strategy()
+        ctx = _make_load_context()
+        with patch.dict("os.environ", {"MODEL_EXPRESS_URL": "server:8001"}):
+            assert strategy.is_available(ctx) is True
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=False)
+    def test_unavailable_when_nixl_not_available(self, _mock):
+        strategy = self._make_strategy()
+        ctx = _make_load_context()
+        assert strategy.is_available(ctx) is False
 
 
 # ---------------------------------------------------------------------------

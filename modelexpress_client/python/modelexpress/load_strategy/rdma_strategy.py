@@ -35,7 +35,13 @@ class RdmaStrategy(LoadStrategy):
     name = "rdma"
 
     def is_available(self, ctx: LoadContext) -> bool:
-        return is_nixl_available()
+        if not is_nixl_available():
+            return False
+        server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+        if not server_addr:
+            logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
+            return False
+        return True
 
     def load(self, model: nn.Module, ctx: LoadContext) -> bool:
         candidates = self._find_source_instances(ctx)

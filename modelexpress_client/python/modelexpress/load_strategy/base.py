@@ -105,31 +105,44 @@ def _init_nixl_manager(
 
 
 def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
-    """Collect model tensors and register them with NIXL."""
+    """Collect model tensors and register them with NIXL.
+
+    Failures are logged but do not raise — the worker continues without
+    P2P serving capability.
+    """
     if not is_nixl_available():
         logger.warning(f"[Worker {ctx.global_rank}] NIXL not available, skipping registration")
         return
 
-    ctx.tensors = collect_module_tensors(model)
-    log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
+    try:
+        ctx.tensors = collect_module_tensors(model)
+        log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
-    if ctx.nixl_manager is None:
-        # Always enable the NIXL listen thread: targets need it to call
-        # fetch_remote_metadata on P2P sources, and every node becomes a
-        # source after receiving weights. Each worker needs a unique port
-        # (base + device_id) to avoid collisions in multi-GPU setups.
-        base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
-        listen_port = base_port + ctx.device_id
-        ctx.nixl_manager = _init_nixl_manager(ctx.global_rank, ctx.device_id, "auto", listen_port)
+        if ctx.nixl_manager is None:
+            base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+            listen_port = base_port + ctx.device_id
+            ctx.nixl_manager = _init_nixl_manager(
+                ctx.global_rank, ctx.device_id, "auto", listen_port
+            )
 
-    if not ctx.nixl_manager.tensor_descriptors:
-        logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
-        ctx.nixl_manager.register_tensors(ctx.tensors)
-        logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
+        if not ctx.nixl_manager.tensor_descriptors:
+            logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
+            ctx.nixl_manager.register_tensors(ctx.tensors)
+            logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
+    except Exception as e:
+        logger.warning(
+            f"[Worker {ctx.global_rank}] NIXL registration failed, "
+            f"worker will continue without P2P serving: {e}"
+        )
 
 
 def publish_metadata(ctx: LoadContext) -> None:
     """Publish metadata to the MX server. Failures are logged but do not raise."""
+    if ctx.nixl_manager is None:
+        logger.info(
+            f"[Worker {ctx.global_rank}] No NIXL manager, skipping metadata publish"
+        )
+        return
     try:
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
