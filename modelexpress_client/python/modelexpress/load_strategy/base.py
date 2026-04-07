@@ -18,7 +18,7 @@ import torch.nn as nn
 from ..client import MxClient
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import collect_module_tensors, log_tensor_summary
-from ..metadata import publish_metadata_and_ready
+from ..metadata import is_p2p_metadata_enabled, publish_metadata_and_ready
 from .. import p2p_pb2
 
 if TYPE_CHECKING:
@@ -86,14 +86,19 @@ class LoadStrategy(ABC):
 # ---------------------------------------------------------------------------
 
 
-def _init_nixl_manager(
-    global_rank: int, device_id: int, role: str, listen_port: int = 0,
-) -> NixlTransferManager:
+def _init_nixl_manager(global_rank: int, device_id: int, role: str) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     from ..nixl_transfer import NixlTransferManager
 
     agent_name = f"mx-{role}-worker{global_rank}-{uuid.uuid4().hex[:8]}"
     logger.debug(f"[Worker {global_rank}] Initializing NIXL manager with agent_name={agent_name}")
+
+    listen_port = None
+    if is_p2p_metadata_enabled():
+        base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+        listen_port = base_port + device_id
+        logger.info(f"[Worker {global_rank}] P2P metadata exchange enabled, listening on port {listen_port}")
+
     manager = NixlTransferManager(
         agent_name=agent_name,
         device_id=device_id,
@@ -114,9 +119,7 @@ def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
     log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
     if ctx.nixl_manager is None:
-        base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
-        listen_port = base_port + ctx.device_id
-        ctx.nixl_manager = _init_nixl_manager(ctx.global_rank, ctx.device_id, "auto", listen_port)
+        ctx.nixl_manager = _init_nixl_manager(ctx.global_rank, ctx.device_id, "auto")
 
     if not ctx.nixl_manager.tensor_descriptors:
         logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
