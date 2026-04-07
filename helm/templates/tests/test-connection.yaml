@@ -10,8 +10,8 @@ metadata:
     "helm.sh/hook": test
 spec:
   containers:
-  - name: wget
-    image: busybox
-    command: ['wget']
-    args: ['{{ include "modelexpress.fullname" . }}:{{ .Values.service.port | default 8001 }}']
+  - name: grpc-health-probe
+    image: registry.k8s.io/grpc-health-probe:v0.4.35
+    command: ['grpc_health_probe']
+    args: ['-addr={{ include "modelexpress.fullname" . }}:{{ .Values.service.port | default 8001 }}']
   restartPolicy: Never
