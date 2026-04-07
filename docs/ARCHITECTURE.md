@@ -118,7 +118,17 @@ ModelExpress/
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader
-│       ├── vllm_loader.py              # MxModelLoader (auto-detect: RDMA/GDS/disk)
+│       ├── vllm_loader.py              # MxModelLoader (thin orchestration)
+│       ├── load_strategy/              # Loading strategy chain
+│       │   ├── __init__.py             # LoadStrategyChain.run()
+│       │   ├── base.py                 # LoadStrategy ABC, LoadContext, shared helpers
+│       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
+│       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
+│       │   └── default_strategy.py     # DefaultStrategy (vLLM DefaultModelLoader)
+│       ├── tensor_utils.py             # Tensor collection, checksums, storage views
+│       ├── metadata.py                 # Metadata building and publishing
+│       ├── rank_utils.py               # Rank detection utilities
+│       ├── worker_server.py            # WorkerGrpcServer (P2P tensor manifest)
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
@@ -437,7 +447,11 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
-| `vllm_loader.py` | `MxModelLoader` - auto-detecting model loader (RDMA -> GDS -> disk) |
+| `vllm_loader.py` | `MxModelLoader` - thin orchestration, delegates to `LoadStrategyChain` |
+| `load_strategy/` | Loading strategy chain package (see below) |
+| `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
+| `metadata.py` | `build_source_identity`, `publish_metadata_and_ready`, retry logic |
+| `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `worker_server.py` | `WorkerGrpcServer` - per-worker gRPC server for P2P tensor manifest exchange |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
@@ -472,21 +486,27 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 **MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
 
-Auto-detects the best loading strategy with a three-tier fallback:
+Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
-1. **RDMA**: Call `ListSources(identity, status=READY)`, filter by `worker_rank`, shuffle for load balancing. For each candidate (max `MAX_SOURCE_RETRIES`), call `GetMetadata` on demand, attempt RDMA transfer. On `SourceTransferError`, try next candidate.
-2. **GDS**: If no RDMA source available and GPUDirect Storage is available, load directly from file to GPU via `MxGdsLoader`.
-3. **Disk**: Standard vLLM `DefaultModelLoader` as final fallback.
+**LoadStrategyChain** (`load_strategy/`):
 
-After loading by any path, the worker registers ALL final tensors with NIXL, publishes metadata, and starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler.
+Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(model, ctx)` methods. The chain filters to eligible strategies and runs them in order until one succeeds:
+
+| Priority | Strategy | `is_available()` | Behavior |
+|---|---|---|---|
+| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError`, try next. |
+| p1 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
+| p2 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
+
+Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies (e.g., ModelStreamer for S3) can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+
+After loading by any strategy, the worker starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged but do not crash the worker.
 
 Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
 
-The loader reads the model name from vLLM's `model_config.model` (set via the `--model` CLI argument). Shared helpers (`_collect_module_tensors`, `_init_nixl_manager`, `_log_tensor_summary`, `_publish_metadata_and_ready`, `_build_source_identity`) are module-level functions used by the loader.
-
 ### Tensor Discovery
 
-The loader uses `_iter_module_tensors()` to walk the full PyTorch module tree and find all CUDA tensors after post-processing. This discovers three categories:
+The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree and find all CUDA tensors after post-processing. This discovers three categories:
 
 | Category | Source | Example |
 |----------|--------|---------|

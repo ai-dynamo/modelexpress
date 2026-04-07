@@ -195,76 +195,72 @@ class TestResolveSafetensorsFiles:
 
 
 # ---------------------------------------------------------------------------
-# Integration with MxModelLoader
+# GdsStrategy integration
 # ---------------------------------------------------------------------------
 
 
-class TestMxModelLoaderGdsIntegration:
-    """Tests for GDS integration in MxModelLoader."""
+class TestGdsStrategyIntegration:
+    """Tests for GdsStrategy loading behavior."""
 
-    def _make_loader(self):
-        with patch("modelexpress.vllm_loader.DefaultModelLoader"), \
-             patch("modelexpress.vllm_loader.DummyModelLoader"):
-            load_config = MagicMock()
-            load_config.load_format = "mx"
-            load_config.device = None
+    def _make_context(self):
+        from modelexpress.load_strategy import LoadContext
+        return LoadContext(
+            vllm_config=MagicMock(),
+            model_config=MagicMock(),
+            load_config=MagicMock(),
+            target_device=torch.device("cpu"),
+            global_rank=0,
+            device_id=0,
+            identity=MagicMock(),
+            mx_client=MagicMock(),
+            worker_id="test-worker",
+        )
 
-            from modelexpress.vllm_loader import MxModelLoader
-            return MxModelLoader(load_config)
-
-    @patch("modelexpress.vllm_loader.is_gds_available", return_value=True)
-    @patch("modelexpress.vllm_loader.MxGdsLoader")
-    def test_gds_success_skips_disk(self, mock_gds_cls, _mock_avail):
-        loader = self._make_loader()
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    @patch("modelexpress.load_strategy.base.publish_metadata_and_ready")
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=False)
+    def test_gds_success(self, _mock_nixl, _mock_pub, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
 
         mock_gds = MagicMock()
         mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
         mock_gds_cls.return_value = mock_gds
 
-        model = MagicMock()
-        model_config = MagicMock()
-        model_config.model = "test-model"
+        ctx = self._make_context()
+        ctx.model_config.model = "test-model"
 
-        result = loader._try_gds_load(model, model_config, device_id=0)
+        strategy = GdsStrategy()
+        model = MagicMock()
+        result = strategy.load(model, ctx)
+
         assert result is True
         mock_gds.load_iter.assert_called_once()
         model.load_weights.assert_called_once()
         mock_gds.shutdown.assert_called_once()
 
-    @patch("modelexpress.vllm_loader.is_gds_available", return_value=True)
-    @patch("modelexpress.vllm_loader.MxGdsLoader")
-    def test_gds_failure_falls_back(self, mock_gds_cls, _mock_avail):
-        loader = self._make_loader()
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_failure_returns_false(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
 
         mock_gds = MagicMock()
         mock_gds.load_iter.side_effect = RuntimeError("GDS error")
         mock_gds_cls.return_value = mock_gds
 
-        model = MagicMock()
-        model_config = MagicMock()
-        model_config.model = "test-model"
+        ctx = self._make_context()
+        ctx.model_config.model = "test-model"
 
-        result = loader._try_gds_load(model, model_config, device_id=0)
+        strategy = GdsStrategy()
+        result = strategy.load(MagicMock(), ctx)
+
         assert result is False
         mock_gds.shutdown.assert_called_once()
 
-    @patch("modelexpress.vllm_loader.is_gds_available", return_value=False)
-    def test_gds_not_available_uses_disk(self, _mock_avail):
-        loader = self._make_loader()
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=False)
+    def test_gds_not_available(self, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
 
-        model = MagicMock()
-        model_config = MagicMock()
-        model_config.model = "test-model"
-
-        with patch.object(loader, "_register_tensors"), \
-             patch.object(loader, "_publish_metadata"), \
-             patch("modelexpress.vllm_loader.process_weights_after_loading"):
-            loader._load_as_source(
-                model, model_config,
-                target_device=torch.device("cpu"),
-                global_rank=0,
-                device_id=0,
-                identity=MagicMock(),
-            )
-
-        loader._default_loader.load_weights.assert_called_once_with(model, model_config)
+        ctx = self._make_context()
+        strategy = GdsStrategy()
+        assert strategy.is_available(ctx) is False
