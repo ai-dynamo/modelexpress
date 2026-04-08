@@ -39,8 +39,10 @@ class DefaultStrategy(LoadStrategy):
         default_loader.load_weights(model, ctx.model_config)
         logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
 
+        logger.info(f"[Worker {ctx.global_rank}] Processing weights after loading...")
         with capture_tensor_attrs():
             process_weights_after_loading(model, ctx.model_config, ctx.target_device)
+        logger.info(f"[Worker {ctx.global_rank}] Weight processing complete")
 
         register_tensors(model, ctx)
         publish_metadata(ctx)

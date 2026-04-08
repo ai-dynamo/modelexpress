@@ -425,17 +425,17 @@ class TestRdmaStrategyLoad:
 
 
 # ---------------------------------------------------------------------------
-# publish_metadata_and_ready (metadata)
+# start_metadata_publisher (metadata)
 # ---------------------------------------------------------------------------
 
 
-class TestPublishMetadataAndReady:
-    def test_calls_publish_and_starts_heartbeat(self):
-        from modelexpress.metadata import publish_metadata_and_ready
+class TestStartMetadataPublisher:
+    def test_starts_heartbeat_with_publish_fn(self):
+        """start_metadata_publisher should build a publish callback
+        and pass it to HeartbeatThread without calling publish itself."""
+        from modelexpress.metadata import start_metadata_publisher
 
         mx_client = MagicMock()
-        mx_client.publish_metadata.return_value = "abc123def456abcd"
-
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"nixl-data"
 
@@ -452,126 +452,77 @@ class TestPublishMetadataAndReady:
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
-
-        mx_client.publish_metadata.assert_called_once()
-        call_args = mx_client.publish_metadata.call_args
-        assert call_args.args[0] is identity
-        assert call_args.args[2] == "inst-uuid"
-
-        hb_cls.assert_called_once_with(
-            mx_client=mx_client,
-            mx_source_id="abc123def456abcd",
-            worker_id="inst-uuid",
-            worker_rank=2,
-            nixl_manager=nixl_manager,
-        )
-        mock_hb.start.assert_called_once()
-
-    def test_retries_publish_before_starting_heartbeat(self):
-        from modelexpress.metadata import publish_metadata_and_ready
-
-        mx_client = MagicMock()
-        mx_client.publish_metadata.side_effect = [
-            _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "grpc error 1"),
-            _FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED, "grpc error 2"),
-            "abc123def456abcd",
-        ]
-
-        nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
-
-        identity = _make_identity()
-        mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
-            publish_metadata_and_ready(
-                mx_client,
-                nixl_manager,
-                {},
-                global_rank=0,
-                device_id=0,
-                identity=identity,
-                worker_id="w-1",
+            start_metadata_publisher(
+                mx_client, nixl_manager, tensors,
+                global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid",
             )
 
-        assert mx_client.publish_metadata.call_count == 3
-        assert sleep_mock.call_args_list == [call(1.0), call(2.0)]
-        hb_cls.assert_called_once_with(
-            mx_client=mx_client,
-            mx_source_id="abc123def456abcd",
-            worker_id="w-1",
-            worker_rank=0,
-            nixl_manager=nixl_manager,
-        )
+        mx_client.publish_metadata.assert_not_called()
+
+        hb_cls.assert_called_once()
+        hb_kwargs = hb_cls.call_args.kwargs
+        assert hb_kwargs["mx_client"] is mx_client
+        assert hb_kwargs["worker_id"] == "inst-uuid"
+        assert hb_kwargs["worker_rank"] == 2
+        assert hb_kwargs["nixl_manager"] is nixl_manager
+        assert callable(hb_kwargs["publish_fn"])
         mock_hb.start.assert_called_once()
 
-    def test_publish_failure_after_retries_raises_runtime_error(self):
-        """If publish_metadata keeps failing, heartbeat should not be started."""
-        from modelexpress.metadata import publish_metadata_and_ready
+    def test_publish_fn_calls_publish_metadata(self):
+        """The publish_fn callback should call mx_client.publish_metadata
+        and return the mx_source_id."""
+        from modelexpress.metadata import start_metadata_publisher
 
         mx_client = MagicMock()
-        mx_client.publish_metadata.side_effect = [
-            _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "grpc error 1"),
-            _FakeRpcError(grpc.StatusCode.DEADLINE_EXCEEDED, "grpc error 2"),
-            _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "grpc error 3"),
-        ]
-
+        mx_client.publish_metadata.return_value = "abc123def456abcd"
         nixl_manager = MagicMock()
         nixl_manager.nixl_metadata = b"data"
 
         identity = _make_identity()
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
-            with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
-                publish_metadata_and_ready(
-                    mx_client,
-                    nixl_manager,
-                    {},
-                    global_rank=0,
-                    device_id=0,
-                    identity=identity,
-                    worker_id="w-1",
-                )
+            start_metadata_publisher(
+                mx_client, nixl_manager, {}, global_rank=0,
+                device_id=0, identity=identity, worker_id="w-1",
+            )
 
-        assert mx_client.publish_metadata.call_count == 3
-        assert sleep_mock.call_args_list == [call(1.0), call(2.0)]
-        hb_cls.assert_not_called()
+        publish_fn = hb_cls.call_args.kwargs["publish_fn"]
+        result = publish_fn()
+        assert result == "abc123def456abcd"
+        mx_client.publish_metadata.assert_called_once()
 
-    def test_non_retryable_grpc_failure_fails_immediately(self):
-        from modelexpress.metadata import publish_metadata_and_ready
+    def test_p2p_mode_starts_grpc_server_before_heartbeat(self):
+        """In P2P mode, the gRPC server should start immediately (before
+        any publish attempt), and publish_fn should set mx_source_id on it."""
+        from modelexpress.metadata import start_metadata_publisher
 
         mx_client = MagicMock()
-        mx_client.publish_metadata.side_effect = _FakeRpcError(
-            grpc.StatusCode.PERMISSION_DENIED,
-            "permission denied",
-        )
-
+        mx_client.publish_metadata.return_value = "abc123def456abcd"
         nixl_manager = MagicMock()
-        nixl_manager.nixl_metadata = b"data"
+        nixl_manager._listen_port = 5555
+        nixl_manager.agent_name = "test-agent"
 
-        identity = _make_identity()
+        mock_grpc_server = MagicMock()
+        mock_grpc_server.start.return_value = 6555
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
-            with pytest.raises(_FakeRpcError, match="permission denied"):
-                publish_metadata_and_ready(
-                    mx_client,
-                    nixl_manager,
-                    {},
-                    global_rank=0,
-                    device_id=0,
-                    identity=identity,
-                    worker_id="w-1",
-                )
 
-        assert mx_client.publish_metadata.call_count == 1
-        assert sleep_mock.call_args_list == []
-        hb_cls.assert_not_called()
+        with patch.dict("os.environ", {"MX_P2P_METADATA": "1", "MX_CONTIGUOUS_REG": "0", "MX_WORKER_HOST": "10.0.0.1"}), \
+             patch("modelexpress.worker_server.WorkerGrpcServer", return_value=mock_grpc_server) as grpc_cls, \
+             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
+            start_metadata_publisher(
+                mx_client, nixl_manager, {}, global_rank=0,
+                device_id=0, identity=_make_identity(), worker_id="w-1",
+            )
+
+        grpc_cls.assert_called_once()
+        mock_grpc_server.start.assert_called_once()
+        mx_client.publish_metadata.assert_not_called()
+
+        publish_fn = hb_cls.call_args.kwargs["publish_fn"]
+        publish_fn()
+        mx_client.publish_metadata.assert_called_once()
+        mock_grpc_server.set_mx_source_id.assert_called_once_with("abc123def456abcd")
 
 
 # ---------------------------------------------------------------------------

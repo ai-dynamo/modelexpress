@@ -166,9 +166,6 @@ class NixlTransferManager:
             self._agent.register_memory(region_tuples, mem_type="cuda", backends=["UCX"])
             self._registered_regions = regions
             logger.info(f"Registered {len(regions)} contiguous regions with NIXL")
-            # Debug: Log first few registered region addresses
-            if len(regions) > 0:
-                logger.info(f"[Contiguous Registration] DEBUG - First 3 regions: {[(hex(r[0]), r[1]) for r in regions[:3]]}")
         else:
             # Traditional: register individual tensors
             tensor_list = list(tensors.values())

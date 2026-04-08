@@ -164,8 +164,10 @@ class RdmaStrategy(LoadStrategy):
         dummy_loader = DummyModelLoader(dummy_config)
         dummy_loader.load_weights(model, ctx.model_config)
 
+        logger.info(f"[Worker {ctx.global_rank}] Processing weights after loading...")
         with capture_tensor_attrs():
             process_weights_after_loading(model, ctx.model_config, ctx.target_device)
+        logger.info(f"[Worker {ctx.global_rank}] Weight processing complete")
 
         self._receive_from_peer(model, ctx, source_worker, mx_source_id)
 

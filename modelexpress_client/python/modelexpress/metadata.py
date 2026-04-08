@@ -107,7 +107,7 @@ def build_tensor_protos(
     return protos
 
 
-def publish_metadata_and_ready(
+def start_metadata_publisher(
     mx_client: MxClient,
     nixl_manager: "NixlTransferManager",
     tensors: dict[str, torch.Tensor],
@@ -116,9 +116,17 @@ def publish_metadata_and_ready(
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
 ) -> None:
-    """Publish tensor metadata and ready flag to the ModelExpress server."""
+    """Prepare metadata and start the heartbeat thread that publishes it.
+
+    In P2P mode, starts a WorkerGrpcServer first (local, unlikely to fail),
+    then builds a publish callback that registers the worker with the MX
+    server.  The heartbeat thread retries the publish on each tick until
+    success or timeout.
+
+    In centralized mode, the callback publishes the full metadata blob.
+    """
     logger.info(
-        f"[Worker {global_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {global_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
     tensor_protos = build_tensor_protos(
@@ -139,23 +147,8 @@ def publish_metadata_and_ready(
         grpc_base = int(os.environ.get("MX_WORKER_GRPC_PORT", "6555"))
         worker_grpc_port = grpc_base + device_id
 
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=global_rank,
-            metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
-            agent_name=nixl_manager.agent_name,
-            worker_grpc_endpoint="",
-        )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            global_rank=global_rank,
-        )
-
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
-            mx_source_id=mx_source_id,
             port=worker_grpc_port,
         )
         actual_port = grpc_server.start()
@@ -167,41 +160,39 @@ def publish_metadata_and_ready(
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
         )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            global_rank=global_rank,
-        )
-        logger.info(
-            f"[Worker {global_rank}] Published P2P metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
-        )
+
+        def publish_fn() -> str:
+            mx_source_id = _publish_metadata_to_server(
+                mx_client=mx_client,
+                identity=identity,
+                worker=worker,
+                worker_id=worker_id,
+                global_rank=global_rank,
+            )
+            grpc_server.set_mx_source_id(mx_source_id)
+            return mx_source_id
     else:
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=global_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensors=tensor_protos,
         )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            global_rank=global_rank,
-        )
-        logger.info(
-            f"[Worker {global_rank}] Published metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
-        )
+
+        def publish_fn() -> str:
+            return _publish_metadata_to_server(
+                mx_client=mx_client,
+                identity=identity,
+                worker=worker,
+                worker_id=worker_id,
+                global_rank=global_rank,
+            )
 
     heartbeat = HeartbeatThread(
         mx_client=mx_client,
-        mx_source_id=mx_source_id,
         worker_id=worker_id,
         worker_rank=global_rank,
         nixl_manager=nixl_manager,
+        publish_fn=publish_fn,
     )
     heartbeat.start()
     _heartbeat_threads[global_rank] = heartbeat
@@ -229,11 +220,6 @@ def _publish_metadata_to_server(
                 break
 
             backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
-            logger.warning(
-                f"[Worker {global_rank}] Publish metadata attempt {attempt}/"
-                f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed with retryable gRPC status "
-                f"{exc.code().name}: {exc}. Retrying in {backoff_seconds:.1f}s"
-            )
             time.sleep(backoff_seconds)
 
     message = (
