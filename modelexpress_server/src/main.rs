@@ -101,6 +101,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_service = ApiServiceImpl;
     let model_service = ModelServiceImpl;
 
+    // Create standard gRPC health service (grpc.health.v1.Health)
+    let (health_reporter, health_service_v1) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<HealthServiceServer<HealthServiceImpl>>()
+        .await;
+    health_reporter
+        .set_serving::<ApiServiceServer<ApiServiceImpl>>()
+        .await;
+    health_reporter
+        .set_serving::<ModelServiceServer<ModelServiceImpl>>()
+        .await;
+    health_reporter
+        .set_serving::<P2pServiceServer<P2pServiceImpl>>()
+        .await;
+
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
     let p2p_state = Arc::new(P2pStateManager::new());
 
@@ -147,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the gRPC server
     info!("Starting gRPC server on: {addr}");
     let server_result = Server::builder()
+        .add_service(health_service_v1)
         .add_service(HealthServiceServer::new(health_service))
         .add_service(ApiServiceServer::new(api_service))
         .add_service(ModelServiceServer::new(model_service))
