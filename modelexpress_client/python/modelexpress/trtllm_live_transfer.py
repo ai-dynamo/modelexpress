@@ -133,6 +133,10 @@ class MxLiveSource:
 
     def _get_torch_model(self):
         """Extract the underlying torch model.
+
+        TODO: Replace with a clean TRT-LLM API to access the torch model.
+        The validated deployment path uses publish_from_worker() which receives
+        the model directly in worker.setup_engine() and does not need this.
         
         TRT-LLM 1.3.0rc5 structure:
         - LLM._executor (PyExecutor)
@@ -386,21 +390,6 @@ def publish_model_params(torch_model: Any) -> None:
             "ModelExpress worker rank %d (GPU %d) published %.2f GB (mx_source_id=%s)",
             mpi_rank, device_id, total_bytes / 1e9, mx_source_id,
         )
-
-        try:
-            verify_resp = mx_client.list_sources(identity=identity)
-            verify_meta = mx_client.get_metadata(
-                mx_source_id=mx_source_id, worker_id=worker_id,
-            )
-            logger.info(
-                "ModelExpress publish verify: list_sources=%d instances, "
-                "get_metadata found=%s tensors=%d",
-                len(verify_resp.instances),
-                verify_meta.found,
-                len(verify_meta.worker.tensors) if verify_meta.found else 0,
-            )
-        except Exception as e:
-            logger.warning("ModelExpress publish verify failed: %s", e)
     finally:
         mx_client.close()
 

@@ -25,9 +25,7 @@ import json
 import logging
 import os
 import re
-import tempfile
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -165,7 +163,6 @@ class MxWeightLoader:
             or CPU tensors (fallback).
         """
         from .nixl_transfer import NixlTransferManager
-        from .client import MxClient
         from .types import TensorDescriptor
 
         mx_server = os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
@@ -179,10 +176,8 @@ class MxWeightLoader:
             model_name, has_model,
         )
 
-        client = MxClient(mx_server)
-
         # 1. Query source metadata (with retry)
-        source_meta = self._query_source(client, model_name, timeout=600)
+        source_meta = self._query_source(model_name, mx_server, timeout=600)
 
         # 2. Determine which source ranks to receive from
         # In TP mode, each worker receives ONLY from its matching source rank.
@@ -249,8 +244,9 @@ class MxWeightLoader:
                 )
 
                 # Copy to CPU before NIXL shutdown (GPU tensors invalidated on shutdown).
-                # TODO: With model reference, we could NIXL directly into param buffers
-                # to avoid this copy. Requires knowing param layout for fused modules.
+                # WARNING: This copies all rank weights to CPU memory, which may OOM for very
+                # large models. This is the legacy checkpoint path only — the validated live
+                # transfer path (MxLiveCheckpointLoader) writes directly into GPU param buffers.
                 cpu_weights = {k: v.cpu() for k, v in weights.items()}
                 all_rank_weights[rank] = cpu_weights
 
@@ -274,39 +270,49 @@ class MxWeightLoader:
 
     # --- Internal methods ---
 
-    def _query_source(self, client, model_name: str, timeout: int = 600):
+    def _query_source(self, model_name: str, mx_server: str, timeout: int = 600):
         """Query MX server for source metadata with retry."""
-        import grpc
-        from . import p2p_pb2, p2p_pb2_grpc
+        from .client import MxClient
+        from .trtllm_loader import _build_trtllm_identity
 
-        server_addr = os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        options = [
-            ("grpc.max_receive_message_length", 200 * 1024 * 1024),
-        ]
-        channel = grpc.insecure_channel(server_addr, options=options)
+        identity = _build_trtllm_identity(model_name=model_name)
+        mx_client = MxClient(
+            server_url=mx_server, max_message_size=200 * 1024 * 1024
+        )
         try:
-            stub = p2p_pb2_grpc.P2pServiceStub(channel)
-
             start = time.time()
             while time.time() - start < timeout:
                 try:
-                    resp = stub.GetMetadata(
-                        p2p_pb2.GetMetadataRequest(model_name=model_name)
-                    )
-                    if resp.found and len(resp.workers) > 0:
-                        logger.info(
-                            "Found source: %d workers", len(resp.workers)
-                        )
-                        # Log a few tensor shapes to verify metadata freshness
-                        w0 = resp.workers[0]
-                        for t in w0.tensors[:5]:
-                            logger.info(
-                                "  Metadata tensor: %s size=%d shape=%s",
-                                t.name, t.size, list(t.shape),
+                    list_resp = mx_client.list_sources(identity=identity)
+                    if list_resp.instances:
+                        workers = []
+                        for inst in list_resp.instances:
+                            meta_resp = mx_client.get_metadata(
+                                mx_source_id=inst.mx_source_id,
+                                worker_id=inst.worker_id,
                             )
-                        # Store for config loader to use
-                        self._source_meta = resp
-                        return resp
+                            if (
+                                meta_resp.found
+                                and meta_resp.worker.tensors
+                            ):
+                                workers.append(meta_resp.worker)
+                        if workers:
+                            logger.info(
+                                "Found source: %d workers", len(workers)
+                            )
+                            w0 = workers[0]
+                            for t in w0.tensors[:5]:
+                                logger.info(
+                                    "  Metadata tensor: %s size=%d shape=%s",
+                                    t.name, t.size, list(t.shape),
+                                )
+                            class _SourceMeta:
+                                pass
+
+                            result = _SourceMeta()
+                            result.workers = workers
+                            self._source_meta = result
+                            return result
                 except Exception as e:
                     logger.warning("Query failed: %s, retrying...", e)
 
@@ -316,7 +322,7 @@ class MxWeightLoader:
                 f"Source for '{model_name}' not found after {timeout}s"
             )
         finally:
-            channel.close()
+            mx_client.close()
 
     def _allocate_tensors(
         self, tensor_protos, device_id: int
@@ -410,110 +416,21 @@ class MxWeightLoader:
 
 class MxConfigLoader:
     """
-    Loads model config from MX server's stored model_files.
+    Loads model config from the checkpoint directory via HfConfigLoader.
 
-    When a source publishes metadata, it includes config.json, tokenizer.json, etc.
-    This loader retrieves those files from the MX server and writes them to a temp
-    directory, then delegates to HfConfigLoader for actual parsing.
-
-    Falls back to local HfConfigLoader if MX server doesn't have model_files.
+    P2P metadata does not carry HF config artifacts; use a local or mounted path.
     """
 
-    def __init__(self):
-        self._temp_dir: Optional[str] = None
-        self._weight_loader: Optional[MxWeightLoader] = None
-
-    def set_weight_loader(self, loader: MxWeightLoader):
-        """Share reference to weight loader for accessing cached source metadata."""
-        self._weight_loader = loader
-
     def load(self, checkpoint_dir: str, **kwargs):
-        """
-        Load model config from MX server or local fallback.
-
-        1. Try to get model_files from MX server (via GetMetadata)
-        2. Write config files to temp dir
-        3. Delegate to HfConfigLoader to parse
-        4. Fall back to local checkpoint_dir if no model_files
-        """
+        """Load model config from checkpoint_dir using HfConfigLoader."""
         trtllm = _import_trtllm()
         HfConfigLoader = trtllm["HfConfigLoader"]
 
-        # Try to get model_files from MX server
-        model_files = self._get_model_files_from_mx()
-
-        if model_files and "config.json" in model_files:
-            # Write to temp dir and load from there
-            self._temp_dir = tempfile.mkdtemp(prefix="mx_config_")
-            config_dir = Path(self._temp_dir)
-
-            for fname, content in model_files.items():
-                fpath = config_dir / fname
-                fpath.write_bytes(content)
-                logger.info("Wrote %s (%d bytes) to temp dir", fname, len(content))
-
-            logger.info("Loading config from MX server model_files (%s)", config_dir)
-            return HfConfigLoader().load(str(config_dir), **kwargs)
-
-        # Fall back to local path
-        logger.info(
-            "No model_files from MX server, falling back to local: %s",
-            checkpoint_dir,
-        )
+        logger.info("Loading config from local path: %s", checkpoint_dir)
         return HfConfigLoader().load(checkpoint_dir, **kwargs)
 
     def cleanup(self):
-        """Clean up temp directory."""
-        if self._temp_dir and os.path.exists(self._temp_dir):
-            import shutil
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
-            self._temp_dir = None
-
-    def _get_model_files_from_mx(self) -> Optional[dict[str, bytes]]:
-        """Query MX server for model_files."""
-        import grpc
-        from . import p2p_pb2, p2p_pb2_grpc
-
-        # If weight loader already queried, use cached response
-        if self._weight_loader and self._weight_loader._source_meta:
-            resp = self._weight_loader._source_meta
-            if resp.model_files:
-                logger.info(
-                    "Using cached model_files from weight loader (%d files)",
-                    len(resp.model_files),
-                )
-                return dict(resp.model_files)
-
-        # Otherwise query directly
-        mx_server = os.environ.get("MODEL_EXPRESS_URL", "localhost:8001")
-        model_name = os.environ.get("MODEL_NAME", "")
-
-        if not model_name:
-            logger.warning("MODEL_NAME not set, cannot query MX server for config")
-            return None
-
-        try:
-            options = [
-                ("grpc.max_receive_message_length", 200 * 1024 * 1024),
-            ]
-            channel = grpc.insecure_channel(mx_server, options=options)
-            stub = p2p_pb2_grpc.P2pServiceStub(channel)
-
-            resp = stub.GetMetadata(
-                p2p_pb2.GetMetadataRequest(model_name=model_name)
-            )
-            channel.close()
-
-            if resp.found and resp.model_files:
-                logger.info(
-                    "Got %d model_files from MX server", len(resp.model_files)
-                )
-                return dict(resp.model_files)
-
-        except Exception as e:
-            logger.warning("Failed to get model_files from MX server: %s", e)
-
-        return None
+        pass
 
 
 # ===========================================================================
@@ -528,8 +445,7 @@ class MxCheckpointLoader:
     """
     ModelExpress P2P checkpoint loader for TRT-LLM.
 
-    Loads model config from MX server metadata (no PVC needed) and
-    model weights via NIXL RDMA (no disk I/O needed).
+    Loads model config from the checkpoint path and model weights via NIXL RDMA.
 
     Reuses HfWeightMapper for HF→TRT-LLM name conversion.
 
@@ -549,10 +465,6 @@ class MxCheckpointLoader:
         self._config_loader = config_loader or MxConfigLoader()
         self._weight_mapper = weight_mapper
         self._checkpoint_format = "mx-p2p"
-
-        # Share weight loader ref with config loader for cached metadata
-        if isinstance(self._config_loader, MxConfigLoader):
-            self._config_loader.set_weight_loader(self._weight_loader)
 
     def get_default_weight_loader(self):
         return MxWeightLoader()
@@ -593,7 +505,7 @@ class MxCheckpointLoader:
         return self._checkpoint_format
 
     def load_config(self, checkpoint_dir: str, **kwargs):
-        """Load config from MX server model_files, fallback to local."""
+        """Load config from checkpoint_dir."""
         logger.info("MxCheckpointLoader.load_config(%s)", checkpoint_dir)
         return self._config_loader.load(checkpoint_dir, **kwargs)
 
