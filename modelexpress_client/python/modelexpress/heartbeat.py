@@ -168,6 +168,7 @@ class HeartbeatThread:
 
         try:
             self._mx_source_id = self._publish_fn()
+            self._started = True
             logger.info(
                 f"[Worker {self._worker_rank}] Metadata published successfully "
                 f"(mx_source_id={self._mx_source_id})"

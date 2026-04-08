@@ -450,7 +450,7 @@ class TestStartMetadataPublisher:
 
         identity = _make_identity("my-model")
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
+        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0", "MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
             start_metadata_publisher(
                 mx_client, nixl_manager, tensors,
@@ -480,7 +480,7 @@ class TestStartMetadataPublisher:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
+        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0", "MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
             start_metadata_publisher(
                 mx_client, nixl_manager, {}, global_rank=0,
