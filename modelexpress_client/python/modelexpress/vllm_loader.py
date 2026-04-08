@@ -1019,11 +1019,17 @@ class MxModelLoader(BaseModelLoader):
         _nixl_managers[device_id] = self._nixl_manager
 
     def _publish_metadata(self, global_rank: int, device_id: int, identity: "p2p_pb2.SourceIdentity") -> None:
-        """Publish metadata to the MX server."""
-        _publish_metadata_and_ready(
-            self._mx_client, self._nixl_manager, self._tensors,
-            global_rank, device_id, identity, self._worker_id
-        )
+        """Publish metadata to the MX server. Failures are logged but do not raise."""
+        try:
+            _publish_metadata_and_ready(
+                self._mx_client, self._nixl_manager, self._tensors,
+                global_rank, device_id, identity, self._worker_id
+            )
+        except Exception as e:
+            logger.warning(
+                f"[Worker {global_rank}] Failed to publish metadata, "
+                f"worker will continue without P2P serving: {e}"
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
