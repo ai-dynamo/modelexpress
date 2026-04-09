@@ -41,6 +41,7 @@ RUN cd /tmp/modelexpress_client && \
     pip install --no-cache-dir . && \
     rm -rf /tmp/modelexpress_client /tmp/proto
 
+# TODO: Remove once ai-dynamo/dynamo PR #8037 merges (--model-express-url native support)
 # Apply Dynamo P2P hooks (--model-express-url support)
 # From the Dynamo branch with P2P support: backend_args.py, engine.py, llm_worker.py
 COPY --from=dynamo components/src/dynamo/trtllm/backend_args.py /tmp/dynamo_p2p/backend_args.py
@@ -55,14 +56,17 @@ RUN DYNAMO_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm && \
     grep -q "model.express.url\|model_express_url" "$DYNAMO_PKG/backend_args.py" && \
     echo "Dynamo P2P hooks OK"
 
+# TODO: Remove once NVIDIA/TensorRT-LLM PR #12898 merges (LoadFormat.PRESHARDED native)
 # Apply PRESHARDED patches to TRT-LLM 1.3.0rc5
 COPY trtllm_patches/v1.3.0rc5/apply_patches.py /tmp/apply_patches.py
 RUN python3 /tmp/apply_patches.py && rm /tmp/apply_patches.py
 
+# TODO: Remove once TRT-LLM fixes MPI allgather truncation natively
 # Patch tp_allgather to use chunked allgather (fixes MPI_ERR_TRUNCATE with ob1 TCP BTL)
 COPY trtllm_patches/v1.3.0rc5/patch_tp_allgather.py /tmp/patch_tp_allgather.py
 RUN python3 /tmp/patch_tp_allgather.py && rm /tmp/patch_tp_allgather.py
 
+# TODO: Remove once NVIDIA/TensorRT-LLM PR #12898 merges (publish hook native)
 # Patch model_loader: source publishes BEFORE post_load_weights, target runs full post_load_weights
 COPY trtllm_patches/v1.3.0rc5/patch_model_loader.py /tmp/patch_model_loader.py
 RUN python3 /tmp/patch_model_loader.py && rm /tmp/patch_model_loader.py
@@ -74,5 +78,5 @@ RUN python3 -c "from modelexpress.client import MxClient; print('ModelExpress cl
     echo "LoadFormat.PRESHARDED OK" && \
     grep -q "publish_model_params" /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/_torch/pyexecutor/model_loader.py && \
     echo "model_loader.py source publish hook OK" && \
-    grep -q "MODEL_EXPRESS_SOURCE" /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/engine.py && \
-    echo "engine.py MODEL_EXPRESS_SOURCE OK"
+    grep -q "model_express_url" /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/engine.py && \
+    echo "engine.py model_express_url OK"

@@ -106,8 +106,6 @@ spec:
             - /config/source-decode.yaml
             - --model-express-url
             - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - source
             - --tensor-parallel-size
             - "8"
           env:
@@ -123,8 +121,6 @@ spec:
               value: "modelexpress-server-decode.default.svc.cluster.local:8001"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
-            - name: MODEL_EXPRESS_SOURCE
-              value: "1"
             - name: WORLD_SIZE
               value: "8"
             - name: HOME
