@@ -233,8 +233,6 @@ spec:
             - prefill
             - --model-express-url
             - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - target
             - --tensor-parallel-size
             - "8"
             - --publish-events-and-metrics
@@ -437,8 +435,6 @@ spec:
             - decode
             - --model-express-url
             - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - target
             - --tensor-parallel-size
             - "8"
             - --publish-events-and-metrics
