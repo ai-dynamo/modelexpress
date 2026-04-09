@@ -128,7 +128,6 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx vLLM loader |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
-| `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
 | `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
 
 ### Docker

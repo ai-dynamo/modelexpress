@@ -84,7 +84,6 @@ register_modelexpress_loaders()
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compatible alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register `mx` loader with vLLM |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
-| `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 
