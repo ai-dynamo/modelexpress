@@ -168,13 +168,11 @@ docker push your-registry/mx-client:TAG
 
 ### Standalone Deployment
 
-Deploy the server with the included manifest:
+Deploy the server using one of the example manifests under `examples/`:
 
-```bash
-kubectl apply -f k8s-deployment.yaml
-```
-
-This creates a Deployment with the ModelExpress server and a Redis sidecar on port 8001.
+- **With Redis backend**: `examples/p2p_transfer_k8s/server/redis_backend/modelexpress-server-redis.yaml`
+- **With Kubernetes CRD backend**: `examples/p2p_transfer_k8s/server/kubernetes_backend/modelexpress-server-kubernetes.yaml`
+- **Aggregated with Dynamo**: `examples/aggregated_k8s/agg.yaml`
 
 ### HuggingFace Token
 

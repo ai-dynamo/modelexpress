@@ -64,7 +64,6 @@ ModelExpress/
 ├── Cargo.lock
 ├── Dockerfile                          # Multi-stage production image
 ├── docker-compose.yml                  # Single-service dev setup
-├── k8s-deployment.yaml                 # Standalone K8s deployment
 ├── run_integration_tests.sh            # Integration test runner
 ├── test_client.sh                      # Client test script
 ├── test_grpc_transfer_k8s.sh           # K8s gRPC transfer test
@@ -335,7 +334,7 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 The server supports two metadata backends, selected via `MX_METADATA_BACKEND`:
 
 - **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). Stale detection and cleanup handled by the server-side reaper.
-- **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection. Stale detection handled by the server-side reaper.
+- **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs (one per worker) with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection. Standard Kubernetes `status.conditions` (`Ready`) and `status.observedGeneration` are maintained so that `kubectl wait --for=condition=Ready` works. Stale detection handled by the server-side reaper.
 
 Each worker publishes independently (no Lua merge scripts needed). The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))`. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
 
