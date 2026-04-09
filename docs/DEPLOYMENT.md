@@ -231,7 +231,7 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
-| `MX_METADATA_PORT` | `0` | NIXL listen thread port for P2P metadata exchange |
+| `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
