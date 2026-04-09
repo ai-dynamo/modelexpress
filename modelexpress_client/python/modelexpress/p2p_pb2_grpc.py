@@ -8,7 +8,7 @@ import warnings
 
 from . import p2p_pb2 as p2p__pb2
 
-GRPC_GENERATED_VERSION = '1.69.0'
+GRPC_GENERATED_VERSION = '1.66.2'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
