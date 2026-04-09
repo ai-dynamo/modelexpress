@@ -96,7 +96,6 @@ spec:
                         type: string
                         description: Condition type
                         enum:
-                          - AllWorkersPublished
                           - Ready
                       status:
                         type: string
