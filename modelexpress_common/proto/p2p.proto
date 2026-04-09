@@ -98,10 +98,6 @@ message TensorDescriptor {
 
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
-  
-  // Tensor shape (e.g., [4096, 4096] for a 2D weight matrix)
-  // Required for proper reconstruction on the target
-  repeated int64 shape = 6;
 }
 
 // ============================================================================

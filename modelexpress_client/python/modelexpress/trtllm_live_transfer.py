@@ -8,15 +8,8 @@ Transfers model weights directly between running TRT-LLM instances via NIXL RDMA
 Source registers its model parameter GPU buffers; target receives into its own
 model parameter buffers. No format conversion, no disk I/O, no CPU round-trip.
 
-Source usage (after model is loaded):
-    from modelexpress.trtllm_live_transfer import MxLiveSource
-    llm = LLM(model="Llama-70B", tp=8)
-    source = MxLiveSource(llm, "llama-70b", "modelexpress-server:8001")
-    source.publish()  # Registers GPU params with NIXL, publishes metadata
-    # Continue serving inference — weights stay in GPU memory
-
 Target usage (via checkpoint_loader):
-    from modelexpress.trtllm_live_transfer import MxLiveWeightLoader
+    from modelexpress.trtllm_live_transfer import MxLiveCheckpointLoader
     loader = MxLiveCheckpointLoader()
     llm = LLM(model="Llama-70B", checkpoint_loader=loader,
               load_format=LoadFormat.PRESHARDED, tp=8)
@@ -34,274 +27,34 @@ import torch
 
 from .client import MxClient
 from . import p2p_pb2
-from .trtllm_loader import _build_trtllm_identity
 
 logger = logging.getLogger("modelexpress.trtllm_live_transfer")
 
 
-class MxLiveSource:
-    """
-    Publishes weights from a running TRT-LLM model's GPU memory.
+def _build_trtllm_identity(
+    model_name: str,
+    tp_size: int = 1,
+    ep_size: int = 1,
+    dtype: str = "bfloat16",
+) -> p2p_pb2.SourceIdentity:
+    from importlib.metadata import version as pkg_version
 
-    The model's parameters are already fused (qkv_proj), TP-sharded, and on GPU.
-    We register them directly with NIXL — no loading from disk, no sharding,
-    no format conversion.
-    """
+    try:
+        mx_version = pkg_version("modelexpress")
+    except Exception:
+        mx_version = "0.0.0"
 
-    def __init__(
-        self,
-        model: Any,
-        model_name: str,
-        mx_server: str = "modelexpress-server:8001",
-        model_path: Optional[str] = None,
-    ):
-        self._model = model
-        self._model_name = model_name
-        self._mx_server = mx_server
-        self._model_path = model_path
-        self._nixl_managers = {}
-        self._published = False
+    return p2p_pb2.SourceIdentity(
+        mx_version=mx_version,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        model_name=model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
+        tensor_parallel_size=tp_size,
+        pipeline_parallel_size=1,
+        expert_parallel_size=ep_size,
+        dtype=dtype,
+    )
 
-    def publish(self):
-        """Register model params with NIXL and publish metadata to MX server."""
-        from .nixl_transfer import NixlTransferManager
-
-        torch_model = self._get_torch_model()
-        if torch_model is None:
-            raise RuntimeError(
-                "Cannot access underlying torch model from LLM instance. "
-                "With TRT-LLM RPC/MPI executor (TP>1), the model lives in worker processes. "
-                "Use publish_from_worker() inside each worker instead."
-            )
-
-        device_id = torch.cuda.current_device()
-        logger.info(
-            "Publishing live model '%s' from GPU %d", self._model_name, device_id
-        )
-
-        param_tensors = {}
-        total_bytes = 0
-        for name, param in torch_model.named_parameters():
-            if param.device.index == device_id:
-                param_tensors[name] = param.data
-                total_bytes += param.numel() * param.element_size()
-
-        logger.info(
-            "Found %d params on GPU %d (%.2f GB)",
-            len(param_tensors), device_id, total_bytes / 1e9,
-        )
-
-        nixl_mgr = NixlTransferManager(
-            agent_name=f"trtllm-live-source-rank{device_id}-{os.getpid()}",
-            device_id=device_id,
-        )
-        nixl_mgr.initialize()
-        nixl_mgr.register_tensors(param_tensors)
-        self._nixl_managers[device_id] = nixl_mgr
-
-        tensor_protos = [
-            p2p_pb2.TensorDescriptor(
-                name=name,
-                addr=tensor.data_ptr(),
-                size=tensor.numel() * tensor.element_size(),
-                device_id=device_id,
-                dtype=str(tensor.dtype),
-            )
-            for name, tensor in param_tensors.items()
-        ]
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=device_id,
-            nixl_metadata=nixl_mgr.nixl_metadata,
-            tensors=tensor_protos,
-        )
-
-        identity = _build_trtllm_identity(model_name=self._model_name)
-        worker_id = uuid.uuid4().hex[:8]
-        mx_client = MxClient(server_url=self._mx_server)
-        mx_source_id = mx_client.publish_metadata(
-            identity=identity, worker=worker, worker_id=worker_id,
-        )
-        mx_client.close()
-
-        self._published = True
-        logger.info(
-            "Published %d params (%.2f GB) for '%s' rank %d (mx_source_id=%s)",
-            len(param_tensors), total_bytes / 1e9, self._model_name, device_id,
-            mx_source_id,
-        )
-
-    def _get_torch_model(self):
-        """Extract the underlying torch model.
-
-        TODO: Replace with a clean TRT-LLM API to access the torch model.
-        The validated deployment path uses publish_from_worker() which receives
-        the model directly in worker.setup_engine() and does not need this.
-        
-        TRT-LLM 1.3.0rc5 structure:
-        - LLM._executor (PyExecutor)
-        - PyExecutor.model_engine (PyTorchModelEngine)
-        - PyTorchModelEngine.model (torch.nn.Module)
-        """
-        model = self._model
-        logger.info(f"_get_torch_model: model type = {type(model)}")
-        
-        # If model itself has named_parameters (direct torch model), use it
-        if hasattr(model, 'named_parameters'):
-            try:
-                # Quick check: try to iterate one param to verify it's a real model
-                next(iter(model.named_parameters()), None)
-                logger.info("_get_torch_model: found direct torch model")
-                return model
-            except (AttributeError, TypeError) as e:
-                logger.debug(f"_get_torch_model: direct model check failed: {e}")
-        
-        # Try TRT-LLM 1.3.0rc5 path: _executor.model_engine.model
-        if hasattr(model, '_executor'):
-            try:
-                executor = getattr(model, '_executor')
-                logger.info(f"_get_torch_model: _executor = {executor}, type = {type(executor)}")
-                if executor is not None:
-                    if hasattr(executor, 'model_engine'):
-                        try:
-                            model_engine = getattr(executor, 'model_engine')
-                            logger.info(f"_get_torch_model: model_engine = {model_engine}, type = {type(model_engine)}")
-                            if model_engine is not None:
-                                if hasattr(model_engine, 'model'):
-                                    try:
-                                        torch_model = getattr(model_engine, 'model')
-                                        logger.info(f"_get_torch_model: torch_model = {torch_model}, type = {type(torch_model)}")
-                                        if hasattr(torch_model, 'named_parameters'):
-                                            try:
-                                                # Verify it's a real model
-                                                next(iter(torch_model.named_parameters()), None)
-                                                logger.info("_get_torch_model: found model via _executor.model_engine.model")
-                                                return torch_model
-                                            except (AttributeError, TypeError, StopIteration) as e:
-                                                logger.warning(f"_get_torch_model: torch_model has named_parameters but iteration failed: {e}")
-                                    except Exception as e:
-                                        logger.warning(f"_get_torch_model: failed to get model from model_engine: {e}")
-                                else:
-                                    logger.info("_get_torch_model: model_engine has no 'model' attribute")
-                                    logger.info(f"_get_torch_model: model_engine dir = {[a for a in dir(model_engine) if not a.startswith('__')][:20]}")
-                            else:
-                                logger.info("_get_torch_model: model_engine is None")
-                        except Exception as e:
-                            logger.warning(f"_get_torch_model: failed to get model_engine from executor: {e}")
-                    else:
-                        logger.info("_get_torch_model: executor has no 'model_engine' attribute")
-                        logger.info(f"_get_torch_model: executor dir = {[a for a in dir(executor) if not a.startswith('__')][:20]}")
-                        
-                        # Try to access underlying executor from proxy
-                        # GenerationExecutorProxy may have internal attributes holding the actual executor
-                        for proxy_attr in ['_executor', 'executor', '_worker', 'worker', '_workers', 'workers']:
-                            if hasattr(executor, proxy_attr):
-                                try:
-                                    underlying = getattr(executor, proxy_attr)
-                                    logger.info(f"_get_torch_model: proxy has '{proxy_attr}' = {underlying}, type = {type(underlying)}")
-                                    if underlying is not None:
-                                        # If it's a list/dict of workers, try first one
-                                        if isinstance(underlying, (list, tuple)) and len(underlying) > 0:
-                                            underlying = underlying[0]
-                                        elif isinstance(underlying, dict) and len(underlying) > 0:
-                                            underlying = next(iter(underlying.values()))
-                                        
-                                        if hasattr(underlying, 'model_engine'):
-                                            try:
-                                                model_engine = getattr(underlying, 'model_engine')
-                                                if model_engine is not None and hasattr(model_engine, 'model'):
-                                                    torch_model = getattr(model_engine, 'model')
-                                                    if torch_model is not None and hasattr(torch_model, 'named_parameters'):
-                                                        try:
-                                                            next(iter(torch_model.named_parameters()), None)
-                                                            logger.info(f"_get_torch_model: found model via proxy.{proxy_attr}.model_engine.model")
-                                                            return torch_model
-                                                        except Exception:
-                                                            pass
-                                            except Exception as e:
-                                                logger.debug(f"_get_torch_model: failed to access model_engine from {proxy_attr}: {e}")
-                                except Exception as e:
-                                    logger.debug(f"_get_torch_model: failed to access proxy attr '{proxy_attr}': {e}")
-                else:
-                    logger.info("_get_torch_model: _executor is None")
-            except Exception as e:
-                logger.warning(f"_get_torch_model: failed to access _executor: {e}")
-        
-        # Try accessing model through _disaggregated_params (for distributed setups)
-        if hasattr(model, '_disaggregated_params'):
-            try:
-                disaggregated = getattr(model, '_disaggregated_params')
-                logger.info(f"_get_torch_model: _disaggregated_params = {disaggregated}, type = {type(disaggregated)}")
-                # _disaggregated_params might be a dict of parameter tensors
-                if isinstance(disaggregated, dict) and len(disaggregated) > 0:
-                    # We can't return a dict, but we can check if it has the parameters we need
-                    logger.info(f"_get_torch_model: found {len(disaggregated)} parameters in _disaggregated_params")
-                    # Note: We'd need to reconstruct a model from these params, which is complex
-                    # For now, we'll continue trying other paths
-            except Exception as e:
-                logger.debug(f"_get_torch_model: failed to access _disaggregated_params: {e}")
-        
-        # Try legacy/common attribute paths for LLM wrapper
-        for attr in ['_model', 'model', '_engine', '_build_model']:
-            if hasattr(model, attr):
-                candidate = getattr(model, attr)
-                logger.debug(f"_get_torch_model: trying attr '{attr}' = {candidate}, type = {type(candidate)}")
-                if candidate is not None and hasattr(candidate, 'named_parameters'):
-                    try:
-                        # Verify it's a real model
-                        next(iter(candidate.named_parameters()), None)
-                        logger.debug(f"_get_torch_model: found model via '{attr}'")
-                        return candidate
-                    except (AttributeError, TypeError, StopIteration) as e:
-                        logger.debug(f"_get_torch_model: '{attr}' candidate failed: {e}")
-                        continue
-        
-        logger.error(f"_get_torch_model: failed to find torch model. Model type: {type(model)}, dir(model): {[a for a in dir(model) if not a.startswith('__')][:20]}")
-        return None
-
-    def _collect_model_files(self) -> dict[str, bytes]:
-        """Collect config files for target config loading.
-
-        If model_path is set, reads directly from that directory (reliable).
-        Otherwise falls back to searching the HF cache (fragile when multiple
-        models are cached — may pick up the wrong config.json).
-        """
-        config_names = [
-            "config.json", "tokenizer.json", "tokenizer_config.json",
-            "generation_config.json", "special_tokens_map.json",
-        ]
-        model_files: dict[str, bytes] = {}
-
-        if self._model_path and os.path.isdir(self._model_path):
-            for fname in config_names:
-                fpath = os.path.join(self._model_path, fname)
-                if os.path.exists(fpath):
-                    with open(fpath, "rb") as f:
-                        model_files[fname] = f.read()
-            if model_files:
-                logger.info("Collected %d config files from %s", len(model_files), self._model_path)
-            return model_files
-
-        # Fallback: search HF cache (unreliable with multiple models)
-        import glob
-        hf_cache = os.environ.get("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
-        for fname in config_names:
-            matches = glob.glob(f"{hf_cache}/**/snapshots/**/{fname}", recursive=True)
-            if matches:
-                try:
-                    with open(matches[0], "rb") as f:
-                        model_files[fname] = f.read()
-                except Exception:
-                    pass
-        if model_files:
-            logger.info("Collected %d config files for target (cache fallback)", len(model_files))
-        return model_files
-
-    def shutdown(self):
-        """Clean up NIXL resources."""
-        for nixl_mgr in self._nixl_managers.values():
-            nixl_mgr.shutdown()
-        self._nixl_managers.clear()
 
 
 def publish_model_params(torch_model: Any) -> None:
@@ -781,6 +534,26 @@ class MxLiveWeightLoader:
         raise TimeoutError(f"Source for '{model_name}' not found after {timeout}s")
 
 
+def _import_trtllm_for_config():
+    from tensorrt_llm._torch.models.checkpoints.hf.config_loader import (
+        HfConfigLoader,
+    )
+
+    return {"HfConfigLoader": HfConfigLoader}
+
+
+class MxConfigLoader:
+    def load(self, checkpoint_dir: str, **kwargs):
+        trtllm = _import_trtllm_for_config()
+        HfConfigLoader = trtllm["HfConfigLoader"]
+
+        logger.info("Loading config from local path: %s", checkpoint_dir)
+        return HfConfigLoader().load(checkpoint_dir, **kwargs)
+
+    def cleanup(self):
+        pass
+
+
 class MxLiveCheckpointLoader:
     """
     Checkpoint loader that uses MxLiveWeightLoader for direct param-to-param transfer.
@@ -801,7 +574,6 @@ class MxLiveCheckpointLoader:
         return MxLiveWeightLoader()
 
     def get_default_config_loader(self):
-        from .trtllm_checkpoint_loader import MxConfigLoader
         return MxConfigLoader()
 
     def cleanup(self):
