@@ -55,7 +55,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `mx` loader with NVIDIA NIXL over RDMA; auto-detects source/target
+- **P2P GPU transfer** — vLLM `mx` loader and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
@@ -66,7 +66,8 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 |---------|-------------|
 | vLLM | `--load-format mx` for P2P weight transfer |
 | NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
-| SGLang, TensorRT-LLM | Coming soon |
+| TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
+| SGLang | Coming soon |
 
 ---
 
