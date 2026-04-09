@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
-from modelexpress.nixl_transfer import NixlTransferManager
 
 
 # ---------------------------------------------------------------------------
@@ -204,37 +203,6 @@ class TestAbstractMethodCompleteness:
         with patch("modelexpress.vllm_loader.DefaultModelLoader") as mock_cls:
             loader.load_weights(model, cfg)
             mock_cls.return_value.load_weights.assert_called_once_with(model, cfg)
-
-
-# ---------------------------------------------------------------------------
-# register_tensors (load_strategy.base)
-# ---------------------------------------------------------------------------
-
-
-class TestInitNixlManager:
-    """Verify _init_nixl_manager computes listen_port from MX_P2P_METADATA."""
-
-    def test_centralized_mode_skips_listen_port(self):
-        from modelexpress.load_strategy.base import _init_nixl_manager
-
-        with patch.dict("os.environ", {"MX_P2P_METADATA": "0"}, clear=False), \
-             patch.object(NixlTransferManager, "initialize"):
-            mgr = _init_nixl_manager(global_rank=0, device_id=0, role="auto")
-
-        assert mgr._listen_port is None
-
-    def test_p2p_mode_sets_listen_port_with_device_offset(self):
-        from modelexpress.load_strategy.base import _init_nixl_manager
-
-        with patch.dict(
-            "os.environ",
-            {"MX_P2P_METADATA": "1", "MX_METADATA_PORT": "6000"},
-            clear=False,
-        ), \
-             patch.object(NixlTransferManager, "initialize"):
-            mgr = _init_nixl_manager(global_rank=0, device_id=2, role="auto")
-
-        assert mgr._listen_port == 6002  # base port 6000 + device_id 2
 
 
 # ---------------------------------------------------------------------------
