@@ -6,7 +6,7 @@ use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
 use modelexpress_client::{Client, ClientConfig, ModelProvider};
-use modelexpress_common::cache::{CacheConfig, CacheStats, ModelInfo};
+use modelexpress_common::cache::{CacheConfig, CacheStats, ModelInfo, resolve_model_path};
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
@@ -510,8 +510,16 @@ async fn validate_models(
     let storage_config = get_storage_config(storage_path_override)?;
 
     if let Some(name) = model_name {
-        // Validate specific model
-        let model_path = storage_config.local_path.join(&name);
+        // Validate specific model.
+        // Try the HuggingFace cache layout first (models--org--name/snapshots/...),
+        // then fall back to a plain path join for other providers.
+        let model_path = resolve_model_path(
+            &storage_config.local_path,
+            ModelProvider::HuggingFace,
+            &name,
+            None,
+        )
+        .unwrap_or_else(|_| storage_config.local_path.join(&name));
         let exists = model_path.exists();
 
         match format {
