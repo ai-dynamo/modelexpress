@@ -10,8 +10,7 @@ This package provides:
 - vLLM worker extension for serving model weights
 - Custom model loaders for FP8 model support (DeepSeek-V3, etc.)
 
-Quick Start:
-    # For FP8 models (DeepSeek-V3), use custom loaders:
+Quick Start (vLLM):
     from modelexpress import register_modelexpress_loaders
     register_modelexpress_loaders()
 

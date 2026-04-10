@@ -168,13 +168,11 @@ docker push your-registry/mx-client:TAG
 
 ### Standalone Deployment
 
-Deploy the server with the included manifest:
+Deploy the server using one of the example manifests under `examples/`:
 
-```bash
-kubectl apply -f k8s-deployment.yaml
-```
-
-This creates a Deployment with the ModelExpress server and a Redis sidecar on port 8001.
+- **With Redis backend**: `examples/p2p_transfer_k8s/server/redis_backend/modelexpress-server-redis.yaml`
+- **With Kubernetes CRD backend**: `examples/p2p_transfer_k8s/server/kubernetes_backend/modelexpress-server-kubernetes.yaml`
+- **Aggregated with Dynamo**: `examples/aggregated_k8s/agg.yaml`
 
 ### HuggingFace Token
 
@@ -231,7 +229,7 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
-| `MX_METADATA_PORT` | `0` | NIXL listen thread port for P2P metadata exchange |
+| `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |

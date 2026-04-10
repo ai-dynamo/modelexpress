@@ -59,3 +59,18 @@ docs/tmp
 .venv/
 *.egg-info/
 modelexpress_client/python/modelexpress.egg-info
+
+# Local documentation (not for repo)
+docs/TRTLLM_*.md
+docs/disagg_*.md
+docs/AUTO_CONFIG.md
+docs/GCP_GB200_NODES.md
+docs/OPERATOR_LLM.md
+docs/PLANNER_PLAN.md
+docs/POC_TRTLLM.md
+docs/PYTORCH_TRTLLM.md
+docs/testing_context.md
+docs/troubleshooting_*.md
+docs/trtllm_*.md
+docs/weight_correctness_*.md
+docs/CONTEXT.md

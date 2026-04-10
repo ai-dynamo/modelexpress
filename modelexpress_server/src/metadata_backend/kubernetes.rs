@@ -282,11 +282,18 @@ impl MetadataBackend for KubernetesBackend {
         for attempt in 0..max_retries {
             let current = api.get(&cr_name).await?;
             let resource_version = current.metadata.resource_version.unwrap_or_default();
+            let generation = current.metadata.generation.unwrap_or(0);
+
+            let mut crd_status = current.status.unwrap_or_default();
+            crd_status.update_ready_condition(worker_record.status);
+
             let status_patch = json!({
                 "metadata": { "resourceVersion": resource_version },
                 "status": {
                     "worker": worker_status,
-                    "publishedAt": now
+                    "publishedAt": now,
+                    "conditions": crd_status.conditions,
+                    "observedGeneration": generation
                 }
             });
 
@@ -628,7 +635,14 @@ impl MetadataBackend for KubernetesBackend {
         let max_retries: u32 = 5;
         for attempt in 0..max_retries {
             let current = api.get(&cr_name).await?;
-            let mut worker = current.status.and_then(|s| s.worker).ok_or_else(|| {
+            let mut crd_status = current.status.ok_or_else(|| {
+                format!(
+                    "update_status: no status in source '{}' worker '{}'",
+                    source_id, worker_id
+                )
+            })?;
+
+            let mut worker = crd_status.worker.take().ok_or_else(|| {
                 format!(
                     "update_status: no worker in source '{}' worker '{}'",
                     source_id, worker_id
@@ -638,10 +652,17 @@ impl MetadataBackend for KubernetesBackend {
             worker.status = status_name.clone();
             worker.updated_at = Some(updated_at_rfc3339.clone());
 
+            crd_status.update_ready_condition(status as i32);
+
+            let generation = current.metadata.generation.unwrap_or(0);
             let resource_version = current.metadata.resource_version.unwrap_or_default();
             let status_patch = serde_json::json!({
                 "metadata": { "resourceVersion": resource_version },
-                "status": { "worker": worker }
+                "status": {
+                    "worker": worker,
+                    "conditions": crd_status.conditions,
+                    "observedGeneration": generation
+                }
             });
 
             match api

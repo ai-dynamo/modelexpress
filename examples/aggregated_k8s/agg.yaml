@@ -16,6 +16,46 @@ spec:
       storage: 500Gi
 
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+---
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
@@ -57,7 +97,7 @@ spec:
           runAsGroup: 1000
           fsGroup: 1000
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.2.0
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
           imagePullPolicy: IfNotPresent
           env:
             - name: MODEL_EXPRESS_SERVER_PORT
@@ -68,6 +108,10 @@ spec:
               value: "/model/models.db"
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: "/model/.model-express/cache"
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
             - name: MODEL_NAME
               value: "Qwen/Qwen3-0.6B"
             - name: MODEL_CACHE_PATH
@@ -96,13 +140,25 @@ spec:
 
               echo "Waiting for server to be ready..."
               for i in {1..60}; do
-                if ./modelexpress-cli --endpoint http://localhost:8002 health > /dev/null 2>&1; then
+                if ./modelexpress-cli --endpoint http://localhost:8000 health > /dev/null 2>&1; then
                   echo "Server is ready!"
                   break
                 fi
                 echo "Waiting for server... ($i/60)"
                 sleep 2
               done
+
+              echo "Downloading $MODEL_NAME model..."
+              ./modelexpress-cli --endpoint http://localhost:8000 \
+                --cache-path $MODEL_CACHE_PATH \
+                model download "$MODEL_NAME" --strategy server-only
+
+              SNAPSHOT_DIR=$(ls -td $MODEL_CACHE_PATH/models--$(echo $MODEL_NAME | tr '/' '--')/snapshots/*/ 2>/dev/null | head -1)
+              if [ -n "$SNAPSHOT_DIR" ]; then
+                SNAPSHOTS_PARENT=$(dirname "$SNAPSHOT_DIR")
+                ln -sfn "$(basename "$SNAPSHOT_DIR")" "$SNAPSHOTS_PARENT/latest"
+                echo "Created symlink: latest -> $(basename "$SNAPSHOT_DIR")"
+              fi
 
               echo "Server PID: $SERVER_PID"
               wait $SERVER_PID

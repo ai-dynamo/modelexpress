@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress server + Redis for decode source (Phase 2 mixed TP)
+# Separate from prefill MX server so each source publishes to its own store
+# Deploys on <CPU_NODE_POOL> nodes (amd64)
+# Namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-decode
+  labels:
+    app: redis-decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-decode
+  template:
+    metadata:
+      labels:
+        app: redis-decode
+    spec:
+      # Update node pool names for your cluster
+      nodeSelector:
+        cloud.google.com/gke-nodepool: <CPU_NODE_POOL>
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: user-workload
+          effect: NoExecute
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "0.5"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-decode
+spec:
+  selector:
+    app: redis-decode
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server-decode
+  labels:
+    app: modelexpress-server-decode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelexpress-server-decode
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server-decode
+    spec:
+      # Update node pool names for your cluster
+      nodeSelector:
+        cloud.google.com/gke-nodepool: <CPU_NODE_POOL>
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: user-workload
+          effect: NoExecute
+      containers:
+        - name: server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            - name: REDIS_URL
+              value: "redis://redis-decode:6379"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server-decode
+spec:
+  selector:
+    app: modelexpress-server-decode
+  ports:
+    - port: 8001
+      targetPort: 8001

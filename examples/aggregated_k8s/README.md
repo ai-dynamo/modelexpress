@@ -42,6 +42,8 @@
    - Kubernetes cluster with GPU support
    - `kubectl` configured to access your cluster
    - Docker registry accessible from your cluster
+   - A HuggingFace token stored in a Kubernetes Secret named `hf-token-secret` (referenced by `envFromSecret`)
+   - Redis is included in `agg.yaml` as a standalone Deployment + Service (no separate setup needed)
 
 ## Quick Start
 
@@ -78,17 +80,14 @@ Server started with PID: 7
 Setting up Model Express configuration...
 Waiting for server to be ready...
 Server is ready!
-Cleaning up any stale lock files...
 Downloading Qwen/Qwen3-0.6B model...
 Model Download
   Model: Qwen/Qwen3-0.6B
   Provider: HuggingFace
-  Strategy: SmartFallback
-✅ SUCCESS
+  Strategy: ServerOnly
+SUCCESS
   Model 'Qwen/Qwen3-0.6B' downloaded successfully
-Model download completed. Creating symlink for VLLM worker...
 Created symlink: latest -> c1899de289a04d12100db370d81485cdf75e47ca
-Model cache directory: models--Qwen--Qwen3-0.6B
 ```
 
 ### Monitor VLLM Worker
@@ -98,13 +97,10 @@ kubectl logs -f vllm-agg-vllmdecodeworker-69dcddfc85-zcwd7
 
 Sample output:
 ```
-Waiting for model to be ready...
-Model is ready! Starting VLLM worker...
-Model path: /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest/
-INFO 08-15 01:24:21 [__init__.py:235] Automatically detected platform cuda.
-2025-08-15T01:24:24.377400Z  INFO dynamo_runtime::http_server: [spawn_http_server] binding to: 0.0.0.0:9090
-2025-08-15T01:24:35.555894Z  INFO parallel_state.initialize_model_parallel: rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
-2025-08-15T01:25:36.139394Z  INFO main.setup_vllm_engine: VllmWorker for /model/.model-express/cache/models--Qwen--Qwen3-0.6B/snapshots/latest/ has been initialized
+INFO [__init__.py:235] Automatically detected platform cuda.
+INFO dynamo_runtime::http_server: [spawn_http_server] binding to: 0.0.0.0:9090
+INFO parallel_state.initialize_model_parallel: rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+INFO main.setup_vllm_engine: VllmWorker for Qwen/Qwen3-0.6B has been initialized
 ```
 
 ## Configuration
