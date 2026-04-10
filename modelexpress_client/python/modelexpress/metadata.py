@@ -133,14 +133,8 @@ def start_metadata_publisher(
         nixl_manager, tensors, device_id, global_rank,
     )
 
-    if is_p2p_metadata_enabled():
+    if _is_p2p_metadata_enabled():
         from .worker_server import WorkerGrpcServer
-
-        if nixl_manager._listen_port is None:
-            raise RuntimeError(
-                "P2P metadata exchange requires a NIXL listen port, "
-                "but the NIXL manager was initialized without one."
-            )
 
         host = _get_worker_host()
 
@@ -230,7 +224,7 @@ def _publish_metadata_to_server(
     raise RuntimeError(f"{message}: {last_error}") from last_error
 
 
-def is_p2p_metadata_enabled() -> bool:
+def _is_p2p_metadata_enabled() -> bool:
     """Check if P2P metadata exchange is enabled via env var."""
     return os.environ.get("MX_P2P_METADATA", "0") == "1"
 
