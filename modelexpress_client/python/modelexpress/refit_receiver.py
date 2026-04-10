@@ -231,6 +231,97 @@ class MxRefitReceiver:
             if td.name in self._nixl._tensors:
                 yield td.name, self._nixl._tensors[td.name]
 
+    def receive_weights_scratch(
+        self,
+        source: SourceRef,
+        timeout_seconds: float = 300.0,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Receive weights into scratch GPU buffers via NIXL RDMA.
+
+        Unlike :meth:`receive_weights` which requires pre-registered model
+        buffers with matching tensor names, this method allocates temporary
+        GPU tensors that match the source's layout, transfers via RDMA, and
+        yields the results. The caller feeds these through
+        ``model.load_weights()`` which handles name mapping and tensor fusion.
+
+        This is the correct approach when the source (trainer) publishes
+        HuggingFace-format weights but the target (vLLM) uses fused internal
+        parameter names.
+
+        Args:
+            source: A :class:`SourceRef` obtained from :meth:`poll_for_source`.
+            timeout_seconds: Maximum time to wait for the RDMA transfer.
+
+        Yields:
+            ``(name, tensor)`` pairs in HF checkpoint format.
+        """
+        if not self._initialized:
+            raise RuntimeError("Call initialize() before receive_weights_scratch()")
+
+        meta_resp = self._client.get_metadata(
+            mx_source_id=source.mx_source_id,
+            worker_id=source.worker_id,
+        )
+        if not meta_resp.found:
+            raise RuntimeError(
+                f"Source {source.mx_source_id}/{source.worker_id} not found on MX Server"
+            )
+
+        worker = meta_resp.worker
+        source_tensors = [
+            TensorDescriptor(
+                name=t.name,
+                addr=t.addr,
+                size=t.size,
+                device_id=t.device_id,
+                dtype=t.dtype,
+            )
+            for t in worker.tensors
+        ]
+
+        _DTYPE_MAP = {
+            "torch.bfloat16": torch.bfloat16,
+            "torch.float16": torch.float16,
+            "torch.float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+
+        scratch_tensors: dict[str, torch.Tensor] = {}
+        for td in source_tensors:
+            dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
+            elem_size = torch.tensor([], dtype=dt).element_size()
+            numel = td.size // elem_size
+            scratch_tensors[td.name] = torch.empty(
+                numel, dtype=dt, device=f"cuda:{self._device_id}"
+            )
+
+        logger.info(
+            f"Allocated {len(scratch_tensors)} scratch buffers "
+            f"({sum(t.numel() * t.element_size() for t in scratch_tensors.values()) / 1e9:.2f} GB)"
+        )
+
+        self._nixl.register_tensors(scratch_tensors)
+
+        transferred, skipped, elapsed = self._nixl.receive_from_source(
+            source_metadata=worker.nixl_metadata,
+            source_tensors=source_tensors,
+            timeout_seconds=timeout_seconds,
+        )
+
+        bandwidth_gbps = (transferred * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
+        logger.info(
+            f"RDMA transfer complete: {transferred / 1e9:.2f} GB, "
+            f"{len(source_tensors)} tensors, {elapsed:.2f}s, "
+            f"{bandwidth_gbps:.1f} Gbps (step={source.training_step})"
+        )
+
+        self._current_step = source.training_step
+
+        for name, tensor in scratch_tensors.items():
+            yield name, tensor
+
     def receive_weights_from_metadata(
         self,
         nixl_metadata: bytes,
