@@ -502,30 +502,9 @@ P2P weight transfer works by loading dummy weights on the target, running `proce
 
 Three safety mechanisms prevent silent transfer failures:
 
-**1. Model feature allow-list** (`transfer_safety.py`): Before attempting P2P transfer, the loader checks the model's architecture, quantization method, dtype, and attention type against strict allow-lists. Only explicitly validated combinations are permitted. Unknown model architectures, quantization methods, or attention types cause automatic fallback to disk loading. Set `MX_SKIP_FEATURE_CHECK=1` to bypass (for testing only).
+**1. MLA feature gate** (`transfer_safety.py`): Before attempting P2P transfer, the loader checks the model's HF config for `kv_lora_rank`, which indicates Multi-head Latent Attention (MLA). MLA models (DeepSeek-V2/V3, Kimi K2/K2.5, and any future model using MLA) are blocked from P2P transfer and fall back to disk loading. All other models are allowed. Set `MX_SKIP_FEATURE_CHECK=1` to bypass (for testing only).
 
-Currently validated (tested on nScale B200 cluster):
-
-| Model | Architecture | Quantization | P2P Transfer |
-|-------|-------------|--------------|--------------|
-| Llama-3.1-8B-Instruct | llama (GQA) | none (BF16) | PASS |
-| Llama-3.1-8B-Instruct-FP8 | llama (GQA) | fp8 | PASS |
-| Llama-3-8B-Instruct-AWQ | llama (GQA) | awq | PASS |
-| Llama-3-8B-Instruct-GPTQ | llama (GQA) | gptq | PASS |
-| Mistral-7B-Instruct-v0.3 | mistral (GQA) | none (BF16) | PASS |
-| Qwen2-7B-Instruct | qwen2 (GQA) | none (BF16) | PASS |
-| Phi-3.5-mini-instruct | phi3 (GQA) | none (BF16) | PASS |
-| Gemma-2-2b-it | gemma2 (GQA) | none (BF16) | PASS |
-| DeepSeek-V2-Lite-Chat-FP8 | deepseek_v2 (MLA) | fp8 | vLLM >= 0.16.0 only |
-
-Blocked features:
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| DeepSeek MLA on vLLM < 0.16.0 | **Blocked** | Derived tensors on non-Module ABC, invisible to tensor capture |
-| DeepSeek MLA on vLLM >= 0.16.0 | **Allowed** | vLLM PR #33284 moved post-processing onto nn.Module |
-| Other quantization methods | **Blocked** | Not yet validated (bitsandbytes, compressed-tensors, etc.) |
-| Unknown model architectures | **Blocked** | Must be explicitly added to allow-list after validation |
+MLA models produce correct inference when loaded from disk but corrupted inference after RDMA weight transfer. The bytes transfer correctly (checksums match), but inference diverges. This has been reproduced across all tested vLLM versions (0.12.0 through 0.17.1). Root cause is under investigation.
 
 **2. Manifest mismatch detection** (`nixl_transfer.py`): During the transfer, the receiver validates that every source tensor has a matching local tensor (by name) and that sizes match. Any mismatch raises `ManifestMismatchError`, which skips that source and tries the next candidate. This is important during rolling updates and canary deployments where the fleet temporarily has pods running different image versions. A target on v2 may encounter a v1 source with a different tensor structure, reject it, then find a compatible v2 source and transfer successfully. Only after all candidates are exhausted does the loader fall back to disk. This also catches environment divergences (different vLLM versions, different attention backends, different CUDA versions) that produce different tensor structures.
 
@@ -650,13 +629,11 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
 
-### DeepSeek MLA P2P Transfer
+### MLA Models and P2P Transfer
 
-P2P weight transfer for DeepSeek models using Multi-head Latent Attention (MLA) is version-gated on vLLM >= 0.16.0. On older vLLM versions, `process_weights_after_loading()` runs on `MLACommonBaseImpl`, an ABC that does not inherit from `nn.Module`. The derived tensors `W_UV` and `W_UK_T` are assigned as bare Python attributes on this non-Module object, making them invisible to `named_buffers()` and the `nn.Module.__setattr__` patch used for tensor capture. vLLM PR #33284 (included in v0.16.0) moved this logic onto `MLAAttention` (an `nn.Module`), making the tensors visible through standard PyTorch mechanisms.
+P2P weight transfer is blocked for models using Multi-head Latent Attention (MLA), including DeepSeek-V2/V3, Kimi K2/K2.5, and any model with `kv_lora_rank` in its HF config. MLA models fall back to disk loading automatically.
 
-The transfer safety check automatically blocks MLA models on vLLM < 0.16.0 and falls back to disk loading. On vLLM >= 0.16.0, MLA models are allowed for P2P transfer. Set `MX_SKIP_FEATURE_CHECK=1` to bypass the check (for debugging only).
-
-Affected models: DeepSeek-V2, DeepSeek-V2-Lite, DeepSeek-V3, Kimi K2/K2.5, and any model with `model_type` in `{deepseek_v2, deepseek_v3, deepseek_v32, deepseek_mtp, kimi_k2, kimi_k25}` or with `kv_lora_rank` in its config.
+The bytes transfer correctly via RDMA (checksums match), but inference produces corrupted output. This has been reproduced across all tested vLLM versions (0.12.0 through 0.17.1). Root cause is under investigation. Set `MX_SKIP_FEATURE_CHECK=1` to bypass the block for debugging.
 
 ### Contiguous Region Failures
 
