@@ -13,11 +13,12 @@ are auto-promoted to non-persistent buffers via capture_tensor_attrs().
 
 Uses LoadStrategyChain to auto-detect the best loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
-    2. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
-    3. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
+    2. ModelStreamer (S3 streaming via runai-model-streamer) - stream to GPU, no disk
+    3. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
+    4. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
-    --load-format mx  (auto-detect: RDMA -> GDS -> default)
+    --load-format mx  (auto-detect: RDMA -> ModelStreamer -> GDS -> default)
 """
 
 from __future__ import annotations

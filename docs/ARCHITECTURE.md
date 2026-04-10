@@ -122,6 +122,7 @@ ModelExpress/
 │       │   ├── __init__.py             # LoadStrategyChain.run()
 │       │   ├── base.py                 # LoadStrategy ABC, LoadContext, shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
+│       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3 streaming)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (vLLM DefaultModelLoader)
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
@@ -447,7 +448,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `vllm_loader.py` | `MxModelLoader` - thin orchestration, delegates to `LoadStrategyChain` |
-| `load_strategy/` | Loading strategy chain package (see below) |
+| `load_strategy/` | Loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3), `GdsStrategy`, `DefaultStrategy` |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `metadata.py` | `build_source_identity`, `publish_metadata_and_ready`, retry logic |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
@@ -494,10 +495,11 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError`, try next. |
-| p1 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
-| p2 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
+| p1 | `ModelStreamerStrategy` | `MX_S3_URI` set + `runai_model_streamer` installed | Stream safetensors from S3 to GPU via CPU staging buffer (no disk writes). |
+| p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
+| p3 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
 
-Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies (e.g., ModelStreamer for S3) can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
 After loading by any strategy, the worker starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged but do not crash the worker.
 
@@ -586,7 +588,7 @@ graph TD
 
 ### Flow
 
-1. **Source loads**: Loads weights from disk (or GDS), runs `process_weights_after_loading()`
+1. **Source loads**: Loads weights from disk, GDS, or S3 (via ModelStreamer), runs `process_weights_after_loading()`
 2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifest serving.
 3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
