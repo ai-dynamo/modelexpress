@@ -11,10 +11,8 @@ import pytest
 import torch
 
 from modelexpress.transfer_safety import (
-    ALLOWED_MODEL_TYPES,
     TransferFingerprint,
     _compute_manifest_hash,
-    _parse_version,
     check_transfer_allowed,
     detect_model_features,
 )
@@ -90,11 +88,11 @@ class TestDetectModelFeatures:
 
 
 # ---------------------------------------------------------------------------
-# Allow-list
+# Feature checks
 # ---------------------------------------------------------------------------
 
 class TestCheckTransferAllowed:
-    def test_llama_bf16_allowed(self):
+    def test_llama_allowed(self):
         config = FakeConfig(
             model_type="llama",
             num_key_value_heads=8,
@@ -103,50 +101,14 @@ class TestCheckTransferAllowed:
         allowed, reason = check_transfer_allowed(config)
         assert allowed
 
-    def test_deepseek_mla_denied_old_vllm(self):
+    def test_unknown_model_type_allowed(self):
         config = FakeConfig(
-            model_type="deepseek_v2",
-            kv_lora_rank=512,
+            model_type="brand_new_architecture",
+            num_key_value_heads=8,
+            num_attention_heads=32,
         )
-        with unittest.mock.patch(
-            "modelexpress.transfer_safety.get_vllm_version", return_value="0.12.0"
-        ):
-            allowed, reason = check_transfer_allowed(config)
-        assert not allowed
-        assert "mla" in reason.lower()
-
-    def test_deepseek_mla_allowed_new_vllm(self):
-        config = FakeConfig(
-            model_type="deepseek_v2",
-            kv_lora_rank=512,
-        )
-        with unittest.mock.patch(
-            "modelexpress.transfer_safety.get_vllm_version", return_value="0.17.1"
-        ):
-            allowed, reason = check_transfer_allowed(config)
+        allowed, reason = check_transfer_allowed(config)
         assert allowed
-
-    def test_kimi_k2_mla_allowed_new_vllm(self):
-        config = FakeConfig(
-            model_type="kimi_k2",
-            kv_lora_rank=512,
-        )
-        with unittest.mock.patch(
-            "modelexpress.transfer_safety.get_vllm_version", return_value="0.16.0"
-        ):
-            allowed, reason = check_transfer_allowed(config)
-        assert allowed
-
-    def test_mla_denied_at_boundary(self):
-        config = FakeConfig(
-            model_type="deepseek_v3",
-            kv_lora_rank=512,
-        )
-        with unittest.mock.patch(
-            "modelexpress.transfer_safety.get_vllm_version", return_value="0.15.9"
-        ):
-            allowed, reason = check_transfer_allowed(config)
-        assert not allowed
 
     def test_fp8_llama_allowed(self):
         config = FakeConfig(
@@ -158,26 +120,39 @@ class TestCheckTransferAllowed:
         allowed, reason = check_transfer_allowed(config)
         assert allowed
 
-    def test_unknown_model_type_denied(self):
+    def test_deepseek_mla_denied(self):
         config = FakeConfig(
-            model_type="brand_new_architecture",
-            num_key_value_heads=8,
-            num_attention_heads=32,
+            model_type="deepseek_v2",
+            kv_lora_rank=512,
         )
         allowed, reason = check_transfer_allowed(config)
         assert not allowed
-        assert "brand_new_architecture" in reason
+        assert "mla" in reason.lower()
 
-    def test_unknown_quantization_denied(self):
+    def test_kimi_mla_denied(self):
         config = FakeConfig(
-            model_type="llama",
-            num_key_value_heads=8,
-            num_attention_heads=32,
-            quantization="some_new_quant",
+            model_type="kimi_k25",
+            kv_lora_rank=512,
         )
         allowed, reason = check_transfer_allowed(config)
         assert not allowed
-        assert "some_new_quant" in reason
+        assert "mla" in reason.lower()
+
+    def test_mla_detected_by_kv_lora_rank(self):
+        config = FakeConfig(
+            model_type="some_future_mla_model",
+            kv_lora_rank=256,
+        )
+        allowed, reason = check_transfer_allowed(config)
+        assert not allowed
+        assert "mla" in reason.lower()
+
+    def test_no_kv_lora_rank_allowed(self):
+        config = FakeConfig(
+            model_type="deepseek_v2",
+        )
+        allowed, reason = check_transfer_allowed(config)
+        assert allowed
 
     def test_bypass_env_var(self):
         config = FakeConfig(
@@ -191,32 +166,6 @@ class TestCheckTransferAllowed:
             assert reason == "bypassed"
         finally:
             del os.environ["MX_SKIP_FEATURE_CHECK"]
-
-
-# ---------------------------------------------------------------------------
-# Version parsing
-# ---------------------------------------------------------------------------
-
-class TestParseVersion:
-    def test_simple_version(self):
-        assert _parse_version("0.16.0") == (0, 16, 0)
-
-    def test_dev_suffix(self):
-        assert _parse_version("0.16.0.dev123") == (0, 16, 0)
-
-    def test_rc_suffix(self):
-        assert _parse_version("0.17.0rc1") == (0, 17, 0)
-
-    def test_comparison(self):
-        assert _parse_version("0.17.1") >= (0, 16, 0)
-        assert _parse_version("0.12.0") < (0, 16, 0)
-        assert _parse_version("0.16.0") >= (0, 16, 0)
-        assert _parse_version("0.15.9") < (0, 16, 0)
-
-    def test_unknown(self):
-        assert _parse_version("unknown") == (0,)
-        # "unknown" should fail safe (< any real version)
-        assert _parse_version("unknown") < (0, 16, 0)
 
 
 # ---------------------------------------------------------------------------

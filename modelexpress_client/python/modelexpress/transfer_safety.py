@@ -8,10 +8,10 @@ Two independent safety mechanisms:
 
 1. Feature allow-list: checks model config before attempting P2P transfer.
    Models with unsupported features are rejected early and fall back to
-   disk loading. MLA attention is version-gated: blocked on vLLM < 0.16.0
-   (where process_weights_after_loading runs on a non-Module ABC and derived
-   tensors are invisible to PyTorch), allowed on >= 0.16.0 (where vLLM PR
-   #33284 moved the logic onto nn.Module).
+   disk loading. MLA attention models (DeepSeek, Kimi) are blocked from
+   P2P transfers due to unresolved weight corruption after RDMA receive.
+   The bytes transfer correctly but inference diverges - root cause is
+   under investigation.
 
 2. Transfer fingerprint: captures the runtime environment and tensor
    manifest structure. Source publishes its fingerprint; target computes
@@ -31,90 +31,15 @@ import torch
 logger = logging.getLogger("modelexpress.transfer_safety")
 
 # ---------------------------------------------------------------------------
-# Feature allow-list
+# Feature detection and blocking
 # ---------------------------------------------------------------------------
 
-# Model features that are known to produce correct results via P2P weight transfer.
-# Any feature not on this list causes automatic fallback to disk loading.
-# Add features here only after validating RDMA correctness end-to-end.
-# Model architectures validated for P2P weight transfer.
-# Only models whose model_type is in this set are allowed.
-# Any unknown architecture falls back to disk loading.
-ALLOWED_MODEL_TYPES: set[str] = {
-    "llama",
-    "mistral",
-    "qwen2",
-    "gemma",
-    "gemma2",
-    "phi3",
-    "phi",
-    "starcoder2",
-    "gpt_neox",
-    "gpt2",
-    "opt",
-    "falcon",
-    "codellama",
-    "deepseek_v2",   # MLA - version-gated (requires vLLM >= 0.16.0)
-    "deepseek_v3",   # MLA - version-gated
-    "deepseek_v32",  # MLA - version-gated
-    "deepseek_mtp",  # MLA - version-gated
-    "AXK1",          # MLA variant - version-gated
-    "kimi_k2",       # MLA (Moonshot Kimi K2) - version-gated
-    "kimi_k25",      # MLA (Moonshot Kimi K2.5) - version-gated
-}
+# MLA (Multi-head Latent Attention) is the only feature currently blocked.
+# Bytes transfer correctly via RDMA but inference diverges on all tested
+# vLLM versions (0.12.0 through 0.17.1). Root cause under investigation.
+# Detection is config-based: kv_lora_rank presence in the HF config.
+# Bypass with MX_SKIP_FEATURE_CHECK=1 to test MLA transfers anyway.
 
-# Minimum vLLM version for MLA P2P transfers.
-# vLLM PR #33284 (v0.16.0) moved process_weights_after_loading from
-# MLACommonBaseImpl (ABC, not nn.Module) into MLAAttention (nn.Module).
-# Before this change, derived tensors W_UV and W_UK_T are bare attributes
-# on a non-Module object, invisible to named_buffers() and the
-# nn.Module.__setattr__ patch used for tensor capture.
-MLA_MIN_VLLM_VERSION: tuple[int, ...] = (0, 16, 0)
-
-# Quantization methods validated for P2P transfer.
-ALLOWED_QUANTIZATIONS: set[str | None] = {
-    None,            # No quantization (BF16/FP16/FP32)
-    "",              # Empty string (same as None)
-    "fp8",           # FP8 block quantization (scales are pure data)
-    "awq",           # AWQ quantization (packed int4 weights + scales)
-    "gptq",          # GPTQ quantization (packed int4 weights + scales + zeros)
-    "gptq_marlin",   # GPTQ with Marlin kernel (same weights, different runtime)
-    "awq_marlin",    # AWQ with Marlin kernel (same weights, different runtime)
-}
-
-# Weight dtypes validated for P2P transfer.
-ALLOWED_DTYPES: set[str] = {
-    "bfloat16",
-    "float16",
-    "float32",
-    "float8_e4m3fn",  # FP8 quantized weights
-}
-
-
-def _parse_version(version_str: str) -> tuple[int, ...]:
-    """Parse a version string like '0.16.0' into a comparable tuple.
-
-    Strips dev/rc/post suffixes (e.g. '0.16.0.dev123' -> (0, 16, 0)).
-    Returns (0,) for unparseable strings so comparisons fail safe (deny).
-    """
-    try:
-        # Strip everything after the numeric portion
-        parts = []
-        for part in version_str.split("."):
-            # Stop at first non-numeric segment
-            digits = ""
-            for ch in part:
-                if ch.isdigit():
-                    digits += ch
-                else:
-                    break
-            if digits:
-                parts.append(int(digits))
-            else:
-                break
-        return tuple(parts) if parts else (0,)
-    except Exception:
-        return (0,)
 
 
 def detect_model_features(model_config) -> dict[str, str]:
@@ -129,12 +54,8 @@ def detect_model_features(model_config) -> dict[str, str]:
     features["dtype"] = str(model_config.dtype).replace("torch.", "")
     features["quantization"] = model_config.quantization or "none"
 
-    # MLA detection
-    mla_model_types = {"deepseek_v2", "deepseek_v3", "deepseek_v32", "deepseek_mtp", "AXK1", "kimi_k2", "kimi_k25"}
-    has_mla = (
-        features["model_type"] in mla_model_types
-        or getattr(hf_config, "kv_lora_rank", None) is not None
-    )
+    # MLA detection via HF config attribute
+    has_mla = getattr(hf_config, "kv_lora_rank", None) is not None
     features["attention"] = "mla" if has_mla else "standard"
 
     # MoE
@@ -151,47 +72,28 @@ def detect_model_features(model_config) -> dict[str, str]:
 def check_transfer_allowed(model_config) -> tuple[bool, str]:
     """Check if P2P weight transfer is allowed for this model.
 
-    Uses a strict allow-list approach: only explicitly validated model
-    architectures, quantization methods, and dtypes are permitted.
-    Everything else falls back to disk loading.
+    Currently blocks only MLA attention models (detected via kv_lora_rank
+    in the HF config). All other models are allowed.
 
     Returns (allowed, reason). If not allowed, reason explains why.
     """
     if os.environ.get("MX_SKIP_FEATURE_CHECK", "0") == "1":
-        logger.warning("MX_SKIP_FEATURE_CHECK=1: bypassing feature allow-list")
+        logger.warning("MX_SKIP_FEATURE_CHECK=1: bypassing feature checks")
         return True, "bypassed"
 
     features = detect_model_features(model_config)
-    reasons: list[str] = []
-
-    model_type = features["model_type"]
-    if model_type not in ALLOWED_MODEL_TYPES:
-        reasons.append(f"model_type '{model_type}' is not validated for P2P transfer")
-
-    dtype = features["dtype"]
-    if dtype not in ALLOWED_DTYPES:
-        reasons.append(f"dtype '{dtype}' is not validated for P2P transfer")
-
-    quant = model_config.quantization
-    if quant not in ALLOWED_QUANTIZATIONS:
-        reasons.append(f"quantization '{quant}' is not validated for P2P transfer")
 
     if features["attention"] == "mla":
-        vllm_ver = _parse_version(get_vllm_version())
-        if vllm_ver < MLA_MIN_VLLM_VERSION:
-            reasons.append(
-                f"MLA attention requires vLLM >= {'.'.join(str(v) for v in MLA_MIN_VLLM_VERSION)} "
-                f"for P2P transfer (found {get_vllm_version()})"
-            )
-
-    if reasons:
-        reason_str = "; ".join(reasons)
+        reason = (
+            "MLA attention models are blocked from P2P transfer due to "
+            "unresolved weight corruption (NVBug 6066010)"
+        )
         logger.warning(
-            f"[Transfer Safety] P2P transfer denied: {reason_str}. "
+            f"[Transfer Safety] P2P transfer denied: {reason}. "
             f"Features: {features}. "
             f"Set MX_SKIP_FEATURE_CHECK=1 to bypass."
         )
-        return False, reason_str
+        return False, reason
 
     logger.info(f"[Transfer Safety] P2P transfer allowed. Features: {features}")
     return True, "allowed"
