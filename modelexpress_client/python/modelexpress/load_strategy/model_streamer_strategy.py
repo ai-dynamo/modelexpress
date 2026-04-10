@@ -41,12 +41,7 @@ class ModelStreamerStrategy(LoadStrategy):
         return True
 
     def load(self, model: nn.Module, ctx: LoadContext) -> bool:
-        from vllm.model_executor.model_loader.utils import process_weights_after_loading
-
-        s3_uri = os.environ.get("MX_S3_URI", "")
-        if not s3_uri:
-            logger.warning(f"[Worker {ctx.global_rank}] MX_S3_URI not set")
-            return False
+        s3_uri = os.environ["MX_S3_URI"]
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {s3_uri}")
         try:
             weights_iter = self._stream_weights(s3_uri, ctx)
@@ -58,6 +53,7 @@ class ModelStreamerStrategy(LoadStrategy):
             )
             return False
 
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
         with capture_tensor_attrs():
             process_weights_after_loading(model, ctx.model_config, ctx.target_device)
 
@@ -113,7 +109,7 @@ class ModelStreamerStrategy(LoadStrategy):
         import boto3
         from botocore.exceptions import ClientError
 
-        path = s3_uri[5:]
+        path = s3_uri.removeprefix("s3://")
         bucket, _, prefix = path.partition("/")
         prefix = prefix.rstrip("/")
 

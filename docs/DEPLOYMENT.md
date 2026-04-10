@@ -256,7 +256,7 @@ Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in 
 
 ModelStreamer enables streaming safetensors directly from S3/S3-compatible storage to GPU memory without writing to disk. The first pod streams from S3; subsequent pods use P2P RDMA from the first pod's GPU memory.
 
-**Prerequisites:** Install `pip install modelexpress[streamer]` (adds `runai-model-streamer[s3]`).
+`runai-model-streamer[s3]` is included as a core dependency of the `modelexpress` package — no extra install step needed. Set `MX_S3_URI` to enable the ModelStreamer strategy.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -266,7 +266,7 @@ ModelStreamer enables streaming safetensors directly from S3/S3-compatible stora
 | `AWS_DEFAULT_REGION` | (none) | AWS region (required by some backends) |
 | `AWS_ENDPOINT_URL` | (none) | Custom endpoint for S3-compatible storage (MinIO, Ceph, etc.) |
 | `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
-| `RUNAI_STREAMER_MEMORY_LIMIT` | (default) | CPU staging buffer size. `0` reuses a single-tensor buffer. |
+| `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). When unset, runai-model-streamer allocates based on file size — see [runai-model-streamer docs](https://github.com/run-ai/model-streamer). |
 
 Credentials are injected via standard AWS mechanisms (EKS Pod Identity, IRSA, or K8s secrets mounted as env vars). No credentials flow through the MX server or gRPC.
 

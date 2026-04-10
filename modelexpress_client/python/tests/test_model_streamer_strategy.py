@@ -125,12 +125,6 @@ class TestModelStreamerLoad:
         mock_capture.return_value.__enter__ = MagicMock()
         mock_capture.return_value.__exit__ = MagicMock(return_value=False)
 
-        mock_streamer_instance = MagicMock()
-        mock_streamer_instance.get_tensors.return_value = [
-            ("layer.0.weight", torch.randn(4, 4)),
-            ("layer.1.weight", torch.randn(4, 4)),
-        ]
-
         model = MagicMock()
         ctx = _make_load_context()
         strategy = self._make_strategy()
@@ -168,10 +162,7 @@ class TestModelStreamerLoad:
                 "ModelStreamerStrategy._stream_weights",
                 side_effect=RuntimeError("S3 connection failed"),
             ):
-                with patch(
-                    "vllm.model_executor.model_loader.utils.process_weights_after_loading"
-                ):
-                    result = strategy.load(model, ctx)
+                result = strategy.load(model, ctx)
 
         assert result is False
         mock_register.assert_not_called()
@@ -265,7 +256,7 @@ class TestResolveS3Safetensors:
         modules["boto3"].client.return_value = mock_client
 
         with patch.dict(sys.modules, modules):
-            with pytest.raises(FileNotFoundError, match="No .safetensors files found"):
+            with pytest.raises(FileNotFoundError, match=r"No \.safetensors files found"):
                 strategy._resolve_s3_safetensors("s3://my-bucket/models/llama")
 
     def test_rejects_non_s3_uri(self):
@@ -328,3 +319,48 @@ class TestChainOrder:
             LoadStrategyChain.run(model, ctx)
 
         assert call_order == ["rdma", "model_streamer", "gds", "default"]
+
+    @patch(
+        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+        return_value=True,
+    )
+    @patch(
+        "modelexpress.load_strategy.model_streamer_strategy."
+        "ModelStreamerStrategy.is_available",
+        return_value=False,
+    )
+    @patch(
+        "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+        return_value=True,
+    )
+    @patch(
+        "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+        return_value=True,
+    )
+    def test_skips_unavailable_strategy(self, _d, _g, _ms, _r):
+        from modelexpress.load_strategy import LoadStrategyChain
+
+        call_order: list[str] = []
+
+        def track_load(strategy_name):
+            def _load(self_or_model, *args, **kwargs):
+                call_order.append(strategy_name)
+                return strategy_name == "default"
+            return _load
+
+        model = MagicMock()
+        ctx = _make_load_context()
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
+            track_load("rdma"),
+        ), patch(
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.load",
+            track_load("gds"),
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
+            track_load("default"),
+        ):
+            LoadStrategyChain.run(model, ctx)
+
+        assert call_order == ["rdma", "gds", "default"]
