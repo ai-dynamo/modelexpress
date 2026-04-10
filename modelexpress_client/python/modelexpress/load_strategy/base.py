@@ -18,7 +18,7 @@ import torch.nn as nn
 from ..client import MxClient
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import collect_module_tensors, log_tensor_summary
-from ..metadata import publish_metadata_and_ready
+from ..metadata import is_p2p_metadata_enabled, start_metadata_publisher
 from .. import p2p_pb2
 
 if TYPE_CHECKING:
@@ -129,14 +129,8 @@ def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
 
 
 def publish_metadata(ctx: LoadContext) -> None:
-    """Publish metadata to the MX server. Failures are logged but do not raise."""
-    try:
-        publish_metadata_and_ready(
-            ctx.mx_client, ctx.nixl_manager, ctx.tensors,
-            ctx.global_rank, ctx.device_id, ctx.identity, ctx.worker_id,
-        )
-    except Exception as e:
-        logger.warning(
-            f"[Worker {ctx.global_rank}] Failed to publish metadata, "
-            f"worker will continue without P2P serving: {e}"
-        )
+    """Start the background metadata publisher and heartbeat thread."""
+    start_metadata_publisher(
+        ctx.mx_client, ctx.nixl_manager, ctx.tensors,
+        ctx.global_rank, ctx.device_id, ctx.identity, ctx.worker_id,
+    )

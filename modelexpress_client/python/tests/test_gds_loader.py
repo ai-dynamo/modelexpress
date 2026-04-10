@@ -218,7 +218,7 @@ class TestGdsStrategyIntegration:
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
     @patch("modelexpress.gds_loader.MxGdsLoader")
-    @patch("modelexpress.load_strategy.base.publish_metadata_and_ready")
+    @patch("modelexpress.load_strategy.base.start_metadata_publisher")
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=False)
     def test_gds_success(self, _mock_nixl, _mock_pub, mock_gds_cls, _mock_avail):
         from modelexpress.load_strategy.gds_strategy import GdsStrategy
