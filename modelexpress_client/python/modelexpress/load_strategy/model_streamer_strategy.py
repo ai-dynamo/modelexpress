@@ -92,6 +92,8 @@ class ModelStreamerStrategy(LoadStrategy):
                         f"in {elapsed:.0f}s"
                     )
                     last_log = now
+                # clone() ensures safety when RUNAI_STREAMER_MEMORY_LIMIT=0
+                # (single-buffer mode reuses memory on next iteration)
                 yield name, tensor.clone()
         elapsed = time.perf_counter() - start
         logger.info(f"[Worker {ctx.global_rank}] Streamed all weights in {elapsed:.1f}s")

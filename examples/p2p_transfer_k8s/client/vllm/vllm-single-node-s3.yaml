@@ -64,6 +64,9 @@ spec:
               value: "us-west-2"
             - name: VLLM_PLUGINS
               value: "modelexpress"
+            # ModelStreamer tuning: more parallel S3 reads (default 8)
+            - name: RUNAI_STREAMER_CONCURRENCY
+              value: "32"
             # Optional: enable P2P serving after S3 load (requires MX server + RDMA)
             # - name: MX_SERVER_ADDRESS
             #   value: "modelexpress-server:8001"
