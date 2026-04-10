@@ -30,6 +30,8 @@ pub enum ModelProvider {
     /// Hugging Face model hub
     #[default]
     HuggingFace,
+    /// NVIDIA NGC catalog
+    Ngc,
 }
 
 impl ModelProvider {
@@ -37,6 +39,7 @@ impl ModelProvider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::HuggingFace => "hugging-face",
+            Self::Ngc => "ngc",
         }
     }
 }
@@ -49,7 +52,7 @@ impl Display for ModelProvider {
 
 impl ValueEnum for ModelProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::HuggingFace]
+        &[Self::HuggingFace, Self::Ngc]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -98,15 +101,26 @@ mod tests {
     #[test]
     fn test_model_provider_display() {
         assert_eq!(ModelProvider::HuggingFace.to_string(), "hugging-face");
+        assert_eq!(ModelProvider::Ngc.to_string(), "ngc");
     }
 
     #[test]
     fn test_model_provider_value_enum_matches_display() {
-        let provider = ModelProvider::HuggingFace;
-        let parsed = ModelProvider::from_str(provider.as_str(), false)
-            .expect("Failed to parse ModelProvider from clap value");
+        for provider in [ModelProvider::HuggingFace, ModelProvider::Ngc] {
+            let parsed = ModelProvider::from_str(provider.as_str(), false)
+                .expect("Failed to parse ModelProvider from clap value");
+            assert_eq!(parsed, provider);
+        }
+    }
 
-        assert_eq!(parsed, provider);
+    #[test]
+    fn test_model_provider_ngc_serialization() {
+        let provider = ModelProvider::Ngc;
+        let serialized =
+            serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
+        let deserialized: ModelProvider =
+            serde_json::from_str(&serialized).expect("Failed to deserialize ModelProvider");
+        assert_eq!(provider, deserialized);
     }
 
     #[test]

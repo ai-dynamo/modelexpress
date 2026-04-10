@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ModelProvider;
-use crate::providers::{HuggingFaceProvider, ModelProviderTrait};
+use crate::providers::{HuggingFaceProvider, ModelProviderTrait, NgcProvider};
 use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -12,6 +12,7 @@ use tracing::{info, warn};
 pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
     match provider {
         ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
+        ModelProvider::Ngc => Box::new(NgcProvider),
     }
 }
 

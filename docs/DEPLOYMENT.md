@@ -131,7 +131,9 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
 
-Cache directory resolution: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
+Cache directory resolution for HuggingFace: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
+
+Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache/ngc`.
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
@@ -184,6 +186,23 @@ kubectl create secret generic hf-token-secret \
   --from-literal=HF_TOKEN=${HF_TOKEN} \
   -n ${NAMESPACE}
 ```
+
+### NGC API Key
+
+To download models from NVIDIA NGC, set an NGC API key. The server resolves it in this order:
+
+1. `NGC_API_KEY` environment variable
+2. `NGC_CLI_API_KEY` environment variable
+3. `~/.ngc/config` (written by `ngc config set`)
+
+```bash
+export NGC_API_KEY=your_ngc_api_key
+kubectl create secret generic ngc-api-key-secret \
+  --from-literal=NGC_API_KEY=${NGC_API_KEY} \
+  -n ${NAMESPACE}
+```
+
+Pass it to the server pod via `envFrom` or individual `env` entries in your deployment manifest.
 
 ### Helm Chart
 

@@ -77,8 +77,10 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 
 pub mod huggingface;
+pub mod ngc;
 
 pub use huggingface::HuggingFaceProvider;
+pub use ngc::NgcProvider;
 
 #[cfg(test)]
 mod tests {

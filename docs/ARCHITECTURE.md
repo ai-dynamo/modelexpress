@@ -11,7 +11,7 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace with SQLite-backed tracking and LRU cache eviction.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace and NGC with SQLite-backed tracking and LRU cache eviction.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
 
 ### Current Status
@@ -29,6 +29,7 @@ graph TD
         C1[Client CLI / Library] -->|gRPC| S1[ModelExpress Server]
         S1 --> DB[(SQLite)]
         S1 --> HF[HuggingFace Hub]
+        S1 --> NGC[NVIDIA NGC]
         S1 --> Cache[Model Cache Dir]
     end
 
@@ -148,9 +149,10 @@ ModelExpress/
 │       ├── config.rs                   # Config trait utilities
 │       ├── download.rs                 # Download orchestration (smart-fallback, direct, server-only)
 │       ├── models.rs                   # Status, ModelProvider, ModelStatus, ModelStatusResponse
+│       ├── providers.rs               # ModelProviderTrait definition, re-exports
 │       └── providers/
-│           ├── mod.rs                  # ModelProviderTrait definition
-│           └── huggingface.rs          # HuggingFaceProvider implementation
+│           ├── huggingface.rs          # HuggingFaceProvider implementation
+│           └── ngc.rs                  # NgcProvider implementation
 │
 ├── workspace-tests/
 │   ├── Cargo.toml
@@ -249,7 +251,7 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
 
-Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
+Key message types: `ModelProvider` (HuggingFace, NGC), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 ### p2p.proto - P2pService
 
@@ -407,7 +409,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 | `config` | Config trait utilities |
 | `download` | Download orchestration with strategy pattern |
 | `models` | `Status`, `ModelProvider`, `ModelStatus`, `ModelStatusResponse` |
-| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` |
+| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` |
 | `grpc` | Generated tonic stubs for all 4 services |
 | `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (32KB) |
 
@@ -426,7 +428,9 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
-Currently one implementation: `HuggingFaceProvider` (uses `hf-hub` crate with high-CPU download mode).
+Two implementations:
+- `HuggingFaceProvider` — uses the `hf-hub` crate with high-CPU download mode.
+- `NgcProvider` — downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 
 ### ClientConfig / ClientArgs
 
