@@ -68,6 +68,7 @@ class MxTrainingPublisher:
         self._mx_source_id: str | None = None
         self._model_name: str = ""
         self._initialized = False
+        self._registered = False
 
     @property
     def mx_source_id(self) -> str | None:
@@ -155,6 +156,10 @@ class MxTrainingPublisher:
         This is the all-at-once variant. For layer-by-layer streaming,
         use :meth:`publish_layer` instead.
 
+        NIXL memory regions are registered only on the first call since
+        parameter tensor addresses stay constant across optimizer steps.
+        Subsequent calls reuse the cached metadata and descriptors.
+
         Args:
             named_tensors: Mapping of parameter name to GPU tensor.
             step: Current training step (used for version tracking).
@@ -166,7 +171,13 @@ class MxTrainingPublisher:
         if not self._initialized:
             raise RuntimeError("Call initialize() before publish_weights()")
 
-        self._nixl.register_tensors(named_tensors)
+        if not self._registered:
+            self._nixl.register_tensors(named_tensors)
+            self._registered = True
+            logger.info(
+                f"Registered {len(named_tensors)} tensors with NIXL "
+                f"(metadata={len(self._nixl.nixl_metadata)} bytes)"
+            )
         metadata = self._nixl.nixl_metadata
         descriptors = self._nixl.tensor_descriptors
 
