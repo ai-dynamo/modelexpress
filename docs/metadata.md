@@ -225,14 +225,26 @@ metadata:
   name: mx-source-a1b2c3d4e5f67890-f3a2b1c4
   labels:
     modelexpress.nvidia.com/mx-source-id: a1b2c3d4e5f67890
+    modelexpress.nvidia.com/mx-worker-id: f3a2b1c4
 spec:
   modelName: deepseek-ai/DeepSeek-V3
 status:
-  workers:
-    - workerRank: 0
-      nixlMetadata: <base64>
-      tensorCount: 1327
-      status: Ready
+  worker:
+    workerRank: 0
+    backendType: nixl
+    nixlMetadata: <base64>
+    tensorCount: 1327
+    tensorConfigMap: mx-source-a1b2c3d4e5f67890-f3a2b1c4-tensors-worker-0
+    status: Ready
+    updatedAt: "2025-11-14T22:13:20Z"
+  conditions:
+    - type: Ready
+      status: "True"
+      reason: WorkerReady
+      message: Worker is ready
+      lastTransitionTime: "2025-11-14T22:13:20Z"
+  observedGeneration: 1
+  publishedAt: "2025-11-14T22:13:20Z"
 ```
 
 ## Client Workflow

@@ -142,6 +142,48 @@ pub struct Condition {
     pub last_transition_time: Option<String>,
 }
 
+impl ModelMetadataStatus {
+    /// Insert or update a condition by type. If a condition with the same type
+    /// already exists, it is updated in place; `lastTransitionTime` is only
+    /// changed when `status` actually transitions.
+    pub fn set_condition(&mut self, type_: &str, status: &str, reason: &str, message: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(existing) = self.conditions.iter_mut().find(|c| c.type_ == type_) {
+            if existing.status != status {
+                existing.last_transition_time = Some(now);
+            }
+            existing.status = status.to_string();
+            existing.reason = Some(reason.to_string());
+            existing.message = Some(message.to_string());
+        } else {
+            self.conditions.push(Condition {
+                type_: type_.to_string(),
+                status: status.to_string(),
+                reason: Some(reason.to_string()),
+                message: Some(message.to_string()),
+                last_transition_time: Some(now),
+            });
+        }
+    }
+
+    /// Update the `Ready` condition based on the worker's proto status value.
+    /// Ready=True only when the worker status is `SOURCE_STATUS_READY` (2).
+    pub fn update_ready_condition(&mut self, worker_proto_status: i32) {
+        let is_ready = worker_proto_status == 2; // SOURCE_STATUS_READY
+        if is_ready {
+            self.set_condition("Ready", "True", "WorkerReady", "Worker is ready");
+        } else {
+            let status_name = WorkerStatus::status_name_from_proto(worker_proto_status);
+            self.set_condition(
+                "Ready",
+                "False",
+                &format!("Worker{}", status_name),
+                "Worker is not ready",
+            );
+        }
+    }
+}
+
 /// Tensor descriptor stored in ConfigMap
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TensorDescriptorJson {
@@ -284,5 +326,111 @@ mod tests {
 
         let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
         assert_eq!(addr, u64::MAX);
+    }
+
+    #[test]
+    fn test_set_condition_inserts_new() {
+        let mut status = ModelMetadataStatus::default();
+        assert!(status.conditions.is_empty());
+
+        status.set_condition("Ready", "True", "WorkerPublished", "Published");
+
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.type_, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("WorkerPublished"));
+        assert_eq!(cond.message.as_deref(), Some("Published"));
+        assert!(cond.last_transition_time.is_some());
+    }
+
+    #[test]
+    fn test_set_condition_updates_existing() {
+        let mut status = ModelMetadataStatus::default();
+        status.set_condition("Ready", "True", "WorkerPublished", "Published");
+        let original_time = status.conditions[0].last_transition_time.clone();
+
+        status.set_condition("Ready", "False", "WorkerStale", "Worker is stale");
+
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason.as_deref(), Some("WorkerStale"));
+        assert_ne!(
+            cond.last_transition_time, original_time,
+            "lastTransitionTime must change on status transition"
+        );
+    }
+
+    #[test]
+    fn test_set_condition_same_status_preserves_transition_time() {
+        let mut status = ModelMetadataStatus::default();
+        status.set_condition("Ready", "True", "WorkerPublished", "Published");
+        let original_time = status.conditions[0].last_transition_time.clone();
+
+        status.set_condition("Ready", "True", "StillReady", "Still ready");
+
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].reason.as_deref(), Some("StillReady"));
+        assert_eq!(
+            status.conditions[0].last_transition_time, original_time,
+            "lastTransitionTime must not change when status stays the same"
+        );
+    }
+
+    #[test]
+    fn test_update_ready_condition_ready() {
+        let mut status = ModelMetadataStatus::default();
+        status.update_ready_condition(2); // SOURCE_STATUS_READY
+
+        assert_eq!(status.conditions.len(), 1);
+        let cond = &status.conditions[0];
+        assert_eq!(cond.type_, "Ready");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason.as_deref(), Some("WorkerReady"));
+    }
+
+    #[test]
+    fn test_update_ready_condition_not_ready_states() {
+        for (proto, expected_reason) in [
+            (0, "WorkerUnknown"),
+            (1, "WorkerInitializing"),
+            (3, "WorkerStale"),
+        ] {
+            let mut status = ModelMetadataStatus::default();
+            status.update_ready_condition(proto);
+
+            assert_eq!(status.conditions.len(), 1);
+            let cond = &status.conditions[0];
+            assert_eq!(cond.type_, "Ready");
+            assert_eq!(cond.status, "False");
+            assert_eq!(
+                cond.reason.as_deref(),
+                Some(expected_reason),
+                "proto status {} should produce reason {}",
+                proto,
+                expected_reason
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_ready_condition_transition() {
+        let mut status = ModelMetadataStatus::default();
+
+        status.update_ready_condition(1); // Initializing
+        assert_eq!(status.conditions[0].status, "False");
+        let time_false = status.conditions[0].last_transition_time.clone();
+
+        status.update_ready_condition(2); // Ready
+        assert_eq!(status.conditions[0].status, "True");
+        assert_ne!(
+            status.conditions[0].last_transition_time, time_false,
+            "lastTransitionTime must change on False->True transition"
+        );
+
+        status.update_ready_condition(3); // Stale
+        assert_eq!(status.conditions[0].status, "False");
+        assert_eq!(status.conditions[0].reason.as_deref(), Some("WorkerStale"));
     }
 }
