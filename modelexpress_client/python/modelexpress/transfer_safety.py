@@ -86,7 +86,7 @@ def check_transfer_allowed(model_config) -> tuple[bool, str]:
     if features["attention"] == "mla":
         reason = (
             "MLA attention models are blocked from P2P transfer due to "
-            "unresolved weight corruption (NVBug 6066010)"
+            "unresolved weight corruption after RDMA receive"
         )
         logger.warning(
             f"[Transfer Safety] P2P transfer denied: {reason}. "
@@ -211,33 +211,6 @@ class TransferFingerprint:
         d = json.loads(s)
         return cls(**d)
 
-    def validate_against(self, source: TransferFingerprint) -> tuple[bool, list[str]]:
-        """Compare this (target) fingerprint against a source fingerprint.
-
-        Returns (compatible, mismatches). Mismatches is a list of human-readable
-        strings describing each incompatibility.
-        """
-        mismatches: list[str] = []
-
-        # vllm_version, cuda_version, torch_version, and deep_gemm_version
-        # are checked at source-selection time via extra_parameters in
-        # SourceIdentity (hashed into mx_source_id).
-        # Only runtime-resolved properties are validated here.
-        if self.attention_backend != source.attention_backend:
-            mismatches.append(
-                f"attention backend: source={source.attention_backend}, target={self.attention_backend}"
-            )
-
-        # Manifest structure: tensor names, sizes, dtypes must match
-        if self.manifest_hash and source.manifest_hash:
-            if self.manifest_hash != source.manifest_hash:
-                mismatches.append(
-                    f"tensor manifest hash: source={source.manifest_hash[:12]}..., "
-                    f"target={self.manifest_hash[:12]}... "
-                    f"(source={source.tensor_count} tensors, target={self.tensor_count} tensors)"
-                )
-
-        return len(mismatches) == 0, mismatches
 
 
 def _compute_manifest_hash(tensors: dict[str, torch.Tensor]) -> str:
