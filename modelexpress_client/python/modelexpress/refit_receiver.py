@@ -141,17 +141,11 @@ class MxRefitReceiver:
         if min_step is None:
             min_step = self._current_step + 1
 
-        identity = p2p_pb2.SourceIdentity(
-            model_name=model_name,
-            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
-        )
-
         deadline = time.perf_counter() + timeout_seconds
 
         while True:
             try:
                 response = self._client.list_sources(
-                    identity=identity,
                     status_filter=status_filter,
                 )
             except Exception as e:
@@ -162,33 +156,16 @@ class MxRefitReceiver:
                 continue
 
             for instance in response.instances:
-                step_str = ""
-                try:
-                    meta_resp = self._client.get_metadata(
-                        mx_source_id=instance.mx_source_id,
-                        worker_id=instance.worker_id,
-                    )
-                    if meta_resp.found and meta_resp.worker:
-                        worker = meta_resp.worker
-                        if hasattr(worker, "tensors") and len(worker.tensors) > 0:
-                            step_str = ""
-                            for t in worker.tensors:
-                                if t.name == "__training_step__":
-                                    step_str = t.dtype
-                                    break
-                except Exception:
-                    pass
+                if instance.model_name != model_name:
+                    continue
 
-                source_step = int(step_str) if step_str.isdigit() else 0
-
-                if source_step >= min_step:
-                    return SourceRef(
-                        mx_source_id=instance.mx_source_id,
-                        worker_id=instance.worker_id,
-                        model_name=instance.model_name,
-                        worker_rank=instance.worker_rank,
-                        training_step=source_step,
-                    )
+                return SourceRef(
+                    mx_source_id=instance.mx_source_id,
+                    worker_id=instance.worker_id,
+                    model_name=instance.model_name,
+                    worker_rank=instance.worker_rank,
+                    training_step=0,
+                )
 
             if time.perf_counter() >= deadline:
                 return None
