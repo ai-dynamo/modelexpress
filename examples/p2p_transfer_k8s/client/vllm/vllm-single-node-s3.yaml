@@ -53,6 +53,8 @@ spec:
               add:
                 - IPC_LOCK
           env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
             # Update to your S3 bucket and region

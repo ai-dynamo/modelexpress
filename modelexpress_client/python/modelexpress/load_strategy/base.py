@@ -143,6 +143,12 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] No NIXL manager, skipping metadata publish"
         )
         return
+    server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+    if not server_addr:
+        logger.info(
+            f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
+        )
+        return
     try:
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
