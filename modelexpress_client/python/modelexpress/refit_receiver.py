@@ -308,6 +308,7 @@ class MxRefitReceiver:
             source_metadata=worker.nixl_metadata,
             source_tensors=source_tensors,
             timeout_seconds=timeout_seconds,
+            coalesce_transfers=False,
         )
 
         bandwidth_gbps = (transferred * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
