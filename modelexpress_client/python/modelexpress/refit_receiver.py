@@ -235,6 +235,7 @@ class MxRefitReceiver:
         self,
         source: SourceRef,
         timeout_seconds: float = 300.0,
+        tensor_shapes: dict[str, tuple[int, ...]] | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Receive weights into scratch GPU buffers via NIXL RDMA.
 
@@ -289,6 +290,7 @@ class MxRefitReceiver:
         }
 
         scratch_tensors: dict[str, torch.Tensor] = {}
+        scratch_shapes: dict[str, tuple[int, ...]] = {}
         for td in source_tensors:
             dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
             elem_size = torch.tensor([], dtype=dt).element_size()
@@ -296,6 +298,7 @@ class MxRefitReceiver:
             scratch_tensors[td.name] = torch.empty(
                 numel, dtype=dt, device=f"cuda:{self._device_id}"
             )
+            scratch_shapes[td.name] = (numel,)
 
         logger.info(
             f"Allocated {len(scratch_tensors)} scratch buffers "
@@ -321,6 +324,8 @@ class MxRefitReceiver:
         self._current_step = source.training_step
 
         for name, tensor in scratch_tensors.items():
+            if tensor_shapes and name in tensor_shapes:
+                tensor = tensor.view(tensor_shapes[name])
             yield name, tensor
 
     def receive_weights_from_metadata(
