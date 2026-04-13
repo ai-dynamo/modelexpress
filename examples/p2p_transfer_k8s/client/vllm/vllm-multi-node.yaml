@@ -3,10 +3,9 @@
 
 # Multi-node vLLM StatefulSet with ModelExpress P2P weight transfer.
 #
-# Deploys Kimi-K2.5 as a single StatefulSet across 2 nodes (8 GPUs total):
+# Deploys Llama-3.1-405B-Instruct as a single StatefulSet across 2 nodes (8 GPUs total):
 #   - tensor-parallel-size=4 (within each node)
 #   - pipeline-parallel-size=2 (across nodes)
-#   - expert-parallel enabled
 #
 # Pod roles are determined by ordinal index:
 #   - pod-0: Ray head node + vLLM API server
@@ -93,7 +92,7 @@ spec:
             - name: HF_HUB_CACHE
               value: "/models"
             - name: MODEL_NAME
-              value: "moonshotai/Kimi-K2.5"
+              value: "meta-llama/Llama-3.1-405B-Instruct"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS

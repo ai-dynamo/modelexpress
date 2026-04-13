@@ -126,6 +126,7 @@ ModelExpress/
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (vLLM DefaultModelLoader)
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
+│       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── metadata.py                 # Metadata building and publishing
 │       ├── rank_utils.py               # Rank detection utilities
 │       ├── worker_server.py            # WorkerGrpcServer (P2P tensor manifest)
@@ -494,12 +495,20 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
-| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError`, try next. |
+| p0 | `RdmaStrategy` | NIXL available + MLA check passes | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError` or `ManifestMismatchError`, try next. |
 | p1 | `ModelStreamerStrategy` | `MX_S3_URI` set + `runai_model_streamer` installed | Stream safetensors from S3 to GPU via CPU staging buffer (no disk writes). |
 | p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
 | p3 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
 
 Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+
+### Transfer Safety
+
+`RdmaStrategy.is_available()` checks `transfer_safety.check_transfer_allowed()` before attempting P2P transfer. Currently the only blocked feature is MLA (Multi-head Latent Attention), detected via `kv_lora_rank` in the HF model config. MLA models (DeepSeek-V2/V3, Kimi K2/K2.5, GLM-5.1, and any future model using MLA) fall back to GDS or disk loading automatically.
+
+MLA models produce correct inference when loaded from disk but corrupted inference after RDMA weight transfer. The bytes transfer correctly (checksums match), but inference diverges. This has been reproduced across all tested vLLM versions (0.12.0 through 0.17.1). Root cause is under investigation. Set `MX_SKIP_FEATURE_CHECK=1` to bypass the block for debugging.
+
+During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match. This triggers trying the next source candidate rather than marking the source as stale, which is important during rolling updates where pods may run different image versions.
 
 After loading by any strategy, the worker starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged but do not crash the worker.
 
