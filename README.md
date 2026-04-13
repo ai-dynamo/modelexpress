@@ -225,6 +225,7 @@ cargo bench
 
 ## Known Issues
 
+- **MLA models blocked from P2P transfer** — Models using Multi-head Latent Attention (DeepSeek-V2/V3, Kimi K2/K2.5) are automatically blocked from GPU-to-GPU transfer and fall back to disk loading. Bytes transfer correctly but inference produces corrupted output. Set `MX_SKIP_FEATURE_CHECK=1` to bypass for debugging. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 - **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
 - **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
 - **Large model gRPC stream** — May not close automatically; use client timeout.
