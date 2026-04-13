@@ -38,12 +38,19 @@ class RdmaStrategy(LoadStrategy):
     def is_available(self, ctx: LoadContext) -> bool:
         if not is_nixl_available():
             return False
+
+        server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+        if not server_addr:
+            logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
+            return False
+
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
             logger.info(
                 f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}"
             )
             return False
+
         return True
 
     def load(self, model: nn.Module, ctx: LoadContext) -> bool:

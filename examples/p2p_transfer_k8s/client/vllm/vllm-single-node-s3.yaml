@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node vLLM deployment with ModelExpress ModelStreamer (S3).
+# Streams weights from S3 via runai-model-streamer — no disk, no PVC.
+#
+# Prerequisites:
+#   - Model weights uploaded to S3 bucket
+#   - kubectl create secret generic aws-creds \
+#       --from-literal=AWS_ACCESS_KEY_ID=<key> \
+#       --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
+#       --from-literal=AWS_SESSION_TOKEN=<token>
+#
+# For P2P RDMA serving after S3 load, also set MX_SERVER_ADDRESS
+# and add RDMA resources (rdma/ib), UCX env vars — see vllm-single-node-p2p.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm-s3
+  labels:
+    app: mx-vllm-s3
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-vllm-s3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm-s3
+  labels:
+    app: mx-vllm-s3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-vllm-s3
+  template:
+    metadata:
+      labels:
+        app: mx-vllm-s3
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Update to your S3 bucket and region
+            - name: MX_S3_URI
+              value: "s3://my-bucket/deepseek-ai/DeepSeek-V3"
+            - name: AWS_DEFAULT_REGION
+              value: "us-west-2"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            # ModelStreamer tuning: more parallel S3 reads (default 8)
+            - name: RUNAI_STREAMER_CONCURRENCY
+              value: "32"
+            # Optional: enable P2P serving after S3 load (requires MX server + RDMA)
+            # - name: MX_SERVER_ADDRESS
+            #   value: "modelexpress-server:8001"
+          # AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+          envFrom:
+            - secretRef:
+                name: aws-creds
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "8"
+            - --enable-expert-parallel
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              # Optional: uncomment for P2P RDMA serving
+              # rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              # rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
