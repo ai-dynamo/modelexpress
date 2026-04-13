@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 
@@ -64,7 +65,10 @@ def _configure_vllm_logging():
     vllm_logger = logging.getLogger("vllm")
     for handler in vllm_logger.handlers:
         mx_root.addHandler(handler)
-    if vllm_logger.level != logging.NOTSET:
+    mx_level = os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper()
+    if mx_level and hasattr(logging, mx_level):
+        mx_root.setLevel(getattr(logging, mx_level))
+    elif vllm_logger.level != logging.NOTSET:
         mx_root.setLevel(vllm_logger.level)
 
 
