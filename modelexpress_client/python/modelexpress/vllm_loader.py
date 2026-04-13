@@ -81,7 +81,7 @@ class MxModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config
                 )
 
-            LoadStrategyChain.run(model, ctx)
+            model = LoadStrategyChain.run(model, ctx)
 
             # Update global registries
             _tensor_registry[ctx.device_id] = ctx.tensors

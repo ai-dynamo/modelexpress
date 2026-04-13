@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 
+import torch
 import torch.nn as nn
 
 from .base import (
@@ -46,11 +47,13 @@ class LoadStrategyChain:
     """
 
     @staticmethod
-    def run(model: nn.Module, ctx: LoadContext) -> None:
+    def run(model: nn.Module, ctx: LoadContext) -> nn.Module:
         """Build the chain and execute strategies until one succeeds.
 
+        Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
+        from vllm.model_executor.model_loader.utils import initialize_model
         from .rdma_strategy import RdmaStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
@@ -69,12 +72,32 @@ class LoadStrategyChain:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
             try:
                 if strategy.load(model, ctx):
-                    return
+                    return model
             except Exception as e:
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
                     f"raised unexpected error, trying next: {e}"
                 )
+
+            # A failed strategy may have mutated the model (e.g. RDMA runs
+            # process_weights_after_loading() before the transfer attempt,
+            # stripping weight_loader from FP8 QuantizedParameters).  Detect
+            # this via stale NIXL state and re-initialize so the next
+            # strategy gets a clean model.
+            if ctx.tensors or ctx.nixl_manager is not None:
+                ctx.tensors = {}
+                ctx.nixl_manager = None
+                del model
+                torch.cuda.empty_cache()
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Re-initializing model after "
+                    f"failed strategy '{strategy.name}'"
+                )
+                with ctx.target_device:
+                    model = initialize_model(
+                        vllm_config=ctx.vllm_config,
+                        model_config=ctx.model_config,
+                    )
 
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy succeeded "
