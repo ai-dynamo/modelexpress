@@ -6,8 +6,8 @@ vLLM instances with ModelExpress P2P weight transfer support.
 
 | Topology | Manifest | Model | Configuration |
 |----------|----------|-------|---------------|
-| **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | DeepSeek-V3 | TP=8, 1 node (8 GPUs) |
-| **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | Kimi-K2.5 | TP=8, PP=2, 2 nodes (16 GPUs) |
+| **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | Llama-3.1-405B-Instruct | TP=8, 1 node (8 GPUs) |
+| **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | Llama-3.1-405B-Instruct | TP=4, PP=2, 2 nodes (8 GPUs) |
 
 ## How It Works
 
