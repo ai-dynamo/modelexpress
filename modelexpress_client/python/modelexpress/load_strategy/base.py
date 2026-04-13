@@ -18,7 +18,7 @@ import torch.nn as nn
 from ..client import MxClient
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import collect_module_tensors, log_tensor_summary
-from ..metadata import publish_metadata_and_ready
+from ..metadata import build_source_identity, publish_metadata_and_ready
 from .. import p2p_pb2
 
 if TYPE_CHECKING:
@@ -60,6 +60,45 @@ class LoadContext:
     worker_id: str
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+def build_load_context(
+    vllm_config: VllmConfig,
+    model_config: ModelConfig,
+) -> LoadContext:
+    """Build a LoadContext from vLLM config objects.
+
+    Resolves device, ranks, builds source identity, and creates MX client
+    and worker ID. Used by both MxModelLoader and GMS loader to avoid
+    duplicating context construction logic.
+
+    Args:
+        vllm_config: vLLM engine configuration.
+        model_config: Model configuration (name, dtype, quantization).
+    """
+    from ..rank_utils import get_global_rank, get_worker_rank
+
+    load_config = vllm_config.load_config
+    load_device = (
+        vllm_config.device_config.device
+        if load_config.device is None
+        else load_config.device
+    )
+    target_device = torch.device(load_device)
+    device_id = get_worker_rank(target_device)
+    global_rank = get_global_rank(target_device)
+
+    return LoadContext(
+        vllm_config=vllm_config,
+        model_config=model_config,
+        load_config=load_config,
+        target_device=target_device,
+        global_rank=global_rank,
+        device_id=device_id,
+        identity=build_source_identity(vllm_config, model_config),
+        mx_client=MxClient(),
+        worker_id=uuid.uuid4().hex[:8],
+    )
 
 
 class LoadStrategy(ABC):
