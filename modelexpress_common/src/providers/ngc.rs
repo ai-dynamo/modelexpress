@@ -14,8 +14,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-const NGC_API_BASE: &str = "https://api.ngc.nvidia.com";
-const NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
+const NGC_API_ENDPOINT_ENV_VAR: &str = "NGC_API_ENDPOINT";
+const NGC_AUTH_ENDPOINT_ENV_VAR: &str = "NGC_AUTH_ENDPOINT";
+const DEFAULT_NGC_API_BASE: &str = "https://api.ngc.nvidia.com";
+const DEFAULT_NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
+
+fn ngc_api_base() -> String {
+    std::env::var(NGC_API_ENDPOINT_ENV_VAR).unwrap_or_else(|_| DEFAULT_NGC_API_BASE.to_string())
+}
+
+fn ngc_authn_base() -> String {
+    std::env::var(NGC_AUTH_ENDPOINT_ENV_VAR).unwrap_or_else(|_| DEFAULT_NGC_AUTHN_BASE.to_string())
+}
 const NGC_API_KEY_ENV_VAR: &str = "NGC_API_KEY";
 const NGC_CLI_API_KEY_ENV_VAR: &str = "NGC_CLI_API_KEY";
 const NGC_CLI_CONFIG_PATH: &str = ".ngc/config";
@@ -312,7 +322,7 @@ async fn fetch_token(
         Some(team) => format!("group/ngc:{}/{}", id.org, team),
         None => format!("group/ngc:{}", id.org),
     };
-    let url = format!("{NGC_AUTHN_BASE}/token");
+    let url = format!("{}/token", ngc_authn_base());
     let response = client
         .get(&url)
         .query(&[("service", "ngc"), ("scope", scope.as_str())])
@@ -361,12 +371,13 @@ async fn fetch_org_artifact_files(
     let mut page = 1i32;
 
     loop {
+        let api_base = ngc_api_base();
         let url = format!(
-            "{NGC_API_BASE}/v2/org/{}/{}/{}/versions/{}/files?page-size={PAGE_SIZE}&page-number={page}",
+            "{api_base}/v2/org/{}/{}/{}/versions/{}/files?page-size={PAGE_SIZE}&page-number={page}",
             id.org, id.artifact_type, id.name, id.version
         );
         let files_base = format!(
-            "{NGC_API_BASE}/v2/org/{}/{}/{}/versions/{}/files",
+            "{api_base}/v2/org/{}/{}/{}/versions/{}/files",
             id.org, id.artifact_type, id.name, id.version
         );
         debug!("NGC org files: GET {url}");
@@ -430,8 +441,13 @@ async fn fetch_team_artifact_files(
     team: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let files_base = format!(
-        "{NGC_API_BASE}/v2/org/{}/team/{}/{}/{}/versions/{}/files",
-        id.org, team, id.artifact_type, id.name, id.version
+        "{}/v2/org/{}/team/{}/{}/{}/versions/{}/files",
+        ngc_api_base(),
+        id.org,
+        team,
+        id.artifact_type,
+        id.name,
+        id.version
     );
     let mut all_urls: Vec<String> = Vec::new();
     let mut all_paths: Vec<String> = Vec::new();
@@ -1391,5 +1407,415 @@ mod tests {
         let id = parse_model_name(name).expect("parse");
         let rebuilt = model_dir(cache_root, &id);
         assert_eq!(rebuilt, model_path);
+    }
+
+    // ── Additional coverage tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_bearer_header_valid() {
+        let header = bearer_header("test-token-123").expect("bearer_header");
+        assert_eq!(header.to_str().expect("to_str"), "Bearer test-token-123");
+    }
+
+    #[test]
+    fn test_download_concurrency_returns_reasonable_value() {
+        let c = download_concurrency();
+        assert!((1..=10).contains(&c));
+    }
+
+    #[test]
+    fn test_get_cache_dir_explicit() {
+        let dir = get_cache_dir(Some(PathBuf::from("/my/cache")));
+        assert_eq!(dir, PathBuf::from("/my/cache"));
+    }
+
+    #[test]
+    fn test_check_request_status_success() {
+        let resp = ArtifactFilesResponse {
+            request_status: Some(RequestStatus {
+                status_code: Some("SUCCESS".to_string()),
+                status_description: Some("OK".to_string()),
+            }),
+            pagination_info: None,
+            urls: None,
+            filepath: None,
+            model_files: None,
+            model_version: None,
+        };
+        assert!(resp.check_request_status().is_ok());
+    }
+
+    #[test]
+    fn test_check_request_status_error() {
+        let resp = ArtifactFilesResponse {
+            request_status: Some(RequestStatus {
+                status_code: Some("INVALID_REQUEST".to_string()),
+                status_description: Some("Bad stuff happened".to_string()),
+            }),
+            pagination_info: None,
+            urls: None,
+            filepath: None,
+            model_files: None,
+            model_version: None,
+        };
+        let err = resp.check_request_status().expect_err("should fail");
+        assert!(err.to_string().contains("INVALID_REQUEST"));
+        assert!(err.to_string().contains("Bad stuff happened"));
+    }
+
+    #[test]
+    fn test_check_request_status_none() {
+        let resp = ArtifactFilesResponse {
+            request_status: None,
+            pagination_info: None,
+            urls: None,
+            filepath: None,
+            model_files: None,
+            model_version: None,
+        };
+        assert!(resp.check_request_status().is_ok());
+    }
+
+    #[test]
+    fn test_into_files_v1_mismatched_lengths() {
+        let resp = ArtifactFilesResponse {
+            request_status: None,
+            pagination_info: None,
+            urls: Some(vec!["a".to_string(), "b".to_string()]),
+            filepath: Some(vec!["x".to_string()]),
+            model_files: None,
+            model_version: None,
+        };
+        assert!(resp.into_files("unused").is_err());
+    }
+
+    #[test]
+    fn test_ngc_provider_cache_clear_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = NgcProviderCache;
+        let result = cache.clear_model(dir.path(), "nvidia/llama/1");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ngc_provider_cache_clear_existing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("ngc/nvidia/models/llama/1");
+        std::fs::create_dir_all(&model_path).expect("create dirs");
+        std::fs::write(model_path.join("config.json"), b"{}").expect("write");
+
+        let cache = NgcProviderCache;
+        cache
+            .clear_model(dir.path(), "nvidia/llama/1")
+            .expect("clear");
+        assert!(!model_path.exists());
+    }
+
+    #[test]
+    fn test_ngc_provider_cache_resolve_existing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("ngc/nvidia/models/llama/1");
+        std::fs::create_dir_all(&model_path).expect("create dirs");
+
+        let cache = NgcProviderCache;
+        let resolved = cache
+            .resolve_model_path(dir.path(), "nvidia/llama/1", None)
+            .expect("resolve");
+        assert_eq!(resolved, model_path);
+    }
+
+    #[test]
+    fn test_ngc_provider_cache_resolve_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = NgcProviderCache;
+        let result = cache.resolve_model_path(dir.path(), "nvidia/llama/1", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ngc_provider_cache_list_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = NgcProviderCache;
+        let models = cache.list_models(dir.path()).expect("list");
+        assert!(models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_token_nvapi_skips_exchange() {
+        let client = reqwest::Client::new();
+        let id = NgcArtifactId {
+            org: "nvidia".to_string(),
+            team: None,
+            artifact_type: "models".to_string(),
+            name: "test".to_string(),
+            version: "1".to_string(),
+        };
+        let token = fetch_token(&client, "nvapi-test-key-12345", &id)
+            .await
+            .expect("fetch_token");
+        assert_eq!(token, "nvapi-test-key-12345");
+    }
+
+    // ── WireMock-based integration tests ──────────────────────────────────
+
+    use crate::test_support::{EnvVarGuard, acquire_env_mutex};
+    use std::sync::MutexGuard;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct MockNgcServer<'a> {
+        _server: MockServer,
+        pub cache_path: PathBuf,
+        _api_endpoint_guard: EnvVarGuard<'a>,
+        _auth_endpoint_guard: EnvVarGuard<'a>,
+        _api_key_guard: EnvVarGuard<'a>,
+        _cache_guard: EnvVarGuard<'a>,
+    }
+
+    impl<'a> MockNgcServer<'a> {
+        async fn new(env_lock: &'a MutexGuard<'static, ()>) -> Self {
+            let temp_dir = tempfile::TempDir::new().expect("tempdir");
+            let server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"token": "mock-jwt-token"})),
+                )
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "requestStatus": {"statusCode": "SUCCESS"},
+                    "paginationInfo": {"totalPages": 1},
+                    "modelVersion": {"storageVersion": "V2"},
+                    "modelFiles": [
+                        {"path": "config.json"},
+                        {"path": "tokenizer.json"}
+                    ]
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"/v2/org/.*/team/.*/models/.*/versions/.*/files/.+",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+                .mount(&server)
+                .await;
+
+            let api_endpoint_guard =
+                EnvVarGuard::set(env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
+            let auth_endpoint_guard =
+                EnvVarGuard::set(env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
+            let api_key_guard = EnvVarGuard::set(env_lock, NGC_API_KEY_ENV_VAR, "mock-legacy-key");
+            let cache_guard = EnvVarGuard::set(
+                env_lock,
+                MODEL_EXPRESS_CACHE_ENV_VAR,
+                temp_dir.path().to_str().expect("path"),
+            );
+
+            Self {
+                _server: server,
+                cache_path: temp_dir.path().to_path_buf(),
+                _api_endpoint_guard: api_endpoint_guard,
+                _auth_endpoint_guard: auth_endpoint_guard,
+                _api_key_guard: api_key_guard,
+                _cache_guard: cache_guard,
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_model_v2_with_mock() {
+        let env_lock = acquire_env_mutex();
+        let mock = MockNgcServer::new(&env_lock).await;
+
+        let result = NgcProvider
+            .download_model(
+                "nim/nvidia/test-model/v1",
+                Some(mock.cache_path.clone()),
+                false,
+            )
+            .await;
+
+        assert!(result.is_ok(), "download failed: {result:?}");
+        let model_path = result.expect("path");
+        assert!(model_path.join("config.json").exists());
+        assert!(model_path.join("tokenizer.json").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_model_skips_ignored_files() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "mock-jwt"})),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestStatus": {"statusCode": "SUCCESS"},
+                "paginationInfo": {"totalPages": 1},
+                "modelVersion": {"storageVersion": "V2"},
+                "modelFiles": [
+                    {"path": "config.json"},
+                    {"path": "README.md"},
+                    {"path": ".gitignore"},
+                    {"path": "photo.png"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/v2/org/.*/team/.*/models/.*/versions/.*/files/config\.json",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
+            .mount(&server)
+            .await;
+
+        let _api = EnvVarGuard::set(&env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, NGC_API_KEY_ENV_VAR, "mock-key");
+
+        let result = NgcProvider
+            .download_model(
+                "nim/nvidia/test-model/v1",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+            )
+            .await;
+
+        assert!(result.is_ok(), "download failed: {result:?}");
+        let model_path = result.expect("path");
+        assert!(model_path.join("config.json").exists());
+        assert!(!model_path.join("README.md").exists());
+        assert!(!model_path.join(".gitignore").exists());
+        assert!(!model_path.join("photo.png").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_model_uam_fallback() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "mock-jwt"})),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "requestStatus": {
+                    "statusCode": "INVALID_REQUEST",
+                    "statusDescription": "Org contex missing"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"checksums\.blake3$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("abc123  config.json\ndef456  tokenizer.json\n"),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/v2/org/.*/team/.*/models/.*/versions/.*/files/(config|tokenizer)\.json$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 32]))
+            .mount(&server)
+            .await;
+
+        let _api = EnvVarGuard::set(&env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, NGC_API_KEY_ENV_VAR, "mock-key");
+
+        let result = NgcProvider
+            .download_model(
+                "nim/nvidia/test-model/v1",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+            )
+            .await;
+
+        assert!(result.is_ok(), "UAM fallback download failed: {result:?}");
+        let model_path = result.expect("path");
+        assert!(model_path.join("config.json").exists());
+        assert!(model_path.join("tokenizer.json").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_model_with_nvapi_key() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestStatus": {"statusCode": "SUCCESS"},
+                "paginationInfo": {"totalPages": 1},
+                "modelVersion": {"storageVersion": "V2"},
+                "modelFiles": [{"path": "config.json"}]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/v2/org/.*/team/.*/models/.*/versions/.*/files/.+",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
+            .mount(&server)
+            .await;
+
+        let _api = EnvVarGuard::set(&env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, NGC_API_KEY_ENV_VAR, "nvapi-test-key-xyz");
+
+        let result = NgcProvider
+            .download_model(
+                "nim/nvidia/test-model/v1",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+            )
+            .await;
+
+        assert!(result.is_ok(), "nvapi key download failed: {result:?}");
     }
 }
