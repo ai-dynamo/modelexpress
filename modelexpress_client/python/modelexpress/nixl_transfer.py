@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from .types import TensorDescriptor
+from .types import ManifestMismatchError, TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
 
@@ -134,7 +134,7 @@ class NixlTransferManager:
 
         for name, tensor in tensors.items():
             if not tensor.is_contiguous():
-                raise RuntimeError(
+                raise ManifestMismatchError(
                     f"Tensor '{name}' is not contiguous. "
                     "Non-contiguous tensors cannot be used for RDMA transfers."
                 )
@@ -331,7 +331,7 @@ class NixlTransferManager:
             if self._registered_regions is None:
                 logger.error("Source sent region descriptors but we didn't register regions!")
                 logger.error("Set MX_CONTIGUOUS_REG=1 on target to enable region transfer")
-                raise RuntimeError("Region transfer mismatch: target must also use MX_CONTIGUOUS_REG=1")
+                raise ManifestMismatchError("Region transfer mismatch: target must also use MX_CONTIGUOUS_REG=1")
 
             logger.info(f"Region-based transfer: {len(source_tensors)} source regions -> {len(self._registered_regions)} local regions")
 
@@ -377,11 +377,53 @@ class NixlTransferManager:
             local_tensor_list = []
             total_bytes = 0
             matched_tensors = 0
+            skipped_source = []
+            skipped_target = []
+
+            source_names = {t.name for t in source_tensors}
+            local_names = set(self._tensors.keys())
+
+            # Detect manifest mismatches BEFORE transfer
+            source_only = source_names - local_names
+            target_only = local_names - source_names
+            if source_only:
+                skipped_source = sorted(source_only)
+                logger.warning(
+                    f"[Manifest Mismatch] {len(source_only)} source tensors have no "
+                    f"local match (will NOT be transferred): "
+                    f"{skipped_source[:5]}{'...' if len(skipped_source) > 5 else ''}"
+                )
+            if target_only:
+                skipped_target = sorted(target_only)
+                logger.warning(
+                    f"[Manifest Mismatch] {len(target_only)} local tensors have no "
+                    f"source match (will keep dummy values): "
+                    f"{skipped_target[:5]}{'...' if len(skipped_target) > 5 else ''}"
+                )
+            if source_only or target_only:
+                raise ManifestMismatchError(
+                    f"[Manifest Mismatch] Source has {len(source_names)} tensors, "
+                    f"target has {len(local_names)} tensors, "
+                    f"{len(source_names & local_names)} matched. "
+                    f"Source-only: {skipped_source[:5]}, "
+                    f"Target-only: {skipped_target[:5]}. "
+                    f"Aborting transfer to prevent incorrect inference."
+                )
 
             for src_tensor in source_tensors:
                 if src_tensor.name not in self._tensors:
                     continue
                 local_tensor = self._tensors[src_tensor.name]
+
+                # Validate size match for each tensor
+                local_size = local_tensor.numel() * local_tensor.element_size()
+                if src_tensor.size != local_size:
+                    raise ManifestMismatchError(
+                        f"[Manifest Mismatch] Tensor '{src_tensor.name}' size mismatch: "
+                        f"source={src_tensor.size}, target={local_size}. "
+                        f"Aborting transfer to prevent incorrect inference."
+                    )
+
                 remote_descs.append((src_tensor.addr, src_tensor.size, src_tensor.device_id))
                 local_tensor_list.append(local_tensor)
                 total_bytes += src_tensor.size
@@ -471,7 +513,7 @@ class NixlTransferManager:
                 break
             if status in ("ERR", "ERROR", "FAIL"):
                 self._agent.release_xfer_handle(handle)
-                raise RuntimeError(f"Transfer failed with status {status}")
+                raise RuntimeError(f"NIXL transfer failed with status {status}")
             time.sleep(0.001)
 
         # CRITICAL: Synchronize CUDA to ensure RDMA writes are visible
