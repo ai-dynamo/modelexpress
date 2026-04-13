@@ -55,7 +55,8 @@ def detect_model_features(model_config) -> dict[str, str]:
     features["quantization"] = model_config.quantization or "none"
 
     # MLA detection via HF config attribute
-    has_mla = getattr(hf_config, "kv_lora_rank", None) is not None
+    kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)
+    has_mla = isinstance(kv_lora_rank, int)
     features["attention"] = "mla" if has_mla else "standard"
 
     # MoE
@@ -63,7 +64,7 @@ def detect_model_features(model_config) -> dict[str, str]:
         getattr(hf_config, "n_routed_experts", None)
         or getattr(hf_config, "num_local_experts", None)
     )
-    if num_experts and num_experts > 1:
+    if isinstance(num_experts, int) and num_experts > 1:
         features["moe"] = str(num_experts)
 
     return features
