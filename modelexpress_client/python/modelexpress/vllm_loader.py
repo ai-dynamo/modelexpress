@@ -654,6 +654,28 @@ class MxModelLoader(BaseModelLoader):
                 )
 
             if not loaded_as_target:
+                if transfer_allowed:
+                    # A failed RDMA target attempt runs
+                    # process_weights_after_loading() to establish the tensor
+                    # layout for receive buffers.  That mutates the model
+                    # in-place (e.g. FP8 post-processing strips weight_loader
+                    # from QuantizedParameters), leaving it in a state
+                    # incompatible with a fresh disk load.  It also registers
+                    # stale tensors with NIXL.  Clean up and re-initialize.
+                    self._tensors = {}
+                    self._nixl_manager = None
+                    _tensor_registry.pop(device_id, None)
+                    _nixl_managers.pop(device_id, None)
+                    del model
+                    torch.cuda.empty_cache()
+                    logger.info(
+                        f"[Worker {global_rank}] Re-initializing model after "
+                        f"failed RDMA attempt"
+                    )
+                    with target_device:
+                        model = initialize_model(
+                            vllm_config=vllm_config, model_config=model_config
+                        )
                 self._load_as_source(model, model_config, target_device, global_rank, device_id, identity)
 
         total_time = time.perf_counter() - load_start
