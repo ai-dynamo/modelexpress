@@ -311,7 +311,7 @@ class NixlTransferManager:
         source_metadata: bytes,
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
-        coalesce_transfers: bool = True,
+        coalesce_transfers: bool = False,
         remote_agent_name: str | None = None,
     ) -> tuple[int, int, float]:
         """
