@@ -108,7 +108,6 @@ spec:
             - mx
             - --tensor-parallel-size
             - "8"
-            - --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"

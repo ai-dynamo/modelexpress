@@ -142,7 +142,6 @@ spec:
                   --load-format mx \
                   --tensor-parallel-size 4 \
                   --pipeline-parallel-size 2 \
-                  --enable-expert-parallel \
                   --trust-remote-code \
                   --distributed-executor-backend ray
               else
