@@ -29,7 +29,7 @@ spec:
               properties:
                 modelName:
                   type: string
-                  description: Full model name (e.g., deepseek-ai/DeepSeek-V3)
+                  description: Full model name (e.g., meta-llama/Llama-3.1-405B-Instruct)
             status:
               type: object
               properties:

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Single-node vLLM deployment with ModelExpress P2P weight transfer.
-# Deploys DeepSeek-V3 on 1 node (8 GPUs, TP=8).
+# Deploys Llama-3.1-405B-Instruct on 1 node (8 GPUs, TP=8).
 #
 # Prerequisites:
 #   - ModelExpress server deployed (see ../../server/)
@@ -61,7 +61,7 @@ spec:
             - name: HF_HUB_CACHE
               value: "/models"
             - name: MODEL_NAME
-              value: "deepseek-ai/DeepSeek-V3"
+              value: "meta-llama/Llama-3.1-405B-Instruct"
             # Register ModelExpress loaders via vLLM plugin system
             - name: VLLM_PLUGINS
               value: "modelexpress"
@@ -108,7 +108,6 @@ spec:
             - mx
             - --tensor-parallel-size
             - "8"
-            - --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"

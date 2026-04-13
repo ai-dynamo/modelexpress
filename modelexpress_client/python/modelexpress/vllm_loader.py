@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 
@@ -47,6 +48,30 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 logger = logging.getLogger("modelexpress.vllm_loader")
 
 
+def _configure_vllm_logging():
+    """Ensure modelexpress loggers are visible in vLLM's EngineCore subprocess.
+
+    vLLM 0.19.0+ only attaches log handlers to the "vllm" namespace.
+    Without this, all "modelexpress.*" output is silently dropped because
+    the root logger in the subprocess has no handler.
+
+    Copies vLLM's handlers onto the "modelexpress" parent logger so every
+    child logger (client, metadata, heartbeat, nixl_transfer, etc.)
+    inherits them via propagation.
+    """
+    mx_root = logging.getLogger("modelexpress")
+    if mx_root.handlers:
+        return
+    vllm_logger = logging.getLogger("vllm")
+    for handler in vllm_logger.handlers:
+        mx_root.addHandler(handler)
+    mx_level = os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper()
+    if mx_level and hasattr(logging, mx_level):
+        mx_root.setLevel(getattr(logging, mx_level))
+    elif vllm_logger.level != logging.NOTSET:
+        mx_root.setLevel(vllm_logger.level)
+
+
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
@@ -65,6 +90,7 @@ class MxModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        _configure_vllm_logging()
         self._mx_client = MxClient()
         self._worker_id = uuid.uuid4().hex[:8]
         self._ctx: LoadContext | None = None

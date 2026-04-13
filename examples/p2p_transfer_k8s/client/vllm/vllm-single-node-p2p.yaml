@@ -59,7 +59,7 @@ spec:
             - name: HF_HUB_CACHE
               value: "/models"
             - name: MODEL_NAME
-              value: "deepseek-ai/DeepSeek-V3"
+              value: "meta-llama/Llama-3.1-405B-Instruct"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
@@ -110,7 +110,6 @@ spec:
             - mx
             - --tensor-parallel-size
             - "8"
-            - --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"
