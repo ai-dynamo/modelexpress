@@ -20,6 +20,7 @@ from .base import (
     SourceTransferError,
     register_tensors,
     publish_metadata,
+    unpublish_metadata,
 )
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "SourceTransferError",
     "register_tensors",
     "publish_metadata",
+    "unpublish_metadata",
 ]
 
 logger = logging.getLogger("modelexpress.load_strategy")

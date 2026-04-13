@@ -159,3 +159,24 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] Failed to publish metadata, "
             f"worker will continue without P2P serving: {e}"
         )
+
+
+def unpublish_metadata(ctx: LoadContext) -> None:
+    """Stop heartbeat, stop worker gRPC server, and mark STALE on MX server.
+
+    Call before memory becomes invalid (e.g., GMS unmap during sleep).
+    The NIXL agent stays alive — only the P2P serving state is torn down.
+    Call publish_metadata() again after memory is valid to re-enter the
+    P2P network.
+    """
+    from ..metadata import _heartbeat_threads, _worker_servers
+
+    hb = _heartbeat_threads.pop(ctx.global_rank, None)
+    if hb is not None:
+        hb.stop()  # also marks STALE on MX server
+        logger.info(f"[Worker {ctx.global_rank}] Heartbeat stopped")
+
+    ws = _worker_servers.pop(ctx.device_id, None)
+    if ws is not None:
+        ws.stop()
+        logger.info(f"[Worker {ctx.global_rank}] Worker gRPC server stopped")
