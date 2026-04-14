@@ -3,6 +3,9 @@
 
 """Tests for the shared helpers and MxModelLoader detection logic."""
 
+import logging
+import logging.handlers
+import os
 from unittest.mock import MagicMock, patch, call
 
 import grpc
@@ -655,3 +658,120 @@ class TestCollectModuleTensorsStorageViews:
         source = _collect_module_tensors(make_model())
         target = _collect_module_tensors(make_model())
         assert set(source.keys()) == set(target.keys())
+
+
+# ---------------------------------------------------------------------------
+# _configure_vllm_logging
+# ---------------------------------------------------------------------------
+
+
+class TestConfigureVllmLogging:
+    """Verify modelexpress loggers inherit vLLM handlers in EngineCore subprocess."""
+
+    def _reset_mx_logger(self):
+        """Clear any handlers/level from the modelexpress root logger."""
+        mx_root = logging.getLogger("modelexpress")
+        mx_root.handlers.clear()
+        mx_root.setLevel(logging.NOTSET)
+
+    def _simulate_vllm_enginecore_logging(self):
+        """Reproduce vLLM 0.19.0 EngineCore: only "vllm" gets a handler."""
+        self._reset_mx_logger()
+
+        vllm_logger = logging.getLogger("vllm")
+        self._saved_vllm_handlers = list(vllm_logger.handlers)
+        self._saved_vllm_level = vllm_logger.level
+        self._saved_vllm_propagate = vllm_logger.propagate
+
+        vllm_logger.handlers.clear()
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(name)s %(levelname)s %(message)s"))
+        vllm_logger.addHandler(handler)
+        vllm_logger.setLevel(logging.DEBUG)
+        vllm_logger.propagate = False
+        return vllm_logger, handler
+
+    def _cleanup(self, vllm_logger):
+        self._reset_mx_logger()
+        vllm_logger.handlers.clear()
+        for h in self._saved_vllm_handlers:
+            vllm_logger.addHandler(h)
+        vllm_logger.setLevel(self._saved_vllm_level)
+        vllm_logger.propagate = self._saved_vllm_propagate
+
+    def test_child_loggers_visible_after_configure(self):
+        from modelexpress.vllm_loader import _configure_vllm_logging
+
+        vllm_logger, handler = self._simulate_vllm_enginecore_logging()
+        try:
+            _configure_vllm_logging()
+
+            mx_root = logging.getLogger("modelexpress")
+            assert len(mx_root.handlers) == 1
+            assert mx_root.handlers[0] is handler
+
+            child = logging.getLogger("modelexpress.metadata")
+            assert child.getEffectiveLevel() == logging.DEBUG
+        finally:
+            self._cleanup(vllm_logger)
+
+    def test_no_duplicate_handlers_on_repeated_calls(self):
+        from modelexpress.vllm_loader import _configure_vllm_logging
+
+        vllm_logger, _handler = self._simulate_vllm_enginecore_logging()
+        try:
+            _configure_vllm_logging()
+            _configure_vllm_logging()
+
+            mx_root = logging.getLogger("modelexpress")
+            assert len(mx_root.handlers) == 1
+        finally:
+            self._cleanup(vllm_logger)
+
+    def test_log_output_actually_captured(self):
+        from modelexpress.vllm_loader import _configure_vllm_logging
+
+        vllm_logger, _ = self._simulate_vllm_enginecore_logging()
+        try:
+            buf = logging.handlers.MemoryHandler(capacity=100)
+            vllm_logger.handlers.clear()
+            vllm_logger.addHandler(buf)
+
+            self._reset_mx_logger()
+            _configure_vllm_logging()
+
+            child = logging.getLogger("modelexpress.heartbeat")
+            child.info("Heartbeat started")
+
+            assert len(buf.buffer) == 1
+            assert "Heartbeat started" in buf.buffer[0].getMessage()
+            assert buf.buffer[0].name == "modelexpress.heartbeat"
+        finally:
+            vllm_logger.removeHandler(buf)
+            self._cleanup(vllm_logger)
+
+    def test_model_express_log_level_overrides_vllm(self):
+        from modelexpress.vllm_loader import _configure_vllm_logging
+
+        vllm_logger, _handler = self._simulate_vllm_enginecore_logging()
+        try:
+            assert vllm_logger.level == logging.DEBUG
+            with patch.dict("os.environ", {"MODEL_EXPRESS_LOG_LEVEL": "WARNING"}):
+                _configure_vllm_logging()
+            mx_root = logging.getLogger("modelexpress")
+            assert mx_root.level == logging.WARNING
+        finally:
+            self._cleanup(vllm_logger)
+
+    def test_falls_back_to_vllm_level_when_env_unset(self):
+        from modelexpress.vllm_loader import _configure_vllm_logging
+
+        vllm_logger, _handler = self._simulate_vllm_enginecore_logging()
+        try:
+            with patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("MODEL_EXPRESS_LOG_LEVEL", None)
+                _configure_vllm_logging()
+            mx_root = logging.getLogger("modelexpress")
+            assert mx_root.level == logging.DEBUG
+        finally:
+            self._cleanup(vllm_logger)

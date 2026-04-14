@@ -78,6 +78,30 @@ PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
     grpc.StatusCode.DEADLINE_EXCEEDED,
 }
 
+def _configure_vllm_logging():
+    """Ensure modelexpress loggers are visible in vLLM's EngineCore subprocess.
+
+    vLLM 0.19.0+ only attaches log handlers to the "vllm" namespace.
+    Without this, all "modelexpress.*" output is silently dropped because
+    the root logger in the subprocess has no handler.
+
+    Copies vLLM's handlers onto the "modelexpress" parent logger so every
+    child logger (client, metadata, heartbeat, nixl_transfer, etc.)
+    inherits them via propagation.
+    """
+    mx_root = logging.getLogger("modelexpress")
+    if mx_root.handlers:
+        return
+    vllm_logger = logging.getLogger("vllm")
+    for handler in vllm_logger.handlers:
+        mx_root.addHandler(handler)
+    mx_level = os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper()
+    if mx_level and hasattr(logging, mx_level):
+        mx_root.setLevel(getattr(logging, mx_level))
+    elif vllm_logger.level != logging.NOTSET:
+        mx_root.setLevel(vllm_logger.level)
+
+
 def _safe_checksum(tensor: torch.Tensor) -> str:
     """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
     try:
@@ -593,6 +617,7 @@ class MxModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        _configure_vllm_logging()
         self._nixl_manager: NixlTransferManager | None = None
         self._tensors: dict[str, torch.Tensor] = {}
         self._mx_client = MxClient()
