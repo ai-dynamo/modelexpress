@@ -1,24 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Single-node vLLM deployment with ModelExpress ModelStreamer (S3).
-# Streams weights from S3 via runai-model-streamer — no disk, no PVC.
+# Single-node vLLM deployment with ModelExpress ModelStreamer (local disk).
+# Streams weights from PVC via runai-model-streamer with concurrent I/O.
+#
+# MX_MODEL_URI accepts:
+#   - HF model ID: "deepseek-ai/DeepSeek-V3" (resolved via HF_HUB_CACHE)
+#   - Absolute path: "/models/my-model"
+#   - Remote URI: "s3://bucket/model" (see vllm-single-node-s3.yaml)
 #
 # Prerequisites:
-#   - Model weights uploaded to S3 bucket
-#   - kubectl create secret generic aws-creds \
-#       --from-literal=AWS_ACCESS_KEY_ID=<key> \
-#       --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
-#       --from-literal=AWS_SESSION_TOKEN=<token>
+#   - PVC with model weights pre-downloaded (HF Hub cache layout)
 #
-# For P2P RDMA serving after S3 load, also set MX_SERVER_ADDRESS
+# For P2P RDMA serving after load, also set MX_SERVER_ADDRESS
 # and add RDMA resources (rdma/ib), UCX env vars — see vllm-single-node-p2p.yaml.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-vllm-s3
+  name: mx-vllm-streamer
   labels:
-    app: mx-vllm-s3
+    app: mx-vllm-streamer
 spec:
   type: ClusterIP
   ports:
@@ -26,30 +27,28 @@ spec:
       targetPort: 8000
       name: http
   selector:
-    app: mx-vllm-s3
+    app: mx-vllm-streamer
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-vllm-s3
+  name: mx-vllm-streamer
   labels:
-    app: mx-vllm-s3
+    app: mx-vllm-streamer
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-vllm-s3
+      app: mx-vllm-streamer
   template:
     metadata:
       labels:
-        app: mx-vllm-s3
+        app: mx-vllm-streamer
     spec:
       containers:
         - name: vllm
-          # Build a vLLM + ModelExpress client image using
-          # examples/p2p_transfer_k8s/Dockerfile.client
-          image: <your-registry>/modelexpress-client:latest
-          imagePullPolicy: Always
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
               add:
@@ -59,23 +58,16 @@ spec:
               value: "7200000"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
-            # Update to your S3 bucket and region
-            - name: MX_S3_URI
-              value: "s3://my-bucket/deepseek-ai/DeepSeek-V3"
-            - name: AWS_DEFAULT_REGION
-              value: "us-west-2"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            # HF model ID — resolved to snapshot path via HF_HUB_CACHE
+            - name: MX_MODEL_URI
+              value: "deepseek-ai/DeepSeek-V3"
             - name: VLLM_PLUGINS
               value: "modelexpress"
-            # ModelStreamer tuning: more parallel S3 reads (default 8)
-            - name: RUNAI_STREAMER_CONCURRENCY
-              value: "32"
-            # Optional: enable P2P serving after S3 load (requires MX server + RDMA)
+            # Optional: enable P2P serving after load (requires MX server + RDMA)
             # - name: MX_SERVER_ADDRESS
             #   value: "modelexpress-server:8001"
-          # AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
-          envFrom:
-            - secretRef:
-                name: aws-creds
           args:
             - --model
             - $(MODEL_NAME)
@@ -97,10 +89,16 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
       volumes:
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 64Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
       imagePullSecrets:
         - name: nvcr-imagepullsecret
