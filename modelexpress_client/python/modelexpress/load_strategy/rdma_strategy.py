@@ -35,6 +35,20 @@ class RdmaStrategy(LoadStrategy):
 
     name = "rdma"
 
+    def rollback(self, ctx: LoadContext) -> bool:
+        """Clean up NIXL state from a failed RDMA target attempt.
+
+        Returns True if _load_as_target() ran (and thus
+        process_weights_after_loading mutated the model).  Detected by
+        checking whether register_tensors() populated ctx during the
+        attempt.
+        """
+        if ctx.tensors or ctx.nixl_manager is not None:
+            ctx.tensors = {}
+            ctx.nixl_manager = None
+            return True
+        return False
+
     def is_available(self, ctx: LoadContext) -> bool:
         if not is_nixl_available():
             return False

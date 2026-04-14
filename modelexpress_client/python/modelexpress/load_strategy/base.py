@@ -119,6 +119,19 @@ class LoadStrategy(ABC):
     def load(self, model: nn.Module, ctx: LoadContext) -> bool:
         """Attempt to load weights. Return True on success, False to try next."""
 
+    def rollback(self, ctx: LoadContext) -> bool:
+        """Clean up after a failed load attempt.
+
+        Called by the chain when load() returns False or raises. Strategies
+        that mutate the model before their failure point (e.g. RDMA runs
+        process_weights_after_loading before the transfer) should override
+        this to clean up their state and return True so the chain can
+        re-initialize the model for the next strategy.
+
+        Returns True if the model was mutated and needs re-initialization.
+        """
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers (used by strategy implementations)

@@ -79,14 +79,7 @@ class LoadStrategyChain:
                     f"raised unexpected error, trying next: {e}"
                 )
 
-            # A failed strategy may have mutated the model (e.g. RDMA runs
-            # process_weights_after_loading() before the transfer attempt,
-            # stripping weight_loader from FP8 QuantizedParameters).  Detect
-            # this via stale NIXL state and re-initialize so the next
-            # strategy gets a clean model.
-            if ctx.tensors or ctx.nixl_manager is not None:
-                ctx.tensors = {}
-                ctx.nixl_manager = None
+            if strategy.rollback(ctx):
                 del model
                 torch.cuda.empty_cache()
                 logger.info(
