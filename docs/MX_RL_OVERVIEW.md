@@ -101,6 +101,63 @@ An async-first RL framework by PrimeIntellect with three separate processes:
 
 No Ray dependency. Raw Kubernetes pods.
 
+### Architecture
+
+```mermaid
+graph LR
+    subgraph cluster["GKE GB200 Cluster"]
+        direction TB
+
+        subgraph control["Control Plane · CPU"]
+            direction LR
+            orch["Orchestrator"]
+            mx["MX Server + Redis"]
+        end
+
+        subgraph gpus["GPU Pods · 4x GB200 each"]
+            direction LR
+
+            subgraph tp["Trainer Pod"]
+                direction TB
+                fsdp["FSDP2 Training"]
+                pub["MX Publisher"]
+                nt(["NIXL Agent"])
+                fsdp --> pub --> nt
+            end
+
+            subgraph ip["Inference Pod"]
+                direction TB
+                vllm["vLLM Server"]
+                recv["MX Receiver"]
+                ni(["NIXL Agent"])
+                ni --> recv --> vllm
+            end
+        end
+
+        orch -. "HTTP rollouts" .-> vllm
+        orch -. "HTTP update_weights" .-> recv
+        pub -- "gRPC publish" --> mx
+        recv -- "gRPC discover" --> mx
+        nt <== "RDMA RoCE · 261-330 Gbps" ==> ni
+    end
+
+    style cluster fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style control fill:#1a1a2e,stroke:#533483,color:#e0e0e0
+    style gpus fill:#0f3460,stroke:#533483,color:#e0e0e0
+    style tp fill:#162447,stroke:#533483,color:#e0e0e0
+    style ip fill:#162447,stroke:#533483,color:#e0e0e0
+    style fsdp fill:#533483,stroke:#e94560,color:#fff
+    style vllm fill:#533483,stroke:#e94560,color:#fff
+    style orch fill:#533483,stroke:#e94560,color:#fff
+    style pub fill:#1b5e20,stroke:#4caf50,color:#fff
+    style recv fill:#1b5e20,stroke:#4caf50,color:#fff
+    style mx fill:#1b5e20,stroke:#4caf50,color:#fff
+    style nt fill:#2e7d32,stroke:#66bb6a,color:#fff
+    style ni fill:#2e7d32,stroke:#66bb6a,color:#fff
+```
+
+Green = ModelExpress / NIXL components. Purple = existing framework components.
+
 ### Integration Summary
 
 | Item | Details |
@@ -163,6 +220,72 @@ UCX 1.20+, IMEX channels via DRA, and `/dev/infiniband` are all required for cro
 ### What is verl?
 
 A production-grade RL framework by ByteDance that uses Ray for orchestration. Supports FSDP, Megatron, vLLM, SGLang, TRT-LLM. Has a `CheckpointEngine` plugin system for weight transfer.
+
+### Architecture
+
+```mermaid
+graph LR
+    subgraph cluster["Ray Cluster · GKE GB200"]
+        direction TB
+
+        subgraph driver["Driver · CPU"]
+            task["TaskRunner"]
+            mgr["CheckpointEngine Manager"]
+        end
+
+        subgraph trainer_wg["Trainer WorkerGroup · GPU"]
+            direction LR
+            tw0["Worker 0<br/>FSDP2 + MX CE"]
+            tw1["Worker 1<br/>FSDP2 + CE"]
+            tw2["Worker 2<br/>FSDP2 + CE"]
+            tw3["Worker 3<br/>FSDP2 + CE"]
+        end
+
+        subgraph rollout_wg["Rollout Replicas · GPU"]
+            direction LR
+            rw0["CE Worker 0"]
+            rw1["CE Worker 1"]
+            rw2["CE Worker 2"]
+            rw3["CE Worker 3"]
+            vs["vLLM Server"]
+        end
+
+        subgraph mx_svc["MX Server + Redis · CPU"]
+            mx["gRPC Metadata Broker"]
+        end
+
+        task --> mgr
+        mgr -. "ray.get" .-> tw0
+        mgr -. "ray.get" .-> rw0
+        tw0 -- "gRPC publish" --> mx
+        rw0 -- "gRPC discover" --> mx
+        tw0 <== "NIXL RDMA" ==> rw0
+        tw1 <== "NIXL RDMA" ==> rw1
+        tw2 <== "NIXL RDMA" ==> rw2
+        tw3 <== "NIXL RDMA" ==> rw3
+        rw0 -. "CUDA IPC" .-> vs
+    end
+
+    style cluster fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style driver fill:#1a1a2e,stroke:#533483,color:#e0e0e0
+    style trainer_wg fill:#0f3460,stroke:#533483,color:#e0e0e0
+    style rollout_wg fill:#0f3460,stroke:#533483,color:#e0e0e0
+    style mx_svc fill:#1a1a2e,stroke:#4caf50,color:#e0e0e0
+    style task fill:#533483,stroke:#e94560,color:#fff
+    style mgr fill:#1b5e20,stroke:#4caf50,color:#fff
+    style tw0 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style tw1 fill:#162447,stroke:#533483,color:#e0e0e0
+    style tw2 fill:#162447,stroke:#533483,color:#e0e0e0
+    style tw3 fill:#162447,stroke:#533483,color:#e0e0e0
+    style rw0 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style rw1 fill:#2e7d32,stroke:#66bb6a,color:#fff
+    style rw2 fill:#2e7d32,stroke:#66bb6a,color:#fff
+    style rw3 fill:#2e7d32,stroke:#66bb6a,color:#fff
+    style vs fill:#533483,stroke:#e94560,color:#fff
+    style mx fill:#1b5e20,stroke:#4caf50,color:#fff
+```
+
+Green = MX checkpoint engine components. Purple = existing verl/Ray components. The `CheckpointEngineManager` coordinates the MX CE workers on both trainer and rollout sides. Each trainer-rollout rank pair transfers via NIXL RDMA. Received weights reach vLLM via CUDA IPC through the existing `ServerAdapter`.
 
 ### Why It's Easier Than PRIME-RL
 
