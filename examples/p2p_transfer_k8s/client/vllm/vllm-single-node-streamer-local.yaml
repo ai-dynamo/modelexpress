@@ -7,7 +7,7 @@
 # MX_MODEL_URI accepts:
 #   - HF model ID: "deepseek-ai/DeepSeek-V3" (resolved via HF_HUB_CACHE)
 #   - Absolute path: "/models/my-model"
-#   - Remote URI: "s3://bucket/model" (see vllm-single-node-s3.yaml)
+#   - Remote URI: "s3://bucket/model" (see vllm-single-node-streamer-s3.yaml)
 #
 # Prerequisites:
 #   - PVC with model weights pre-downloaded (HF Hub cache layout)

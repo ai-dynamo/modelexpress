@@ -208,6 +208,63 @@ class TestModelStreamerLoad:
 # ---------------------------------------------------------------------------
 
 
+class TestResolveModelUri:
+    def _resolve(self, uri, **env_overrides):
+        from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
+        with patch.dict("os.environ", env_overrides, clear=True):
+            return _resolve_model_uri(uri)
+
+    def test_s3_passthrough(self):
+        assert self._resolve("s3://bucket/model") == "s3://bucket/model"
+
+    def test_gs_passthrough(self):
+        assert self._resolve("gs://bucket/model") == "gs://bucket/model"
+
+    def test_az_passthrough(self):
+        assert self._resolve("az://container/model") == "az://container/model"
+
+    def test_absolute_path_passthrough(self):
+        assert self._resolve("/models/deepseek-ai/DeepSeek-V3") == "/models/deepseek-ai/DeepSeek-V3"
+
+    def _mock_hf_cache(self, repos):
+        mock_cache = MagicMock()
+        mock_cache.repos = repos
+        mock_scan = MagicMock(return_value=mock_cache)
+        mock_hf_hub = MagicMock()
+        mock_hf_hub.scan_cache_dir = mock_scan
+        return mock_hf_hub, mock_scan
+
+    def test_hf_model_id_resolved_via_cache(self):
+        mock_rev = MagicMock()
+        mock_rev.snapshot_path = "/cache/models--org--name/snapshots/abc123"
+        mock_rev.last_modified = 1000
+        mock_repo = MagicMock()
+        mock_repo.repo_id = "org/name"
+        mock_repo.revisions = [mock_rev]
+
+        mock_hf_hub, mock_scan = self._mock_hf_cache([mock_repo])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            result = self._resolve("org/name", HF_HUB_CACHE="/cache")
+
+        assert result == "/cache/models--org--name/snapshots/abc123"
+        mock_scan.assert_called_once_with("/cache")
+
+    def test_hf_home_fallback_appends_hub(self):
+        mock_hf_hub, mock_scan = self._mock_hf_cache([])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            self._resolve("org/name", HF_HOME="/home/user/.cache/huggingface")
+
+        mock_scan.assert_called_once_with("/home/user/.cache/huggingface/hub")
+
+    def test_unresolved_hf_id_returned_as_is(self):
+        mock_hf_hub, _ = self._mock_hf_cache([])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            assert self._resolve("org/unknown-model", HF_HUB_CACHE="/cache") == "org/unknown-model"
+
+    def test_no_cache_env_returns_as_is(self):
+        assert self._resolve("org/name") == "org/name"
+
+
 class TestStreamWeights:
     def _make_strategy(self):
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy

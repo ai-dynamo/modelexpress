@@ -42,7 +42,11 @@ def _resolve_model_uri(uri: str) -> str:
 
     try:
         from huggingface_hub import scan_cache_dir
-        cache_dir = os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME")
+        cache_dir = os.environ.get("HF_HUB_CACHE")
+        if not cache_dir:
+            hf_home = os.environ.get("HF_HOME")
+            if hf_home:
+                cache_dir = os.path.join(hf_home, "hub")
         if cache_dir:
             cache_info = scan_cache_dir(cache_dir)
             for repo in cache_info.repos:
