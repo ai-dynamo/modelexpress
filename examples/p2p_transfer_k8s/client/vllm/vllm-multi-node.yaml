@@ -74,7 +74,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-client:0.3.0
           imagePullPolicy: IfNotPresent
           # IPC_LOCK required for RDMA memory pinning (NIXL/UCX GPUDirect)
           securityContext:
