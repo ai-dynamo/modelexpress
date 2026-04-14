@@ -47,7 +47,7 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: nvcr.io/nvidia/ai-dynamo/modelexpress-client:0.3.0
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:0.3.0
           imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
