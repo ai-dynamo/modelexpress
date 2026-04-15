@@ -17,7 +17,7 @@ import torch.nn as nn
 
 from ..client import MxClient
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import collect_module_tensors, log_tensor_summary
+from ..tensor_utils import adopt_hidden_tensors, collect_module_tensors, log_tensor_summary
 from ..metadata import build_source_identity, publish_metadata_and_ready
 from .. import p2p_pb2
 
@@ -154,6 +154,9 @@ def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
         return
 
     try:
+        # Order matters: adopt first so hidden tensors appear in named_buffers()
+        # before collect_module_tensors iterates them.
+        adopt_hidden_tensors(model)
         ctx.tensors = collect_module_tensors(model)
         log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 

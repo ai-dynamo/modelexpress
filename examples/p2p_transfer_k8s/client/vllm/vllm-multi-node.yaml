@@ -3,7 +3,7 @@
 
 # Multi-node vLLM StatefulSet with ModelExpress P2P weight transfer.
 #
-# Deploys Llama-3.1-405B-Instruct as a single StatefulSet across 2 nodes (8 GPUs total):
+# Deploys nvidia/Kimi-K2.5-NVFP4 as a single StatefulSet across 2 nodes (8 GPUs total):
 #   - tensor-parallel-size=4 (within each node)
 #   - pipeline-parallel-size=2 (across nodes)
 #
@@ -55,6 +55,7 @@ metadata:
     app: mx-vllm
 spec:
   serviceName: mx-vllm
+  podManagementPolicy: Parallel
   replicas: 2
   selector:
     matchLabels:
@@ -89,16 +90,18 @@ spec:
           env:
             - name: VLLM_RPC_TIMEOUT
               value: "7200000"
-            - name: HF_HUB_CACHE
+            - name: HF_HOME
               value: "/models"
             - name: MODEL_NAME
-              value: "meta-llama/Llama-3.1-405B-Instruct"
+              value: "nvidia/Kimi-K2.5-NVFP4"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
             - name: MX_CONTIGUOUS_REG
               value: "0"
+            - name: MX_SKIP_FEATURE_CHECK
+              value: "1"
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
@@ -136,11 +139,11 @@ spec:
               if [ "$ORDINAL" = "0" ]; then
                 ray start --head --port=6379 --num-gpus=4
                 until ray status --address=127.0.0.1:6379 >/dev/null 2>&1; do sleep 1; done
-                RAY_ADDRESS=127.0.0.1:6379 python3 -m vllm.entrypoints.openai.api_server \
-                  --model $MODEL_NAME \
+                RAY_ADDRESS=127.0.0.1:6379 vllm serve $MODEL_NAME \
                   --load-format mx \
                   --tensor-parallel-size 4 \
                   --pipeline-parallel-size 2 \
+                  --max-model-len 32768 \
                   --trust-remote-code \
                   --distributed-executor-backend ray
               else
@@ -153,7 +156,7 @@ spec:
             requests:
               nvidia.com/gpu: "4"
               rdma/ib: "4"
-              memory: "200Gi"
+              memory: "300Gi"
               cpu: "16"
           volumeMounts:
             - name: shm
@@ -164,7 +167,7 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 64Gi
+            sizeLimit: 179Gi
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
