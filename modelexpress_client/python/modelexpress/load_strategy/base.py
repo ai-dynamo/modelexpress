@@ -212,10 +212,20 @@ def unpublish_metadata(ctx: LoadContext) -> None:
 
     hb = _heartbeat_threads.pop(ctx.global_rank, None)
     if hb is not None:
-        hb.stop()  # also marks STALE on MX server
-        logger.info(f"[Worker {ctx.global_rank}] Heartbeat stopped")
+        try:
+            hb.stop()  # also marks STALE on MX server
+            logger.info(f"[Worker {ctx.global_rank}] Heartbeat stopped")
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Failed to stop heartbeat cleanly: {e}"
+            )
 
     ws = _worker_servers.pop(ctx.device_id, None)
     if ws is not None:
-        ws.stop()
-        logger.info(f"[Worker {ctx.global_rank}] Worker gRPC server stopped")
+        try:
+            ws.stop()
+            logger.info(f"[Worker {ctx.global_rank}] Worker gRPC server stopped")
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Failed to stop worker gRPC server cleanly: {e}"
+            )
