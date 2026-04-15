@@ -19,9 +19,31 @@ Quick Start (vLLM):
 """
 
 import logging
+import os
 
 _logger = logging.getLogger(__name__)
 _loaders_registered = False
+
+
+def configure_vllm_logging():
+    """Ensure modelexpress loggers are visible in vLLM worker subprocesses.
+
+    vLLM only attaches log handlers to the "vllm" namespace. Without this,
+    all "modelexpress.*" output is silently dropped in EngineCore worker
+    processes. Copies vLLM's handlers onto the "modelexpress" parent logger
+    so every child inherits them via propagation. Idempotent.
+    """
+    mx_root = logging.getLogger("modelexpress")
+    if mx_root.handlers:
+        return
+    vllm_logger = logging.getLogger("vllm")
+    for handler in vllm_logger.handlers:
+        mx_root.addHandler(handler)
+    mx_level = os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper()
+    if mx_level and hasattr(logging, mx_level):
+        mx_root.setLevel(getattr(logging, mx_level))
+    elif vllm_logger.level != logging.NOTSET:
+        mx_root.setLevel(vllm_logger.level)
 
 
 def register_modelexpress_loaders():
@@ -55,5 +77,6 @@ __all__ = [
     "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
+    "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]

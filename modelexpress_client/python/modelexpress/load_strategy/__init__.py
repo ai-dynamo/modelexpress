@@ -18,8 +18,10 @@ from .base import (
     LoadContext,
     LoadStrategy,
     SourceTransferError,
+    build_load_context,
     register_tensors,
     publish_metadata,
+    unpublish_metadata,
 )
 
 __all__ = [
@@ -27,8 +29,10 @@ __all__ = [
     "LoadStrategy",
     "LoadStrategyChain",
     "SourceTransferError",
+    "build_load_context",
     "register_tensors",
     "publish_metadata",
+    "unpublish_metadata",
 ]
 
 logger = logging.getLogger("modelexpress.load_strategy")

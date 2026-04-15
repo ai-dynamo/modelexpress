@@ -815,7 +815,7 @@ class TestCollectModuleTensorsStorageViews:
 
 
 # ---------------------------------------------------------------------------
-# _configure_vllm_logging
+# configure_vllm_logging
 # ---------------------------------------------------------------------------
 
 
@@ -854,11 +854,11 @@ class TestConfigureVllmLogging:
         vllm_logger.propagate = self._saved_vllm_propagate
 
     def test_child_loggers_visible_after_configure(self):
-        from modelexpress.vllm_loader import _configure_vllm_logging
+        from modelexpress import configure_vllm_logging
 
         vllm_logger, handler = self._simulate_vllm_enginecore_logging()
         try:
-            _configure_vllm_logging()
+            configure_vllm_logging()
 
             mx_root = logging.getLogger("modelexpress")
             assert len(mx_root.handlers) == 1
@@ -870,12 +870,12 @@ class TestConfigureVllmLogging:
             self._cleanup(vllm_logger)
 
     def test_no_duplicate_handlers_on_repeated_calls(self):
-        from modelexpress.vllm_loader import _configure_vllm_logging
+        from modelexpress import configure_vllm_logging
 
         vllm_logger, _handler = self._simulate_vllm_enginecore_logging()
         try:
-            _configure_vllm_logging()
-            _configure_vllm_logging()
+            configure_vllm_logging()
+            configure_vllm_logging()
 
             mx_root = logging.getLogger("modelexpress")
             assert len(mx_root.handlers) == 1
@@ -883,7 +883,7 @@ class TestConfigureVllmLogging:
             self._cleanup(vllm_logger)
 
     def test_log_output_actually_captured(self):
-        from modelexpress.vllm_loader import _configure_vllm_logging
+        from modelexpress import configure_vllm_logging
 
         vllm_logger, _ = self._simulate_vllm_enginecore_logging()
         try:
@@ -892,7 +892,7 @@ class TestConfigureVllmLogging:
             vllm_logger.addHandler(buf)
 
             self._reset_mx_logger()
-            _configure_vllm_logging()
+            configure_vllm_logging()
 
             child = logging.getLogger("modelexpress.heartbeat")
             child.info("Heartbeat started")
@@ -905,26 +905,26 @@ class TestConfigureVllmLogging:
             self._cleanup(vllm_logger)
 
     def test_model_express_log_level_overrides_vllm(self):
-        from modelexpress.vllm_loader import _configure_vllm_logging
+        from modelexpress import configure_vllm_logging
 
         vllm_logger, _handler = self._simulate_vllm_enginecore_logging()
         try:
             assert vllm_logger.level == logging.DEBUG
             with patch.dict("os.environ", {"MODEL_EXPRESS_LOG_LEVEL": "WARNING"}):
-                _configure_vllm_logging()
+                configure_vllm_logging()
             mx_root = logging.getLogger("modelexpress")
             assert mx_root.level == logging.WARNING
         finally:
             self._cleanup(vllm_logger)
 
     def test_falls_back_to_vllm_level_when_env_unset(self):
-        from modelexpress.vllm_loader import _configure_vllm_logging
+        from modelexpress import configure_vllm_logging
 
         vllm_logger, _handler = self._simulate_vllm_enginecore_logging()
         try:
             with patch.dict("os.environ", {}, clear=False):
                 os.environ.pop("MODEL_EXPRESS_LOG_LEVEL", None)
-                _configure_vllm_logging()
+                configure_vllm_logging()
             mx_root = logging.getLogger("modelexpress")
             assert mx_root.level == logging.DEBUG
         finally:
