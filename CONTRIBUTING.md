@@ -68,6 +68,8 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `./run_integration_tests.sh` | Integration tests (starts server) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
+| `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
+| `(cd modelexpress_client/go && go test ./...)` | Run Go binding compilation tests |
 | `pre-commit run` | Run hooks on staged files |
 | `pre-commit run --all-files` | Run hooks on all files |
 
