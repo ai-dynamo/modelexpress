@@ -78,7 +78,7 @@ def _find_hidden_cuda_tensors(
 
     results: list[tuple[str, torch.Tensor]] = []
 
-    if isinstance(obj, torch.Tensor) and obj.is_cuda:
+    if isinstance(obj, torch.Tensor) and obj.is_cuda and obj.numel() > 0:
         results.append(("t", obj))
     elif isinstance(obj, (list, tuple)):
         for i, item in enumerate(obj):
