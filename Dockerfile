@@ -18,6 +18,13 @@ RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin test_client && \
     cargo build --release --bin fallback_test
 
+# Generate third-party license attributions
+FROM builder AS attributions
+
+RUN cargo install cargo-about --locked
+RUN cargo about generate --format json -o /tmp/licenses.json && \
+    python3 scripts/generate_attributions.py /tmp/licenses.json
+
 # Create a minimal runtime image
 FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS runtime
 
@@ -34,8 +41,8 @@ COPY --from=builder /app/target/release/modelexpress-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/fallback_test .
 
-# Copy the Attribution files
-COPY ATTRIBUTIONS_Rust.md .
+# Copy the generated attribution file
+COPY --from=attributions /app/ATTRIBUTIONS_Rust.md .
 
 # Expose the default port
 EXPOSE 8001
