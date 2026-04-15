@@ -107,6 +107,21 @@ extraVolumeMounts: []
 # Additional volumes
 extraVolumes: []
 # Additional environment variables
+# To enable HuggingFace model downloads (private/gated models), create a secret and uncomment:
+#   kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<your-token>
+# To enable NGC model downloads, create a secret and uncomment:
+#   kubectl create secret generic ngc-api-key-secret --from-literal=NGC_API_KEY=<your-key>
+# extraEnv:
+#   - name: HF_TOKEN
+#     valueFrom:
+#       secretKeyRef:
+#         name: hf-token-secret
+#         key: HF_TOKEN
+#   - name: NGC_API_KEY
+#     valueFrom:
+#       secretKeyRef:
+#         name: ngc-api-key-secret
+#         key: NGC_API_KEY
 extraEnv: []
 # Additional container arguments
 args: []

@@ -78,6 +78,20 @@ extraEnv:
     valueFrom:
       fieldRef:
         fieldPath: metadata.namespace
+  # Uncomment to enable HuggingFace downloads (private/gated models):
+  #   kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<your-token>
+  # - name: HF_TOKEN
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: hf-token-secret
+  #       key: HF_TOKEN
+  # Uncomment to enable NGC model downloads:
+  #   kubectl create secret generic ngc-api-key-secret --from-literal=NGC_API_KEY=<your-key>
+  # - name: NGC_API_KEY
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: ngc-api-key-secret
+  #       key: NGC_API_KEY
 
 livenessProbe:
   enabled: true
