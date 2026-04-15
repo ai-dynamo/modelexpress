@@ -669,8 +669,9 @@ class MxModelLoader(BaseModelLoader):
                 )
 
             loaded_as_target = False
+            rdma_attempted = False
             if transfer_allowed:
-                loaded_as_target = self._try_load_from_candidates(
+                loaded_as_target, rdma_attempted = self._try_load_from_candidates(
                     model, model_config, target_device, global_rank, device_id, identity
                 )
             else:
@@ -679,7 +680,7 @@ class MxModelLoader(BaseModelLoader):
                 )
 
             if not loaded_as_target:
-                if transfer_allowed:
+                if rdma_attempted:
                     # A failed RDMA target attempt runs
                     # process_weights_after_loading() to establish the tensor
                     # layout for receive buffers.  That mutates the model
@@ -758,16 +759,16 @@ class MxModelLoader(BaseModelLoader):
         global_rank: int,
         device_id: int,
         identity: p2p_pb2.SourceIdentity,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         """Try RDMA load from each candidate source instance in order.
 
-        Returns True if a load succeeded. Only marks an instance STALE when a
-        SourceTransferError is raised, which indicates a proven source-side failure
-        (RDMA receive, missing remote tensors). Target-local errors (OOM, weight
-        processing) propagate normally without poisoning a healthy source.
-        Falls back to disk and returns False if all candidates are exhausted.
+        Returns (loaded, attempted) where loaded is True if a load succeeded
+        and attempted is True if _load_as_target() was called on at least one
+        candidate (meaning the model may have been mutated by post-processing).
+        Falls back to disk and returns (False, ...) if all candidates are exhausted.
         """
         candidates = self._find_source_instances(identity, global_rank)
+        rdma_attempted = False
         for instance in candidates[:MAX_SOURCE_RETRIES]:
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
@@ -790,11 +791,12 @@ class MxModelLoader(BaseModelLoader):
             )
 
             try:
+                rdma_attempted = True
                 self._load_as_target(
                     model, model_config, target_device,
                     global_rank, device_id, identity, source_worker, mx_source_id, worker_id,
                 )
-                return True
+                return True, True
             except SourceTransferError as e:
                 logger.warning(
                     f"[Worker {global_rank}] Source transfer failed for worker {worker_id}: {e}. "
@@ -813,7 +815,7 @@ class MxModelLoader(BaseModelLoader):
             )
         else:
             logger.info(f"[Worker {global_rank}] No source worker found - loading from disk")
-        return False
+        return False, rdma_attempted
 
     def _find_source_instances(
         self, identity: p2p_pb2.SourceIdentity, global_rank: int
