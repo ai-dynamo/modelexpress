@@ -95,8 +95,9 @@ class TestFindHiddenCudaTensors:
     def test_skips_non_tensor_attrs(self):
         config = QuantConfig(device="cpu")
         results = _find_hidden_cuda_tensors(config, visited=set())
-        # some_int and some_string should not produce results
-        assert all(isinstance(t, torch.Tensor) for _, t in results)
+        # CPU tensors are not CUDA; some_int and some_string are not tensors.
+        # Nothing should be found.
+        assert len(results) == 0
 
     def test_handles_circular_references(self):
         class Circular:

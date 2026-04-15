@@ -100,6 +100,9 @@ spec:
               value: "modelexpress-server:8001"
             - name: MX_CONTIGUOUS_REG
               value: "0"
+            # Kimi-K2.5-NVFP4 uses MLA which is blocked by default.
+            # P2P inference verified correct with adopt_hidden_tensors fix.
+            # Do not enable globally without verifying model correctness.
             - name: MX_SKIP_FEATURE_CHECK
               value: "1"
             - name: NIXL_LOG_LEVEL
