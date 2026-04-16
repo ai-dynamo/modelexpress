@@ -77,7 +77,7 @@ spec:
           effect: NoExecute
       containers:
         - name: server
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
           ports:
             - containerPort: 8001
           env:
