@@ -13,7 +13,7 @@ Or via stdin:
 
 Outputs:
     ATTRIBUTIONS_Rust.md  - Full license texts for container inclusion
-    ATTRIBUTIONS_Rust.csv - Summary with type, name, version, SPDX license
+    rust_deps.csv         - Summary with type, name, version, SPDX license
 
 Requires cargo-about (https://github.com/EmbarkStudios/cargo-about).
 Configure accepted licenses in about.toml before running.
@@ -140,7 +140,7 @@ def main():
         f.write("\n".join(output).rstrip())
         f.write("\n")
 
-    with open("ATTRIBUTIONS_Rust.csv", "w", newline="") as f:
+    with open("rust_deps.csv", "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["type", "name", "version", "license"])
         for crate in sorted_crates:

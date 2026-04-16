@@ -25,6 +25,11 @@ RUN cargo install cargo-about --locked
 RUN cargo about generate --format json -o /tmp/licenses.json && \
     python3 scripts/generate_attributions.py /tmp/licenses.json
 
+# Snapshot base image packages before installing runtime dependencies
+FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS base-snapshot
+
+RUN dpkg-query -W -f '${Package}\n' | sort > /tmp/base_packages.txt
+
 # Create a minimal runtime image
 FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS runtime
 
@@ -56,3 +61,11 @@ ENV HF_HUB_CACHE=/app/cache
 
 # Run the server by default
 CMD ["./modelexpress-server"]
+
+# Extract dpkg dependency information from the runtime image
+FROM runtime AS dpkg-deps
+
+COPY --from=attributions /app/rust_deps.csv .
+COPY scripts/calculate_dpkg_deps.py /tmp/
+COPY --from=base-snapshot /tmp/base_packages.txt /tmp/base_packages.txt
+RUN python3 /tmp/calculate_dpkg_deps.py --baseline /tmp/base_packages.txt /app/dpkg_deps.csv

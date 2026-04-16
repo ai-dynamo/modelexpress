@@ -77,4 +77,5 @@ docs/CONTEXT.md
 
 # Generated attribution files (built in container)
 ATTRIBUTIONS_Rust.md
-ATTRIBUTIONS_Rust.csv
+rust_deps.csv
+dpkg_deps.csv
