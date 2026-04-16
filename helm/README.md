@@ -294,7 +294,7 @@ The Helm chart uses the official NVIDIA ModelExpress image from the NVIDIA Conta
 docker login nvcr.io -u '$oauthtoken' -p 'YOUR_NVCR_API_KEY'
 
 # Pull the image
-docker pull nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.2.0
+docker pull nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
 ```
 
 **Note:** The default image requires authentication. See the [Installation](#installation) section for creating the required Kubernetes secret.

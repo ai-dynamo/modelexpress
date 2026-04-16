@@ -47,7 +47,9 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          # Build a vLLM + ModelExpress client image using
+          # examples/p2p_transfer_k8s/Dockerfile.client
+          image: <your-registry>/modelexpress-client:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
