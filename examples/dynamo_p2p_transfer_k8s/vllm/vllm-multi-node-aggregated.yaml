@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-node vLLM DynamoGraphDeployment with ModelExpress P2P weight transfer.
+#
+# Deploys nvidia/Kimi-K2.5-NVFP4 with TP=4, PP=2 (8 GPUs across 2 nodes per replica).
+# Includes ModelExpress server (kubernetes CRD backend) and dynamo Frontend.
+#
+# Start with replicas=1 (source loads from disk), then scale to 2 for P2P:
+#   kubectl apply -f rbac-modelmetadata.yaml -n <namespace>
+#   kubectl apply -f vllm-multi-node-aggregated.yaml -n <namespace>
+#   # Wait for source to publish metadata + DGD READY
+#   # Edit replicas to 2 and re-apply, or:
+#   kubectl patch dgd mx-vllm -n <ns> --type merge \
+#     -p '{"spec":{"services":{"VllmWorker":{"replicas":2}}}}'
+#
+# Prerequisites:
+#   - Dynamo operator installed (DynamoGraphDeployment CRD)
+#   - ModelMetadata CRD installed (cluster-admin, one-time):
+#     kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
+#   - RBAC applied: kubectl apply -f rbac-modelmetadata.yaml -n <namespace>
+#   - PVC with model weights pre-downloaded
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: mx-vllm
+spec:
+  backendFramework: vllm
+  pvcs:
+    - create: false
+      name: shared-model-cache
+  services:
+    # ModelExpress P2P metadata server (kubernetes CRD backend).
+    # Manages source discovery, heartbeats, and stale metadata reaping.
+    ModelExpress:
+      componentType: frontend
+      replicas: 1
+      livenessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      readinessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      extraPodSpec:
+        serviceAccountName: modelexpress
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - exec /app/modelexpress-server --port 8000
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+
+    # Dynamo Frontend: HTTP API server, round-robins to VllmWorker replicas.
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          # Build using Dockerfile.client or dynamo repo (see README)
+          image: <your-registry>/modelexpress-vllm-runtime:latest
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --http-port
+            - "8000"
+
+    # vLLM workers with ModelExpress P2P weight transfer.
+    # Each replica spans 2 nodes (PP=2). First replica loads from disk,
+    # subsequent replicas receive weights via RDMA from existing sources.
+    VllmWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      multinode:
+        nodeCount: 2
+      sharedMemory:
+        size: 179Gi
+      resources:
+        limits:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+      envs:
+        - name: VLLM_RPC_TIMEOUT
+          value: "7200000"
+        - name: HF_HOME
+          value: "/models"
+        - name: MODEL_NAME
+          value: "nvidia/Kimi-K2.5-NVFP4"
+        - name: VLLM_PLUGINS
+          value: "modelexpress"
+        - name: MX_SERVER_ADDRESS
+          value: "mx-vllm-modelexpress:8000"
+        - name: MX_CONTIGUOUS_REG
+          value: "0"
+        # Kimi-K2.5-NVFP4 uses MLA which is blocked by default.
+        # P2P inference verified correct with adopt_hidden_tensors fix.
+        - name: MX_SKIP_FEATURE_CHECK
+          value: "1"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: UCX_LOG_LEVEL
+          value: "INFO"
+        - name: UCX_TLS
+          value: "rc_x,rc,dc_x,dc,cuda_copy"
+        # Uncomment and set to your cluster's IB HCA devices if needed:
+        # - name: UCX_NET_DEVICES
+        #   value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      extraPodSpec:
+        mainContainer:
+          # Build using Dockerfile.client or dynamo repo (see README)
+          image: <your-registry>/modelexpress-vllm-runtime:latest
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - nvidia/Kimi-K2.5-NVFP4
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "4"
+            - --pipeline-parallel-size
+            - "2"
+            - --max-model-len
+            - "32768"
+            - --trust-remote-code
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models

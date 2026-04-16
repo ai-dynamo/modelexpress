@@ -189,9 +189,16 @@ ModelExpress/
 │   │       └── vllm/
 │   │           ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
 │   │           └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
-│   └── aggregated_k8s/                 # Dynamo integration example
+│   ├── aggregated_k8s/                 # Dynamo aggregated serving example
+│   │   ├── README.md
+│   │   └── agg.yaml
+│   └── dynamo_p2p_transfer_k8s/        # Dynamo DGD with P2P weight transfer
+│       ├── Dockerfile                   # dynamo vllm-runtime + MX client
 │       ├── README.md
-│       └── agg.yaml
+│       └── vllm/
+│           ├── crd-modelmetadata.yaml   # ModelMetadata CRD (cluster-admin)
+│           ├── rbac-modelmetadata.yaml  # ServiceAccount + Role + RoleBinding
+│           └── vllm-multi-node-aggregated.yaml  # DGD: MX server + Frontend + VllmWorker
 │
 ├── docs/
 │   ├── ARCHITECTURE.md                 # Architecture reference
