@@ -178,6 +178,30 @@ class TestAdoptHiddenTensors:
         count = adopt_hidden_tensors(module)
         assert count == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_buffer_name_collisions_disambiguated(self):
+        module = nn.Module()
+
+        class A:
+            def __init__(self):
+                self.scale = torch.randn(4, device="cuda")
+
+        a = A()
+        b_dict = {"scale": torch.randn(4, device="cuda")}
+        # Both attributes normalize to `_mx_<attr>_scale`; with "__dot__" the
+        # attr prefix differs, but we also want collision handling if two
+        # hidden tensors under one attr share a sanitized suffix.
+        module.a = a
+        module.b = b_dict
+        # Second hidden tensor on `a` whose path collides after sanitization:
+        # "scale.x" and "scale[x]" both normalize similarly.
+        a.__dict__["inner"] = {"k": torch.randn(4, device="cuda")}
+
+        count = adopt_hidden_tensors(module)
+        assert count == 3
+        buffer_ptrs = {buf.data_ptr() for _, buf in module.named_buffers()}
+        assert len(buffer_ptrs) == 3  # no overwrite, all tensors survived
+
 
 # ---------------------------------------------------------------------------
 # capture_tensor_attrs
@@ -243,6 +267,16 @@ class TestSafeChecksum:
         result = safe_checksum(t)
         assert len(result) == 8
         int(result, 16)  # should be valid hex
+
+    def test_permutation_sensitive(self):
+        t1 = torch.tensor([1, 255], dtype=torch.uint8)
+        t2 = torch.tensor([255, 1], dtype=torch.uint8)
+        assert safe_checksum(t1) != safe_checksum(t2)
+
+    def test_compensating_byte_delta_detected(self):
+        t1 = torch.tensor([10, 20, 30], dtype=torch.uint8)
+        t2 = torch.tensor([11, 19, 30], dtype=torch.uint8)
+        assert safe_checksum(t1) != safe_checksum(t2)
 
 
 # ---------------------------------------------------------------------------

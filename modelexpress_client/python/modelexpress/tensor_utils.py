@@ -15,13 +15,21 @@ logger = logging.getLogger("modelexpress.tensor_utils")
 
 
 def safe_checksum(tensor: torch.Tensor) -> str:
-    """Compute a fast fingerprint of tensor contents, staying on GPU when possible."""
+    """Compute a fast fingerprint of tensor contents, staying on GPU when possible.
+
+    Uses position-weighted mixing with Knuth's multiplicative constant so that
+    permutations of the same bytes and compensating ±1 byte pairs produce
+    different fingerprints — a plain byte sum collides on both.
+    """
     try:
         t = tensor.detach().contiguous()
         if t.dim() == 0:
             t = t.unsqueeze(0)
         flat = t.view(torch.uint8)
-        return format(flat.sum().item() & 0xFFFFFFFF, "08x")
+        idx = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
+        weights = (idx * 2654435761 + 1) & 0xFFFFFFFF
+        mixed = (flat.to(torch.int64) * weights) & 0xFFFFFFFF
+        return format(mixed.sum().item() & 0xFFFFFFFF, "08x")
     except Exception as e:
         return f"err:{e}"
 
@@ -71,7 +79,13 @@ def capture_tensor_attrs():
 def _find_hidden_cuda_tensors(
     obj: object, visited: set[int], depth: int = 0,
 ) -> list[tuple[str, torch.Tensor]]:
-    """Recursively find CUDA tensors in a non-Module Python object graph."""
+    """Recursively find CUDA tensors in a non-Module Python object graph.
+
+    Known limitation: objects using ``__slots__`` are skipped because they
+    lack ``__dict__``. No current vLLM quant class uses slots, but any
+    upstream adoption would silently cause hidden tensors to be missed —
+    which is exactly the bug class this function exists to fix.
+    """
     if depth > 20 or id(obj) in visited:
         return []
     visited.add(id(obj))
@@ -134,9 +148,16 @@ def adopt_hidden_tensors(model: nn.Module) -> int:
                 if tensor.data_ptr() in existing_ptrs:
                     continue
                 safe_path = (
-                    tensor_path.replace(".", "_").replace("[", "").replace("]", "")
+                    tensor_path.replace(".", "__dot__")
+                    .replace("[", "")
+                    .replace("]", "")
                 )
                 buf_name = f"_mx_{attr_name}_{safe_path}"
+                if hasattr(module, buf_name):
+                    suffix = 0
+                    while hasattr(module, f"{buf_name}_{suffix}"):
+                        suffix += 1
+                    buf_name = f"{buf_name}_{suffix}"
                 module.register_buffer(buf_name, tensor, persistent=False)
                 existing_ptrs.add(tensor.data_ptr())
                 adopted += 1
