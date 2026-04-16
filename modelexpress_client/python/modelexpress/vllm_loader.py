@@ -694,6 +694,17 @@ class MxModelLoader(BaseModelLoader):
                     _nixl_managers.pop(device_id, None)
                     del model
                     torch.cuda.empty_cache()
+                    # vLLM registers each attention / MLA / Mamba / FusedMoE
+                    # layer into dicts on vllm_config.compilation_config during
+                    # the first initialize_model() call.  The dicts live on the
+                    # config object, not the model, so they survive del model
+                    # and trip the duplicate-layer-name guard (and silently
+                    # accumulate MoE entries) on the second initialize_model().
+                    # Clear them so the re-init starts from a clean slate.
+                    # Audited against vLLM 0.17.1; other versions may add
+                    # init=False fields that need similar treatment.
+                    vllm_config.compilation_config.static_forward_context.clear()
+                    vllm_config.compilation_config.static_all_moe_layers.clear()
                     logger.info(
                         f"[Worker {global_rank}] Re-initializing model after "
                         f"failed RDMA attempt"
