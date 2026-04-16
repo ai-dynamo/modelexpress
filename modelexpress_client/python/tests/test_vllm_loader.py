@@ -327,7 +327,7 @@ class TestTryLoadFromCandidates:
                 MagicMock(), MagicMock(), MagicMock(), 0, 0, _make_identity()
             )
 
-        assert result is True
+        assert result == (True, True)
         assert attempts == ["w-1"]
 
     def test_marks_stale_on_source_transfer_error_and_tries_next(self):
@@ -349,7 +349,7 @@ class TestTryLoadFromCandidates:
                 MagicMock(), MagicMock(), MagicMock(), 0, 0, _make_identity()
             )
 
-        assert result is True
+        assert result == (True, True)
         assert attempts == ["w-1", "w-2"]
         # Target no longer marks sources STALE — that's owned by heartbeat + reaper
         loader._mx_client.update_status.assert_not_called()
@@ -360,7 +360,7 @@ class TestTryLoadFromCandidates:
             result = loader._try_load_from_candidates(
                 MagicMock(), MagicMock(), MagicMock(), 0, 0, _make_identity()
             )
-        assert result is False
+        assert result == (False, False)
 
     def test_returns_false_when_all_fail(self):
         loader = _make_loader()
@@ -377,7 +377,7 @@ class TestTryLoadFromCandidates:
                 MagicMock(), MagicMock(), MagicMock(), 0, 0, _make_identity()
             )
 
-        assert result is False
+        assert result == (False, True)
         # Target no longer marks sources STALE — that's owned by heartbeat + reaper
         loader._mx_client.update_status.assert_not_called()
 
