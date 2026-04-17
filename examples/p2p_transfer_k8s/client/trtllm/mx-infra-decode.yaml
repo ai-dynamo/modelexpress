@@ -3,7 +3,7 @@
 
 # ModelExpress server + Redis for decode source (Phase 2 mixed TP)
 # Separate from prefill MX server so each source publishes to its own store
-# Deploys on <CPU_NODE_POOL> nodes (amd64)
+# Deploys on customer-cpu nodes (amd64)
 # Namespace: default
 ---
 apiVersion: apps/v1
@@ -24,7 +24,7 @@ spec:
     spec:
       # Update node pool names for your cluster
       nodeSelector:
-        cloud.google.com/gke-nodepool: <CPU_NODE_POOL>
+        cloud.google.com/gke-nodepool: customer-cpu
       tolerations:
         - key: dedicated
           operator: Equal
@@ -69,7 +69,7 @@ spec:
     spec:
       # Update node pool names for your cluster
       nodeSelector:
-        cloud.google.com/gke-nodepool: <CPU_NODE_POOL>
+        cloud.google.com/gke-nodepool: customer-cpu
       tolerations:
         - key: dedicated
           operator: Equal
@@ -85,6 +85,10 @@ spec:
               value: "redis"
             - name: REDIS_URL
               value: "redis://redis-decode:6379"
+            - name: MX_HEARTBEAT_TIMEOUT_SECS
+              value: "999999"
+            - name: MX_GC_TIMEOUT_SECS
+              value: "999999"
           resources:
             requests:
               cpu: "1"

@@ -2,18 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # TRT-LLM P2P image for GCP GB200 (ARM64)
-# Layers ModelExpress client + MX checkpoint loader + Dynamo P2P hooks
-# on karenc's Dynamo v1.0.0 image
+# Layers ModelExpress client + Chien-Chun's MX checkpoint loader + Dynamo hooks
 #
 # Base: nvcr.io/nvidian/dynamo-dev/karenc:dynamo-trtllm-v1.0.0-a9b6f95
-# - TRT-LLM 1.3.0rc5
-# - NIXL pre-installed
-# - ARM64 (aarch64)
-# - Dynamo worker (python3 -m dynamo.trtllm)
-#
 # Requires:
-#   - dynamo fork at ../dynamo (branch with --model-express-url support)
-#   - TRT-LLM fork at ../TensorRT-LLM (branch with checkpoints/mx/)
+#   - dynamo fork with --model-express-url support
+#   - TRT-LLM fork with MXCheckpointLoader (chienchun/dynamo-integration-prototype)
 #
 # Build (from modelexpress repo root):
 #   docker buildx build --platform linux/arm64 --no-cache \
@@ -57,37 +51,33 @@ RUN DYNAMO_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm && \
     grep -q "model_express_url" "$DYNAMO_PKG/backend_args.py" && \
     echo "Dynamo P2P hooks OK"
 
-# TODO: Remove once NVIDIA/TensorRT-LLM PR #12898 merges
-# Install MX checkpoint loader into TRT-LLM
-COPY --from=trtllm tensorrt_llm/_torch/models/checkpoints/mx /tmp/mx_loader
+# TODO: Remove once NVIDIA/TensorRT-LLM PR #13045 merges
+# Install MX checkpoint loader from TRT-LLM fork
+COPY --from=trtllm tensorrt_llm/_torch/models/checkpoints/mx /tmp/trtllm_mx/mx
 
 RUN TRTLLM_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm && \
-    cp -r /tmp/mx_loader "$TRTLLM_PKG/_torch/models/checkpoints/mx" && \
-    rm -rf /tmp/mx_loader && \
-    echo "from .mx.checkpoint_loader import MxCheckpointLoader" >> "$TRTLLM_PKG/_torch/models/checkpoints/__init__.py" && \
+    cp -r /tmp/trtllm_mx/mx "$TRTLLM_PKG/_torch/models/checkpoints/mx" && \
+    rm -rf /tmp/trtllm_mx && \
     test -f "$TRTLLM_PKG/_torch/models/checkpoints/mx/checkpoint_loader.py" && \
-    echo "MxCheckpointLoader installed OK"
+    echo "MXCheckpointLoader installed OK"
 
-# TODO: Remove once NVIDIA/TensorRT-LLM PR #12898 merges
-# Apply worker.py publish hook
-COPY --from=trtllm tensorrt_llm/executor/worker.py /tmp/worker.py
-
-RUN TRTLLM_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm && \
-    cp /tmp/worker.py "$TRTLLM_PKG/executor/worker.py" && \
-    rm /tmp/worker.py && \
-    grep -q "MODEL_EXPRESS_URL" "$TRTLLM_PKG/executor/worker.py" && \
-    echo "worker.py publish hook OK"
+# Apply minimal patches to base TRT-LLM for MX loader compatibility
+COPY trtllm_patches/v1.3.0rc5/patch_mx_loader.py /tmp/patch_mx_loader.py
+RUN python3 /tmp/patch_mx_loader.py && rm /tmp/patch_mx_loader.py
 
 # TODO: Remove once TRT-LLM fixes MPI allgather truncation natively
 COPY trtllm_patches/v1.3.0rc5/patch_tp_allgather.py /tmp/patch_tp_allgather.py
 RUN python3 /tmp/patch_tp_allgather.py && rm /tmp/patch_tp_allgather.py
 
-# Verify installation (can't import TRT-LLM at build time — no GPU)
-RUN python3 -c "from modelexpress.client import MxClient; print('ModelExpress client OK')" && \
-    python3 -c "from modelexpress.trtllm_live_transfer import publish_model_params; print('publish_model_params OK')" && \
-    test -f /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/_torch/models/checkpoints/mx/checkpoint_loader.py && \
-    echo "MxCheckpointLoader installed OK" && \
+# Verify installation
+RUN TRTLLM_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm && \
+    python3 -c "from modelexpress.client import MxClient; print('ModelExpress client OK')" && \
     grep -q "model_express_url" /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/engine.py && \
     echo "engine.py model_express_url OK" && \
-    grep -q "MODEL_EXPRESS_URL" /opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm/executor/worker.py && \
-    echo "worker.py publish hook OK"
+    grep -q "p2p_succeeded" "$TRTLLM_PKG/_torch/pyexecutor/model_loader.py" && \
+    echo "model_loader.py MX patch OK" && \
+    grep -q "MXCheckpointLoader" "$TRTLLM_PKG/_torch/models/checkpoints/__init__.py" && \
+    echo "checkpoints/__init__.py patched OK" && \
+    grep -q "MODEL_EXPRESS_URL" "$TRTLLM_PKG/executor/worker.py" && \
+    echo "worker.py patched OK" && \
+    echo "All patches verified OK"
