@@ -1,0 +1,246 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node vLLM DynamoGraphDeployment with disaggregated prefill/decode
+# AND ModelExpress P2P weight transfer.
+#
+# Each worker replica fits on ONE node with TP=8, PP=1. This avoids the known
+# vLLM bug where PP>1 + disaggregated NixlConnector trips a block_lens
+# IndexError in `_validate_remote_agent_handshake` (see
+# https://github.com/vllm-project/vllm/issues/22430).
+#
+# Shape follows dynamo's canonical disagg example
+# (https://github.com/ai-dynamo/dynamo/blob/main/examples/backends/vllm/deploy/disagg.yaml):
+#   - subComponentType: decode / prefill for service-level labeling
+#   - `--disaggregation-mode {decode,prefill}` on workers
+#   - engine_id omitted (dynamo's service discovery resolves peer ids)
+# This lets replicas>1 work without manual per-replica engine_id templating.
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: mx-vllm-disagg-sn
+spec:
+  backendFramework: vllm
+  pvcs:
+    - create: false
+      name: shared-model-cache
+  services:
+    # ModelExpress P2P metadata server (kubernetes CRD backend).
+    # Shared by both prefill and decode workers — a single pool of sources.
+    ModelExpress:
+      componentType: frontend
+      replicas: 1
+      livenessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      readinessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      extraPodSpec:
+        serviceAccountName: modelexpress
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - exec /app/modelexpress-server --port 8000
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+
+    # Dynamo Frontend: HTTP API server, routes to decode workers which
+    # internally coordinate with prefill workers via NIXL KV transfer.
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: <your-registry>/modelexpress-vllm-runtime:latest
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --http-port
+            - "8000"
+
+    # Decode workers: run token generation after receiving KV from prefill.
+    VllmDecodeWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      subComponentType: decode
+      replicas: 1
+      sharedMemory:
+        size: 179Gi
+      resources:
+        limits:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+      envs:
+        - name: VLLM_RPC_TIMEOUT
+          value: "7200000"
+        - name: HF_HOME
+          value: "/models"
+        - name: MODEL_NAME
+          value: "nvidia/Kimi-K2.5-NVFP4"
+        - name: VLLM_PLUGINS
+          value: "modelexpress"
+        - name: MX_SERVER_ADDRESS
+          value: "mx-vllm-disagg-sn-modelexpress:8000"
+        - name: MX_CONTIGUOUS_REG
+          value: "0"
+        - name: MX_SKIP_FEATURE_CHECK
+          value: "1"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: UCX_LOG_LEVEL
+          value: "INFO"
+        - name: UCX_TLS
+          value: "rc_x,rc,dc_x,dc,cuda_copy"
+        # Optional: pin UCX to specific compute-fabric HCAs if your cluster
+        # exposes multiple IB fabrics. Device list is cluster-specific.
+        # - name: UCX_NET_DEVICES
+        #   value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      extraPodSpec:
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+          - key: dra
+            operator: Exists
+            effect: NoSchedule
+        # Keep decode replicas on distinct nodes so each replica uses a full
+        # 8-GPU node's worth of RDMA bandwidth.
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-component: VllmDecodeWorker
+                topologyKey: kubernetes.io/hostname
+        mainContainer:
+          image: <your-registry>/modelexpress-vllm-runtime:latest
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - nvidia/Kimi-K2.5-NVFP4
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "4"
+            - --max-model-len
+            - "32768"
+            - --trust-remote-code
+            - --disaggregation-mode
+            - decode
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+
+    # Prefill workers: compute KV cache, ship it to decode via NIXL.
+    VllmPrefillWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      subComponentType: prefill
+      replicas: 1
+      sharedMemory:
+        size: 179Gi
+      resources:
+        limits:
+          gpu: "4"
+          custom:
+            rdma/ib: "4"
+      envs:
+        - name: VLLM_RPC_TIMEOUT
+          value: "7200000"
+        - name: HF_HOME
+          value: "/models"
+        - name: MODEL_NAME
+          value: "nvidia/Kimi-K2.5-NVFP4"
+        - name: VLLM_PLUGINS
+          value: "modelexpress"
+        - name: MX_SERVER_ADDRESS
+          value: "mx-vllm-disagg-sn-modelexpress:8000"
+        - name: MX_CONTIGUOUS_REG
+          value: "0"
+        - name: MX_SKIP_FEATURE_CHECK
+          value: "1"
+        - name: NIXL_LOG_LEVEL
+          value: "INFO"
+        - name: UCX_LOG_LEVEL
+          value: "INFO"
+        - name: UCX_TLS
+          value: "rc_x,rc,dc_x,dc,cuda_copy"
+        # Optional UCX_NET_DEVICES — see decode block.
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      extraPodSpec:
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+          - key: dra
+            operator: Exists
+            effect: NoSchedule
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-component: VllmPrefillWorker
+                topologyKey: kubernetes.io/hostname
+        mainContainer:
+          image: <your-registry>/modelexpress-vllm-runtime:latest
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - nvidia/Kimi-K2.5-NVFP4
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "4"
+            - --max-model-len
+            - "32768"
+            - --trust-remote-code
+            - --disaggregation-mode
+            - prefill
+            - --kv-transfer-config
+            - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
