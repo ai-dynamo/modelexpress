@@ -35,7 +35,8 @@ def _resolve_model_uri(uri: str) -> str:
 
     - s3://, gs://, az:// -> pass through (remote storage)
     - /absolute/path -> pass through (local filesystem)
-    - org/model-name -> resolve via HuggingFace Hub cache (HF_HUB_CACHE)
+    - org/model-name -> resolve via HuggingFace Hub cache
+      (HF_HUB_CACHE, HF_HOME/hub, or ~/.cache/huggingface/hub)
     """
     if any(uri.startswith(s) for s in _REMOTE_SCHEMES) or os.path.isabs(uri):
         return uri
@@ -47,13 +48,12 @@ def _resolve_model_uri(uri: str) -> str:
             hf_home = os.environ.get("HF_HOME")
             if hf_home:
                 cache_dir = os.path.join(hf_home, "hub")
-        if cache_dir:
-            cache_info = scan_cache_dir(cache_dir)
-            for repo in cache_info.repos:
-                if repo.repo_id == uri:
-                    rev = max(repo.revisions, key=lambda r: r.last_modified)
-                    logger.info(f"Resolved HF model '{uri}' -> {rev.snapshot_path}")
-                    return str(rev.snapshot_path)
+        cache_info = scan_cache_dir(cache_dir) if cache_dir else scan_cache_dir()
+        for repo in cache_info.repos:
+            if repo.repo_id == uri:
+                rev = max(repo.revisions, key=lambda r: r.last_modified)
+                logger.info(f"Resolved HF model '{uri}' -> {rev.snapshot_path}")
+                return str(rev.snapshot_path)
     except Exception as e:
         logger.warning(f"Failed to resolve HF cache for '{uri}': {e}")
 

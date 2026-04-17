@@ -261,8 +261,29 @@ class TestResolveModelUri:
         with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
             assert self._resolve("org/unknown-model", HF_HUB_CACHE="/cache") == "org/unknown-model"
 
-    def test_no_cache_env_returns_as_is(self):
-        assert self._resolve("org/name") == "org/name"
+    def test_no_cache_env_scans_default_cache(self):
+        """When no cache env is set, scan_cache_dir() is called with no args (uses ~/.cache/huggingface/hub)."""
+        mock_hf_hub, mock_scan = self._mock_hf_cache([])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            assert self._resolve("org/unknown") == "org/unknown"
+
+        mock_scan.assert_called_once_with()
+
+    def test_no_cache_env_resolves_via_default_cache(self):
+        """Model IDs can be resolved via the default HF cache even when no env vars are set."""
+        mock_rev = MagicMock()
+        mock_rev.snapshot_path = "/home/user/.cache/huggingface/hub/models--org--name/snapshots/abc123"
+        mock_rev.last_modified = 1000
+        mock_repo = MagicMock()
+        mock_repo.repo_id = "org/name"
+        mock_repo.revisions = [mock_rev]
+
+        mock_hf_hub, mock_scan = self._mock_hf_cache([mock_repo])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            result = self._resolve("org/name")
+
+        assert result == "/home/user/.cache/huggingface/hub/models--org--name/snapshots/abc123"
+        mock_scan.assert_called_once_with()
 
 
 class TestStreamWeights:
