@@ -74,7 +74,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - <GPU_NODE_POOL>
+                  - customer-gpu-o7v
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -88,7 +88,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v2.9.0"
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -105,7 +105,7 @@ spec:
             - --extra-engine-args
             - /config/source-decode.yaml
             - --model-express-url
-            - modelexpress-server-decode.default.svc.cluster.local:8001
+            - modelexpress-server-decode.kavin.svc.cluster.local:8001
             - --tensor-parallel-size
             - "8"
           env:
@@ -114,11 +114,11 @@ spec:
                 fieldRef:
                   fieldPath: metadata.uid
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.default.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.kavin.svc.cluster.local:8001"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: WORLD_SIZE
@@ -208,7 +208,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: my-compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
         volumes:
           - name: infiniband
             hostPath:
