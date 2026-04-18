@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from contextlib import contextmanager
 
@@ -16,12 +15,21 @@ logger = logging.getLogger("modelexpress.tensor_utils")
 
 
 def safe_checksum(tensor: torch.Tensor) -> str:
-    """Compute MD5 checksum of tensor, handling bfloat16 which numpy doesn't support."""
+    """Compute a fast fingerprint of tensor contents, staying on GPU when possible.
+
+    Uses position-weighted mixing with Knuth's multiplicative constant so that
+    permutations of the same bytes and compensating ±1 byte pairs produce
+    different fingerprints — a plain byte sum collides on both.
+    """
     try:
-        t = tensor.cpu()
-        if t.dtype == torch.bfloat16:
-            t = t.float()
-        return hashlib.md5(t.numpy().tobytes()).hexdigest()[:8]
+        t = tensor.detach().contiguous()
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        flat = t.view(torch.uint8)
+        idx = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
+        weights = (idx * 2654435761 + 1) & 0xFFFFFFFF
+        mixed = (flat.to(torch.int64) * weights) & 0xFFFFFFFF
+        return format(mixed.sum().item() & 0xFFFFFFFF, "08x")
     except Exception as e:
         return f"err:{e}"
 
@@ -54,6 +62,10 @@ def capture_tensor_attrs():
                 except AttributeError:
                     pass
             self.register_buffer(name, value, persistent=False)
+            logger.debug(
+                "Captured bare CUDA tensor: %s.%s (shape=%s, dtype=%s)",
+                type(self).__name__, name, list(value.shape), value.dtype,
+            )
         else:
             original_setattr(self, name, value)
 
@@ -62,6 +74,110 @@ def capture_tensor_attrs():
         yield
     finally:
         nn.Module.__setattr__ = original_setattr
+
+
+def _find_hidden_cuda_tensors(
+    obj: object, visited: set[int], depth: int = 0,
+) -> list[tuple[str, torch.Tensor]]:
+    """Recursively find CUDA tensors in a non-Module Python object graph.
+
+    Known limitation: objects using ``__slots__`` are skipped because they
+    lack ``__dict__``. No current vLLM quant class uses slots, but any
+    upstream adoption would silently cause hidden tensors to be missed —
+    which is exactly the bug class this function exists to fix.
+    """
+    if depth > 20 or id(obj) in visited:
+        return []
+    visited.add(id(obj))
+
+    results: list[tuple[str, torch.Tensor]] = []
+
+    if isinstance(obj, torch.Tensor) and obj.is_cuda and obj.numel() > 0:
+        results.append(("t", obj))
+    elif isinstance(obj, (list, tuple)):
+        for i, item in enumerate(obj):
+            for path, tensor in _find_hidden_cuda_tensors(item, visited, depth + 1):
+                results.append((f"{i}_{path}", tensor))
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            for path, tensor in _find_hidden_cuda_tensors(v, visited, depth + 1):
+                results.append((f"{k}_{path}", tensor))
+    elif hasattr(obj, "__dict__") and not isinstance(obj, (type, nn.Module)):
+        for attr_name, attr_val in vars(obj).items():
+            if attr_name.startswith("__"):
+                continue
+            for path, tensor in _find_hidden_cuda_tensors(attr_val, visited, depth + 1):
+                results.append((f"{attr_name}_{path}", tensor))
+
+    return results
+
+
+def adopt_hidden_tensors(model: nn.Module) -> int:
+    """Register hidden CUDA tensors as module buffers for RDMA transfer.
+
+    process_weights_after_loading may create CUDA tensors stored on plain
+    Python objects attached to modules (e.g. quant configs, kernel objects,
+    dataclasses) rather than as nn.Module parameters or buffers. These are
+    invisible to named_parameters()/named_buffers() and thus missing from
+    the RDMA manifest, causing incorrect inference on the target.
+
+    This function scans each module's non-Module attributes recursively for
+    any CUDA tensors not already registered, and adopts them as non-persistent
+    buffers so they appear in the manifest and get transferred.
+    """
+    import time
+    start = time.perf_counter()
+
+    existing_ptrs: set[int] = set()
+    for _, p in model.named_parameters():
+        existing_ptrs.add(p.data_ptr())
+    for _, b in model.named_buffers():
+        existing_ptrs.add(b.data_ptr())
+
+    adopted = 0
+    for _module_name, module in model.named_modules():
+        for attr_name in list(vars(module)):
+            attr_val = getattr(module, attr_name, None)
+            if attr_val is None:
+                continue
+            if isinstance(attr_val, (torch.Tensor, nn.Parameter, nn.Module)):
+                continue
+
+            tensors = _find_hidden_cuda_tensors(attr_val, visited=set())
+            for tensor_path, tensor in tensors:
+                if tensor.data_ptr() in existing_ptrs:
+                    continue
+                safe_path = (
+                    tensor_path.replace(".", "__dot__")
+                    .replace("[", "")
+                    .replace("]", "")
+                )
+                buf_name = f"_mx_{attr_name}_{safe_path}"
+                if hasattr(module, buf_name):
+                    suffix = 0
+                    while hasattr(module, f"{buf_name}_{suffix}"):
+                        suffix += 1
+                    buf_name = f"{buf_name}_{suffix}"
+                module.register_buffer(buf_name, tensor, persistent=False)
+                existing_ptrs.add(tensor.data_ptr())
+                adopted += 1
+                logger.debug(
+                    "Adopted hidden tensor: %s.%s "
+                    "(shape=%s, dtype=%s, from %s.%s)",
+                    _module_name, buf_name,
+                    list(tensor.shape), tensor.dtype,
+                    type(attr_val).__name__, tensor_path,
+                )
+
+    elapsed = time.perf_counter() - start
+    if adopted:
+        logger.info(
+            f"Adopted {adopted} hidden CUDA tensors as module buffers "
+            f"in {elapsed:.3f}s"
+        )
+    else:
+        logger.debug(f"No hidden CUDA tensors found ({elapsed:.3f}s)")
+    return adopted
 
 
 def iter_module_tensors(
@@ -164,20 +280,20 @@ def collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
 def log_tensor_summary(
     tensors: dict[str, torch.Tensor], global_rank: int, label: str
 ) -> None:
-    """Log a summary of tensor count, size, scale_inv count, and sample checksums."""
+    """Log a summary of tensor count, total size, and optionally per-tensor checksums.
+
+    At DEBUG level, logs a checksum for every tensor. Expensive (GPU reduction
+    per tensor) — enable via MODEL_EXPRESS_LOG_LEVEL=DEBUG.
+    """
     total_size = sum(t.numel() * t.element_size() for t in tensors.values())
     logger.info(
         f"[Worker {global_rank}] {label}: {len(tensors)} tensors ({total_size / 1e9:.2f} GB)"
     )
 
     if logger.isEnabledFor(logging.DEBUG):
-        tensor_names = list(tensors.keys())
-        logger.debug(f"[Worker {global_rank}] First 5 tensor names: {tensor_names[:5]}")
-
-        for name in tensor_names[:3]:
-            t = tensors[name]
+        for name, t in tensors.items():
             checksum = safe_checksum(t)
             logger.debug(
-                f"[Worker {global_rank}] Sample tensor '{name}': "
-                f"shape={t.shape}, dtype={t.dtype}, checksum={checksum}"
+                f"[Worker {global_rank}] [CHECKSUM] {label} | {name} | "
+                f"shape={list(t.shape)} dtype={t.dtype} | {checksum}"
             )

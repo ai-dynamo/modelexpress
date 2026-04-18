@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Utils, constants, models::ModelProvider, providers::huggingface::HuggingFaceProviderCache,
+    Utils, constants,
+    models::ModelProvider,
+    providers::{huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache},
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -228,8 +230,9 @@ impl CacheConfig {
             });
         }
 
-        let provider = ModelProvider::HuggingFace;
-        models.extend(cache_for_provider(provider).list_models(&self.local_path)?);
+        for provider in [ModelProvider::HuggingFace, ModelProvider::Ngc] {
+            models.extend(cache_for_provider(provider).list_models(&self.local_path)?);
+        }
 
         models.sort_by(|left, right| {
             provider_sort_key(left.provider)
@@ -334,6 +337,7 @@ pub(crate) trait ProviderCache: Send + Sync {
 pub(crate) fn cache_for_provider(provider: ModelProvider) -> &'static dyn ProviderCache {
     match provider {
         ModelProvider::HuggingFace => &HuggingFaceProviderCache,
+        ModelProvider::Ngc => &NgcProviderCache,
     }
 }
 
@@ -366,6 +370,7 @@ pub(crate) fn directory_size(path: &Path) -> Result<u64> {
 fn provider_sort_key(provider: ModelProvider) -> u8 {
     match provider {
         ModelProvider::HuggingFace => 0,
+        ModelProvider::Ngc => 1,
     }
 }
 

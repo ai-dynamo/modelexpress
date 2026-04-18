@@ -30,7 +30,9 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
+futures = { workspace = true }
 jiff = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 mockall = "0.13"

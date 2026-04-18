@@ -17,7 +17,8 @@ import torch.nn as nn
 from .base import LoadContext, LoadStrategy, SourceTransferError, register_tensors, publish_metadata
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import capture_tensor_attrs
-from ..types import TensorDescriptor
+from ..transfer_safety import check_transfer_allowed
+from ..types import ManifestMismatchError, TensorDescriptor
 from .. import p2p_pb2
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
@@ -35,7 +36,22 @@ class RdmaStrategy(LoadStrategy):
     name = "rdma"
 
     def is_available(self, ctx: LoadContext) -> bool:
-        return is_nixl_available()
+        if not is_nixl_available():
+            return False
+
+        server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+        if not server_addr:
+            logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
+            return False
+
+        allowed, reason = check_transfer_allowed(ctx.model_config)
+        if not allowed:
+            logger.info(
+                f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}"
+            )
+            return False
+
+        return True
 
     def load(self, model: nn.Module, ctx: LoadContext) -> bool:
         candidates = self._find_source_instances(ctx)
@@ -72,6 +88,11 @@ class RdmaStrategy(LoadStrategy):
             except SourceTransferError as e:
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Source transfer failed for worker {worker_id}: {e}. "
+                    f"Trying next candidate."
+                )
+            except ManifestMismatchError as e:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Manifest mismatch with worker {worker_id}: {e}. "
                     f"Trying next candidate."
                 )
 

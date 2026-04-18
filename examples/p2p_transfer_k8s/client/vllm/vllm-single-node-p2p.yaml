@@ -47,7 +47,9 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          # Build a vLLM + ModelExpress client image using
+          # examples/p2p_transfer_k8s/Dockerfile.client
+          image: <your-registry>/modelexpress-client:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
@@ -59,7 +61,7 @@ spec:
             - name: HF_HUB_CACHE
               value: "/models"
             - name: MODEL_NAME
-              value: "deepseek-ai/DeepSeek-V3"
+              value: "meta-llama/Llama-3.1-405B-Instruct"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
@@ -110,7 +112,6 @@ spec:
             - mx
             - --tensor-parallel-size
             - "8"
-            - --enable-expert-parallel
           resources:
             limits:
               nvidia.com/gpu: "8"

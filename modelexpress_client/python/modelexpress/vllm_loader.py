@@ -13,26 +13,23 @@ are auto-promoted to non-persistent buffers via capture_tensor_attrs().
 
 Uses LoadStrategyChain to auto-detect the best loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
-    2. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
-    3. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
+    2. ModelStreamer (S3 streaming via runai-model-streamer) - stream to GPU, no disk
+    3. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
+    4. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
-    --load-format mx  (auto-detect: RDMA -> GDS -> default)
+    --load-format mx  (auto-detect: RDMA -> ModelStreamer -> GDS -> default)
 """
 
 from __future__ import annotations
 
 import logging
 import time
-import uuid
-
 import torch
 import torch.nn as nn
 
-from .client import MxClient
-from .load_strategy import LoadContext, LoadStrategyChain
-from .metadata import build_source_identity
-from .rank_utils import get_global_rank, get_worker_rank
+from . import configure_vllm_logging
+from .load_strategy import build_load_context, LoadContext, LoadStrategyChain
 from .nixl_transfer import NixlTransferManager
 
 from vllm.config import ModelConfig, VllmConfig
@@ -64,32 +61,8 @@ class MxModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        self._mx_client = MxClient()
-        self._worker_id = uuid.uuid4().hex[:8]
+        configure_vllm_logging()
         self._ctx: LoadContext | None = None
-        logger.debug("MxModelLoader initialized (worker_id=%s)", self._worker_id)
-
-    def _build_context(
-        self, vllm_config: VllmConfig, model_config: ModelConfig,
-    ) -> LoadContext:
-        """Build a LoadContext from vLLM config objects."""
-        device_config = vllm_config.device_config
-        load_config = vllm_config.load_config
-        load_device = (
-            device_config.device if load_config.device is None else load_config.device
-        )
-        target_device = torch.device(load_device)
-        return LoadContext(
-            vllm_config=vllm_config,
-            model_config=model_config,
-            load_config=load_config,
-            target_device=target_device,
-            global_rank=get_global_rank(target_device),
-            device_id=get_worker_rank(target_device),
-            identity=build_source_identity(vllm_config, model_config),
-            mx_client=self._mx_client,
-            worker_id=self._worker_id,
-        )
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig
@@ -97,7 +70,7 @@ class MxModelLoader(BaseModelLoader):
         """Load model, auto-detecting the best loading strategy."""
         load_start = time.perf_counter()
 
-        ctx = self._build_context(vllm_config, model_config)
+        ctx = build_load_context(vllm_config, model_config)
         self._ctx = ctx
 
         logger.info(f"[Worker {ctx.global_rank}] MxModelLoader starting (model={ctx.identity.model_name})")

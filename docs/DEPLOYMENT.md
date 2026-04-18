@@ -131,7 +131,9 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
 
-Cache directory resolution: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
+Cache directory resolution for HuggingFace: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.
+
+Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache/ngc`.
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
@@ -185,6 +187,23 @@ kubectl create secret generic hf-token-secret \
   -n ${NAMESPACE}
 ```
 
+### NGC API Key
+
+To download models from NVIDIA NGC, set an NGC API key. The server resolves it in this order:
+
+1. `NGC_API_KEY` environment variable
+2. `NGC_CLI_API_KEY` environment variable
+3. `~/.ngc/config` (written by `ngc config set`)
+
+```bash
+export NGC_API_KEY=your_ngc_api_key
+kubectl create secret generic ngc-api-key-secret \
+  --from-literal=NGC_API_KEY=${NGC_API_KEY} \
+  -n ${NAMESPACE}
+```
+
+Pass it to the server pod via `envFrom` or individual `env` entries in your deployment manifest.
+
 ### Helm Chart
 
 The `helm/` directory provides a full Helm chart with configurable replicas, PVC, ingress, and resource limits.
@@ -228,6 +247,8 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
+| `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
+| `MX_SKIP_FEATURE_CHECK` | `0` | Bypass the MLA feature gate for P2P transfer (testing only) |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
@@ -251,6 +272,24 @@ By default, source workers publish full tensor metadata (NIXL blobs + tensor des
 Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the metadata. No configuration needed on the target side.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
+
+### ModelStreamer (S3 Object Storage)
+
+ModelStreamer enables streaming safetensors directly from S3/S3-compatible storage to GPU memory without writing to disk. The first pod streams from S3; subsequent pods use P2P RDMA from the first pod's GPU memory.
+
+`runai-model-streamer[s3]` is included as a core dependency of the `modelexpress` package — no extra install step needed. Set `MX_S3_URI` to enable the ModelStreamer strategy.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_S3_URI` | (none) | S3 model location (e.g., `s3://bucket/path/to/model`). When set, enables the ModelStreamer strategy. |
+| `AWS_ACCESS_KEY_ID` | (none) | S3 credentials (read by boto3 and runai-model-streamer) |
+| `AWS_SECRET_ACCESS_KEY` | (none) | S3 credentials |
+| `AWS_DEFAULT_REGION` | (none) | AWS region (required by some backends) |
+| `AWS_ENDPOINT_URL` | (none) | Custom endpoint for S3-compatible storage (MinIO, Ceph, etc.) |
+| `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
+| `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). When unset, runai-model-streamer allocates based on file size — see [runai-model-streamer docs](https://github.com/run-ai/model-streamer). |
+
+Credentials are injected via standard AWS mechanisms (EKS Pod Identity, IRSA, or K8s secrets mounted as env vars). No credentials flow through the MX server or gRPC.
 
 ### UCX/NIXL Tuning
 

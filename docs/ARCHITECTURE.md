@@ -11,7 +11,7 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace with SQLite-backed tracking and LRU cache eviction.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace and NGC with SQLite-backed tracking and LRU cache eviction.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
 
 ### Current Status
@@ -29,6 +29,7 @@ graph TD
         C1[Client CLI / Library] -->|gRPC| S1[ModelExpress Server]
         S1 --> DB[(SQLite)]
         S1 --> HF[HuggingFace Hub]
+        S1 --> NGC[NVIDIA NGC]
         S1 --> Cache[Model Cache Dir]
     end
 
@@ -122,9 +123,11 @@ ModelExpress/
 │       │   ├── __init__.py             # LoadStrategyChain.run()
 │       │   ├── base.py                 # LoadStrategy ABC, LoadContext, shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
+│       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3 streaming)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (vLLM DefaultModelLoader)
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
+│       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── metadata.py                 # Metadata building and publishing
 │       ├── rank_utils.py               # Rank detection utilities
 │       ├── worker_server.py            # WorkerGrpcServer (P2P tensor manifest)
@@ -148,9 +151,10 @@ ModelExpress/
 │       ├── config.rs                   # Config trait utilities
 │       ├── download.rs                 # Download orchestration (smart-fallback, direct, server-only)
 │       ├── models.rs                   # Status, ModelProvider, ModelStatus, ModelStatusResponse
+│       ├── providers.rs               # ModelProviderTrait definition, re-exports
 │       └── providers/
-│           ├── mod.rs                  # ModelProviderTrait definition
-│           └── huggingface.rs          # HuggingFaceProvider implementation
+│           ├── huggingface.rs          # HuggingFaceProvider implementation
+│           └── ngc.rs                  # NgcProvider implementation
 │
 ├── workspace-tests/
 │   ├── Cargo.toml
@@ -185,9 +189,16 @@ ModelExpress/
 │   │       └── vllm/
 │   │           ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
 │   │           └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
-│   └── aggregated_k8s/                 # Dynamo integration example
+│   ├── aggregated_k8s/                 # Dynamo aggregated serving example
+│   │   ├── README.md
+│   │   └── agg.yaml
+│   └── dynamo_p2p_transfer_k8s/        # Dynamo DGD with P2P weight transfer
+│       ├── Dockerfile                   # dynamo vllm-runtime + MX client
 │       ├── README.md
-│       └── agg.yaml
+│       └── vllm/
+│           ├── crd-modelmetadata.yaml   # ModelMetadata CRD (cluster-admin)
+│           ├── rbac-modelmetadata.yaml  # ServiceAccount + Role + RoleBinding
+│           └── vllm-multi-node-aggregated.yaml  # DGD: MX server + Frontend + VllmWorker
 │
 ├── docs/
 │   ├── ARCHITECTURE.md                 # Architecture reference
@@ -249,7 +260,7 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
 
-Key message types: `ModelProvider` (HuggingFace), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
+Key message types: `ModelProvider` (HuggingFace, NGC), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 ### p2p.proto - P2pService
 
@@ -407,7 +418,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 | `config` | Config trait utilities |
 | `download` | Download orchestration with strategy pattern |
 | `models` | `Status`, `ModelProvider`, `ModelStatus`, `ModelStatusResponse` |
-| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` |
+| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` |
 | `grpc` | Generated tonic stubs for all 4 services |
 | `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (32KB) |
 
@@ -426,7 +437,9 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
-Currently one implementation: `HuggingFaceProvider` (uses `hf-hub` crate with high-CPU download mode).
+Two implementations:
+- `HuggingFaceProvider` — uses the `hf-hub` crate with high-CPU download mode.
+- `NgcProvider` — downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 
 ### ClientConfig / ClientArgs
 
@@ -447,7 +460,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `vllm_loader.py` | `MxModelLoader` - thin orchestration, delegates to `LoadStrategyChain` |
-| `load_strategy/` | Loading strategy chain package (see below) |
+| `load_strategy/` | Loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3), `GdsStrategy`, `DefaultStrategy` |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `metadata.py` | `build_source_identity`, `publish_metadata_and_ready`, retry logic |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
@@ -493,11 +506,20 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
-| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError`, try next. |
-| p1 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
-| p2 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
+| p0 | `RdmaStrategy` | NIXL available + MLA check passes | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError` or `ManifestMismatchError`, try next. |
+| p1 | `ModelStreamerStrategy` | `MX_S3_URI` set + `runai_model_streamer` installed | Stream safetensors from S3 to GPU via CPU staging buffer (no disk writes). |
+| p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
+| p3 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
 
-Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies (e.g., ModelStreamer for S3) can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+
+### Transfer Safety
+
+`RdmaStrategy.is_available()` checks `transfer_safety.check_transfer_allowed()` before attempting P2P transfer. Currently the only blocked feature is MLA (Multi-head Latent Attention), detected via `kv_lora_rank` in the HF model config. MLA models (DeepSeek-V2/V3, Kimi K2/K2.5, GLM-5.1, and any future model using MLA) fall back to GDS or disk loading automatically.
+
+NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. Note DeepSeek-V3 (MLA + FP8) is not affected — FP8 scale state lives on Modules and is already captured. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned CUDA tensors and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4. Set `MX_SKIP_FEATURE_CHECK=1` to bypass the MLA feature gate for models in this class.
+
+During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match. This triggers trying the next source candidate rather than marking the source as stale, which is important during rolling updates where pods may run different image versions.
 
 After loading by any strategy, the worker starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged but do not crash the worker.
 
@@ -513,7 +535,9 @@ The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full 
 | Buffers | `module._buffers` | Batch norm running mean |
 | Tensor attributes | `dir(module)` scan | FP8 `weight_scale`, `_k_scale` |
 
-This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. transposed views like `W_UK_T`) are skipped because they are views over contiguous tensors already in the module tree. Tensors are deduplicated by `data_ptr()` so tied weights (e.g. `embed_tokens.weight` and `lm_head.weight` sharing the same memory) are only registered and transferred once.
+This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. MLA's `W_UV` and `W_UK_T` sharing a dequantized intermediate) are registered as flat byte views of their underlying storage via `storage_view()`. Multiple views into the same storage are deduplicated by `data_ptr()` so tied weights are only transferred once.
+
+Before tensor collection, `adopt_hidden_tensors()` scans each module's non-Module attributes recursively for CUDA tensors not already in `named_parameters()`/`named_buffers()`. These "orphaned" tensors (e.g. `FusedMoEQuantConfig.a1_gscale`, FlashInfer workspace buffers) are registered as non-persistent buffers so they appear in the manifest. Without this, the target's quant method objects retain values computed from dummy weights, causing incorrect inference despite all registered tensor bytes matching.
 
 ## NIXL Integration
 
@@ -559,34 +583,36 @@ agent.release_xfer_handle(handle)
 
 ## FP8 Model Handling (DeepSeek-V3)
 
-DeepSeek-V3 uses FP8 quantization with scale factors. vLLM's `process_weights_after_loading()` transforms `weight_scale_inv` into `weight_scale` and may create new tensors as bare attributes or buffers.
+vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
-The solution: both source and target run `process_weights_after_loading()` first, then register and transfer the fully-processed tensors. The target runs post-processing on dummy data purely to establish the correct tensor layout (shapes, dtypes, attribute names), then receives the real data via RDMA.
+The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers any CUDA tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout, receives the real data via RDMA, and all state (including hidden quant config tensors) is correct.
 
 ```mermaid
 graph TD
     subgraph Source
         S1[Load real weights from disk]
         S2[process_weights_after_loading]
-        S3[Register ALL final tensors with NIXL]
-        S4[Publish metadata]
-        S1 --> S2 --> S3 --> S4
+        S3[adopt_hidden_tensors - find orphaned CUDA tensors]
+        S4[Register ALL tensors with NIXL]
+        S5[Publish metadata]
+        S1 --> S2 --> S3 --> S4 --> S5
     end
     subgraph Target
         T1[Load dummy weights]
         T2[process_weights_after_loading on dummy]
-        T3[Register ALL final tensors with NIXL]
-        T4[Receive processed weights via RDMA]
-        T1 --> T2 --> T3 --> T4
+        T3[adopt_hidden_tensors - same layout as source]
+        T4[Register ALL tensors with NIXL]
+        T5[Receive processed weights via RDMA]
+        T1 --> T2 --> T3 --> T4 --> T5
     end
-    S3 -- "RDMA" --> T4
+    S4 -- "RDMA" --> T5
 ```
 
 ## Coordination Protocol
 
 ### Flow
 
-1. **Source loads**: Loads weights from disk (or GDS), runs `process_weights_after_loading()`
+1. **Source loads**: Loads weights from disk, GDS, or S3 (via ModelStreamer), runs `process_weights_after_loading()`
 2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifest serving.
 3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`

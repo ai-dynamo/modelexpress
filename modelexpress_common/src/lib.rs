@@ -141,6 +141,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
     fn from(provider: models::ModelProvider) -> Self {
         match provider {
             models::ModelProvider::HuggingFace => grpc::model::ModelProvider::HuggingFace,
+            models::ModelProvider::Ngc => grpc::model::ModelProvider::Ngc,
         }
     }
 }
@@ -149,6 +150,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
     fn from(provider: grpc::model::ModelProvider) -> Self {
         match provider {
             grpc::model::ModelProvider::HuggingFace => models::ModelProvider::HuggingFace,
+            grpc::model::ModelProvider::Ngc => models::ModelProvider::Ngc,
         }
     }
 }

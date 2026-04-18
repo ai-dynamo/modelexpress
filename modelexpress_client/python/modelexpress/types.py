@@ -34,3 +34,13 @@ class GetMetadataResponse:
     """Response from GetMetadata RPC."""
     found: bool
     workers: list[WorkerMetadata]
+
+
+class ManifestMismatchError(Exception):
+    """Source and target tensor manifests are incompatible.
+
+    Raised during RDMA transfer when tensor names or sizes don't match.
+    The caller should try the next source candidate rather than marking
+    the source as stale (the mismatch may be due to a rolling update,
+    not a source-side failure).
+    """
