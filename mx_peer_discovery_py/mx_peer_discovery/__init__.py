@@ -4,7 +4,7 @@
 """Peer discovery substrate probes for ModelExpress.
 
 This package provides substrate-agnostic peer discovery mechanisms used to
-bootstrap higher-level peer networks. It has no libp2p dependencies.
+bootstrap higher-level peer networks.
 
 Currently exposes:
 - :mod:`mx_peer_discovery.mdns`: multicast DNS service discovery (RFC 6762/6763).
@@ -19,7 +19,8 @@ from mx_peer_discovery.dns import (
     resolve_hostname,
 )
 from mx_peer_discovery.mdns import (
-    DEFAULT_SERVICE_NAME,
+    DEFAULT_SERVICE_TYPE,
+    Config,
     MdnsDiscovery,
 )
 from mx_peer_discovery.slurm import expand_hostlist
@@ -30,8 +31,9 @@ from mx_peer_discovery.static import (
 )
 
 __all__ = [
+    "Config",
     "DEFAULT_ENV_VAR",
-    "DEFAULT_SERVICE_NAME",
+    "DEFAULT_SERVICE_TYPE",
     "MdnsDiscovery",
     "endpoints_from_env",
     "expand_hostlist",

@@ -7,7 +7,9 @@ version = "0.1.0"
 description = "Peer discovery substrate probes (mDNS, SLURM, DNS) for ModelExpress"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-dependencies = []
+dependencies = [
+    "zeroconf>=0.148.0",
+]
 
 [project.optional-dependencies]
 test = [
