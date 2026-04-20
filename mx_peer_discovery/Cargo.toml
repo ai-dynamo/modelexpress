@@ -13,7 +13,8 @@ repository.workspace = true
 keywords.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["net"] }
+mdns-sd = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
