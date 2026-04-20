@@ -7,6 +7,7 @@ members = [
     "modelexpress_server", # modelexpress-server
     "modelexpress_client", # modelexpress-client
     "modelexpress_common", # modelexpress-common
+    "mx_peer_discovery",   # mx-peer-discovery
     "workspace-tests",
 ]
 resolver = "3"
