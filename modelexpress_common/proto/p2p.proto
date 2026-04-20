@@ -162,6 +162,12 @@ service WorkerService {
   // peer-direct metadata client to enumerate what's available on a
   // discovered peer without calling into a central server.
   rpc ListWorkerSources(ListWorkerSourcesRequest) returns (ListWorkerSourcesResponse);
+
+  // Fetch the full WorkerMetadata for one source on this worker.
+  // Mirrors P2pService.GetMetadata but served by the worker itself
+  // instead of a central server - the peer becomes its own scattered
+  // source of truth in peer-direct mode.
+  rpc GetWorkerMetadata(GetWorkerMetadataRequest) returns (GetWorkerMetadataResponse);
 }
 
 message GetTensorManifestRequest {
@@ -185,6 +191,27 @@ message ListWorkerSourcesResponse {
   // Typically 1 entry for a vLLM worker (one model per process), but the
   // API supports plurality for future multi-tenant scenarios.
   repeated SourceInstanceRef sources = 1;
+}
+
+message GetWorkerMetadataRequest {
+  // mx_source_id from ListWorkerSources (catches stale discovery)
+  string mx_source_id = 1;
+  // worker_id from ListWorkerSources
+  string worker_id = 2;
+}
+
+message GetWorkerMetadataResponse {
+  // Whether this worker serves the requested source
+  bool found = 1;
+  // Full worker metadata (status, endpoints, tensors) for NIXL handshake
+  // and tensor transfer. The tensors field carries the same content as
+  // GetTensorManifest; callers that only need tensors should prefer the
+  // lighter GetTensorManifest RPC.
+  WorkerMetadata worker = 2;
+  // Echoed mx_source_id
+  string mx_source_id = 3;
+  // Echoed worker_id
+  string worker_id = 4;
 }
 
 // ============================================================================

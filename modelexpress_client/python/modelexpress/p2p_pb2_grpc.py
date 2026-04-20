@@ -272,6 +272,11 @@ class WorkerServiceStub(object):
                 request_serializer=p2p__pb2.ListWorkerSourcesRequest.SerializeToString,
                 response_deserializer=p2p__pb2.ListWorkerSourcesResponse.FromString,
                 _registered_method=True)
+        self.GetWorkerMetadata = channel.unary_unary(
+                '/model_express.p2p.WorkerService/GetWorkerMetadata',
+                request_serializer=p2p__pb2.GetWorkerMetadataRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetWorkerMetadataResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -300,6 +305,16 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetWorkerMetadata(self, request, context):
+        """Fetch the full WorkerMetadata for one source on this worker.
+        Mirrors P2pService.GetMetadata but served by the worker itself
+        instead of a central server - the peer becomes its own scattered
+        source of truth in peer-direct mode.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -312,6 +327,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.ListWorkerSources,
                     request_deserializer=p2p__pb2.ListWorkerSourcesRequest.FromString,
                     response_serializer=p2p__pb2.ListWorkerSourcesResponse.SerializeToString,
+            ),
+            'GetWorkerMetadata': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWorkerMetadata,
+                    request_deserializer=p2p__pb2.GetWorkerMetadataRequest.FromString,
+                    response_serializer=p2p__pb2.GetWorkerMetadataResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -376,6 +396,33 @@ class WorkerService(object):
             '/model_express.p2p.WorkerService/ListWorkerSources',
             p2p__pb2.ListWorkerSourcesRequest.SerializeToString,
             p2p__pb2.ListWorkerSourcesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetWorkerMetadata(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/GetWorkerMetadata',
+            p2p__pb2.GetWorkerMetadataRequest.SerializeToString,
+            p2p__pb2.GetWorkerMetadataResponse.FromString,
             options,
             channel_credentials,
             insecure,

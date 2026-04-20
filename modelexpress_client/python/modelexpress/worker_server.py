@@ -45,6 +45,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         model_name: str = "",
         worker_rank: int = 0,
         status: "p2p_pb2.SourceStatus" = p2p_pb2.SOURCE_STATUS_UNKNOWN,
+        worker_metadata: "p2p_pb2.WorkerMetadata | None" = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
@@ -52,6 +53,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._model_name = model_name
         self._worker_rank = worker_rank
         self._status = status
+        self._worker_metadata = worker_metadata
         self._status_lock = threading.Lock()
 
     def set_status(self, status: "p2p_pb2.SourceStatus") -> None:
@@ -83,6 +85,51 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         )
         return p2p_pb2.ListWorkerSourcesResponse(sources=[ref])
 
+    def GetWorkerMetadata(self, request, context):
+        """Return the full WorkerMetadata for a source served by this worker.
+
+        Peer-direct analog of P2pService.GetMetadata. Callers use this to
+        learn metadata_endpoint, agent_name, worker_grpc_endpoint, status,
+        and tensors without a central server round-trip.
+        """
+        if request.mx_source_id and request.mx_source_id != self._mx_source_id:
+            return p2p_pb2.GetWorkerMetadataResponse(
+                found=False,
+                mx_source_id=request.mx_source_id,
+                worker_id=request.worker_id,
+            )
+        if request.worker_id and self._worker_id and request.worker_id != self._worker_id:
+            return p2p_pb2.GetWorkerMetadataResponse(
+                found=False,
+                mx_source_id=request.mx_source_id,
+                worker_id=request.worker_id,
+            )
+        if self._worker_metadata is None:
+            # Construction-site didn't supply full metadata; we only know
+            # enough for tensor/source enumeration, not for NIXL handshake.
+            return p2p_pb2.GetWorkerMetadataResponse(
+                found=False,
+                mx_source_id=self._mx_source_id,
+                worker_id=self._worker_id,
+            )
+
+        response_worker = p2p_pb2.WorkerMetadata()
+        response_worker.CopyFrom(self._worker_metadata)
+        with self._status_lock:
+            response_worker.status = self._status
+        # Tensors live in tensor_protos; populate if the stored metadata
+        # doesn't already carry them (the usual case for P2P mode where
+        # the registered metadata has tensors stripped).
+        if not response_worker.tensors:
+            response_worker.tensors.extend(self._tensor_protos)
+
+        return p2p_pb2.GetWorkerMetadataResponse(
+            found=True,
+            worker=response_worker,
+            mx_source_id=self._mx_source_id,
+            worker_id=self._worker_id,
+        )
+
 
 class WorkerGrpcServer:
     """Manages a gRPC server for the WorkerService on a source worker."""
@@ -96,6 +143,7 @@ class WorkerGrpcServer:
         model_name: str = "",
         worker_rank: int = 0,
         status: "p2p_pb2.SourceStatus" = p2p_pb2.SOURCE_STATUS_UNKNOWN,
+        worker_metadata: "p2p_pb2.WorkerMetadata | None" = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
@@ -104,6 +152,7 @@ class WorkerGrpcServer:
         self._model_name = model_name
         self._worker_rank = worker_rank
         self._initial_status = status
+        self._worker_metadata = worker_metadata
         self._server: grpc.Server | None = None
         self._port: int | None = None
         self._servicer: WorkerServiceServicer | None = None
@@ -130,6 +179,7 @@ class WorkerGrpcServer:
             model_name=self._model_name,
             worker_rank=self._worker_rank,
             status=self._initial_status,
+            worker_metadata=self._worker_metadata,
         )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(self._servicer, self._server)
 
@@ -184,5 +234,28 @@ def fetch_worker_sources(
         request = p2p_pb2.ListWorkerSourcesRequest()
         response = stub.ListWorkerSources(request, timeout=timeout)
         return list(response.sources)
+    finally:
+        channel.close()
+
+
+def fetch_worker_metadata(
+    endpoint: str,
+    mx_source_id: str,
+    worker_id: str,
+    timeout: float = 10.0,
+) -> p2p_pb2.GetWorkerMetadataResponse:
+    """Fetch full WorkerMetadata from a peer for one source.
+
+    Peer-direct analog of MxClient.get_metadata - the peer itself is the
+    scattered source of truth in this mode.
+    """
+    channel = grpc.insecure_channel(endpoint)
+    try:
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        request = p2p_pb2.GetWorkerMetadataRequest(
+            mx_source_id=mx_source_id,
+            worker_id=worker_id,
+        )
+        return stub.GetWorkerMetadata(request, timeout=timeout)
     finally:
         channel.close()
