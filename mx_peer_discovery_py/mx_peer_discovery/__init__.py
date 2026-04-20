@@ -9,8 +9,14 @@ bootstrap higher-level peer networks. It has no libp2p dependencies.
 Currently exposes:
 - :mod:`mx_peer_discovery.mdns`: multicast DNS service discovery (RFC 6762/6763).
 - :mod:`mx_peer_discovery.slurm`: SLURM compact hostlist expansion.
+- :mod:`mx_peer_discovery.dns`: hostname resolution via ``getaddrinfo``.
 """
 
+from mx_peer_discovery.dns import (
+    filter_own_ips,
+    resolve_hostlist,
+    resolve_hostname,
+)
 from mx_peer_discovery.mdns import (
     DEFAULT_SERVICE_NAME,
     MdnsDiscovery,
@@ -21,4 +27,7 @@ __all__ = [
     "DEFAULT_SERVICE_NAME",
     "MdnsDiscovery",
     "expand_hostlist",
+    "filter_own_ips",
+    "resolve_hostlist",
+    "resolve_hostname",
 ]
