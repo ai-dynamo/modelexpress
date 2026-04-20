@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Peer-direct metadata client e2e test: two pods cross-discover via static substrate
+# using pod DNS names from a headless Service.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mxpeer-test-headless
+  namespace: mxpeer-test
+spec:
+  clusterIP: None
+  selector:
+    app: mxpeer-test
+  ports:
+  - name: worker-grpc
+    port: 6555
+    targetPort: 6555
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mxpeer-test
+  namespace: mxpeer-test
+spec:
+  serviceName: mxpeer-test-headless
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mxpeer-test
+  template:
+    metadata:
+      labels:
+        app: mxpeer-test
+    spec:
+      restartPolicy: Always
+      containers:
+      - name: peer
+        image: localhost:32000/mxpeer-e2e-test:latest
+        imagePullPolicy: IfNotPresent
+        command: ["python3", "/test/peer_test.py"]
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: PEER_ROLE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MX_PEER_DISCOVERY_SUBSTRATE
+          value: "static"
+        - name: MX_PEER_ENDPOINTS
+          value: "mxpeer-test-0.mxpeer-test-headless.mxpeer-test.svc.cluster.local:6555,mxpeer-test-1.mxpeer-test-headless.mxpeer-test.svc.cluster.local:6555"
+        - name: MX_WORKER_GRPC_PORT
+          value: "6555"
+        ports:
+        - containerPort: 6555
+          name: worker-grpc
