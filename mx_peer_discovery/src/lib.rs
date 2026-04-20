@@ -10,6 +10,7 @@
 //!
 //! Modules:
 //!
+//! - [`dns`]: hostname resolution via tokio async DNS.
 //! - [`slurm`]: SLURM compact hostlist expansion.
 //! - [`static_peers`]: explicit `host:port` peer lists from strings or env.
 //!
@@ -17,7 +18,7 @@
 //!
 //! - `mdns`: multicast DNS service discovery (RFC 6762/6763), wire-compatible
 //!   with the Python half. Default service name `_mx-peer._tcp.local`.
-//! - `dns`: hostname resolution via tokio DNS.
 
+pub mod dns;
 pub mod slurm;
 pub mod static_peers;

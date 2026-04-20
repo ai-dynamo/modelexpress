@@ -13,9 +13,11 @@ repository.workspace = true
 keywords.workspace = true
 
 [dependencies]
+tokio = { workspace = true, features = ["net"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true
