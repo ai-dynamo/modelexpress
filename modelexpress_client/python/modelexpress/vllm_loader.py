@@ -30,7 +30,8 @@ import uuid
 import torch
 import torch.nn as nn
 
-from .client import MxClient
+from .client import MxClient  # noqa: F401  # re-exported for external callers
+from .client_factory import create_metadata_client
 from .load_strategy import LoadContext, LoadStrategyChain
 from .metadata import build_source_identity
 from .rank_utils import get_global_rank, get_worker_rank
@@ -65,7 +66,7 @@ class MxModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        self._mx_client = MxClient()
+        self._mx_client = create_metadata_client()
         self._worker_id = uuid.uuid4().hex[:8]
         self._ctx: LoadContext | None = None
         logger.debug("MxModelLoader initialized (worker_id=%s)", self._worker_id)
