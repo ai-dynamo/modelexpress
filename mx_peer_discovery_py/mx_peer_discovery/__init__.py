@@ -10,6 +10,7 @@ Currently exposes:
 - :mod:`mx_peer_discovery.mdns`: multicast DNS service discovery (RFC 6762/6763).
 - :mod:`mx_peer_discovery.slurm`: SLURM compact hostlist expansion.
 - :mod:`mx_peer_discovery.dns`: hostname resolution via ``getaddrinfo``.
+- :mod:`mx_peer_discovery.static`: explicit ``host:port`` peer lists.
 """
 
 from mx_peer_discovery.dns import (
@@ -22,12 +23,20 @@ from mx_peer_discovery.mdns import (
     MdnsDiscovery,
 )
 from mx_peer_discovery.slurm import expand_hostlist
+from mx_peer_discovery.static import (
+    DEFAULT_ENV_VAR,
+    endpoints_from_env,
+    parse_endpoints,
+)
 
 __all__ = [
+    "DEFAULT_ENV_VAR",
     "DEFAULT_SERVICE_NAME",
     "MdnsDiscovery",
+    "endpoints_from_env",
     "expand_hostlist",
     "filter_own_ips",
+    "parse_endpoints",
     "resolve_hostlist",
     "resolve_hostname",
 ]
