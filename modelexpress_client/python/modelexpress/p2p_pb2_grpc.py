@@ -267,6 +267,11 @@ class WorkerServiceStub(object):
                 request_serializer=p2p__pb2.GetTensorManifestRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetTensorManifestResponse.FromString,
                 _registered_method=True)
+        self.ListWorkerSources = channel.unary_unary(
+                '/model_express.p2p.WorkerService/ListWorkerSources',
+                request_serializer=p2p__pb2.ListWorkerSourcesRequest.SerializeToString,
+                response_deserializer=p2p__pb2.ListWorkerSourcesResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -286,6 +291,15 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ListWorkerSources(self, request, context):
+        """List the sources this worker is currently serving. Used by the
+        peer-direct metadata client to enumerate what's available on a
+        discovered peer without calling into a central server.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -293,6 +307,11 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.GetTensorManifest,
                     request_deserializer=p2p__pb2.GetTensorManifestRequest.FromString,
                     response_serializer=p2p__pb2.GetTensorManifestResponse.SerializeToString,
+            ),
+            'ListWorkerSources': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWorkerSources,
+                    request_deserializer=p2p__pb2.ListWorkerSourcesRequest.FromString,
+                    response_serializer=p2p__pb2.ListWorkerSourcesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -330,6 +349,33 @@ class WorkerService(object):
             '/model_express.p2p.WorkerService/GetTensorManifest',
             p2p__pb2.GetTensorManifestRequest.SerializeToString,
             p2p__pb2.GetTensorManifestResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWorkerSources(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/ListWorkerSources',
+            p2p__pb2.ListWorkerSourcesRequest.SerializeToString,
+            p2p__pb2.ListWorkerSourcesResponse.FromString,
             options,
             channel_credentials,
             insecure,

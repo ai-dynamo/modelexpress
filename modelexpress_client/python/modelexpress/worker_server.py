@@ -8,11 +8,17 @@ When MX_P2P_METADATA=1, each source worker starts a WorkerGrpcServer
 that serves its tensor descriptors directly to target workers via the
 GetTensorManifest RPC. This avoids storing MB-scale tensor lists in the
 central metadata server.
+
+In the peer-direct world (MX_METADATA_BACKEND=peer-direct), the same
+server additionally answers ListWorkerSources so the peer-direct client
+can enumerate what a discovered peer is serving without calling into a
+central coordinator.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent import futures
 
 import grpc
@@ -24,15 +30,34 @@ logger = logging.getLogger("modelexpress.worker_server")
 
 
 class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
-    """Serves tensor descriptors for a single source worker."""
+    """Serves tensor descriptors and source enumeration for a single worker.
+
+    Holds one source's data for v1 (a vLLM worker loads one model per
+    process). The ListWorkerSources response schema is plural so the
+    structure can grow to multi-tenant workers without a protocol break.
+    """
 
     def __init__(
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
+        worker_id: str = "",
+        model_name: str = "",
+        worker_rank: int = 0,
+        status: "p2p_pb2.SourceStatus" = p2p_pb2.SOURCE_STATUS_UNKNOWN,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
+        self._worker_id = worker_id
+        self._model_name = model_name
+        self._worker_rank = worker_rank
+        self._status = status
+        self._status_lock = threading.Lock()
+
+    def set_status(self, status: "p2p_pb2.SourceStatus") -> None:
+        """Update the advertised worker status (thread-safe)."""
+        with self._status_lock:
+            self._status = status
 
     def GetTensorManifest(self, request, context):
         if request.mx_source_id and request.mx_source_id != self._mx_source_id:
@@ -46,6 +71,18 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             mx_source_id=self._mx_source_id,
         )
 
+    def ListWorkerSources(self, request, context):
+        with self._status_lock:
+            status = self._status
+        ref = p2p_pb2.SourceInstanceRef(
+            mx_source_id=self._mx_source_id,
+            worker_id=self._worker_id,
+            model_name=self._model_name,
+            worker_rank=self._worker_rank,
+            status=status,
+        )
+        return p2p_pb2.ListWorkerSourcesResponse(sources=[ref])
+
 
 class WorkerGrpcServer:
     """Manages a gRPC server for the WorkerService on a source worker."""
@@ -55,22 +92,46 @@ class WorkerGrpcServer:
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
         port: int = 0,
+        worker_id: str = "",
+        model_name: str = "",
+        worker_rank: int = 0,
+        status: "p2p_pb2.SourceStatus" = p2p_pb2.SOURCE_STATUS_UNKNOWN,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
         self._requested_port = port
+        self._worker_id = worker_id
+        self._model_name = model_name
+        self._worker_rank = worker_rank
+        self._initial_status = status
         self._server: grpc.Server | None = None
         self._port: int | None = None
+        self._servicer: WorkerServiceServicer | None = None
 
     @property
     def port(self) -> int | None:
         return self._port
 
+    def set_status(self, status: "p2p_pb2.SourceStatus") -> None:
+        """Update the status the servicer reports for ListWorkerSources."""
+        if self._servicer is not None:
+            self._servicer.set_status(status)
+        else:
+            # Server not started yet; apply on next start().
+            self._initial_status = status
+
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-        servicer = WorkerServiceServicer(self._tensor_protos, self._mx_source_id)
-        p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, self._server)
+        self._servicer = WorkerServiceServicer(
+            tensor_protos=self._tensor_protos,
+            mx_source_id=self._mx_source_id,
+            worker_id=self._worker_id,
+            model_name=self._model_name,
+            worker_rank=self._worker_rank,
+            status=self._initial_status,
+        )
+        p2p_pb2_grpc.add_WorkerServiceServicer_to_server(self._servicer, self._server)
 
         if self._requested_port:
             self._port = self._server.add_insecure_port(f"[::]:{self._requested_port}")
@@ -106,3 +167,22 @@ def fetch_tensor_manifest(
         f"Fetched {len(response.tensors)} tensors from worker at {endpoint}"
     )
     return list(response.tensors)
+
+
+def fetch_worker_sources(
+    endpoint: str,
+    timeout: float = 5.0,
+) -> list[p2p_pb2.SourceInstanceRef]:
+    """List the sources a discovered peer is currently serving.
+
+    Intended for use by the peer-direct metadata client, which calls this
+    once per discovered peer to populate its local peer-to-sources cache.
+    """
+    channel = grpc.insecure_channel(endpoint)
+    try:
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        request = p2p_pb2.ListWorkerSourcesRequest()
+        response = stub.ListWorkerSources(request, timeout=timeout)
+        return list(response.sources)
+    finally:
+        channel.close()

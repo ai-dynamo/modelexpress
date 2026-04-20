@@ -157,6 +157,11 @@ message WorkerMetadata {
 // source worker instead of from the central metadata server.
 service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+
+  // List the sources this worker is currently serving. Used by the
+  // peer-direct metadata client to enumerate what's available on a
+  // discovered peer without calling into a central server.
+  rpc ListWorkerSources(ListWorkerSourcesRequest) returns (ListWorkerSourcesResponse);
 }
 
 message GetTensorManifestRequest {
@@ -168,6 +173,18 @@ message GetTensorManifestResponse {
   repeated TensorDescriptor tensors = 1;
   // Echoed mx_source_id for confirmation
   string mx_source_id = 2;
+}
+
+message ListWorkerSourcesRequest {
+  // Reserved for future filters (by identity, by status, etc.).
+  // Empty request in v1 - returns everything the worker is serving.
+}
+
+message ListWorkerSourcesResponse {
+  // One entry per (mx_source_id, worker_id) pair this worker is serving.
+  // Typically 1 entry for a vLLM worker (one model per process), but the
+  // API supports plurality for future multi-tenant scenarios.
+  repeated SourceInstanceRef sources = 1;
 }
 
 // ============================================================================
@@ -215,6 +232,12 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Worker lifecycle status. Added 2026-04-20 for WorkerService.ListWorkerSources.
+  // Existing P2pService.ListSources callers that predate this field see
+  // SOURCE_STATUS_UNKNOWN (proto3 zero default) and can continue to call
+  // GetMetadata for the authoritative status.
+  SourceStatus status = 5;
 }
 
 message ListSourcesRequest {
