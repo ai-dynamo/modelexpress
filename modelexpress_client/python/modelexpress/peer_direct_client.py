@@ -205,6 +205,13 @@ class PeerDirectMetadataClient:
         self._pending: "queue.Queue[Any]" = queue.Queue()
         self._enumerator_thread: threading.Thread | None = None
 
+        # Static substrate: periodic re-seed so an enumeration that failed
+        # (e.g. peer not listening yet) gets retried. 5s is short enough to
+        # recover a cold-start race but long enough not to hammer peers.
+        self._static_refresh_interval_sec: float = 5.0
+        self._static_refresh_thread: threading.Thread | None = None
+        self._shutdown_event = self._shutdown_event if hasattr(self, "_shutdown_event") else threading.Event()
+
         # Shared peer state, guarded by ``self._lock``.
         self._lock = threading.Lock()
         self._peer_entries: dict[str, _PeerEntry] = {}
@@ -260,6 +267,12 @@ class PeerDirectMetadataClient:
 
         if self._substrate == "static":
             self._seed_static_peers()
+            self._static_refresh_thread = threading.Thread(
+                target=self._static_refresh_run,
+                daemon=True,
+                name="peer-direct-static-refresh",
+            )
+            self._static_refresh_thread.start()
 
         self._started = True
         logger.info(
@@ -290,6 +303,21 @@ class PeerDirectMetadataClient:
         logger.info(
             "static substrate: queued %d peer endpoint(s)", len(endpoints)
         )
+
+    def _static_refresh_run(self) -> None:
+        """Periodically re-enqueue static peers so failed enumerations retry.
+
+        Static substrate seeds the queue once at startup; if a peer's gRPC
+        server isn't up yet (cold-start race), its enumeration fails and
+        the peer is never re-probed. This loop ticks every
+        ``self._static_refresh_interval_sec`` and re-seeds the queue until
+        the client is closed.
+        """
+        while not self._shutdown_event.wait(self._static_refresh_interval_sec):
+            try:
+                self._seed_static_peers()
+            except Exception as e:
+                logger.warning("static refresh failed: %s", e)
 
     def _start_mdns(self, advertised_port: int) -> None:
         """Start mDNS discovery. Called on first publish_metadata once we
@@ -363,6 +391,10 @@ class PeerDirectMetadataClient:
         if self._enumerator_thread is not None:
             self._enumerator_thread.join(timeout=5)
         self._enumerator_thread = None
+
+        if self._static_refresh_thread is not None:
+            self._static_refresh_thread.join(timeout=5)
+        self._static_refresh_thread = None
 
         # Stop local gRPC servers.
         with self._lock:
