@@ -272,6 +272,91 @@ class TestRegisterTensorsErrorHandling:
         register_tensors(model, ctx)
 
 
+class TestRegisterTensorsReuseDiscovered:
+    """Verify the reuse_discovered flag skips walker + collect.
+
+    Used on wake / CRIU-restore paths where the weight set is unchanged
+    since initial load. Skipping the walk avoids tripping on
+    post-warmup artifacts (e.g. torch._dynamo AOT compiled functions).
+    """
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base.adopt_hidden_tensors")
+    @patch("modelexpress.load_strategy.base.collect_module_tensors")
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_reuse_skips_walk_when_ctx_has_tensors(
+        self, mock_init, mock_collect, mock_adopt, _avail,
+    ):
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        cached = {"weight_0": MagicMock(), "weight_1": MagicMock()}
+        ctx.tensors = cached
+
+        register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+        # Walk helpers must not be called.
+        mock_adopt.assert_not_called()
+        mock_collect.assert_not_called()
+        # ctx.tensors must be preserved untouched.
+        assert ctx.tensors is cached
+        # NIXL registration still happens with the cached set.
+        mock_mgr.register_tensors.assert_called_once_with(cached)
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base.adopt_hidden_tensors")
+    @patch(
+        "modelexpress.load_strategy.base.collect_module_tensors",
+        return_value={"fresh_w": MagicMock()},
+    )
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_reuse_falls_back_to_walk_when_ctx_tensors_empty(
+        self, mock_init, mock_collect, mock_adopt, _avail,
+    ):
+        """If reuse requested but no cache, fall through to discovery."""
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        # ctx.tensors defaults to {} in LoadContext.
+
+        register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+        mock_adopt.assert_called_once()
+        mock_collect.assert_called_once()
+        assert "fresh_w" in ctx.tensors
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base.adopt_hidden_tensors")
+    @patch(
+        "modelexpress.load_strategy.base.collect_module_tensors",
+        return_value={"w": MagicMock()},
+    )
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_default_behavior_unchanged(
+        self, mock_init, mock_collect, mock_adopt, _avail,
+    ):
+        """Default (reuse_discovered=False) must still run the walker."""
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        # Even if ctx.tensors is pre-populated, default mode re-walks.
+        ctx.tensors = {"stale": MagicMock()}
+
+        register_tensors(MagicMock(), ctx)
+
+        mock_adopt.assert_called_once()
+        mock_collect.assert_called_once()
+
+
 class TestPublishMetadataErrorHandling:
     """Verify publish_metadata never raises."""
 

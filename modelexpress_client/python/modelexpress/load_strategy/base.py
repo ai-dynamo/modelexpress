@@ -143,22 +143,53 @@ def _init_nixl_manager(
     return manager
 
 
-def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
+def register_tensors(
+    model: nn.Module, ctx: LoadContext, *, reuse_discovered: bool = False,
+) -> None:
     """Collect model tensors and register them with NIXL.
 
     Failures are logged but do not raise — the worker continues without
     P2P serving capability.
+
+    Args:
+        reuse_discovered: If True, skip tensor discovery (``adopt_hidden_tensors``
+            + ``collect_module_tensors``) and re-register the previously
+            collected set held in ``ctx.tensors``. Use on wake / CRIU-restore
+            paths where the weight set is unchanged from initial load.
+
+            Rationale: tensor discovery only needs to run once, when the
+            model is in its final post-``process_weights_after_loading``
+            state. Re-running it after vLLM's warmup / ``torch.compile`` /
+            CUDA graph capture is both unnecessary (the weight set is
+            frozen) and risky — post-warmup artifacts such as
+            ``torch._dynamo.aot_compile.AOTCompiledFunction`` attach to
+            ``model`` as plain attributes and reach framework objects
+            (llvmlite, ``torch.distributed`` deprecation shims,
+            HuggingFace ``_LazyAutoMapping``) that the walker was never
+            designed to traverse. P2P targets receive only the weight
+            tensors and run their own warmup / compile locally, so
+            compile artifacts are never part of what P2P must expose.
+
+            Falls back to a full walk if ``ctx.tensors`` is empty so
+            the flag is safe even if the caller misuses it.
     """
     if not is_nixl_available():
         logger.warning(f"[Worker {ctx.global_rank}] NIXL not available, skipping registration")
         return
 
     try:
-        # Order matters: adopt first so hidden tensors appear in named_buffers()
-        # before collect_module_tensors iterates them.
-        adopt_hidden_tensors(model)
-        ctx.tensors = collect_module_tensors(model)
-        log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
+        if reuse_discovered and ctx.tensors:
+            logger.info(
+                f"[Worker {ctx.global_rank}] Re-registering "
+                f"{len(ctx.tensors)} previously-discovered tensors "
+                f"(skipping model walk)"
+            )
+        else:
+            # Order matters: adopt first so hidden tensors appear in named_buffers()
+            # before collect_module_tensors iterates them.
+            adopt_hidden_tensors(model)
+            ctx.tensors = collect_module_tensors(model)
+            log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
             base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
