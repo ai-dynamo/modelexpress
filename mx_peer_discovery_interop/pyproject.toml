@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "mx-peer-discovery-interop"
+version = "0.1.0"
+description = "Cross-language interop tests between the Python and Rust halves of mx_peer_discovery"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "mx-peer-discovery",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.uv.sources]
+mx-peer-discovery = { path = "../mx_peer_discovery_py" }
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

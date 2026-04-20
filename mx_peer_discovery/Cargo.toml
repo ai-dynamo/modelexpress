@@ -14,11 +14,15 @@ keywords.workspace = true
 
 [dependencies]
 mdns-sd = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt", "sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "macros", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[[bin]]
+name = "mx-peer-discovery-test-peer"
+path = "src/bin/test_peer.rs"
 
 [lints]
 workspace = true
