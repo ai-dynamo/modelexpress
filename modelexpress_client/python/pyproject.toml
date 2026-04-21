@@ -31,7 +31,7 @@ dependencies = [
     "protobuf>=5.27.0,<6.0.0", # protobuf 5.x compatibility
     "pydantic>=2.0.0",
     "torch>=2.6.0",
-    "runai-model-streamer[s3]",
+    "runai-model-streamer[s3,gcs,azure]",
 ]
 
 [project.optional-dependencies]

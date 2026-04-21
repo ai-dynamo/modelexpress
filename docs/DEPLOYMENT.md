@@ -273,23 +273,48 @@ Targets auto-detect which mode a source is using based on whether `worker_grpc_e
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
-### ModelStreamer (S3 Object Storage)
+### ModelStreamer (Object Storage & Local Disk)
 
-ModelStreamer enables streaming safetensors directly from S3/S3-compatible storage to GPU memory without writing to disk. The first pod streams from S3; subsequent pods use P2P RDMA from the first pod's GPU memory.
+ModelStreamer streams safetensors directly to GPU memory via `runai-model-streamer`. Supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. The first pod streams from storage; subsequent pods use P2P RDMA from GPU memory.
 
-`runai-model-streamer[s3]` is included as a core dependency of the `modelexpress` package — no extra install step needed. Set `MX_S3_URI` to enable the ModelStreamer strategy.
+All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. The strategy activates when `MX_MODEL_URI` is set.
+
+**General configuration:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_S3_URI` | (none) | S3 model location (e.g., `s3://bucket/path/to/model`). When set, enables the ModelStreamer strategy. |
-| `AWS_ACCESS_KEY_ID` | (none) | S3 credentials (read by boto3 and runai-model-streamer) |
-| `AWS_SECRET_ACCESS_KEY` | (none) | S3 credentials |
-| `AWS_DEFAULT_REGION` | (none) | AWS region (required by some backends) |
-| `AWS_ENDPOINT_URL` | (none) | Custom endpoint for S3-compatible storage (MinIO, Ceph, etc.) |
+| `MX_MODEL_URI` | (none) | Model location. Must be set to enable ModelStreamer. Accepts: remote URI (`s3://bucket/model`, `gs://...`, `az://...`), absolute local path (`/models/deepseek-ai/DeepSeek-V3`), or HuggingFace model ID (`deepseek-ai/DeepSeek-V3` — resolved via `HF_HUB_CACHE`). |
 | `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
-| `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). When unset, runai-model-streamer allocates based on file size — see [runai-model-streamer docs](https://github.com/run-ai/model-streamer). |
+| `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). See [runai-model-streamer docs](https://github.com/run-ai/model-streamer). |
 
-Credentials are injected via standard AWS mechanisms (EKS Pod Identity, IRSA, or K8s secrets mounted as env vars). No credentials flow through the MX server or gRPC.
+**S3 / S3-compatible:**
+
+| Variable | Description |
+|----------|-------------|
+| `AWS_ACCESS_KEY_ID` | S3 credentials (auto-detected by boto3) |
+| `AWS_SECRET_ACCESS_KEY` | S3 credentials |
+| `AWS_SESSION_TOKEN` | Required for temporary credentials (SSO/IRSA) |
+| `AWS_DEFAULT_REGION` | AWS region |
+| `AWS_ENDPOINT_URL` | Custom endpoint for S3-compatible storage (MinIO, Ceph) |
+
+**Google Cloud Storage:**
+
+| Variable | Description |
+|----------|-------------|
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account JSON key file |
+
+Also supports GKE Workload Identity and Application Default Credentials (ADC) — no env vars needed when running on GKE with a properly configured service account.
+
+**Azure Blob Storage:**
+
+| Variable | Description |
+|----------|-------------|
+| `AZURE_ACCOUNT_NAME` | Storage account name |
+| `AZURE_ACCOUNT_KEY` | Storage account access key |
+
+Or use service principal auth (`AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` + `AZURE_TENANT_ID`) or Azure Managed Identity (no env vars needed on AKS).
+
+Credentials are auto-detected by the underlying cloud SDKs. No credentials flow through the MX server or gRPC.
 
 ### UCX/NIXL Tuning
 
