@@ -9,9 +9,9 @@
 # Alternatively, build from the dynamo repo with MX integrated:
 #   cd path/to/dynamo
 #   python container/render.py --framework vllm --target runtime \
-#       --platform amd64 --cuda-version 12.9 --show-result
+#       --platform amd64 --cuda-version 12.9 --output-short-filename
 #   docker build --platform linux/amd64 \
-#       -f container/vllm-runtime-cuda12.9-amd64-rendered.Dockerfile \
+#       -f container/rendered.Dockerfile \
 #       --build-arg ENABLE_MODELEXPRESS_P2P=true \
 #       --build-arg MODELEXPRESS_REF=main \
 #       -t <your-tag> .

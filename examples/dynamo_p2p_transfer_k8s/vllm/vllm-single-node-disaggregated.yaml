@@ -4,7 +4,7 @@
 # Single-node vLLM DynamoGraphDeployment with disaggregated prefill/decode
 # AND ModelExpress P2P weight transfer.
 #
-# Each worker replica fits on ONE node with TP=8, PP=1. This avoids the known
+# Each worker replica fits on ONE node with TP=4, PP=1. This avoids the known
 # vLLM bug where PP>1 + disaggregated NixlConnector trips a block_lens
 # IndexError in `_validate_remote_agent_handshake` (see
 # https://github.com/vllm-project/vllm/issues/22430).
@@ -128,8 +128,8 @@ spec:
           - key: dra
             operator: Exists
             effect: NoSchedule
-        # Keep decode replicas on distinct nodes so each replica uses a full
-        # 8-GPU node's worth of RDMA bandwidth.
+        # Keep decode replicas on distinct nodes so each replica gets a full
+        # node's GPU/RDMA bandwidth.
         affinity:
           podAntiAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
