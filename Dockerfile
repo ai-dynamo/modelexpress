@@ -18,6 +18,18 @@ RUN cargo build --release --bin modelexpress-server && \
     cargo build --release --bin test_client && \
     cargo build --release --bin fallback_test
 
+# Generate third-party license attributions
+FROM builder AS attributions
+
+RUN cargo install cargo-about --locked
+RUN cargo about generate --format json -o /tmp/licenses.json && \
+    python3 scripts/generate_attributions.py /tmp/licenses.json
+
+# Snapshot base image packages before installing runtime dependencies
+FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS base-snapshot
+
+RUN dpkg-query -W -f '${Package}\n' | sort > /tmp/base_packages.txt
+
 # Create a minimal runtime image
 FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS runtime
 
@@ -34,8 +46,8 @@ COPY --from=builder /app/target/release/modelexpress-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/fallback_test .
 
-# Copy the Attribution files
-COPY ATTRIBUTIONS_Rust.md .
+# Copy the generated attribution file
+COPY --from=attributions /app/ATTRIBUTIONS_Rust.md .
 
 # Expose the default port
 EXPOSE 8001
@@ -49,3 +61,11 @@ ENV HF_HUB_CACHE=/app/cache
 
 # Run the server by default
 CMD ["./modelexpress-server"]
+
+# Extract dpkg dependency information from the runtime image
+FROM runtime AS dpkg-deps
+
+COPY --from=attributions /app/rust_deps.csv .
+COPY scripts/calculate_dpkg_deps.py /tmp/
+COPY --from=base-snapshot /tmp/base_packages.txt /tmp/base_packages.txt
+RUN python3 /tmp/calculate_dpkg_deps.py --baseline /tmp/base_packages.txt /app/dpkg_deps.csv

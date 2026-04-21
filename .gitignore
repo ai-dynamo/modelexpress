@@ -74,3 +74,8 @@ docs/troubleshooting_*.md
 docs/trtllm_*.md
 docs/weight_correctness_*.md
 docs/CONTEXT.md
+
+# Generated attribution files (built in container)
+ATTRIBUTIONS_Rust.md
+rust_deps.csv
+dpkg_deps.csv

@@ -246,7 +246,23 @@ jobs:
 
     - name: Build Docker image
       run: |
-        docker build -t model-express:latest .
+        docker build --target runtime -t model-express:latest .
+
+    - name: Extract dependency attributions
+      run: |
+        docker build --target dpkg-deps -t model-express-dpkg-deps .
+        docker create --name dpkg-deps model-express-dpkg-deps
+        docker cp dpkg-deps:/app/dpkg_deps.csv dpkg_deps.csv
+        docker cp dpkg-deps:/app/rust_deps.csv rust_deps.csv
+        docker rm dpkg-deps
+
+    - name: Upload dependency attributions
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-attributions
+        path: |
+          dpkg_deps.csv
+          rust_deps.csv
 
     - name: Test Docker image
       run: |
