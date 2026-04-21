@@ -1,12 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ModelStreamer loading strategy: stream safetensors from S3 to GPU via runai-model-streamer."""
+"""ModelStreamer loading strategy: stream safetensors via runai-model-streamer.
+
+Supports object storage (S3, GCS, Azure Blob) and local filesystem paths.
+File resolution is delegated to runai_model_streamer.list_safetensors(),
+which handles all backends transparently.
+"""
 
 from __future__ import annotations
 
 import importlib.util
-import json
 import logging
 import os
 import time
@@ -23,28 +27,71 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 _LOG_INTERVAL_SECS = 30
 
 
+_REMOTE_SCHEMES = ("s3://", "gs://", "az://")
+
+
+def _resolve_model_uri(uri: str) -> str:
+    """Resolve MX_MODEL_URI to a path that runai-model-streamer can read.
+
+    - s3://, gs://, az:// -> pass through (remote storage)
+    - /absolute/path -> pass through (local filesystem)
+    - org/model-name -> resolve via HuggingFace Hub cache
+      (HF_HUB_CACHE, HF_HOME/hub, or ~/.cache/huggingface/hub)
+    """
+    if any(uri.startswith(s) for s in _REMOTE_SCHEMES) or os.path.isabs(uri):
+        return uri
+
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_dir = os.environ.get("HF_HUB_CACHE")
+        if not cache_dir:
+            hf_home = os.environ.get("HF_HOME")
+            if hf_home:
+                cache_dir = os.path.join(hf_home, "hub")
+        cache_info = scan_cache_dir(cache_dir) if cache_dir else scan_cache_dir()
+        for repo in cache_info.repos:
+            if repo.repo_id == uri:
+                rev = max(repo.revisions, key=lambda r: r.last_modified)
+                logger.info(f"Resolved HF model '{uri}' -> {rev.snapshot_path}")
+                return str(rev.snapshot_path)
+    except Exception as e:
+        logger.warning(f"Failed to resolve HF cache for '{uri}': {e}")
+
+    return uri
+
+
 class ModelStreamerStrategy(LoadStrategy):
-    """Load weights by streaming safetensors from S3 via runai-model-streamer."""
+    """Load weights by streaming safetensors via runai-model-streamer.
+
+    Activated by setting MX_MODEL_URI. Supported formats:
+      - Remote: s3://bucket/model, gs://bucket/model, az://container/model
+      - Local absolute path: /models/deepseek-ai/DeepSeek-V3
+      - HF model ID: deepseek-ai/DeepSeek-V3 (resolved via HF_HUB_CACHE)
+    """
 
     name = "model_streamer"
 
     def is_available(self, ctx: LoadContext) -> bool:
-        s3_uri = os.environ.get("MX_S3_URI", "")
-        if not s3_uri:
-            logger.info(f"[Worker {ctx.global_rank}] MX_S3_URI not set, skipping model streamer")
-            return False
         if importlib.util.find_spec("runai_model_streamer") is None:
             logger.info(
                 f"[Worker {ctx.global_rank}] runai_model_streamer not installed, skipping"
             )
             return False
+
+        model_uri = os.environ.get("MX_MODEL_URI", "")
+        if not model_uri:
+            logger.info(
+                f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
+            )
+            return False
         return True
 
     def load(self, model: nn.Module, ctx: LoadContext) -> bool:
-        s3_uri = os.environ["MX_S3_URI"]
-        logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {s3_uri}")
+        model_uri = _resolve_model_uri(os.environ["MX_MODEL_URI"])
+
+        logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:
-            weights_iter = self._stream_weights(s3_uri, ctx)
+            weights_iter = self._stream_weights(model_uri, ctx)
             model.load_weights(weights_iter)
             logger.info(f"[Worker {ctx.global_rank}] Model streamer weight loading complete")
         except Exception as e:
@@ -62,14 +109,17 @@ class ModelStreamerStrategy(LoadStrategy):
         return True
 
     def _stream_weights(
-        self, s3_uri: str, ctx: LoadContext
+        self, model_uri: str, ctx: LoadContext
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        from runai_model_streamer import SafetensorsStreamer
+        from runai_model_streamer import SafetensorsStreamer, list_safetensors
 
-        file_uris = self._resolve_s3_safetensors(s3_uri)
+        file_uris = list_safetensors(model_uri)
+        if not file_uris:
+            raise FileNotFoundError(f"No safetensors files found at {model_uri}")
+
         logger.info(
             f"[Worker {ctx.global_rank}] Streaming {len(file_uris)} safetensors files "
-            f"from {s3_uri}"
+            f"from {model_uri}"
         )
 
         start = time.perf_counter()
@@ -87,7 +137,7 @@ class ModelStreamerStrategy(LoadStrategy):
                     pct = count / total_tensors * 100 if total_tensors else 0
                     elapsed = now - start
                     logger.info(
-                        f"[Worker {ctx.global_rank}] S3 streaming: "
+                        f"[Worker {ctx.global_rank}] Streaming: "
                         f"{count}/{total_tensors} tensors ({pct:.0f}%) "
                         f"in {elapsed:.0f}s"
                     )
@@ -98,48 +148,4 @@ class ModelStreamerStrategy(LoadStrategy):
         elapsed = time.perf_counter() - start
         logger.info(f"[Worker {ctx.global_rank}] Streamed all weights in {elapsed:.1f}s")
 
-    @staticmethod
-    def _resolve_s3_safetensors(s3_uri: str) -> list[str]:
-        """Resolve safetensors file URIs from an S3 prefix.
 
-        Tries model.safetensors.index.json first, then falls back to
-        listing all .safetensors files under the prefix.
-        """
-        if not s3_uri.startswith("s3://"):
-            raise ValueError(f"Expected s3:// URI, got: {s3_uri}")
-
-        import boto3
-        from botocore.exceptions import ClientError
-
-        path = s3_uri.removeprefix("s3://")
-        bucket, _, prefix = path.partition("/")
-        prefix = prefix.rstrip("/")
-
-        s3 = boto3.client("s3")
-
-        index_key = f"{prefix}/model.safetensors.index.json"
-        try:
-            resp = s3.get_object(Bucket=bucket, Key=index_key)
-            index = json.loads(resp["Body"].read())
-            weight_map = index.get("weight_map", {})
-            filenames = sorted(set(weight_map.values()))
-            if filenames:
-                return [f"s3://{bucket}/{prefix}/{fn}" for fn in filenames]
-        except ClientError as e:
-            if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
-                pass
-            else:
-                raise
-
-        paginator = s3.get_paginator("list_objects_v2")
-        uris: list[str] = []
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".safetensors"):
-                    uris.append(f"s3://{bucket}/{key}")
-
-        if not uris:
-            raise FileNotFoundError(f"No .safetensors files found at {s3_uri}")
-
-        return sorted(uris)

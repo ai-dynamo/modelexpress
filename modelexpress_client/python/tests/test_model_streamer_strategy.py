@@ -3,43 +3,12 @@
 
 """Tests for ModelStreamerStrategy."""
 
-import json
-import sys
-from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from modelexpress import p2p_pb2
-
-
-# ---------------------------------------------------------------------------
-# boto3 / botocore mock helpers (not installed in dev environment)
-# ---------------------------------------------------------------------------
-
-
-class _MockClientError(Exception):
-    """Stand-in for botocore.exceptions.ClientError."""
-
-    def __init__(self, error_response, operation_name):
-        self.response = error_response
-        self.operation_name = operation_name
-        super().__init__(f"{operation_name}: {error_response}")
-
-
-def _boto3_modules():
-    """Return a dict of mock modules to inject into sys.modules for boto3/botocore."""
-    mock_boto3 = MagicMock()
-    mock_botocore = MagicMock()
-    mock_botocore_exceptions = MagicMock()
-    mock_botocore_exceptions.ClientError = _MockClientError
-    mock_botocore.exceptions = mock_botocore_exceptions
-    return {
-        "boto3": mock_boto3,
-        "botocore": mock_botocore,
-        "botocore.exceptions": mock_botocore_exceptions,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +45,38 @@ class TestModelStreamerIsAvailable:
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
 
-    def test_available_when_env_and_package(self):
+    def test_available_with_s3_uri(self):
         ctx = _make_load_context()
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_S3_URI": "s3://bucket/model"}):
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is True
+
+    def test_available_with_local_path_env(self):
+        ctx = _make_load_context()
+        strategy = self._make_strategy()
+        with patch.dict("os.environ", {"MX_MODEL_URI": "/models/deepseek"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is True
+
+    def test_available_with_gcs_uri(self):
+        ctx = _make_load_context()
+        strategy = self._make_strategy()
+        with patch.dict("os.environ", {"MX_MODEL_URI": "gs://bucket/model"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is True
+
+    def test_available_with_local_path(self):
+        ctx = _make_load_context()
+        strategy = self._make_strategy()
+        with patch.dict("os.environ", {"MX_MODEL_URI": "/models/deepseek-ai/DeepSeek-V3"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is True
+
+    def test_available_with_hf_model_id(self):
+        ctx = _make_load_context()
+        strategy = self._make_strategy()
+        with patch.dict("os.environ", {"MX_MODEL_URI": "deepseek-ai/DeepSeek-V3"}):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is True
 
@@ -87,18 +84,13 @@ class TestModelStreamerIsAvailable:
         ctx = _make_load_context()
         strategy = self._make_strategy()
         with patch.dict("os.environ", {}, clear=True):
-            assert strategy.is_available(ctx) is False
-
-    def test_unavailable_empty_env(self):
-        ctx = _make_load_context()
-        strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_S3_URI": ""}):
-            assert strategy.is_available(ctx) is False
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is False
 
     def test_unavailable_no_package(self):
         ctx = _make_load_context()
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_S3_URI": "s3://bucket/model"}):
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
             with patch("importlib.util.find_spec", return_value=None):
                 assert strategy.is_available(ctx) is False
 
@@ -116,12 +108,7 @@ class TestModelStreamerLoad:
     @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     @patch("modelexpress.load_strategy.model_streamer_strategy.capture_tensor_attrs")
-    @patch(
-        "modelexpress.load_strategy.model_streamer_strategy."
-        "ModelStreamerStrategy._resolve_s3_safetensors"
-    )
-    def test_success_path(self, mock_resolve, mock_capture, mock_register, mock_publish):
-        mock_resolve.return_value = ["s3://bucket/model/shard-00001.safetensors"]
+    def test_success_path_s3(self, mock_capture, mock_register, mock_publish):
         mock_capture.return_value.__enter__ = MagicMock()
         mock_capture.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -129,20 +116,19 @@ class TestModelStreamerLoad:
         ctx = _make_load_context()
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_S3_URI": "s3://bucket/model"}):
-            with patch.dict("sys.modules", {"runai_model_streamer": MagicMock()}):
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights"
+            ) as mock_stream:
+                mock_stream.return_value = iter([
+                    ("layer.0.weight", torch.randn(4, 4)),
+                    ("layer.1.weight", torch.randn(4, 4)),
+                ])
                 with patch(
-                    "modelexpress.load_strategy.model_streamer_strategy."
-                    "ModelStreamerStrategy._stream_weights"
-                ) as mock_stream:
-                    mock_stream.return_value = iter([
-                        ("layer.0.weight", torch.randn(4, 4)),
-                        ("layer.1.weight", torch.randn(4, 4)),
-                    ])
-                    with patch(
-                        "vllm.model_executor.model_loader.utils.process_weights_after_loading"
-                    ):
-                        result = strategy.load(model, ctx)
+                    "vllm.model_executor.model_loader.utils.process_weights_after_loading"
+                ):
+                    result = strategy.load(model, ctx)
 
         assert result is True
         model.load_weights.assert_called_once()
@@ -151,12 +137,60 @@ class TestModelStreamerLoad:
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    @patch("modelexpress.load_strategy.model_streamer_strategy.capture_tensor_attrs")
+    def test_success_path_local(self, mock_capture, mock_register, mock_publish):
+        """load() works with a local path in MX_MODEL_URI."""
+        mock_capture.return_value.__enter__ = MagicMock()
+        mock_capture.return_value.__exit__ = MagicMock(return_value=False)
+
+        model = MagicMock()
+        ctx = _make_load_context()
+        strategy = self._make_strategy()
+
+        with patch.dict("os.environ", {"MX_MODEL_URI": "/models/llama"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights"
+            ) as mock_stream:
+                mock_stream.return_value = iter([
+                    ("layer.0.weight", torch.randn(4, 4)),
+                ])
+                with patch(
+                    "vllm.model_executor.model_loader.utils.process_weights_after_loading"
+                ):
+                    result = strategy.load(model, ctx)
+
+        assert result is True
+        mock_stream.assert_called_once_with("/models/llama", ctx)
+
+    @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    def test_env_overrides_model_config(self, mock_register, mock_publish):
+        """MX_MODEL_URI takes priority over model_config.model."""
+        model = MagicMock()
+        model_config = MagicMock()
+        model_config.model = "/models/local-llama"
+        ctx = _make_load_context(model_config=model_config)
+        strategy = self._make_strategy()
+
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights"
+            ) as mock_stream:
+                mock_stream.side_effect = RuntimeError("expected")
+                strategy.load(model, ctx)
+
+        mock_stream.assert_called_once_with("s3://bucket/model", ctx)
+
+    @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_returns_false_on_error(self, mock_register, mock_publish):
         model = MagicMock()
         ctx = _make_load_context()
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_S3_URI": "s3://bucket/model"}):
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
             with patch(
                 "modelexpress.load_strategy.model_streamer_strategy."
                 "ModelStreamerStrategy._stream_weights",
@@ -170,99 +204,108 @@ class TestModelStreamerLoad:
 
 
 # ---------------------------------------------------------------------------
-# TestResolveS3Safetensors
+# TestStreamWeights
 # ---------------------------------------------------------------------------
 
 
-class TestResolveS3Safetensors:
+class TestResolveModelUri:
+    def _resolve(self, uri, **env_overrides):
+        from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
+        with patch.dict("os.environ", env_overrides, clear=True):
+            return _resolve_model_uri(uri)
+
+    def test_s3_passthrough(self):
+        assert self._resolve("s3://bucket/model") == "s3://bucket/model"
+
+    def test_gs_passthrough(self):
+        assert self._resolve("gs://bucket/model") == "gs://bucket/model"
+
+    def test_az_passthrough(self):
+        assert self._resolve("az://container/model") == "az://container/model"
+
+    def test_absolute_path_passthrough(self):
+        assert self._resolve("/models/deepseek-ai/DeepSeek-V3") == "/models/deepseek-ai/DeepSeek-V3"
+
+    def _mock_hf_cache(self, repos):
+        mock_cache = MagicMock()
+        mock_cache.repos = repos
+        mock_scan = MagicMock(return_value=mock_cache)
+        mock_hf_hub = MagicMock()
+        mock_hf_hub.scan_cache_dir = mock_scan
+        return mock_hf_hub, mock_scan
+
+    def test_hf_model_id_resolved_via_cache(self):
+        mock_rev = MagicMock()
+        mock_rev.snapshot_path = "/cache/models--org--name/snapshots/abc123"
+        mock_rev.last_modified = 1000
+        mock_repo = MagicMock()
+        mock_repo.repo_id = "org/name"
+        mock_repo.revisions = [mock_rev]
+
+        mock_hf_hub, mock_scan = self._mock_hf_cache([mock_repo])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            result = self._resolve("org/name", HF_HUB_CACHE="/cache")
+
+        assert result == "/cache/models--org--name/snapshots/abc123"
+        mock_scan.assert_called_once_with("/cache")
+
+    def test_hf_home_fallback_appends_hub(self):
+        mock_hf_hub, mock_scan = self._mock_hf_cache([])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            self._resolve("org/name", HF_HOME="/home/user/.cache/huggingface")
+
+        mock_scan.assert_called_once_with("/home/user/.cache/huggingface/hub")
+
+    def test_unresolved_hf_id_returned_as_is(self):
+        mock_hf_hub, _ = self._mock_hf_cache([])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            assert self._resolve("org/unknown-model", HF_HUB_CACHE="/cache") == "org/unknown-model"
+
+    def test_no_cache_env_scans_default_cache(self):
+        """When no cache env is set, scan_cache_dir() is called with no args (uses ~/.cache/huggingface/hub)."""
+        mock_hf_hub, mock_scan = self._mock_hf_cache([])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            assert self._resolve("org/unknown") == "org/unknown"
+
+        mock_scan.assert_called_once_with()
+
+    def test_no_cache_env_resolves_via_default_cache(self):
+        """Model IDs can be resolved via the default HF cache even when no env vars are set."""
+        mock_rev = MagicMock()
+        mock_rev.snapshot_path = "/home/user/.cache/huggingface/hub/models--org--name/snapshots/abc123"
+        mock_rev.last_modified = 1000
+        mock_repo = MagicMock()
+        mock_repo.repo_id = "org/name"
+        mock_repo.revisions = [mock_rev]
+
+        mock_hf_hub, mock_scan = self._mock_hf_cache([mock_repo])
+        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
+            result = self._resolve("org/name")
+
+        assert result == "/home/user/.cache/huggingface/hub/models--org--name/snapshots/abc123"
+        mock_scan.assert_called_once_with()
+
+
+class TestStreamWeights:
     def _make_strategy(self):
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
 
-    def test_resolves_from_index(self):
+    def test_raises_when_no_files(self):
         strategy = self._make_strategy()
+        ctx = _make_load_context()
 
-        index_data = {
-            "weight_map": {
-                "model.layer.0.weight": "model-00001-of-00002.safetensors",
-                "model.layer.1.weight": "model-00001-of-00002.safetensors",
-                "model.layer.2.weight": "model-00002-of-00002.safetensors",
-            }
-        }
-        body = BytesIO(json.dumps(index_data).encode())
+        mock_list = MagicMock(return_value=[])
+        mock_streamer = MagicMock()
 
-        mock_client = MagicMock()
-        mock_client.get_object.return_value = {"Body": body}
-
-        modules = _boto3_modules()
-        modules["boto3"].client.return_value = mock_client
-
-        with patch.dict(sys.modules, modules):
-            result = strategy._resolve_s3_safetensors("s3://my-bucket/models/llama")
-
-        assert result == [
-            "s3://my-bucket/models/llama/model-00001-of-00002.safetensors",
-            "s3://my-bucket/models/llama/model-00002-of-00002.safetensors",
-        ]
-        mock_client.get_object.assert_called_once_with(
-            Bucket="my-bucket",
-            Key="models/llama/model.safetensors.index.json",
-        )
-
-    def test_fallback_to_listing(self):
-        strategy = self._make_strategy()
-
-        error_response = {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}
-
-        mock_client = MagicMock()
-        mock_client.get_object.side_effect = _MockClientError(error_response, "GetObject")
-
-        mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [
-            {
-                "Contents": [
-                    {"Key": "models/llama/model-00001.safetensors"},
-                    {"Key": "models/llama/model-00002.safetensors"},
-                    {"Key": "models/llama/config.json"},
-                ]
-            }
-        ]
-        mock_client.get_paginator.return_value = mock_paginator
-
-        modules = _boto3_modules()
-        modules["boto3"].client.return_value = mock_client
-
-        with patch.dict(sys.modules, modules):
-            result = strategy._resolve_s3_safetensors("s3://my-bucket/models/llama")
-
-        assert result == [
-            "s3://my-bucket/models/llama/model-00001.safetensors",
-            "s3://my-bucket/models/llama/model-00002.safetensors",
-        ]
-
-    def test_raises_no_files(self):
-        strategy = self._make_strategy()
-
-        error_response = {"Error": {"Code": "NoSuchKey", "Message": "Not found"}}
-
-        mock_client = MagicMock()
-        mock_client.get_object.side_effect = _MockClientError(error_response, "GetObject")
-
-        mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [{"Contents": []}]
-        mock_client.get_paginator.return_value = mock_paginator
-
-        modules = _boto3_modules()
-        modules["boto3"].client.return_value = mock_client
-
-        with patch.dict(sys.modules, modules):
-            with pytest.raises(FileNotFoundError, match=r"No \.safetensors files found"):
-                strategy._resolve_s3_safetensors("s3://my-bucket/models/llama")
-
-    def test_rejects_non_s3_uri(self):
-        strategy = self._make_strategy()
-        with pytest.raises(ValueError, match="Expected s3:// URI"):
-            strategy._resolve_s3_safetensors("gs://bucket/model")
+        with patch.dict("sys.modules", {
+            "runai_model_streamer": MagicMock(
+                list_safetensors=mock_list,
+                SafetensorsStreamer=mock_streamer,
+            ),
+        }):
+            with pytest.raises(FileNotFoundError, match="No safetensors files found"):
+                list(strategy._stream_weights("s3://empty-bucket/model", ctx))
 
 
 # ---------------------------------------------------------------------------
