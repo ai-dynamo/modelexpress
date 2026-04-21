@@ -357,6 +357,59 @@ class TestRegisterTensorsReuseDiscovered:
         mock_collect.assert_called_once()
 
 
+class TestNixlTransferManagerDictOwnership:
+    """Regression: NixlTransferManager must not mutate the caller's tensor dict.
+
+    Historically, register_tensors aliased the caller's dict via
+    `self._tensors = tensors`, and shutdown() then called
+    `self._tensors.clear()`. Combined, shutdown wiped the caller's dict
+    in place. This silently broke reuse_discovered=True on wake, because
+    mx_teardown calls nixl_manager.shutdown() while expecting
+    ctx.tensors (the caller-owned dict) to survive for mx_bringup to reuse.
+    """
+
+    def test_register_tensors_does_not_alias_caller_dict(self):
+        mgr = NixlTransferManager(agent_name="t", device_id=0)
+        mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b""
+
+        caller = {"a": torch.zeros(2), "b": torch.zeros(3)}
+        mgr.register_tensors(caller)
+
+        # Manager must own a distinct dict.
+        assert caller is not mgr._tensors
+        # Contents equivalent.
+        assert set(caller) == set(mgr._tensors)
+        assert caller["a"] is mgr._tensors["a"]  # tensor identity preserved
+
+    def test_shutdown_does_not_mutate_caller_dict(self):
+        mgr = NixlTransferManager(agent_name="t", device_id=0)
+        mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b""
+
+        caller = {"a": torch.zeros(2), "b": torch.zeros(3)}
+        mgr.register_tensors(caller)
+        mgr.shutdown()
+
+        # Caller's dict must survive shutdown — even if a future caller
+        # aliases it by assigning self._tensors directly, shutdown
+        # rebinds rather than mutating.
+        assert len(caller) == 2
+        assert set(caller) == {"a", "b"}
+
+    def test_shutdown_rebinds_even_under_forced_aliasing(self):
+        """Defense in depth: if something bypasses register_tensors and
+        aliases _tensors directly, shutdown still must not mutate it."""
+        mgr = NixlTransferManager(agent_name="t", device_id=0)
+        forced_alias = {"x": torch.zeros(1)}
+        mgr._tensors = forced_alias   # skip the defensive copy in register_tensors
+
+        mgr.shutdown()
+
+        assert len(forced_alias) == 1
+        assert "x" in forced_alias
+
+
 class TestPublishMetadataErrorHandling:
     """Verify publish_metadata never raises."""
 
