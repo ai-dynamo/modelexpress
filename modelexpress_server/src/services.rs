@@ -877,6 +877,111 @@ mod tests {
         assert!(!waiters);
     }
 
+    #[tokio::test]
+    async fn test_tracker_set_status_delegates_without_message() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_set_status()
+            .withf(|_, _, status, msg| *status == ModelStatus::DOWNLOADING && msg.is_none())
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        tracker
+            .set_status(
+                "m".to_string(),
+                ModelStatus::DOWNLOADING,
+                ModelProvider::HuggingFace,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_tracker_error_status_clears_waiters() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_set_status()
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("m", tx);
+        tracker
+            .set_status_and_notify(
+                "m".to_string(),
+                ModelStatus::ERROR,
+                ModelProvider::HuggingFace,
+                Some("fail".to_string()),
+            )
+            .await;
+        let waiters = tracker
+            .waiting_channels
+            .lock()
+            .expect("waiters lock")
+            .get("m")
+            .map_or(0, std::vec::Vec::len);
+        assert_eq!(waiters, 0, "ERROR is terminal, waiters must be cleared");
+    }
+
+    #[tokio::test]
+    async fn test_tracker_downloading_status_keeps_waiters() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_set_status()
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("m", tx);
+        tracker
+            .set_status_and_notify(
+                "m".to_string(),
+                ModelStatus::DOWNLOADING,
+                ModelProvider::HuggingFace,
+                None,
+            )
+            .await;
+        let waiters = tracker
+            .waiting_channels
+            .lock()
+            .expect("waiters lock")
+            .get("m")
+            .map_or(0, std::vec::Vec::len);
+        assert_eq!(
+            waiters, 1,
+            "DOWNLOADING is non-terminal, waiter must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tracker_set_status_swallows_backend_error() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_set_status()
+            .once()
+            .returning(|_, _, _, _| Err("redis down".into()));
+        let tracker = tracker_with_mock(mock);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("m", tx);
+        // Error is logged but set_status_and_notify returns ()
+        tracker
+            .set_status_and_notify(
+                "m".to_string(),
+                ModelStatus::DOWNLOADED,
+                ModelProvider::HuggingFace,
+                None,
+            )
+            .await;
+        // Nothing should be notified on the channel because set_status failed early.
+        assert!(
+            rx.try_recv().is_err(),
+            "waiter shouldn't receive on backend error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_tracker_uninitialized_returns_none() {
+        // The process-wide MODEL_TRACKER hasn't been init'd in tests, so
+        // model_tracker() returns None — the service layer uses this to respond with
+        // Status::unavailable rather than panic.
+        assert!(model_tracker().is_none());
+    }
+
     #[test]
     fn test_collect_model_files_empty_dir() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");

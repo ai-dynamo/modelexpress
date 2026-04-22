@@ -117,4 +117,92 @@ mod tests {
             "error should echo bad value: {err}"
         );
     }
+
+    #[test]
+    fn rejects_empty_backend_type() {
+        let err = BackendConfig::from_type_str("MX_METADATA_BACKEND", "", "", "")
+            .expect_err("empty should reject");
+        assert!(err.contains("''"), "error should echo empty value: {err}");
+    }
+
+    #[test]
+    fn display_renders_backend_name() {
+        let redis = BackendConfig::Redis {
+            url: "redis://host:6379".to_string(),
+        };
+        assert_eq!(redis.to_string(), "redis");
+        let k8s = BackendConfig::Kubernetes {
+            namespace: "prod".to_string(),
+        };
+        assert_eq!(k8s.to_string(), "kubernetes");
+    }
+
+    /// The `from_env` / `redis_url_from_env` / `k8s_namespace_from_env` helpers read
+    /// process-global env vars. Tests that mutate env have to acquire a mutex to stay
+    /// serialized, since `cargo test` runs with multiple threads by default.
+    use modelexpress_common::test_support::{EnvVarGuard, acquire_env_mutex};
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn from_env_reads_mx_metadata_backend() {
+        let lock = acquire_env_mutex();
+        let _g1 = EnvVarGuard::set(&lock, "MX_METADATA_BACKEND", "redis");
+        let _g2 = EnvVarGuard::set(&lock, "REDIS_URL", "redis://myhost:7777");
+        let cfg = BackendConfig::from_env().expect("from_env redis");
+        assert!(matches!(cfg, BackendConfig::Redis { url } if url == "redis://myhost:7777"));
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn from_env_accepts_kubernetes_aliases() {
+        let lock = acquire_env_mutex();
+        let _g1 = EnvVarGuard::set(&lock, "MX_METADATA_BACKEND", "k8s");
+        let _g2 = EnvVarGuard::set(&lock, "POD_NAMESPACE", "test-ns");
+        let cfg = BackendConfig::from_env().expect("from_env k8s alias");
+        assert!(matches!(cfg, BackendConfig::Kubernetes { namespace } if namespace == "test-ns"));
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn from_env_errors_when_backend_unset() {
+        let lock = acquire_env_mutex();
+        let _g = EnvVarGuard::remove(&lock, "MX_METADATA_BACKEND");
+        let err = BackendConfig::from_env().expect_err("should reject missing backend");
+        assert!(err.contains("MX_METADATA_BACKEND"));
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn redis_url_from_env_honors_explicit_url_over_host_port() {
+        let lock = acquire_env_mutex();
+        let _g1 = EnvVarGuard::set(&lock, "REDIS_URL", "redis://explicit:1234");
+        let _g2 = EnvVarGuard::set(&lock, "MX_REDIS_HOST", "other");
+        let _g3 = EnvVarGuard::set(&lock, "MX_REDIS_PORT", "9999");
+        assert_eq!(BackendConfig::redis_url_from_env(), "redis://explicit:1234");
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn redis_url_from_env_builds_from_host_port_when_url_missing() {
+        let lock = acquire_env_mutex();
+        let _g1 = EnvVarGuard::remove(&lock, "REDIS_URL");
+        let _g2 = EnvVarGuard::set(&lock, "MX_REDIS_HOST", "myhost");
+        let _g3 = EnvVarGuard::set(&lock, "MX_REDIS_PORT", "6380");
+        assert_eq!(BackendConfig::redis_url_from_env(), "redis://myhost:6380");
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn redis_url_from_env_defaults_localhost_when_all_missing() {
+        let lock = acquire_env_mutex();
+        let _g1 = EnvVarGuard::remove(&lock, "REDIS_URL");
+        let _g2 = EnvVarGuard::remove(&lock, "MX_REDIS_HOST");
+        let _g3 = EnvVarGuard::remove(&lock, "REDIS_HOST");
+        let _g4 = EnvVarGuard::remove(&lock, "MX_REDIS_PORT");
+        let _g5 = EnvVarGuard::remove(&lock, "REDIS_PORT");
+        assert_eq!(
+            BackendConfig::redis_url_from_env(),
+            "redis://localhost:6379"
+        );
+    }
 }
