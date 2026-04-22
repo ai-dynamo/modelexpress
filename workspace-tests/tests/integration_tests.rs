@@ -4,7 +4,10 @@
 #![allow(clippy::expect_used)]
 
 use modelexpress_client::{Client, ClientConfig};
-use modelexpress_common::{constants, download, models::ModelProvider};
+use modelexpress_common::{
+    constants, download,
+    models::{ModelProvider, WeightFormat},
+};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -18,6 +21,7 @@ async fn download_model_directly(
     model_name: &str,
     provider: ModelProvider,
     ignore_weights: bool,
+    weight_format: WeightFormat,
 ) -> Result<(), modelexpress_common::Error> {
     let cache_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
 
@@ -26,6 +30,7 @@ async fn download_model_directly(
         provider,
         Some(cache_dir.path().to_path_buf()),
         ignore_weights,
+        weight_format,
     )
     .await
     .map(|_| ())
@@ -85,6 +90,7 @@ async fn test_integration_model_download_fallback() {
         ModelProvider::HuggingFace,
         config,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -101,6 +107,7 @@ async fn test_integration_direct_download_invalid_model() {
         "definitely-not-a-real-model-name-12345",
         ModelProvider::HuggingFace,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -116,8 +123,13 @@ async fn test_integration_small_model_download() {
     // Test with a very small, real model (only run this in CI or when explicitly requested)
     // Note: This test requires internet access and may take some time
 
-    let result =
-        download_model_directly("prajjwal1/bert-tiny", ModelProvider::HuggingFace, false).await;
+    let result = download_model_directly(
+        "prajjwal1/bert-tiny",
+        ModelProvider::HuggingFace,
+        false,
+        WeightFormat::default(),
+    )
+    .await;
 
     match result {
         Ok(()) => info!("Small model download successful"),
@@ -167,6 +179,7 @@ async fn test_integration_offline_mode_without_cache() {
         "nonexistent-model-for-offline-test",
         ModelProvider::HuggingFace,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -216,6 +229,7 @@ async fn test_integration_offline_mode_with_cached_model() {
         ModelProvider::HuggingFace,
         Some(cache_path),
         false,
+        WeightFormat::default(),
     )
     .await;
 

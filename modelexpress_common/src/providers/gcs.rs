@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::models::WeightFormat;
 use crate::providers::ModelProviderTrait;
 use anyhow::{Context, Result};
 use google_cloud_storage::client::{Storage, StorageControl};
@@ -130,6 +131,7 @@ impl ModelProviderTrait for GcsProvider {
         model_name: &str,
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
+        _weight_format: WeightFormat,
     ) -> Result<PathBuf> {
         self.download_with_clients(model_name, cache_dir, ignore_weights, || async {
             ensure_crypto_provider()?;
@@ -484,6 +486,7 @@ mod tests {
                 model_name,
                 cache_dir.as_ref().map(|dir| dir.path().to_path_buf()),
                 false,
+                WeightFormat::default(),
             ));
             assert!(
                 result
@@ -532,6 +535,7 @@ mod tests {
                     model_name,
                     Some(temp_dir.path().to_path_buf()),
                     ignore_weights,
+                    WeightFormat::default(),
                 ))
                 .expect("Expected cached model reuse");
 

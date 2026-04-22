@@ -5,6 +5,7 @@ use crate::cache::CacheConfig;
 use crate::config::{
     ConnectionConfig, LogFormat, LogLevel, load_layered_config, normalize_grpc_endpoint,
 };
+use crate::models::WeightFormat;
 use anyhow::Result;
 use clap::Parser;
 use config::ConfigError;
@@ -79,6 +80,15 @@ pub struct ClientArgs {
     /// Chunk size in bytes for file transfer when shared storage is disabled
     #[arg(long, env = "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE")]
     pub transfer_chunk_size: Option<usize>,
+
+    /// Weight file format to download (auto, safetensors, pytorch, all)
+    #[arg(
+        long,
+        env = "MODEL_EXPRESS_WEIGHT_FORMAT",
+        value_enum,
+        default_value = "auto"
+    )]
+    pub weight_format: WeightFormat,
 }
 
 /// Complete client configuration
@@ -90,6 +100,9 @@ pub struct ClientConfig {
     pub cache: CacheConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
+    /// Weight format preference for downloads
+    #[serde(default)]
+    pub weight_format: WeightFormat,
 }
 
 /// Logging configuration for the client
@@ -171,6 +184,9 @@ impl ClientConfig {
             config.logging.quiet = true;
         }
 
+        // Download settings
+        config.weight_format = args.weight_format;
+
         // ==================== END CLI ARGUMENT OVERRIDES ====================
 
         config.connection.endpoint =
@@ -231,6 +247,7 @@ impl ClientConfig {
             connection: ConnectionConfig::new(endpoint),
             cache: CacheConfig::default(),
             logging: LoggingConfig::default(),
+            weight_format: WeightFormat::default(),
         }
     }
 
@@ -347,6 +364,7 @@ mod tests {
         assert!(!args.quiet);
         assert!(!args.no_shared_storage);
         assert!(args.transfer_chunk_size.is_none());
+        assert_eq!(args.weight_format, WeightFormat::Auto);
     }
 
     #[test]
@@ -408,6 +426,7 @@ mod tests {
             retry_delay: Some(10),
             no_shared_storage: true,
             transfer_chunk_size: Some(2097152),
+            weight_format: WeightFormat::Safetensors,
         };
 
         let config = ClientConfig::load(args).expect("Failed to load config");
@@ -419,5 +438,6 @@ mod tests {
         assert_eq!(config.connection.retry_delay_secs, Some(10));
         assert!(!config.cache.shared_storage);
         assert_eq!(config.cache.transfer_chunk_size, 2097152);
+        assert_eq!(config.weight_format, WeightFormat::Safetensors);
     }
 }

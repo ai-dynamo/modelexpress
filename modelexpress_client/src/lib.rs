@@ -31,6 +31,9 @@ use uuid::Uuid;
 pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
 pub use modelexpress_common::models::ModelProvider;
 
+// Re-export WeightFormat for downstream consumers
+pub use modelexpress_common::models::WeightFormat;
+
 /// The main client for interacting with the `modelexpress_server` via gRPC
 pub struct Client {
     health_client: HealthServiceClient<Channel>,
@@ -629,6 +632,7 @@ impl Client {
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
         info!(
@@ -640,6 +644,8 @@ impl Client {
             model_name: model_name.clone(),
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             ignore_weights,
+            weight_format: modelexpress_common::grpc::model::WeightFormat::from(weight_format)
+                as i32,
         });
 
         let mut stream = self
@@ -699,10 +705,11 @@ impl Client {
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
-        self.request_model_on_server(&model_name, provider, ignore_weights)
+        self.request_model_on_server(&model_name, provider, ignore_weights, weight_format)
             .await?;
 
         info!("Model {} downloaded successfully via server", model_name);
@@ -733,6 +740,7 @@ impl Client {
         provider: ModelProvider,
         config: Config,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
@@ -740,7 +748,7 @@ impl Client {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
-                    .request_model(&model_name, provider, ignore_weights)
+                    .request_model(&model_name, provider, ignore_weights, weight_format)
                     .await
             }
             Err(e) => {
@@ -750,6 +758,7 @@ impl Client {
                     provider,
                     Some(config.cache.local_path.clone()),
                     ignore_weights,
+                    weight_format,
                 )
                 .await
                 .map(|_| ())
@@ -1137,6 +1146,7 @@ mod tests {
             ModelProvider::HuggingFace,
             Some(ClientConfig::default().cache.local_path.clone()),
             false,
+            WeightFormat::default(),
         )
         .await;
 
@@ -1494,7 +1504,12 @@ mod tests {
             .expect("Expected test client to connect");
 
         client
-            .request_model(model_name, ModelProvider::Gcs, false)
+            .request_model(
+                model_name,
+                ModelProvider::Gcs,
+                false,
+                WeightFormat::default(),
+            )
             .await
             .expect("Expected streamed model request to succeed");
 
@@ -1526,6 +1541,7 @@ mod tests {
             ModelProvider::HuggingFace,
             config,
             false,
+            WeightFormat::default(),
         )
         .await;
 
@@ -1553,6 +1569,7 @@ mod tests {
             ModelProvider::HuggingFace,
             config,
             false,
+            WeightFormat::default(),
         )
         .await;
 
@@ -1588,6 +1605,7 @@ mod tests {
             ModelProvider::Gcs,
             config,
             false,
+            WeightFormat::default(),
         )
         .await
         .expect("Expected smart fallback request to succeed");
@@ -1679,6 +1697,7 @@ mod integration_tests {
                     "sentence-transformers/all-MiniLM-L6-v2",
                     ModelProvider::default(),
                     false,
+                    WeightFormat::default(),
                 )
                 .await;
 

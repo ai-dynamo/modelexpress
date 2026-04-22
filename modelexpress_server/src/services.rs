@@ -16,7 +16,7 @@ use modelexpress_common::{
             model_service_server::ModelService,
         },
     },
-    models::{ModelProvider, ModelStatus},
+    models::{ModelProvider, ModelStatus, WeightFormat},
 };
 use std::{
     collections::HashMap,
@@ -228,6 +228,10 @@ impl ModelService for ModelServiceImpl {
         let model_name = download::canonical_model_name(&model_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let ignore_weights = model_request.ignore_weights;
+        let weight_format: WeightFormat =
+            modelexpress_common::grpc::model::WeightFormat::try_from(model_request.weight_format)
+                .unwrap_or(modelexpress_common::grpc::model::WeightFormat::Auto)
+                .into();
 
         // Spawn a task to handle the streaming download updates
         tokio::spawn(async move {
@@ -246,7 +250,7 @@ impl ModelService for ModelServiceImpl {
             // about to retry and trip the client-lib's terminal-error bailout before
             // the retry completion broadcast arrives.
             let final_status = tracker
-                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
+                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights, weight_format)
                 .await;
 
             // Send final status update
@@ -675,12 +679,21 @@ impl ModelDownloadTracker {
         model_name: String,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
         retry: bool,
     ) {
         let tracker = self.clone();
         tokio::spawn(async move {
             let cache_dir = get_server_cache_dir();
-            match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
+            match download::download_model(
+                &model_name,
+                provider,
+                cache_dir,
+                ignore_weights,
+                weight_format,
+            )
+            .await
+            {
                 Ok(_path) => {
                     tracker
                         .set_status_and_notify(
@@ -717,6 +730,7 @@ impl ModelDownloadTracker {
         provider: ModelProvider,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> ModelStatus {
         // Atomically try to claim this model for download. The `ClaimOutcome` tells us
         // whether THIS replica won the claim or is observing someone else's claim —
@@ -822,7 +836,13 @@ impl ModelDownloadTracker {
             // download) or won the ERROR-retry CAS. Everyone else waits.
             if is_owner || is_retry_owner {
                 let retry = status == ModelStatus::ERROR;
-                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, retry);
+                self.spawn_download_task(
+                    model_name.to_string(),
+                    provider,
+                    ignore_weights,
+                    weight_format,
+                    retry,
+                );
             }
 
             // Wait for completion by polling the registry.
@@ -1444,6 +1464,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             ignore_weights: false,
+            weight_format: modelexpress_common::grpc::model::WeightFormat::Auto as i32,
         });
 
         let result = service.ensure_model_downloaded(request).await;

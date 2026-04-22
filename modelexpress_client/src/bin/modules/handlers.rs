@@ -238,6 +238,8 @@ async fn download_model(
         c
     });
 
+    let weight_format = config.weight_format;
+
     let result = match strategy {
         DownloadStrategy::SmartFallback => {
             debug!("Using smart fallback strategy");
@@ -245,9 +247,15 @@ async fn download_model(
             if let Some(cache_config) = cache_config {
                 config.cache = cache_config;
             }
-            Client::request_model_with_smart_fallback(model_name.clone(), provider, config, false)
-                .await
-                .map(|_| ())
+            Client::request_model_with_smart_fallback(
+                model_name.clone(),
+                provider,
+                config,
+                false,
+                weight_format,
+            )
+            .await
+            .map(|_| ())
         }
         DownloadStrategy::ServerOnly => {
             debug!("Using server-only strategy");
@@ -257,7 +265,7 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model(&model_name, provider, false)
+                .request_model(&model_name, provider, false, weight_format)
                 .await
                 .map(|_| ())
         }
@@ -268,6 +276,7 @@ async fn download_model(
                 provider,
                 cache_config.map(|config| config.local_path),
                 false,
+                weight_format,
             )
             .await
             .map(|_| ())
