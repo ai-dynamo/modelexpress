@@ -238,21 +238,42 @@ See [`../examples/aggregated_k8s/README.md`](../examples/aggregated_k8s/README.m
 
 ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA. Use `--load-format mx`, which auto-detects whether to load from disk or receive via RDMA.
 
+### Choosing a Metadata Backend
+
+Pick based on workload, not operational preference. The choice has structural consequences for what the system can do.
+
+| Workload shape                                                         | Backend          | Why                                                                                                                                            |
+|------------------------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`    | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service-routing requires.             |
+| RL rollouts. Training loop updates weights every step, all inference pods refit in-place, repeat. | `redis` or `kubernetes` | Central store tracks each worker's state individually by `worker_id`. Targets can fetch "worker W as it exists right now" instead of random-sampling a pool. Live refits stay consistent at the per-worker level. |
+| Live fine-tune broadcasts. New checkpoint produced outside training, pushed to all replicas, hot-swapped in place. | `redis` or `kubernetes` | Same reason as RL. The k8s-service backend can't swap a live pod's source_id without restarting the pod.                                      |
+| Mixed-version fleet. Multiple revisions serving concurrently, callers dispatch by revision. | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, so multiple identities coexist cleanly. k8s-service requires one Service pool per identity.          |
+| Heterogeneous hardware. Some sources on H100, some on B200, callers match on topology. | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.   |
+| Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).   | Either           | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work. |
+
+The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
+
+See [`../docs/ARCHITECTURE.md`](ARCHITECTURE.md#backend-choice-stable-weight-inference-vs-live-refit) for the deep dive on why the two backend families differ structurally on source addressability.
+
 ### P2P Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required on server) | `redis` or `kubernetes` |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (peer-direct via K8s Service routing). |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` backend) |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_SKIP_FEATURE_CHECK` | `0` | Bypass the MLA feature gate for P2P transfer (testing only) |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves peer-direct, currently `k8s-service`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
+| `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for peer-direct backends where no central coordinator tracks versions. |
+| `MX_K8S_SERVICE_PATTERN` | `mx-sources-rank-{rank}:6555` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. |
+| `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
+| `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
@@ -261,15 +282,12 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
-### P2P Metadata Exchange (Opt-In)
+### P2P Metadata Exchange
 
-By default, source workers publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server. With `MX_P2P_METADATA=1`, source workers instead publish lightweight endpoint pointers and exchange metadata directly with targets:
+`MX_P2P_METADATA=1` makes source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch both directly from the source worker rather than pulling them through the central store. The division of responsibility depends on which metadata backend is in use:
 
-- **NIXL agent blobs** exchanged via NIXL's native listen thread (`MX_METADATA_PORT`)
-- **Tensor descriptors** served by a per-worker gRPC `WorkerService` (`MX_WORKER_GRPC_PORT`)
-- **Central server** stores only endpoint addresses, not MB-scale metadata
-
-Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the metadata. No configuration needed on the target side.
+- **Central-coordinator backends (`redis`, `kubernetes`):** opt-in via `MX_P2P_METADATA=1`. By default the source publishes full tensor metadata (NIXL blobs + tensor descriptors) to the central server, and targets fetch the full blob from the server. With the env var set, the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration needed on the target side.
+- **`k8s-service` backend:** auto-enabled. The backend declares itself peer-direct (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
@@ -357,6 +375,21 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
+
+#### K8s-Service-Routed Backend (peer-direct, no central server)
+
+Minimal deployment shape when you want peer-direct transfers and are happy to let Kubernetes own discovery. No `modelexpress-server` deployed, no Redis, no CRDs. Source pods sit behind one Service per tensor-parallel rank; clients open a gRPC channel directly to the Service DNS name and kube-proxy load-balances across ready backends.
+
+```bash
+# No server, no CRDs, no Redis. Just the source and target pools.
+kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/sources-tp2.yaml
+kubectl wait -n $NAMESPACE --for=condition=Ready pod -l app=mx-sources --timeout=15m
+kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/target.yaml
+```
+
+Clients enable the backend with `MX_METADATA_BACKEND=k8s-service`. Rank-aware DNS resolution happens via `MX_K8S_SERVICE_PATTERN` (default `mx-sources-rank-{rank}:6555`); the worker's own rank is substituted. Pin `MX_MODEL_REVISION` to the exact checkpoint identifier so `mx_source_id` is content-addressed - this is what lets clients retry safely during rolling updates (mismatched pods return `FAILED_PRECONDITION` on the `GetTensorManifest` handshake and the client tries a fresh channel).
+
+Trade-offs vs the central-server backends: simpler to deploy (no server to run, no Redis, no CRDs) and no central failure point, but it assumes every pod behind a given Service serves identical weights. Heterogeneous fleets or graceful multi-revision operation should stay on the Redis or Kubernetes-CRD backends. See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_sources/README.md) for the full walkthrough and the multi-GPU-per-pod variation.
 
 ## Debugging
 

@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Target pool that pulls weights via the k8s-service backend.
+#
+# Each target pod picks up its own rank from the mx.rank label and uses it
+# to resolve the rank-matching source Service. Pods at rank R hit
+# mx-sources-rank-R:6555 for GetTensorManifest, then open NIXL to the
+# serving source pod for the actual weight pull.
+#
+# Target pods also end up as sources themselves once their weights are
+# loaded (the k8s-service backend forces the WorkerGrpcServer on), so
+# scaling this Deployment adds to the pool that later-arriving targets
+# can pull from.
+# If you want the target to participate in the same Service pool as the
+# sources, apply the app=mx-sources label and drop this Deployment into
+# the same Service selector. Otherwise use a separate Deployment/label
+# scope to keep the pools distinct.
+
+# ---------------------------------------------------------------------------
+# Rank 0 target
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-target-rank-0
+  labels:
+    app: mx-target
+    mx.rank: "0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-target
+      mx.rank: "0"
+  template:
+    metadata:
+      labels:
+        app: mx-target
+        mx.rank: "0"
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+
+            - name: MX_METADATA_BACKEND
+              value: "k8s-service"
+            - name: MX_K8S_SERVICE_PATTERN
+              value: "mx-sources-rank-{rank}:6555"
+
+            # Retry behavior during rolling updates: if the caller lands
+            # on a backend whose mx_source_id doesn't match (e.g. stale
+            # version in the Service's endpoint set), retry with a fresh
+            # channel so kube-proxy picks a different backend.
+            - name: MX_K8S_SOURCE_RETRIES
+              value: "5"
+            - name: MX_K8S_SOURCE_BACKOFF_SECONDS
+              value: "0.5"
+
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - name: worker-grpc
+              containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+            requests:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+
+# ---------------------------------------------------------------------------
+# Rank 1 target
+# ---------------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-target-rank-1
+  labels:
+    app: mx-target
+    mx.rank: "1"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-target
+      mx.rank: "1"
+  template:
+    metadata:
+      labels:
+        app: mx-target
+        mx.rank: "1"
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_METADATA_BACKEND
+              value: "k8s-service"
+            - name: MX_K8S_SERVICE_PATTERN
+              value: "mx-sources-rank-{rank}:6555"
+            - name: MX_K8S_SOURCE_RETRIES
+              value: "5"
+            - name: MX_K8S_SOURCE_BACKOFF_SECONDS
+              value: "0.5"
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - name: worker-grpc
+              containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+            requests:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1

@@ -1,0 +1,213 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TP=2 source pool using the k8s-service metadata backend.
+#
+# Two rank pools: rank 0 and rank 1. Each pool runs two replicas so the
+# Service can load-balance across ready backends. Pods are labeled with
+# mx.rank=<R>; the per-rank Services select on that label so kube-proxy
+# only routes a target at rank R to a source at rank R.
+#
+# Scale to TP=N by duplicating the Deployment+Service pair per rank.
+#
+# Prerequisites:
+#   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#   - RDMA-capable NICs available on the nodes (rdma/shared_ib)
+#   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
+
+# ---------------------------------------------------------------------------
+# Rank 0
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sources-rank-0
+  labels:
+    app: mx-sources
+    mx.rank: "0"
+spec:
+  type: ClusterIP
+  # Default sessionAffinity (None) means each new TCP connection picks a
+  # random backend. The k8s-service client opens a fresh channel per retry
+  # specifically to leverage this behavior.
+  sessionAffinity: None
+  ports:
+    - name: worker-grpc
+      port: 6555
+      targetPort: 6555
+  selector:
+    app: mx-sources
+    mx.rank: "0"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sources-rank-0
+  labels:
+    app: mx-sources
+    mx.rank: "0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-sources
+      mx.rank: "0"
+  template:
+    metadata:
+      labels:
+        app: mx-sources
+        mx.rank: "0"
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Pin the model revision so mx_source_id is content-addressed.
+            # Replace with the exact HuggingFace commit SHA you intend to serve.
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+
+            # Backend selection: K8s Service routing.
+            - name: MX_METADATA_BACKEND
+              value: "k8s-service"
+            # Rank-aware DNS pattern. {rank} is substituted client-side with
+            # the worker's own global_rank.
+            - name: MX_K8S_SERVICE_PATTERN
+              value: "mx-sources-rank-{rank}:6555"
+
+            # NIXL listen port and WorkerGrpcServer port are fixed so the
+            # Service's targetPort is stable.
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - name: worker-grpc
+              containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+            requests:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+          readinessProbe:
+            # Ready once the WorkerGrpcServer is serving. The standard
+            # grpc_health_probe image reports NOT_SERVING until the server
+            # has been added to the health service.
+            exec:
+              command:
+                - /bin/grpc_health_probe
+                - -addr=:6555
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Rank 1
+# ---------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sources-rank-1
+  labels:
+    app: mx-sources
+    mx.rank: "1"
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  ports:
+    - name: worker-grpc
+      port: 6555
+      targetPort: 6555
+  selector:
+    app: mx-sources
+    mx.rank: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sources-rank-1
+  labels:
+    app: mx-sources
+    mx.rank: "1"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-sources
+      mx.rank: "1"
+  template:
+    metadata:
+      labels:
+        app: mx-sources
+        mx.rank: "1"
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_METADATA_BACKEND
+              value: "k8s-service"
+            - name: MX_K8S_SERVICE_PATTERN
+              value: "mx-sources-rank-{rank}:6555"
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - name: worker-grpc
+              containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+            requests:
+              nvidia.com/gpu: 1
+              rdma/shared_ib: 1
+          readinessProbe:
+            exec:
+              command:
+                - /bin/grpc_health_probe
+                - -addr=:6555
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
