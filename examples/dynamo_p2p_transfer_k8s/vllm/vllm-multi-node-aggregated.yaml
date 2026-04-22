@@ -16,8 +16,8 @@
 #
 # Prerequisites:
 #   - Dynamo operator installed (DynamoGraphDeployment CRD)
-#   - ModelMetadata CRD installed (cluster-admin, one-time):
-#     kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
+#   - ModelExpress CRDs installed (cluster-admin, one-time):
+#     kubectl apply -f examples/crds.yaml
 #   - RBAC applied: kubectl apply -f rbac-modelmetadata.yaml -n <namespace>
 #   - PVC with model weights pre-downloaded
 #   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>

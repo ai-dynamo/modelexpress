@@ -168,7 +168,6 @@ fn merge_yaml_into_config(
             if let serde_yaml::Value::String(key_str) = key {
                 match key_str.as_str() {
                     "server" => merge_server_config(&mut config.server, value)?,
-                    "database" => merge_database_config(&mut config.database, value)?,
                     "cache" => merge_cache_config(&mut config.cache, value)?,
                     "logging" => merge_logging_config(&mut config.logging, value)?,
                     _ => {
@@ -202,29 +201,6 @@ fn merge_server_config(
                             && let Some(port) = NonZeroU16::new(port_u16)
                         {
                             server.port = port;
-                        }
-                    }
-                    _ => {
-                        eprintln!("Warning: Unknown configuration key '{key_str}', ignoring");
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn merge_database_config(
-    database: &mut modelexpress_server::config::DatabaseSettings,
-    value: &serde_yaml::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let serde_yaml::Value::Mapping(map) = value {
-        for (key, val) in map {
-            if let serde_yaml::Value::String(key_str) = key {
-                match key_str.as_str() {
-                    "path" => {
-                        if let serde_yaml::Value::String(path) = val {
-                            database.path = PathBuf::from(path);
                         }
                     }
                     _ => {

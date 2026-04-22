@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::database::ModelDatabase;
+use crate::registry::state::RegistryManager;
 use modelexpress_common::{
     cache::CacheConfig,
     constants, download,
@@ -192,8 +192,16 @@ impl ModelService for ModelServiceImpl {
 
         // Spawn a task to handle the streaming download updates
         tokio::spawn(async move {
+            let Some(tracker) = model_tracker() else {
+                let _ = tx
+                    .send(Err(Status::unavailable(
+                        "server startup incomplete: model tracker not initialized",
+                    )))
+                    .await;
+                return;
+            };
             // Check if the model is already downloaded
-            if let Some(status) = MODEL_TRACKER.get_status(&model_name) {
+            if let Some(status) = tracker.get_status(&model_name).await {
                 let update = ModelStatusUpdate {
                     model_name: model_name.clone(),
                     status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
@@ -219,7 +227,7 @@ impl ModelService for ModelServiceImpl {
             }
 
             // Start or monitor the download process
-            let final_status = MODEL_TRACKER
+            let final_status = tracker
                 .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
                 .await;
 
@@ -427,75 +435,58 @@ impl ModelService for ModelServiceImpl {
 type WaitingChannels =
     Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>>>>>;
 
-/// Tracks the status of model downloads using `SQLite` for persistence
-#[derive(Debug, Clone)]
+/// Tracks the status of model downloads through the distributed registry backend.
+#[derive(Clone)]
 pub struct ModelDownloadTracker {
-    /// `SQLite` database for persistent model status tracking
-    database: ModelDatabase,
-    /// Maps model names to list of channels waiting for updates
+    /// Distributed registry (Redis today, K8s CRDs in a follow-up).
+    registry: Arc<RegistryManager>,
+    /// Maps model names to list of channels waiting for updates on this server replica.
     waiting_channels: WaitingChannels,
 }
 
-impl Default for ModelDownloadTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ModelDownloadTracker {
-    #[must_use]
-    pub fn new() -> Self {
-        // Initialize database in the current directory
-        let database = match ModelDatabase::new("./models.db") {
-            Ok(db) => db,
-            Err(e) => {
-                error!("Critical error: Could not initialize model database at ./models.db: {e}");
-                panic!("Critical error: Could not initialize model database at ./models.db");
-            }
-        };
-
+    pub fn new(registry: Arc<RegistryManager>) -> Self {
         Self {
-            database,
+            registry,
             waiting_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Gets the status of a model from the database
-    /// If the model is not in the database, it returns None
-    pub fn get_status(&self, model_name: &str) -> Option<ModelStatus> {
-        match self.database.get_status(model_name) {
-            Ok(status) => {
-                // Update last_used_at when checking status
-                if status.is_some() {
-                    let _ = self.database.touch_model(model_name);
+    /// Gets the status of a model from the registry, bumping `last_used_at` on hit.
+    /// Returns None on lookup failure (error logged) or unknown model.
+    pub async fn get_status(&self, model_name: &str) -> Option<ModelStatus> {
+        match self.registry.get_status(model_name).await {
+            Ok(Some(status)) => {
+                if let Err(e) = self.registry.touch_model(model_name).await {
+                    error!("Failed to touch model {model_name}: {e}");
                 }
-                status
+                Some(status)
             }
+            Ok(None) => None,
             Err(e) => {
-                error!("Failed to get model status from database: {}", e);
+                error!("Failed to get model status from registry: {e}");
                 None
             }
         }
     }
 
-    /// Sets the status of a model and notifies all waiting channels
-    pub fn set_status_and_notify(
+    /// Sets the status of a model and notifies all waiting channels on this replica.
+    pub async fn set_status_and_notify(
         &self,
         model_name: String,
         status: ModelStatus,
         provider: ModelProvider,
         message: Option<String>,
     ) {
-        // Update status in database
         if let Err(e) = self
-            .database
+            .registry
             .set_status(&model_name, provider, status, message.clone())
+            .await
         {
-            error!("Failed to update model status in database: {}", e);
+            error!("Failed to update model status in registry: {e}");
             return;
         }
 
-        // Notify all waiting channels
         let mut waiting = match self.waiting_channels.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -510,24 +501,27 @@ impl ModelDownloadTracker {
                 message,
                 provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             };
-
             for channel in channels {
                 let _ = channel.try_send(Ok(update.clone()));
             }
-
-            // If the model is downloaded or errored, remove all waiting channels
             if status == ModelStatus::DOWNLOADED || status == ModelStatus::ERROR {
                 waiting.remove(&model_name);
             }
         }
     }
 
-    /// Sets the status of a model
-    pub fn set_status(&self, model_name: String, status: ModelStatus, provider: ModelProvider) {
-        self.set_status_and_notify(model_name, status, provider, None);
+    /// Sets the status of a model (no message), notifying waiters.
+    pub async fn set_status(
+        &self,
+        model_name: String,
+        status: ModelStatus,
+        provider: ModelProvider,
+    ) {
+        self.set_status_and_notify(model_name, status, provider, None)
+            .await;
     }
 
-    /// Adds a channel to wait for updates on a specific model
+    /// Adds a channel that wants updates on a specific model (server-replica-local).
     pub fn add_waiting_channel(
         &self,
         model_name: &str,
@@ -543,11 +537,10 @@ impl ModelDownloadTracker {
         waiting.entry(model_name.to_string()).or_default().push(tx);
     }
 
-    /// Deletes the status of a model from the database
-    /// This is used when a model is removed from the tracker
-    pub fn delete_status(&self, model_name: &str) {
-        if let Err(e) = self.database.delete_model(model_name) {
-            error!("Failed to delete model from database: {}", e);
+    /// Deletes a model record from the registry and clears local waiters.
+    pub async fn delete_status(&self, model_name: &str) {
+        if let Err(e) = self.registry.delete_model(model_name).await {
+            error!("Failed to delete model from registry: {e}");
         }
         let mut waiting = match self.waiting_channels.lock() {
             Ok(guard) => guard,
@@ -559,7 +552,49 @@ impl ModelDownloadTracker {
         waiting.remove(model_name);
     }
 
-    /// Initiates a download for a model and streams status updates
+    /// Spawn a background task that actually downloads the model, updating the tracker on
+    /// success or failure. Extracted here so the claim and retry paths share the code.
+    fn spawn_download_task(
+        &self,
+        model_name: String,
+        provider: ModelProvider,
+        ignore_weights: bool,
+        retry: bool,
+    ) {
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            let cache_dir = get_server_cache_dir();
+            match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
+                Ok(_path) => {
+                    tracker
+                        .set_status_and_notify(
+                            model_name,
+                            ModelStatus::DOWNLOADED,
+                            provider,
+                            Some("Model download completed successfully".to_string()),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    if retry {
+                        error!("Failed to download model {model_name} on retry: {e}");
+                    } else {
+                        error!("Failed to download model {model_name}: {e}");
+                    }
+                    let msg = if retry {
+                        format!("Download failed on retry: {e}")
+                    } else {
+                        format!("Download failed: {e}")
+                    };
+                    tracker
+                        .set_status_and_notify(model_name, ModelStatus::ERROR, provider, Some(msg))
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Initiates a download for a model and streams status updates.
     pub async fn ensure_model_downloaded(
         &self,
         model_name: &str,
@@ -568,16 +603,19 @@ impl ModelDownloadTracker {
         ignore_weights: bool,
     ) -> ModelStatus {
         // Atomically try to claim this model for download using compare-and-swap
-        let status = match self.database.try_claim_for_download(model_name, provider) {
+        let status = match self
+            .registry
+            .try_claim_for_download(model_name, provider)
+            .await
+        {
             Ok(status) => status,
             Err(e) => {
-                error!("Failed to claim model for download: {}", e);
-                // Send error and return
+                error!("Failed to claim model for download: {e}");
                 let error_update = ModelStatusUpdate {
                     model_name: model_name.to_string(),
                     status: modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
                         as i32,
-                    message: Some("Database error occurred".to_string()),
+                    message: Some("Registry error occurred".to_string()),
                     provider: modelexpress_common::grpc::model::ModelProvider::from(provider)
                         as i32,
                 };
@@ -586,7 +624,6 @@ impl ModelDownloadTracker {
             }
         };
 
-        // Send current status
         let update = ModelStatusUpdate {
             model_name: model_name.to_string(),
             status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
@@ -597,16 +634,14 @@ impl ModelDownloadTracker {
             },
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
         };
-
         let _ = tx.send(Ok(update)).await;
 
-        // If the model already existed and is downloading, add this channel to wait for updates
         if status == ModelStatus::DOWNLOADING {
             self.add_waiting_channel(model_name, tx.clone());
 
-            // Check if we were the ones who just claimed it vs. it was already downloading
-            // If we just claimed it, we need to start the actual download
-            // We can determine this by checking if there are any waiting channels yet
+            // Check if we were the ones who just claimed it vs. another replica holds it.
+            // If this server-replica has only 1 waiter (this request), assume we're the
+            // winner and kick off the download.
             let should_start_download = {
                 let waiting = match self.waiting_channels.lock() {
                     Ok(guard) => guard,
@@ -619,111 +654,39 @@ impl ModelDownloadTracker {
                     .get(model_name)
                     .is_none_or(|channels| channels.len() <= 1)
             };
-
             if should_start_download {
-                // We claimed the model, so we're responsible for downloading it
-                let tracker = self.clone();
-                let model_name_owned = model_name.to_string();
-
-                // Perform the download in the background
-                tokio::spawn(async move {
-                    let cache_dir = get_server_cache_dir();
-                    match download::download_model(
-                        &model_name_owned,
-                        provider,
-                        cache_dir,
-                        ignore_weights,
-                    )
-                    .await
-                    {
-                        Ok(_path) => {
-                            // Download completed successfully
-                            tracker.set_status_and_notify(
-                                model_name_owned,
-                                ModelStatus::DOWNLOADED,
-                                provider,
-                                Some("Model download completed successfully".to_string()),
-                            );
-                        }
-                        Err(e) => {
-                            // Download failed
-                            error!("Failed to download model {model_name_owned}: {e}");
-                            tracker.set_status_and_notify(
-                                model_name_owned,
-                                ModelStatus::ERROR,
-                                provider,
-                                Some(format!("Download failed: {e}")),
-                            );
-                        }
-                    }
-                });
+                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, false);
             }
 
-            // Wait for completion by monitoring the status
+            // Wait for completion by polling the registry.
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Some(current_status) = self.get_status(model_name)
+                if let Some(current_status) = self.get_status(model_name).await
                     && current_status != ModelStatus::DOWNLOADING
                 {
                     return current_status;
                 }
             }
         } else if status == ModelStatus::ERROR {
-            // If the model is in ERROR status, try to retry the download
-            // First, reset the status to DOWNLOADING
-            if let Err(e) = self.database.set_status(
-                model_name,
-                provider,
-                ModelStatus::DOWNLOADING,
-                Some("Retrying download...".to_string()),
-            ) {
-                error!("Failed to reset status for retry: {}", e);
-                return ModelStatus::ERROR;
-            }
-
-            // Add this channel to wait for updates
-            self.add_waiting_channel(model_name, tx.clone());
-
-            // Start the download
-            let tracker = self.clone();
-            let model_name_owned = model_name.to_string();
-
-            tokio::spawn(async move {
-                let cache_dir = get_server_cache_dir();
-                match download::download_model(
-                    &model_name_owned,
+            if let Err(e) = self
+                .registry
+                .set_status(
+                    model_name,
                     provider,
-                    cache_dir,
-                    ignore_weights,
+                    ModelStatus::DOWNLOADING,
+                    Some("Retrying download...".to_string()),
                 )
                 .await
-                {
-                    Ok(_path) => {
-                        // Download completed successfully
-                        tracker.set_status_and_notify(
-                            model_name_owned,
-                            ModelStatus::DOWNLOADED,
-                            provider,
-                            Some("Model download completed successfully".to_string()),
-                        );
-                    }
-                    Err(e) => {
-                        // Download failed again
-                        error!("Failed to download model {model_name_owned} on retry: {e}");
-                        tracker.set_status_and_notify(
-                            model_name_owned,
-                            ModelStatus::ERROR,
-                            provider,
-                            Some(format!("Download failed on retry: {e}")),
-                        );
-                    }
-                }
-            });
+            {
+                error!("Failed to reset status for retry: {e}");
+                return ModelStatus::ERROR;
+            }
+            self.add_waiting_channel(model_name, tx.clone());
+            self.spawn_download_task(model_name.to_string(), provider, ignore_weights, true);
 
-            // Wait for completion by monitoring the status
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Some(current_status) = self.get_status(model_name)
+                if let Some(current_status) = self.get_status(model_name).await
                     && current_status != ModelStatus::DOWNLOADING
                 {
                     return current_status;
@@ -735,17 +698,32 @@ impl ModelDownloadTracker {
     }
 }
 
-/// Global model download tracker
-pub static MODEL_TRACKER: std::sync::LazyLock<ModelDownloadTracker> =
-    std::sync::LazyLock::new(ModelDownloadTracker::new);
+/// Global model download tracker. Initialized by `main.rs` after the registry is
+/// connected, then read via `model_tracker()` from gRPC service handlers.
+static MODEL_TRACKER: std::sync::OnceLock<Arc<ModelDownloadTracker>> = std::sync::OnceLock::new();
+
+/// Initialize the process-wide tracker. Called exactly once during server startup.
+/// Returns an error if called twice — main.rs propagates it as a startup failure.
+pub fn init_model_tracker(
+    tracker: Arc<ModelDownloadTracker>,
+) -> Result<Arc<ModelDownloadTracker>, &'static str> {
+    MODEL_TRACKER
+        .set(tracker.clone())
+        .map(|()| tracker)
+        .map_err(|_| "init_model_tracker called more than once")
+}
+
+/// Read the process-wide tracker. Returns `None` if `init_model_tracker` hasn't run yet,
+/// letting gRPC handlers return `Status::unavailable` instead of crashing the server.
+pub fn model_tracker() -> Option<&'static Arc<ModelDownloadTracker>> {
+    MODEL_TRACKER.get()
+}
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use modelexpress_common::grpc::{
-        api::ApiRequest, health::HealthRequest, model::ModelDownloadRequest,
-    };
+    use modelexpress_common::grpc::{api::ApiRequest, health::HealthRequest};
     use modelexpress_common::test_support::{EnvVarGuard, acquire_env_mutex};
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
@@ -811,242 +789,92 @@ mod tests {
         assert!(error_message.contains("Unknown action"));
     }
 
-    #[test]
-    fn test_model_download_tracker_new() {
-        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let tracker = ModelDownloadTracker::new();
-
-        // Test that we can get status for a non-existent model
-        let status = tracker.get_status("non-existent-model");
-        assert!(status.is_none());
-    }
-
-    #[test]
-    fn test_model_download_tracker_set_and_get_status() {
-        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let tracker = ModelDownloadTracker::new();
-
-        // Use a unique model name based on current time to avoid conflicts
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos();
-        let model_name = format!("test-model-{timestamp}");
-        let provider = ModelProvider::HuggingFace;
-
-        // Initially should return None
-        assert!(tracker.get_status(&model_name).is_none());
-
-        // Set status
-        tracker.set_status(model_name.clone(), ModelStatus::DOWNLOADING, provider);
-
-        // Should now return the status
-        let status = tracker.get_status(&model_name);
-        assert!(status.is_some());
-        assert_eq!(
-            status.expect("Status should be present"),
-            ModelStatus::DOWNLOADING
-        );
-
-        // Cleanup
-        tracker.delete_status(&model_name);
-    }
-
-    #[test]
-    fn test_model_download_tracker_delete_status() {
-        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let tracker = ModelDownloadTracker::new();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos();
-        let model_name = format!("test-delete-model-{timestamp}");
-        let provider = ModelProvider::HuggingFace;
-
-        // Set status
-        tracker.set_status(model_name.clone(), ModelStatus::DOWNLOADED, provider);
-        assert!(tracker.get_status(&model_name).is_some());
-
-        // Delete status
-        tracker.delete_status(&model_name);
-        assert!(tracker.get_status(&model_name).is_none());
+    // Tracker tests exercise the ModelDownloadTracker's interaction with a mocked
+    // RegistryBackend. The full backend semantics (claim atomicity, LRU ordering, etc.) are
+    // covered by the per-backend unit tests in modelexpress_server::registry and by the
+    // testcontainers-based integration tests.
+    fn tracker_with_mock(
+        mock: crate::registry::backend::MockRegistryBackend,
+    ) -> ModelDownloadTracker {
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
+        ModelDownloadTracker::new(registry)
     }
 
     #[tokio::test]
-    async fn test_model_service_already_downloaded() {
-        let service = ModelServiceImpl;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_nanos();
-        let model_name = format!("test-already-downloaded-model-{timestamp}");
+    async fn test_tracker_get_status_missing_returns_none() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_status().once().returning(|_| Ok(None));
+        // touch is NOT called when status is missing
+        let tracker = tracker_with_mock(mock);
+        assert!(tracker.get_status("unknown").await.is_none());
+    }
 
-        // Pre-populate the model as downloaded
-        MODEL_TRACKER.set_status(
-            model_name.clone(),
-            ModelStatus::DOWNLOADED,
-            ModelProvider::HuggingFace,
-        );
+    #[tokio::test]
+    async fn test_tracker_get_status_hit_bumps_last_used_at() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_status()
+            .once()
+            .returning(|_| Ok(Some(ModelStatus::DOWNLOADED)));
+        mock.expect_touch_model().once().returning(|_| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        assert_eq!(tracker.get_status("m").await, Some(ModelStatus::DOWNLOADED));
+    }
 
-        let request = Request::new(ModelDownloadRequest {
-            model_name: model_name.clone(),
-            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
-            ignore_weights: false,
-        });
+    #[tokio::test]
+    async fn test_tracker_set_status_notifies_waiting_channel() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_set_status()
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+        let tracker = tracker_with_mock(mock);
 
-        let response = service.ensure_model_downloaded(request).await;
-        assert!(response.is_ok());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tracker.add_waiting_channel("m", tx);
 
-        let mut stream = response.expect("Response should be ok").into_inner();
+        tracker
+            .set_status_and_notify(
+                "m".to_string(),
+                ModelStatus::DOWNLOADED,
+                ModelProvider::HuggingFace,
+                Some("done".to_string()),
+            )
+            .await;
 
-        // Should get at least one update indicating it's already downloaded
-        let update = stream.next().await;
-        assert!(update.is_some());
-
-        let update = update.expect("Update should be present");
-        assert!(update.is_ok());
-
-        let status_update = update.expect("Status update should be ok");
-        assert_eq!(status_update.model_name, model_name);
+        let update = rx.recv().await.expect("waiter should receive update");
+        let update = update.expect("notify should send Ok");
+        assert_eq!(update.model_name, "m");
         assert_eq!(
-            status_update.status,
+            update.status,
             modelexpress_common::grpc::model::ModelStatus::Downloaded as i32
         );
+        assert_eq!(update.message.as_deref(), Some("done"));
 
-        // Cleanup
-        MODEL_TRACKER.delete_status(&model_name);
-    }
-
-    #[test]
-    fn test_model_download_tracker_set_status_and_notify() {
-        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let tracker = ModelDownloadTracker::new();
-        let model_name = "test-notify-model".to_string();
-        let provider = ModelProvider::HuggingFace;
-
-        // Test set_status_and_notify doesn't panic
-        tracker.set_status_and_notify(
-            model_name.clone(),
-            ModelStatus::DOWNLOADED,
-            provider,
-            Some("Download completed".to_string()),
-        );
-
-        // Verify status was set
-        let status = tracker.get_status(&model_name);
-        assert!(status.is_some());
-        assert_eq!(
-            status.expect("Status should be present"),
-            ModelStatus::DOWNLOADED
-        );
-    }
-
-    #[test]
-    fn test_waiting_channels_management() {
-        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let tracker = ModelDownloadTracker::new();
-        let model_name = "test-channels-model";
-
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-
-        // Add a waiting channel
-        tracker.add_waiting_channel(model_name, tx);
-
-        // Verify the channel was added by checking internal state
-        let waiting_count = {
-            let waiting = match tracker.waiting_channels.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            waiting.get(model_name).map_or(0, std::vec::Vec::len)
-        };
-        assert_eq!(waiting_count, 1);
-
-        // Clean up by setting final status
-        tracker.set_status_and_notify(
-            model_name.to_string(),
-            ModelStatus::DOWNLOADED,
-            ModelProvider::HuggingFace,
-            None,
-        );
-
-        // Channels should be cleared for final statuses
-        let waiting_count_after = {
-            let waiting = match tracker.waiting_channels.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            waiting.get(model_name).map_or(0, std::vec::Vec::len)
-        };
-        assert_eq!(waiting_count_after, 0);
+        // Terminal status removes waiters.
+        let waiters = tracker
+            .waiting_channels
+            .lock()
+            .expect("waiters lock")
+            .get("m")
+            .map_or(0, std::vec::Vec::len);
+        assert_eq!(waiters, 0);
     }
 
     #[tokio::test]
-    async fn test_model_service_stream_closes_properly() {
-        let service = ModelServiceImpl;
-        let model_name = "test-stream-model";
+    async fn test_tracker_delete_status_clears_backend_and_waiters() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        let tracker = tracker_with_mock(mock);
 
-        let request = Request::new(ModelDownloadRequest {
-            model_name: model_name.to_string(),
-            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
-            ignore_weights: false,
-        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("m", tx);
+        tracker.delete_status("m").await;
 
-        let response = service.ensure_model_downloaded(request).await;
-        assert!(response.is_ok());
-
-        let mut stream = response.expect("Response should be ok").into_inner();
-
-        // Read a few updates (may include initial status and progress)
-        let mut update_count = 0;
-        while let Some(update) = stream.next().await {
-            assert!(update.is_ok());
-            update_count += 1;
-
-            // Prevent infinite loop in case of issues
-            if update_count > 10 {
-                break;
-            }
-        }
-
-        assert!(update_count > 0);
-
-        // Cleanup
-        MODEL_TRACKER.delete_status(model_name);
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_model_download_no_race_condition() {
-        let _temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let tracker = ModelDownloadTracker::new();
-        let model_name = "test-concurrent-model";
-        let provider = ModelProvider::HuggingFace;
-
-        // Test that the compare-and-swap mechanism works
-        // First attempt should claim the model
-        let status1 = tracker
-            .database
-            .try_claim_for_download(model_name, provider)
-            .expect("Failed to claim for download 1");
-        assert_eq!(status1, ModelStatus::DOWNLOADING);
-
-        // Second attempt should see it's already claimed
-        let status2 = tracker
-            .database
-            .try_claim_for_download(model_name, provider)
-            .expect("Failed to claim for download 2");
-        assert_eq!(status2, ModelStatus::DOWNLOADING);
-
-        // Verify only one record exists
-        let record = tracker
-            .database
-            .get_model_record(model_name)
-            .expect("Failed to get model record")
-            .expect("Record should exist");
-        assert_eq!(record.status, ModelStatus::DOWNLOADING);
-
-        // Cleanup
-        tracker.delete_status(model_name);
+        let waiters = tracker
+            .waiting_channels
+            .lock()
+            .expect("waiters lock")
+            .contains_key("m");
+        assert!(!waiters);
     }
 
     #[test]

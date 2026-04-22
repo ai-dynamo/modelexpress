@@ -160,6 +160,14 @@ jobs:
     - name: Build release
       run: cargo build --release
 
+    - name: Run registry backend Redis integration tests
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test registry_backend_redis \
+          -- --include-ignored --test-threads=1
+
     - name: Run integration test script
       env:
         MX_METADATA_BACKEND: redis

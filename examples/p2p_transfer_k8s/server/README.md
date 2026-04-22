@@ -21,7 +21,7 @@ Set `MX_METADATA_BACKEND=redis` and `REDIS_URL=redis://redis:6379` on the server
 ## Kubernetes CRD Backend
 
 ```bash
-kubectl apply -f kubernetes_backend/crd-modelmetadata.yaml
+kubectl apply -f ../crds.yaml
 kubectl apply -f kubernetes_backend/rbac-modelmetadata.yaml -n <namespace>
 kubectl apply -f kubernetes_backend/modelexpress-server-kubernetes.yaml -n <namespace>
 ```

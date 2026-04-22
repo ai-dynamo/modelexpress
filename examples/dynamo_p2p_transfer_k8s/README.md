@@ -21,10 +21,12 @@ graph LR
 ## Prerequisites
 
 1. **Dynamo operator** installed (DynamoGraphDeployment CRD)
-2. **ModelMetadata CRD** installed (one-time, requires cluster-admin):
+2. **ModelExpress CRDs** installed (one-time, requires cluster-admin):
    ```bash
-   kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
+   kubectl apply -f examples/crds.yaml
    ```
+   Installs `ModelMetadata` (P2P worker coordination) and `ModelCacheEntry` (model-download
+   registry) in one pass.
 3. **PVC** with model weights pre-downloaded (`shared-model-cache`)
 4. **HuggingFace token secret**: `kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>`
 
@@ -57,9 +59,9 @@ docker build --platform linux/amd64 \
 
 1. Update image tags in `vllm/vllm-multi-node-aggregated.yaml` (search for `# REPLACE`)
 
-2. Apply CRD, RBAC, and DGD:
+2. Apply CRDs, RBAC, and DGD:
    ```bash
-   kubectl apply -f vllm/crd-modelmetadata.yaml            # one-time, cluster-admin
+   kubectl apply -f ../crds.yaml                           # one-time, cluster-admin
    kubectl apply -f vllm/rbac-modelmetadata.yaml -n <namespace>
    kubectl apply -f vllm/vllm-multi-node-aggregated.yaml -n <namespace>
    ```
