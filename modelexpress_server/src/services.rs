@@ -13,7 +13,7 @@ use modelexpress_common::{
             ModelStatusUpdate, model_service_server::ModelService,
         },
     },
-    models::{ModelProvider, ModelStatus},
+    models::{ModelProvider, ModelStatus, WeightFormat},
 };
 use std::{
     collections::HashMap,
@@ -189,6 +189,10 @@ impl ModelService for ModelServiceImpl {
                 .unwrap_or(modelexpress_common::grpc::model::ModelProvider::HuggingFace)
                 .into();
         let ignore_weights = model_request.ignore_weights;
+        let weight_format: WeightFormat =
+            modelexpress_common::grpc::model::WeightFormat::try_from(model_request.weight_format)
+                .unwrap_or(modelexpress_common::grpc::model::WeightFormat::Auto)
+                .into();
 
         // Spawn a task to handle the streaming download updates
         tokio::spawn(async move {
@@ -220,7 +224,7 @@ impl ModelService for ModelServiceImpl {
 
             // Start or monitor the download process
             let final_status = MODEL_TRACKER
-                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
+                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights, weight_format)
                 .await;
 
             // Send final status update
@@ -566,6 +570,7 @@ impl ModelDownloadTracker {
         provider: ModelProvider,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> ModelStatus {
         // Atomically try to claim this model for download using compare-and-swap
         let status = match self.database.try_claim_for_download(model_name, provider) {
@@ -633,6 +638,7 @@ impl ModelDownloadTracker {
                         provider,
                         cache_dir,
                         ignore_weights,
+                        weight_format,
                     )
                     .await
                     {
@@ -695,6 +701,7 @@ impl ModelDownloadTracker {
                     provider,
                     cache_dir,
                     ignore_weights,
+                    weight_format,
                 )
                 .await
                 {
@@ -892,6 +899,7 @@ mod tests {
             model_name: model_name.clone(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             ignore_weights: false,
+            weight_format: modelexpress_common::grpc::model::WeightFormat::Auto as i32,
         });
 
         let response = service.ensure_model_downloaded(request).await;
@@ -990,6 +998,7 @@ mod tests {
             model_name: model_name.to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             ignore_weights: false,
+            weight_format: modelexpress_common::grpc::model::WeightFormat::Auto as i32,
         });
 
         let response = service.ensure_model_downloaded(request).await;

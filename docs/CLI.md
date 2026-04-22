@@ -45,6 +45,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 - `--cache-path <PATH>`: Model storage path override
 - `--no-shared-storage`: Disable shared storage mode (will transfer files from server to client)
 - `--transfer-chunk-size <SIZE>`: Chunk size in bytes for file transfer when shared storage is disabled (default: 32768)
+- `--weight-format <FORMAT>`: Weight file format to download: `auto`, `safetensors`, `pytorch`, `all` (default: auto)
 - `-h, --help`: Print help information
 - `-V, --version`: Print version
 
@@ -53,6 +54,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 - `MODEL_EXPRESS_CACHE_DIRECTORY`: Set the default model storage path
 - `MODEL_EXPRESS_NO_SHARED_STORAGE`: Disable shared storage mode (set to 'true' to enable file transfers)
 - `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE`: Set the chunk size in bytes for file transfers
+- `MODEL_EXPRESS_WEIGHT_FORMAT`: Set the weight file format preference (auto, safetensors, pytorch, all)
 
 ### Commands
 

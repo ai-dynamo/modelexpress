@@ -427,7 +427,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 ```rust
 #[async_trait]
 pub trait ModelProviderTrait: Send + Sync {
-    async fn download_model(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool) -> Result<PathBuf>;
+    async fn download_model(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool, weight_format: WeightFormat) -> Result<PathBuf>;
     async fn delete_model(&self, name: &str) -> Result<()>;
     async fn get_model_path(&self, name: &str, cache_dir: PathBuf) -> Result<PathBuf>;
     fn provider_name(&self) -> &'static str;

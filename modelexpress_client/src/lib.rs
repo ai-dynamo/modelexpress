@@ -30,6 +30,9 @@ use uuid::Uuid;
 pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
 pub use modelexpress_common::models::ModelProvider;
 
+// Re-export WeightFormat for downstream consumers
+pub use modelexpress_common::models::WeightFormat;
+
 /// The main client for interacting with the `modelexpress_server` via gRPC
 pub struct Client {
     health_client: HealthServiceClient<Channel>,
@@ -269,12 +272,13 @@ impl Client {
         model_name: &str,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         info!("Pre-loading model {} to cache", model_name);
 
         // First try to download via server
         match self
-            .request_model_with_provider(model_name, provider, ignore_weights)
+            .request_model_with_provider(model_name, provider, ignore_weights, weight_format)
             .await
         {
             Ok(()) => {
@@ -303,7 +307,8 @@ impl Client {
                     "Server unavailable, pre-loading model {} directly. Error: {}",
                     model_name, e
                 );
-                Self::download_model_directly(model_name, provider, ignore_weights).await
+                Self::download_model_directly(model_name, provider, ignore_weights, weight_format)
+                    .await
             }
         }
     }
@@ -372,12 +377,13 @@ impl Client {
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
         // First try the server-based approach
         match self
-            .request_model_with_provider(&model_name, provider, ignore_weights)
+            .request_model_with_provider(&model_name, provider, ignore_weights, weight_format)
             .await
         {
             Ok(()) => {
@@ -410,7 +416,7 @@ impl Client {
 
                     // Fallback to direct download
                     let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
-                    match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
+                    match download::download_model(&model_name, provider, cache_dir, ignore_weights, weight_format).await {
                         Ok(_) => {
                             info!(
                                 "Model {} downloaded successfully via direct download",
@@ -614,6 +620,7 @@ impl Client {
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
         info!(
@@ -625,6 +632,8 @@ impl Client {
             model_name: model_name.clone(),
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             ignore_weights,
+            weight_format: modelexpress_common::grpc::model::WeightFormat::from(weight_format)
+                as i32,
         });
 
         let mut stream = self
@@ -682,11 +691,13 @@ impl Client {
         &mut self,
         model_name: impl Into<String>,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         self.request_model_with_provider_and_fallback(
             model_name,
             ModelProvider::default(),
             ignore_weights,
+            weight_format,
         )
         .await
     }
@@ -697,9 +708,15 @@ impl Client {
         &mut self,
         model_name: impl Into<String>,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
-        self.request_model_with_provider(model_name, ModelProvider::default(), ignore_weights)
-            .await
+        self.request_model_with_provider(
+            model_name,
+            ModelProvider::default(),
+            ignore_weights,
+            weight_format,
+        )
+        .await
     }
 
     /// Request a model with automatic server fallback, creating client connection only if needed
@@ -709,6 +726,7 @@ impl Client {
         provider: ModelProvider,
         config: Config,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
 
@@ -717,13 +735,24 @@ impl Client {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
-                    .request_model_with_provider_and_fallback(&model_name, provider, ignore_weights)
+                    .request_model_with_provider_and_fallback(
+                        &model_name,
+                        provider,
+                        ignore_weights,
+                        weight_format,
+                    )
                     .await
             }
             Err(e) => {
                 // If we can't even connect to the server, go straight to direct download
                 info!("Cannot connect to server ({}), downloading directly...", e);
-                Client::download_model_directly(&model_name, provider, ignore_weights).await
+                Client::download_model_directly(
+                    &model_name,
+                    provider,
+                    ignore_weights,
+                    weight_format,
+                )
+                .await
             }
         }
     }
@@ -734,6 +763,7 @@ impl Client {
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
         info!(
@@ -744,11 +774,15 @@ impl Client {
         // Try to get cache configuration, but don't fail if not available
         let cache_dir = CacheConfig::discover().ok().map(|config| config.local_path);
 
-        download::download_model(&model_name, provider, cache_dir, ignore_weights)
-            .await
-            .map_err(|e| {
-                modelexpress_common::Error::Server(format!("Direct download failed: {e}"))
-            })?;
+        download::download_model(
+            &model_name,
+            provider,
+            cache_dir,
+            ignore_weights,
+            weight_format,
+        )
+        .await
+        .map_err(|e| modelexpress_common::Error::Server(format!("Direct download failed: {e}")))?;
 
         info!("Model {} downloaded successfully", model_name);
         Ok(())
@@ -952,6 +986,7 @@ mod tests {
             "definitely-not-a-real-model-name-12345",
             ModelProvider::HuggingFace,
             false,
+            WeightFormat::default(),
         )
         .await;
 
@@ -1155,6 +1190,7 @@ mod tests {
             ModelProvider::HuggingFace,
             config,
             false,
+            WeightFormat::default(),
         )
         .await;
 
@@ -1242,7 +1278,11 @@ mod integration_tests {
             // Use a very small model for testing to avoid long download times
             // Note: This test might still take time and requires network access
             let result = client
-                .request_model_server_only("sentence-transformers/all-MiniLM-L6-v2", false)
+                .request_model_server_only(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    false,
+                    WeightFormat::default(),
+                )
                 .await;
 
             // We don't assert success here because it depends on network availability

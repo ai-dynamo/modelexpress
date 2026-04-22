@@ -155,6 +155,28 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
     }
 }
 
+impl From<models::WeightFormat> for grpc::model::WeightFormat {
+    fn from(format: models::WeightFormat) -> Self {
+        match format {
+            models::WeightFormat::Auto => grpc::model::WeightFormat::Auto,
+            models::WeightFormat::Safetensors => grpc::model::WeightFormat::Safetensors,
+            models::WeightFormat::Pytorch => grpc::model::WeightFormat::Pytorch,
+            models::WeightFormat::All => grpc::model::WeightFormat::All,
+        }
+    }
+}
+
+impl From<grpc::model::WeightFormat> for models::WeightFormat {
+    fn from(format: grpc::model::WeightFormat) -> Self {
+        match format {
+            grpc::model::WeightFormat::Auto => models::WeightFormat::Auto,
+            grpc::model::WeightFormat::Safetensors => models::WeightFormat::Safetensors,
+            grpc::model::WeightFormat::Pytorch => models::WeightFormat::Pytorch,
+            grpc::model::WeightFormat::All => models::WeightFormat::All,
+        }
+    }
+}
+
 impl From<models::ModelStatus> for grpc::model::ModelStatus {
     fn from(status: models::ModelStatus) -> Self {
         match status {
@@ -242,6 +264,22 @@ mod tests {
         let back_to_model: models::ModelProvider = grpc_provider.into();
 
         assert_eq!(model_provider, back_to_model);
+    }
+
+    #[test]
+    fn test_weight_format_conversion_both_ways() {
+        let formats = vec![
+            models::WeightFormat::Auto,
+            models::WeightFormat::Safetensors,
+            models::WeightFormat::Pytorch,
+            models::WeightFormat::All,
+        ];
+
+        for format in formats {
+            let grpc_format: grpc::model::WeightFormat = format.into();
+            let back_to_model: models::WeightFormat = grpc_format.into();
+            assert_eq!(format, back_to_model);
+        }
     }
 
     #[test]

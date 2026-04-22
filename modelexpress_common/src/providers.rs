@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::models::WeightFormat;
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -14,6 +15,7 @@ pub trait ModelProviderTrait: Send + Sync {
         model_name: &str,
         cache_path: Option<PathBuf>,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> Result<PathBuf>;
 
     /// Delete a model from the provider's cache
@@ -34,7 +36,13 @@ pub trait ModelProviderTrait: Send + Sync {
     where
         Self: Sized,
     {
-        const DEFAULT_IGNORED: [&str; 1] = ["README.md"];
+        const DEFAULT_IGNORED: [&str; 5] = [
+            "README.md",
+            "LICENSE",
+            "LICENSE.md",
+            "LICENSE.txt",
+            "NOTICE",
+        ];
         let name = std::path::Path::new(filename)
             .file_name()
             .and_then(|s| s.to_str())
@@ -117,6 +125,11 @@ mod tests {
         // Explicit files
         assert!(HuggingFaceProvider::is_ignored("README.md"));
         assert!(HuggingFaceProvider::is_ignored("subdir/README.md"));
+        assert!(HuggingFaceProvider::is_ignored("LICENSE"));
+        assert!(HuggingFaceProvider::is_ignored("LICENSE.md"));
+        assert!(HuggingFaceProvider::is_ignored("LICENSE.txt"));
+        assert!(HuggingFaceProvider::is_ignored("NOTICE"));
+        assert!(HuggingFaceProvider::is_ignored("subdir/LICENSE"));
 
         // (Not Ignored) Regular files
         assert!(!HuggingFaceProvider::is_ignored("model.bin"));
