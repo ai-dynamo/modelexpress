@@ -473,19 +473,3 @@ This proved publisher/receiver correctness before moving to cross-node.
 3. **The ARM64 path is painful but survivable.** All the image work is in `docker/Dockerfile.mx-arm64` and the compat shim, and is shared with (and borrowed from) the PRIME-RL POC.
 4. **Standalone rollout is the production shape.** Hybrid/colocated mode is useful for debugging but cannot drive any non-naive checkpoint engine — true for NIXL, NCCL, and MX alike.
 
----
-
-## 6. Related Documents
-
-- **PRIME-RL POC**: `recovery/reinforcement learning/PRIMERL_MX_NIXL_Overview.md`
-- **verl POC state log**: `recovery/reinforcement learning/VERL_POC_STATE.md`
-- **verl design log**: `recovery/reinforcement learning/VERL_RAY_MX.md`
-- **General MX for RL design**: `docs/MX_RL_OVERVIEW.md`
-- **TensorHub comparison** (pipeline replication roadmap): `recovery/reinforcement learning/TensorHub_Analysis.md`
-
-### Upstream repos
-
-| Repo | Branch | Key files |
-|------|--------|-----------|
-| `github.com/KavinKrishnan/verl` | `kavink/mx-checkpoint-engine` | `verl/checkpoint_engine/mx_checkpoint_engine.py`, `verl/utils/flash_attn_compat.py`, `docker/Dockerfile.mx-arm64`, `k8s/verl-mx-poc/*` |
-| `github.com/ai-dynamo/modelexpress` | `kavink/RL` | `training_publisher.py`, `refit_receiver.py`, `nixl_transfer.py`, `client.py` |
