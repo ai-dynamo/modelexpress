@@ -5,7 +5,7 @@ use crate::{
     Utils,
     cache::{ModelInfo, ProviderCache, directory_size},
     constants,
-    models::ModelProvider,
+    models::{ModelProvider, WeightFormat},
     providers::ModelProviderTrait,
 };
 use anyhow::{Context, Result};
@@ -178,6 +178,91 @@ impl HuggingFaceProvider {
     fn is_subdirectory_file(filename: &str) -> bool {
         Path::new(filename).components().count() > 1
     }
+
+    /// Filter a list of filenames according to the requested weight format.
+    ///
+    /// For `WeightFormat::Auto`:
+    ///   1. If any `.safetensors` weight files exist, drop `.bin`, `.h5`, `.msgpack`, `.gguf`.
+    ///   2. Within the chosen format, deduplicate sharded vs. consolidated:
+    ///      - If an index file (e.g. `model.safetensors.index.json`) exists, the sharded set
+    ///        is canonical; skip standalone consolidated files.
+    ///      - Otherwise keep whatever is present.
+    ///
+    /// For `Safetensors` / `Pytorch`: keep only weight files of that format (and all
+    /// non-weight files).
+    ///
+    /// For `All`: no filtering, return all filenames unchanged.
+    fn filter_files_by_weight_format(
+        filenames: &[String],
+        weight_format: WeightFormat,
+    ) -> Vec<String> {
+        match weight_format {
+            WeightFormat::All => filenames.to_vec(),
+            WeightFormat::Safetensors => filenames
+                .iter()
+                .filter(|f| !Self::is_non_preferred_weight(f, true))
+                .cloned()
+                .collect(),
+            WeightFormat::Pytorch => filenames
+                .iter()
+                .filter(|f| !Self::is_non_preferred_weight(f, false))
+                .cloned()
+                .collect(),
+            WeightFormat::Auto => Self::auto_filter_weight_files(filenames),
+        }
+    }
+
+    /// Returns true if this is a weight file that does NOT match the preferred format.
+    /// When `prefer_safetensors` is true, non-safetensors weight files are filtered out.
+    /// When false, safetensors weight files are filtered out (prefer pytorch).
+    fn is_non_preferred_weight(filename: &str, prefer_safetensors: bool) -> bool {
+        if !Self::is_weight_file(filename) {
+            return false;
+        }
+        if prefer_safetensors {
+            !filename.ends_with(".safetensors")
+        } else {
+            !filename.ends_with(".bin")
+        }
+    }
+
+    fn auto_filter_weight_files(filenames: &[String]) -> Vec<String> {
+        let has_safetensors = filenames.iter().any(|f| f.ends_with(".safetensors"));
+        let has_safetensors_index = filenames
+            .iter()
+            .any(|f| f.ends_with(".safetensors.index.json"));
+        let has_pytorch_index = filenames
+            .iter()
+            .any(|f| f == "pytorch_model.bin.index.json");
+
+        filenames
+            .iter()
+            .filter(|f| {
+                // Drop weight files in non-preferred formats
+                if Self::is_weight_file(f) || f.ends_with(".gguf") {
+                    if has_safetensors {
+                        if !f.ends_with(".safetensors") {
+                            return false;
+                        }
+                    } else if f.ends_with(".h5") || f.ends_with(".msgpack") || f.ends_with(".gguf")
+                    {
+                        return false;
+                    }
+                }
+
+                // Deduplicate sharded vs. consolidated within chosen format
+                if has_safetensors_index && *f == "model.safetensors" {
+                    return false;
+                }
+                if has_pytorch_index && *f == "pytorch_model.bin" {
+                    return false;
+                }
+
+                true
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[async_trait::async_trait]
@@ -189,6 +274,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         model_name: &str,
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
+        weight_format: WeightFormat,
     ) -> Result<PathBuf> {
         let cache_dir = get_cache_dir(cache_dir);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
@@ -228,6 +314,18 @@ impl ModelProviderTrait for HuggingFaceProvider {
             anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
         }
 
+        // Collect top-level filenames and apply weight format filtering
+        let all_filenames: Vec<String> = info
+            .siblings
+            .iter()
+            .filter(|s| !HuggingFaceProvider::is_subdirectory_file(&s.rfilename))
+            .map(|s| s.rfilename.clone())
+            .collect();
+        let allowed_files: HashSet<String> =
+            HuggingFaceProvider::filter_files_by_weight_format(&all_filenames, weight_format)
+                .into_iter()
+                .collect();
+
         let mut p = PathBuf::new();
         let mut files_downloaded = false;
 
@@ -243,6 +341,14 @@ impl ModelProviderTrait for HuggingFaceProvider {
             }
 
             if ignore_weights && HuggingFaceProvider::is_weight_file(&sib.rfilename) {
+                continue;
+            }
+
+            if !allowed_files.contains(&sib.rfilename) {
+                debug!(
+                    "Skipping file '{}' due to weight format filter ({})",
+                    sib.rfilename, weight_format
+                );
                 continue;
             }
 
@@ -563,6 +669,7 @@ mod tests {
                 "test/model",
                 Some(explicit_cache.path().to_path_buf()),
                 false,
+                WeightFormat::default(),
             )
             .await
             .expect("Failed to seed explicit cache");
@@ -574,7 +681,12 @@ mod tests {
         );
 
         let env_snapshot = provider
-            .download_model("test/model", Some(env_cache.path().to_path_buf()), false)
+            .download_model(
+                "test/model",
+                Some(env_cache.path().to_path_buf()),
+                false,
+                WeightFormat::default(),
+            )
             .await
             .expect("Failed to seed env cache");
         let env_config = env_snapshot.join("config.json");
@@ -699,7 +811,12 @@ mod tests {
         let mock_server = MockHFServer::new(&env_lock).await;
         let provider = HuggingFaceProvider;
         let result = provider
-            .download_model("test/model", Some(mock_server.cache_path.clone()), false)
+            .download_model(
+                "test/model",
+                Some(mock_server.cache_path.clone()),
+                false,
+                WeightFormat::default(),
+            )
             .await
             .expect("Failed to download model");
 
@@ -721,7 +838,12 @@ mod tests {
         let provider = HuggingFaceProvider;
 
         let result = provider
-            .download_model("test/model", Some(mock_server.cache_path.clone()), false)
+            .download_model(
+                "test/model",
+                Some(mock_server.cache_path.clone()),
+                false,
+                WeightFormat::default(),
+            )
             .await
             .expect("Failed to download model");
 
@@ -776,7 +898,12 @@ mod tests {
 
         let provider = HuggingFaceProvider;
         let result = provider
-            .download_model("test/model", Some(temp_dir.path().to_path_buf()), false)
+            .download_model(
+                "test/model",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                WeightFormat::default(),
+            )
             .await;
 
         assert!(
@@ -819,7 +946,12 @@ mod tests {
         let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
 
         let result = HuggingFaceProvider
-            .download_model("test/model", Some(temp_dir.path().into()), false)
+            .download_model(
+                "test/model",
+                Some(temp_dir.path().into()),
+                false,
+                WeightFormat::default(),
+            )
             .await;
 
         assert!(result.is_ok());
@@ -835,7 +967,12 @@ mod tests {
         let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
 
         let result = HuggingFaceProvider
-            .download_model("nonexistent/model", Some(temp_dir.path().into()), false)
+            .download_model(
+                "nonexistent/model",
+                Some(temp_dir.path().into()),
+                false,
+                WeightFormat::default(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -845,5 +982,134 @@ mod tests {
                 .to_string()
                 .contains("not found in cache")
         );
+    }
+
+    #[test]
+    fn test_filter_weight_format_auto_prefers_safetensors() {
+        let files = vec![
+            "config.json".to_string(),
+            "model.safetensors".to_string(),
+            "model.safetensors.index.json".to_string(),
+            "model-00001-of-00002.safetensors".to_string(),
+            "model-00002-of-00002.safetensors".to_string(),
+            "pytorch_model.bin".to_string(),
+            "model.h5".to_string(),
+            "tokenizer.json".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::Auto);
+
+        assert!(filtered.contains(&"config.json".to_string()));
+        assert!(filtered.contains(&"tokenizer.json".to_string()));
+        assert!(filtered.contains(&"model.safetensors.index.json".to_string()));
+        assert!(filtered.contains(&"model-00001-of-00002.safetensors".to_string()));
+        assert!(filtered.contains(&"model-00002-of-00002.safetensors".to_string()));
+        // Consolidated file should be skipped when index exists
+        assert!(!filtered.contains(&"model.safetensors".to_string()));
+        // Non-safetensors weight formats should be skipped
+        assert!(!filtered.contains(&"pytorch_model.bin".to_string()));
+        assert!(!filtered.contains(&"model.h5".to_string()));
+    }
+
+    #[test]
+    fn test_filter_weight_format_auto_consolidated_only() {
+        let files = vec![
+            "config.json".to_string(),
+            "model.safetensors".to_string(),
+            "tokenizer.json".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::Auto);
+
+        assert!(filtered.contains(&"config.json".to_string()));
+        assert!(filtered.contains(&"model.safetensors".to_string()));
+        assert!(filtered.contains(&"tokenizer.json".to_string()));
+    }
+
+    #[test]
+    fn test_filter_weight_format_auto_falls_back_to_pytorch() {
+        let files = vec![
+            "config.json".to_string(),
+            "pytorch_model.bin".to_string(),
+            "pytorch_model.bin.index.json".to_string(),
+            "pytorch_model-00001-of-00002.bin".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::Auto);
+
+        assert!(filtered.contains(&"config.json".to_string()));
+        assert!(filtered.contains(&"pytorch_model.bin.index.json".to_string()));
+        assert!(filtered.contains(&"pytorch_model-00001-of-00002.bin".to_string()));
+        // Consolidated should be skipped when index exists
+        assert!(!filtered.contains(&"pytorch_model.bin".to_string()));
+    }
+
+    #[test]
+    fn test_filter_weight_format_safetensors_only() {
+        let files = vec![
+            "config.json".to_string(),
+            "model.safetensors".to_string(),
+            "pytorch_model.bin".to_string(),
+            "tokenizer.json".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::Safetensors);
+
+        assert!(filtered.contains(&"config.json".to_string()));
+        assert!(filtered.contains(&"model.safetensors".to_string()));
+        assert!(filtered.contains(&"tokenizer.json".to_string()));
+        assert!(!filtered.contains(&"pytorch_model.bin".to_string()));
+    }
+
+    #[test]
+    fn test_filter_weight_format_pytorch_only() {
+        let files = vec![
+            "config.json".to_string(),
+            "model.safetensors".to_string(),
+            "pytorch_model.bin".to_string(),
+            "tokenizer.json".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::Pytorch);
+
+        assert!(filtered.contains(&"config.json".to_string()));
+        assert!(filtered.contains(&"pytorch_model.bin".to_string()));
+        assert!(filtered.contains(&"tokenizer.json".to_string()));
+        assert!(!filtered.contains(&"model.safetensors".to_string()));
+    }
+
+    #[test]
+    fn test_filter_weight_format_all() {
+        let files = vec![
+            "config.json".to_string(),
+            "model.safetensors".to_string(),
+            "pytorch_model.bin".to_string(),
+            "model.h5".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::All);
+
+        assert_eq!(filtered.len(), files.len());
+    }
+
+    #[test]
+    fn test_filter_weight_format_auto_skips_gguf() {
+        let files = vec![
+            "config.json".to_string(),
+            "model.safetensors".to_string(),
+            "model-Q4_K_M.gguf".to_string(),
+        ];
+
+        let filtered =
+            HuggingFaceProvider::filter_files_by_weight_format(&files, WeightFormat::Auto);
+
+        assert!(filtered.contains(&"model.safetensors".to_string()));
+        assert!(!filtered.contains(&"model-Q4_K_M.gguf".to_string()));
     }
 }

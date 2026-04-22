@@ -4,7 +4,10 @@
 #![allow(clippy::expect_used)]
 
 use modelexpress_client::{Client, ClientConfig};
-use modelexpress_common::{constants, models::ModelProvider};
+use modelexpress_common::{
+    constants,
+    models::{ModelProvider, WeightFormat},
+};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -67,6 +70,7 @@ async fn test_integration_model_download_fallback() {
         ModelProvider::HuggingFace,
         config,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -83,6 +87,7 @@ async fn test_integration_direct_download_invalid_model() {
         "definitely-not-a-real-model-name-12345",
         ModelProvider::HuggingFace,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -102,6 +107,7 @@ async fn test_integration_small_model_download() {
         "prajjwal1/bert-tiny", // A very small BERT model for testing
         ModelProvider::HuggingFace,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -153,6 +159,7 @@ async fn test_integration_offline_mode_without_cache() {
         "nonexistent-model-for-offline-test",
         ModelProvider::HuggingFace,
         false,
+        WeightFormat::default(),
     )
     .await;
 
@@ -202,6 +209,7 @@ async fn test_integration_offline_mode_with_cached_model() {
         ModelProvider::HuggingFace,
         Some(cache_path),
         false,
+        WeightFormat::default(),
     )
     .await;
 

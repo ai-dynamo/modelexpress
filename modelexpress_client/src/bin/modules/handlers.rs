@@ -171,13 +171,15 @@ async fn download_model(
         c
     });
 
+    let weight_format = config.weight_format;
+
     let result = match strategy {
         DownloadStrategy::SmartFallback => {
             debug!("Using smart fallback strategy");
             if let Some(cache_config) = cache_config {
                 let mut client = Client::new_with_cache(config.clone(), cache_config).await?;
                 client
-                    .preload_model_to_cache(&model_name, provider, false)
+                    .preload_model_to_cache(&model_name, provider, false, weight_format)
                     .await
             } else {
                 Client::request_model_with_smart_fallback(
@@ -185,6 +187,7 @@ async fn download_model(
                     provider,
                     config,
                     false,
+                    weight_format,
                 )
                 .await
             }
@@ -197,12 +200,13 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model_with_provider(&model_name, provider, false)
+                .request_model_with_provider(&model_name, provider, false, weight_format)
                 .await
         }
         DownloadStrategy::Direct => {
             debug!("Using direct download strategy");
-            Client::download_model_directly(model_name.clone(), provider, false).await
+            Client::download_model_directly(model_name.clone(), provider, false, weight_format)
+                .await
         }
     };
 

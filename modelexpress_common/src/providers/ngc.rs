@@ -4,7 +4,7 @@
 use crate::{
     Utils,
     cache::{ModelInfo, ProviderCache, directory_size},
-    models::ModelProvider,
+    models::{ModelProvider, WeightFormat},
     providers::ModelProviderTrait,
 };
 use anyhow::{Context, Result};
@@ -890,6 +890,7 @@ impl ModelProviderTrait for NgcProvider {
         model_name: &str,
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
+        _weight_format: WeightFormat,
     ) -> Result<PathBuf> {
         let cache_root = get_cache_dir(cache_dir);
         let id = parse_model_name(model_name)?;
@@ -1643,6 +1644,7 @@ mod tests {
                 "nim/nvidia/test-model/v1",
                 Some(mock.cache_path.clone()),
                 false,
+                WeightFormat::default(),
             )
             .await;
 
@@ -1702,6 +1704,7 @@ mod tests {
                 "nim/nvidia/test-model/v1",
                 Some(temp_dir.path().to_path_buf()),
                 false,
+                WeightFormat::default(),
             )
             .await;
 
@@ -1767,6 +1770,7 @@ mod tests {
                 "nim/nvidia/test-model/v1",
                 Some(temp_dir.path().to_path_buf()),
                 false,
+                WeightFormat::default(),
             )
             .await;
 
@@ -1813,6 +1817,7 @@ mod tests {
                 "nim/nvidia/test-model/v1",
                 Some(temp_dir.path().to_path_buf()),
                 false,
+                WeightFormat::default(),
             )
             .await;
 

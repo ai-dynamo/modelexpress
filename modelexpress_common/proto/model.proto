@@ -22,6 +22,7 @@ message ModelDownloadRequest {
   string model_name = 1;
   ModelProvider provider = 2;
   bool ignore_weights = 3;
+  WeightFormat weight_format = 4;
 }
 
 // Streaming status update for model download progress
@@ -44,6 +45,18 @@ enum ModelStatus {
 enum ModelProvider {
   HUGGING_FACE = 0;
   NGC = 1;
+}
+
+// Controls which weight file formats to download
+enum WeightFormat {
+  // Smart defaults: prefer safetensors, deduplicate sharded vs consolidated
+  AUTO = 0;
+  // Only download safetensors files
+  SAFETENSORS = 1;
+  // Only download pytorch bin files
+  PYTORCH = 2;
+  // Download all weight formats (legacy behavior)
+  ALL = 3;
 }
 
 // Request for streaming model files

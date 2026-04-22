@@ -4,6 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use modelexpress_client::{Client, ClientConfig, ModelProvider};
+use modelexpress_common::models::WeightFormat;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -23,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ModelProvider::HuggingFace,
         ClientConfig::default(),
         false,
+        WeightFormat::default(),
     )
     .await
     {
