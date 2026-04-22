@@ -129,8 +129,9 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `persistence.mountPath`                      | Mount path                                     | `/root`  |
 | `env.MODEL_EXPRESS_SERVER_PORT`              | Server port                                    | `8001`   |
 | `env.MODEL_EXPRESS_LOGGING_LEVEL`            | Logging level                                  | `info`   |
-| `env.MODEL_EXPRESS_DATABASE_PATH`            | Database path                                  | `/app/models.db` |
 | `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/app/cache` |
+| `env.MX_METADATA_BACKEND`                    | Distributed backend (`redis` or `kubernetes`)  | `redis`  |
+| `env.REDIS_URL`                              | Redis connection URL (when backend is `redis`) | `redis://redis:6379` |
 | `livenessProbe.enabled`                      | Enable liveness probe                          | `true`   |
 | `readinessProbe.enabled`                     | Enable readiness probe                         | `true`   |
 | `nodeSelector`                               | Node selector                                  | `{}`     |

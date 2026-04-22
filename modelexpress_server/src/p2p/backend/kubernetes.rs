@@ -6,7 +6,7 @@
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
 use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
-use crate::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -186,7 +186,7 @@ impl MetadataBackend for KubernetesBackend {
         worker_id: &str,
         worker: WorkerMetadata,
     ) -> MetadataResult<()> {
-        let source_id = crate::source_identity::compute_mx_source_id(identity);
+        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let source_id = source_id.as_str();
         let model_name = &identity.model_name;
         let api = self.model_metadata_api();
@@ -489,8 +489,9 @@ impl MetadataBackend for KubernetesBackend {
                 .unwrap_or(0);
 
             if let Some(required_status) = status_filter {
-                let required_name =
-                    crate::k8s_types::WorkerStatus::status_name_from_proto(required_status as i32);
+                let required_name = crate::p2p::k8s_types::WorkerStatus::status_name_from_proto(
+                    required_status as i32,
+                );
                 let matches = cr
                     .status
                     .as_ref()
@@ -507,7 +508,7 @@ impl MetadataBackend for KubernetesBackend {
                 .and_then(|s| s.worker.as_ref())
                 .map(|w| {
                     let proto_status =
-                        crate::k8s_types::WorkerStatus::status_proto_from_name(&w.status);
+                        crate::p2p::k8s_types::WorkerStatus::status_proto_from_name(&w.status);
                     let millis = w
                         .updated_at
                         .as_deref()

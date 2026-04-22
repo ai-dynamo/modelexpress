@@ -178,9 +178,11 @@ async fn deploy_server(
                         "env": [
                             { "name": "MODEL_EXPRESS_SERVER_PORT", "value": "8001" },
                             { "name": "MODEL_EXPRESS_LOG_LEVEL", "value": "debug" },
-                            { "name": "MODEL_EXPRESS_DATABASE_PATH", "value": "/tmp/models.db" },
                             { "name": "MODEL_EXPRESS_CACHE_DIRECTORY", "value": "/root" },
                             { "name": "MX_METADATA_BACKEND", "value": "kubernetes" },
+                            // MX_METADATA_BACKEND drives both P2P and registry; the
+                            // registry uses the Kubernetes ModelCacheEntry CRD here.
+                            // Requires ModelMetadata + ModelCacheEntry CRDs + RBAC.
                             { "name": "HOME", "value": "/root" },
                         ],
                         "readinessProbe": {

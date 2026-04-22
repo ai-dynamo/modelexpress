@@ -25,7 +25,6 @@ hf-hub = { workspace = true }
 jiff = { workspace = true }
 once_cell = { workspace = true }
 prost = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"

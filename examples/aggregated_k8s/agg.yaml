@@ -104,8 +104,6 @@ spec:
               value: "8000"
             - name: MODEL_EXPRESS_LOGGING_LEVEL
               value: "info"
-            - name: MODEL_EXPRESS_DATABASE_PATH
-              value: "/model/models.db"
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: "/model/.model-express/cache"
             - name: MX_METADATA_BACKEND

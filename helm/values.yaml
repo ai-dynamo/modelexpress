@@ -79,8 +79,18 @@ persistence:
 env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
   MODEL_EXPRESS_LOGGING_LEVEL: "info"
-  MODEL_EXPRESS_DATABASE_PATH: "/app/models.db"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
+  # Distributed backend selection. Required — the server fails to start without it.
+  # Set MX_METADATA_BACKEND to "redis" or "kubernetes"; it drives both the P2P metadata
+  # store and the model registry.
+  #
+  # When "redis": also set REDIS_URL to your cluster's Redis service (e.g.
+  # "redis://redis.default.svc:6379"). The chart does not bundle a Redis sub-chart.
+  # When "kubernetes": apply examples/crds.yaml as a cluster-admin and set
+  # serviceAccount.rbac.enabled=true to grant the server access to the CRDs.
+  #
+  # MX_METADATA_BACKEND: "redis"
+  # REDIS_URL: "redis://redis.default.svc:6379"
 
 livenessProbe:
   enabled: true

@@ -36,10 +36,6 @@ pub struct ServerArgs {
     #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
     pub log_format: Option<LogFormat>,
 
-    /// Database file path
-    #[arg(short, long, env = "MODEL_EXPRESS_DATABASE_PATH")]
-    pub database_path: Option<PathBuf>,
-
     /// Cache directory path
     #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
     pub cache_directory: Option<PathBuf>,
@@ -58,8 +54,6 @@ pub struct ServerArgs {
 pub struct ServerConfig {
     /// Server settings
     pub server: ServerSettings,
-    /// Database settings
-    pub database: DatabaseSettings,
     /// Cache configuration
     pub cache: CacheConfig,
     /// Logging configuration
@@ -73,13 +67,6 @@ pub struct ServerSettings {
     pub host: String,
     /// Server port
     pub port: NonZeroU16,
-}
-
-/// Database configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabaseSettings {
-    /// Database file path
-    pub path: PathBuf,
 }
 
 /// Cache configuration wrapper
@@ -113,14 +100,6 @@ impl Default for ServerSettings {
         Self {
             host: "0.0.0.0".to_string(),
             port: modelexpress_common::constants::DEFAULT_GRPC_PORT,
-        }
-    }
-}
-
-impl Default for DatabaseSettings {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::from("./models.db"),
         }
     }
 }
@@ -185,10 +164,6 @@ impl ServerConfig {
             config.logging.format = log_format;
         }
 
-        if let Some(database_path) = args.database_path {
-            config.database.path = database_path;
-        }
-
         // Apply cache overrides
         if let Some(cache_directory) = args.cache_directory {
             config.cache.directory = cache_directory;
@@ -206,16 +181,6 @@ impl ServerConfig {
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Validate database path parent directory exists
-        if let Some(parent) = self.database.path.parent()
-            && !parent.exists()
-        {
-            return Err(ConfigError::Message(format!(
-                "Database directory does not exist: {}",
-                parent.display()
-            )));
-        }
-
         // Validate cache directory
         if let Some(parent) = self.cache.directory.parent()
             && !parent.exists()
@@ -248,9 +213,6 @@ impl ServerConfig {
         info!("Server Configuration:");
         info!("  Host: {}", self.server.host);
         info!("  Port: {}", self.server.port);
-
-        info!("Database Configuration:");
-        info!("  Path: {}", self.database.path.display());
 
         info!("Cache Configuration:");
         info!("  Directory: {}", self.cache.directory.display());
@@ -502,8 +464,6 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-            database:
-              path: "./test.db"
             cache:
               eviction:
                 enabled: false
@@ -530,7 +490,6 @@ mod tests {
             host: None,
             log_level: None,
             log_format: None,
-            database_path: None,
             cache_directory: None,
             cache_eviction_enabled: None,
             validate_config: false,
@@ -542,7 +501,6 @@ mod tests {
         let config = result.expect("Expected successful config parsing");
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port.get(), 8002);
-        assert_eq!(config.database.path, PathBuf::from("./test.db"));
         assert!(!config.cache.eviction.enabled);
         assert_eq!(config.logging.level, LogLevel::Debug);
         assert_eq!(config.logging.format, LogFormat::Json);
@@ -558,8 +516,6 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-            database:
-              pat: "./test.db"  # Wrong field name (should be 'path')
             cache:
               eviction:
                 enabled: "not_a_boolean"  # Invalid type
@@ -573,7 +529,6 @@ mod tests {
             host: None,
             log_level: None,
             log_format: None,
-            database_path: None,
             cache_directory: None,
             cache_eviction_enabled: None,
             validate_config: false,
@@ -593,8 +548,6 @@ mod tests {
             server:
               host: "127.0.0.1"
               port: 8002
-            database:
-              path: "./test.db"
             cache:
               eviction:
                 enabled: true
@@ -621,7 +574,6 @@ mod tests {
             host: Some("0.0.0.0".to_string()),
             log_level: Some(LogLevel::Error),
             log_format: Some(LogFormat::Json),
-            database_path: Some(PathBuf::from("./override.db")),
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
             validate_config: false,
@@ -634,7 +586,6 @@ mod tests {
         // CLI overrides should be applied
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port.get(), 9000);
-        assert_eq!(config.database.path, PathBuf::from("./override.db"));
         assert_eq!(config.logging.level, LogLevel::Error);
         assert_eq!(config.logging.format, LogFormat::Json);
         assert_eq!(config.cache.directory, PathBuf::from("/tmp/override_cache"));
@@ -650,7 +601,6 @@ mod tests {
             host: Some("localhost".to_string()),
             log_level: Some(LogLevel::Warn),
             log_format: None,
-            database_path: None,
             cache_directory: None,
             cache_eviction_enabled: None,
             validate_config: false,

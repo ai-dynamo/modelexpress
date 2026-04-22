@@ -335,7 +335,7 @@ impl MetadataBackend for RedisBackend {
         worker_id: &str,
         worker: WorkerMetadata,
     ) -> MetadataResult<()> {
-        let source_id = crate::source_identity::compute_mx_source_id(identity);
+        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let mut conn = self.get_conn().await?;
         let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
