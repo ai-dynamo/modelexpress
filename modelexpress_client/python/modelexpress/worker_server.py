@@ -30,9 +30,15 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
+        metadata_endpoint: str = "",
+        agent_name: str = "",
+        worker_rank: int = 0,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
+        self._metadata_endpoint = metadata_endpoint
+        self._agent_name = agent_name
+        self._worker_rank = worker_rank
 
     def GetTensorManifest(self, request, context):
         if request.mx_source_id and request.mx_source_id != self._mx_source_id:
@@ -44,6 +50,9 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         return p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
             mx_source_id=self._mx_source_id,
+            metadata_endpoint=self._metadata_endpoint,
+            agent_name=self._agent_name,
+            worker_rank=self._worker_rank,
         )
 
 
@@ -55,10 +64,16 @@ class WorkerGrpcServer:
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
         port: int = 0,
+        metadata_endpoint: str = "",
+        agent_name: str = "",
+        worker_rank: int = 0,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
         self._requested_port = port
+        self._metadata_endpoint = metadata_endpoint
+        self._agent_name = agent_name
+        self._worker_rank = worker_rank
         self._server: grpc.Server | None = None
         self._port: int | None = None
 
@@ -69,7 +84,13 @@ class WorkerGrpcServer:
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-        servicer = WorkerServiceServicer(self._tensor_protos, self._mx_source_id)
+        servicer = WorkerServiceServicer(
+            tensor_protos=self._tensor_protos,
+            mx_source_id=self._mx_source_id,
+            metadata_endpoint=self._metadata_endpoint,
+            agent_name=self._agent_name,
+            worker_rank=self._worker_rank,
+        )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, self._server)
 
         if self._requested_port:

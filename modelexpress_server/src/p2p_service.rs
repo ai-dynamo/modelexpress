@@ -308,6 +308,7 @@ mod tests {
             dtype: "bfloat16".to_string(),
             quantization: String::new(),
             extra_parameters: Default::default(),
+            revision: String::new(),
         }
     }
 

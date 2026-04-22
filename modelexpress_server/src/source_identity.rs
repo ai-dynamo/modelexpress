@@ -46,6 +46,7 @@ fn canonical_json(identity: &SourceIdentity) -> String {
         "dtype": identity.dtype.to_lowercase(),
         "quantization": identity.quantization.to_lowercase(),
         "extra_parameters": sorted_extra,
+        "revision": identity.revision.to_lowercase(),
     })
     .to_string()
 }
@@ -67,6 +68,7 @@ mod tests {
             dtype: "bfloat16".to_string(),
             quantization: String::new(),
             extra_parameters: Default::default(),
+            revision: String::new(),
         }
     }
 
@@ -140,6 +142,41 @@ mod tests {
             .insert("z_key".to_string(), "val".to_string());
 
         assert_eq!(compute_mx_source_id(&a), compute_mx_source_id(&b));
+    }
+
+    #[test]
+    fn test_different_revision_gives_different_id() {
+        let mut pinned = base_identity();
+        pinned.revision = "abc123def4567890".to_string();
+        assert_ne!(
+            compute_mx_source_id(&base_identity()),
+            compute_mx_source_id(&pinned)
+        );
+    }
+
+    #[test]
+    fn test_revision_case_insensitive() {
+        let mut upper = base_identity();
+        upper.revision = "ABC123DEF4567890".to_string();
+        let mut lower = base_identity();
+        lower.revision = "abc123def4567890".to_string();
+        assert_eq!(compute_mx_source_id(&upper), compute_mx_source_id(&lower));
+    }
+
+    // Cross-checked against modelexpress_client/python/tests/test_source_id.py.
+    // If either side's canonical JSON encoding or hashing scheme changes,
+    // both of these asserts diverge from their Python counterparts and
+    // the mismatch is caught in CI.
+    #[test]
+    fn test_python_cross_check_base_identity() {
+        assert_eq!(compute_mx_source_id(&base_identity()), "b0c2c67edeaefc20");
+    }
+
+    #[test]
+    fn test_python_cross_check_with_revision() {
+        let mut pinned = base_identity();
+        pinned.revision = "abc123def4567890".to_string();
+        assert_eq!(compute_mx_source_id(&pinned), "40704b34e4b7deaa");
     }
 
     #[test]

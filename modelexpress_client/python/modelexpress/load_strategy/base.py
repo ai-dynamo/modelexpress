@@ -16,6 +16,8 @@ import torch
 import torch.nn as nn
 
 from ..client import MxClient
+from ..client_factory import create_metadata_client
+from ..k8s_service_client import K8sServiceMetadataClient
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import adopt_hidden_tensors, collect_module_tensors, log_tensor_summary
 from ..metadata import build_source_identity, publish_metadata_and_ready
@@ -56,7 +58,7 @@ class LoadContext:
     global_rank: int
     device_id: int
     identity: p2p_pb2.SourceIdentity
-    mx_client: MxClient
+    mx_client: MxClient | K8sServiceMetadataClient
     worker_id: str
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -96,7 +98,7 @@ def build_load_context(
         global_rank=global_rank,
         device_id=device_id,
         identity=build_source_identity(vllm_config, model_config),
-        mx_client=MxClient(),
+        mx_client=create_metadata_client(worker_rank=global_rank),
         worker_id=uuid.uuid4().hex[:8],
     )
 
