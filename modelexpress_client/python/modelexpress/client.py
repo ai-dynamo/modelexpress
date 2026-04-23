@@ -14,6 +14,7 @@ registered by the owning process for GPUDirect RDMA.
 
 import logging
 import os
+from abc import ABC, abstractmethod
 
 import grpc
 
@@ -21,6 +22,62 @@ from . import p2p_pb2
 from . import p2p_pb2_grpc
 
 logger = logging.getLogger("modelexpress.client")
+
+
+class MxClientBase(ABC):
+    """Abstract metadata client.
+
+    Both the central-coordinator :class:`MxClient` and the decentralized
+    :class:`~.k8s_service_client.MxK8sServiceClient` implement this
+    interface; callers (loaders, strategies) depend on the base class so
+    backend swaps are a factory-level choice.
+
+    ``REQUIRES_P2P_METADATA`` lets a backend opt into forcing the P2P
+    path in :func:`metadata.publish_metadata_and_ready` regardless of
+    the ``MX_P2P_METADATA`` env var. Decentralized backends set it to
+    True because they have no central store to fall back to.
+    """
+
+    REQUIRES_P2P_METADATA: bool = False
+
+    @abstractmethod
+    def publish_metadata(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        worker: "p2p_pb2.WorkerMetadata",
+        worker_id: str,
+    ) -> str:
+        """Publish worker metadata and return the computed mx_source_id."""
+
+    @abstractmethod
+    def list_sources(
+        self,
+        identity: "p2p_pb2.SourceIdentity | None" = None,
+        status_filter: "p2p_pb2.SourceStatus | None" = None,
+    ) -> "p2p_pb2.ListSourcesResponse":
+        """List candidate source workers matching the given identity."""
+
+    @abstractmethod
+    def get_metadata(
+        self,
+        mx_source_id: str,
+        worker_id: str,
+    ) -> "p2p_pb2.GetMetadataResponse":
+        """Fetch full worker metadata for one specific source."""
+
+    @abstractmethod
+    def update_status(
+        self,
+        mx_source_id: str,
+        worker_id: str,
+        worker_rank: int,
+        status: "p2p_pb2.SourceStatus",
+    ) -> bool:
+        """Update a source worker's lifecycle status."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release any resources held by the client."""
 
 
 def _parse_server_address(address: str) -> str:
@@ -51,7 +108,7 @@ def _get_server_url(explicit_url: str | None = None) -> str:
     return _parse_server_address(url)
 
 
-class MxClient:
+class MxClient(MxClientBase):
     """
     Lightweight gRPC client for ModelExpress server communication.
 

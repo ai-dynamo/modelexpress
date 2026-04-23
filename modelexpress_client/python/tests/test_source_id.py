@@ -82,3 +82,19 @@ def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
     assert compute_mx_source_id(pinned) == "40704b34e4b7deaa"
+
+
+def test_case_colliding_extra_parameters_are_deterministic():
+    # Case-colliding keys (Foo vs foo) with different values. The
+    # normalization rule is: sort original keys (ASCII order, so "Foo"
+    # before "foo"), lowercase, keep the first value. "Foo"="a" survives
+    # over "foo"="b" regardless of insertion order. Cross-checked against
+    # source_identity.rs::test_python_cross_check_case_colliding_extra.
+    a = _base_identity()
+    a.extra_parameters["Foo"] = "a"
+    a.extra_parameters["foo"] = "b"
+    b = _base_identity()
+    b.extra_parameters["foo"] = "b"
+    b.extra_parameters["Foo"] = "a"
+    assert compute_mx_source_id(a) == compute_mx_source_id(b)
+    assert compute_mx_source_id(a) == "bd9ea6c70d83fef1"

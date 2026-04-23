@@ -93,9 +93,6 @@ spec:
             capabilities:
               add:
                 - IPC_LOCK
-          # vLLM command sets --tensor-parallel-size=2 via its
-          # entrypoint (image-specific). The pod gets 2 GPUs and vLLM
-          # spawns 2 worker processes, one per device.
           env:
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
@@ -118,6 +115,16 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+          # vLLM runs with TP=2 inside the pod, spawning one worker per
+          # GPU; each binds MX_WORKER_GRPC_PORT + device_id (6555 for
+          # rank 0, 6556 for rank 1).
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "2"
           # Expose both per-rank ports on the pod; the Services route
           # to whichever one matches their targetPort.
           ports:

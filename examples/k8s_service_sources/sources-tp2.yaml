@@ -98,6 +98,17 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+          # Each pod runs vLLM with TP=1 (one GPU per pod). Cross-pod
+          # TP=N deployments (Ray / torchrun) would set a different TP
+          # value here and populate the rank from their runtime; this
+          # example stays standalone-per-pod for simplicity.
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
           ports:
             - name: worker-grpc
               containerPort: 6555
@@ -192,6 +203,17 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+          # Each pod runs vLLM with TP=1 (one GPU per pod). Cross-pod
+          # TP=N deployments (Ray / torchrun) would set a different TP
+          # value here and populate the rank from their runtime; this
+          # example stays standalone-per-pod for simplicity.
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
           ports:
             - name: worker-grpc
               containerPort: 6555

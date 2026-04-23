@@ -14,25 +14,19 @@ Supported values:
 - ``""`` / ``"server"`` / ``"redis"`` / ``"kubernetes"`` / ``"k8s"`` /
   ``"crd"`` - central ModelExpress server (default). Returns
   :class:`MxClient`.
-- ``"k8s-service"`` / ``"service"`` - K8s Service-routed peer-direct.
-  Returns :class:`K8sServiceMetadataClient`.
-
-Additional backends (peer-direct with mDNS, libp2p DHT, etc.) may
-slot in here over time without touching call sites.
+- ``"k8s-service"`` / ``"service"`` - K8s-Service-routed decentralized
+  backend. Returns :class:`MxK8sServiceClient`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Union
 
-from .client import MxClient
-from .k8s_service_client import K8sServiceMetadataClient
+from .client import MxClient, MxClientBase
+from .k8s_service_client import MxK8sServiceClient
 
 logger = logging.getLogger("modelexpress.client_factory")
-
-MetadataClient = Union[MxClient, K8sServiceMetadataClient]
 
 _CENTRAL_BACKEND_ALIASES = frozenset({
     "", "server", "redis", "kubernetes", "k8s", "crd",
@@ -42,11 +36,11 @@ _K8S_SERVICE_ALIASES = frozenset({"k8s-service", "service"})
 
 def create_metadata_client(
     worker_rank: int | None = None,
-) -> MetadataClient:
+) -> MxClientBase:
     """Create the metadata client dictated by ``MX_METADATA_BACKEND``.
 
     ``worker_rank`` is only consumed by backends that resolve a rank-
-    specific endpoint (currently :class:`K8sServiceMetadataClient`);
+    specific endpoint (currently :class:`MxK8sServiceClient`);
     others ignore it.
     """
     backend = os.environ.get("MX_METADATA_BACKEND", "").lower().strip()
@@ -55,11 +49,11 @@ def create_metadata_client(
         return MxClient()
     if backend in _K8S_SERVICE_ALIASES:
         logger.info(
-            "create_metadata_client: K8sServiceMetadataClient "
+            "create_metadata_client: MxK8sServiceClient "
             "(backend=%r, worker_rank=%s)",
             backend, worker_rank,
         )
-        return K8sServiceMetadataClient(worker_rank=worker_rank)
+        return MxK8sServiceClient(worker_rank=worker_rank)
     raise ValueError(
         f"Unknown MX_METADATA_BACKEND value {backend!r}. "
         f"Supported: {sorted(_CENTRAL_BACKEND_ALIASES | _K8S_SERVICE_ALIASES)}"

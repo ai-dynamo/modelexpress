@@ -78,7 +78,7 @@ def _resolve_model_revision(model_config) -> str:
     2. model_config.revision (from vLLM's ModelConfig; typically the
        HuggingFace commit SHA or branch/tag that was loaded).
     3. Empty string (unknown revision; handshake relies on the other
-       identity fields only, and peer-direct deployments lose the
+       identity fields only, and decentralized deployments lose the
        bit-identical guarantee).
 
     Future iterations can resolve HF branches/tags to the underlying

@@ -81,6 +81,13 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
           ports:
             - name: worker-grpc
               containerPort: 6555
@@ -149,6 +156,13 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
           ports:
             - name: worker-grpc
               containerPort: 6555

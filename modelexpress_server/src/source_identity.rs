@@ -29,11 +29,22 @@ pub fn validate_identity(identity: &SourceIdentity) -> Result<(), String> {
 }
 
 fn canonical_json(identity: &SourceIdentity) -> String {
-    let sorted_extra: BTreeMap<String, String> = identity
-        .extra_parameters
-        .iter()
-        .map(|(k, v)| (k.to_lowercase(), v.to_lowercase()))
-        .collect();
+    // Normalize extra_parameters deterministically:
+    // 1. sort by original key (String::cmp = byte order, matches Python's
+    //    default sorted() on str keys for ASCII content)
+    // 2. lowercase both keys and values
+    // 3. on case-colliding keys, keep the first value we see
+    // HashMap iteration order is non-deterministic in Rust, so relying on
+    // .collect() into BTreeMap would let a case-colliding key's surviving
+    // value flip run-to-run. Explicit sort-then-dedup keeps cross-language
+    // hashes stable with the Python implementation.
+    let mut items: Vec<(&String, &String)> = identity.extra_parameters.iter().collect();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+    let mut sorted_extra: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in items {
+        let lk = k.to_lowercase();
+        sorted_extra.entry(lk).or_insert_with(|| v.to_lowercase());
+    }
 
     serde_json::json!({
         "mx_version": identity.mx_version.to_lowercase(),
@@ -177,6 +188,22 @@ mod tests {
         let mut pinned = base_identity();
         pinned.revision = "abc123def4567890".to_string();
         assert_eq!(compute_mx_source_id(&pinned), "40704b34e4b7deaa");
+    }
+
+    #[test]
+    fn test_python_cross_check_case_colliding_extra() {
+        // Case-colliding keys (Foo vs foo) with different values. The
+        // deterministic normalization rule: sort original keys (String::cmp
+        // byte order puts "Foo" before "foo"), lowercase, keep the first
+        // value. "Foo"="a" survives over "foo"="b" regardless of insertion
+        // order into the proto's HashMap. Matches Python
+        // test_source_id.py::test_case_colliding_extra_parameters_are_deterministic.
+        let mut id = base_identity();
+        id.extra_parameters
+            .insert("Foo".to_string(), "a".to_string());
+        id.extra_parameters
+            .insert("foo".to_string(), "b".to_string());
+        assert_eq!(compute_mx_source_id(&id), "bd9ea6c70d83fef1");
     }
 
     #[test]

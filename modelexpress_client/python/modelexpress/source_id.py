@@ -6,7 +6,7 @@
 Mirrors the Rust ``compute_mx_source_id`` in
 ``modelexpress_server/src/source_identity.rs``. When the central server
 is in the loop, it computes the ID and returns it to clients; in
-peer-direct / K8s-Service-routed deployments where there is no central
+decentralized / K8s-Service-routed deployments where there is no central
 server, clients compute the ID locally. The two implementations MUST
 produce identical IDs for identical identities, or the handshake
 validation that ties ``mx_source_id`` to the content of
@@ -34,10 +34,19 @@ def compute_mx_source_id(identity: p2p_pb2.SourceIdentity) -> str:
 
 
 def _canonical_json(identity: p2p_pb2.SourceIdentity) -> str:
-    sorted_extra = {
-        k.lower(): v.lower()
-        for k, v in sorted(identity.extra_parameters.items())
-    }
+    # Normalize extra_parameters deterministically:
+    # 1. sort by original key (ASCII/byte order, matches Rust's String::cmp)
+    # 2. lowercase both keys and values
+    # 3. on case-colliding keys, keep the first value we see (stable because
+    #    the sort already picks a canonical survivor)
+    # Rust's HashMap iteration order is non-deterministic, so this explicit
+    # sort-then-dedup is what keeps cross-language hashes stable when users
+    # pass case-colliding keys.
+    sorted_extra: dict[str, str] = {}
+    for k, v in sorted(identity.extra_parameters.items()):
+        lk = k.lower()
+        if lk not in sorted_extra:
+            sorted_extra[lk] = v.lower()
     payload = {
         "mx_version": identity.mx_version.lower(),
         "mx_source_type": identity.mx_source_type,

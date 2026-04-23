@@ -36,6 +36,7 @@ import grpc
 
 from . import p2p_pb2
 from . import p2p_pb2_grpc
+from .client import MxClientBase
 from .source_id import compute_mx_source_id
 
 logger = logging.getLogger("modelexpress.k8s_service_client")
@@ -45,14 +46,14 @@ _DEFAULT_MAX_RETRIES = 5
 _DEFAULT_BACKOFF_SECONDS = 0.5
 
 
-class K8sServiceMetadataClient:
-    """K8s-Service-routed, duck-typed MxClient."""
+class MxK8sServiceClient(MxClientBase):
+    """K8s-Service-routed metadata client."""
 
     # Signals to metadata.publish_metadata_and_ready that this backend
     # has no central store to fall back to, so the P2P path (start
     # WorkerGrpcServer, serve tensor manifests directly) is required.
-    # `_is_p2p_metadata_enabled` checks for this attribute; its absence
-    # (MxClient) defaults to False.
+    # `_is_p2p_metadata_enabled` checks for this attribute; MxClient
+    # inherits the default False from MxClientBase.
     REQUIRES_P2P_METADATA = True
 
     def __init__(
@@ -107,7 +108,7 @@ class K8sServiceMetadataClient:
         self._worker_rank = worker.worker_rank
         source_id = compute_mx_source_id(identity)
         logger.info(
-            "K8sServiceMetadataClient.publish_metadata: "
+            "MxK8sServiceClient.publish_metadata: "
             "computed mx_source_id=%s for worker_rank=%d",
             source_id, worker.worker_rank,
         )
@@ -133,15 +134,20 @@ class K8sServiceMetadataClient:
             )
         if self._worker_rank is None:
             raise RuntimeError(
-                "K8sServiceMetadataClient needs a worker_rank before "
+                "MxK8sServiceClient needs a worker_rank before "
                 "list_sources can resolve the Service endpoint; pass "
                 "worker_rank to the constructor or call publish_metadata "
                 "first"
             )
         source_id = compute_mx_source_id(identity)
+        # worker_id is intentionally empty. This backend has no per-pod
+        # addressability (kube-proxy picks the backend at connection
+        # time); get_metadata ignores worker_id and routes through the
+        # Service instead. Stamping a synthetic ID here would suggest
+        # per-pod semantics that don't exist in this backend.
         ref = p2p_pb2.SourceInstanceRef(
             mx_source_id=source_id,
-            worker_id=f"svc-rank-{self._worker_rank}",
+            worker_id="",
             model_name=identity.model_name,
             worker_rank=self._worker_rank,
         )
@@ -160,12 +166,12 @@ class K8sServiceMetadataClient:
         """
         if self._worker_rank is None:
             raise RuntimeError(
-                "K8sServiceMetadataClient.get_metadata requires "
+                "MxK8sServiceClient.get_metadata requires "
                 "worker_rank; call publish_metadata first or set it "
                 "at construction time"
             )
         endpoint = self._resolve_endpoint()
-        last_error: grpc.RpcError | None = None
+        last_error: Exception | None = None
 
         for attempt in range(1, self._max_retries + 2):
             channel = grpc.insecure_channel(endpoint)
@@ -173,6 +179,46 @@ class K8sServiceMetadataClient:
                 stub = p2p_pb2_grpc.WorkerServiceStub(channel)
                 req = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
                 resp = stub.GetTensorManifest(req, timeout=30)
+
+                # Defense-in-depth: validate the response matches what
+                # was asked for. The server-side handshake in
+                # WorkerServiceServicer rejects mismatched mx_source_id
+                # with FAILED_PRECONDITION, but only when the request
+                # carries a non-empty ID AND the server's own storage
+                # is correct. A misconfigured Service selector routing
+                # the caller to a wrong-rank pool, or the client
+                # somehow passing an empty mx_source_id, would slip
+                # past that check. Validate both fields here before
+                # accepting the manifest.
+                mismatch_reason: str | None = None
+                if resp.mx_source_id != mx_source_id:
+                    mismatch_reason = (
+                        f"mx_source_id mismatch: expected "
+                        f"{mx_source_id!r}, got {resp.mx_source_id!r}"
+                    )
+                elif resp.worker_rank != self._worker_rank:
+                    mismatch_reason = (
+                        f"worker_rank mismatch: expected "
+                        f"{self._worker_rank}, got {resp.worker_rank}"
+                    )
+
+                if mismatch_reason is not None:
+                    last_error = RuntimeError(
+                        f"manifest from {endpoint} failed validation: "
+                        f"{mismatch_reason}"
+                    )
+                    if attempt <= self._max_retries:
+                        logger.warning(
+                            "MxK8sServiceClient.get_metadata: "
+                            "%s on attempt %d/%d; retrying on fresh "
+                            "channel after %.2fs backoff",
+                            mismatch_reason, attempt,
+                            self._max_retries + 1, self._backoff_seconds,
+                        )
+                        time.sleep(self._backoff_seconds)
+                        continue
+                    raise last_error
+
                 worker = p2p_pb2.WorkerMetadata(
                     worker_rank=resp.worker_rank,
                     metadata_endpoint=resp.metadata_endpoint,
@@ -181,7 +227,7 @@ class K8sServiceMetadataClient:
                     status=p2p_pb2.SOURCE_STATUS_READY,
                 )
                 logger.info(
-                    "K8sServiceMetadataClient.get_metadata: fetched "
+                    "MxK8sServiceClient.get_metadata: fetched "
                     "manifest from %s (mx_source_id=%s, rank=%d, "
                     "%d tensors, attempt=%d)",
                     endpoint, resp.mx_source_id, resp.worker_rank,
@@ -200,7 +246,7 @@ class K8sServiceMetadataClient:
                     and attempt <= self._max_retries
                 ):
                     logger.warning(
-                        "K8sServiceMetadataClient.get_metadata: "
+                        "MxK8sServiceClient.get_metadata: "
                         "mx_source_id mismatch on attempt %d/%d "
                         "against %s (server: %s); retrying on fresh "
                         "channel after %.2fs backoff",
@@ -214,9 +260,8 @@ class K8sServiceMetadataClient:
                 channel.close()
 
         message = (
-            f"K8sServiceMetadataClient.get_metadata: exhausted "
-            f"{self._max_retries + 1} attempts against {endpoint} "
-            f"with no matching mx_source_id"
+            f"MxK8sServiceClient.get_metadata: exhausted "
+            f"{self._max_retries + 1} attempts against {endpoint}"
         )
         logger.error("%s: %s", message, last_error)
         raise RuntimeError(f"{message}: {last_error}") from last_error

@@ -259,18 +259,18 @@ See [`../docs/ARCHITECTURE.md`](ARCHITECTURE.md#backend-choice-stable-weight-inf
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (peer-direct via K8s Service routing). |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` backend) |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_SKIP_FEATURE_CHECK` | `0` | Bypass the MLA feature gate for P2P transfer (testing only) |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves peer-direct, currently `k8s-service`. |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for peer-direct backends where no central coordinator tracks versions. |
+| `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources-rank-{rank}:6555` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
@@ -287,7 +287,7 @@ Each GPU worker publishes independently using its global rank (`torch.distribute
 `MX_P2P_METADATA=1` makes source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch both directly from the source worker rather than pulling them through the central store. The division of responsibility depends on which metadata backend is in use:
 
 - **Central-coordinator backends (`redis`, `kubernetes`):** opt-in via `MX_P2P_METADATA=1`. By default the source publishes full tensor metadata (NIXL blobs + tensor descriptors) to the central server, and targets fetch the full blob from the server. With the env var set, the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration needed on the target side.
-- **`k8s-service` backend:** auto-enabled. The backend declares itself peer-direct (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly.
+- **`k8s-service` backend:** auto-enabled. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
@@ -376,9 +376,9 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
 
-#### K8s-Service-Routed Backend (peer-direct, no central server)
+#### K8s-Service-Routed Backend (decentralized, no central server)
 
-Minimal deployment shape when you want peer-direct transfers and are happy to let Kubernetes own discovery. No `modelexpress-server` deployed, no Redis, no CRDs. Source pods sit behind one Service per tensor-parallel rank; clients open a gRPC channel directly to the Service DNS name and kube-proxy load-balances across ready backends.
+Minimal deployment shape when you want decentralized transfers and are happy to let Kubernetes own discovery. No `modelexpress-server` deployed, no Redis, no CRDs. Source pods sit behind one Service per tensor-parallel rank; clients open a gRPC channel directly to the Service DNS name and kube-proxy load-balances across ready backends.
 
 ```bash
 # No server, no CRDs, no Redis. Just the source and target pools.

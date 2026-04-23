@@ -279,7 +279,7 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 |-----|---------|----------|---------|
 | `GetTensorManifest` | `GetTensorManifestRequest` | `GetTensorManifestResponse` | Fetch tensor descriptors directly from a source worker |
 
-Per-worker gRPC service started when `MX_P2P_METADATA=1`. Targets call this instead of fetching tensor descriptors from the central server. Validates `mx_source_id` to catch stale discovery.
+Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors from the central server. Validates `mx_source_id` to catch stale discovery.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
@@ -352,18 +352,18 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 
 ### P2P Metadata Backends
 
-Two families of backends exist: **server-coordinated** (the server owns the metadata store) and **peer-direct** (no central server in the loop).
+Two families of backends exist: **server-coordinated** (the server owns the metadata store) and **decentralized** (no central server in the loop).
 
 Server-coordinated backends live in the Rust server and are selected via `MX_METADATA_BACKEND`:
 
 - **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). Stale detection and cleanup handled by the server-side reaper.
 - **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs (one per worker) with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection. Standard Kubernetes `status.conditions` (`Ready`) and `status.observedGeneration` are maintained so that `kubectl wait --for=condition=Ready` works. Stale detection handled by the server-side reaper.
 
-The peer-direct backend lives in the Python client and is selected via `MX_METADATA_BACKEND`:
+The decentralized backend lives in the Python client and is selected via `MX_METADATA_BACKEND`:
 
 - **K8s-service** (`k8s-service`/`service`): each source pool sits behind a Kubernetes Service (one per tensor-parallel rank, label selector pinned to `mx.rank=R`). Clients open a direct gRPC channel to the Service DNS and call `GetTensorManifest`; kube-proxy load-balances across ready backends. No central server is involved. `mx_source_id` is computed client-side via the same canonical JSON + SHA256 scheme and validated on the response. See [`../examples/k8s_service_sources/`](../examples/k8s_service_sources/) for the deployment shape.
 
-Each worker publishes independently. The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))` where `SourceIdentity` includes a `revision` field for content-addressed identity (HuggingFace commit SHA, S3 object version, or a deployer-provided string). Two sources with identical `mx_source_id` are guaranteed to have bit-identical weight bytes, which is what lets peer-direct deployments safely validate ranges without a central authority. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
+Each worker publishes independently. The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))` where `SourceIdentity` includes a `revision` field for content-addressed identity (HuggingFace commit SHA, S3 object version, or a deployer-provided string). When `revision` names immutable content, two sources with identical `mx_source_id` are expected to serve bit-identical weight bytes; the ID itself validates declared identity rather than hashing tensor contents, so the guarantee is only as strong as the revision pin and the local cache being intact. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
 
 The Rust and Python implementations of `compute_mx_source_id` are locked together via cross-checked pinned-hash unit tests (`source_identity.rs::test_python_cross_check_*` and `test_source_id.py::test_pinned_hash_*`). Either side drifting on canonical JSON encoding or hashing breaks both test sets together.
 
@@ -371,7 +371,7 @@ See [`metadata.md`](metadata.md) for the full storage layout and schemas.
 
 ### Backend choice: stable-weight inference vs live-refit
 
-The choice between server-coordinated and peer-direct backends is not purely about operational simplicity; the two families have structurally different guarantees around **source addressability**, which dictates what workloads each can support.
+The choice between server-coordinated and decentralized backends is not purely about operational simplicity; the two families have structurally different guarantees around **source addressability**, which dictates what workloads each can support.
 
 **Server-coordinated backends (Redis / Kubernetes-CRD) give you per-worker addressability.** The central store is organised around `(mx_source_id, worker_id)` tuples, and the client-facing RPCs reflect that:
 
@@ -383,7 +383,7 @@ The central store therefore functions as an authoritative, updatable directory o
 
 This property is what lets the central-coordinator backends support **live weight updates** (RL rollouts, fine-tune broadcasts, continuous checkpoint refresh). W updates its weights, publishes the new state, the server reflects it, future targets see the new state. Older targets that already read the previous record get older weights - stale but consistent. The RL loop tolerates that by design.
 
-**The peer-direct `k8s-service` backend gives you pool-level addressability only.** The K8s Service selector is the discovery mechanism; kube-proxy routes each incoming connection to a random ready backend. There is no way through the gRPC call to say "I want worker W specifically, not whichever of the N ready pods kube-proxy happened to pick." That's a deliberate simplification - it's what lets the backend work with zero infrastructure beyond the Service itself - but it has hard consequences:
+**The decentralized `k8s-service` backend gives you pool-level addressability only.** The K8s Service selector is the discovery mechanism; kube-proxy routes each incoming connection to a random ready backend. There is no way through the gRPC call to say "I want worker W specifically, not whichever of the N ready pods kube-proxy happened to pick." That's a deliberate simplification - it's what lets the backend work with zero infrastructure beyond the Service itself - but it has hard consequences:
 
 - Every ready pod in a given Service pool must serve an identical `mx_source_id`. Otherwise the caller's retry loop starts eating into `MX_K8S_SOURCE_RETRIES` to walk past mismatches, and that budget is finite.
 - When a single pod refits in place, the Service pool is temporarily inconsistent. The retry loop handles it for a few attempts, which covers a normal rolling update (pods refit in sequence, transition window is bounded). It does *not* cover a continuously-shifting pool where pods refit every few minutes and callers arrive on arbitrary pods throughout.
@@ -690,7 +690,7 @@ graph TD
 ### Flow
 
 1. **Source loads**: Loads weights from storage (S3/GCS/Azure/local via ModelStreamer, GDS, or disk), runs `process_weights_after_loading()`
-2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifest serving.
+2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifest serving.
 3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
 5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Auto-detects P2P mode if `worker_grpc_endpoint` is populated - fetches tensors from the source worker's `WorkerService` and NIXL metadata via the listen thread instead of from the central server.
@@ -709,9 +709,13 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
-| `MX_METADATA_BACKEND` | (required) | Metadata backend: `redis` or `kubernetes` |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers. Opt-in on central-coordinator backends; auto-enabled (env var ignored) on decentralized backends |
+| `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
+| `MX_K8S_SERVICE_PATTERN` | `mx-sources-rank-{rank}:6555` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank |
+| `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
+| `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |

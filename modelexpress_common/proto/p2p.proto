@@ -82,7 +82,7 @@ message SourceIdentity {
   // commit SHA, S3 object version, or any deployer-provided version
   // string). When populated, two sources with identical SourceIdentity
   // are guaranteed to have bit-identical weight bytes, which lets
-  // peer-direct modes (no central coordinator) use mx_source_id as a
+  // decentralized modes (no central coordinator) use mx_source_id as a
   // full content check. Empty string means "unknown revision" and is
   // compatible with older publishers that pre-date this field.
   string revision = 11;
@@ -180,7 +180,7 @@ message GetTensorManifestResponse {
 
   // Self-describing worker info, populated so a single GetTensorManifest
   // round-trip is enough to open a NIXL transfer. Required for deployments
-  // with no central coordinator (e.g., peer-direct, K8s-Service-routed)
+  // with no central coordinator (e.g., decentralized, K8s-Service-routed)
   // where the caller never saw a ListSources/GetMetadata response.
 
   // host:port of this worker's NIXL listen thread
