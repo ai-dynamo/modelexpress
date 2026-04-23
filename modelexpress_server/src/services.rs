@@ -201,33 +201,12 @@ impl ModelService for ModelServiceImpl {
                     .await;
                 return;
             };
-            // Check if the model is already downloaded
-            if let Some(status) = tracker.get_status(&model_name).await {
-                let update = ModelStatusUpdate {
-                    model_name: model_name.clone(),
-                    status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
-                    message: match status {
-                        ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
-                        ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
-                        ModelStatus::ERROR => {
-                            Some("Previous download failed - retrying".to_string())
-                        }
-                    },
-                    provider: modelexpress_common::grpc::model::ModelProvider::from(provider)
-                        as i32,
-                };
-
-                if tx.send(Ok(update)).await.is_err() {
-                    return; // Client disconnected
-                }
-
-                // If already downloaded, we're done
-                if status == ModelStatus::DOWNLOADED {
-                    return;
-                }
-            }
-
-            // Start or monitor the download process
+            // Run the full claim + wait + retry flow. `ensure_model_downloaded` sends
+            // its own initial status update (based on the `ClaimOutcome` returned by the
+            // registry), so we don't do a pre-check here — a pre-check would either
+            // duplicate that update or, worse, emit `status=ERROR` on a model we're
+            // about to retry and trip the client-lib's terminal-error bailout before
+            // the retry completion broadcast arrives.
             let final_status = tracker
                 .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
                 .await;
@@ -628,26 +607,64 @@ impl ModelDownloadTracker {
             }
         };
 
+        // If we observed a previous ERROR, attempt the ERROR→DOWNLOADING CAS up front.
+        // Only the CAS winner spawns the retry download; observers fall through to the
+        // wait loop. Doing this *before* the initial stream update keeps the reported
+        // status honest: after this block, the record is DOWNLOADING (the record may
+        // briefly have been ERROR, but the client should wait, not bail).
+        let (effective_status, is_retry_owner) = if status == ModelStatus::ERROR {
+            let won = match self
+                .registry
+                .try_reset_error_for_retry(model_name, provider)
+                .await
+            {
+                Ok(won) => won,
+                Err(e) => {
+                    error!("Failed to CAS status for retry: {e}");
+                    let _ = tx
+                        .send(Ok(ModelStatusUpdate {
+                            model_name: model_name.to_string(),
+                            status: modelexpress_common::grpc::model::ModelStatus::from(
+                                ModelStatus::ERROR,
+                            ) as i32,
+                            message: Some("Registry error occurred during retry".to_string()),
+                            provider: modelexpress_common::grpc::model::ModelProvider::from(
+                                provider,
+                            ) as i32,
+                        }))
+                        .await;
+                    return ModelStatus::ERROR;
+                }
+            };
+            (ModelStatus::DOWNLOADING, won)
+        } else {
+            (status, false)
+        };
+
         let update = ModelStatusUpdate {
             model_name: model_name.to_string(),
-            status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
-            message: match status {
-                ModelStatus::DOWNLOADED => Some("Model already downloaded".to_string()),
-                ModelStatus::DOWNLOADING => Some("Model download in progress".to_string()),
-                ModelStatus::ERROR => Some("Previous download failed - retrying".to_string()),
+            status: modelexpress_common::grpc::model::ModelStatus::from(effective_status) as i32,
+            message: match (status, effective_status) {
+                (_, ModelStatus::DOWNLOADED) => Some("Model already downloaded".to_string()),
+                (ModelStatus::ERROR, _) => Some("Previous download failed, retrying".to_string()),
+                (_, ModelStatus::DOWNLOADING) => Some("Model download in progress".to_string()),
+                // effective can never be ERROR: ERROR observations are CAS'd above.
+                (_, ModelStatus::ERROR) => Some("Download error".to_string()),
             },
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
         };
         let _ = tx.send(Ok(update)).await;
 
-        if status == ModelStatus::DOWNLOADING {
+        if effective_status == ModelStatus::DOWNLOADING {
             // Every caller is a waiter — whether we own the download or not, we still
             // need a channel so the completion broadcast reaches this stream.
             self.add_waiting_channel(model_name, tx.clone());
 
-            // Only the claim winner spawns the download. Observers wait.
-            if is_owner {
-                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, false);
+            // Spawn the download only on the replica that won the claim (fresh
+            // download) or won the ERROR-retry CAS. Everyone else waits.
+            if is_owner || is_retry_owner {
+                let retry = status == ModelStatus::ERROR;
+                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, retry);
             }
 
             // Wait for completion by polling the registry.
@@ -659,37 +676,9 @@ impl ModelDownloadTracker {
                     return current_status;
                 }
             }
-        } else if status == ModelStatus::ERROR {
-            // Atomic CAS from ERROR to DOWNLOADING. Only the replica that wins the CAS
-            // spawns the retry; the others observe DOWNLOADING on the next poll and
-            // fall through to the wait loop.
-            let won_retry = match self
-                .registry
-                .try_reset_error_for_retry(model_name, provider)
-                .await
-            {
-                Ok(won) => won,
-                Err(e) => {
-                    error!("Failed to CAS status for retry: {e}");
-                    return ModelStatus::ERROR;
-                }
-            };
-            self.add_waiting_channel(model_name, tx.clone());
-            if won_retry {
-                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, true);
-            }
-
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Some(current_status) = self.get_status(model_name).await
-                    && current_status != ModelStatus::DOWNLOADING
-                {
-                    return current_status;
-                }
-            }
         }
 
-        status
+        effective_status
     }
 }
 
