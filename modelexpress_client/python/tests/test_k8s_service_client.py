@@ -158,6 +158,49 @@ def test_resolve_endpoint_substitutes_rank():
     assert client._resolve_endpoint() == "my-svc-rank-7.ns.svc.cluster.local:6555"
 
 
+def test_resolve_endpoint_autoappends_port_when_pattern_has_no_port(monkeypatch):
+    # Shape 2: bare hostname, client auto-computes port = base + rank.
+    monkeypatch.delenv("MX_WORKER_GRPC_PORT", raising=False)
+    client = MxK8sServiceClient(
+        worker_rank=3,
+        service_pattern="mx-sources",
+    )
+    assert client._resolve_endpoint() == "mx-sources:6558"  # 6555 + 3
+
+
+def test_resolve_endpoint_autoappend_honors_mx_worker_grpc_port(monkeypatch):
+    monkeypatch.setenv("MX_WORKER_GRPC_PORT", "9000")
+    client = MxK8sServiceClient(
+        worker_rank=2,
+        service_pattern="mx-sources",
+    )
+    assert client._resolve_endpoint() == "mx-sources:9002"  # 9000 + 2
+
+
+def test_resolve_endpoint_autoappend_works_with_rank_substitution(monkeypatch):
+    # Pattern has {rank} in the hostname but no port; client still
+    # auto-appends :base+rank.
+    monkeypatch.delenv("MX_WORKER_GRPC_PORT", raising=False)
+    client = MxK8sServiceClient(
+        worker_rank=1,
+        service_pattern="mx-sources-rank-{rank}",
+    )
+    assert client._resolve_endpoint() == "mx-sources-rank-1:6556"  # 6555 + 1
+
+
+def test_default_service_pattern_is_bare_hostname():
+    # Default is the Shape-2-friendly bare hostname. Clients that want
+    # Shape 1 (rank-in-hostname) set MX_K8S_SERVICE_PATTERN explicitly.
+    import os
+    saved = os.environ.pop("MX_K8S_SERVICE_PATTERN", None)
+    try:
+        client = MxK8sServiceClient(worker_rank=0)
+        assert client._service_pattern == "mx-sources"
+    finally:
+        if saved is not None:
+            os.environ["MX_K8S_SERVICE_PATTERN"] = saved
+
+
 def test_close_is_safe_noop():
     client = MxK8sServiceClient(worker_rank=0)
     client.close()

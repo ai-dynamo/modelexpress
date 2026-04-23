@@ -3,64 +3,50 @@
 
 # TP=2 multi-GPU-per-pod variant of sources-tp2.yaml.
 #
-# This is the "all ranks live in one pod" topology: each source pod
-# has N GPUs and runs N worker processes internally (vLLM spawns them
-# with --tensor-parallel-size=N). Each worker binds its own
-# WorkerGrpcServer on MX_WORKER_GRPC_PORT + device_id. TP communication
-# happens over NVLink inside the pod, which is the shape most perf-
-# conscious inference deployments use.
+# This is the "all ranks live in one pod" topology: each source pod has
+# N GPUs and runs N worker processes internally (vLLM spawns them via
+# --tensor-parallel-size=N). Each worker binds its WorkerGrpcServer on
+# MX_WORKER_GRPC_PORT + device_id. TP communication happens over NVLink
+# inside the pod, which is the shape most perf-conscious inference
+# deployments use (and the only shape that works at all for TP since
+# NVLink is intra-node).
 #
-# The key K8s difference vs the 1-GPU-per-pod shape (sources-tp2.yaml):
-# all Services share the same pod selector (app=mx-sources) - every
-# pod has every rank - but each Service targets a different port on
-# that pod (targetPort: 6555+rank). Client-side pattern is identical
-# to the 1-GPU-per-pod case: mx-sources-rank-{rank}:6555 resolves
-# correctly regardless of which topology is deployed.
+# Because every pod has every rank, we only need ONE Service with N
+# named ports: external port 6555+R maps to the rank-R WorkerGrpcServer
+# inside the pod. Client-side pattern is just `mx-sources` (the default):
+# MxK8sServiceClient auto-computes `:MX_WORKER_GRPC_PORT + rank` when no
+# port is in the pattern.
 #
-# Scale to TP=N by duplicating the Service block per rank (same
-# selector, targetPort = 6555 + rank) and setting
-# tensor_parallel_size=N in the vLLM command.
+# Scale to TP=N by adding N named ports to the Service (one per rank)
+# and setting --tensor-parallel-size=N in the vLLM command.
 #
 # Prerequisites:
-#   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#   - HF token secret: kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #   - Nodes with N GPUs available per pod (for TP=2: 2x GPU per pod)
 #   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
 
 # ---------------------------------------------------------------------------
-# Services - one per rank, same selector, differing targetPort
+# Service - one Service, one port per rank (port 6555+rank)
 # ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-sources-rank-0
+  name: mx-sources
   labels:
     app: mx-sources
 spec:
   type: ClusterIP
   sessionAffinity: None
   ports:
-    - name: worker-grpc
+    # One port entry per rank. Port 6555 -> rank 0, 6556 -> rank 1, etc.
+    # The targetPort matches the external port: each rank's
+    # WorkerGrpcServer binds MX_WORKER_GRPC_PORT + device_id inside the
+    # pod, so external 6556 -> internal 6556 -> rank-1's server.
+    - name: rank-0
       port: 6555
       targetPort: 6555
-  selector:
-    app: mx-sources
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: mx-sources-rank-1
-  labels:
-    app: mx-sources
-spec:
-  type: ClusterIP
-  sessionAffinity: None
-  ports:
-    - name: worker-grpc
-      port: 6555
-      # Rank 1 lives on port 6556 inside the pod (MX_WORKER_GRPC_PORT
-      # + device_id where device_id=1). Service fronts it on the same
-      # external port as rank 0's Service does; kube-proxy routes
-      # external :6555 -> internal :6556 on the selected pod.
+    - name: rank-1
+      port: 6556
       targetPort: 6556
   selector:
     app: mx-sources
@@ -102,8 +88,12 @@ spec:
               value: "modelexpress"
             - name: MX_METADATA_BACKEND
               value: "k8s-service"
+            # Bare hostname - MxK8sServiceClient auto-computes the port as
+            # MX_WORKER_GRPC_PORT + its own rank. No per-rank Services
+            # needed; the single mx-sources Service above handles all ranks
+            # via named ports.
             - name: MX_K8S_SERVICE_PATTERN
-              value: "mx-sources-rank-{rank}:6555"
+              value: "mx-sources"
             - name: MX_METADATA_PORT
               value: "5555"
             - name: MX_WORKER_GRPC_PORT
@@ -125,8 +115,8 @@ spec:
             - mx
             - --tensor-parallel-size
             - "2"
-          # Expose both per-rank ports on the pod; the Services route
-          # to whichever one matches their targetPort.
+          # Expose both per-rank ports on the pod; the Service routes
+          # external port 6555 -> :6555, 6556 -> :6556.
           ports:
             - name: rank-0
               containerPort: 6555
@@ -141,9 +131,7 @@ spec:
               rdma/shared_ib: 2
           # Readiness probe checks rank-0's port only; in practice all
           # ranks in a pod finish loading around the same time, so the
-          # first one being ready is a reasonable proxy. If your
-          # deployment needs per-rank readiness, add a probe per port
-          # or aggregate via a wrapper script.
+          # first one being ready is a reasonable proxy.
           readinessProbe:
             exec:
               command:

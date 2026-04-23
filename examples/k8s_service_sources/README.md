@@ -49,33 +49,32 @@ Two deployment shapes work, and the client code is identical for both - the diff
 
 **Shape 1: 1-GPU-per-pod, N pods per TP group.** Each pod holds exactly one rank. The pod is labeled `mx.rank=R` and the per-rank Service selector matches on that label. Each pod binds port 6555 (its device_id is 0 inside that pod). Targets at rank R hit `mx-sources-rank-R:6555` and kube-proxy routes them to one of the replica pods labeled `mx.rank=R`. TP communication across ranks requires cross-pod NCCL (over IB/Ethernet).
 
-**Shape 2: multi-GPU-per-pod, N GPUs in one pod.** Each pod has N GPUs and runs N worker processes internally (vLLM spawns them with `--tensor-parallel-size=N`). Each worker binds its own `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT + device_id`, so a TP=2 pod listens on 6555 (rank 0) and 6556 (rank 1). TP communication happens over NVLink inside the pod, which is usually faster for latency-sensitive inference.
+**Shape 2: multi-GPU-per-pod, N GPUs in one pod.** Each pod has N GPUs and runs N worker processes internally (vLLM spawns them with `--tensor-parallel-size=N`). Each worker binds its own `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT + device_id`, so a TP=2 pod listens on 6555 (rank 0) and 6556 (rank 1). TP communication happens over NVLink inside the pod, which is usually faster for latency-sensitive inference - and is in fact the only shape that works for heavy TP, since NVLink is intra-node-only.
 
-The Service side is where the two shapes diverge. In shape 1 the Services *partition* pods by rank via the selector; in shape 2 every pod serves every rank, so the Services share the selector and each one targets a different port on the same pod pool:
+The two shapes diverge on the Service side. Shape 1 needs per-rank Services to partition pods by rank label (selectors are Service-wide, so no way around N Services). Shape 2 every pod has every rank, so the rank dimension moves into the *port*: ONE Service with N named ports, each external port maps to the matching in-pod port:
 
 ```yaml
-# Shape 2 Service: same selector across ranks, different targetPort per rank.
+# Shape 2: one Service, N named ports.
 kind: Service
-metadata: { name: mx-sources-rank-0 }
+metadata: { name: mx-sources }
 spec:
   selector: { app: mx-sources }
-  ports: [{ port: 6555, targetPort: 6555 }]   # rank 0
----
-kind: Service
-metadata: { name: mx-sources-rank-1 }
-spec:
-  selector: { app: mx-sources }               # same pods as rank 0
-  ports: [{ port: 6555, targetPort: 6556 }]   # rank 1 (device_id=1 -> +1)
+  ports:
+    - { name: rank-0, port: 6555, targetPort: 6555 }
+    - { name: rank-1, port: 6556, targetPort: 6556 }
 ```
 
-Client-side, `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555` resolves correctly for both shapes; kube-proxy handles the targetPort routing transparently.
+**Client-side pattern rule:** `MX_K8S_SERVICE_PATTERN` with an explicit `:port` is used verbatim (Shape 1). A pattern without a port is treated as a bare hostname and the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (Shape 2). So:
 
-Shape 1 is the cleaner K8s-native pattern for cross-pod TP or when you want per-rank autoscaling. Shape 2 is what most latency-focused inference deployments end up with because of the NVLink benefit. Pick based on your TP topology, not based on how the backend works.
+- Shape 1: `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555` - rank in hostname, port literal.
+- Shape 2: `MX_K8S_SERVICE_PATTERN=mx-sources` (also the default) - rank baked into the auto-computed port.
+
+Shape 1 is the K8s-native pattern if you want per-rank autoscaling or are working with cross-pod setups where TP isn't involved. Shape 2 is what perf-focused TP inference deployments land on because of the NVLink requirement, and it's a strictly smaller manifest (one Service, not N). Pick based on your parallelism topology, not on how the backend works.
 
 ## Files
 
 - [`sources-tp2.yaml`](sources-tp2.yaml) - TP=2 source pool in the **1-GPU-per-pod** shape (Shape 1 above). Two Deployments (one per rank) with rank-labeled pods, two Services selecting by `mx.rank`, two replicas per rank.
-- [`sources-tp2-single-pod.yaml`](sources-tp2-single-pod.yaml) - TP=2 source pool in the **multi-GPU-per-pod** shape (Shape 2 above). One Deployment with 2-GPU pods, two Services sharing the same pod selector and differing by `targetPort`. Same client pattern as Shape 1.
+- [`sources-tp2-single-pod.yaml`](sources-tp2-single-pod.yaml) - TP=2 source pool in the **multi-GPU-per-pod** shape (Shape 2 above). One Deployment with 2-GPU pods, ONE Service named `mx-sources` with two named ports (`rank-0: 6555`, `rank-1: 6556`). Client pattern is the default `mx-sources` (bare hostname); the client auto-computes the port from rank.
 - [`target.yaml`](target.yaml) - A target vLLM pod that pulls weights via the K8s-service backend. Works against either source topology (the client sees the same Service DNS regardless).
 
 Scale the pattern to TP=N by adding N rank Deployments and N Services.
@@ -171,7 +170,7 @@ This backend is built for **stable-weight inference deployments**: the weights l
 | Variable                         | Default                         | Meaning                                                                       |
 |----------------------------------|---------------------------------|-------------------------------------------------------------------------------|
 | `MX_METADATA_BACKEND`            | `""` (central server)           | Set to `k8s-service` to enable this backend.                                   |
-| `MX_K8S_SERVICE_PATTERN`         | `mx-sources-rank-{rank}:6555`   | DNS template. `{rank}` is substituted with the worker's own rank.              |
+| `MX_K8S_SERVICE_PATTERN`         | `mx-sources`                    | DNS template. `{rank}` is substituted with the worker's own rank. If the pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}`. |
 | `MX_K8S_SOURCE_RETRIES`          | `5`                             | Max retries on `FAILED_PRECONDITION` before giving up.                         |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS`  | `0.5`                           | Sleep between retries (fresh channel per attempt).                             |
 | `MX_MODEL_REVISION`              | unset                           | Override for `SourceIdentity.revision`. Useful for local / non-HF checkpoints. |

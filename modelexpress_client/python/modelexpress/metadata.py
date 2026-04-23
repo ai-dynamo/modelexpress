@@ -80,10 +80,6 @@ def _resolve_model_revision(model_config) -> str:
     3. Empty string (unknown revision; handshake relies on the other
        identity fields only, and decentralized deployments lose the
        bit-identical guarantee).
-
-    Future iterations can resolve HF branches/tags to the underlying
-    commit SHA via huggingface_hub, and hash S3 object versions or
-    local checkpoint contents when no upstream revision is available.
     """
     override = os.environ.get("MX_MODEL_REVISION", "")
     if override:

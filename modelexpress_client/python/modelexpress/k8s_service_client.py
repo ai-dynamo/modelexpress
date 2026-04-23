@@ -5,21 +5,33 @@
 K8s-Service-routed metadata client.
 
 Duck-typed replacement for :class:`MxClient` that skips the central
-coordinator entirely. Each source pool sits behind a Kubernetes Service
-(one Service per tensor-parallel rank, selectors pinning to pods that
-hold that rank); peers open a gRPC channel directly to the Service DNS
-name and call ``GetTensorManifest``. Kube-proxy load-balances across
-the ready backends for that rank.
+coordinator entirely. Each source pool sits behind a Kubernetes Service;
+peers open a gRPC channel directly to the Service DNS name and call
+``GetTensorManifest``. Kube-proxy load-balances across the ready
+backends.
 
-Rank-matching is enforced two ways:
+The ``MX_K8S_SERVICE_PATTERN`` pattern decides how rank is encoded:
 
-1. The Service selector scopes the backend pool to pods with the right
-   ``mx.rank`` label, so kube-proxy only routes the caller to
-   rank-compatible sources.
-2. ``GetTensorManifest`` validates ``mx_source_id`` server-side. If the
-   caller hit a backend that has been silently updated to a different
-   revision or config (rolling update, version skew), the server
-   returns ``FAILED_PRECONDITION`` and the client retries on a fresh
+- **Pattern with explicit port** (e.g. ``mx-sources-rank-{rank}:6555``):
+  used verbatim after ``{rank}`` substitution. Rank is encoded in the
+  hostname; caller hits one Service per rank, each with a label
+  selector that scopes to pods holding that rank. Fits the
+  1-GPU-per-pod topology.
+- **Pattern without a port** (e.g. ``mx-sources``): client auto-appends
+  ``:{MX_WORKER_GRPC_PORT + rank}``. Rank is encoded in the port;
+  caller hits one Service with N named ports, each targeting the
+  matching in-pod port. Fits the multi-GPU-per-pod topology where every
+  pod has every rank.
+
+Rank-matching is enforced two ways regardless of shape:
+
+1. Shape 1: the Service selector scopes the backend pool to pods with
+   the right ``mx.rank`` label. Shape 2: the port differentiation
+   naturally picks the right rank-R WorkerGrpcServer inside the pod.
+2. ``GetTensorManifest`` validates ``mx_source_id`` server-side and the
+   client validates the response's ``mx_source_id`` and ``worker_rank``
+   before accepting. Mismatches return ``FAILED_PRECONDITION`` (or
+   raise on the client side), and the client retries on a fresh
    channel so kube-proxy re-picks a backend.
 
 There is no substrate advertisement here: the Service's Endpoints
@@ -41,7 +53,8 @@ from .source_id import compute_mx_source_id
 
 logger = logging.getLogger("modelexpress.k8s_service_client")
 
-_DEFAULT_SERVICE_PATTERN = "mx-sources-rank-{rank}:6555"
+_DEFAULT_SERVICE_PATTERN = "mx-sources"
+_DEFAULT_WORKER_GRPC_PORT = 6555
 _DEFAULT_MAX_RETRIES = 5
 _DEFAULT_BACKOFF_SECONDS = 0.5
 
@@ -279,5 +292,18 @@ class MxK8sServiceClient(MxClientBase):
     # -- helpers -------------------------------------------------------------
 
     def _resolve_endpoint(self) -> str:
-        """Substitute ``{rank}`` in the Service pattern with the worker's rank."""
-        return self._service_pattern.format(rank=self._worker_rank)
+        """Substitute ``{rank}`` into the pattern; auto-append port if absent.
+
+        If the pattern resolves to a string containing ``:`` (explicit
+        ``host:port``), it is used verbatim. If the pattern is a bare
+        hostname, the client appends ``:{MX_WORKER_GRPC_PORT + rank}`` so
+        the multi-GPU-per-pod Shape-2 topology (one Service with N named
+        ports) works without any explicit port encoding in the pattern.
+        """
+        resolved = self._service_pattern.format(rank=self._worker_rank)
+        if ":" in resolved:
+            return resolved
+        base_port = int(
+            os.environ.get("MX_WORKER_GRPC_PORT", str(_DEFAULT_WORKER_GRPC_PORT)),
+        )
+        return f"{resolved}:{base_port + self._worker_rank}"

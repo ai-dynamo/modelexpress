@@ -199,8 +199,8 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] No NIXL manager, skipping metadata publish"
         )
         return
-    # Decentralized backends (k8s-service, future DHT) have no central
-    # server address; their metadata path is entirely peer-to-peer.
+    # Decentralized backends (k8s-service) have no central server
+    # address; their metadata path is entirely peer-to-peer.
     # Only bail on missing MODEL_EXPRESS_URL / MX_SERVER_ADDRESS when the
     # client actually needs a central coordinator. Strict `is True`
     # check so MagicMock's auto-attribute doesn't masquerade as the flag.

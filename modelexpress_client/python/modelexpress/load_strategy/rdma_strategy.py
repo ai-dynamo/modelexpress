@@ -53,8 +53,8 @@ class RdmaStrategy(LoadStrategy):
         if not is_nixl_available():
             return False
 
-        # Decentralized backends (k8s-service, future DHT) serve their
-        # own metadata; skip the central-server precondition for them.
+        # Decentralized backends (k8s-service) serve their own
+        # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't
         # masquerade as the flag in tests.
         server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
