@@ -279,7 +279,46 @@ def test_get_metadata_success_builds_synthetic_response():
         assert resp.worker.status == p2p_pb2.SOURCE_STATUS_READY
         assert len(resp.worker.tensors) == 1
         assert resp.worker.tensors[0].name == "t0"
+        # worker_grpc_endpoint must be populated: rdma_strategy gates
+        # the P2P branch (which pulls NIXL metadata from the source's
+        # listen thread) on bool(worker.worker_grpc_endpoint). An empty
+        # value silently disables NIXL metadata exchange and the target
+        # hits "missing nixlSerDes tag" during deserialization.
+        assert resp.worker.worker_grpc_endpoint == f"127.0.0.1:{port}"
         assert servicer.call_count == 1
+    finally:
+        server.stop(grace=None)
+
+
+def test_get_metadata_populates_worker_grpc_endpoint_for_p2p_gating():
+    """Regression test: worker_grpc_endpoint must equal the Service endpoint.
+
+    rdma_strategy._receive_from_peer evaluates
+    is_p2p = bool(source_worker.worker_grpc_endpoint) and only takes
+    the P2P branch (which calls fetch_remote_and_wait to pull the
+    source's NIXL metadata) when truthy. If this client synthesizes a
+    WorkerMetadata with worker_grpc_endpoint unset, the target skips
+    NIXL metadata exchange entirely and the transfer fails with
+    "missing nixlSerDes tag" during deserialization.
+    """
+    identity = _base_identity()
+    sid = compute_mx_source_id(identity)
+    servicer = _FakeWorkerServicer(sid, worker_rank=0)
+    server, port = _start_fake_server(servicer)
+    try:
+        pattern = f"mx-sources-rank-{{rank}}:{port}"
+        # Override hostname resolution by pointing the pattern at localhost.
+        client = MxK8sServiceClient(
+            worker_rank=0,
+            service_pattern=f"127.0.0.1:{port}",
+        )
+        resp = client.get_metadata(sid, "worker-xyz")
+        assert bool(resp.worker.worker_grpc_endpoint), (
+            "worker_grpc_endpoint must be non-empty so rdma_strategy "
+            "takes the P2P branch"
+        )
+        assert resp.worker.worker_grpc_endpoint == f"127.0.0.1:{port}"
+        _ = pattern  # silence unused; pattern shape documented above
     finally:
         server.stop(grace=None)
 
