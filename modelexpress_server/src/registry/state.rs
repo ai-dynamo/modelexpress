@@ -5,7 +5,7 @@
 
 use crate::backend_config::BackendConfig;
 use crate::registry::backend::{
-    ModelRecord, RegistryBackend, RegistryResult, create_registry_backend,
+    ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult, create_registry_backend,
 };
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use std::sync::Arc;
@@ -49,13 +49,29 @@ impl RegistryManager {
     }
 
     /// Eagerly connect to the configured backend. Returns the backend type name.
+    /// Idempotent: if a backend is already cached, return its name without
+    /// re-creating it.
     pub async fn connect(&self) -> RegistryResult<String> {
+        {
+            let guard = self.backend.read().await;
+            if guard.is_some() {
+                let name = self
+                    .config
+                    .as_ref()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return Ok(name);
+            }
+        }
         let config = self.config.clone().ok_or(
             "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
         )?;
+        let mut guard = self.backend.write().await;
+        if guard.is_some() {
+            return Ok(config.to_string());
+        }
         let backend_name = config.to_string();
         let backend = create_registry_backend(config).await?;
-        let mut guard = self.backend.write().await;
         *guard = Some(backend);
         info!("RegistryManager connected (backend: {})", backend_name);
         Ok(backend_name)
@@ -75,8 +91,11 @@ impl RegistryManager {
         let config = self.config.clone().ok_or(
             "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
         )?;
-        let backend = create_registry_backend(config.clone()).await?;
-        info!("RegistryManager lazily connected ({:?})", config);
+        // Use Display (redacts connection URLs for Redis) — Debug would print the full
+        // `BackendConfig` including the unredacted URL.
+        let backend_name = config.to_string();
+        let backend = create_registry_backend(config).await?;
+        info!("RegistryManager lazily connected ({})", backend_name);
         *guard = Some(backend.clone());
         Ok(backend)
     }
@@ -128,10 +147,21 @@ impl RegistryManager {
         &self,
         model_name: &str,
         provider: ModelProvider,
-    ) -> RegistryResult<ModelStatus> {
+    ) -> RegistryResult<ClaimOutcome> {
         self.get_backend()
             .await?
             .try_claim_for_download(model_name, provider)
+            .await
+    }
+
+    pub async fn try_reset_error_for_retry(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> RegistryResult<bool> {
+        self.get_backend()
+            .await?
+            .try_reset_error_for_retry(model_name, provider)
             .await
     }
 }
@@ -158,13 +188,28 @@ mod tests {
         mock.expect_try_claim_for_download()
             .with(eq("m"), eq(ModelProvider::HuggingFace))
             .once()
-            .returning(|_, _| Ok(ModelStatus::DOWNLOADING));
+            .returning(|_, _| Ok(ClaimOutcome::Claimed));
         let mgr = RegistryManager::with_backend(Arc::new(mock));
-        let status = mgr
+        let outcome = mgr
             .try_claim_for_download("m", ModelProvider::HuggingFace)
             .await
             .expect("claim");
-        assert_eq!(status, ModelStatus::DOWNLOADING);
+        assert_eq!(outcome, ClaimOutcome::Claimed);
+    }
+
+    #[tokio::test]
+    async fn try_reset_error_delegates_to_backend() {
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_try_reset_error_for_retry()
+            .with(eq("m"), eq(ModelProvider::HuggingFace))
+            .once()
+            .returning(|_, _| Ok(true));
+        let mgr = RegistryManager::with_backend(Arc::new(mock));
+        let won = mgr
+            .try_reset_error_for_retry("m", ModelProvider::HuggingFace)
+            .await
+            .expect("retry cas");
+        assert!(won);
     }
 
     #[tokio::test]

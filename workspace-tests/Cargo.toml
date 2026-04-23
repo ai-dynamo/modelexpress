@@ -28,7 +28,7 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
-redis = { workspace = true, features = ["aio", "tokio-comp"] }
+redis = { workspace = true }
 tokio-test = "0.4"
 
 [[bench]]
