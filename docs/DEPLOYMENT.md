@@ -253,7 +253,7 @@ Pick based on workload, not operational preference. The choice has structural co
 
 The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
 
-See [`../docs/ARCHITECTURE.md`](ARCHITECTURE.md#backend-choice-stable-weight-inference-vs-live-refit) for the deep dive on why the two backend families differ structurally on source addressability.
+See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
 ### P2P Environment Variables
 
@@ -376,20 +376,106 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
 
-#### K8s-Service-Routed Backend (decentralized, no central server)
+#### K8s-Service-Routed Backend
 
-Minimal deployment shape when you want decentralized transfers and are happy to let Kubernetes own discovery. No `modelexpress-server` deployed, no Redis, no CRDs. Source pods sit behind one Service per tensor-parallel rank; clients open a gRPC channel directly to the Service DNS name and kube-proxy load-balances across ready backends.
+No `modelexpress-server`, no Redis, no CRDs. Source pods sit behind a Kubernetes Service; clients hit the Service DNS and kube-proxy load-balances. See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for when to use this backend and when to prefer the central-coordinator alternatives.
+
+Two deployment topologies are supported; pick based on your TP parallelism needs:
+
+1. **Multi-GPU-per-pod** (TP ranks share NVLink inside one pod). One Service with N named ports. Default pattern: `MX_K8S_SERVICE_PATTERN=mx-sources`, client auto-computes `:{MX_WORKER_GRPC_PORT + rank}`.
+2. **1-GPU-per-pod** (one rank per pod; rank partitioning via labels). N Services with rank selectors. Pattern: `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555`.
+
+**Deploy the multi-GPU-per-pod shape (the common case for TP inference):**
 
 ```bash
-# No server, no CRDs, no Redis. Just the source and target pools.
+# 1. Create the HF token secret (once per namespace).
+export HF_TOKEN=your_hf_token
+kubectl -n $NAMESPACE create secret generic hf-token-secret \
+  --from-literal=HF_TOKEN=${HF_TOKEN}
+
+# 2. Apply the source pool: one Service with N named ports + one
+#    Deployment with multi-GPU pods.
+kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/sources-tp2-single-pod.yaml
+
+# 3. Wait for the first replica to finish loading (can take minutes for
+#    large models). Readiness probe flips when the WorkerGrpcServer is
+#    serving.
+kubectl -n $NAMESPACE wait --for=condition=Ready pod -l app=mx-sources --timeout=15m
+
+# 4. Verify the Service has live endpoints.
+kubectl -n $NAMESPACE get svc mx-sources
+kubectl -n $NAMESPACE get endpoints mx-sources
+
+# 5. Scale up. New replicas will pull weights via P2P RDMA from the
+#    existing ready pods rather than re-downloading from storage.
+kubectl -n $NAMESPACE scale deployment mx-sources --replicas=4
+```
+
+**Deploy the 1-GPU-per-pod shape:**
+
+```bash
 kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/sources-tp2.yaml
-kubectl wait -n $NAMESPACE --for=condition=Ready pod -l app=mx-sources --timeout=15m
+kubectl -n $NAMESPACE wait --for=condition=Ready pod -l app=mx-sources --timeout=15m
 kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/target.yaml
 ```
 
-Clients enable the backend with `MX_METADATA_BACKEND=k8s-service`. Rank-aware DNS resolution happens via `MX_K8S_SERVICE_PATTERN` (default `mx-sources-rank-{rank}:6555`); the worker's own rank is substituted. Pin `MX_MODEL_REVISION` to the exact checkpoint identifier so `mx_source_id` is content-addressed - this is what lets clients retry safely during rolling updates (mismatched pods return `FAILED_PRECONDITION` on the `GetTensorManifest` handshake and the client tries a fresh channel).
+**Minimal inline YAML for the single-Service / multi-port shape:**
 
-Trade-offs vs the central-server backends: simpler to deploy (no server to run, no Redis, no CRDs) and no central failure point, but it assumes every pod behind a given Service serves identical weights. Heterogeneous fleets or graceful multi-revision operation should stay on the Redis or Kubernetes-CRD backends. See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_sources/README.md) for the full walkthrough and the multi-GPU-per-pod variation.
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sources
+spec:
+  selector: { app: mx-sources }
+  ports:
+    - { name: rank-0, port: 6555, targetPort: 6555 }
+    - { name: rank-1, port: 6556, targetPort: 6556 }
+    # ... one port per rank, port = 6555 + rank
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sources
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: mx-sources } }
+  template:
+    metadata: { labels: { app: mx-sources } }
+    spec:
+      containers:
+        - name: vllm
+          image: your-registry/modelexpress-client:TAG
+          env:
+            - { name: MX_METADATA_BACKEND, value: "k8s-service" }
+            - { name: MX_MODEL_REVISION,   value: "<pinned-commit-sha>" }
+            - { name: MX_WORKER_GRPC_PORT, value: "6555" }
+            # MX_K8S_SERVICE_PATTERN defaults to `mx-sources`; omit unless overriding.
+          args: ["--model", "$(MODEL_NAME)", "--load-format", "mx", "--tensor-parallel-size", "2"]
+          resources: { limits: { nvidia.com/gpu: 2 } }
+```
+
+**Common operations:**
+
+```bash
+# Check which rank a pod's workers are serving.
+kubectl -n $NAMESPACE logs deploy/mx-sources -c vllm | grep -i "worker_rank"
+
+# Inspect the Service's port -> backend mapping.
+kubectl -n $NAMESPACE describe svc mx-sources
+
+# Rolling update to a new model revision. Update MX_MODEL_REVISION env
+# in the Deployment; K8s rolls pods one by one; during the transition
+# kube-proxy may route to either version. The client handshake returns
+# FAILED_PRECONDITION on mismatch, and targets retry on a fresh channel.
+kubectl -n $NAMESPACE set env deployment/mx-sources MX_MODEL_REVISION=<new-sha>
+kubectl -n $NAMESPACE rollout status deployment/mx-sources
+
+# Tear down.
+kubectl -n $NAMESPACE delete -f examples/k8s_service_sources/sources-tp2-single-pod.yaml
+```
+
+See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_sources/README.md) for the annotated manifests and [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale.
 
 ## Debugging
 

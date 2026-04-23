@@ -369,74 +369,18 @@ The Rust and Python implementations of `compute_mx_source_id` are locked togethe
 
 See [`metadata.md`](metadata.md) for the full storage layout and schemas.
 
-### Backend choice: stable-weight inference vs live-refit
+### k8s-service Metadata Backend
 
-The choice between server-coordinated and decentralized backends is not purely about operational simplicity; the two families have structurally different guarantees around **source addressability**, which dictates what workloads each can support.
+The decentralized `k8s-service` backend lives in the Python client as `MxK8sServiceClient` (duck-typed to `MxClientBase`). Clients open a direct gRPC channel to a Kubernetes Service DNS name and call `GetTensorManifest`; kube-proxy load-balances across ready backends; `mx_source_id` is computed client-side (Python `compute_mx_source_id` matches the Rust implementation via pinned cross-check tests) and validated on every response.
 
-**Server-coordinated backends (Redis / Kubernetes-CRD) give you per-worker addressability.** The central store is organised around `(mx_source_id, worker_id)` tuples, and the client-facing RPCs reflect that:
+**Pattern encoding:** `MX_K8S_SERVICE_PATTERN` supports two shapes:
 
-1. `ListSources(identity)` returns every worker currently serving any source for that identity, including their individual `worker_id`s and `worker_rank`s.
-2. `GetMetadata(mx_source_id, worker_id)` fetches *that specific worker's* current `WorkerMetadata` - its NIXL endpoint, agent name, tensor descriptors, status.
-3. `PublishMetadata(identity, worker_metadata, worker_id)` is the worker's own way of updating its record. If the identity is unchanged but tensor layout or endpoint has shifted, the worker republishes under the same `worker_id`, the server overwrites the record, and the next `GetMetadata` call on that `worker_id` returns the fresh state. If the identity changes (e.g. the worker refits to a new `revision`), the worker simply publishes under the new `mx_source_id` with the same `worker_id`; `HeartbeatThread` stops renewing the old record, the server-side reaper cleans it up after the TTL.
+- Explicit `:port` in the pattern (e.g. `mx-sources-rank-{rank}:6555`) is used verbatim after `{rank}` substitution. Rank encoded in the hostname; one Service per rank with a rank-specific label selector.
+- No port in the pattern (e.g. `mx-sources`, the default) triggers auto-append of `:{MX_WORKER_GRPC_PORT + rank}`. Rank encoded in the port; one Service with N named ports, each targeting the matching in-pod `WorkerGrpcServer`.
 
-The central store therefore functions as an authoritative, updatable directory of live source workers. A target that wants to pull from "worker W as it exists right now" can: ask the server, get W's current NIXL endpoint + tensor manifest, NIXL-pull from that exact worker. If W was mid-refit when the target looked it up, W's record is either still the old state (safe - old weights still in memory) or already the new state (safe - W flipped its record after the new weights landed). W's publish ordering ensures the record is never externally inconsistent with W's GPU memory.
+**Pool constraint:** every ready pod behind a given Service must serve the same `mx_source_id`. Transient revision skew during rolling updates is handled by client-side retry on `FAILED_PRECONDITION` over fresh gRPC channels, up to `MX_K8S_SOURCE_RETRIES`. Workloads that need per-worker addressability (RL rollouts, live fine-tune refits, mixed-version fleets) must use the central-coordinator backends instead; the k8s-service backend's Service-routing model has no way to express "this specific worker."
 
-This property is what lets the central-coordinator backends support **live weight updates** (RL rollouts, fine-tune broadcasts, continuous checkpoint refresh). W updates its weights, publishes the new state, the server reflects it, future targets see the new state. Older targets that already read the previous record get older weights - stale but consistent. The RL loop tolerates that by design.
-
-**The decentralized `k8s-service` backend gives you pool-level addressability only.** The K8s Service selector is the discovery mechanism; kube-proxy routes each incoming connection to a random ready backend. There is no way through the gRPC call to say "I want worker W specifically, not whichever of the N ready pods kube-proxy happened to pick." That's a deliberate simplification - it's what lets the backend work with zero infrastructure beyond the Service itself - but it has hard consequences:
-
-- Every ready pod in a given Service pool must serve an identical `mx_source_id`. Otherwise the caller's retry loop starts eating into `MX_K8S_SOURCE_RETRIES` to walk past mismatches, and that budget is finite.
-- When a single pod refits in place, the Service pool is temporarily inconsistent. The retry loop handles it for a few attempts, which covers a normal rolling update (pods refit in sequence, transition window is bounded). It does *not* cover a continuously-shifting pool where pods refit every few minutes and callers arrive on arbitrary pods throughout.
-- There is no per-worker state tracking. The `WorkerGrpcServer` holds one `(tensor_protos, mx_source_id, metadata_endpoint)` tuple bound at construction time (in `metadata.py`'s `publish_metadata_and_ready`). Nothing in the current servicer lets a live pod atomically swap that tuple for a new one.
-
-**Concretely:** an RL rollout workload - training step produces new weights, all inference pods refit, repeat - needs per-worker addressability. A target pulling during the refit window needs to either see `worker W at revision v42` or `worker W at revision v43`, consistently, from the same source. The central-coordinator model provides that. The Service-routed model can't, because "which source" is not a concept the caller can express.
-
-**What would it take to support live refit on the k8s-service backend?** A `WorkerGrpcServer.update_tensors()` method that atomically swaps `(tensor_protos, mx_source_id, metadata_endpoint)` under a lock, plus a trigger mechanism (vLLM weight-reload hook, S3 object-version watch, or external orchestrator poke) that causes every pod in a pool to refit in roughly-synchronised fashion. The retry loop already handles the transient cross-pod mismatch. Neither piece exists today; both are tractable if the workload demand appears. Until they do, live-refit workloads should stay on the central-coordinator backends.
-
-### k8s-service: Service naming and identity drift
-
-**The core design property of this backend: Service names are deliberately decoupled from `mx_source_id`.** The Service name is a deployer-chosen string that lives in the Kubernetes namespace; `mx_source_id` is an internal MX value derived cryptographically from `SourceIdentity` fields (model, dtype, quantization, TP, revision, mx_version, proto schema). These two namespaces never see each other, never reconcile automatically, and have no mechanism to stay in sync beyond operator discipline. **It is the operator's responsibility** to make sure the Service their pods sit behind actually serves the identity their client is asking for.
-
-That decoupling is the whole reason the backend is robust to library-side changes: `mx_version` bumps, `SourceIdentity` proto additions, canonical-JSON tweaks all shift `mx_source_id` without touching Service names, so a Helm chart written today keeps resolving after every future MX release. The cost is that the operator owns the alignment between what the Service is named and what identity its pods serve, and any misalignment has to be caught downstream rather than prevented by the naming scheme itself.
-
-**The handshake is the safety net.** Every `GetTensorManifest` call passes an `mx_source_id`. If the client resolves its pattern, connects to a pod, and that pod's `WorkerServiceServicer` is serving a different `mx_source_id`, it returns `FAILED_PRECONDITION`. The client retries on a fresh channel up to `MX_K8S_SOURCE_RETRIES` times so kube-proxy can route to a potentially-matching backend. Content mismatches fail loudly and give you a retry budget; they never silently transfer wrong weights.
-
-The coordination contract: the string returned by substituting `{rank}` into `MX_K8S_SERVICE_PATTERN` must exactly match the `metadata.name` of a Kubernetes Service whose selector scopes to pods serving a matching `mx_source_id`. If the DNS name doesn't resolve, the client gets connection-refused (operator pattern typo, unresolvable). If it resolves to a pod serving the wrong `mx_source_id`, the handshake catches it.
-
-**Multi-model deployments:** multiple models coexist in one cluster by giving each model Deployment its own Service-name prefix and its own `MX_K8S_SERVICE_PATTERN`. Example for two distinct models:
-
-```text
-Model A Deployment:
-  Services: model-a-rank-0, model-a-rank-1, ..., model-a-rank-7
-  Pods env: MX_K8S_SERVICE_PATTERN=model-a-rank-{rank}:6555
-
-Model B Deployment:
-  Services: model-b-rank-0, model-b-rank-1, ..., model-b-rank-7
-  Pods env: MX_K8S_SERVICE_PATTERN=model-b-rank-{rank}:6555
-```
-
-Both Deployments run concurrently; the per-pod env var is the only per-model coordination needed. There is no global Service pool to share, and nothing in one model's pattern can accidentally resolve to the other model's pool (different DNS names entirely).
-
-**Why `{mx_source_id}` substitution isn't part of the pattern:** using the `mx_source_id` hash as the Service name isn't viable from a UX perspective, even though it would superficially offer "wrong-identity traffic can't even reach the wrong Service" as a DNS-level guarantee. The cost is silent brittleness under any change that shifts `mx_source_id`:
-
-- `mx_version` bumps on every ModelExpress release. A routine container-image bump changes every pod's computed source_id without the deployer touching their Helm values; the declared Service names go stale; resolution fails cluster-wide.
-- `SourceIdentity` proto gaining fields (like `revision`, added for this backend). All pre-computed hashes shift by one schema revision. Every Helm chart in the wild becomes stale on the next release unless the deployer re-runs the hashing CLI and re-applies.
-- `revision` / `dtype` / `quantization` / TP reshape. Any of these updates re-hashes. Rolling update across one of these boundaries puts half the pool at one name and half at another; the Service selector only matches one.
-- Operators have no way to recover a "hash mismatch" failure except by re-deriving and re-applying Services in lockstep with client config. There's no graceful degradation to "any pod serving the right identity" because the DNS layer hard-fails before the source_id handshake even runs.
-
-The deployer-chosen name used today is strictly more robust to library-side drift: `mx_version` bumps don't touch the Service name, `SourceIdentity` schema changes don't touch the Service name, only an explicit rename does. Identity skew that does occur at the content level is caught by the existing `FAILED_PRECONDITION` path, which can retry across the pool for a potential match - graceful degradation rather than hard fail at DNS.
-
-**What's stable about the current contract:**
-
-- Service names are chosen by the deployer and persist across MX releases, proto schema changes, and revision pins. A Deployment manifest written today keeps working after a library upgrade without re-templating.
-- `{rank}` is the only substitution, and rank is a deployment-topology property, not a library-version property. Deployer's declared name and client's substituted pattern use the same static prefix forever.
-
-**What can still drift (runtime, not configuration):**
-
-- `SourceIdentity` content changes (revision bump, quantization tweak) between source and target pods produce different `mx_source_id`s. The DNS name still resolves; the handshake catches the mismatch and the retry loop walks the pool.
-- Partial-version rolling updates leave a pool mixed between two identities. Same handshake/retry path handles it as long as at least one pod matches.
-
-Runtime drift gets a retry budget; configuration drift (typo in the pattern vs a typo in the Service name) never occurs because the string is under deployer control, declared once, and doesn't depend on cryptographic coincidence.
+See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for design rationale, limitations, and backend-selection guidance.
 
 ### ModelDownloadTracker
 
