@@ -44,7 +44,13 @@ env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
   MODEL_EXPRESS_LOGGING_LEVEL: "debug"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
+  # Distributed backend selection. Required — the server fails to start without it.
+  # This values file opinionates on Redis for dev convenience; override to
+  # "kubernetes" for the CRD backend (and set serviceAccount.rbac.enabled=true).
   MX_METADATA_BACKEND: "redis"
+  # The chart does NOT deploy Redis. Provide a Redis Service reachable at the URL
+  # below in the same namespace, or override REDIS_URL to point at your own
+  # instance (e.g. an in-cluster StatefulSet, a sidecar, or a managed service).
   REDIS_URL: "redis://redis:6379"
 
 livenessProbe:

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::registry::backend::ClaimOutcome;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::{
     cache::CacheConfig,
@@ -602,13 +603,16 @@ impl ModelDownloadTracker {
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
         ignore_weights: bool,
     ) -> ModelStatus {
-        // Atomically try to claim this model for download using compare-and-swap
-        let status = match self
+        // Atomically try to claim this model for download. The `ClaimOutcome` tells us
+        // whether THIS replica won the claim or is observing someone else's claim —
+        // status alone (`DOWNLOADING`) can't distinguish those cases across replicas.
+        let (status, is_owner) = match self
             .registry
             .try_claim_for_download(model_name, provider)
             .await
         {
-            Ok(status) => status,
+            Ok(ClaimOutcome::Claimed) => (ModelStatus::DOWNLOADING, true),
+            Ok(ClaimOutcome::AlreadyExists(existing)) => (existing, false),
             Err(e) => {
                 error!("Failed to claim model for download: {e}");
                 let error_update = ModelStatusUpdate {
@@ -637,24 +641,12 @@ impl ModelDownloadTracker {
         let _ = tx.send(Ok(update)).await;
 
         if status == ModelStatus::DOWNLOADING {
+            // Every caller is a waiter — whether we own the download or not, we still
+            // need a channel so the completion broadcast reaches this stream.
             self.add_waiting_channel(model_name, tx.clone());
 
-            // Check if we were the ones who just claimed it vs. another replica holds it.
-            // If this server-replica has only 1 waiter (this request), assume we're the
-            // winner and kick off the download.
-            let should_start_download = {
-                let waiting = match self.waiting_channels.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => {
-                        error!("Waiting channels mutex is poisoned, recovering");
-                        poisoned.into_inner()
-                    }
-                };
-                waiting
-                    .get(model_name)
-                    .is_none_or(|channels| channels.len() <= 1)
-            };
-            if should_start_download {
+            // Only the claim winner spawns the download. Observers wait.
+            if is_owner {
                 self.spawn_download_task(model_name.to_string(), provider, ignore_weights, false);
             }
 
@@ -668,21 +660,24 @@ impl ModelDownloadTracker {
                 }
             }
         } else if status == ModelStatus::ERROR {
-            if let Err(e) = self
+            // Atomic CAS from ERROR to DOWNLOADING. Only the replica that wins the CAS
+            // spawns the retry; the others observe DOWNLOADING on the next poll and
+            // fall through to the wait loop.
+            let won_retry = match self
                 .registry
-                .set_status(
-                    model_name,
-                    provider,
-                    ModelStatus::DOWNLOADING,
-                    Some("Retrying download...".to_string()),
-                )
+                .try_reset_error_for_retry(model_name, provider)
                 .await
             {
-                error!("Failed to reset status for retry: {e}");
-                return ModelStatus::ERROR;
-            }
+                Ok(won) => won,
+                Err(e) => {
+                    error!("Failed to CAS status for retry: {e}");
+                    return ModelStatus::ERROR;
+                }
+            };
             self.add_waiting_channel(model_name, tx.clone());
-            self.spawn_download_task(model_name.to_string(), provider, ignore_weights, true);
+            if won_retry {
+                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, true);
+            }
 
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

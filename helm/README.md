@@ -130,8 +130,8 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `env.MODEL_EXPRESS_SERVER_PORT`              | Server port                                    | `8001`   |
 | `env.MODEL_EXPRESS_LOGGING_LEVEL`            | Logging level                                  | `info`   |
 | `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/app/cache` |
-| `env.MX_METADATA_BACKEND`                    | Distributed backend (`redis` or `kubernetes`)  | `redis`  |
-| `env.REDIS_URL`                              | Redis connection URL (when backend is `redis`) | `redis://redis:6379` |
+| `env.MX_METADATA_BACKEND`                    | Distributed backend (`redis` or `kubernetes`). Server fails to start without this. | `<required>` |
+| `env.REDIS_URL`                              | Redis connection URL; required when backend is `redis`. Chart does not bundle Redis. | `<required when backend=redis>` |
 | `livenessProbe.enabled`                      | Enable liveness probe                          | `true`   |
 | `readinessProbe.enabled`                     | Enable readiness probe                         | `true`   |
 | `nodeSelector`                               | Node selector                                  | `{}`     |

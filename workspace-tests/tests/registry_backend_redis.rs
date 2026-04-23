@@ -14,14 +14,12 @@
 //!
 //! Each test uses a unique key prefix so runs are isolated without needing FLUSHDB.
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::arithmetic_side_effects
-)]
+#![allow(clippy::expect_used, clippy::arithmetic_side_effects)]
 
 use modelexpress_common::models::{ModelProvider, ModelStatus};
-use modelexpress_server::registry::backend::{RegistryBackend, redis::RedisRegistryBackend};
+use modelexpress_server::registry::backend::{
+    ClaimOutcome, RegistryBackend, redis::RedisRegistryBackend,
+};
 use std::sync::Arc;
 
 fn redis_url() -> String {
@@ -32,7 +30,7 @@ fn redis_url() -> String {
 fn unique_name(tag: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is before UNIX_EPOCH")
         .as_nanos();
     format!("mx-test/{tag}-{nanos}")
 }
@@ -60,14 +58,17 @@ async fn claim_then_set_then_delete_roundtrip() {
         .try_claim_for_download(&name, ModelProvider::HuggingFace)
         .await
         .expect("claim");
-    assert_eq!(claimed, ModelStatus::DOWNLOADING);
+    assert_eq!(claimed, ClaimOutcome::Claimed);
 
-    // Second claim returns the existing status without mutation.
+    // Second claim observes the existing record without mutation.
     let re_claim = backend
         .try_claim_for_download(&name, ModelProvider::HuggingFace)
         .await
         .expect("re-claim");
-    assert_eq!(re_claim, ModelStatus::DOWNLOADING);
+    assert_eq!(
+        re_claim,
+        ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)
+    );
 
     // Full record is populated.
     let rec = backend
@@ -120,10 +121,22 @@ async fn concurrent_claims_yield_single_winner() {
                 .await
         }));
     }
-    // All return DOWNLOADING — the winner just-set it, losers read it.
+    // Exactly one `Claimed`; the rest see `AlreadyExists(DOWNLOADING)`. This is the
+    // assertion that guarantees multi-replica servers never double-download.
+    let mut winners = 0;
+    let mut observers = 0;
     for h in handles {
-        assert_eq!(h.await.unwrap().unwrap(), ModelStatus::DOWNLOADING);
+        let outcome = h.await.expect("spawn join").expect("claim result");
+        match outcome {
+            ClaimOutcome::Claimed => winners += 1,
+            ClaimOutcome::AlreadyExists(s) => {
+                assert_eq!(s, ModelStatus::DOWNLOADING);
+                observers += 1;
+            }
+        }
     }
+    assert_eq!(winners, 1, "exactly one replica must claim");
+    assert_eq!(observers, 7, "the other seven must observe");
 
     // Only one record exists.
     let rec = backend
@@ -145,29 +158,29 @@ async fn touch_updates_last_used_at() {
     backend
         .try_claim_for_download(&name, ModelProvider::HuggingFace)
         .await
-        .unwrap();
+        .expect("initial claim");
     let first = backend
         .get_model_record(&name)
         .await
-        .unwrap()
-        .unwrap()
+        .expect("get_model_record")
+        .expect("record present after claim")
         .last_used_at;
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    backend.touch_model(&name).await.unwrap();
+    backend.touch_model(&name).await.expect("touch_model");
 
     let second = backend
         .get_model_record(&name)
         .await
-        .unwrap()
-        .unwrap()
+        .expect("get_model_record after touch")
+        .expect("record present after touch")
         .last_used_at;
     assert!(
         second > first,
         "touch_model should bump last_used_at: {first} -> {second}"
     );
 
-    backend.delete_model(&name).await.unwrap();
+    backend.delete_model(&name).await.expect("delete_model");
 }
 
 #[tokio::test]
@@ -177,8 +190,12 @@ async fn touch_missing_model_is_noop() {
     let name = unique_name("touch-missing");
 
     // Should succeed without creating a malformed record.
-    backend.touch_model(&name).await.unwrap();
-    assert_eq!(backend.get_status(&name).await.unwrap(), None);
+    backend.touch_model(&name).await.expect("touch missing");
+    assert_eq!(
+        backend.get_status(&name).await.expect("get_status"),
+        None,
+        "touching a missing model must not create a record"
+    );
 }
 
 #[tokio::test]
@@ -194,16 +211,22 @@ async fn get_models_by_last_used_returns_sorted_slice() {
         backend
             .set_status(n, ModelProvider::HuggingFace, ModelStatus::DOWNLOADED, None)
             .await
-            .unwrap();
+            .expect("set_status seeds a record");
         tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     }
 
-    let all = backend.get_models_by_last_used(None).await.unwrap();
+    let all = backend
+        .get_models_by_last_used(None)
+        .await
+        .expect("get_models_by_last_used (all)");
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].model_name, "a"); // oldest
     assert_eq!(all[2].model_name, "c"); // newest
 
-    let limited = backend.get_models_by_last_used(Some(2)).await.unwrap();
+    let limited = backend
+        .get_models_by_last_used(Some(2))
+        .await
+        .expect("get_models_by_last_used (limited)");
     assert_eq!(limited.len(), 2);
     assert_eq!(limited[0].model_name, "a");
     assert_eq!(limited[1].model_name, "b");
@@ -226,12 +249,12 @@ fn isolated_db_url(db: u32) -> String {
 /// expose a flush primitive by design).
 fn flushdb(db: u32) {
     let mut conn = redis::Client::open(isolated_db_url(db).as_str())
-        .expect("client")
+        .expect("open Redis client for FLUSHDB")
         .get_connection()
-        .expect("sync conn for FLUSHDB");
+        .expect("open sync connection for FLUSHDB");
     redis::cmd("FLUSHDB")
         .query::<()>(&mut conn)
-        .expect("flush isolated DB");
+        .expect("FLUSHDB on isolated DB");
 }
 
 #[tokio::test]
@@ -241,7 +264,7 @@ async fn get_status_counts_reflects_stored_records() {
     backend.connect().await.expect("connect to isolated DB");
     flushdb(15);
 
-    let (d0, ok0, e0) = backend.get_status_counts().await.unwrap();
+    let (d0, ok0, e0) = backend.get_status_counts().await.expect("initial counts");
     assert_eq!((d0, ok0, e0), (0, 0, 0));
 
     backend
@@ -252,7 +275,7 @@ async fn get_status_counts_reflects_stored_records() {
             None,
         )
         .await
-        .unwrap();
+        .expect("set DOWNLOADED");
     backend
         .set_status(
             "m-error",
@@ -261,13 +284,16 @@ async fn get_status_counts_reflects_stored_records() {
             None,
         )
         .await
-        .unwrap();
+        .expect("set ERROR");
     backend
         .try_claim_for_download("m-downloading", ModelProvider::HuggingFace)
         .await
-        .unwrap();
+        .expect("claim DOWNLOADING");
 
-    let (d1, ok1, e1) = backend.get_status_counts().await.unwrap();
+    let (d1, ok1, e1) = backend
+        .get_status_counts()
+        .await
+        .expect("counts after seeding");
     assert_eq!((d1, ok1, e1), (1, 1, 1));
 
     flushdb(15);

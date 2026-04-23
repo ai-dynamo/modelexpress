@@ -64,7 +64,6 @@ rules:
     verbs:
       - get
       - list
-      - watch
       - create
       - update
       - patch
@@ -90,9 +89,11 @@ roleRef:
   kind: Role
   name: modelexpress-metadata
 subjects:
+  # subjects[].namespace omitted on purpose: for a namespaced RoleBinding,
+  # a ServiceAccount subject without an explicit namespace resolves to the
+  # RoleBinding's own namespace (whatever `kubectl apply -n <ns>` lands in).
   - kind: ServiceAccount
     name: modelexpress
-    namespace: default  # Change to your target namespace
 ---
 # ClusterRole for CRD management (cluster-admin typically handles this)
 # Only needed if server creates/manages the CRD itself

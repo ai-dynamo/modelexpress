@@ -11,7 +11,7 @@
 //! check + full field population into a single atomic EVAL so concurrent readers never
 //! see a partially-written record.
 
-use super::{ModelRecord, RegistryBackend, RegistryResult};
+use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
@@ -124,10 +124,16 @@ impl RedisRegistryBackend {
         Ok(conn)
     }
 
-    /// Collect every `mx:model:*` key with a paged SCAN.
+    /// Collect every `mx:model:*` key with a paged SCAN, deduplicating as we go.
+    ///
+    /// Redis `SCAN` can legitimately return the same key twice across cursor pages (for
+    /// example when the hash table is resized mid-iteration), so callers that use the
+    /// result length as a count would double-count. The dedup set keeps this honest.
     async fn scan_all_keys(&self, conn: &mut ConnectionManager) -> RegistryResult<Vec<String>> {
+        use std::collections::HashSet;
         let mut cursor: u64 = 0;
         let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         loop {
             let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
                 .arg(cursor)
@@ -137,7 +143,11 @@ impl RedisRegistryBackend {
                 .arg(SCAN_BATCH)
                 .query_async(conn)
                 .await?;
-            keys.extend(batch);
+            for k in batch {
+                if seen.insert(k.clone()) {
+                    keys.push(k);
+                }
+            }
             if next == 0 {
                 break;
             }
@@ -215,21 +225,24 @@ impl RegistryBackend for RedisRegistryBackend {
         let mut conn = self.get_conn().await?;
         let now = Utc::now().to_rfc3339();
         let key = model_key(model_name);
-        // HSET writes all fields in one command; then HSETNX backfills created_at only if
-        // this is the first write for the key (preserves original timestamp otherwise).
-        let mut pipe = redis::pipe();
-        pipe.hset(&key, fields::STATUS, status_str(status))
-            .ignore()
-            .hset(&key, fields::PROVIDER, provider_str(provider))
-            .ignore()
-            .hset(&key, fields::LAST_USED_AT, &now)
-            .ignore();
-        match message {
-            Some(m) => pipe.hset(&key, fields::MESSAGE, m).ignore(),
-            None => pipe.hdel(&key, fields::MESSAGE).ignore(),
+        // A single EVAL so the status/provider/last_used_at/message/created_at updates
+        // are atomic: concurrent get_model_record calls see either the pre- or post-
+        // update record, never a half-written one (HGETALL never interleaves with the
+        // script since Redis is single-threaded for scripts).
+        let (msg_flag, msg_value) = match &message {
+            Some(m) => ("1", m.as_str()),
+            None => ("0", ""),
         };
-        pipe.hset_nx(&key, fields::CREATED_AT, &now).ignore();
-        let _: () = pipe.query_async(&mut conn).await?;
+        let _: () = redis::Script::new(SET_STATUS_LUA)
+            .key(&key)
+            .arg(status_str(status))
+            .arg(provider_str(provider))
+            .arg(&now)
+            .arg(&now)
+            .arg(msg_flag)
+            .arg(msg_value)
+            .invoke_async(&mut conn)
+            .await?;
         Ok(())
     }
 
@@ -318,39 +331,110 @@ impl RegistryBackend for RedisRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
-    ) -> RegistryResult<ModelStatus> {
+    ) -> RegistryResult<ClaimOutcome> {
         let mut conn = self.get_conn().await?;
         let key = model_key(model_name);
         let now = Utc::now().to_rfc3339();
         // Atomic claim + populate: a single EVAL so readers never see a partially-written
-        // record (status set but provider/created_at missing). Returns the status string
-        // either way — "DOWNLOADING" if we created it, or the existing value.
-        let status_str: String = redis::Script::new(CLAIM_LUA)
+        // record. The script returns a sentinel string — `CLAIM_WON_SENTINEL` if we
+        // created the record, or the existing status string if someone else already
+        // claimed it. This distinction is what lets callers know which replica owns
+        // the download (status alone can't — both claimer and observer see DOWNLOADING).
+        let result: String = redis::Script::new(CLAIM_LUA)
             .key(&key)
+            .arg(CLAIM_WON_SENTINEL)
             .arg(status_str(ModelStatus::DOWNLOADING))
             .arg(provider_str(provider))
             .arg(&now)
             .arg("Starting download...")
             .invoke_async(&mut conn)
             .await?;
-        status_from_str(&status_str)
+        if result == CLAIM_WON_SENTINEL {
+            Ok(ClaimOutcome::Claimed)
+        } else {
+            Ok(ClaimOutcome::AlreadyExists(status_from_str(&result)?))
+        }
+    }
+
+    async fn try_reset_error_for_retry(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> RegistryResult<bool> {
+        let mut conn = self.get_conn().await?;
+        let key = model_key(model_name);
+        let now = Utc::now().to_rfc3339();
+        // Atomic CAS: flip status from ERROR to DOWNLOADING. Returns 1 on win, 0 on
+        // miss. Only the winner spawns the retry download.
+        let won: i32 = redis::Script::new(RETRY_CAS_LUA)
+            .key(&key)
+            .arg(status_str(ModelStatus::ERROR))
+            .arg(status_str(ModelStatus::DOWNLOADING))
+            .arg(provider_str(provider))
+            .arg(&now)
+            .arg("Retrying download...")
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(won == 1)
     }
 }
 
+/// Sentinel string returned by [`CLAIM_LUA`] when the caller won the claim. Picked so
+/// it cannot be confused with any real `ModelStatus` string.
+const CLAIM_WON_SENTINEL: &str = "__MX_CLAIM_WON__";
+
 /// Atomic claim: if the hash has no `status` field, populate all fields in one shot and
-/// return the new `status`; otherwise return the existing `status` unchanged.
+/// return the win sentinel; otherwise return the existing `status` unchanged.
 ///
-/// KEYS[1] = model key, ARGV = [status, provider, now, message]
+/// KEYS[1] = model key, ARGV = [win_sentinel, status, provider, now, message]
 const CLAIM_LUA: &str = r#"
 local existing = redis.call("HGET", KEYS[1], "status")
 if existing then return existing end
 redis.call("HSET", KEYS[1],
+    "status", ARGV[2],
+    "provider", ARGV[3],
+    "created_at", ARGV[4],
+    "last_used_at", ARGV[4],
+    "message", ARGV[5])
+return ARGV[1]
+"#;
+
+/// Atomic CAS: flip status from `from_status` to `to_status` (also refreshing
+/// provider, last_used_at, message). Returns 1 on win, 0 on miss.
+///
+/// KEYS[1] = model key
+/// ARGV    = [from_status, to_status, provider, last_used_at, message]
+const RETRY_CAS_LUA: &str = r#"
+local cur = redis.call("HGET", KEYS[1], "status")
+if cur ~= ARGV[1] then return 0 end
+redis.call("HSET", KEYS[1],
+    "status", ARGV[2],
+    "provider", ARGV[3],
+    "last_used_at", ARGV[4],
+    "message", ARGV[5])
+return 1
+"#;
+
+/// Atomic `set_status`: overwrite status/provider/last_used_at, either set or clear
+/// `message`, and only stamp `created_at` if it isn't already there (preserves the
+/// original timestamp across status transitions).
+///
+/// KEYS[1] = model key
+/// ARGV    = [status, provider, last_used_at, created_at_if_new, msg_flag, msg_value]
+///    msg_flag = "1" → HSET message = msg_value
+///    msg_flag = "0" → HDEL message (msg_value ignored)
+const SET_STATUS_LUA: &str = r#"
+redis.call("HSET", KEYS[1],
     "status", ARGV[1],
     "provider", ARGV[2],
-    "created_at", ARGV[3],
-    "last_used_at", ARGV[3],
-    "message", ARGV[4])
-return ARGV[1]
+    "last_used_at", ARGV[3])
+if ARGV[5] == "1" then
+    redis.call("HSET", KEYS[1], "message", ARGV[6])
+else
+    redis.call("HDEL", KEYS[1], "message")
+end
+redis.call("HSETNX", KEYS[1], "created_at", ARGV[4])
+return 1
 "#;
 
 #[cfg(test)]

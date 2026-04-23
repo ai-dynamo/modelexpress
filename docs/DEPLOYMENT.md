@@ -50,18 +50,34 @@ logging:
 
 ### Starting the Server
 
+The server requires `MX_METADATA_BACKEND` (`redis` or `kubernetes`) plus the connection
+env vars for the chosen backend — the server refuses to start without them. See
+[Distributed backend selection](#distributed-backend-selection) below for the full env
+contract.
+
 ```bash
-# With defaults
+# Redis backend
+export MX_METADATA_BACKEND=redis
+export REDIS_URL=redis://localhost:6379
 cargo run --bin modelexpress-server
 
-# With a configuration file
-cargo run --bin modelexpress-server -- --config model-express.yaml
+# Kubernetes backend (typically only useful in-cluster)
+export MX_METADATA_BACKEND=kubernetes
+export POD_NAMESPACE=default   # or MX_METADATA_NAMESPACE
+cargo run --bin modelexpress-server
+
+# With a configuration file (backend env vars still required)
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
+  cargo run --bin modelexpress-server -- --config model-express.yaml
 
 # With CLI overrides
-cargo run --bin modelexpress-server -- --port 8080 --log-level debug
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
+  cargo run --bin modelexpress-server -- --port 8080 --log-level debug
 
-# Validate config without starting
-cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
+# Validate config without starting (backend env vars still required — the validator
+# parses the full startup path including MX_METADATA_BACKEND)
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
+  cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
 ```
 
 ### Configuration Options
@@ -392,8 +408,9 @@ kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli HGET
 # Flush Redis (clear stale metadata - do this on redeploy)
 kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
 
-# Check Kubernetes CRD state
+# Check Kubernetes CRD state (P2P worker metadata + model registry)
 kubectl -n $NAMESPACE get modelmetadatas
+kubectl -n $NAMESPACE get modelcacheentries   # model registry (lifecycle state, LRU)
 
 # Test inference
 kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/completions \

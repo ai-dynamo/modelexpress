@@ -14,7 +14,7 @@
 //! so they don't share a name space with the P2P `ModelMetadata` CRs. The original
 //! model name lives in `spec.modelName` for human readability.
 
-use super::{ModelRecord, RegistryBackend, RegistryResult};
+use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use crate::registry::k8s_types::{ModelCacheEntry, ModelCacheEntrySpec, phase};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -38,16 +38,17 @@ const HASH_SUFFIX_LEN: usize = 12;
 
 /// Sanitize a HuggingFace/NGC model name into a DNS-1123 `metadata.name` component.
 ///
-/// Transform rules (injective for the alphanumeric/`-`/`.`/`/` inputs that real-world
-/// model names actually use):
-/// - `/` → `--` so `"org/model"` and `"org-model"` don't collide
+/// Transform rules:
+/// - `/` → `--`
 /// - ASCII uppercase → lowercase
 /// - `-` and `.` pass through
-/// - other characters → `-` (rare in practice)
+/// - other characters → `-`
 /// - leading/trailing `-` or `.` trimmed (DNS-1123 requires alphanumeric boundaries)
 ///
-/// When the sanitized result exceeds [`NAME_BUDGET`], truncate and append a sha256 hex
-/// suffix of the original (case-preserving) name so long names stay unique.
+/// The transform is lossy (case-folding, non-alphanumeric collapse), so every output
+/// carries a 12-hex-char sha256 suffix derived from the **original** model name. That
+/// way `google-T5/model` and `google-t5/model` never collide on the same CR name even
+/// though the visible prefix is identical.
 fn sanitize_registry_name(model_name: &str) -> String {
     let mut out = String::with_capacity(model_name.len());
     for c in model_name.chars() {
@@ -59,20 +60,17 @@ fn sanitize_registry_name(model_name: &str) -> String {
         }
     }
     let trimmed = out.trim_matches(|c: char| c == '-' || c == '.');
-    if trimmed.is_empty() {
-        // Degenerate input ("", "///", "---"): fall back to a full hash.
-        let hash = hex_sha256(model_name);
-        return hash[..HASH_SUFFIX_LEN].to_string();
-    }
-    if trimmed.len() <= NAME_BUDGET {
-        return trimmed.to_string();
-    }
-    // Long name: keep a readable prefix and suffix-disambiguate with a hash of the
-    // original input.
-    let prefix_len = NAME_BUDGET.saturating_sub(HASH_SUFFIX_LEN + 1);
-    let prefix = &trimmed[..prefix_len];
     let hash = hex_sha256(model_name);
-    format!("{prefix}-{}", &hash[..HASH_SUFFIX_LEN])
+    let hash_suffix = &hash[..HASH_SUFFIX_LEN];
+    if trimmed.is_empty() {
+        // Degenerate input ("", "///", "---"): emit just the hash.
+        return hash_suffix.to_string();
+    }
+    // Reserve space for `-{hash}`; truncate the readable prefix if we're over budget.
+    let max_prefix = NAME_BUDGET.saturating_sub(HASH_SUFFIX_LEN + 1);
+    let prefix_len = trimmed.len().min(max_prefix);
+    let prefix = &trimmed[..prefix_len];
+    format!("{prefix}-{hash_suffix}")
 }
 
 fn hex_sha256(s: &str) -> String {
@@ -374,7 +372,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
-    ) -> RegistryResult<ModelStatus> {
+    ) -> RegistryResult<ClaimOutcome> {
         let cr_name = Self::cr_name_for(model_name);
         let cr = ModelCacheEntry::new(
             &cr_name,
@@ -387,16 +385,35 @@ impl RegistryBackend for KubernetesRegistryBackend {
         match self.api().create(&PostParams::default(), &cr).await {
             Ok(_) => {
                 // We won the claim: stamp phase + timestamps on the status subresource.
+                // If patch_status fails, rollback the CR we just created so a retry
+                // can try again and other replicas don't observe a CR with an empty
+                // phase (which status_from_phase treats as DOWNLOADING — a lie).
                 let now = Utc::now().to_rfc3339();
-                self.patch_status(
-                    &cr_name,
-                    Some(phase::DOWNLOADING),
-                    Some(&now),
-                    Some(&now),
-                    Some(Some("Starting download...")),
-                )
-                .await?;
-                Ok(ModelStatus::DOWNLOADING)
+                if let Err(patch_err) = self
+                    .patch_status(
+                        &cr_name,
+                        Some(phase::DOWNLOADING),
+                        Some(&now),
+                        Some(&now),
+                        Some(Some("Starting download...")),
+                    )
+                    .await
+                {
+                    if let Err(delete_err) = self
+                        .api()
+                        .delete(&cr_name, &kube::api::DeleteParams::default())
+                        .await
+                    {
+                        warn!(
+                            "patch_status failed for {cr_name}; rollback delete also \
+                             failed: {delete_err}. CR may be left with empty phase."
+                        );
+                    } else {
+                        debug!("Rolled back {cr_name} after patch_status failure: {patch_err}");
+                    }
+                    return Err(patch_err);
+                }
+                Ok(ClaimOutcome::Claimed)
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {
                 // Already exists: someone else claimed it (or an earlier run did). Read
@@ -406,7 +423,55 @@ impl RegistryBackend for KubernetesRegistryBackend {
                     .await?
                     .ok_or("ModelCacheEntry disappeared between 409 and GET")?;
                 let phase_str = existing.status.unwrap_or_default().phase;
-                Ok(Self::status_from_phase(&phase_str))
+                Ok(ClaimOutcome::AlreadyExists(Self::status_from_phase(
+                    &phase_str,
+                )))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn try_reset_error_for_retry(
+        &self,
+        model_name: &str,
+        _provider: ModelProvider,
+    ) -> RegistryResult<bool> {
+        let cr_name = Self::cr_name_for(model_name);
+        let Some(existing) = self.get_cr(&cr_name).await? else {
+            return Ok(false);
+        };
+        let current_phase = existing
+            .status
+            .as_ref()
+            .map(|s| s.phase.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if current_phase != phase::ERROR {
+            return Ok(false);
+        }
+        // Use a JSON Patch `test` op as a server-side precondition — kube rejects the
+        // patch with 422 if the status phase was flipped out from under us between
+        // GET and PATCH, and we report the CAS miss.
+        let now = Utc::now().to_rfc3339();
+        let patch = json!([
+            { "op": "test", "path": "/status/phase", "value": phase::ERROR },
+            { "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING },
+            { "op": "replace", "path": "/status/message", "value": "Retrying download..." },
+            { "op": "replace", "path": "/status/lastUsedAt", "value": now },
+        ]);
+        match self
+            .api()
+            .patch_status(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 409 => {
+                debug!("Error-retry CAS for {cr_name} lost to a concurrent write");
+                Ok(false)
             }
             Err(e) => Err(e.into()),
         }
@@ -418,11 +483,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_preserves_slash_as_double_dash() {
-        assert_eq!(sanitize_registry_name("org/model"), "org--model");
-        assert_eq!(
-            sanitize_registry_name("meta-llama/Llama-3.1-70B"),
-            "meta-llama--llama-3.1-70b"
+    fn sanitize_preserves_readable_prefix() {
+        // The readable prefix is still present; the hash suffix disambiguates collisions.
+        assert!(sanitize_registry_name("org/model").starts_with("org--model-"));
+        assert!(
+            sanitize_registry_name("meta-llama/Llama-3.1-70B")
+                .starts_with("meta-llama--llama-3.1-70b-")
         );
     }
 
@@ -431,6 +497,16 @@ mod tests {
         assert_ne!(
             sanitize_registry_name("org/model"),
             sanitize_registry_name("org-model")
+        );
+    }
+
+    #[test]
+    fn sanitize_distinguishes_case() {
+        // Case-folding used to collide silently; the always-on hash suffix (of the
+        // original case-preserving name) prevents that.
+        assert_ne!(
+            sanitize_registry_name("Foo/Bar"),
+            sanitize_registry_name("foo/bar")
         );
     }
 
@@ -467,7 +543,7 @@ mod tests {
 
     #[test]
     fn sanitize_trims_leading_trailing_dashes() {
-        assert_eq!(sanitize_registry_name("-model-"), "model");
-        assert_eq!(sanitize_registry_name(".model."), "model");
+        assert!(sanitize_registry_name("-model-").starts_with("model-"));
+        assert!(sanitize_registry_name(".model.").starts_with("model-"));
     }
 }

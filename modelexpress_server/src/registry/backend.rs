@@ -29,6 +29,19 @@ pub struct ModelRecord {
     pub message: Option<String>,
 }
 
+/// Result of a `try_claim_for_download` call. Distributed semantics across replicas:
+/// only the caller that sees `Claimed` owns the download. Replicas that see
+/// `AlreadyExists` must wait on the owner instead of spawning a duplicate download.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClaimOutcome {
+    /// This call atomically created the registry record with status `DOWNLOADING`.
+    /// The caller is the download owner.
+    Claimed,
+    /// The record already existed when we tried to claim. The caller is a waiter, not
+    /// the owner; the enclosed status is the snapshot observed during the attempt.
+    AlreadyExists(ModelStatus),
+}
+
 /// Trait for model-registry backend implementations.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -66,14 +79,29 @@ pub trait RegistryBackend: Send + Sync {
     /// Return (downloading, downloaded, error) counts. Used by the metrics path.
     async fn get_status_counts(&self) -> RegistryResult<(u32, u32, u32)>;
 
-    /// Atomic compare-and-swap: if the model is unknown, mark it `DOWNLOADING` and return
-    /// `DOWNLOADING` (the caller "won" the claim and is responsible for the download).
-    /// Otherwise, return the model's existing status without mutation.
+    /// Atomic claim: if the model has no registry record, create one with status
+    /// `DOWNLOADING` and return `ClaimOutcome::Claimed`. Otherwise, return
+    /// `ClaimOutcome::AlreadyExists(status)` without mutation.
+    ///
+    /// This is the only way multi-replica servers know which one actually owns the
+    /// download. Callers MUST NOT infer ownership from the observed status alone —
+    /// two replicas can both observe `DOWNLOADING` but only the one that receives
+    /// `Claimed` owns it.
     async fn try_claim_for_download(
         &self,
         model_name: &str,
         provider: ModelProvider,
-    ) -> RegistryResult<ModelStatus>;
+    ) -> RegistryResult<ClaimOutcome>;
+
+    /// Atomic compare-and-set: if the current status is `ERROR`, flip it to
+    /// `DOWNLOADING` with `Retrying download...` as the message and return `true`.
+    /// Otherwise return `false` without mutation. Used by the error-retry path so
+    /// only one replica spawns the retry even when multiple observe `ERROR`.
+    async fn try_reset_error_for_retry(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> RegistryResult<bool>;
 }
 
 /// Construct a registry backend from config, eagerly connecting before returning.

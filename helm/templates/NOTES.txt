@@ -1,6 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+{{- if and .Values.env .Values.env.MX_METADATA_BACKEND }}
+{{- if eq .Values.env.MX_METADATA_BACKEND "redis" }}
+
+IMPORTANT: This chart does NOT deploy Redis. The server is configured with
+MX_METADATA_BACKEND=redis and REDIS_URL={{ .Values.env.REDIS_URL | default "<unset>" }} —
+you must have a reachable Redis Service at that host in namespace {{ .Release.Namespace }},
+or override env.REDIS_URL to point at your own instance.
+{{- end }}
+{{- if eq .Values.env.MX_METADATA_BACKEND "kubernetes" }}
+
+IMPORTANT: The Kubernetes backend requires the ModelExpress CRDs to be installed
+cluster-wide (examples/crds.yaml) and serviceAccount.rbac.enabled=true so the
+server can manage ModelMetadata and ModelCacheEntry resources.
+{{- end }}
+{{- else }}
+
+WARNING: MX_METADATA_BACKEND is not set in values. The server will fail to start —
+set env.MX_METADATA_BACKEND to "redis" or "kubernetes" (with the matching
+connection settings) and re-run `helm upgrade`.
+{{- end }}
+
 1. Get the gRPC service endpoint by running these commands:
 {{- if and .Values.ingress .Values.ingress.enabled .Values.ingress.hosts }}
 {{- range $host := .Values.ingress.hosts }}

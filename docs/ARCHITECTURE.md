@@ -11,7 +11,7 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace and NGC. Model lifecycle state lives in a distributed registry (Redis, with Kubernetes CRDs as a P1 follow-up) so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace and NGC. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
 
 ### Current Status
