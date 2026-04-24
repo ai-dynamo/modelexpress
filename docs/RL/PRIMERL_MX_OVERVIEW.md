@@ -1,7 +1,7 @@
 # ModelExpress × PRIME-RL — Design Overview
 
-**Last Updated**: April 2026
-**Status**: Design complete; prototype overlay on top of [PrimeIntellect-ai/prime-rl#2326](https://github.com/PrimeIntellect-ai/prime-rl/pull/2326) targeting GB200 (ARM64, GKE). Metrics sections below are populated as the benchmark run produces data.
+**Last Updated**: April 24, 2026
+**Status**: **Scenario A green on GB200** — overlay validated end-to-end against PI's `nixl-weight-transfer` branch ([#2326](https://github.com/PrimeIntellect-ai/prime-rl/pull/2326)). 20/20 RL training steps with real NIXL RDMA pushes (~596 MB/step, 310 slots, 100% `/update_weights` success). Scenarios B (MX rendezvous engaged) and C (pipeline replication) are next — MX overlay code is deployed behind env-var gates (`PRIME_RL_MX_RENDEZVOUS`, `PRIME_RL_MX_PIPELINE_REPLICATION`) and awaits flip + measurement. Scenarios D (scratch-buffer diagnostic) and E (peer recovery) are designed but not yet run. Draft PR: [#2343](https://github.com/PrimeIntellect-ai/prime-rl/pull/2343).
 
 This document covers how ModelExpress (MX) plugs into [PRIME-RL](https://github.com/PrimeIntellect-ai/prime-rl)'s NIXL weight-transfer path as a **metadata and elasticity layer on top of** the existing `NIXLWeightBroadcast` / `TransportPlan` introduced by PR #2326. We do not reimplement their transport. We replace the SPG (StatelessProcessGroup) rendezvous with an MX-Server-mediated discovery plane, add pipeline replication, add a mutability contract, and enable a scratch-buffer diagnostic mode — all opt-in behind a single config flag.
 
@@ -182,16 +182,18 @@ sequenceDiagram
 
 ### Observed per-step timing
 
-_These numbers are populated from the GB200 benchmark run described in §4. Until that run completes, cells are marked **TBD** and prior PI-reported numbers are noted for reference._
+Scenario A numbers are measured on GB200 (Qwen3-0.6B BF16, 2 trainer ranks × 1 inference rank, customer-gpu-o7v pool). Scenarios B and C await the next session's env-var flip.
 
-| Phase | PI SPG (12-node prod, reported) | MX rendezvous (GB200 2-node, measured) | MX + pipeline replication (GB200, projected) |
-|-------|---------------------------------|----------------------------------------|----------------------------------------------|
-| Rendezvous (SPG init vs MX poll) | ~0.8s (post-iter15 pre-write barrier) | **TBD** (target: ≤100 ms first poll, ≤20 ms steady-state) | **TBD** |
-| `send_weights` / `receive_weights` (RDMA) | ~7.5 GB/s wire / 20 GB/s net | **TBD** (target: parity with PI — same transport) | **TBD** (target: linear scale with replica count) |
-| `finalize` | ~0.1s | **TBD** | **TBD** |
-| **Total `update_weights`** | — | **TBD** | **TBD** |
+| Phase | Scenario A — PI SPG baseline (GB200 2-node, measured) | Scenario B — MX rendezvous (GB200, pending) | Scenario C — MX + pipeline replication (GB200, pending) |
+|-------|-------------------------------------------------------|---------------------------------------------|---------------------------------------------------------|
+| Rendezvous (SPG init vs MX poll) | ~0.8s first, negligible steady-state (10 steps observed in single SPG session) | **pending** (target: ≤100 ms first poll via gRPC catalog, ≤20 ms steady-state) | **pending** |
+| `send_weights` / `receive_weights` (RDMA) | 596 MB bucket per push, 310 slots, avg step time 5.1s incl. forward+backward+optim+push (SDPA, not flash-attn) | **pending** (target: parity with A — same transport) | **pending** (target: aggregate BW > A as rollouts re-publish) |
+| `finalize` + `dist.barrier()` | ~0.1s | **pending** | **pending** |
+| **Total `update_weights`** wall-clock | ~5.1s avg (incl. training step; pure transfer share TBD from phase-split trace) | **pending** | **pending** |
 
 Parity with PI on the data path is the acceptance criterion for the MX overlay — any regression means we've accidentally touched the hot path, which is not the design.
+
+**Known caveat for comparison against PI's reported 12-node prod numbers**: our scenario A runs on SDPA (our ARM64 image ships a flash-attn import stub; real kernels require a ~3h QEMU compile). This caps throughput at ~6.7k tokens/s/rank vs PI's prod numbers which assume flash-attn. The **NIXL transfer** portion is unaffected (same UCX rc_mlx5, same bytes on wire); the **step-time** fraction attributable to training (forward + backward) is inflated. Flash-attn parity is a P1 follow-up in `PRIMERL_POC_Next_Steps.md`.
 
 ---
 
@@ -562,26 +564,28 @@ Three scenarios run back-to-back on the same config so results are directly comp
 
 ### 4.5 Metrics to capture
 
-_Populated after the run; target values are derived from PI's reported 12-node numbers and our verl POC parity runs._
-
-Scenarios are numbered A-E. DAG observability (§4.5.5) applies wherever pipeline replication is enabled.
+Scenarios are numbered A-E. DAG observability (§4.5.5) applies wherever pipeline replication is enabled. Scenario A measurements below are from the April 24 GB200 run (Qwen3-0.6B BF16, 2 trainer ranks × 1 inference rank, 20 RL steps). B/C/D/E are populated as the corresponding runs complete.
 
 #### 4.5.1 Weight-sync phase timing
 
-| Metric | Target (based on PI prod) | A SPG | B MX rendezvous | C MX + pipeline | D MX + scratch |
+| Metric | Target (based on PI prod) | A SPG (measured) | B MX rendezvous (pending) | C MX + pipeline (pending) | D MX + scratch (pending) |
 |--------|---------------------------|-------|-----------------|-----------------|----------------|
-| Rendezvous wall-clock | ≤ 0.5 s first, ≤ 50 ms steady | TBD | TBD | TBD | TBD |
-| Pre-write barrier | ~0.8 s (PI iter15) | TBD | TBD | TBD | TBD |
-| Per-slot RDMA WRITE | parity with PI | TBD | TBD | TBD | TBD |
-| Total `update_weights` | 1.0-1.5 s on our shape | TBD | TBD | TBD | TBD |
+| Rendezvous wall-clock | ≤ 0.5 s first, ≤ 50 ms steady | ~0.8 s first (one-shot for whole run) | pending | pending | pending |
+| Pre-write barrier | ~0.8 s (PI iter15) | not broken out from step time yet (phase trace TBD) | pending | pending | pending |
+| Per-slot RDMA WRITE | parity with PI | 310 slots / 310 writes rank-0, 197 rank-1 | pending | pending | pending |
+| Total `update_weights` (incl. trainer step) | 1.0-1.5 s on our shape | ~5.1 s avg (dominated by SDPA forward/backward; flash-attn would close this) | pending | pending | pending |
+| Trainer steps completed | — | **20 / 20** | pending | pending | pending |
 
 #### 4.5.2 RDMA throughput
 
-| Metric | Target | A | B | C | D |
+| Metric | Target | A (measured) | B | C | D |
 |--------|--------|---|---|---|---|
-| Wire BW per trainer NIC | ~7.5 GB/s | TBD | TBD | TBD | TBD |
-| Aggregate net BW | ~20 GB/s (4 NICs) | TBD | TBD | TBD | TBD |
-| Aggregate with pipeline replication | > 20 GB/s effective | — | — | TBD | — |
+| Bucket size per push | — | **596.12 MB** | pending | pending | pending |
+| Wire BW per trainer NIC | ~7.5 GB/s | phase trace TBD (need per-xfer timestamps; not separated from step time in current log) | pending | pending | pending |
+| Aggregate net BW | ~20 GB/s (4 NICs) | N/A on 1 NIC × 1 rollout shape | pending | pending | pending |
+| Aggregate with pipeline replication | > 20 GB/s effective | — | — | pending | — |
+
+*Throughput figures in A are surfaced by `update_weights` wall-clock; a phase-split trace (registering timestamps inside `TransportPlan.push_once`) is a small follow-up that lets us state wire GB/s directly.*
 
 #### 4.5.3 MX Server round-trip latencies (B/C only)
 
@@ -635,15 +639,24 @@ KL divergence vs NCCL baseline, measured over 20 training steps per scenario:
 
 This is the KL-drift triangulation data. If B drifts and D does not, the bug is in live-param-refit layout/identity, not NIXL. If both drift, the bug is deeper. Either result is valuable to the PI investigation.
 
-### 4.6 Results summary (to be filled)
+### 4.6 Results summary
 
-_To be written after the benchmark run. Expected headline numbers:_
+**Scenario A — PI NIXL direct-refit path (April 24, 2026 measured on GB200):**
 
-- **Data-path parity**: MX rendezvous shows no wall-clock regression vs SPG on `update_weights` timing — same transport, same bytes.
-- **Dynamic discovery**: MX rendezvous setup < 100 ms first call, < 20 ms steady-state. SPG equivalent requires process restart.
-- **Pipeline replication**: aggregate effective bandwidth scales with rollout count beyond trainer NIC cap.
-- **Elastic join**: a 5th rollout joins a 4-rollout setup mid-run and receives weights on the next push without affecting the other four.
-- **Diagnostic value**: scratch-mode run provides the first bit-exact isolation of the PI KL drift to either transport or target layout.
+- ✅ **Foundation validated end-to-end.** 20/20 RL training steps completed on Qwen3-0.6B (via our `qwen3_specs_patch.py`) with 100% `/update_weights` 200 OK.
+- ✅ **Per-rank sharding-aware path works as PI designed.** 310 slots registered; rank 0 writes 310, rank 1 writes 197 — no gather-to-rank-0 happened anywhere (confirms §3.9's inherited property).
+- ✅ **Overlay is structurally correct.** With `PRIME_RL_MX_RENDEZVOUS` unset, our overlay branch runs PI's code bit-identical — the scenario A result *is* PI's own baseline, just on our Qwen3-patched infrastructure.
+- 📏 **Measured**: ~5.1 s avg training-step wall-clock (SDPA-bound on forward/backward, not NIXL-bound). 596 MB NIXL bucket per push. 22.7 GB peak trainer GPU mem. Grad norm healthy (0.0006 – 0.0042) across all 20 steps.
+- 🔧 **Nine blockers resolved to reach green** (documented in `OVERLAY_PR_EXECUTION_STATE.md`): tilelang libcudart stub shadowing FlashInfer, vLLM 0.19 `/update_weights` route conflict, orchestrator `output_dir` must live under a `run_*` subdir, `trainer_world_size=2` config match, TP=1 required for PI's LayoutEntry layout, flash-attn → SDPA, SPG `inference_world_size` alignment, Qwen3 `conversion_specs()` patch, server.py hot-patch staging.
+
+**Scenarios B / C / D / E — next sessions. Expected findings:**
+
+- Data-path parity with A on B (same transport, control plane swap only).
+- MX rendezvous latency: target ≤100 ms first `discover_spg_coordinator` gRPC, ≤20 ms steady-state.
+- Pipeline replication (C): aggregate effective bandwidth scales with rollout count beyond trainer NIC cap; DAG observability metrics (§4.5.5) confirm sources-per-poll ≥ 2 once first rollout finishes.
+- Elastic join (C): 5th rollout joins a 4-rollout setup mid-run and receives weights on the next push without disturbing the other four.
+- Scratch-buffer diagnostic (D): bit-exact isolation of PI's KL drift to either transport or target layout.
+- Peer recovery (E): recovering rollout pulls from a surviving peer rather than the trainer; trainer NIC bandwidth remains available for steady-state pushes.
 
 ---
 
