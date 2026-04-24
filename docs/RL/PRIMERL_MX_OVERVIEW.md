@@ -34,12 +34,12 @@ PR #2326 gives PRIME-RL a bit-exact RDMA weight transport built on NIXL/UCX over
 ```mermaid
 graph TB
     subgraph driver["Driver · CPU · orchestrator process"]
-        orch["RL Orchestrator<br/>(existing)"]
+        orch["RL Orchestrator<br/>(PI, unchanged)"]
         httpapi["/pause /resume /update_weights<br/>(vLLM WeightTransferEngine endpoints)"]
         orch --> httpapi
     end
 
-    subgraph mx_meta["Metadata Plane · CPU"]
+    subgraph mx_meta["Metadata Plane · CPU · MX overlay adds"]
         mx["MX Server<br/>(gRPC)"]
         redis[("Redis")]
         mx --> redis
@@ -48,30 +48,31 @@ graph TB
     subgraph trainer["Trainer node · FSDP2 + optimizer"]
         direction TB
         tw["Trainer ranks × N<br/>(dp_shard × cp)"]
-        tp["NIXLWeightBroadcast<br/>+ TransportPlan<br/>(PI's code, unchanged)"]
-        pub["MxTrainingPublisher<br/>(MX overlay)"]
-        tnixl(["NIXL Agent × N"])
+        tp["NIXLWeightBroadcast<br/>+ TransportPlan<br/>(PI, unchanged)"]
+        pub["MxTrainingPublisher<br/>(MX overlay,<br/>env-var gated)"]
+        tnixl(["NIXL Agent × N<br/>(PI)"])
         tw --> tp
-        tp -->|slot registry| pub
+        tp -.->|register_coordinator<br/>once at boot| pub
         tp --> tnixl
     end
 
     subgraph rollout["Rollout nodes · vLLM TP"]
         direction TB
-        cew["NIXLWeightUpdateWorker × M<br/>(PI's code, unchanged)"]
-        rcv["MxRefitReceiver<br/>(MX overlay)"]
-        rnixl(["NIXL Agent × M"])
+        cew["NIXLWeightUpdateWorker × M<br/>(PI, unchanged)"]
+        rcv["MxRefitReceiver<br/>(MX overlay,<br/>env-var gated)"]
+        rnixl(["NIXL Agent × M<br/>(PI)"])
         vllm["vLLM engine × M<br/>(live params)"]
         cew --> rcv
         cew --> rnixl
-        cew -. "in-place RDMA WRITE<br/>or scratch-buffer stage" .-> vllm
+        cew ==> vllm
     end
 
-    pub -- "gRPC publish_agent<br/>slots + agent_meta + version" --> mx
-    rcv -- "gRPC poll_for_source<br/>(model_name, worker_rank)" --> mx
-    mx -- "trainer agent_meta<br/>slot layout + NIXL blob" --> rcv
-    tnixl <== "NIXL RDMA WRITE<br/>RoCE · rc_mlx5<br/>(PI transport, unchanged)" ==> rnixl
-    rcv -. "publish_rollout_source<br/>(pipeline replication)" .-> mx
+    pub -. "gRPC publish_spg_coordinator<br/>(boot) · mark_version_ready (per step)" .-> mx
+    rcv -. "gRPC discover_spg_coordinator<br/>(boot)" .-> mx
+    rcv -. "gRPC publish_rollout_source<br/>(§3.2 pipeline replication, optional)" .-> mx
+
+    cew <== "SPG all_gather_obj × 2 rounds<br/>(agent_meta, slot_layout, xfer descs)<br/>PI code, unchanged" ==> tp
+    tnixl <== "NIXL RDMA WRITE<br/>trainer → rollout recv buffer<br/>RoCE · rc_mlx5 (PI, unchanged)" ==> rnixl
 
     style driver fill:#1a1a2e,stroke:#533483,color:#e0e0e0
     style mx_meta fill:#1a1a2e,stroke:#4caf50,color:#e0e0e0
@@ -91,7 +92,12 @@ graph TB
     style redis fill:#162447,stroke:#533483,color:#e0e0e0
 ```
 
-**Legend**: Green boxes = MX/NIXL additions (metadata plane + overlay client classes). Purple = existing PRIME-RL / vLLM / PI-PR-#2326 components. The trainer-to-rollout NIXL arrow is the exact same RDMA WRITE path PI introduced; MX does not touch the data plane.
+**Legend**:
+
+- **Purple boxes + solid purple edges** — existing PRIME-RL / vLLM / PI #2326 code the overlay imports and uses as-is.
+- **Green boxes + dotted green edges** — MX additions: MX Server, overlay client classes, gRPC control-plane calls.
+- **Data plane** (trainer NIXL ↔ rollout NIXL, solid double-edge) is **100% PI** — MX does not see or touch weight bytes.
+- **SPG metadata rounds** (trainer ↔ rollout double-edge between `TransportPlan` and `NIXLWeightUpdateWorker`) are **100% PI** — MX only swaps how participants *find* the SPG coordinator; the two `all_gather_obj` rounds themselves are untouched.
 
 ### Key ideas
 
@@ -105,61 +111,74 @@ graph TB
 
 ## 2. Timing Diagram — One `update_weights` Step
 
-Shows the MX-mediated path (`rendezvous: mx_server`). The SPG path is unchanged from PI #2326.
+Shows the MX-mediated path (`rendezvous: mx_server`). The SPG path is unchanged from PI #2326. The overlay's v0.1 scope is **coordinator discovery only** — once the SPG coordinator is found via MX, PI's existing 2-round `all_gather_obj` metadata exchange and `TransportPlan` RDMA WRITE run bit-identically.
 
 ```mermaid
 sequenceDiagram
     participant O as Orchestrator
-    participant T as Trainer rank k<br/>(TransportPlan)
+    participant T as Trainer ranks<br/>(NIXLWeightBroadcast)
     participant PUB as MxTrainingPublisher
     participant MX as MX Server
     participant RCV as MxRefitReceiver
-    participant R as NIXLWeightUpdateWorker<br/>(rollout rank k)
+    participant R as NIXLWeightUpdateWorker<br/>(rollout ranks)
     participant V as vLLM engine
+
+    rect rgba(76,175,80,0.08)
+        Note over T,MX: Boot-time (once per run) — late-bound SPG discovery
+        T->>PUB: register_coordinator(model, host, port)
+        PUB->>MX: gRPC publish_spg_coordinator(model, host:port)
+        R->>RCV: init(model_name, worker_rank=k)
+        RCV->>MX: gRPC discover_spg_coordinator(model)
+        MX-->>RCV: SPG host:port
+    end
 
     Note over T: optimizer.step() complete
 
     O->>R: POST /pause
     R-->>O: 200 OK (quiesced)
 
-    par publish (trainer) + discover (rollout)
-        T->>PUB: prepare_slots(slots, agent_meta, version=N)
-        PUB->>MX: gRPC publish(model, agents[], slot_layout[], version=N)
-        MX-->>PUB: OK (mark version N publishable)
-        R->>RCV: init(model_name, worker_rank=k)
-        RCV->>MX: gRPC poll_for_source(model, worker_rank=k, min_version=N)
-        MX-->>RCV: agent_meta, slot_layout, source_id
+    rect rgba(83,52,131,0.10)
+        Note over T,R: SPG 2-round metadata exchange (PI code, unchanged)
+        par per step
+            T->>T: StatelessProcessGroup(host, port, rank, world_size)
+            R->>R: StatelessProcessGroup(host, port, rank, world_size)
+        end
+        T-->>R: Round 1 — NIXL agent_meta, slot_layout,<br/>recv-buffer descriptors
+        T-->>R: Round 2 — per-slot xfer descriptors
+        T->>T: dist.barrier() (PI iter15 pre-write quiescence)
     end
 
-    Note over T,R: (no SPG init needed; rendezvous complete via MX)
-
-    T->>T: dist.barrier() (pre-write quiescence)
-
-    loop per slot bucket (PI's chunked drain)
-        T->>T: pack slot → GPU bucket, NIXL WRITE to rollout
-        T-->>R: NIXL RDMA WRITE (RoCE, rc_mlx5)
+    rect rgba(83,52,131,0.10)
+        Note over T,R: Data plane — PI RDMA WRITE (unchanged)
+        loop per slot bucket (TransportPlan.drain)
+            T-->>R: NIXL RDMA WRITE → rollout's recv buffer<br/>(RoCE, rc_mlx5)
+        end
     end
 
-    T->>PUB: publish.finalize(version=N, done=true)
-    PUB->>MX: gRPC mark_version_ready(version=N)
-    R->>RCV: finalize()
-    RCV->>V: in-place refit complete<br/>(or scratch apply via load_weights)
+    par finalize
+        T->>PUB: mark_version_ready(N)
+        PUB->>MX: gRPC mark_version_ready(model, version=N)
+        R->>RCV: finalize()
+        RCV->>V: direct refit into live params<br/>or scratch → model.load_weights()
+    end
 
     opt pipeline_replication=true
         RCV->>MX: gRPC publish_rollout_source(model, version=N, agent_meta)
-        Note over MX: subsequent rollouts poll<br/>and may discover this rollout<br/>as source
+        Note over MX: future pollers may be<br/>steered to this rollout<br/>(see §3.2 DAG)
     end
 
-    opt next iteration — trainer about to mutate slots
+    opt async_level ≥ 1 — trainer about to mutate slots
         T->>PUB: unpublish(version=N)
-        PUB->>MX: gRPC unpublish(version=N)
-        MX->>MX: wait for in-flight pulls to drain
-        MX-->>PUB: OK (safe to mutate)
+        PUB->>MX: gRPC unpublish(model, version=N)
+        MX->>MX: wait for in-flight pulls<br/>(version N) to drain
+        MX-->>PUB: OK (buffers safe to mutate)
     end
 
     O->>R: POST /resume
     R-->>O: 200 OK
 ```
+
+**Legend**: Green-tinted block = one-time boot path (MX discovery — the only control-plane change the v0.1 overlay makes). Purple-tinted blocks = per-step flow that's **unchanged from PI #2326** (SPG metadata rounds, barrier, RDMA WRITE). MX Server hooks at finalize + optional blocks (`publish_rollout_source`, `unpublish`) are additive — absent when the corresponding feature flag is unset.
 
 ### Observed per-step timing
 
