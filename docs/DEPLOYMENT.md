@@ -245,13 +245,14 @@ Pick based on workload, not operational preference. The choice has structural co
 | Workload shape                                                         | Backend          | Why                                                                                                                                            |
 |------------------------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`    | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service-routing requires.             |
+| Stable-weight inference outside K8s (Slurm/HPC, bare metal, mixed environments). | `dht` | Same homogeneous-pool assumption as `k8s-service`, but peer discovery is by Kademlia DHT instead of Kubernetes Services. Bootstraps from explicit multiaddrs, headless Service DNS, Slurm hostlists (`SLURM_JOB_NODELIST`), or mDNS for single-host. |
 | RL rollouts. Training loop updates weights every step, all inference pods refit in-place, repeat. | `redis` or `kubernetes` | Central store tracks each worker's state individually by `worker_id`. Targets can fetch "worker W as it exists right now" instead of random-sampling a pool. Live refits stay consistent at the per-worker level. |
 | Live fine-tune broadcasts. New checkpoint produced outside training, pushed to all replicas, hot-swapped in place. | `redis` or `kubernetes` | Same reason as RL. The k8s-service backend can't swap a live pod's source_id without restarting the pod.                                      |
 | Mixed-version fleet. Multiple revisions serving concurrently, callers dispatch by revision. | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, so multiple identities coexist cleanly. k8s-service requires one Service pool per identity.          |
 | Heterogeneous hardware. Some sources on H100, some on B200, callers match on topology. | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.   |
 | Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).   | Either           | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work. |
 
-The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
+The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification. Reach for `dht` when those same criteria hold but the deployment isn't K8s-Service-shaped (Slurm, bare metal, multi-environment) - it provides equivalent decentralized discovery via Kademlia instead of `kube-proxy`.
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
@@ -259,14 +260,14 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` backend) |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server), `k8s-service` (decentralized via K8s Service routing), or `dht`/`kademlia` (decentralized via Kademlia DHT). |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` or `dht` backend) |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_SKIP_FEATURE_CHECK` | `0` | Bypass the MLA feature gate for P2P transfer (testing only) |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service`. |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service` and `dht`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -274,6 +275,14 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
+| `MX_DHT_LISTEN` | `0.0.0.0:0` | `dht` backend: listen `host:port` for the local Kademlia node. Port `0` selects an ephemeral port. |
+| `MX_DHT_BOOTSTRAP_PEERS` | (empty) | `dht` backend: comma-separated libp2p multiaddrs (e.g. `/ip4/10.0.0.1/tcp/4001/p2p/Qm...`). Highest-priority bootstrap source. |
+| `MX_DHT_BOOTSTRAP_DNS` | (empty) | `dht` backend: K8s headless Service hostname; resolves to all backing pod IPs at `MX_DHT_BOOTSTRAP_PORT`. |
+| `MX_DHT_BOOTSTRAP_SLURM` | (auto from `SLURM_JOB_NODELIST`) | `dht` backend: Slurm-style hostlist (e.g. `node[01-04]`). Auto-picked up from `SLURM_JOB_NODELIST` inside a Slurm allocation. |
+| `MX_DHT_BOOTSTRAP_PORT` | `4001` | `dht` backend: port at which to dial DNS-resolved or Slurm-resolved peers. Should match the `MX_DHT_LISTEN` port of the cluster's nodes. |
+| `MX_DHT_RECORD_TTL` | `86400` | `dht` backend: record TTL in seconds (default 24 h). The publisher republishes on the DHT's standard cadence to cover liveness. |
+| `MX_DHT_GET_RETRIES` | `5` | `dht` backend: max retries on a missing key (publisher hasn't propagated yet) or `FAILED_PRECONDITION` (revision skew). |
+| `MX_DHT_GET_BACKOFF_SECONDS` | `0.5` | `dht` backend: sleep between retry attempts. |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
@@ -288,6 +297,7 @@ Each GPU worker publishes independently using its global rank (`torch.distribute
 
 - **Central-coordinator backends (`redis`, `kubernetes`):** opt-in via `MX_P2P_METADATA=1`. By default the source publishes full tensor metadata (NIXL blobs + tensor descriptors) to the central server, and targets fetch the full blob from the server. With the env var set, the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration needed on the target side.
 - **`k8s-service` backend:** auto-enabled. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly.
+- **`dht` backend:** auto-enabled, same mechanism as `k8s-service`. The publisher writes a small pointer (`worker_grpc_endpoint`, `metadata_endpoint`, `agent_name`) into the DHT under a rank-keyed, content-addressed key; receivers compute the same key locally, do a single DHT GET, and call `GetTensorManifest` against the resolved endpoint. The full tensor manifest stays on the worker.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 

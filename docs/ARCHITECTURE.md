@@ -359,9 +359,10 @@ Server-coordinated backends live in the Rust server and are selected via `MX_MET
 - **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). Stale detection and cleanup handled by the server-side reaper.
 - **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs (one per worker) with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection. Standard Kubernetes `status.conditions` (`Ready`) and `status.observedGeneration` are maintained so that `kubectl wait --for=condition=Ready` works. Stale detection handled by the server-side reaper.
 
-The decentralized backend lives in the Python client and is selected via `MX_METADATA_BACKEND`:
+The decentralized backends live in the Python client and are selected via `MX_METADATA_BACKEND`:
 
 - **K8s-service** (`k8s-service`/`service`): each source pool sits behind a Kubernetes Service (one per tensor-parallel rank, label selector pinned to `mx.rank=R`). Clients open a direct gRPC channel to the Service DNS and call `GetTensorManifest`; kube-proxy load-balances across ready backends. No central server is involved. `mx_source_id` is computed client-side via the same canonical JSON + SHA256 scheme and validated on the response. See [`../examples/k8s_service_sources/`](../examples/k8s_service_sources/) for the deployment shape.
+- **DHT** (`dht`/`kademlia`): peers form a Kademlia DHT and publish a small pointer record under a content-addressed, rank-keyed key. Receivers compute the same key locally and resolve the publishing worker's gRPC endpoint with a single DHT GET, then call `GetTensorManifest` against that endpoint. Bootstrap mechanisms include explicit peer multiaddrs, K8s headless Service DNS, Slurm hostlists (auto-detected from `SLURM_JOB_NODELIST`), and mDNS for single-host / LAN. Fits HPC clusters and bare-metal deployments where K8s Services aren't the right shape.
 
 Each worker publishes independently. The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))` where `SourceIdentity` includes a `revision` field for content-addressed identity (HuggingFace commit SHA, S3 object version, or a deployer-provided string). When `revision` names immutable content, two sources with identical `mx_source_id` are expected to serve bit-identical weight bytes; the ID itself validates declared identity rather than hashing tensor contents, so the guarantee is only as strong as the revision pin and the local cache being intact. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
 
@@ -381,6 +382,16 @@ The decentralized `k8s-service` backend lives in the Python client as `MxK8sServ
 **Pool constraint:** every ready pod behind a given Service must serve the same `mx_source_id`. Transient revision skew during rolling updates is handled by client-side retry on `FAILED_PRECONDITION` over fresh gRPC channels, up to `MX_K8S_SOURCE_RETRIES`. Workloads that need per-worker addressability (RL rollouts, live fine-tune refits, mixed-version fleets) must use the central-coordinator backends instead; the k8s-service backend's Service-routing model has no way to express "this specific worker."
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for design rationale, limitations, and backend-selection guidance.
+
+### DHT Metadata Backend
+
+The decentralized `dht` backend lives in the Python client as `MxDhtClient` (duck-typed to `MxClientBase`). Each worker runs an in-process Kademlia DHT node that participates in a peer mesh; on publish, the worker writes a small pointer record (`worker_grpc_endpoint`, `metadata_endpoint`, `agent_name`) under the rank-keyed DHT key `/mx/{mx_source_id}/rank/{worker_rank}`. Receivers compute the same key locally and resolve the matching publisher with a single DHT GET, then call `GetTensorManifest` against the resulting endpoint.
+
+**Storage schema:** rank-keyed entries (one DHT record per (source, rank)) keep lookups to a single GET regardless of cluster size. The full tensor manifest is never put in the DHT; it stays on the worker and is served via the existing `WorkerService.GetTensorManifest` RPC. Records carry a TTL (default 24 h, override via `MX_DHT_RECORD_TTL`) and the publisher republishes on the DHT's standard cadence to cover liveness.
+
+**Bootstrap priority:** `MX_DHT_BOOTSTRAP_PEERS` (explicit libp2p multiaddrs) > `MX_DHT_BOOTSTRAP_DNS` (K8s headless Service hostname; resolves to all backing pod IPs at `MX_DHT_BOOTSTRAP_PORT`) > `MX_DHT_BOOTSTRAP_SLURM` or auto-detected `SLURM_JOB_NODELIST` (Slurm-style hostlist dialed at `MX_DHT_BOOTSTRAP_PORT`) > mDNS auto-fallback (single-host / LAN). Bootstrap failures are logged but not fatal: the node still listens and can pick up peers via mDNS or future republish cycles.
+
+**Pool constraint:** the same one-publisher-per-rank assumption as k8s-service. Mixed-version fleets and per-worker addressability still require the central-coordinator backends. The `mx_source_id` mismatch case is handled by the same retry-on-`FAILED_PRECONDITION` pattern used by k8s-service, with `MX_DHT_GET_RETRIES` / `MX_DHT_GET_BACKOFF_SECONDS` covering both transient missing-key races and revision skew.
 
 ### ModelDownloadTracker
 
@@ -653,13 +664,21 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
-| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server), `k8s-service` (decentralized via K8s Service routing), or `dht` / `kademlia` (decentralized via Kademlia DHT) |
 | `MX_CONTIGUOUS_REG` | `0` | Enable contiguous region registration (experimental) |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers. Opt-in on central-coordinator backends; auto-enabled (env var ignored) on decentralized backends |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
+| `MX_DHT_LISTEN` | `0.0.0.0:0` | DHT node listen `host:port`. Port `0` selects an ephemeral port |
+| `MX_DHT_BOOTSTRAP_PEERS` | (empty) | DHT bootstrap: comma-separated libp2p multiaddrs (e.g. `/ip4/10.0.0.1/tcp/4001/p2p/Qm...`) |
+| `MX_DHT_BOOTSTRAP_DNS` | (empty) | DHT bootstrap: K8s headless Service hostname; resolves to all backing pod IPs |
+| `MX_DHT_BOOTSTRAP_SLURM` | (auto from `SLURM_JOB_NODELIST`) | DHT bootstrap: Slurm-style hostlist (e.g. `node[01-04]`) |
+| `MX_DHT_BOOTSTRAP_PORT` | `4001` | Port at which to dial DNS-resolved or Slurm-resolved peers |
+| `MX_DHT_RECORD_TTL` | `86400` | DHT record TTL in seconds (default 24 h) |
+| `MX_DHT_GET_RETRIES` | `5` | DHT `get_metadata` max retries on missing key or `FAILED_PRECONDITION` |
+| `MX_DHT_GET_BACKOFF_SECONDS` | `0.5` | DHT `get_metadata` sleep between retry attempts |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
