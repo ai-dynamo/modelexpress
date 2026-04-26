@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]",
+    "kademlite>=0.1.0",
 ]
 
 [project.optional-dependencies]

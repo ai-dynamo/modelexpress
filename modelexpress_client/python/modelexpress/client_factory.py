@@ -16,6 +16,8 @@ Supported values:
   :class:`MxClient`.
 - ``"k8s-service"`` / ``"service"`` - K8s-Service-routed decentralized
   backend. Returns :class:`MxK8sServiceClient`.
+- ``"dht"`` / ``"kademlia"`` - Kademlia-DHT-routed decentralized
+  backend (kademlite-backed). Returns :class:`MxDhtClient`.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import logging
 import os
 
 from .client import MxClient, MxClientBase
+from .dht_client import MxDhtClient
 from .k8s_service_client import MxK8sServiceClient
 
 logger = logging.getLogger("modelexpress.client_factory")
@@ -32,6 +35,7 @@ _CENTRAL_BACKEND_ALIASES = frozenset({
     "", "server", "redis", "kubernetes", "k8s", "crd",
 })
 _K8S_SERVICE_ALIASES = frozenset({"k8s-service", "service"})
+_DHT_ALIASES = frozenset({"dht", "kademlia"})
 
 
 def create_metadata_client(
@@ -40,8 +44,8 @@ def create_metadata_client(
     """Create the metadata client dictated by ``MX_METADATA_BACKEND``.
 
     ``worker_rank`` is only consumed by backends that resolve a rank-
-    specific endpoint (currently :class:`MxK8sServiceClient`);
-    others ignore it.
+    specific endpoint (:class:`MxK8sServiceClient`,
+    :class:`MxDhtClient`); others ignore it.
     """
     backend = os.environ.get("MX_METADATA_BACKEND", "").lower().strip()
     if backend in _CENTRAL_BACKEND_ALIASES:
@@ -54,7 +58,14 @@ def create_metadata_client(
             backend, worker_rank,
         )
         return MxK8sServiceClient(worker_rank=worker_rank)
+    if backend in _DHT_ALIASES:
+        logger.info(
+            "create_metadata_client: MxDhtClient "
+            "(backend=%r, worker_rank=%s)",
+            backend, worker_rank,
+        )
+        return MxDhtClient(worker_rank=worker_rank)
     raise ValueError(
         f"Unknown MX_METADATA_BACKEND value {backend!r}. "
-        f"Supported: {sorted(_CENTRAL_BACKEND_ALIASES | _K8S_SERVICE_ALIASES)}"
+        f"Supported: {sorted(_CENTRAL_BACKEND_ALIASES | _K8S_SERVICE_ALIASES | _DHT_ALIASES)}"
     )
