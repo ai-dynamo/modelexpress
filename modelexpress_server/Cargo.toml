@@ -45,6 +45,7 @@ schemars = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 tonic-health = { workspace = true }
+libp2p = { workspace = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, features = ["test-support"] }

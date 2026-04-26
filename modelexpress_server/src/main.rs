@@ -140,6 +140,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         modelexpress_server::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
     });
 
+    // Optional DHT peer participation. Opt-in via `MX_DHT_LISTEN`; the
+    // server joins the Kademlia mesh used by the `dht` Python client
+    // backend so its node helps with routing and can serve as a stable
+    // bootstrap target. No records are published from this side: this
+    // is participation-only.
+    let dht_node = match modelexpress_server::dht::DhtConfig::from_env() {
+        None => {
+            info!("DHT participation disabled (MX_DHT_LISTEN unset)");
+            None
+        }
+        Some(cfg) => match modelexpress_server::dht::DhtNode::start(cfg).await {
+            Ok(node) => {
+                info!("DHT peer started (peer_id={})", node.peer_id);
+                Some(node)
+            }
+            Err(err) => {
+                error!("Failed to start DHT peer ({err}); continuing without DHT participation");
+                None
+            }
+        },
+    };
+
     // Setup graceful shutdown handler
     let shutdown_signal = async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -182,6 +204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
+    }
+    if let Some(node) = dht_node {
+        node.stop().await;
     }
 
     server_result?;

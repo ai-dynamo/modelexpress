@@ -299,6 +299,8 @@ Each GPU worker publishes independently using its global rank (`torch.distribute
 - **`k8s-service` backend:** auto-enabled. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly.
 - **`dht` backend:** auto-enabled, same mechanism as `k8s-service`. The publisher writes a small pointer (`worker_grpc_endpoint`, `metadata_endpoint`, `agent_name`) into the DHT under a rank-keyed, content-addressed key; receivers compute the same key locally, do a single DHT GET, and call `GetTensorManifest` against the resolved endpoint. The full tensor manifest stays on the worker.
 
+The same `MX_DHT_*` env vars also configure the optional server-side DHT participant. Setting `MX_DHT_LISTEN` on the `modelexpress-server` makes it join the Kademlia mesh as a peer (helping with routing, acting as a stable bootstrap target) without publishing any records of its own. This is orthogonal to the server's metadata backend choice and can be enabled alongside `redis` / `kubernetes` / etc.
+
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
 ### ModelStreamer (Object Storage & Local Disk)

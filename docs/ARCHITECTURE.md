@@ -393,6 +393,8 @@ The decentralized `dht` backend lives in the Python client as `MxDhtClient` (duc
 
 **Pool constraint:** the same one-publisher-per-rank assumption as k8s-service. Mixed-version fleets and per-worker addressability still require the central-coordinator backends. The `mx_source_id` mismatch case is handled by the same retry-on-`FAILED_PRECONDITION` pattern used by k8s-service, with `MX_DHT_GET_RETRIES` / `MX_DHT_GET_BACKOFF_SECONDS` covering both transient missing-key races and revision skew.
 
+**Optional server-side DHT participation:** the `modelexpress-server` itself can opt into joining the same Kademlia mesh as a participant by setting `MX_DHT_LISTEN`. The server runs an in-process libp2p node (TCP + Noise + Yamux + Kademlia + Identify + mDNS, via `rust-libp2p`), helps with peer routing and DHT lookups, and acts as a stable bootstrap target for clients - but it does NOT publish records of its own. Active publishing (server-cached models becoming peer-discoverable as DHT sources) is intentionally out of scope for this initial cut. The peer is opt-in and orthogonal to the server's metadata backend choice (redis / kubernetes / etc. continue to work unchanged); see `modelexpress_server/src/dht.rs`.
+
 ### ModelDownloadTracker
 
 Global singleton (`LazyLock<ModelDownloadTracker>`) that coordinates concurrent downloads. Uses `try_claim_for_download()` for race-free model claiming and tokio channels for streaming status updates to multiple waiting clients.
