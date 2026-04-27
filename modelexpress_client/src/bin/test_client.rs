@@ -9,6 +9,7 @@
 #![allow(clippy::expect_used)]
 
 use modelexpress_client::{Client, ClientConfig};
+use modelexpress_common::download;
 use modelexpress_common::models::ModelProvider;
 use std::env;
 use std::time::{Duration, Instant};
@@ -100,7 +101,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         info!("Client 1: Requesting model {model_name1}");
         let start = Instant::now();
         client1
-            .request_model(model_name1, false)
+            .request_model(model_name1, ModelProvider::default(), false)
             .await
             .expect("Client 1 failed to download model");
         info!("Client 1: Model downloaded in {:?}", start.elapsed());
@@ -116,7 +117,7 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         info!("Client 2: Requesting model {model_name2}");
         let start = Instant::now();
         client2
-            .request_model(model_name2, false)
+            .request_model(model_name2, ModelProvider::default(), false)
             .await
             .expect("Client 2 failed to download model");
         info!("Client 2: Model downloaded in {:?}", start.elapsed());
@@ -140,7 +141,10 @@ async fn run_single_model_test(model_name: &str) -> Result<(), Box<dyn std::erro
     info!("Client: Requesting model {model_name}");
     let start = Instant::now();
 
-    match client.request_model(model_name.to_string(), false).await {
+    match client
+        .request_model(model_name.to_string(), ModelProvider::default(), false)
+        .await
+    {
         Ok(()) => {
             info!("Client: Model downloaded in {:?}", start.elapsed());
             info!("Client completed in {:?}", start_time.elapsed());
@@ -154,7 +158,7 @@ async fn run_single_model_test(model_name: &str) -> Result<(), Box<dyn std::erro
     }
 }
 
-/// Test fallback functionality including server fallback, direct download, and smart fallback
+/// Test download functionality including server fallback, direct download, and smart fallback
 async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     info!("Testing fallback functionality (assuming server is running)...");
     let mut client = Client::new(ClientConfig::default()).await?;
@@ -163,7 +167,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
 
     // This should work via server since it's running
     match client
-        .request_model_with_provider_and_fallback(model_name, ModelProvider::HuggingFace, false)
+        .request_model(model_name, ModelProvider::HuggingFace, false)
         .await
     {
         Ok(()) => {
@@ -181,8 +185,15 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
     info!("Testing direct download (bypassing server)...");
     let start_direct = Instant::now();
 
-    match Client::download_model_directly(model_name, ModelProvider::HuggingFace, false).await {
-        Ok(()) => {
+    match download::download_model(
+        model_name,
+        ModelProvider::HuggingFace,
+        Some(ClientConfig::default().cache.local_path.clone()),
+        false,
+    )
+    .await
+    {
+        Ok(_) => {
             info!("Model downloaded directly in {:?}", start_direct.elapsed());
         }
         Err(e) => {
@@ -190,12 +201,11 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         }
     }
 
-    // Test smart fallback (will use server if available, direct download if not)
     info!("Testing smart fallback...");
     let start_smart = Instant::now();
 
     match Client::request_model_with_smart_fallback(
-        model_name,
+        model_name.to_string(),
         ModelProvider::HuggingFace,
         ClientConfig::default(),
         false,
@@ -207,11 +217,12 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
                 "Model downloaded with smart fallback in {:?}",
                 start_smart.elapsed()
             );
-            info!(
-                "FALLBACK TEST PASSED: Server-with-fallback, direct download, and smart fallback all work"
-            );
-            Ok(())
         }
-        Err(e) => Err(format!("Failed to download model with smart fallback: {e}").into()),
+        Err(e) => {
+            return Err(format!("Failed to download model with smart fallback: {e}").into());
+        }
     }
+
+    info!("FALLBACK TEST PASSED: Server, direct download, and smart fallback paths all work");
+    Ok(())
 }
