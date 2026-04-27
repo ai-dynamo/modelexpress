@@ -16,6 +16,11 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
     }
 }
 
+/// Canonicalize a model name using the provider-specific rules.
+pub fn canonical_model_name(model_name: &str, provider: ModelProvider) -> Result<String> {
+    get_provider(provider).canonical_model_name(model_name)
+}
+
 /// Download a model using the specified provider
 pub async fn download_model(
     model_name: &str,
@@ -102,6 +107,15 @@ mod tests {
         assert_eq!(provider.provider_name(), "Hugging Face");
     }
 
+    #[test]
+    fn test_canonical_model_name_routing() {
+        assert_eq!(
+            canonical_model_name("test/model", ModelProvider::HuggingFace)
+                .expect("Expected canonical model name"),
+            "test/model"
+        );
+    }
+
     #[tokio::test]
     async fn test_mock_provider_success() {
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
@@ -137,16 +151,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_download_model_routing() {
-        // Test that download_model function properly routes to the provider
-        // Note: This test doesn't actually download from HF to avoid network dependency
-        // In a real scenario, you might want to mock the hf-hub dependency
-
-        let provider = ModelProvider::HuggingFace;
-        let provider_impl = get_provider(provider);
-        assert_eq!(provider_impl.provider_name(), "Hugging Face");
-    }
     #[test]
     fn test_default_trait_implementations() {
         // Create a minimal provider that uses default implementations

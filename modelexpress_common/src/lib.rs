@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::error::Error as StdError;
 
 pub mod cache;
 pub mod client_config;
@@ -64,10 +65,33 @@ pub enum Error {
     Grpc(#[from] tonic::Status),
 
     #[error("Transport error: {0}")]
-    Transport(#[from] tonic::transport::Error),
+    Transport(String),
 
     #[error("Generic error: {0}")]
     Generic(String),
+}
+
+fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    let mut parts = Vec::new();
+    let mut current = Some(err);
+
+    while let Some(error) = current {
+        let part = error.to_string();
+        if !part.is_empty() && parts.last() != Some(&part) {
+            parts.push(part);
+        }
+        current = error.source();
+    }
+
+    if parts.len() > 1 && parts.first().is_some_and(|part| part == "transport error") {
+        parts.remove(0);
+    }
+
+    if parts.is_empty() {
+        "transport error".to_string()
+    } else {
+        parts.join(": ")
+    }
 }
 
 // Implement From traits for Box<Error> to work with the Result<T> type
@@ -77,9 +101,15 @@ impl From<tonic::Status> for Box<Error> {
     }
 }
 
+impl From<tonic::transport::Error> for Error {
+    fn from(err: tonic::transport::Error) -> Self {
+        Error::Transport(format_error_chain(&err))
+    }
+}
+
 impl From<tonic::transport::Error> for Box<Error> {
     fn from(err: tonic::transport::Error) -> Self {
-        Box::new(Error::Transport(err))
+        Box::new(Error::from(err))
     }
 }
 
@@ -204,6 +234,7 @@ impl From<grpc::model::ModelStatusUpdate> for models::ModelStatusResponse {
 mod tests {
     use super::*;
     use std::env;
+    use std::io;
 
     #[test]
     fn test_status_conversion_from_models_to_grpc() {
@@ -218,6 +249,29 @@ mod tests {
         assert_eq!(grpc_response.version, status.version);
         assert_eq!(grpc_response.status, status.status);
         assert_eq!(grpc_response.uptime, status.uptime);
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("outer error")]
+    struct OuterError(#[source] io::Error);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("transport error")]
+    struct TransportWrapper(#[source] io::Error);
+
+    #[test]
+    fn test_format_error_chain_includes_nested_causes() {
+        let err = OuterError(io::Error::other("connection reset by peer"));
+        assert_eq!(
+            format_error_chain(&err),
+            "outer error: connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn test_format_error_chain_skips_repeated_transport_prefix() {
+        let err = TransportWrapper(io::Error::other("underlying cause"));
+        assert_eq!(format_error_chain(&err), "underlying cause");
     }
 
     #[test]
@@ -240,7 +294,6 @@ mod tests {
         let model_provider = models::ModelProvider::HuggingFace;
         let grpc_provider: grpc::model::ModelProvider = model_provider.into();
         let back_to_model: models::ModelProvider = grpc_provider.into();
-
         assert_eq!(model_provider, back_to_model);
     }
 
