@@ -263,7 +263,9 @@ type ModelFilesRequest struct {
 	// The provider of the model
 	Provider ModelProvider `protobuf:"varint,2,opt,name=provider,proto3,enum=model_express.model.ModelProvider" json:"provider,omitempty"`
 	// Chunk size in bytes for streaming (0 = use server default)
-	ChunkSize     uint32 `protobuf:"varint,3,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
+	ChunkSize uint32 `protobuf:"varint,3,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
+	// Optional file selector. If unset, all files are streamed.
+	FileSelector  *ModelFileSelector `protobuf:"bytes,4,opt,name=file_selector,json=fileSelector,proto3" json:"file_selector,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -319,6 +321,59 @@ func (x *ModelFilesRequest) GetChunkSize() uint32 {
 	return 0
 }
 
+func (x *ModelFilesRequest) GetFileSelector() *ModelFileSelector {
+	if x != nil {
+		return x.FileSelector
+	}
+	return nil
+}
+
+// Selects files within a model directory
+type ModelFileSelector struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Exact paths relative to the model root.
+	Paths         []string `protobuf:"bytes,1,rep,name=paths,proto3" json:"paths,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ModelFileSelector) Reset() {
+	*x = ModelFileSelector{}
+	mi := &file_model_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelFileSelector) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelFileSelector) ProtoMessage() {}
+
+func (x *ModelFileSelector) ProtoReflect() protoreflect.Message {
+	mi := &file_model_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelFileSelector.ProtoReflect.Descriptor instead.
+func (*ModelFileSelector) Descriptor() ([]byte, []int) {
+	return file_model_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ModelFileSelector) GetPaths() []string {
+	if x != nil {
+		return x.Paths
+	}
+	return nil
+}
+
 // A chunk of file data for streaming transfers
 type FileChunk struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -342,7 +397,7 @@ type FileChunk struct {
 
 func (x *FileChunk) Reset() {
 	*x = FileChunk{}
-	mi := &file_model_proto_msgTypes[3]
+	mi := &file_model_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +409,7 @@ func (x *FileChunk) String() string {
 func (*FileChunk) ProtoMessage() {}
 
 func (x *FileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[3]
+	mi := &file_model_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +422,7 @@ func (x *FileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileChunk.ProtoReflect.Descriptor instead.
 func (*FileChunk) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{3}
+	return file_model_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *FileChunk) GetRelativePath() string {
@@ -434,7 +489,7 @@ type ModelFileList struct {
 
 func (x *ModelFileList) Reset() {
 	*x = ModelFileList{}
-	mi := &file_model_proto_msgTypes[4]
+	mi := &file_model_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -446,7 +501,7 @@ func (x *ModelFileList) String() string {
 func (*ModelFileList) ProtoMessage() {}
 
 func (x *ModelFileList) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[4]
+	mi := &file_model_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -459,7 +514,7 @@ func (x *ModelFileList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelFileList.ProtoReflect.Descriptor instead.
 func (*ModelFileList) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{4}
+	return file_model_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ModelFileList) GetModelName() string {
@@ -496,7 +551,7 @@ type ModelFileInfo struct {
 
 func (x *ModelFileInfo) Reset() {
 	*x = ModelFileInfo{}
-	mi := &file_model_proto_msgTypes[5]
+	mi := &file_model_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -508,7 +563,7 @@ func (x *ModelFileInfo) String() string {
 func (*ModelFileInfo) ProtoMessage() {}
 
 func (x *ModelFileInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[5]
+	mi := &file_model_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -521,7 +576,7 @@ func (x *ModelFileInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelFileInfo.ProtoReflect.Descriptor instead.
 func (*ModelFileInfo) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{5}
+	return file_model_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ModelFileInfo) GetRelativePath() string {
@@ -555,13 +610,16 @@ const file_model_proto_rawDesc = "" +
 	"\amessage\x18\x03 \x01(\tH\x00R\amessage\x88\x01\x01\x12>\n" +
 	"\bprovider\x18\x04 \x01(\x0e2\".model_express.model.ModelProviderR\bproviderB\n" +
 	"\n" +
-	"\b_message\"\x91\x01\n" +
+	"\b_message\"\xde\x01\n" +
 	"\x11ModelFilesRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12>\n" +
 	"\bprovider\x18\x02 \x01(\x0e2\".model_express.model.ModelProviderR\bprovider\x12\x1d\n" +
 	"\n" +
-	"chunk_size\x18\x03 \x01(\rR\tchunkSize\"\xf7\x01\n" +
+	"chunk_size\x18\x03 \x01(\rR\tchunkSize\x12K\n" +
+	"\rfile_selector\x18\x04 \x01(\v2&.model_express.model.ModelFileSelectorR\ffileSelector\")\n" +
+	"\x11ModelFileSelector\x12\x14\n" +
+	"\x05paths\x18\x01 \x03(\tR\x05paths\"\xf7\x01\n" +
 	"\tFileChunk\x12#\n" +
 	"\rrelative_path\x18\x01 \x01(\tR\frelativePath\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\x12\x16\n" +
@@ -610,34 +668,36 @@ func file_model_proto_rawDescGZIP() []byte {
 }
 
 var file_model_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_model_proto_goTypes = []any{
 	(ModelStatus)(0),             // 0: model_express.model.ModelStatus
 	(ModelProvider)(0),           // 1: model_express.model.ModelProvider
 	(*ModelDownloadRequest)(nil), // 2: model_express.model.ModelDownloadRequest
 	(*ModelStatusUpdate)(nil),    // 3: model_express.model.ModelStatusUpdate
 	(*ModelFilesRequest)(nil),    // 4: model_express.model.ModelFilesRequest
-	(*FileChunk)(nil),            // 5: model_express.model.FileChunk
-	(*ModelFileList)(nil),        // 6: model_express.model.ModelFileList
-	(*ModelFileInfo)(nil),        // 7: model_express.model.ModelFileInfo
+	(*ModelFileSelector)(nil),    // 5: model_express.model.ModelFileSelector
+	(*FileChunk)(nil),            // 6: model_express.model.FileChunk
+	(*ModelFileList)(nil),        // 7: model_express.model.ModelFileList
+	(*ModelFileInfo)(nil),        // 8: model_express.model.ModelFileInfo
 }
 var file_model_proto_depIdxs = []int32{
 	1, // 0: model_express.model.ModelDownloadRequest.provider:type_name -> model_express.model.ModelProvider
 	0, // 1: model_express.model.ModelStatusUpdate.status:type_name -> model_express.model.ModelStatus
 	1, // 2: model_express.model.ModelStatusUpdate.provider:type_name -> model_express.model.ModelProvider
 	1, // 3: model_express.model.ModelFilesRequest.provider:type_name -> model_express.model.ModelProvider
-	7, // 4: model_express.model.ModelFileList.files:type_name -> model_express.model.ModelFileInfo
-	2, // 5: model_express.model.ModelService.EnsureModelDownloaded:input_type -> model_express.model.ModelDownloadRequest
-	4, // 6: model_express.model.ModelService.StreamModelFiles:input_type -> model_express.model.ModelFilesRequest
-	4, // 7: model_express.model.ModelService.ListModelFiles:input_type -> model_express.model.ModelFilesRequest
-	3, // 8: model_express.model.ModelService.EnsureModelDownloaded:output_type -> model_express.model.ModelStatusUpdate
-	5, // 9: model_express.model.ModelService.StreamModelFiles:output_type -> model_express.model.FileChunk
-	6, // 10: model_express.model.ModelService.ListModelFiles:output_type -> model_express.model.ModelFileList
-	8, // [8:11] is the sub-list for method output_type
-	5, // [5:8] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	5, // 4: model_express.model.ModelFilesRequest.file_selector:type_name -> model_express.model.ModelFileSelector
+	8, // 5: model_express.model.ModelFileList.files:type_name -> model_express.model.ModelFileInfo
+	2, // 6: model_express.model.ModelService.EnsureModelDownloaded:input_type -> model_express.model.ModelDownloadRequest
+	4, // 7: model_express.model.ModelService.StreamModelFiles:input_type -> model_express.model.ModelFilesRequest
+	4, // 8: model_express.model.ModelService.ListModelFiles:input_type -> model_express.model.ModelFilesRequest
+	3, // 9: model_express.model.ModelService.EnsureModelDownloaded:output_type -> model_express.model.ModelStatusUpdate
+	6, // 10: model_express.model.ModelService.StreamModelFiles:output_type -> model_express.model.FileChunk
+	7, // 11: model_express.model.ModelService.ListModelFiles:output_type -> model_express.model.ModelFileList
+	9, // [9:12] is the sub-list for method output_type
+	6, // [6:9] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_model_proto_init() }
@@ -646,14 +706,14 @@ func file_model_proto_init() {
 		return
 	}
 	file_model_proto_msgTypes[1].OneofWrappers = []any{}
-	file_model_proto_msgTypes[3].OneofWrappers = []any{}
+	file_model_proto_msgTypes[4].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_model_proto_rawDesc), len(file_model_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   6,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
