@@ -75,7 +75,7 @@ Salient differences from PI's design:
 
 Same NIXL data plane as PI; different prime-rl-side abstractions on top of it.
 
-```
+```text
 ┌───────────────────────────────────────────────────────────────────┐
 │  prime-rl trainer process                                         │
 │  ┌─────────────────────────────────────────────────────────────┐  │

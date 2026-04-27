@@ -200,7 +200,7 @@ Parity with PI on the data path is the acceptance criterion for the MX overlay. 
 
 **Pipeline-replication catalog state** (scenario C, after init): MX Server's `list_sources` for the run identity returned 4 entries:
 
-```
+```text
 worker_rank=0  worker_id=primerl-overlay-scenario-c-trainer-0-997daac3       # SPG coordinator
 worker_rank=1  worker_id=primerl-overlay-scenario-c-trainer-1-354aaebe       # rank-1 self-publish
 worker_rank=0  worker_id=primerl-overlay-scenario-c-inference-0-8db04e3d     # standard rollout
@@ -248,32 +248,72 @@ weight_broadcast:
   pipeline_replication: true     # default false
 ```
 
-**DAG buildup over time** (12 rollouts, single trainer source for a given rank k):
+**DAG buildup over time** (12 rollouts, single trainer source for a given rank k). Each phase shows which workers act as sources and which are still polling. Edges represent "may be selected as a source by future pollers."
 
+```mermaid
+flowchart TB
+    subgraph t0["t = 0 — only the trainer is a source"]
+        T0[Trainer]
+        P0(["R0..R11<br/>(polling)"])
+        T0 --> P0
+    end
+
+    subgraph t1["t = t1 — R0 finished first, now also a source"]
+        T1[Trainer]
+        R0_1[R0]
+        P1(["R1..R11<br/>(polling)"])
+        T1 --> P1
+        T1 --> R0_1
+        R0_1 --> P1
+    end
+
+    subgraph t2["t = t2 — R1 and R2 finalize from {Trainer, R0}"]
+        T2[Trainer]
+        R0_2[R0]
+        R1_2[R1]
+        R2_2[R2]
+        P2(["R3..R11<br/>(polling)"])
+        T2 --> P2
+        R0_2 --> P2
+        R1_2 --> P2
+        R2_2 --> P2
+    end
+
+    subgraph t3["t = t3 — Trainer + R0..R6 serve R7..R11"]
+        T3[Trainer]
+        R06[R0..R6]
+        P3(["R7..R11<br/>(polling)"])
+        T3 --> P3
+        R06 --> P3
+    end
+
+    subgraph t4["t = t4 — all 12 rollouts hold version N"]
+        Done["{Trainer, R0..R11}"]
+    end
+
+    t0 --> t1 --> t2 --> t3 --> t4
+
+    style T0 fill:#533483,stroke:#e94560,color:#fff
+    style T1 fill:#533483,stroke:#e94560,color:#fff
+    style T2 fill:#533483,stroke:#e94560,color:#fff
+    style T3 fill:#533483,stroke:#e94560,color:#fff
+    style R0_1 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style R0_2 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style R1_2 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style R2_2 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style R06 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style Done fill:#1b5e20,stroke:#4caf50,color:#fff
 ```
-t=0       Trainer publishes version N.
-          Sources for version N: {Trainer}.
-          MX Server DAG:  Trainer ──→  (R0..R11 all polling)
 
-t=t0      Trainer → R0 RDMA completes first.
-          R0 calls publish_rollout_source(version=N).
-          Sources: {Trainer, R0}.
-          MX Server DAG:  Trainer  ──→  (R1..R11 polling)
-                            │
-                            └─ R0 ──→ (next pollers can choose R0 or Trainer)
+**Per-phase outbound bandwidth** (assuming each NIC = 1 unit of outbound):
 
-t=t1      R1 and R2 pull in parallel from {Trainer, R0} (server load-balances).
-          Both finalize; publish_rollout_source().
-          Sources: {Trainer, R0, R1, R2}.
-          Effective outbound: 4 NICs serving R3..R11.
-
-t=t2      R3..R6 finalize from {Trainer, R0, R1, R2}.
-          Sources: {Trainer, R0..R6}.
-          Effective outbound: 8 NICs serving R7..R11.
-
-t=t3      R7..R11 finalize.
-          All 12 rollouts hold version N.
-```
+| Phase | Sources serving pollers | Aggregate outbound | Pollers remaining |
+|---|---|---|---|
+| `t=0` | `{Trainer}` | 1× | 12 |
+| `t=t1` | `{Trainer, R0}` | 2× | 11 |
+| `t=t2` | `{Trainer, R0..R2}` | 4× | 9 |
+| `t=t3` | `{Trainer, R0..R6}` | 8× | 5 |
+| `t=t4` | (all done) | — | 0 |
 
 **Bandwidth math**: A naive star with T trainer NICs serving R rollouts caps aggregate throughput at T × per-NIC-BW, regardless of R. The DAG caps aggregate throughput at R × per-NIC-BW (every GPU's outbound contributes once it has received). For R=12 and T=8 on the PI prod shape, this is a 1.5× headroom; for R=64 on a future scale-out, it's 8× headroom.
 
@@ -287,7 +327,7 @@ Contrast with §3.10 peer-recovery preference, which prefers same-node > same-ra
 
 **Server-side state used** (shared with peer recovery in §3.10 — same index, two entry points):
 
-```
+```text
 sources_index : Map<(model, version, worker_rank), Set<SourceId>>
 source_health : Map<SourceId, LastHeartbeat>
 source_load   : Map<SourceId, InFlightTransfers>   // for load-balancing
@@ -397,21 +437,53 @@ PI's `TransportPlan` + `ShardedSlot` / `GatheredSlot` / `ExpertSlot` design mean
 
 **Contrast with the naive path** (what our pre-pivot MX POC on `kavink/mx-weight-broadcast` does, and what filesystem / NCCL-broadcast backends effectively do):
 
+```mermaid
+flowchart LR
+    subgraph naive["Before — naive / pre-pivot MX POC"]
+        direction LR
+        N0[Rank 0]
+        N1[Rank 1]
+        N2[Rank 2]
+        N3[Rank 3]
+        NG{{allgather}}
+        NF["Rank 0 holds<br/>full state_dict<br/>(4× memory spike)"]
+        NW(["1× NIXL WRITE"])
+        NINF[Inference]
+        N0 --> NG
+        N1 --> NG
+        N2 --> NG
+        N3 --> NG
+        NG --> NF --> NW --> NINF
+    end
+
+    subgraph overlay["After — overlay on top of PI"]
+        direction LR
+        O0[Rank 0] --> S0[ShardedSlot 0] --> A0(["NIXL agent 0"]) --> I0[Inference rank 0]
+        O1[Rank 1] --> S1[ShardedSlot 1] --> A1(["NIXL agent 1"]) --> I1[Inference rank 1]
+        O2[Rank 2] --> S2[ShardedSlot 2] --> A2(["NIXL agent 2"]) --> I2[Inference rank 2]
+        O3[Rank 3] --> S3[ShardedSlot 3] --> A3(["NIXL agent 3"]) --> I3[Inference rank 3]
+    end
+
+    style NF fill:#7a1818,stroke:#ff5252,color:#fff
+    style NG fill:#7a1818,stroke:#ff5252,color:#fff
+    style NW fill:#7a1818,stroke:#ff5252,color:#fff
+    style S0 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style S1 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style S2 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style S3 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style A0 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style A1 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style A2 fill:#1b5e20,stroke:#4caf50,color:#fff
+    style A3 fill:#1b5e20,stroke:#4caf50,color:#fff
 ```
-Before (naive / pre-pivot MX POC):
-  Rank 0 ──┐
-  Rank 1 ──┼── allgather ──► Rank 0 holds full state_dict ──► 1× NIXL WRITE ──► Inference
-  Rank 2 ──┤                 (3.55 GB on 1.5B, 15 GB on 7B,
-  Rank 3 ──┘                  65 GB on 32B — does not fit!)
 
-  Cost: 4x memory spike on rank 0, single NIC used, allgather
-  serializes all ranks, does not scale past ~30B.
+The remaining bookkeeping captured as plain text (the "After" overlay path):
 
-After (overlay on top of PI):
-  Rank 0 ── ShardedSlot 0 ── NIXL agent 0 ── RDMA WRITE ──► Inference rank 0
-  Rank 1 ── ShardedSlot 1 ── NIXL agent 1 ── RDMA WRITE ──► Inference rank 1
-  Rank 2 ── ShardedSlot 2 ── NIXL agent 2 ── RDMA WRITE ──► Inference rank 2
-  Rank 3 ── ShardedSlot 3 ── NIXL agent 3 ── RDMA WRITE ──► Inference rank 3
+```text
+Rank 0 ── ShardedSlot 0 ── NIXL agent 0 ── RDMA WRITE ──► Inference rank 0
+Rank 1 ── ShardedSlot 1 ── NIXL agent 1 ── RDMA WRITE ──► Inference rank 1
+Rank 2 ── ShardedSlot 2 ── NIXL agent 2 ── RDMA WRITE ──► Inference rank 2
+Rank 3 ── ShardedSlot 3 ── NIXL agent 3 ── RDMA WRITE ──► Inference rank 3
 
   Cost: zero memory spike, 4 NICs in parallel, each rank's transfer
   is independent, scales linearly with rank count.
@@ -431,7 +503,7 @@ After (overlay on top of PI):
 
 - Memory: 0 GB spike on any single rank regardless of model size.
 - NIC utilization: 4 outbound streams in parallel on trainer, 4 inbound on rollout. Total bandwidth = sum of per-rank NICs, not capped at one NIC.
-- Correctness: per-rank byte-exact byte-exact transfer (PI iter16 `nixl_diff.py` confirmed across all slot types).
+- Correctness: per-rank byte-exact transfer (PI iter16 `nixl_diff.py` confirmed across all slot types).
 
 **Retiring Step 8**: `PRIMERL_POC_Next_Steps.md` Step 8 ("Eliminate rank-0 allgather — per-rank shard publishing") was one of our original P0 roadmap items. It is now absorbed by the pivot: adopting PI's `Slot` + `TransportPlan` gives us this behavior at Phase 1, with no additional MX-side code to write for the *publishing* topology itself. What remains on our side is (a) the MX rendezvous that routes rank-k → rank-k discovery through the server instead of SPG, and (b) the server-side expert-aware index in §3.7.
 
@@ -441,7 +513,7 @@ A rollout pod crashes and restarts. Without recovery support it must re-pull its
 
 **Server-side state** (a small extension of what pipeline replication already requires):
 
-```
+```text
 sources_index : Map<(model, version, worker_rank), Set<SourceId>>
 source_health : Map<SourceId, LastHeartbeat>   // TTL-driven liveness, e.g. 10 s
 ```
@@ -543,7 +615,7 @@ Selection confirmed at first-boot feasibility test in W1 (see `PRIMERL_MX_OVERLA
 
 ### 4.3 Deployment shape
 
-```
+```text
 Node 1  (customer-gpu-w0e, IP 10.0.0.83)
 ├─ StatefulSet: prime-rl-mx-trainer-0
 │   ├─ 4× FSDP2 trainer ranks
