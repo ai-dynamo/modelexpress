@@ -309,14 +309,14 @@ verl has two deployment modes for the rollout:
 
 | Mode | Ray actors | Status for MX |
 |------|-----------|--------------|
-| **Hybrid (colocated)** | `WorkerDict` does both training and rollout | ❌ No `execute_checkpoint_engine` method — `CheckpointEngineManager` fails |
-| **Standalone (disaggregated)** | Trainer uses `WorkerDict`, rollout uses `CheckpointEngineWorker` | ✅ Full CE lifecycle available |
+| **Hybrid (colocated)** | `WorkerDict` does both training and rollout | **Not supported** — `WorkerDict` lacks an `execute_checkpoint_engine` method, so `CheckpointEngineManager` fails. |
+| **Standalone (disaggregated)** | Trainer uses `WorkerDict`, rollout uses `CheckpointEngineWorker` | **Supported** — full CE lifecycle available. |
 
 This is a verl framework constraint, not an MX constraint — the built-in `nixl` and `nccl` engines have the same requirement. Our prototype runs in standalone mode on 2 nodes.
 
 ### How a weight sync crosses the actor boundary
 
-```
+```text
 TaskRunner (Node 1)
   └─► CheckpointEngineManager.update_weights(step=N)        # driver-side
         ├─► ray.get([wd0.execute_checkpoint_engine("prepare"),   # fan-out to trainer
@@ -453,7 +453,7 @@ verl streams `(name, tensor)` pairs through the `CheckpointEngine` API. `MxCheck
 
 ### Deployment
 
-```
+```text
 Node 1  (gke-...-w0e-...-tz1d, IP 10.0.0.83)
 ├─ Ray head StatefulSet (verl-mx-head-0)
 │   ├─ TaskRunner / CheckpointEngineManager

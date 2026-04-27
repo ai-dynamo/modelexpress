@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
 
@@ -34,6 +34,19 @@ from .types import TensorDescriptor
 from . import p2p_pb2
 
 logger = logging.getLogger("modelexpress.refit_receiver")
+
+
+# Maps the dtype string the publisher writes into TensorDescriptor.dtype to a
+# torch.dtype. Module-scope so all receiver paths share one definition (and so
+# we don't rebuild it on every receive_weights_scratch call).
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "torch.bfloat16": torch.bfloat16,
+    "torch.float16": torch.float16,
+    "torch.float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
 
 
 @dataclass
@@ -134,6 +147,16 @@ class MxRefitReceiver:
 
         Returns:
             A :class:`SourceRef` if a matching source was found, else *None*.
+
+        Note:
+            ``training_step`` is published in ``SourceIdentity.extra_parameters``
+            but ``ListSourcesResponse.instances`` only carries
+            ``SourceInstanceRef`` (no ``extra_parameters``). To honor the
+            ``min_step`` contract, this method does a per-candidate
+            ``get_metadata`` lookup so it can read ``training_step`` from the
+            publisher's full ``SourceIdentity``. A future server-side fix
+            (adding ``training_step`` to ``SourceInstanceRef``) will let us
+            drop the extra round-trip.
         """
         if not self._initialized:
             raise RuntimeError("Call initialize() before poll_for_source()")
@@ -148,7 +171,7 @@ class MxRefitReceiver:
                 response = self._client.list_sources(
                     status_filter=status_filter,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — log + retry on transient gRPC error
                 logger.warning(f"list_sources failed: {e}")
                 if time.perf_counter() >= deadline:
                     return None
@@ -159,17 +182,53 @@ class MxRefitReceiver:
                 if instance.model_name != model_name:
                     continue
 
+                # Resolve training_step from the publisher's SourceIdentity so
+                # min_step can be enforced. Skip candidates whose metadata is
+                # unreachable or whose step is below the threshold.
+                step = self._resolve_training_step(instance)
+                if step is None or step < min_step:
+                    continue
+
                 return SourceRef(
                     mx_source_id=instance.mx_source_id,
                     worker_id=instance.worker_id,
                     model_name=instance.model_name,
                     worker_rank=instance.worker_rank,
-                    training_step=0,
+                    training_step=step,
                 )
 
             if time.perf_counter() >= deadline:
                 return None
             time.sleep(0.5)
+
+    def _resolve_training_step(self, instance: Any) -> int | None:
+        """Fetch the publisher's ``training_step`` from MX Server metadata.
+
+        ``SourceInstanceRef`` (returned by ``list_sources``) doesn't expose
+        ``extra_parameters``, so we do a follow-up ``get_metadata`` to read
+        ``training_step`` from ``SourceIdentity.extra_parameters``. Returns
+        ``None`` if the metadata isn't available or the step can't be
+        parsed — caller should treat this as "skip candidate".
+        """
+        try:
+            meta = self._client.get_metadata(instance.mx_source_id, instance.worker_id)
+        except Exception as e:  # noqa: BLE001 — gRPC failures are per-candidate, not fatal
+            logger.debug(f"get_metadata failed for {instance.worker_id}: {e}")
+            return None
+        if not getattr(meta, "found", False):
+            return None
+        identity = getattr(meta, "identity", None)
+        if identity is None:
+            return None
+        extra = getattr(identity, "extra_parameters", None) or {}
+        raw = extra.get("training_step") if hasattr(extra, "get") else None
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.debug(f"training_step={raw!r} not parseable as int; skipping")
+            return None
 
     def receive_weights(
         self,
@@ -279,15 +338,6 @@ class MxRefitReceiver:
             )
             for t in worker.tensors
         ]
-
-        _DTYPE_MAP = {
-            "torch.bfloat16": torch.bfloat16,
-            "torch.float16": torch.float16,
-            "torch.float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }
 
         scratch_tensors: dict[str, torch.Tensor] = {}
         scratch_shapes: dict[str, tuple[int, ...]] = {}

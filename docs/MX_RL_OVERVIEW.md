@@ -24,27 +24,23 @@ ModelExpress eliminates the serialization-to-disk bottleneck while preserving as
 
 ### Architecture
 
-```
-Trainer GPU                    MX Server (gRPC + Redis)              Inference GPU
-     │                               │                                    │
-     │  1. optimizer.step()           │                                    │
-     │     (weights updated in VRAM)  │                                    │
-     │                                │                                    │
-     │  2. publish_weights()          │                                    │
-     │──── tensor addrs + NIXL ──────►│                                    │
-     │     metadata via gRPC          │                                    │
-     │                                │  3. poll_for_source()              │
-     │                                │◄──── "any new weights?" ───────────│
-     │                                │                                    │
-     │                                │  4. get_metadata()                 │
-     │                                │──── addrs + NIXL conn info ───────►│
-     │                                │                                    │
-     │  5. NIXL RDMA READ             │                                    │
-     │◄══════════════ GPU-to-GPU data transfer ═══════════════════════════►│
-     │     (inference GPU reads from trainer GPU, CPU not involved)        │
-     │                                │                                    │
-     │                                │  6. model.load_weights()           │
-     │                                │     (inference applies weights)    │
+```mermaid
+sequenceDiagram
+    participant T as Trainer GPU
+    participant M as MX Server<br/>(gRPC + Redis)
+    participant I as Inference GPU
+
+    Note over T: 1. optimizer.step()<br/>weights updated in VRAM
+
+    T->>M: 2. publish_weights()<br/>tensor addrs + NIXL metadata via gRPC
+
+    I->>M: 3. poll_for_source()<br/>"any new weights?"
+    M-->>I: 4. get_metadata()<br/>addrs + NIXL connection info
+
+    Note over T,I: 5. NIXL RDMA READ — GPU-to-GPU data transfer<br/>(inference reads from trainer's VRAM, CPU not involved)
+    T-->>I: weight bytes (RDMA)
+
+    Note over I: 6. model.load_weights()<br/>inference applies weights
 ```
 
 **MX Server** stores only metadata — tensor names, GPU memory addresses, NIXL agent connection info, version tracking. It never touches weight data. The bulk transfer is a one-sided RDMA read between GPUs.
@@ -362,7 +358,7 @@ This is prioritized as P1 in our roadmap.
 
 ### ModelExpress client (`kavink/RL` branch)
 
-```
+```text
 modelexpress_client/python/modelexpress/
 ├── training_publisher.py    # MxTrainingPublisher — trainer-side publish
 ├── refit_receiver.py        # MxRefitReceiver — inference-side RDMA receive
@@ -373,7 +369,7 @@ modelexpress_client/python/modelexpress/
 
 ### PRIME-RL integration (`kavink/mx-weight-broadcast` branch)
 
-```
+```text
 src/prime_rl/
 ├── trainer/rl/broadcast/modelexpress.py    # ModelExpressWeightBroadcast
 ├── inference/vllm/worker/modelexpress.py   # MxWeightUpdateWorker
@@ -385,7 +381,7 @@ src/prime_rl/
 
 ### verl integration (`kavink/mx-checkpoint-engine` branch)
 
-```
+```text
 verl/
 ├── checkpoint_engine/mx_checkpoint_engine.py   # MxCheckpointEngine
 ├── checkpoint_engine/__init__.py               # Optional import (+7 lines)

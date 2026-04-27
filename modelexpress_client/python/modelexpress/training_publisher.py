@@ -67,8 +67,15 @@ class MxTrainingPublisher:
         self._worker_id: str = str(uuid.uuid4())
         self._mx_source_id: str | None = None
         self._model_name: str = ""
+        self._training_framework: str = "unknown"
         self._initialized = False
         self._registered = False
+        # Tracks which publish path has been used. publish_weights and
+        # publish_layer are mutually exclusive within a publisher's lifetime
+        # because they hold different sets of tensors registered with NIXL —
+        # mixing them silently invalidates the cached registration. None
+        # until first publish; "weights" or "layer" thereafter.
+        self._publish_mode: str | None = None
 
     @property
     def mx_source_id(self) -> str | None:
@@ -85,11 +92,20 @@ class MxTrainingPublisher:
         pipeline_parallel_size: int = 1,
         expert_parallel_size: int = 1,
         dtype: str = "bfloat16",
+        training_framework: str = "unknown",
     ) -> None:
         """Initialize NIXL agent and MX client.
 
         Must be called before any publish operations. Sets up the source
         identity that inference workers will use to filter compatible sources.
+
+        Args:
+            training_framework: Identifier for the framework driving this
+                publisher (``"prime_rl"``, ``"verl"``, ``"nemo_rl"``, ...).
+                Surfaced in ``SourceIdentity.extra_parameters`` so consumers
+                can disambiguate sources from different frameworks publishing
+                to the same MX Server. Default ``"unknown"`` is intentional —
+                callers should pass an explicit value.
         """
         if not is_nixl_available():
             raise RuntimeError(
@@ -97,6 +113,7 @@ class MxTrainingPublisher:
             )
 
         self._model_name = model_name
+        self._training_framework = training_framework
         self._identity_kwargs = dict(
             model_name=model_name,
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
@@ -118,7 +135,8 @@ class MxTrainingPublisher:
         self._initialized = True
         logger.info(
             f"MxTrainingPublisher initialized: agent={self._agent_name}, "
-            f"device={self._device_id}, model={model_name}"
+            f"device={self._device_id}, model={model_name}, "
+            f"framework={training_framework}"
         )
 
     def _build_identity(self, step: int) -> p2p_pb2.SourceIdentity:
@@ -126,7 +144,7 @@ class MxTrainingPublisher:
         return p2p_pb2.SourceIdentity(
             extra_parameters={
                 "training_step": str(step),
-                "training_framework": "prime_rl",
+                "training_framework": self._training_framework,
             },
             **self._identity_kwargs,
         )
@@ -170,6 +188,16 @@ class MxTrainingPublisher:
         """
         if not self._initialized:
             raise RuntimeError("Call initialize() before publish_weights()")
+        if self._publish_mode == "layer":
+            raise RuntimeError(
+                "publish_weights() and publish_layer() are mutually exclusive: "
+                "this publisher has already been used in 'layer' mode "
+                "(publish_layer was called previously). Mixing the two paths "
+                "leaves NIXL holding only the most recently registered tensor "
+                "set, which silently invalidates earlier publishes. Use one "
+                "mode per publisher lifetime."
+            )
+        self._publish_mode = "weights"
 
         if not self._registered:
             self._nixl.register_tensors(named_tensors)
@@ -228,6 +256,14 @@ class MxTrainingPublisher:
         """
         if not self._initialized:
             raise RuntimeError("Call initialize() before publish_layer()")
+        if self._publish_mode == "weights":
+            raise RuntimeError(
+                "publish_layer() and publish_weights() are mutually exclusive: "
+                "this publisher has already been used in 'weights' mode "
+                "(publish_weights was called previously). See publish_weights "
+                "for the full explanation."
+            )
+        self._publish_mode = "layer"
 
         self._nixl.register_tensors(layer_state_dict)
         metadata = self._nixl.nixl_metadata

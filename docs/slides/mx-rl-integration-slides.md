@@ -26,7 +26,7 @@ On-policy RL (GRPO, PPO, DAPO) alternates between rollout generation on inferenc
 
 ### Wall-clock time breakdown (illustrative)
 
-```
+```text
 |  Rollout (40%)  | Rew | Train (20%) | ██ REFIT (30%) ██ |
                                         ▲ BOTTLENECK ▲
 ```
@@ -50,7 +50,7 @@ Extend MX from inference-to-inference P2P to the training→inference boundary. 
 
 ### High-level data flow
 
-```
+```text
 Training Workers          MX Server              Inference Workers
 (FSDP2 / Megatron)       (gRPC + Redis/CRD)     (vLLM / SGLang)
                                                  
