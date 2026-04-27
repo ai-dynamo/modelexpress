@@ -4,7 +4,7 @@
 #![allow(clippy::expect_used)]
 
 use modelexpress_client::{Client, ClientConfig};
-use modelexpress_common::{constants, models::ModelProvider};
+use modelexpress_common::{constants, download, models::ModelProvider};
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -13,6 +13,24 @@ use tracing::{info, warn};
 /// Mutex to serialize access to HF_HUB_OFFLINE environment variable across tests.
 /// This prevents race conditions when tests run in parallel.
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+async fn download_model_directly(
+    model_name: &str,
+    provider: ModelProvider,
+    ignore_weights: bool,
+) -> Result<(), modelexpress_common::Error> {
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    download::download_model(
+        model_name,
+        provider,
+        Some(cache_dir.path().to_path_buf()),
+        ignore_weights,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| modelexpress_common::Error::Server(format!("Direct download failed: {e}")))
+}
 
 #[tokio::test]
 #[ignore = "Ignore by default since it requires a running server"]
@@ -79,7 +97,7 @@ async fn test_integration_model_download_fallback() {
 #[tokio::test]
 async fn test_integration_direct_download_invalid_model() {
     // Test direct download with an invalid model name
-    let result = Client::download_model_directly(
+    let result = download_model_directly(
         "definitely-not-a-real-model-name-12345",
         ModelProvider::HuggingFace,
         false,
@@ -98,12 +116,8 @@ async fn test_integration_small_model_download() {
     // Test with a very small, real model (only run this in CI or when explicitly requested)
     // Note: This test requires internet access and may take some time
 
-    let result = Client::download_model_directly(
-        "prajjwal1/bert-tiny", // A very small BERT model for testing
-        ModelProvider::HuggingFace,
-        false,
-    )
-    .await;
+    let result =
+        download_model_directly("prajjwal1/bert-tiny", ModelProvider::HuggingFace, false).await;
 
     match result {
         Ok(()) => info!("Small model download successful"),
@@ -149,7 +163,7 @@ async fn test_integration_offline_mode_without_cache() {
         std::env::set_var("HF_HUB_OFFLINE", "1");
     }
 
-    let result = Client::download_model_directly(
+    let result = download_model_directly(
         "nonexistent-model-for-offline-test",
         ModelProvider::HuggingFace,
         false,
