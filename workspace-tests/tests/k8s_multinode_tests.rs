@@ -19,13 +19,16 @@ use anyhow::{Context, Result, bail};
 use k8s_openapi::api::{
     apps::v1::Deployment,
     batch::v1::Job,
-    core::v1::{Namespace, Node, Pod, Service},
+    core::v1::{Namespace, Node, Pod, Service, ServiceAccount},
+    rbac::v1::{Role, RoleBinding},
 };
 use kube::{
     Client,
     api::{Api, AttachParams, DeleteParams, ListParams, PostParams},
     config::{KubeConfigOptions, Kubeconfig},
 };
+
+const MX_RBAC_SA: &str = "modelexpress";
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -147,6 +150,55 @@ impl Drop for NamespaceGuard {
     }
 }
 
+/// Create ServiceAccount + Role + RoleBinding granting the test server pod access to
+/// the ModelExpress CRDs (P2P `ModelMetadata` + registry `ModelCacheEntry`) plus the
+/// ConfigMaps used for tensor descriptors, all scoped to `namespace`. Required when
+/// `MX_METADATA_BACKEND=kubernetes`; otherwise the server fails at startup with 403.
+async fn create_kubernetes_backend_rbac(client: &Client, namespace: &str) -> Result<()> {
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    let role_api: Api<Role> = Api::namespaced(client.clone(), namespace);
+    let rb_api: Api<RoleBinding> = Api::namespaced(client.clone(), namespace);
+
+    let sa: ServiceAccount = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": { "name": MX_RBAC_SA },
+    }))?;
+    sa_api.create(&PostParams::default(), &sa).await?;
+
+    let role: Role = serde_json::from_value(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": { "name": MX_RBAC_SA },
+        "rules": [
+            {
+                "apiGroups": ["modelexpress.nvidia.com"],
+                "resources": [
+                    "modelmetadatas", "modelmetadatas/status",
+                    "modelcacheentries", "modelcacheentries/status",
+                ],
+                "verbs": ["get", "list", "create", "update", "patch", "delete"],
+            },
+            {
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "verbs": ["get", "list", "create", "update", "patch", "delete"],
+            },
+        ],
+    }))?;
+    role_api.create(&PostParams::default(), &role).await?;
+
+    let rb: RoleBinding = serde_json::from_value(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": { "name": MX_RBAC_SA },
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": MX_RBAC_SA },
+        "subjects": [{ "kind": "ServiceAccount", "name": MX_RBAC_SA, "namespace": namespace }],
+    }))?;
+    rb_api.create(&PostParams::default(), &rb).await?;
+    Ok(())
+}
+
 /// Deploy a ModelExpress server on a specific node. Returns the service name.
 async fn deploy_server(
     client: &Client,
@@ -169,6 +221,7 @@ async fn deploy_server(
                 "metadata": { "labels": { "app": release } },
                 "spec": {
                     "nodeName": node,
+                    "serviceAccountName": MX_RBAC_SA,
                     "containers": [{
                         "name": "server",
                         "image": IMAGE,
@@ -178,9 +231,11 @@ async fn deploy_server(
                         "env": [
                             { "name": "MODEL_EXPRESS_SERVER_PORT", "value": "8001" },
                             { "name": "MODEL_EXPRESS_LOG_LEVEL", "value": "debug" },
-                            { "name": "MODEL_EXPRESS_DATABASE_PATH", "value": "/tmp/models.db" },
                             { "name": "MODEL_EXPRESS_CACHE_DIRECTORY", "value": "/root" },
                             { "name": "MX_METADATA_BACKEND", "value": "kubernetes" },
+                            // MX_METADATA_BACKEND drives both P2P and registry; the
+                            // registry uses the Kubernetes ModelCacheEntry CRD here.
+                            // Requires ModelMetadata + ModelCacheEntry CRDs + RBAC.
                             { "name": "HOME", "value": "/root" },
                         ],
                         "readinessProbe": {
@@ -530,6 +585,7 @@ async fn cross_node_transfer_default_chunks() -> Result<()> {
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-default";
     let _guard = create_namespace(&client, ns).await?;
+    create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
     submit_client_job(&client, ns, "dl-default", &client_node, &svc, "").await?;
@@ -553,6 +609,7 @@ async fn cross_node_transfer_small_chunks() -> Result<()> {
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-small";
     let _guard = create_namespace(&client, ns).await?;
+    create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
     submit_client_job(
@@ -584,6 +641,7 @@ async fn cross_node_transfer_large_chunks() -> Result<()> {
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-large";
     let _guard = create_namespace(&client, ns).await?;
+    create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
     submit_client_job(
@@ -617,6 +675,7 @@ async fn cross_node_transfer_integrity() -> Result<()> {
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-integrity";
     let _guard = create_namespace(&client, ns).await?;
+    create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
 
@@ -653,6 +712,7 @@ async fn multi_replica_independent_caches() -> Result<()> {
     let (node_a, node_b) = select_nodes(&client).await?;
     let ns = "mx-test-replica";
     let _guard = create_namespace(&client, ns).await?;
+    create_kubernetes_backend_rbac(&client, ns).await?;
 
     // Deploy two servers on different nodes
     let svc_a = deploy_server(&client, ns, "mx-a", &node_a).await?;

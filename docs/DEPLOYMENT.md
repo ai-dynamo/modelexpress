@@ -29,9 +29,6 @@ server:
   host: "0.0.0.0"
   port: 8001
 
-database:
-  path: "./models.db"
-
 cache:
   directory: "./cache"
   max_size_bytes: null
@@ -53,18 +50,34 @@ logging:
 
 ### Starting the Server
 
+The server requires `MX_METADATA_BACKEND` (`redis` or `kubernetes`) plus the connection
+env vars for the chosen backend — the server refuses to start without them. See
+[Distributed backend selection](#distributed-backend-selection) below for the full env
+contract.
+
 ```bash
-# With defaults
+# Redis backend
+export MX_METADATA_BACKEND=redis
+export REDIS_URL=redis://localhost:6379
 cargo run --bin modelexpress-server
 
-# With a configuration file
-cargo run --bin modelexpress-server -- --config model-express.yaml
+# Kubernetes backend (typically only useful in-cluster)
+export MX_METADATA_BACKEND=kubernetes
+export POD_NAMESPACE=default   # or MX_METADATA_NAMESPACE
+cargo run --bin modelexpress-server
+
+# With a configuration file (backend env vars still required)
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
+  cargo run --bin modelexpress-server -- --config model-express.yaml
 
 # With CLI overrides
-cargo run --bin modelexpress-server -- --port 8080 --log-level debug
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
+  cargo run --bin modelexpress-server -- --port 8080 --log-level debug
 
-# Validate config without starting
-cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
+# Validate config without starting (backend env vars still required — the validator
+# parses the full startup path including MX_METADATA_BACKEND)
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
+  cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config
 ```
 
 ### Configuration Options
@@ -76,13 +89,31 @@ cargo run --bin modelexpress-server -- --config model-express.yaml --validate-co
 | host | `--host` | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Bind address |
 | port | `--port`, `-p` | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 
-#### Database Settings
+#### Distributed backend selection
 
-| Option | CLI Flag | Env Var | Default | Description |
-|--------|----------|---------|---------|-------------|
-| path | `--database-path`, `-d` | `MODEL_EXPRESS_DATABASE_PATH` | `./models.db` | SQLite file path |
+Model lifecycle state (download status, LRU timestamps) and P2P worker metadata are both
+persisted to a distributed backend. The server fails fast at startup if no backend is
+reachable.
 
-In multi-node Kubernetes deployments, the database should be on a shared persistent volume.
+| Env var | Values | Required | Notes |
+|---------|--------|----------|-------|
+| `MX_METADATA_BACKEND` | `redis` \| `kubernetes` | yes | Selects the backend for both the P2P metadata store and the model registry |
+| `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
+| `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
+
+To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time (installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD), then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+
+#### Storage access modes
+
+MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:
+
+| Mode | Cache volume | Notes |
+|------|-------------|-------|
+| Single-replica MX, all pods on one node, RWO cache | RWO | Simplest option |
+| Multi-container sharing the cache (e.g. vLLM worker on a different node) | RWX | Operator choice; MX doesn't force it |
+| Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
+| S3 ModelStreamer on clients | none | Clients bypass MX cache entirely |
+| P2P RDMA receivers | none on receiver (sender still needs disk) | Weights land in GPU HBM |
 
 #### Cache Settings
 
@@ -111,11 +142,12 @@ Eviction policy settings (in config file only):
 ```bash
 export MODEL_EXPRESS_SERVER_HOST="127.0.0.1"
 export MODEL_EXPRESS_SERVER_PORT=8080
-export MODEL_EXPRESS_DATABASE_PATH="/data/models.db"
 export MODEL_EXPRESS_CACHE_DIRECTORY="/data/cache"
 export MODEL_EXPRESS_CACHE_EVICTION_ENABLED=true
 export MODEL_EXPRESS_LOG_LEVEL=debug
 export MODEL_EXPRESS_LOG_FORMAT=json
+export MX_METADATA_BACKEND=redis
+export REDIS_URL=redis://redis:6379
 ```
 
 ## Client Configuration
@@ -345,8 +377,8 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-single
 #### Kubernetes CRD Backend
 
 ```bash
-# Install CRD and RBAC
-kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
+# Install CRDs and RBAC
+kubectl apply -f examples/crds.yaml
 kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml
 
 # Deploy server with CRD backend
@@ -376,8 +408,9 @@ kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli HGET
 # Flush Redis (clear stale metadata - do this on redeploy)
 kubectl -n $NAMESPACE exec deploy/modelexpress-server -c redis -- redis-cli FLUSHALL
 
-# Check Kubernetes CRD state
+# Check Kubernetes CRD state (P2P worker metadata + model registry)
 kubectl -n $NAMESPACE get modelmetadatas
+kubectl -n $NAMESPACE get modelcacheentries   # model registry (lifecycle state, LRU)
 
 # Test inference
 kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/completions \

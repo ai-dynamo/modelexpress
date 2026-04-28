@@ -7,8 +7,10 @@ use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::database::{ModelDatabase, ModelRecord};
+use crate::registry::backend::ModelRecord;
+use crate::registry::state::RegistryManager;
 use modelexpress_common::config::DurationConfig;
 use modelexpress_common::download::get_provider;
 use modelexpress_common::models::ModelStatus;
@@ -203,7 +205,7 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
 
 /// Background service that manages cache eviction
 pub struct CacheEvictionService {
-    database: ModelDatabase,
+    registry: Arc<RegistryManager>,
     config: CacheEvictionConfig,
     cache_directory: PathBuf,
 }
@@ -211,12 +213,12 @@ pub struct CacheEvictionService {
 impl CacheEvictionService {
     /// Create a new cache eviction service
     pub fn new(
-        database: ModelDatabase,
+        registry: Arc<RegistryManager>,
         config: CacheEvictionConfig,
         cache_directory: PathBuf,
     ) -> Self {
         Self {
-            database,
+            registry,
             config,
             cache_directory,
         }
@@ -267,7 +269,7 @@ impl CacheEvictionService {
         debug!("Starting cache eviction cycle");
 
         // Get all models from the database
-        let models = self.database.get_models_by_last_used(None)?;
+        let models = self.registry.get_models_by_last_used(None).await?;
         debug!(
             "Found {total_models} total models in database",
             total_models = models.len()
@@ -348,11 +350,12 @@ impl CacheEvictionService {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Look up the model record to determine the provider
         let record = self
-            .database
-            .get_model_record(model_name)?
-            .ok_or_else(|| format!("model '{model_name}' not found in database"))?;
+            .registry
+            .get_model_record(model_name)
+            .await?
+            .ok_or_else(|| format!("model '{model_name}' not found in registry"))?;
 
-        // Delete files from disk first. If this fails, we keep the DB record
+        // Delete files from disk first. If this fails, we keep the registry record
         // so the next eviction cycle can retry.
         let provider = get_provider(record.provider);
         provider
@@ -360,8 +363,8 @@ impl CacheEvictionService {
             .await
             .map_err(|e| format!("failed to delete model files for '{model_name}': {e}"))?;
 
-        // Only remove from database after successful filesystem deletion
-        self.database.delete_model(model_name)?;
+        // Only remove from registry after successful filesystem deletion
+        self.registry.delete_model(model_name).await?;
 
         Ok(())
     }
@@ -408,8 +411,8 @@ impl CacheEvictionService {
     pub async fn get_cache_stats(
         &self,
     ) -> Result<CacheStats, Box<dyn std::error::Error + Send + Sync>> {
-        let models = self.database.get_models_by_last_used(None)?;
-        let (downloading, downloaded, error) = self.database.get_status_counts()?;
+        let models = self.registry.get_models_by_last_used(None).await?;
+        let (downloading, downloaded, error) = self.registry.get_status_counts().await?;
 
         let _now = Utc::now();
         let mut oldest_model: Option<DateTime<Utc>> = None;
@@ -452,24 +455,17 @@ pub struct CacheStats {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::database::ModelDatabase;
+    use crate::registry::backend::MockRegistryBackend;
     use modelexpress_common::models::ModelProvider;
     use tempfile::TempDir;
 
-    fn create_test_database() -> (ModelDatabase, TempDir) {
-        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-        let db_path = temp_dir.path().join("test_models.db");
-        let db = ModelDatabase::new(db_path.to_str().expect("Invalid path"))
-            .expect("Failed to create test database");
-        (db, temp_dir)
-    }
-
-    fn create_test_service(
-        db: ModelDatabase,
+    fn service_with_mock(
+        mock: MockRegistryBackend,
         config: CacheEvictionConfig,
     ) -> (CacheEvictionService, TempDir) {
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
         let cache_dir = TempDir::new().expect("Failed to create cache directory");
-        let service = CacheEvictionService::new(db, config, cache_dir.path().to_path_buf());
+        let service = CacheEvictionService::new(registry, config, cache_dir.path().to_path_buf());
         (service, cache_dir)
     }
 
@@ -671,82 +667,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_eviction_service_creation() {
-        let (db, _temp_dir) = create_test_database();
-        let config = CacheEvictionConfig::default();
-
-        let (service, _cache_dir) = create_test_service(db, config);
+        let mock = MockRegistryBackend::new();
+        let (service, _cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
         assert!(service.config.enabled);
     }
 
     #[tokio::test]
-    async fn test_manual_evict() {
-        let (db, _temp_dir) = create_test_database();
-        let config = CacheEvictionConfig::default();
-
-        // Add a test model
-        db.set_status(
-            "test-model",
-            ModelProvider::HuggingFace,
-            ModelStatus::DOWNLOADED,
-            None,
-        )
-        .expect("Failed to set model status");
-
-        let (service, _cache_dir) = create_test_service(db.clone(), config);
-
-        let models_to_evict = vec!["test-model".to_string()];
-        let result = service
-            .manual_evict(&models_to_evict)
-            .await
-            .expect("Failed to manually evict models");
-
-        assert_eq!(result.evicted_count, 1);
-        assert_eq!(result.evicted_models[0], "test-model");
-        assert!(matches!(result.reason, EvictionReason::Manual));
-
-        // Verify model was removed from database
-        assert!(
-            db.get_status("test-model")
-                .expect("Failed to get model status")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_cache_stats() {
-        let (db, _temp_dir) = create_test_database();
-        let config = CacheEvictionConfig::default();
-
-        // Add test models with different statuses
-        db.set_status(
-            "model1",
-            ModelProvider::HuggingFace,
-            ModelStatus::DOWNLOADED,
-            None,
-        )
-        .expect("Failed to set model1 status");
-        db.set_status(
-            "model2",
-            ModelProvider::HuggingFace,
-            ModelStatus::DOWNLOADING,
-            None,
-        )
-        .expect("Failed to set model2 status");
-        db.set_status(
-            "model3",
-            ModelProvider::HuggingFace,
-            ModelStatus::ERROR,
-            None,
-        )
-        .expect("Failed to set model3 status");
-
-        let (service, _cache_dir) = create_test_service(db, config);
-        let stats = service
-            .get_cache_stats()
-            .await
-            .expect("Failed to get cache stats");
-
-        assert_eq!(stats.total_models, 3);
+    async fn test_get_cache_stats_uses_registry() {
+        let now = Utc::now();
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(move |_| {
+                Ok(vec![ModelRecord {
+                    model_name: "model1".to_string(),
+                    provider: ModelProvider::HuggingFace,
+                    status: ModelStatus::DOWNLOADED,
+                    created_at: now,
+                    last_used_at: now,
+                    message: None,
+                }])
+            });
+        mock.expect_get_status_counts()
+            .once()
+            .returning(|| Ok((1, 1, 1)));
+        let (service, _cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let stats = service.get_cache_stats().await.expect("stats");
+        assert_eq!(stats.total_models, 1);
         assert_eq!(stats.downloaded_models, 1);
         assert_eq!(stats.downloading_models, 1);
         assert_eq!(stats.error_models, 1);

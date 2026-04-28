@@ -47,21 +47,17 @@ graph LR
 
 ## Prerequisites
 
-1. **Dynamo operator** installed (provides the `DynamoGraphDeployment` CRD).
-2. **ModelMetadata CRD** installed — one-time, cluster-admin:
+1. **Dynamo operator** installed (DynamoGraphDeployment CRD)
+2. **ModelExpress CRDs** installed (one-time, requires cluster-admin):
    ```bash
-   kubectl apply -f vllm/crd-modelmetadata.yaml
+   kubectl apply -f examples/crds.yaml
    ```
-3. **RBAC** for the ModelExpress server to manage ModelMetadata CRs:
-   ```bash
-   kubectl apply -f vllm/rbac-modelmetadata.yaml -n <namespace>
-   ```
-4. **PVC** with the model weights pre-downloaded (the YAMLs expect a PVC named `shared-model-cache`; change `spec.pvcs` and `volumeMounts` to match your setup).
-5. **HuggingFace token** for gated models:
-   ```bash
-   kubectl create secret generic hf-token-secret \
-     --from-literal=HF_TOKEN=<your-token> -n <namespace>
-   ```
+   Installs `ModelMetadata` (P2P worker coordination) and `ModelCacheEntry` (model-download
+   registry) in one pass.
+3. **PVC** with model weights pre-downloaded (`shared-model-cache`)
+4. **HuggingFace token secret**: `kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>`
+
+Note: RBAC (ServiceAccount, Role, RoleBinding) is included in the aggregated YAML and applied automatically.
 
 ## Building the Image
 
@@ -98,9 +94,9 @@ Either way, push the resulting image to a registry reachable from your Kubernete
 ### Aggregated
 
 1. Replace the image placeholder (`<your-registry>/modelexpress-vllm-runtime:latest`) in [`vllm/vllm-multi-node-aggregated.yaml`](vllm/vllm-multi-node-aggregated.yaml) with your pushed tag.
-2. Apply:
+2. Apply CRDs, RBAC, and DGD:
    ```bash
-   kubectl apply -f vllm/crd-modelmetadata.yaml
+   kubectl apply -f ../crds.yaml                           # one-time, cluster-admin
    kubectl apply -f vllm/rbac-modelmetadata.yaml -n <namespace>
    kubectl apply -f vllm/vllm-multi-node-aggregated.yaml -n <namespace>
    ```

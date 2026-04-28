@@ -101,12 +101,19 @@ Run pre-commit after every code change, even before creating commits. Do not wai
 |----------|---------|-------------|
 | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Server bind address |
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | Server port |
-| `MODEL_EXPRESS_DATABASE_PATH` | `./models.db` | SQLite database path |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Model cache directory |
 | `MODEL_EXPRESS_CACHE_EVICTION_ENABLED` | `true` | Enable cache eviction |
 | `MODEL_EXPRESS_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
 | `MODEL_EXPRESS_LOG_FORMAT` | `pretty` | Log format (json, pretty, compact) |
-| `REDIS_URL` | `redis://localhost:6379` | Redis URL for P2P state |
+| `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` — drives both the P2P metadata and model registry backends |
+| `REDIS_URL` | `redis://localhost:6379` | Redis URL (when backend is `redis`) |
+
+For local dev the quickest Redis is a one-liner:
+
+```bash
+docker run --rm -d -p 6379:6379 --name mx-redis redis:7-alpine
+MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexpress-server
+```
 
 #### Client
 

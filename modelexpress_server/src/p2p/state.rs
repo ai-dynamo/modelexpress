@@ -7,14 +7,14 @@
 //! All state — model metadata and source status — is persisted to the backend,
 //! making the server stateless and horizontally scalable.
 
-use crate::metadata_backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
+use crate::p2p::backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
 use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 // Re-export types for backwards compatibility
-pub use crate::metadata_backend::{
+pub use crate::p2p::backend::{
     BackendMetadataRecord, ModelMetadataRecord, TensorRecord, WorkerRecord,
 };
 
@@ -136,7 +136,7 @@ impl P2pStateManager {
         &self,
         source_id: Option<String>,
         status_filter: Option<modelexpress_common::grpc::p2p::SourceStatus>,
-    ) -> MetadataResult<Vec<crate::metadata_backend::SourceInstanceInfo>> {
+    ) -> MetadataResult<Vec<crate::p2p::backend::SourceInstanceInfo>> {
         self.get_backend()
             .await?
             .list_workers(source_id, status_filter)
@@ -191,7 +191,7 @@ impl P2pStateManager {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::metadata_backend::MockMetadataBackend;
+    use crate::p2p::backend::MockMetadataBackend;
     use mockall::predicate::eq;
     use modelexpress_common::grpc::p2p::{
         MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor,
@@ -382,34 +382,6 @@ mod tests {
         assert_eq!(record.workers[1].worker_rank, 1);
     }
 
-    #[test]
-    fn test_backend_config_parsing() {
-        let default_redis = "redis://localhost:6379";
-        let default_ns = "default";
-
-        // Redis
-        let config =
-            BackendConfig::from_type_str("redis", "redis://myhost:6379", default_ns).expect("ok");
-        assert!(matches!(config, BackendConfig::Redis { url } if url == "redis://myhost:6379"));
-
-        // Kubernetes aliases
-        for alias in &["kubernetes", "k8s", "crd"] {
-            let config = BackendConfig::from_type_str(alias, default_redis, "prod-ns").expect("ok");
-            assert!(
-                matches!(config, BackendConfig::Kubernetes { namespace } if namespace == "prod-ns")
-            );
-        }
-
-        // Unknown returns Err
-        assert!(BackendConfig::from_type_str("bogus", default_redis, default_ns).is_err());
-        assert!(BackendConfig::from_type_str("memory", default_redis, default_ns).is_err());
-        assert!(BackendConfig::from_type_str("", default_redis, default_ns).is_err());
-
-        // Case insensitive
-        let config = BackendConfig::from_type_str("REDIS", default_redis, default_ns).expect("ok");
-        assert!(matches!(config, BackendConfig::Redis { .. }));
-    }
-
     #[tokio::test]
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
@@ -513,7 +485,7 @@ mod tests {
             })
             .once()
             .returning(|_, _| {
-                Ok(vec![crate::metadata_backend::SourceInstanceInfo {
+                Ok(vec![crate::p2p::backend::SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
                     worker_id: "w1".to_string(),
                     model_name: "my-model".to_string(),
