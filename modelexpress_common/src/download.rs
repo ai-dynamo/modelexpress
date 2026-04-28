@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ModelProvider;
-use crate::providers::{HuggingFaceProvider, ModelProviderTrait, NgcProvider};
+use crate::providers::{GcsProvider, HuggingFaceProvider, ModelProviderTrait, NgcProvider};
 use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -13,6 +13,7 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
     match provider {
         ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
         ModelProvider::Ngc => Box::new(NgcProvider),
+        ModelProvider::Gcs => Box::new(GcsProvider),
     }
 }
 
@@ -105,6 +106,12 @@ mod tests {
     fn test_get_provider() {
         let provider = get_provider(ModelProvider::HuggingFace);
         assert_eq!(provider.provider_name(), "Hugging Face");
+
+        let provider = get_provider(ModelProvider::Ngc);
+        assert_eq!(provider.provider_name(), "NGC");
+
+        let provider = get_provider(ModelProvider::Gcs);
+        assert_eq!(provider.provider_name(), "GCS");
     }
 
     #[test]
@@ -113,6 +120,11 @@ mod tests {
             canonical_model_name("test/model", ModelProvider::HuggingFace)
                 .expect("Expected canonical model name"),
             "test/model"
+        );
+        assert_eq!(
+            canonical_model_name("gs://test-bucket/org/model/rev-1/", ModelProvider::Gcs)
+                .expect("Expected canonical model name"),
+            "gs://test-bucket/org/model/rev-1"
         );
     }
 

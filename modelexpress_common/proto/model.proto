@@ -44,6 +44,7 @@ enum ModelStatus {
 enum ModelProvider {
   HUGGING_FACE = 0;
   NGC = 1;
+  GCS = 2;
 }
 
 // Request for streaming model files
@@ -54,6 +55,14 @@ message ModelFilesRequest {
   ModelProvider provider = 2;
   // Chunk size in bytes for streaming (0 = use server default)
   uint32 chunk_size = 3;
+  // Optional file selector. If unset, all files are streamed.
+  ModelFileSelector file_selector = 4;
+}
+
+// Selects files within a model directory
+message ModelFileSelector {
+  // Exact paths relative to the model root.
+  repeated string paths = 1;
 }
 
 // A chunk of file data for streaming transfers

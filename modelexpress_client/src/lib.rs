@@ -353,6 +353,7 @@ impl Client {
             model_name: model_name.to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             chunk_size,
+            file_selector: None,
         });
 
         let mut stream = self
@@ -748,6 +749,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tonic::{Request, Response, Status, transport::Server};
 
@@ -757,6 +759,10 @@ mod tests {
         chunks: Vec<FileChunk>,
     }
     struct UnavailableModelService;
+    struct RecordingModelService {
+        seen_model_name: Arc<Mutex<Option<String>>>,
+    }
+    struct ZeroByteGcsMarkerStreamModelService;
 
     #[tonic::async_trait]
     impl ModelService for EmptyFileStreamModelService {
@@ -844,6 +850,102 @@ mod tests {
             Ok(Response::new(Box::pin(futures::stream::iter(
                 self.chunks.clone().into_iter().map(Ok),
             ))))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for RecordingModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            let request = request.into_inner();
+            *self
+                .seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name") = Some(request.model_name);
+            let update = ModelStatusUpdate {
+                model_name: "gs://envbucket/dev/bake/qwen/rev123".to_string(),
+                status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
+                message: None,
+                provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            };
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                update,
+            )]))))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            Err(Status::unimplemented(
+                "stream_model_files is not used in this test",
+            ))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ModelService for ZeroByteGcsMarkerStreamModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            let request = request.into_inner();
+            let update = ModelStatusUpdate {
+                model_name: request.model_name,
+                status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
+                message: None,
+                provider: request.provider,
+            };
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                update,
+            )]))))
+        }
+
+        async fn stream_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            let chunk = FileChunk {
+                relative_path: ".mx-model".to_string(),
+                data: vec![],
+                offset: 0,
+                total_size: 0,
+                is_last_chunk: true,
+                is_last_file: true,
+                commit_hash: None,
+            };
+
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                chunk,
+            )]))))
         }
 
         async fn list_model_files(
@@ -972,6 +1074,9 @@ mod tests {
         let provider = ModelProvider::HuggingFace;
         assert_eq!(provider, ModelProvider::HuggingFace);
 
+        let provider = ModelProvider::Gcs;
+        assert_eq!(provider, ModelProvider::Gcs);
+
         let default_provider = ModelProvider::default();
         assert_eq!(default_provider, ModelProvider::HuggingFace);
     }
@@ -1084,6 +1189,22 @@ mod tests {
             matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("outside cache root")),
             "Unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_prepare_stream_model_dir_uses_gcs_layout_without_commit_hash() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_root = temp_dir.path();
+
+        let (dir, _) = prepare_stream_model_dir(
+            cache_root,
+            ModelProvider::Gcs,
+            "gs://envbucket/dev/bake/qwen/rev123",
+            None,
+        )
+        .expect("Expected GCS cache layout");
+
+        assert_eq!(dir, cache_root.join("gcs/envbucket/dev/bake/qwen/rev123"));
     }
 
     #[cfg(unix)]
@@ -1284,6 +1405,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_model_streaming_creates_zero_byte_gcs_marker() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let (addr, server_handle) = spawn_model_service(ZeroByteGcsMarkerStreamModelService).await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        config.cache.shared_storage = false;
+
+        let model_name = "gs://test-bucket/org/model/rev-1";
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        client
+            .request_model(model_name, ModelProvider::Gcs, false)
+            .await
+            .expect("Expected streamed model request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        let model_dir = resolve_model_path(cache_dir.path(), ModelProvider::Gcs, model_name, None)
+            .expect("Expected resolved GCS model dir");
+        let marker_path = model_dir.join(".mx-model");
+        assert!(
+            marker_path.is_file(),
+            "Expected marker file at {:?}",
+            marker_path
+        );
+        assert_eq!(
+            std::fs::metadata(&marker_path)
+                .expect("Expected marker metadata")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn test_request_model_with_smart_fallback_no_server() {
         let config = Config::for_testing("http://127.0.0.1:99999"); // Invalid port
 
@@ -1334,6 +1493,39 @@ mod tests {
         assert!(
             error_msg.contains("gRPC error") || error_msg.contains("unavailable"),
             "Expected a server-side availability error, got: {error_msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_model_with_smart_fallback_accepts_full_gcs_url() {
+        let seen_model_name = Arc::new(Mutex::new(None));
+        let (addr, server_handle) = spawn_model_service(RecordingModelService {
+            seen_model_name: Arc::clone(&seen_model_name),
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.shared_storage = true;
+
+        Client::request_model_with_smart_fallback(
+            "gs://envbucket/dev/bake/qwen/rev123",
+            ModelProvider::Gcs,
+            config,
+            false,
+        )
+        .await
+        .expect("Expected smart fallback request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        assert_eq!(
+            seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name")
+                .clone(),
+            "gs://envbucket/dev/bake/qwen/rev123".to_string().into()
         );
     }
 }

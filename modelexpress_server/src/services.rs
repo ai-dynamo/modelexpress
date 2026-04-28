@@ -9,8 +9,8 @@ use modelexpress_common::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
         model::{
-            FileChunk, ModelDownloadRequest, ModelFileInfo, ModelFileList, ModelFilesRequest,
-            ModelProvider as GrpcModelProvider, ModelStatusUpdate,
+            FileChunk, ModelDownloadRequest, ModelFileInfo, ModelFileList, ModelFileSelector,
+            ModelFilesRequest, ModelProvider as GrpcModelProvider, ModelStatusUpdate,
             model_service_server::ModelService,
         },
     },
@@ -109,7 +109,11 @@ impl ApiService for ApiServiceImpl {
 pub struct ModelServiceImpl;
 
 /// Helper function to collect all files in a model directory recursively
-fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u64)> {
+fn collect_model_files(
+    base_path: &Path,
+    current_path: &Path,
+    file_selector: Option<&ModelFileSelector>,
+) -> Vec<(PathBuf, u64)> {
     let mut files = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(current_path) {
@@ -133,19 +137,24 @@ fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u
                                 _ => {}
                             }
                         }
-                        if is_safe {
-                            files.push((relative.to_path_buf(), metadata.len()));
-                        } else {
+                        if !is_safe {
                             tracing::warn!(
                                 "Skipping potentially unsafe file path: {:?} (relative: {:?})",
                                 path,
                                 relative
                             );
+                        } else if file_selector.is_none_or(|selector| {
+                            selector
+                                .paths
+                                .iter()
+                                .any(|path| Path::new(path) == relative)
+                        }) {
+                            files.push((relative.to_path_buf(), metadata.len()));
                         }
                     }
                 }
             } else if path.is_dir() {
-                files.extend(collect_model_files(base_path, &path));
+                files.extend(collect_model_files(base_path, &path, file_selector));
             }
         }
     }
@@ -303,7 +312,11 @@ impl ModelService for ModelServiceImpl {
         }
 
         // Collect all files to stream
-        let files = collect_model_files(&model_path, &model_path);
+        let files = collect_model_files(
+            &model_path,
+            &model_path,
+            files_request.file_selector.as_ref(),
+        );
 
         if files.is_empty() {
             return Err(Status::not_found("No files found in model directory"));
@@ -445,7 +458,11 @@ impl ModelService for ModelServiceImpl {
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
         // Collect all files
-        let files = collect_model_files(&model_path, &model_path);
+        let files = collect_model_files(
+            &model_path,
+            &model_path,
+            files_request.file_selector.as_ref(),
+        );
 
         let file_infos: Vec<ModelFileInfo> = files
             .iter()
@@ -958,6 +975,44 @@ mod tests {
         MODEL_TRACKER.delete_status(&model_name);
     }
 
+    #[tokio::test]
+    async fn test_model_service_already_downloaded_gcs_trailing_slash_uses_canonical_name() {
+        let service = ModelServiceImpl;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos();
+        let canonical_model_name = format!("gs://test-bucket-{timestamp}/org/model/rev-1");
+
+        MODEL_TRACKER.set_status(
+            canonical_model_name.clone(),
+            ModelStatus::DOWNLOADED,
+            ModelProvider::Gcs,
+        );
+
+        let request = Request::new(ModelDownloadRequest {
+            model_name: format!("{canonical_model_name}/"),
+            provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            ignore_weights: false,
+        });
+
+        let response = service.ensure_model_downloaded(request).await;
+        assert!(response.is_ok());
+
+        let mut stream = response.expect("Response should be ok").into_inner();
+        let update = stream.next().await.expect("Update should be present");
+        assert!(update.is_ok());
+
+        let status_update = update.expect("Status update should be ok");
+        assert_eq!(status_update.model_name, canonical_model_name);
+        assert_eq!(
+            status_update.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloaded as i32
+        );
+
+        MODEL_TRACKER.delete_status(&canonical_model_name);
+    }
+
     #[test]
     fn test_model_download_tracker_set_status_and_notify() {
         let _temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -1093,7 +1148,7 @@ mod tests {
     #[test]
     fn test_collect_model_files_empty_dir() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
         assert!(files.is_empty());
     }
 
@@ -1108,7 +1163,7 @@ mod tests {
         let file2_path = temp_dir.path().join("model.bin");
         std::fs::write(&file2_path, vec![0u8; 100]).expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
 
         assert_eq!(files.len(), 2);
 
@@ -1139,7 +1194,7 @@ mod tests {
         let file2_path = subdir.join("nested_file.txt");
         std::fs::write(&file2_path, "nested content").expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
 
         assert_eq!(files.len(), 2);
 
@@ -1159,6 +1214,7 @@ mod tests {
             model_name: "non-existent-model-12345".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 0,
+            file_selector: None,
         });
 
         let result = service.list_model_files(request).await;
@@ -1175,6 +1231,7 @@ mod tests {
             model_name: "non-existent-model-12345".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1208,6 +1265,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             chunk_size: 0,
+            file_selector: None,
         });
 
         let result = service.list_model_files(request).await;
@@ -1225,6 +1283,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1256,6 +1315,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let response = service
@@ -1296,6 +1356,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let response = service
