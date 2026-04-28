@@ -1,9 +1,11 @@
 # ModelExpress P2P for TRT-LLM on GCP GB200
 
-GPU-to-GPU weight loading for Kimi K2.5 via ModelExpress NIXL RDMA.
-Targets load weights in seconds instead of 15-24 minutes from PVC.
+GPU-to-GPU weight loading for TRT-LLM via ModelExpress NIXL RDMA.
+Targets load weights in ~2 seconds instead of 15-20 minutes from disk.
 
-## Architecture
+**Validated:** Kimi K2.5 TP=8, 16 target ranks × 90.75 GB at 363–506 Gbps (RoCE).
+
+## How It Works
 
 ```
                     ┌─────────────────────────────────────┐
@@ -14,288 +16,188 @@ Targets load weights in seconds instead of 15-24 minutes from PVC.
                   metadata   │                │   metadata
                              │                │
   ┌──────────────────────────┴───┐  ┌─────────┴───────────────────────┐
-  │  MX Source (DGD, TP=8)       │  │  MX Targets (DGD)               │
+  │  Source (TP=8, 2 nodes)      │  │  Targets (prefill + decode)     │
   │                              │  │                                 │
-  │  1. Load weights from PVC    │  │  1. Query MX server for source  │
-  │  2. model.load_weights()     │  │  2. NIXL RDMA into param bufs   │
-  │  3. ── PUBLISH HERE ──       │  │  3. post_load_weights()         │
-  │  4. post_load_weights()      │  │  4. NCCL init + serve           │
-  │  5. Serve (holds GPU mem)    │  │                                 │
-  │                              │  │  Source publishes BEFORE step 4 │
-  │  Node A ┌──┐┌──┐┌──┐┌──┐     │  │  so targets run same xforms     │
-  │         │R0││R1││R2││R3│     │  │                                 │
-  │  Node B ┌──┐┌──┐┌──┐┌──┐     │  │  ┌───────────────────────────┐  │
-  │         │R4││R5││R6││R7│     │  │  │ Prefill  (TP=8, 2 nodes)  │  │
-  │                              │  │  │ Decode   (TP=8, 2 nodes)  │  │
-  └──────────────────────────────┘  │  │ Frontend (KV router)      │  │
-               │                    │  └───────────────────────────┘  │
-               │    NIXL RDMA       │                                 │
-               └────────────────────►  400-457 Gbps RoCE per rank     │
-                90.75 GB/rank        ─────────────────────────────────┘
+  │  1. checkpoint_format="MX"   │  │  1. checkpoint_format="MX"      │
+  │  2. No MX sources found      │  │  2. MX sources detected         │
+  │  3. Fall back to disk load   │  │  3. MxLiveWeightLoader RDMA     │
+  │  4. publish_as_source()      │  │  4. _weights_presharded=True    │
+  │  5. post_load_weights()      │  │  5. post_load_weights()         │
+  │  6. Serve (holds GPU mem)    │  │  6. Serve                       │
+  └──────────────────────────────┘  └─────────────────────────────────┘
+               │                                    ▲
+               └────── NIXL RDMA (RoCE) ────────────┘
+                  ~2s, 363-506 Gbps per rank
 ```
 
----
+The integration uses TRT-LLM's `@register_checkpoint_loader("MX")` architecture
+([TRT-LLM PR #13531](https://github.com/NVIDIA/TensorRT-LLM/pull/13531)):
+- **Source** auto-detects no existing MX sources → loads from disk → publishes via `publish_model_params()`
+- **Target** auto-detects existing sources → `MxLiveWeightLoader` does RDMA → marks modules `_weights_presharded`
 
 ## Quick Start
 
 ### Prerequisites
 
-```bash
-# 1. Teleport auth
-tsh kube login dynamo-gcp-dev-01
+- GKE cluster with GB200 nodes (ARM64) and CPU nodes
+- Dynamo platform (etcd + NATS) running in your namespace
+- `nvcr-imagepullsecret` and `hf-token-secret` in your namespace
+- `shared-model-cache` PVC with the model downloaded
+- ComputeDomain created for your namespace
 
-# 2. Dynamo platform (etcd + NATS) must be running
-kubectl -n default get pods  # verify etcd-0, nats-0
-
-# 3. Secrets
-kubectl -n default get secret hf-token-secret
-kubectl -n default get secret nvcr-imagepullsecret
-
-# 4. ComputeDomain (creates IMEX channels for GPU allocation)
-cat <<EOF | kubectl -n default apply -f -
-apiVersion: resource.nvidia.com/v1beta1
-kind: ComputeDomain
-metadata:
-  name: my-compute-domain
-spec:
-  numNodes: 0
-  channel:
-    resourceClaimTemplate:
-      name: my-compute-domain-channel
-EOF
-
-# 5. Shared PVC with model files
-kubectl -n default get pvc shared-model-cache
-```
-
----
-
-## Aggregated Inference (P2P)
-
-Single worker type — serves both prefill and decode. Fastest to validate.
-
-### Step 1: Deploy infrastructure
+### Step 1: Deploy MX infrastructure
 
 ```bash
-kubectl -n default apply -f mx-infra-decode.yaml
+kubectl -n <namespace> apply -f mx-infra-decode.yaml
 # Creates: modelexpress-server-decode + redis-decode
+# Verify: kubectl -n <namespace> get pods -l 'app in (redis-decode, modelexpress-server-decode)'
 ```
 
-### Step 2: Deploy source (loads from PVC, publishes via RDMA)
+### Step 2: Deploy source (loads from disk, publishes weights)
 
 ```bash
-kubectl -n default apply -f kimi-source-decode-dgd.yaml
-# TP=8 across 2 nodes, loads ~15 min from PVC
-# Watch: kubectl -n default logs -f <source-leader-pod> | grep "published ALL"
+kubectl -n <namespace> apply -f kimi-source-decode-dgd.yaml
+# TP=8 across 2 nodes, loads ~15-20 min from disk
 ```
 
-### Step 3: Deploy target (receives weights via P2P)
+Wait for all 8 workers to publish:
+```bash
+kubectl exec -n <namespace> deploy/redis-decode -- redis-cli KEYS 'mx:source:*:*' | wc -l
+# Should output: 8
+```
+
+### Step 3: Deploy targets (receive weights via RDMA)
 
 ```bash
-# After source publishes:
-kubectl -n default apply -f kimi-target-agg-tp8-dgd.yaml
-# TP=8, loads via RDMA in ~2 seconds
-# Watch: kubectl -n default logs -f <target-leader-pod> | grep "Gbps"
+kubectl -n <namespace> apply -f kimi-disagg-mx-tp8-dgd.yaml
+# Creates: Frontend + Prefill (TP=8) + Decode (TP=8)
+# Both load via RDMA concurrently (~2s per rank)
 ```
 
-### Step 4: Test inference
+### Step 4: Verify RDMA transfer
+
+Check per-rank transfer logs:
+```bash
+kubectl exec -n <namespace> <target-worker-pod> -- cat /tmp/mx_logs/rank0.log
+# Look for: "Transfer complete: 1815 tensors, 90.75 GB in 1.97s (369.1 Gbps)"
+```
+
+Or check main logs:
+```bash
+kubectl logs -n <namespace> <target-leader-pod> | grep "MX P2P weight transfer succeeded"
+```
+
+### Step 5: Cleanup
 
 ```bash
-FRONTEND=$(kubectl -n default get pod -l app.kubernetes.io/part-of=kimi-target-agg-tp8 \
-  -l nvidia.com/dynamo-component=frontend -o name | head -1)
-kubectl -n default exec $FRONTEND -- curl -s http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3",
-       "messages":[{"role":"user","content":"What is the capital of France?"}],
-       "max_tokens":50}'
+kubectl delete dgd -n <namespace> --all
+# MX infra can stay running for future deployments
 ```
-
----
-
-## Disaggregated Inference (P2P)
-
-Separate prefill and decode workers with KV cache transfer. Each loads
-weights via P2P from the same MX source.
-
-### Step 1: Deploy infrastructure + source
-
-```bash
-kubectl -n default apply -f mx-infra-decode.yaml
-kubectl -n default apply -f kimi-source-decode-dgd.yaml
-# Wait for source to publish (~15 min)
-```
-
-### Step 2: Deploy disagg targets
-
-```bash
-kubectl -n default apply -f kimi-disagg-mx-tp8-dgd.yaml
-# Creates: Frontend (KV router) + Prefill (MX target) + Decode (MX target)
-# Both load via P2P concurrently
-```
-
-### Step 3: Test inference
-
-```bash
-FRONTEND_IP=$(kubectl -n default get pod -l app.kubernetes.io/part-of=kimi-disagg-mx-tp8 \
-  -l nvidia.com/dynamo-component=frontend -o jsonpath='{.items[0].status.podIP}')
-kubectl -n default exec <any-worker-pod> -- curl -s http://${FRONTEND_IP}:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"baseten-admin/Kimi-2.5-text-nvfp4-v3",
-       "messages":[{"role":"user","content":"What is the capital of France?"}],
-       "max_tokens":50}'
-```
-
-### Disagg without MX (PVC baseline)
-
-To validate disagg works without P2P (both workers load from PVC):
-
-```bash
-kubectl -n default apply -f kimi-disagg-baseline-dgd.yaml
-# No MX source needed — loads directly from shared-model-cache PVC
-```
-
----
-
-## File Reference
-
-### Infrastructure
-
-| File | Purpose |
-|------|---------|
-| `mx-infra.yaml` | ModelExpress server + Redis (TP=4 source) |
-| `mx-infra-decode.yaml` | ModelExpress server + Redis (TP=8 source) |
-
-### Sources (load from PVC, publish for RDMA)
-
-| File | TP | Nodes | Notes |
-|------|-----|-------|-------|
-| `kimi-source-decode-dgd.yaml` | 8 | 2 | Primary source for TP=8 targets |
-| `kimi-source-deploy.yaml` | 4 | 1 | Legacy TP=4 source (Deployment) |
-| `kimi-source-dgd.yaml` | 4 | 1 | TP=4 source (DGD format) |
-
-### Targets (receive weights via P2P)
-
-| File | Mode | TP | MX Source | Notes |
-|------|------|-----|-----------|-------|
-| `kimi-target-agg-tp8-dgd.yaml` | Aggregated | 8 | decode server | Simplest P2P test |
-| `kimi-disagg-mx-tp8-dgd.yaml` | Disagg | 8+8 | decode server | Prefill + decode via P2P |
-| `kimi-disagg-baseline-dgd.yaml` | Disagg | 8+8 | PVC (no MX) | Baseline for comparison |
-| `kimi-disagg-mx-dgd.yaml` | Disagg | 4+4 | MX server | Legacy TP=4 disagg |
-| `kimi-disagg-phase2-dgd.yaml` | Disagg | 4+8 | dual MX | Mixed TP (needs 2 sources) |
-| `kimi-target-pvc-tp8-dgd.yaml` | Aggregated | 8 | PVC (no MX) | Ground truth baseline |
-
-### Testing
-
-| File | Purpose |
-|------|---------|
-| `qwen-source-deploy.yaml` | Qwen 0.5B TP=2 source (fast iteration) |
-| `qwen-target-deploy.yaml` | Qwen 0.5B TP=2 target |
-| `qwen-baseline-test.yaml` | Qwen baseline without MX |
-
----
-
-## Required Configuration for GCP GB200
-
-All worker pods need these settings. See `docs/disagg_trtllm.md` for details.
-
-```yaml
-securityContext:
-  privileged: true              # RDMA memory registration
-  runAsUser: 0                  # SSH key path fix for multinode
-
-env:
-  HOME: /root                   # Fix SSH host key path mismatch
-  UCX_TLS: "self,sm,rc,cuda_copy,gdr_copy,tcp"
-  UCX_IB_GID_INDEX: "3"        # GCP RoCEv2 GID selection
-  TRTLLM_UCX_INTERFACE: eth0    # Prevent 169.254.x.x binding
-  OMPI_MCA_pml: ob1             # Bypass UCX UD for MPI
-  OMPI_MCA_btl: "tcp,self,vader"
-  NATS_SERVER: "nats://dynamo-platform-nats.<ns>.svc.cluster.local:4222"
-  ETCD_ENDPOINTS: "dynamo-platform-etcd.<ns>.svc.cluster.local:2379"
-
-# Engine config (extra-engine-args YAML):
-  cache_transceiver_config:
-    backend: DEFAULT            # Bypass UCX UD for KV cache transfer
-  enable_autotuner: false       # Avoid warmup MPI desync
-```
-
----
-
-## Cleanup
-
-```bash
-# Delete all workloads
-kubectl -n default delete dgd --all
-
-# Delete compute domain (releases IMEX channels)
-kubectl -n default delete computedomain my-compute-domain
-
-# Keep infra running for next deployment
-# kubectl -n default delete -f mx-infra-decode.yaml  # if needed
-```
-
----
 
 ## Building the Image
 
-The image combines three repos into a single ARM64 container layered on the
-Dynamo TRT-LLM base image.
+Two Dockerfiles are provided for different base images:
 
-### Repos and branches
+| Dockerfile | Base Image | TRT-LLM Version |
+|------------|-----------|-----------------|
+| `Dockerfile.ph3-gcp-gb200` | `karenc:dynamo-trtllm-v1.0.0-a9b6f95` | 1.3.0rc5 |
+| `Dockerfile.dynamo-runtime` | `tensorrtllm-runtime:1.1.0-dev.3` | 1.3.0rc11 |
 
-| Repo | Branch | What it provides |
-|------|--------|-----------------|
-| `modelexpress` | your modelexpress branch | MX client, NIXL transfer, TRT-LLM patches |
-| `dynamo` | the Dynamo branch with P2P support | Engine P2P hooks (`--model-express-url`) |
-| `TensorRT-LLM` | your TRT-LLM branch | `LoadFormat.PRESHARDED` (applied via patches) |
+### Build (recommended: dynamo-runtime base)
 
-### Directory layout
+```bash
+cd <modelexpress-repo-root>
 
+docker buildx build --platform linux/arm64 --no-cache \
+    -f examples/p2p_transfer_k8s/client/trtllm/Dockerfile.dynamo-runtime \
+    --build-context trtllm=../TensorRT-LLM \
+    -t nvcr.io/nvidian/dynamo-dev/<user>:dynamo-trtllm-mx-<tag> \
+    --push .
+```
+
+Requires the TRT-LLM repo checked out alongside with the MX checkpoint loader:
 ```
 ~/work/github/
-├── modelexpress/   (your modelexpress branch)
-└── dynamo/         (the Dynamo branch with P2P support)
+├── modelexpress/     (branch: kavink/trtllm_clean)
+└── TensorRT-LLM/    (branch: kavink/mx-compat-fixes)
 ```
 
-### Build command
+### What the Dockerfile does
 
-```bash
-cd ~/work/github/modelexpress
+1. Installs `modelexpress` Python client (gRPC + NIXL transfer)
+2. Patches Dynamo with `--model-express-url` support (`patch_dynamo_mx.py`)
+3. Copies `MXCheckpointLoader` from TRT-LLM fork
+4. Patches base `model_loader.py` with P2P hooks (`patch_mx_loader.py`)
+5. Symlinks `modelexpress` into the venv for import
 
-docker buildx build --platform linux/arm64 --no-cache \
-    -f examples/p2p_transfer_trtllm/Dockerfile.ph3-gcp-gb200 \
-    --build-context dynamo=../dynamo \
-    -t <REGISTRY>/dynamo-trtllm-mx:<TAG> \
-    --push .
-```
-
-The Dockerfile (`examples/p2p_transfer_trtllm/Dockerfile.ph3-gcp-gb200`):
-1. Starts from `karenc:dynamo-trtllm-v1.0.0-a9b6f95` (TRT-LLM 1.3.0rc5 + NIXL, ARM64)
-2. Installs ModelExpress Python client (gRPC + NIXL transfer)
-3. Copies Dynamo engine/worker files from `dynamo` repo via `--build-context`
-4. Applies TRT-LLM patches: `PRESHARDED` LoadFormat, source publish hook, MPI allgather fix
-
-### Building the base image from dynamo
-
-If you don't have access to `karenc:dynamo-trtllm-v1.0.0-a9b6f95`, build the
-base image from the `dynamo` repo using its rendered Dockerfile:
-
-```bash
-cd ~/work/github/dynamo
-
-docker buildx build --platform linux/arm64 --no-cache \
-    -f container/trtllm-runtime-cuda13.1-arm64-rendered.Dockerfile \
-    --build-arg ARCH=arm64 \
-    --build-arg ARCH_ALT=aarch64 \
-    -t my-registry/dynamo-trtllm-base:latest \
-    --push .
-```
-
-Then update the `FROM` line in `Dockerfile.ph3-gcp-gb200` to point to your
-base image instead of `karenc:dynamo-trtllm-v1.0.0-a9b6f95`.
-
-### Current image
+### Pre-built images
 
 ```
-<REGISTRY>/dynamo-trtllm-mx:<TAG>
+nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v2.9.0   # old base, E2E validated
+nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.2.0   # new base, E2E validated
+```
+
+## File Reference
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile.dynamo-runtime` | Docker build for `tensorrtllm-runtime` base images |
+| `Dockerfile.ph3-gcp-gb200` | Docker build for older `karenc` base image |
+| `mx-infra-decode.yaml` | ModelExpress server + Redis deployment |
+| `kimi-source-decode-dgd.yaml` | Source DGD (TP=8, loads from disk, publishes) |
+| `kimi-disagg-mx-tp8-dgd.yaml` | Target DGD (prefill + decode + frontend, loads via RDMA) |
+
+Patch scripts (in `trtllm_patches/`):
+
+| File | Purpose |
+|------|---------|
+| `dynamo/patch_dynamo_mx.py` | Adds `--model-express-url` to Dynamo engine/worker |
+| `v1.3.0rc5/patch_mx_loader.py` | Adds P2P hooks to TRT-LLM model_loader.py |
+
+## Companion PRs
+
+| PR | Repo | Status |
+|----|------|--------|
+| [#13531](https://github.com/NVIDIA/TensorRT-LLM/pull/13531) | TRT-LLM | MX-only checkpoint loader (ready for review) |
+| [#8037](https://github.com/ai-dynamo/dynamo/pull/8037) | Dynamo | `--model-express-url` engine integration |
+| [#218](https://github.com/ai-dynamo/modelexpress/pull/218) | ModelExpress | This directory (Dockerfiles, yamls, patches) |
+| [#202](https://github.com/ai-dynamo/modelexpress/pull/202) | ModelExpress | MX client (`MxLiveWeightLoader`, merged) |
+
+## Customization
+
+### Different model
+
+Update in the DGD yamls:
+- `--model-path` and `--served-model-name` args
+- `MODEL_NAME` env var
+- `model_kwargs.num_hidden_layers` in the ConfigMap
+- Ensure the model is on the `shared-model-cache` PVC
+
+### Different namespace
+
+Update FQDN references for services:
+- `modelexpress-server-decode.<namespace>.svc.cluster.local`
+- `dynamo-platform-nats.<namespace>.svc.cluster.local`
+- `dynamo-platform-etcd.<namespace>.svc.cluster.local`
+- `resourceClaimTemplateName` for compute domain
+
+### Different cluster / node pools
+
+Update `nodeSelector` and `nodeAffinity` in the DGD yamls:
+- `cloud.google.com/gke-nodepool` values
+
+## GCP GB200 Required Config
+
+All worker pods need these environment variables:
+
+```yaml
+env:
+  HOME: /root
+  UCX_TLS: "cuda_ipc,cuda_copy,rc"
+  UCX_IB_GID_INDEX: "3"
+  TRTLLM_UCX_INTERFACE: eth0
+  OMPI_MCA_pml: ob1
+  OMPI_MCA_btl: "tcp,self,vader"
+  NCCL_CUMEM_ENABLE: "1"
+  NCCL_NVLS_ENABLE: "1"
 ```
