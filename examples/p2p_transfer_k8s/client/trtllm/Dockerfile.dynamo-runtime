@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TRT-LLM P2P image for Dynamo tensorrtllm-runtime base
+# Layers ModelExpress client + MXCheckpointLoader + Dynamo hooks
+#
+# Base: nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.1.0-dev.3
+#
+# Build (from modelexpress repo root):
+#   docker buildx build --platform linux/arm64 --no-cache \
+#       -f examples/p2p_transfer_k8s/client/trtllm/Dockerfile.dynamo-runtime \
+#       --build-context trtllm=../TensorRT-LLM \
+#       -t <REGISTRY>/<NAME>:<TAG> \
+#       --push .
+ARG BASE_IMAGE=nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.1.0-dev.3
+FROM ${BASE_IMAGE}
+
+USER root
+
+RUN mkdir -p /run/sshd && chmod 0755 /run/sshd && chown root:root /run/sshd
+
+# Install ModelExpress client (gRPC + NIXL transfer)
+COPY modelexpress_client/python /tmp/modelexpress_client
+COPY modelexpress_common/proto /tmp/proto
+
+RUN cd /tmp/modelexpress_client && \
+    pip install --no-cache-dir --break-system-packages grpcio grpcio-tools protobuf && \
+    python3 -m grpc_tools.protoc \
+        -I/tmp/proto \
+        --python_out=modelexpress \
+        --grpc_python_out=modelexpress \
+        /tmp/proto/p2p.proto && \
+    sed -i 's/^import p2p_pb2/from . import p2p_pb2/' modelexpress/p2p_pb2_grpc.py && \
+    pip install --no-cache-dir --break-system-packages . && \
+    rm -rf /tmp/modelexpress_client /tmp/proto && \
+    SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    if [ -d /opt/dynamo/venv ] && [ ! -f "$SITE/modelexpress/__init__.py" ]; then \
+        SYS_SITE=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+        VENV_SITE=$(ls -d /opt/dynamo/venv/lib/python*/site-packages 2>/dev/null | head -1) && \
+        if [ -d "$SYS_SITE/modelexpress" ] && [ -n "$VENV_SITE" ]; then \
+            ln -sf "$SYS_SITE/modelexpress" "$VENV_SITE/modelexpress" && \
+            echo "Symlinked modelexpress into venv at $VENV_SITE"; \
+        fi; \
+    fi
+
+# Dynamo P2P hooks (--model-express-url support)
+# TODO: Remove once ai-dynamo/dynamo PR #8037 merges
+COPY trtllm_patches/dynamo/patch_dynamo_mx.py /tmp/patch_dynamo_mx.py
+RUN python3 /tmp/patch_dynamo_mx.py && rm /tmp/patch_dynamo_mx.py
+
+# MX checkpoint loader from TRT-LLM fork
+# TODO: Remove once NVIDIA/TensorRT-LLM PR #13045 merges
+COPY --from=trtllm tensorrt_llm/_torch/models/checkpoints/mx /tmp/trtllm_mx/mx
+
+RUN TRTLLM_PKG=$(python3 -c "import importlib.util; s=importlib.util.find_spec('tensorrt_llm'); print(s.submodule_search_locations[0])") && \
+    echo "TRT-LLM package at: $TRTLLM_PKG" && \
+    cp -r /tmp/trtllm_mx/mx "$TRTLLM_PKG/_torch/models/checkpoints/mx" && \
+    rm -rf /tmp/trtllm_mx && \
+    test -f "$TRTLLM_PKG/_torch/models/checkpoints/mx/checkpoint_loader.py" && \
+    echo "MXCheckpointLoader installed OK"
+
+# Patch base TRT-LLM for MX loader compatibility
+# patch_mx_loader.py uses importlib to find paths dynamically
+COPY trtllm_patches/v1.3.0rc5/patch_mx_loader.py /tmp/patch_mx_loader.py
+RUN python3 /tmp/patch_mx_loader.py && rm /tmp/patch_mx_loader.py
+
+# Verify patches and make modelexpress importable from venv
+RUN TRTLLM_PKG=$(python3 -c "import importlib.util; s=importlib.util.find_spec('tensorrt_llm'); print(s.submodule_search_locations[0])") && \
+    DYNAMO_PKG=$(python3 -c "import importlib.util; s=importlib.util.find_spec('dynamo.trtllm'); print(s.submodule_search_locations[0])") && \
+    MX_CLIENT=$(find / -path '*/modelexpress/client.py' -print -quit 2>/dev/null) && \
+    test -n "$MX_CLIENT" && echo "ModelExpress client OK: $MX_CLIENT" && \
+    MX_DIR=$(dirname "$MX_CLIENT") && \
+    VENV_SITE=$(dirname "$TRTLLM_PKG") && \
+    if [ ! -d "$VENV_SITE/modelexpress" ]; then \
+        ln -sf "$MX_DIR" "$VENV_SITE/modelexpress" && \
+        echo "Symlinked $MX_DIR -> $VENV_SITE/modelexpress"; \
+    fi && \
+    grep -q "model_express_url" "$DYNAMO_PKG/engine.py" && \
+    echo "engine.py model_express_url OK" && \
+    grep -q "p2p_succeeded" "$TRTLLM_PKG/_torch/pyexecutor/model_loader.py" && \
+    echo "model_loader.py MX patch OK" && \
+    grep -q "MXCheckpointLoader" "$TRTLLM_PKG/_torch/models/checkpoints/__init__.py" && \
+    echo "checkpoints/__init__.py patched OK" && \
+    grep -q "MODEL_EXPRESS_URL" "$TRTLLM_PKG/executor/worker.py" && \
+    echo "worker.py patched OK" && \
+    echo "All patches verified OK"

@@ -103,7 +103,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v2.9.0"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.1.0"
           command:
             - python3
           args:
@@ -210,7 +210,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v2.9.0"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.1.0"
           workingDir: /workspace/
           securityContext:
             privileged: true
@@ -414,7 +414,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v2.9.0"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.1.0"
           workingDir: /workspace/
           securityContext:
             privileged: true
