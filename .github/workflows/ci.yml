@@ -115,6 +115,44 @@ jobs:
       run: |
         .venv/bin/python -m pytest tests/ -v
 
+  go-test:
+    name: Go Bindings
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.24.x"
+        cache-dependency-path: modelexpress_client/go/go.sum
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Install protoc plugins
+      run: |
+        go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+        go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.0
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    - name: Validate generated bindings
+      run: |
+        modelexpress_client/go/generate_proto.sh
+        if [ -n "$(git status --porcelain -- modelexpress_client/go)" ]; then
+          git status --porcelain -- modelexpress_client/go
+          git diff -- modelexpress_client/go
+          exit 1
+        fi
+
+    - name: Run Go tests
+      working-directory: modelexpress_client/go
+      run: go test ./...
+
   integration-test:
     name: Integration Tests
     runs-on: ubuntu-latest
@@ -309,7 +347,7 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [test, python-test, integration-test, security-audit, docker-build, k8s-grpc-test]
+    needs: [test, python-test, go-test, integration-test, security-audit, docker-build, k8s-grpc-test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
@@ -352,7 +390,7 @@ jobs:
   notify:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [test, python-test, integration-test, security-audit, docker-build, k8s-grpc-test]
+    needs: [test, python-test, go-test, integration-test, security-audit, docker-build, k8s-grpc-test]
     if: failure()
 
     steps:
