@@ -53,8 +53,13 @@ class RdmaStrategy(LoadStrategy):
         if not is_nixl_available():
             return False
 
+        # Decentralized backends (k8s-service) serve their own
+        # metadata; skip the central-server precondition for them.
+        # Strict `is True` check so MagicMock's auto-attribute doesn't
+        # masquerade as the flag in tests.
         server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
-        if not server_addr:
+        requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
+        if not server_addr and not requires_p2p:
             logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
             return False
 

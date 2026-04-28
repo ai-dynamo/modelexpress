@@ -1,0 +1,143 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TP=2 multi-GPU-per-pod variant of sources-tp2.yaml.
+#
+# This is the "all ranks live in one pod" topology: each source pod has
+# N GPUs and runs N worker processes internally (vLLM spawns them via
+# --tensor-parallel-size=N). Each worker binds its WorkerGrpcServer on
+# MX_WORKER_GRPC_PORT + device_id. TP communication happens over NVLink
+# inside the pod, which is the shape most perf-conscious inference
+# deployments use (and the only shape that works at all for TP since
+# NVLink is intra-node).
+#
+# Because every pod has every rank, we only need ONE Service with N
+# named ports: external port 6555+R maps to the rank-R WorkerGrpcServer
+# inside the pod. Client-side pattern is just `mx-sources` (the default):
+# MxK8sServiceClient auto-computes `:MX_WORKER_GRPC_PORT + rank` when no
+# port is in the pattern.
+#
+# Scale to TP=N by adding N named ports to the Service (one per rank)
+# and setting --tensor-parallel-size=N in the vLLM command.
+#
+# Prerequisites:
+#   - HF token secret: kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#   - Nodes with N GPUs available per pod (for TP=2: 2x GPU per pod)
+#   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
+
+# ---------------------------------------------------------------------------
+# Service - one Service, one port per rank (port 6555+rank)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sources
+  labels:
+    app: mx-sources
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  ports:
+    # One port entry per rank. Port 6555 -> rank 0, 6556 -> rank 1, etc.
+    # The targetPort matches the external port: each rank's
+    # WorkerGrpcServer binds MX_WORKER_GRPC_PORT + device_id inside the
+    # pod, so external 6556 -> internal 6556 -> rank-1's server.
+    - name: rank-0
+      port: 6555
+      targetPort: 6555
+    - name: rank-1
+      port: 6556
+      targetPort: 6556
+  selector:
+    app: mx-sources
+
+# ---------------------------------------------------------------------------
+# Source Deployment - 2 replicas, each pod has 2 GPUs running TP=2
+# ---------------------------------------------------------------------------
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sources
+  labels:
+    app: mx-sources
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mx-sources
+  template:
+    metadata:
+      labels:
+        app: mx-sources
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_METADATA_BACKEND
+              value: "k8s-service"
+            # Bare hostname - MxK8sServiceClient auto-computes the port as
+            # MX_WORKER_GRPC_PORT + its own rank. No per-rank Services
+            # needed; the single mx-sources Service above handles all ranks
+            # via named ports.
+            - name: MX_K8S_SERVICE_PATTERN
+              value: "mx-sources"
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          # vLLM runs with TP=2 inside the pod, spawning one worker per
+          # GPU; each binds MX_WORKER_GRPC_PORT + device_id (6555 for
+          # rank 0, 6556 for rank 1).
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "2"
+          # Expose both per-rank ports on the pod; the Service routes
+          # external port 6555 -> :6555, 6556 -> :6556.
+          ports:
+            - name: rank-0
+              containerPort: 6555
+            - name: rank-1
+              containerPort: 6556
+          resources:
+            limits:
+              nvidia.com/gpu: 2
+              rdma/shared_ib: 2
+            requests:
+              nvidia.com/gpu: 2
+              rdma/shared_ib: 2
+          # Readiness probe checks rank-0's port only; in practice all
+          # ranks in a pod finish loading around the same time, so the
+          # first one being ready is a reasonable proxy.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/grpc_health_probe
+                - -addr=:6555
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3

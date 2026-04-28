@@ -368,6 +368,19 @@ class TestRdmaStrategyAvailability:
         ctx = _make_load_context()
         assert strategy.is_available(ctx) is False
 
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_available_when_decentralized_backend_and_no_server_address(self, _mock):
+        # Decentralized backends (REQUIRES_P2P_METADATA=True) don't need
+        # a central server, so the "no server configured" gate shouldn't
+        # trip. Strict `is True` check means MagicMock's auto-attribute
+        # in _make_load_context's default ctx does NOT accidentally
+        # trigger this path - this test has to override explicitly.
+        strategy = self._make_strategy()
+        ctx = _make_load_context()
+        ctx.mx_client.REQUIRES_P2P_METADATA = True
+        with patch.dict("os.environ", {}, clear=True):
+            assert strategy.is_available(ctx) is True
+
 
 # ---------------------------------------------------------------------------
 # RdmaStrategy._find_source_instances

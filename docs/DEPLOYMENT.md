@@ -238,21 +238,42 @@ See [`../examples/aggregated_k8s/README.md`](../examples/aggregated_k8s/README.m
 
 ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA. Use `--load-format mx`, which auto-detects whether to load from disk or receive via RDMA.
 
+### Choosing a Metadata Backend
+
+Pick based on workload, not operational preference. The choice has structural consequences for what the system can do.
+
+| Workload shape                                                         | Backend          | Why                                                                                                                                            |
+|------------------------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`    | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service-routing requires.             |
+| RL rollouts. Training loop updates weights every step, all inference pods refit in-place, repeat. | `redis` or `kubernetes` | Central store tracks each worker's state individually by `worker_id`. Targets can fetch "worker W as it exists right now" instead of random-sampling a pool. Live refits stay consistent at the per-worker level. |
+| Live fine-tune broadcasts. New checkpoint produced outside training, pushed to all replicas, hot-swapped in place. | `redis` or `kubernetes` | Same reason as RL. The k8s-service backend can't swap a live pod's source_id without restarting the pod.                                      |
+| Mixed-version fleet. Multiple revisions serving concurrently, callers dispatch by revision. | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, so multiple identities coexist cleanly. k8s-service requires one Service pool per identity.          |
+| Heterogeneous hardware. Some sources on H100, some on B200, callers match on topology. | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.   |
+| Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).   | Either           | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work. |
+
+The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
+
+See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
+
 ### P2P Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required on server) | `redis` or `kubernetes` |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` backend) |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_SKIP_FEATURE_CHECK` | `0` | Bypass the MLA feature gate for P2P transfer (testing only) |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
+| `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
+| `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
+| `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
+| `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
@@ -261,15 +282,12 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
-### P2P Metadata Exchange (Opt-In)
+### P2P Metadata Exchange
 
-By default, source workers publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server. With `MX_P2P_METADATA=1`, source workers instead publish lightweight endpoint pointers and exchange metadata directly with targets:
+`MX_P2P_METADATA=1` makes source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch both directly from the source worker rather than pulling them through the central store. The division of responsibility depends on which metadata backend is in use:
 
-- **NIXL agent blobs** exchanged via NIXL's native listen thread (`MX_METADATA_PORT`)
-- **Tensor descriptors** served by a per-worker gRPC `WorkerService` (`MX_WORKER_GRPC_PORT`)
-- **Central server** stores only endpoint addresses, not MB-scale metadata
-
-Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the metadata. No configuration needed on the target side.
+- **Central-coordinator backends (`redis`, `kubernetes`):** opt-in via `MX_P2P_METADATA=1`. By default the source publishes full tensor metadata (NIXL blobs + tensor descriptors) to the central server, and targets fetch the full blob from the server. With the env var set, the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration needed on the target side.
+- **`k8s-service` backend:** auto-enabled. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
@@ -357,6 +375,107 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 ```
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
+
+#### K8s-Service-Routed Backend
+
+No `modelexpress-server`, no Redis, no CRDs. Source pods sit behind a Kubernetes Service; clients hit the Service DNS and kube-proxy load-balances. See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for when to use this backend and when to prefer the central-coordinator alternatives.
+
+Two deployment topologies are supported; pick based on your TP parallelism needs:
+
+1. **Multi-GPU-per-pod** (TP ranks share NVLink inside one pod). One Service with N named ports. Default pattern: `MX_K8S_SERVICE_PATTERN=mx-sources`, client auto-computes `:{MX_WORKER_GRPC_PORT + rank}`.
+2. **1-GPU-per-pod** (one rank per pod; rank partitioning via labels). N Services with rank selectors. Pattern: `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555`.
+
+**Deploy the multi-GPU-per-pod shape (the common case for TP inference):**
+
+```bash
+# 1. Create the HF token secret (once per namespace).
+export HF_TOKEN=your_hf_token
+kubectl -n $NAMESPACE create secret generic hf-token-secret \
+  --from-literal=HF_TOKEN=${HF_TOKEN}
+
+# 2. Apply the source pool: one Service with N named ports + one
+#    Deployment with multi-GPU pods.
+kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/sources-tp2-single-pod.yaml
+
+# 3. Wait for the first replica to finish loading (can take minutes for
+#    large models). Readiness probe flips when the WorkerGrpcServer is
+#    serving.
+kubectl -n $NAMESPACE wait --for=condition=Ready pod -l app=mx-sources --timeout=15m
+
+# 4. Verify the Service has live endpoints.
+kubectl -n $NAMESPACE get svc mx-sources
+kubectl -n $NAMESPACE get endpoints mx-sources
+
+# 5. Scale up. New replicas will pull weights via P2P RDMA from the
+#    existing ready pods rather than re-downloading from storage.
+kubectl -n $NAMESPACE scale deployment mx-sources --replicas=4
+```
+
+**Deploy the 1-GPU-per-pod shape:**
+
+```bash
+kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/sources-tp2.yaml
+kubectl -n $NAMESPACE wait --for=condition=Ready pod -l app=mx-sources --timeout=15m
+kubectl -n $NAMESPACE apply -f examples/k8s_service_sources/target.yaml
+```
+
+**Minimal inline YAML for the single-Service / multi-port shape:**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sources
+spec:
+  selector: { app: mx-sources }
+  ports:
+    - { name: rank-0, port: 6555, targetPort: 6555 }
+    - { name: rank-1, port: 6556, targetPort: 6556 }
+    # ... one port per rank, port = 6555 + rank
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sources
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: mx-sources } }
+  template:
+    metadata: { labels: { app: mx-sources } }
+    spec:
+      containers:
+        - name: vllm
+          image: your-registry/modelexpress-client:TAG
+          env:
+            - { name: MX_METADATA_BACKEND, value: "k8s-service" }
+            - { name: MX_MODEL_REVISION,   value: "<pinned-commit-sha>" }
+            - { name: MX_WORKER_GRPC_PORT, value: "6555" }
+            # MX_K8S_SERVICE_PATTERN defaults to `mx-sources`; omit unless overriding.
+          args: ["--model", "$(MODEL_NAME)", "--load-format", "mx", "--tensor-parallel-size", "2"]
+          resources: { limits: { nvidia.com/gpu: 2 } }
+```
+
+**Common operations:**
+
+```bash
+# Check which rank a pod's workers are serving.
+kubectl -n $NAMESPACE logs deploy/mx-sources -c vllm | grep -i "worker_rank"
+
+# Inspect the Service's port -> backend mapping.
+kubectl -n $NAMESPACE describe svc mx-sources
+
+# Rolling update to a new model revision. Update MX_MODEL_REVISION env
+# in the Deployment; K8s rolls pods one by one; during the transition
+# kube-proxy may route to either version. The client handshake returns
+# FAILED_PRECONDITION on mismatch, and targets retry on a fresh channel.
+kubectl -n $NAMESPACE set env deployment/mx-sources MX_MODEL_REVISION=<new-sha>
+kubectl -n $NAMESPACE rollout status deployment/mx-sources
+
+# Tear down.
+kubectl -n $NAMESPACE delete -f examples/k8s_service_sources/sources-tp2-single-pod.yaml
+```
+
+See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_sources/README.md) for the annotated manifests and [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale.
 
 ## Debugging
 
