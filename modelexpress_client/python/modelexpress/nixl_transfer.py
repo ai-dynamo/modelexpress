@@ -86,6 +86,16 @@ class NixlTransferManager:
         auto-detect RoCE/IB transports, even if the global UCX_TLS is
         restricted to TCP (e.g., for MPI). Restores the original value
         after agent creation.
+
+        If MX_RDMA_NIC_PIN is set (comma-separated NIC list, e.g.
+        "mlx5_0:1,mlx5_1:1,..."), sets UCX_NET_DEVICES to the entry
+        indexed by self._device_id for the lifetime of the worker, so
+        each worker pins to its NUMA-local NIC instead of letting UCX
+        pick across the global pool. Avoids cross-socket SMP-interconnect
+        traffic that caps single-flow bandwidth at ~30-50 Gbps when a
+        worker's GPU and chosen NIC are on different NUMA nodes. The
+        override is permanent (not restored in finally) so any
+        subsequent UCP contexts created in the worker also pin.
         """
         import os
 
@@ -108,6 +118,27 @@ class NixlTransferManager:
         elif saved_ucx_tls == "tcp":
             os.environ.pop("UCX_TLS", None)
             logger.info("NIXL: removed UCX_TLS=tcp for auto-detection")
+
+        # Optional per-rank NIC pinning. Set permanently for the worker's
+        # lifetime (no restore in finally) so any subsequent UCP contexts
+        # also use the pinned NIC.
+        nic_pin = os.environ.get("MX_RDMA_NIC_PIN")
+        if nic_pin:
+            nic_list = [n.strip() for n in nic_pin.split(",") if n.strip()]
+            if 0 <= self._device_id < len(nic_list):
+                pinned = nic_list[self._device_id]
+                prev = os.environ.get("UCX_NET_DEVICES")
+                os.environ["UCX_NET_DEVICES"] = pinned
+                logger.info(
+                    f"NIXL NIC pin (MX_RDMA_NIC_PIN): device {self._device_id} -> "
+                    f"UCX_NET_DEVICES={pinned} (was: {prev})"
+                )
+            else:
+                logger.warning(
+                    f"NIXL NIC pin: device_id {self._device_id} out of range "
+                    f"for MX_RDMA_NIC_PIN list of length {len(nic_list)}; "
+                    f"keeping global UCX_NET_DEVICES={os.environ.get('UCX_NET_DEVICES')}"
+                )
 
         try:
             if self._listen_port is not None and nixl_agent_config:
