@@ -78,7 +78,7 @@ kv = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).reshape(1, 2, 501, 1
 
 ## Option 2: Reproduce end-to-end on GB200 (PRIME-RL overlay)
 
-Run our validated PRIME-RL overlay workflow and capture weights mid-flight.
+Run our validated PRIME-RL overlay workflow and capture weights mid-flight using the published [`scripts/`](./scripts/) directory.
 
 ### Prerequisites
 
@@ -93,7 +93,6 @@ Run our validated PRIME-RL overlay workflow and capture weights mid-flight.
 ### Step 1: Deploy the PRIME-RL overlay
 
 ```bash
-# Clone and check out the overlay branch
 git clone git@github.com:KavinKrishnan/prime-rl.git
 cd prime-rl
 git checkout kavink/mx-on-nixl
@@ -108,105 +107,55 @@ docker buildx build --platform linux/arm64 \
 # Deploy scenario A (baseline — PI's NIXL transport, no MX env vars)
 cd k8s/prime-rl-mx-on-nixl
 ./run.sh deploy A
-
-# Watch until all 3 pods are Running
-./run.sh status
+./run.sh status   # wait until all 3 pods are Running
 ```
 
 ### Step 2: Verify the RL loop is running
 
 ```bash
-# Trainer should show "Step N | Time: Xs" lines
 kubectl -n kavin logs prime-rl-mx-on-nixl-trainer-0 --tail=20 | grep "SUCCESS.*Step"
-
-# Inference should show /update_weights 200 OK
 kubectl -n kavin logs prime-rl-mx-on-nixl-inference-0 | grep "update_weights.*200"
 ```
 
-### Step 3: Capture weights from the running trainer
+### Step 3: Capture using the published script
+
+We ship `capture_on_pod.py` in [`scripts/`](./scripts/) — same script that produced our pre-captured Qwen2.5-1.5B package. It captures pre/post RL weights, simulates one AdamW step, computes deltas, and dumps a KV cache prefill, all in one pass.
 
 ```bash
-# Exec into the trainer pod
-kubectl -n kavin exec -it prime-rl-mx-on-nixl-trainer-0 -- bash
+# Copy the script into the trainer pod
+kubectl cp docs/RL/scripts/capture_on_pod.py \
+  kavin/prime-rl-mx-on-nixl-trainer-0:/tmp/capture.py
 
-# Inside the pod — capture pre/post RL weights + KV cache
-cd /tmp
-/app/.venv/bin/python - << 'PYEOF'
-import torch, json, os, time
-from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from safetensors.torch import save_file
+# Run it inside the pod (overlay image's interpreter is /app/.venv/bin/python)
+kubectl exec kavin/prime-rl-mx-on-nixl-trainer-0 -- /app/.venv/bin/python /tmp/capture.py \
+  --model Qwen/Qwen2.5-1.5B \
+  --out /tmp/nixl_capture \
+  --kv-seq-len 512 \
+  --lr 5e-6
 
-model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
-out = Path("/tmp/nixl_compression_capture")
-out.mkdir(exist_ok=True)
-
-print("Loading model...")
-model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="cpu")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-# 1. Capture current weights (= what NIXL transfers during refit)
-print("Saving current weights...")
-sd = {k: v.clone() for k, v in model.state_dict().items()}
-save_file(sd, str(out / "weights_current.safetensors"))
-
-# 2. Simulate one RL step for delta capture
-print("Simulating one RL step...")
-model.to("cuda:0")
-model.train()
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6)
-inputs = tokenizer("The quick brown fox jumps over the lazy dog", return_tensors="pt").to("cuda:0")
-loss = model(**inputs, labels=inputs["input_ids"]).loss
-loss.backward()
-optimizer.step()
-
-sd_post = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-save_file(sd_post, str(out / "weights_post_step.safetensors"))
-
-# 3. Compute delta
-deltas = {}
-for k in sd:
-    d = sd_post[k].float() - sd[k].float()
-    deltas[k] = d.to(torch.bfloat16)
-save_file(deltas, str(out / "weight_deltas.safetensors"))
-
-# 4. KV cache from a prefill pass
-print("Capturing KV cache...")
-model.eval()
-kv_out = out / "kv_cache"
-kv_out.mkdir(exist_ok=True)
-with torch.no_grad():
-    outputs = model(**inputs, use_cache=True)
-manifest = {"tensors": []}
-for i, layer_kv in enumerate(outputs.past_key_values):
-    for j, name in enumerate(["key", "value"]):
-        t = layer_kv[j].cpu().contiguous()
-        fname = f"layer_{i}_{name}.bin"
-        (kv_out / fname).write_bytes(t.numpy().tobytes())
-        manifest["tensors"].append({
-            "name": f"layer_{i}_{name}", "shape": list(t.shape),
-            "dtype": "bfloat16", "size_bytes": t.numel() * 2, "file": fname
-        })
-json.dump(manifest, open(kv_out / "manifest.json", "w"), indent=2)
-
-# 5. Write weight manifest
-w_manifest = {"model": model_name, "tensors": []}
-for k, v in sd.items():
-    w_manifest["tensors"].append({
-        "name": k, "shape": list(v.shape), "dtype": str(v.dtype),
-        "size_bytes": v.numel() * v.element_size()
-    })
-json.dump(w_manifest, open(out / "manifest.json", "w"), indent=2)
-
-print(f"Done. Files in {out}")
-PYEOF
-
-# Copy out of the pod
-exit
-kubectl -n kavin cp prime-rl-mx-on-nixl-trainer-0:/tmp/nixl_compression_capture ./nixl_capture
+# Copy the results back
+kubectl cp kavin/prime-rl-mx-on-nixl-trainer-0:/tmp/nixl_capture ./RL_capture
 ```
 
-### Step 4: Tear down
+Output `RL_capture/` contains four sub-directories (`weights_pre_rl/`, `weights_post_rl/`, `weight_deltas/`, `kv_cache/`) each with raw `.bin` files plus a `manifest.json`. See [`scripts/README.md`](./scripts/README.md) for the full layout + flag reference.
+
+### Step 4 (optional): Capture without a running RL deployment
+
+If reproducing the overlay is more cluster work than the data is worth, [`scripts/capture_weights_and_kv.py`](./scripts/capture_weights_and_kv.py) is the **standalone** variant — works on any host (CPU or single GPU), no Kubernetes / RL framework required:
+
+```bash
+pip install torch transformers safetensors
+
+python docs/RL/scripts/capture_weights_and_kv.py \
+  --model Qwen/Qwen2.5-1.5B \
+  --output-dir ./nixl_data \
+  --dtype bfloat16 \
+  --device cpu
+```
+
+Doesn't simulate an RL step (no pre/post/delta), but produces the same weight + KV cache layout the NIXL team can compress against.
+
+### Step 5: Tear down
 
 ```bash
 ./run.sh clean
