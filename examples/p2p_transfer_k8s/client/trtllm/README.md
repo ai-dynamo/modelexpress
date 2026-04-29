@@ -146,6 +146,7 @@ nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.2.0   # new base, E2E vali
 | `mx-infra-decode.yaml` | ModelExpress server + Redis deployment |
 | `kimi-source-decode-dgd.yaml` | Source DGD (TP=8, loads from disk, publishes) |
 | `kimi-disagg-mx-tp8-dgd.yaml` | Target DGD (prefill + decode + frontend, loads via RDMA) |
+| [`hpa/`](hpa/README.md) | HPA-driven autoscale demo (single-replica → multi-replica with RDMA) |
 
 Patch scripts (in `trtllm_patches/`):
 
