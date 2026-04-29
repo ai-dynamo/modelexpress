@@ -5,13 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Architecture
 
-Detailed reference document for the ModelExpress codebase. For deployment and configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage, see [`CLI.md`](CLI.md).
+Detailed reference document for the ModelExpress codebase. For deployment and configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage, see [`CLI.md`](CLI.md). For GCS provider internals, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
 
 ## Project Overview
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace and NGC with SQLite-backed tracking and LRU cache eviction.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS with SQLite-backed tracking and LRU cache eviction.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
 
 ### Current Status
@@ -30,6 +30,7 @@ graph TD
         S1 --> DB[(SQLite)]
         S1 --> HF[HuggingFace Hub]
         S1 --> NGC[NVIDIA NGC]
+        S1 --> GCS[Google Cloud Storage]
         S1 --> Cache[Model Cache Dir]
     end
 
@@ -151,8 +152,10 @@ ModelExpress/
 │       ├── config.rs                   # Config trait utilities
 │       ├── download.rs                 # Download orchestration (smart-fallback, direct, server-only)
 │       ├── models.rs                   # Status, ModelProvider, ModelStatus, ModelStatusResponse
-│       ├── providers.rs               # ModelProviderTrait definition, re-exports
+│       ├── providers.rs                # ModelProviderTrait definition, re-exports
 │       └── providers/
+│           ├── gcs.rs                  # GcsProvider implementation
+│           ├── gcs/                    # GCS manifest, cache layout, locking, download helpers
 │           ├── huggingface.rs          # HuggingFaceProvider implementation
 │           └── ngc.rs                  # NgcProvider implementation
 │
@@ -260,7 +263,7 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
 
-Key message types: `ModelProvider` (HuggingFace, NGC), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
+Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 ### p2p.proto - P2pService
 
@@ -418,7 +421,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 | `config` | Config trait utilities |
 | `download` | Download orchestration with strategy pattern |
 | `models` | `Status`, `ModelProvider`, `ModelStatus`, `ModelStatusResponse` |
-| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` |
+| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` + `GcsProvider` |
 | `grpc` | Generated tonic stubs for all 4 services |
 | `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (32KB) |
 
@@ -428,7 +431,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 #[async_trait]
 pub trait ModelProviderTrait: Send + Sync {
     async fn download_model(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool) -> Result<PathBuf>;
-    async fn delete_model(&self, name: &str) -> Result<()>;
+    async fn delete_model(&self, name: &str, cache_dir: PathBuf) -> Result<()>;
     async fn get_model_path(&self, name: &str, cache_dir: PathBuf) -> Result<PathBuf>;
     fn provider_name(&self) -> &'static str;
     fn is_ignored(filename: &str) -> bool;
@@ -437,9 +440,10 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
-Two implementations:
-- `HuggingFaceProvider` — uses the `hf-hub` crate with high-CPU download mode.
-- `NgcProvider` — downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
+Three implementations:
+- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode.
+- `NgcProvider` - downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
+- `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
 
 ### ClientConfig / ClientArgs
 
