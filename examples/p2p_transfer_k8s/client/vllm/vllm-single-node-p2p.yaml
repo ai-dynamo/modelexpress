@@ -68,6 +68,9 @@ spec:
               value: "modelexpress-server:8001"
             - name: MX_CONTIGUOUS_REG
               value: "0"
+            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
             # P2P metadata exchange: source workers serve NIXL metadata and
             # tensor manifests directly to targets instead of via the server.
             - name: MX_P2P_METADATA

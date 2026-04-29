@@ -268,6 +268,8 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
+| `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
+| `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_SKIP_FEATURE_CHECK` | `0` | Bypass the MLA feature gate for P2P transfer (testing only) |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only) |
@@ -281,6 +283,30 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `VLLM_PLUGINS` | - | Set to `modelexpress` to register the mx loader |
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### NIC Pinning (UCX Workaround)
+
+`MX_RDMA_NIC_PIN=auto` works around
+[openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259), where
+UCX may pick a NIC on a different NUMA node from a worker's GPU when
+the IB device pool spans multiple NUMA domains; the resulting CUDA
+RDMA traffic crosses the CPU interconnect and loses bandwidth.
+
+The probe runs at worker startup, walks PCIe sysfs, and sets
+`UCX_NET_DEVICES` to a single NUMA-local NIC per worker before the
+NIXL agent is constructed. Same affinity metric as
+`nvidia-smi topo -m` (PIX > PXB > NODE > SYS).
+
+Recommended on multi-GPU hosts where the IB pool spans NUMA. Leave
+unset on single-NUMA hosts or when you manage `UCX_NET_DEVICES` per
+rank externally. Once the upstream UCX fix lands and a patched UCX
+is deployed, drop this env var.
+
+`MX_RDMA_NIC_PIN_MIN_RATE_GBPS` overrides the default max-rate filter
+for clusters with multiple rate tiers in the compute fabric.
+`MX_RDMA_NIC_PIN` also accepts a comma-separated NIC list indexed by
+`device_id` for unusual topologies where the auto-probe can't infer
+the mapping.
 
 ### P2P Metadata Exchange (Opt-In)
 

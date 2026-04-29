@@ -74,6 +74,9 @@ spec:
             # Set to "1" for contiguous regions (experimental - see docs/CONTIGUOUS_CONTEXT.md)
             - name: MX_CONTIGUOUS_REG
               value: "0"
+            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
             # Logging (set to DEBUG for troubleshooting)
             - name: NIXL_LOG_LEVEL
               value: "INFO"

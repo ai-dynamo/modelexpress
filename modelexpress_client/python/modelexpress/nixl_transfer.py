@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 
+from . import ucx_utils
 from .types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
@@ -86,6 +87,10 @@ class NixlTransferManager:
         auto-detect RoCE/IB transports, even if the global UCX_TLS is
         restricted to TCP (e.g., for MPI). Restores the original value
         after agent creation.
+
+        Optional per-rank NIC pinning (MX_RDMA_NIC_PIN) is delegated to
+        ucx_utils.apply_nic_pin_for_device. Default (env var unset) is a
+        no-op. See ucx_utils for the topology probe and env var modes.
         """
         import os
 
@@ -108,6 +113,12 @@ class NixlTransferManager:
         elif saved_ucx_tls == "tcp":
             os.environ.pop("UCX_TLS", None)
             logger.info("NIXL: removed UCX_TLS=tcp for auto-detection")
+
+        # Optional per-rank NIC pinning, set permanently for the worker's
+        # lifetime so any subsequently-created UCP contexts also pin.
+        # No-op unless MX_RDMA_NIC_PIN is set. See ucx_utils for full env
+        # semantics and the topology probe.
+        ucx_utils.apply_nic_pin_for_device(self._device_id)
 
         try:
             if self._listen_port is not None and nixl_agent_config:
