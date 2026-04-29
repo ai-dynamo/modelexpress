@@ -7,9 +7,8 @@
 //! `status`, `created_at`, `last_used_at`, and optional `message`. LRU and status tallies
 //! use on-demand `SCAN` + pipelined reads (no secondary indexes).
 //!
-//! [`CLAIM_LUA`] is the only Lua used: it combines the "claim if absent, else read status"
-//! check + full field population into a single atomic EVAL so concurrent readers never
-//! see a partially-written record.
+//! Lua scripts combine claim/retry/set-status mutations into single atomic EVALs so
+//! concurrent readers never see a partially-written record.
 
 use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use async_trait::async_trait;

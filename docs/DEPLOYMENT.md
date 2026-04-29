@@ -115,6 +115,8 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | S3 ModelStreamer on clients | none | Clients bypass MX cache entirely |
 | P2P RDMA receivers | none on receiver (sender still needs disk) | Weights land in GPU HBM |
 
+For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
+
 #### Cache Settings
 
 | Option | CLI Flag | Env Var | Default | Description |

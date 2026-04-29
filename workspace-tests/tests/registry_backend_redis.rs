@@ -151,6 +151,55 @@ async fn concurrent_claims_yield_single_winner() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+async fn concurrent_error_retries_yield_single_winner() {
+    let backend = Arc::new(fresh_backend().await);
+    let name = unique_name("retry");
+
+    backend
+        .set_status(
+            &name,
+            ModelProvider::HuggingFace,
+            ModelStatus::ERROR,
+            Some("seeded failure".to_string()),
+        )
+        .await
+        .expect("seed ERROR record");
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let b = backend.clone();
+        let n = name.clone();
+        handles.push(tokio::spawn(async move {
+            b.try_reset_error_for_retry(&n, ModelProvider::HuggingFace)
+                .await
+        }));
+    }
+
+    let mut winners = 0;
+    let mut observers = 0;
+    for h in handles {
+        if h.await.expect("spawn join").expect("retry CAS result") {
+            winners += 1;
+        } else {
+            observers += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one replica must win retry CAS");
+    assert_eq!(observers, 7, "the other seven must observe retry owner");
+
+    let rec = backend
+        .get_model_record(&name)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(rec.status, ModelStatus::DOWNLOADING);
+    assert_eq!(rec.message.as_deref(), Some("Retrying download..."));
+
+    backend.delete_model(&name).await.expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
 async fn touch_updates_last_used_at() {
     let backend = fresh_backend().await;
     let name = unique_name("touch");

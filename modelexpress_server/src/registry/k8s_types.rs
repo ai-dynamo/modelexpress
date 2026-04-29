@@ -30,7 +30,7 @@ pub struct ModelCacheEntrySpec {
     #[serde(rename = "modelName")]
     pub model_name: String,
 
-    /// Provider string — `"HuggingFace"` or `"Ngc"`.
+    /// Provider string — `"HuggingFace"`, `"Ngc"`, or `"Gcs"`.
     pub provider: String,
 }
 

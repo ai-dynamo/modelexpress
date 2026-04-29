@@ -406,9 +406,14 @@ impl RegistryBackend for KubernetesRegistryBackend {
                         .delete(&cr_name, &kube::api::DeleteParams::default())
                         .await
                     {
+                        // A CR stranded with empty phase is currently observed as
+                        // DOWNLOADING. MX-287 tracks registry claim reaping so this
+                        // recovery path can clear phantom owners after server/API
+                        // failures.
                         warn!(
                             "patch_status failed for {cr_name}; rollback delete also \
-                             failed: {delete_err}. CR may be left with empty phase."
+                             failed: {delete_err}. CR may be left with empty phase \
+                             until MX-287 registry claim reaping lands."
                         );
                     } else {
                         debug!("Rolled back {cr_name} after patch_status failure: {patch_err}");

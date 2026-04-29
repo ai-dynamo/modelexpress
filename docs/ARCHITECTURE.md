@@ -338,7 +338,7 @@ Distributed backend selection lives outside the YAML, in env vars: `MX_METADATA_
 
 ### ModelRegistryBackend (Redis and Kubernetes CRD)
 
-**Redis backend**: single Redis Hash per cached model at `mx:model:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Atomicity on the claim path comes from `HSETNX` on the status field.
+**Redis backend**: single Redis Hash per cached model at `mx:model:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
 
 **Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names use the shared `sanitize_model_name` with an `mx-cache-` prefix to stay distinct from the P2P `ModelMetadata` CRs.
 
@@ -347,14 +347,14 @@ Key operations on the async `RegistryBackend` trait:
 | Method | Redis implementation |
 |--------|----------------------|
 | `get_status(name)` | `HGET mx:model:{name} status` |
-| `set_status(name, provider, status, msg)` | Pipelined `HSET` + `HSETNX created_at` to preserve the first-write timestamp |
+| `set_status(name, provider, status, msg)` | Lua `EVAL` updates status/provider/last_used_at/message atomically and `HSETNX`s `created_at` to preserve the first-write timestamp |
 | `try_claim_for_download(name, provider)` | `HSETNX status DOWNLOADING`; winner populates remaining fields without contention |
 | `touch_model(name)` | `HSET last_used_at {now}` (gated on `EXISTS` so touch is update-only, never create) |
 | `delete_model(name)` | `DEL` |
 | `get_models_by_last_used(limit)` | `SCAN mx:model:*` + pipelined `HGETALL` + Rust-side sort |
 | `get_status_counts()` | `SCAN mx:model:*` + pipelined `HGET status` + Rust-side tally |
 
-Concurrency: `Arc<Mutex<Connection>>` with poison recovery.
+Concurrency: Redis backends use cloned async `ConnectionManager`s behind an `RwLock` for lazy initialization and reconnect caching.
 
 ### CacheEvictionService
 
