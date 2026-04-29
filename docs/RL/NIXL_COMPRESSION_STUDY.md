@@ -24,12 +24,14 @@ Both produce the **exact same kind of data** the NIXL team requested: raw BF16 w
 
 ---
 
-## Option 1: Use pre-captured data (fastest)
+## Option 1: Request the pre-captured data package (fastest)
 
-We have a ready-made data package captured from a live PRIME-RL deployment on GB200:
+We have a ready-made data package captured from a live PRIME-RL deployment on GB200. **It's not in this repo** (binary tensors at GB scale aren't appropriate to commit) — request access from `kavink@nvidia.com` and we'll share via the appropriate channel (NV S3 bucket, internal share, or direct upload to your `eschmidt@nvidia.com` inbox per the original request).
+
+Package contents:
 
 ```text
-recovery/reinforcement learning/nixl_compression_data/RL_Qwen25/
+RL_Qwen25/
 ├── model.safetensors              # 2.9 GB — all 338 weight tensors (BF16)
 ├── weights_pre_rl.safetensors     # 3.4 GB — weights before optimizer.step()
 ├── weights_post_rl.safetensors    # 3.4 GB — weights after 1 AdamW step (lr=5e-6)
@@ -43,7 +45,7 @@ recovery/reinforcement learning/nixl_compression_data/RL_Qwen25/
 └── README.md                      #          full layout + compression properties
 ```
 
-**Model**: Qwen2.5-1.5B BF16, 28 layers, 1.54B parameters.
+**Model**: Qwen2.5-1.5B BF16, 28 layers, 1.54B parameters. ~14 GB total package size.
 
 **How to read**:
 
@@ -239,7 +241,7 @@ The steps above use Qwen3-0.6B (our scenario A model). For larger models closer 
 | Model | Params | Weight payload | Notes |
 |-------|--------|----------------|-------|
 | Qwen3-0.6B (above) | 0.6B | ~1.2 GB | Validated in PR #2343 scenarios A/B/C |
-| Qwen2.5-1.5B | 1.5B | ~3 GB | Pre-captured data already available (see Option 1) |
+| Qwen2.5-1.5B | 1.5B | ~3 GB | Pre-captured package available on request (see Option 1) |
 | Qwen2.5-7B | 7.6B | ~15 GB | T1 model in our overlay plan |
 | Qwen3-MoE (PI offered spec) | MoE | varies | Would exercise `ExpertSlot` + per-expert tensors — most representative for MoE compression |
 
