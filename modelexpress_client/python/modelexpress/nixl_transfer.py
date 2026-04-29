@@ -157,29 +157,42 @@ def _nic_pci_bdf(nic_name: str) -> str | None:
 
 
 def _list_compute_ib_nics(
-    min_rate_gbps: float,
+    min_rate_gbps: float | None = None,
 ) -> list[tuple[str, int, float, list[str]]]:
-    """Enumerate IB NICs eligible for compute RDMA traffic.
+    """Enumerate IB-class NICs eligible for compute RDMA traffic.
+
+    Probe surface is /sys/class/infiniband/, which is the kernel verbs
+    API. This covers InfiniBand, RoCE, OPA, and AWS EFA - any fabric
+    that exposes via ibv_*. Fabrics outside the verbs API (e.g. HPE
+    Cray Slingshot's CXI driver) are not visible here; on those
+    systems users should either leave MX_RDMA_NIC_PIN unset or set it
+    to an explicit NIC list. If /sys/class/infiniband is missing or
+    empty (most non-RDMA hosts) this returns []; the caller treats
+    that as "skip pin" and leaves UCX selection alone.
 
     Filters out:
-      - bonded interfaces (e.g. mlx5_bond_0): UCX cannot resolve them in
-        containers and the AH lookup segfaults.
+      - bonded interfaces (e.g. mlx5_bond_0): UCX cannot resolve them
+        in containers and the AH lookup segfaults.
       - NICs without a /ports/1 directory.
-      - NICs whose port-1 rate is below `min_rate_gbps`. The default
-        threshold excludes lower-rate management/storage-fabric NICs
-        which often sit on a different IB subnet from the compute fabric
-        and cause UCX keepalive death when mixed with it.
+      - NICs whose port-1 rate is below the effective threshold.
+        If min_rate_gbps is None (default), the threshold is set to
+        max(rate) over discovered NICs - this strips any side-fabric
+        NICs (management, storage) running slower than the compute
+        fabric without hardcoding a number. If min_rate_gbps is set,
+        it is used as an absolute lower bound (overrides the max-rate
+        autodetect; useful for clusters with mixed-tier compute
+        fabrics where you do want to keep multiple rates).
 
-    Returns a list of (nic_name, numa_node, rate_gbps, pci_path) sorted
-    alphabetically by NIC name. The PCIe path is the BDF chain from
-    /sys realpath; pair-wise common-prefix depth between a GPU's path
-    and a NIC's path encodes affinity (PIX > PXB > NODE > SYS) and is
-    the actual selection signal in probe_nic_pin_for_device(). NIC name
-    ordering only affects the final lex tiebreak.
+    Returns a list of (nic_name, numa_node, rate_gbps, pci_path)
+    sorted alphabetically by NIC name. The PCIe path is the BDF chain
+    from /sys realpath; pair-wise common-prefix depth between a GPU's
+    path and a NIC's path encodes affinity (PIX > PXB > NODE > SYS)
+    and is the actual selection signal in probe_nic_pin_for_device().
+    NIC name ordering only affects the final lex tiebreak.
 
     NUMA is read from /sys/class/infiniband/<nic>/device/numa_node and
-    is kept on the tuple for diagnostic logging only; -1 if the kernel
-    reports unknown.
+    is kept on the tuple for diagnostic logging only; -1 if the
+    kernel reports unknown.
     """
     import os
 
@@ -187,12 +200,12 @@ def _list_compute_ib_nics(
     if not os.path.isdir(base):
         return []
 
-    out: list[tuple[str, int, float, list[str]]] = []
     try:
         names = sorted(os.listdir(base))
     except OSError:
         return []
 
+    candidates: list[tuple[str, float, str]] = []
     for name in names:
         if "bond" in name:
             continue
@@ -201,7 +214,21 @@ def _list_compute_ib_nics(
             continue
         rate_str = _read_str_file(f"{port_dir}/rate")
         rate = _parse_ib_rate_gbps(rate_str) if rate_str else None
-        if rate is None or rate < min_rate_gbps:
+        if rate is None:
+            continue
+        candidates.append((name, rate, port_dir))
+
+    if not candidates:
+        return []
+
+    if min_rate_gbps is None:
+        threshold = max(r for _, r, _ in candidates)
+    else:
+        threshold = min_rate_gbps
+
+    out: list[tuple[str, int, float, list[str]]] = []
+    for name, rate, _port_dir in candidates:
+        if rate < threshold:
             continue
         numa = _read_int_file(f"{base}/{name}/device/numa_node")
         if numa is None:
@@ -212,36 +239,49 @@ def _list_compute_ib_nics(
     return out
 
 
-def probe_nic_pin_for_device(device_id: int, min_rate_gbps: float = 200.0) -> str | None:
+def probe_nic_pin_for_device(
+    device_id: int, min_rate_gbps: float | None = None
+) -> str | None:
     """Probe topology and choose a UCX_NET_DEVICES value for a given GPU.
 
     Selection signal is PCIe sysfs path distance: each device's
     /sys/bus/pci/devices/<bdf> realpath exposes the full bus tree, and
-    the longest common BDF prefix between a GPU's path and a NIC's path
-    encodes affinity (PIX > PXB > NODE > SYS, the same metric
+    the longest common BDF prefix between a GPU's path and a NIC's
+    path encodes affinity (PIX > PXB > NODE > SYS, the same metric
     nvidia-smi topo -m reports). NIC names and GPU indices stop
     mattering for correctness; they only affect the final lex tiebreak.
 
     Strategy:
-      1. Enumerate compute-fabric IB NICs (rate >= min_rate_gbps, not
-         bonded) along with their PCIe paths.
+      1. Enumerate compute-fabric IB-class NICs (verbs-API: IB / RoCE
+         / OPA / EFA), with their PCIe paths. Rate filtering: by
+         default, keep only NICs at max(rate) across the discovered
+         set so side-fabric NICs (management, storage) at a lower
+         rate are stripped. min_rate_gbps overrides this with an
+         explicit absolute lower bound.
       2. Discover every visible CUDA device's PCIe path so this rank
-         computes the same global GPU->NIC assignment that every other
-         rank computes from the same /sys snapshot. No coordination.
+         computes the same global GPU->NIC assignment that every
+         other rank computes from the same /sys snapshot. No
+         coordination.
       3. Greedy assignment in visible-index order. Each GPU picks the
-         NIC with highest (score, fewest-prior-assignments, lex-smallest
-         name) - score dominates, then load balancing across reuse,
-         then determinism. Reuse is allowed when GPU count exceeds NIC
-         count, with cycle counts kept balanced.
+         NIC with highest (score, fewest-prior-assignments,
+         lex-smallest name) - score dominates, then load balancing
+         across reuse, then determinism. Reuse is allowed when GPU
+         count exceeds NIC count, with cycle counts kept balanced.
       4. Returns this rank's assignment as 'NICNAME:1', or None if no
-         compute IB device is reachable.
+         compute device is reachable.
     """
     nics = _list_compute_ib_nics(min_rate_gbps)
     if not nics:
+        rate_desc = (
+            "max-rate auto-detect"
+            if min_rate_gbps is None
+            else f"rate >= {min_rate_gbps} Gb/s"
+        )
         logger.warning(
-            f"MX_RDMA_NIC_PIN auto-probe: no compute IB NICs found "
-            f"(rate >= {min_rate_gbps} Gb/s under /sys/class/infiniband); "
-            f"skipping pin"
+            f"MX_RDMA_NIC_PIN auto-probe: no compute IB-class NICs found "
+            f"under /sys/class/infiniband ({rate_desc}); skipping pin. "
+            f"This is expected on hosts without IB / RoCE / OPA / EFA, "
+            f"or on fabrics outside the kernel verbs API (e.g. Slingshot)."
         )
         return None
 
@@ -337,11 +377,14 @@ def _resolve_nic_pin(device_id: int) -> str | None:
       - unset / "off" / "0" / "false" / "no": returns None (no pinning).
       - explicit comma-separated list: indexed by device_id, like the
         original hardcoded shape. Useful for unusual topologies where
-        the auto-probe heuristic doesn't fit.
+        the auto-probe heuristic doesn't fit (e.g. fabrics outside the
+        kernel verbs API).
       - any other truthy value (e.g. "auto", "1", "true", "yes", "on"):
-        runs probe_nic_pin_for_device(). Min rate gating is read from
-        MX_RDMA_NIC_PIN_MIN_RATE_GBPS (default 200 Gb/s, which excludes
-        lower-rate management/storage-fabric NICs).
+        runs probe_nic_pin_for_device(). Rate filtering defaults to
+        max-rate auto-detect (keep only NICs at the fastest rate
+        present, strips slower side-fabric NICs without hardcoding a
+        number). MX_RDMA_NIC_PIN_MIN_RATE_GBPS overrides with an
+        explicit absolute lower bound when needed.
     """
     import os
 
@@ -363,10 +406,18 @@ def _resolve_nic_pin(device_id: int) -> str | None:
         )
         return None
 
-    try:
-        min_rate = float(os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS", "200"))
-    except ValueError:
-        min_rate = 200.0
+    raw_min = os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS")
+    if raw_min is None or raw_min.strip() == "":
+        min_rate: float | None = None
+    else:
+        try:
+            min_rate = float(raw_min)
+        except ValueError:
+            logger.warning(
+                f"MX_RDMA_NIC_PIN_MIN_RATE_GBPS={raw_min!r} not a float; "
+                f"falling back to max-rate auto-detect"
+            )
+            min_rate = None
     return probe_nic_pin_for_device(device_id, min_rate_gbps=min_rate)
 
 
