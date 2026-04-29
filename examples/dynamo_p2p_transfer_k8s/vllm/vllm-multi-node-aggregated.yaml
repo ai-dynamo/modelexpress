@@ -117,6 +117,9 @@ spec:
         # P2P inference verified correct with adopt_hidden_tensors fix.
         - name: MX_SKIP_FEATURE_CHECK
           value: "1"
+        # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+        - name: MX_RDMA_NIC_PIN
+          value: "auto"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL

@@ -285,6 +285,9 @@ spec:
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
+            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
             - name: UCX_TLS
               value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
@@ -489,6 +492,9 @@ spec:
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
+            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
             - name: UCX_TLS
               value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
