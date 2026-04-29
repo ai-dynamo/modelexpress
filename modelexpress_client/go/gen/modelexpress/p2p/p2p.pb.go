@@ -205,8 +205,16 @@ type SourceIdentity struct {
 	Quantization string `protobuf:"bytes,9,opt,name=quantization,proto3" json:"quantization,omitempty"`
 	// Escape hatch for framework-specific config
 	ExtraParameters map[string]string `protobuf:"bytes,10,rep,name=extra_parameters,json=extraParameters,proto3" json:"extra_parameters,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Content-addressed revision of the model weights (e.g., HuggingFace
+	// commit SHA, S3 object version, or any deployer-provided version
+	// string). When populated, two sources with identical SourceIdentity
+	// are guaranteed to have bit-identical weight bytes, which lets
+	// decentralized modes (no central coordinator) use mx_source_id as a
+	// full content check. Empty string means "unknown revision" and is
+	// compatible with older publishers that pre-date this field.
+	Revision      string `protobuf:"bytes,11,opt,name=revision,proto3" json:"revision,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SourceIdentity) Reset() {
@@ -307,6 +315,13 @@ func (x *SourceIdentity) GetExtraParameters() map[string]string {
 		return x.ExtraParameters
 	}
 	return nil
+}
+
+func (x *SourceIdentity) GetRevision() string {
+	if x != nil {
+		return x.Revision
+	}
+	return ""
 }
 
 type TensorDescriptor struct {
@@ -588,7 +603,13 @@ type GetTensorManifestResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Tensors []*TensorDescriptor    `protobuf:"bytes,1,rep,name=tensors,proto3" json:"tensors,omitempty"`
 	// Echoed mx_source_id for confirmation
-	MxSourceId    string `protobuf:"bytes,2,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	MxSourceId string `protobuf:"bytes,2,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// host:port of this worker's NIXL listen thread
+	MetadataEndpoint string `protobuf:"bytes,3,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
+	// NIXL agent name for the serving worker
+	AgentName string `protobuf:"bytes,4,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
+	// Rank of the serving worker (for rank-matched transfers)
+	WorkerRank    uint32 `protobuf:"varint,5,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -635,6 +656,27 @@ func (x *GetTensorManifestResponse) GetMxSourceId() string {
 		return x.MxSourceId
 	}
 	return ""
+}
+
+func (x *GetTensorManifestResponse) GetMetadataEndpoint() string {
+	if x != nil {
+		return x.MetadataEndpoint
+	}
+	return ""
+}
+
+func (x *GetTensorManifestResponse) GetAgentName() string {
+	if x != nil {
+		return x.AgentName
+	}
+	return ""
+}
+
+func (x *GetTensorManifestResponse) GetWorkerRank() uint32 {
+	if x != nil {
+		return x.WorkerRank
+	}
+	return 0
 }
 
 type PublishMetadataRequest struct {
@@ -1200,7 +1242,7 @@ var File_p2p_proto protoreflect.FileDescriptor
 
 const file_p2p_proto_rawDesc = "" +
 	"\n" +
-	"\tp2p.proto\x12\x11model_express.p2p\"\xe2\x04\n" +
+	"\tp2p.proto\x12\x11model_express.p2p\"\xfe\x04\n" +
 	"\x0eSourceIdentity\x12\x1d\n" +
 	"\n" +
 	"mx_version\x18\x01 \x01(\tR\tmxVersion\x12E\n" +
@@ -1214,7 +1256,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\x05dtype\x18\b \x01(\tR\x05dtype\x12\"\n" +
 	"\fquantization\x18\t \x01(\tR\fquantization\x12a\n" +
 	"\x10extra_parameters\x18\n" +
-	" \x03(\v26.model_express.p2p.SourceIdentity.ExtraParametersEntryR\x0fextraParameters\x1aB\n" +
+	" \x03(\v26.model_express.p2p.SourceIdentity.ExtraParametersEntryR\x0fextraParameters\x12\x1a\n" +
+	"\brevision\x18\v \x01(\tR\brevision\x1aB\n" +
 	"\x14ExtraParametersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x81\x01\n" +
@@ -1241,11 +1284,16 @@ const file_p2p_proto_rawDesc = "" +
 	"\x10backend_metadata\"<\n" +
 	"\x18GetTensorManifestRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
-	"mxSourceId\"|\n" +
+	"mxSourceId\"\xe9\x01\n" +
 	"\x19GetTensorManifestResponse\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\x12 \n" +
 	"\fmx_source_id\x18\x02 \x01(\tR\n" +
-	"mxSourceId\"\xaf\x01\n" +
+	"mxSourceId\x12+\n" +
+	"\x11metadata_endpoint\x18\x03 \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
+	"\n" +
+	"agent_name\x18\x04 \x01(\tR\tagentName\x12\x1f\n" +
+	"\vworker_rank\x18\x05 \x01(\rR\n" +
+	"workerRank\"\xaf\x01\n" +
 	"\x16PublishMetadataRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x129\n" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12\x1b\n" +
