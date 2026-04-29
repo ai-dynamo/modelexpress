@@ -43,8 +43,16 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Health service implementation
-#[derive(Debug, Default)]
-pub struct HealthServiceImpl;
+#[derive(Debug)]
+pub struct HealthServiceImpl {
+    cache_directory: String,
+}
+
+impl HealthServiceImpl {
+    pub fn new(cache_directory: String) -> Self {
+        Self { cache_directory }
+    }
+}
 
 #[tonic::async_trait]
 impl HealthService for HealthServiceImpl {
@@ -62,6 +70,7 @@ impl HealthService for HealthServiceImpl {
             version: env!("CARGO_PKG_VERSION").to_string(),
             status: "ok".to_string(),
             uptime,
+            cache_directory: self.cache_directory.clone(),
         };
 
         Ok(Response::new(response))
@@ -794,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_service() {
-        let service = HealthServiceImpl;
+        let service = HealthServiceImpl::new("/tmp/test-cache".to_string());
         let request = Request::new(HealthRequest {});
 
         let response = service.get_health(request).await;
@@ -803,6 +812,7 @@ mod tests {
         let health_response = response.expect("Health response should be ok").into_inner();
         assert_eq!(health_response.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(health_response.status, "ok");
+        assert_eq!(health_response.cache_directory, "/tmp/test-cache");
         // uptime is u64, always >= 0, so just verify it exists
         let _uptime = health_response.uptime;
     }

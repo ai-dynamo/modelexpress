@@ -87,6 +87,7 @@ fn benchmark_serialization(c: &mut Criterion) {
             version: "1.0.0".to_string(),
             status: "ok".to_string(),
             uptime: 3600,
+            cache_directory: None,
         };
 
         b.iter(|| {

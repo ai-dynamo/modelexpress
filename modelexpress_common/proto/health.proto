@@ -19,4 +19,5 @@ message HealthResponse {
   string version = 1;
   string status = 2;
   uint64 uptime = 3;
+  string cache_directory = 4;
 }

@@ -123,9 +123,11 @@ pub async fn handle_model_command(
         ModelCommands::Clear {
             provider,
             model_name,
-        } => clear_model(storage_path_override, provider, &model_name, format).await,
+        } => {
+            clear_model(storage_path_override, provider, &model_name, &server_config, format).await
+        }
         ModelCommands::ClearAll { yes } => {
-            clear_all_models(storage_path_override, yes, format).await
+            clear_all_models(storage_path_override, yes, &server_config, format).await
         }
         ModelCommands::Validate { model_name } => {
             validate_models(storage_path_override, model_name, format).await
@@ -440,13 +442,54 @@ async fn show_model_status(
     Ok(())
 }
 
+/// Check whether clearing local model files is safe.
+///
+/// Refuses if shared storage mode is enabled (the client's local path IS the server's
+/// storage, so deleting files would corrupt the server's database). Also refuses if
+/// the server reports a cache directory that matches the client's local path, even
+/// when shared_storage is not explicitly set (belt and suspenders).
+async fn check_shared_storage_guard(
+    storage_config: &CacheConfig,
+    server_config: &ClientConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if server_config.cache.shared_storage {
+        return Err(
+            "model clear is not available in shared storage mode (client and server share the same filesystem)"
+                .into(),
+        );
+    }
+
+    // Belt and suspenders: even if shared_storage is false, check whether the server's
+    // cache directory actually matches our local path.
+    if let Ok(mut client) = Client::new(server_config.clone()).await
+        && let Ok(status) = client.health_check().await
+        && let Some(server_dir) = status.cache_directory
+    {
+        let server_path =
+            std::fs::canonicalize(&server_dir).unwrap_or_else(|_| PathBuf::from(&server_dir));
+        let local_path = std::fs::canonicalize(&storage_config.local_path)
+            .unwrap_or_else(|_| storage_config.local_path.clone());
+        if server_path == local_path {
+            return Err(
+                "model clear is not available: local cache path matches the server's cache directory"
+                    .into(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn clear_model(
     storage_path_override: Option<PathBuf>,
     provider: ModelProvider,
     model_name: &str,
+    server_config: &ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
+
+    check_shared_storage_guard(&storage_config, server_config).await?;
 
     storage_config.clear_model(model_name, provider)?;
 
@@ -474,9 +517,12 @@ async fn clear_model(
 async fn clear_all_models(
     storage_path_override: Option<PathBuf>,
     yes: bool,
+    server_config: &ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
+
+    check_shared_storage_guard(&storage_config, server_config).await?;
 
     if !yes && matches!(format, OutputFormat::Human) {
         print!("Are you sure you want to clear all models from storage? [y/N]: ");
