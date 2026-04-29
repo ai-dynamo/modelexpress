@@ -103,39 +103,71 @@ Two Dockerfiles are provided for different base images:
 | `Dockerfile.ph3-gcp-gb200` | `karenc:dynamo-trtllm-v1.0.0-a9b6f95` | 1.3.0rc5 |
 | `Dockerfile.dynamo-runtime` | `tensorrtllm-runtime:1.1.0-dev.3` | 1.3.0rc11 |
 
-### Build (recommended: dynamo-runtime base)
+### Step 1 — Check out the companion repos
+
+The Dockerfile copies the `MXCheckpointLoader` source from the TRT-LLM
+fork referenced in [PR #13531](https://github.com/NVIDIA/TensorRT-LLM/pull/13531).
+Until that PR merges into `NVIDIA/TensorRT-LLM:main`, check out the
+PR branch alongside the modelexpress repo:
 
 ```bash
-cd <modelexpress-repo-root>
+mkdir -p ~/work/github && cd ~/work/github
+
+# This repo (the modelexpress branch with the MX P2P client + this examples/ directory)
+git clone https://github.com/ai-dynamo/modelexpress.git
+cd modelexpress
+git checkout <pr-branch-or-main-after-merge>      # e.g. kavink/trtllm_clean (PR #218)
+cd ..
+
+# TRT-LLM with MXCheckpointLoader
+git clone https://github.com/NVIDIA/TensorRT-LLM.git
+cd TensorRT-LLM
+git checkout <pr-branch-or-main-after-merge>      # e.g. PR #13531 head, or main once merged
+cd ..
+```
+
+After both PRs merge upstream you only need `main` of each repo.
+
+The directory layout the build context expects:
+```
+~/work/github/
+├── modelexpress/    <-- you build from here
+└── TensorRT-LLM/    <-- referenced via --build-context trtllm=../TensorRT-LLM
+```
+
+### Step 2 — Build and push
+
+```bash
+cd ~/work/github/modelexpress
 
 docker buildx build --platform linux/arm64 --no-cache \
     -f examples/p2p_transfer_k8s/client/trtllm/Dockerfile.dynamo-runtime \
     --build-context trtllm=../TensorRT-LLM \
-    -t nvcr.io/nvidian/dynamo-dev/<user>:dynamo-trtllm-mx-<tag> \
+    -t <YOUR_REGISTRY>/<YOUR_NAME>:<YOUR_TAG> \
     --push .
 ```
 
-Requires the TRT-LLM repo checked out alongside with the MX checkpoint loader:
-```
-~/work/github/
-├── modelexpress/     (branch: kavink/trtllm_clean)
-└── TensorRT-LLM/    (branch: kavink/mx-compat-fixes)
-```
+Substitute:
+- `<YOUR_REGISTRY>` — your container registry host/org (e.g. `nvcr.io/<org>/<repo>`)
+- `<YOUR_NAME>` — image name
+- `<YOUR_TAG>` — version tag
+
+For x86 builds, use `--platform linux/amd64` and a base image variant
+that supports it. The `tensorrtllm-runtime` image is published for both
+arm64 and amd64.
 
 ### What the Dockerfile does
 
-1. Installs `modelexpress` Python client (gRPC + NIXL transfer)
-2. Patches Dynamo with `--model-express-url` support (`patch_dynamo_mx.py`)
-3. Copies `MXCheckpointLoader` from TRT-LLM fork
-4. Patches base `model_loader.py` with P2P hooks (`patch_mx_loader.py`)
-5. Symlinks `modelexpress` into the venv for import
-
-### Pre-built images
-
-```
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v2.9.0   # old base, E2E validated
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.2.0   # new base, E2E validated
-```
+1. Installs the `modelexpress` Python client (gRPC + NIXL transfer)
+   from the local `modelexpress_client/python` source tree
+2. Compiles the protobuf and symlinks `modelexpress` into the venv
+3. Patches Dynamo with `--model-express-url` CLI support and engine
+   integration (`trtllm_patches/dynamo/patch_dynamo_mx.py`)
+4. Copies `MXCheckpointLoader` from the `TensorRT-LLM` build context
+5. Patches the base `model_loader.py` with P2P hooks
+   (`trtllm_patches/v1.3.0rc5/patch_mx_loader.py`)
+6. Verifies every patch applied (build fails fast if any pattern
+   doesn't match — protects against upstream API drift)
 
 ## File Reference
 
@@ -176,13 +208,9 @@ values. Before applying, replace the following:
 | `<GPU_NODE_POOL>` | Your GPU node pool name | `cloud.google.com/gke-nodepool` in worker yamls |
 | `<CPU_NODE_POOL>` | Your CPU node pool name | `cloud.google.com/gke-nodepool` in `mx-infra-decode.yaml` |
 
-A pre-built image we have validated end-to-end:
-
-```
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.3.0
-```
-
-(ARM64, GB200; `tensorrtllm-runtime:1.1.0-dev.3` base; TRT-LLM 1.3.0rc11)
+If you don't want to build, you can validate the deployment path with
+any image that has the same layered components. Build the image with
+the instructions above and substitute its full URI into the DGD yamls.
 
 ### Different model
 

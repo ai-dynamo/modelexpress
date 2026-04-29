@@ -28,20 +28,28 @@ Per-rank RDMA throughput on the new replica: **361–583 Gbps**
 | `kimi-agg-autoscale-dgd.yaml` | The aggregated worker DGD. Same spec for every replica — auto-detect handles source vs target |
 | `kimi-agg-autoscale-hpa.yaml` | DGDSA + HPA wrapper that exposes the `scale` subresource and drives replica count |
 
-## Pre-built Container Image
+## Container Image
 
-You don't need to build anything. Use:
+This demo uses the same image as the rest of the parent examples — see
+[`../README.md`](../README.md) for build instructions. In short:
 
+```bash
+cd <modelexpress-repo-root>
+
+docker buildx build --platform linux/arm64 --no-cache \
+    -f examples/p2p_transfer_k8s/client/trtllm/Dockerfile.dynamo-runtime \
+    --build-context trtllm=../TensorRT-LLM \
+    -t <YOUR_REGISTRY>/<YOUR_NAME>:<YOUR_TAG> \
+    --push .
 ```
-nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.3.0
-```
 
-This image (ARM64, GB200) layers MX client, MXCheckpointLoader, and
-Dynamo P2P hooks on top of `tensorrtllm-runtime:1.1.0-dev.3` (TRT-LLM
-1.3.0rc11). It works out-of-the-box with the yamls in this folder.
+Substitute the resulting image URI into the `image:` fields of
+`kimi-agg-autoscale-dgd.yaml` (search for `<REGISTRY>/<NAME>:<TAG>`).
 
-If you need to rebuild (different base, different model, etc.), see the
-parent directory's `README.md` for build instructions.
+The image layers the MX client, MXCheckpointLoader, and Dynamo P2P hooks
+on top of `nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.1.0-dev.3`
+(TRT-LLM 1.3.0rc11). The `tensorrtllm-runtime` image is published for
+both `arm64` and `amd64`.
 
 ## Prerequisites
 
