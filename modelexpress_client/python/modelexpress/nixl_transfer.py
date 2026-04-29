@@ -39,6 +39,337 @@ def is_nixl_available() -> bool:
     return NIXL_AVAILABLE
 
 
+def _read_int_file(path: str) -> int | None:
+    """Read a single int from a sysfs file. Returns None on any failure."""
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_str_file(path: str) -> str | None:
+    """Read a string from a sysfs file. Returns None on any failure."""
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _parse_ib_rate_gbps(rate_str: str) -> float | None:
+    """Parse an InfiniBand port rate string ('400 Gb/s (4X NDR)') -> 400.0."""
+    if not rate_str:
+        return None
+    parts = rate_str.strip().split()
+    if not parts:
+        return None
+    try:
+        return float(parts[0])
+    except ValueError:
+        return None
+
+
+def _gpu_pci_bdf(device_id: int) -> str | None:
+    """Return the PCIe BDF ('0000:0f:00.0') for a CUDA visible device.
+
+    Uses torch.cuda.get_device_properties; the CUDA runtime handles
+    CUDA_VISIBLE_DEVICES filtering, so device_id here is the visible
+    index that the worker drives.
+    """
+    try:
+        props = torch.cuda.get_device_properties(device_id)
+        domain = int(getattr(props, "pci_domain_id", 0))
+        bus = int(props.pci_bus_id)
+        dev = int(props.pci_device_id)
+    except (AttributeError, RuntimeError, AssertionError, TypeError) as e:
+        logger.warning(f"NIC pin probe: unable to read PCI BDF for device {device_id}: {e}")
+        return None
+    return f"{domain:04x}:{bus:02x}:{dev:02x}.0"
+
+
+def _gpu_numa_node(device_id: int) -> int | None:
+    """Read the NUMA node for a given CUDA visible device's GPU.
+
+    Returns the numa_node int (which may be -1 on systems without NUMA),
+    or None if the BDF or sysfs file isn't readable.
+    """
+    bdf = _gpu_pci_bdf(device_id)
+    if bdf is None:
+        return None
+    return _read_int_file(f"/sys/bus/pci/devices/{bdf}/numa_node")
+
+
+def _pci_path_components(bdf: str) -> list[str]:
+    """Resolve a PCI BDF to its sysfs realpath and return the BDF chain.
+
+    For a device at 0000:0f:00.0, the realpath of
+    /sys/bus/pci/devices/0000:0f:00.0 typically looks like:
+        /sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:0f:00.0
+    The returned list keeps only the BDF-shaped components, in order
+    from closest-to-root to leaf. Common-prefix length between two such
+    lists encodes PCIe affinity (longer prefix = same switch / bridge),
+    which is exactly the metric nvidia-smi topo -m uses to label PIX /
+    PXB / NODE / SYS connections.
+
+    Returns [] on any read failure.
+    """
+    import os
+    import re
+
+    try:
+        rp = os.path.realpath(f"/sys/bus/pci/devices/{bdf}")
+    except OSError:
+        return []
+    bdf_re = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$")
+    return [p for p in rp.split("/") if bdf_re.match(p)]
+
+
+def _pci_common_depth(a: list[str], b: list[str]) -> int:
+    """Length of the longest shared prefix between two PCIe path component lists.
+
+    Higher values mean closer in the PCIe tree:
+      - 4+ shared = PIX (single PCIe bridge), best
+      - 2-3 shared = PXB / PHB (multiple bridges, same root port)
+      - 1 shared = NODE (same root complex, different root ports)
+      - 0 shared = SYS (different sockets, traffic crosses CPU UPI)
+    """
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+def _nic_pci_bdf(nic_name: str) -> str | None:
+    """Return the PCI BDF for an InfiniBand NIC.
+
+    Reads the symlink /sys/class/infiniband/<nic>/device which points at
+    something like ../../../0000:10:00.0; returns the basename.
+    """
+    import os
+
+    try:
+        target = os.readlink(f"/sys/class/infiniband/{nic_name}/device")
+    except OSError:
+        return None
+    return os.path.basename(target.rstrip("/"))
+
+
+def _list_compute_ib_nics(
+    min_rate_gbps: float,
+) -> list[tuple[str, int, float, list[str]]]:
+    """Enumerate IB NICs eligible for compute RDMA traffic.
+
+    Filters out:
+      - bonded interfaces (e.g. mlx5_bond_0): UCX cannot resolve them in
+        containers and the AH lookup segfaults.
+      - NICs without a /ports/1 directory.
+      - NICs whose port-1 rate is below `min_rate_gbps`. The default
+        threshold excludes lower-rate management/storage-fabric NICs
+        which often sit on a different IB subnet from the compute fabric
+        and cause UCX keepalive death when mixed with it.
+
+    Returns a list of (nic_name, numa_node, rate_gbps, pci_path) sorted
+    alphabetically by NIC name. The PCIe path is the BDF chain from
+    /sys realpath; pair-wise common-prefix depth between a GPU's path
+    and a NIC's path encodes affinity (PIX > PXB > NODE > SYS) and is
+    the actual selection signal in probe_nic_pin_for_device(). NIC name
+    ordering only affects the final lex tiebreak.
+
+    NUMA is read from /sys/class/infiniband/<nic>/device/numa_node and
+    is kept on the tuple for diagnostic logging only; -1 if the kernel
+    reports unknown.
+    """
+    import os
+
+    base = "/sys/class/infiniband"
+    if not os.path.isdir(base):
+        return []
+
+    out: list[tuple[str, int, float, list[str]]] = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return []
+
+    for name in names:
+        if "bond" in name:
+            continue
+        port_dir = f"{base}/{name}/ports/1"
+        if not os.path.isdir(port_dir):
+            continue
+        rate_str = _read_str_file(f"{port_dir}/rate")
+        rate = _parse_ib_rate_gbps(rate_str) if rate_str else None
+        if rate is None or rate < min_rate_gbps:
+            continue
+        numa = _read_int_file(f"{base}/{name}/device/numa_node")
+        if numa is None:
+            numa = -1
+        bdf = _nic_pci_bdf(name)
+        path = _pci_path_components(bdf) if bdf else []
+        out.append((name, numa, rate, path))
+    return out
+
+
+def probe_nic_pin_for_device(device_id: int, min_rate_gbps: float = 200.0) -> str | None:
+    """Probe topology and choose a UCX_NET_DEVICES value for a given GPU.
+
+    Selection signal is PCIe sysfs path distance: each device's
+    /sys/bus/pci/devices/<bdf> realpath exposes the full bus tree, and
+    the longest common BDF prefix between a GPU's path and a NIC's path
+    encodes affinity (PIX > PXB > NODE > SYS, the same metric
+    nvidia-smi topo -m reports). NIC names and GPU indices stop
+    mattering for correctness; they only affect the final lex tiebreak.
+
+    Strategy:
+      1. Enumerate compute-fabric IB NICs (rate >= min_rate_gbps, not
+         bonded) along with their PCIe paths.
+      2. Discover every visible CUDA device's PCIe path so this rank
+         computes the same global GPU->NIC assignment that every other
+         rank computes from the same /sys snapshot. No coordination.
+      3. Greedy assignment in visible-index order. Each GPU picks the
+         NIC with highest (score, fewest-prior-assignments, lex-smallest
+         name) - score dominates, then load balancing across reuse,
+         then determinism. Reuse is allowed when GPU count exceeds NIC
+         count, with cycle counts kept balanced.
+      4. Returns this rank's assignment as 'NICNAME:1', or None if no
+         compute IB device is reachable.
+    """
+    nics = _list_compute_ib_nics(min_rate_gbps)
+    if not nics:
+        logger.warning(
+            f"MX_RDMA_NIC_PIN auto-probe: no compute IB NICs found "
+            f"(rate >= {min_rate_gbps} Gb/s under /sys/class/infiniband); "
+            f"skipping pin"
+        )
+        return None
+
+    try:
+        num_gpus = torch.cuda.device_count()
+    except Exception:
+        num_gpus = 0
+
+    gpu_paths: dict[int, list[str]] = {}
+    gpu_numa: dict[int, int] = {}
+    for gi in range(num_gpus):
+        bdf = _gpu_pci_bdf(gi)
+        if bdf is None:
+            continue
+        gpu_paths[gi] = _pci_path_components(bdf)
+        numa = _read_int_file(f"/sys/bus/pci/devices/{bdf}/numa_node")
+        gpu_numa[gi] = numa if numa is not None else -1
+
+    if device_id not in gpu_paths:
+        logger.warning(
+            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} not found among "
+            f"visible CUDA devices ({sorted(gpu_paths.keys())}); skipping pin"
+        )
+        return None
+
+    # Greedy assignment in visible-index order. Each GPU picks the NIC
+    # with the highest PCIe-affinity score; ties broken by fewest prior
+    # assignments (load balancing across reuse), then lex-smallest NIC
+    # name (determinism so every rank computes the same map).
+    #
+    # Note: greedy-by-index is not globally optimal. On an asymmetric
+    # topology where two GPUs both score equally on the same best NIC
+    # but each has a distinct second-best, the lower-index GPU wins the
+    # shared best and the higher-index GPU may end up on a worse NIC
+    # than a Hungarian-style global assignment would give it. In
+    # practice real GPU clusters are symmetric within a NUMA (n GPUs +
+    # n PIX-affined NICs on the same root complex), so each GPU's PIX
+    # NIC is unique and the greedy result equals the optimal. If a
+    # future topology breaks this assumption, replace with a Hungarian
+    # solve over the (gpu, nic) score matrix - same inputs, just a
+    # better assignment policy. Don't try to "fix" it by reshuffling
+    # the iteration order; that just changes which rank is the loser.
+    assigned_count: dict[str, int] = {n[0]: 0 for n in nics}
+    assignments: dict[int, tuple[str, int]] = {}
+    for gi in sorted(gpu_paths.keys()):
+        gpu_path = gpu_paths[gi]
+        ranked: list[tuple[int, int, str]] = []
+        for nic_name, _nic_numa, _nic_rate, nic_path in nics:
+            score = _pci_common_depth(gpu_path, nic_path)
+            ranked.append((-score, assigned_count[nic_name], nic_name))
+        ranked.sort()
+        chosen_name = ranked[0][2]
+        chosen_score = -ranked[0][0]
+        assignments[gi] = (chosen_name, chosen_score)
+        assigned_count[chosen_name] += 1
+
+    chosen_name, chosen_score = assignments[device_id]
+    nic_numa_map = {n[0]: n[1] for n in nics}
+    nic_rate_map = {n[0]: n[2] for n in nics}
+    same_numa_nics = [
+        n[0] for n in nics if n[1] == gpu_numa.get(device_id, -2) and n[1] >= 0
+    ]
+    full_map = {gi: a[0] for gi, a in sorted(assignments.items())}
+    cross_socket = (
+        gpu_numa.get(device_id, -1) >= 0
+        and nic_numa_map.get(chosen_name, -1) >= 0
+        and gpu_numa[device_id] != nic_numa_map[chosen_name]
+    )
+    if cross_socket:
+        logger.warning(
+            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} -> {chosen_name}:1 "
+            f"is CROSS-SOCKET (GPU NUMA {gpu_numa[device_id]}, NIC NUMA "
+            f"{nic_numa_map[chosen_name]}); single-flow bandwidth will be "
+            f"capped by UPI / Infinity Fabric. PCIe common-depth {chosen_score}, "
+            f"same-NUMA NICs available: {same_numa_nics}, full GPU->NIC map: "
+            f"{full_map}"
+        )
+    else:
+        logger.info(
+            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} -> {chosen_name}:1 "
+            f"(PCIe common-depth {chosen_score}; GPU NUMA "
+            f"{gpu_numa.get(device_id)}, NIC NUMA {nic_numa_map.get(chosen_name)}, "
+            f"NIC rate {nic_rate_map.get(chosen_name)} Gb/s; "
+            f"same-NUMA NICs: {same_numa_nics}; full GPU->NIC map: {full_map})"
+        )
+    return f"{chosen_name}:1"
+
+
+def _resolve_nic_pin(device_id: int) -> str | None:
+    """Resolve MX_RDMA_NIC_PIN env var into a UCX_NET_DEVICES value.
+
+    Modes:
+      - unset / "off" / "0" / "false" / "no": returns None (no pinning).
+      - explicit comma-separated list: indexed by device_id, like the
+        original hardcoded shape. Useful for unusual topologies where
+        the auto-probe heuristic doesn't fit.
+      - any other truthy value (e.g. "auto", "1", "true", "yes", "on"):
+        runs probe_nic_pin_for_device(). Min rate gating is read from
+        MX_RDMA_NIC_PIN_MIN_RATE_GBPS (default 200 Gb/s, which excludes
+        lower-rate management/storage-fabric NICs).
+    """
+    import os
+
+    raw = os.environ.get("MX_RDMA_NIC_PIN", "").strip()
+    if raw == "" or raw.lower() in ("off", "0", "false", "no"):
+        return None
+
+    if "," in raw:
+        nic_list = [n.strip() for n in raw.split(",") if n.strip()]
+        if 0 <= device_id < len(nic_list):
+            pinned = nic_list[device_id]
+            logger.info(
+                f"MX_RDMA_NIC_PIN explicit list: device {device_id} -> {pinned}"
+            )
+            return pinned
+        logger.warning(
+            f"MX_RDMA_NIC_PIN explicit list: device_id {device_id} out of "
+            f"range for list of length {len(nic_list)}; skipping pin"
+        )
+        return None
+
+    try:
+        min_rate = float(os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS", "200"))
+    except ValueError:
+        min_rate = 200.0
+    return probe_nic_pin_for_device(device_id, min_rate_gbps=min_rate)
+
+
 class NixlTransferManager:
     """
     Manages a single NIXL agent and RDMA transfers for GPU tensors.
@@ -86,6 +417,18 @@ class NixlTransferManager:
         auto-detect RoCE/IB transports, even if the global UCX_TLS is
         restricted to TCP (e.g., for MPI). Restores the original value
         after agent creation.
+
+        If MX_RDMA_NIC_PIN is set to a truthy value (e.g. "auto", "1",
+        "true"), runs a sysfs topology probe to pick a NUMA-local IB NIC
+        for this worker and sets UCX_NET_DEVICES to it. If the env var
+        is set to an explicit comma-separated NIC list, that list is
+        indexed by self._device_id directly (legacy / override path for
+        unusual topologies). Default (unset, "off", "0", "false", "no")
+        is no pinning, matching pre-feature behavior. The override is
+        permanent for the worker's lifetime (not restored in finally)
+        so any subsequent UCP contexts created in the worker also pin.
+        See _resolve_nic_pin() and probe_nic_pin_for_device() for
+        full semantics.
         """
         import os
 
@@ -108,6 +451,18 @@ class NixlTransferManager:
         elif saved_ucx_tls == "tcp":
             os.environ.pop("UCX_TLS", None)
             logger.info("NIXL: removed UCX_TLS=tcp for auto-detection")
+
+        # Optional per-rank NIC pinning, set permanently for the worker's
+        # lifetime (no restore in finally) so any subsequent UCP contexts
+        # also use the pinned NIC. See _resolve_nic_pin() for env semantics.
+        pinned = _resolve_nic_pin(self._device_id)
+        if pinned:
+            prev = os.environ.get("UCX_NET_DEVICES")
+            os.environ["UCX_NET_DEVICES"] = pinned
+            logger.info(
+                f"NIXL NIC pin: device {self._device_id} -> "
+                f"UCX_NET_DEVICES={pinned} (was: {prev})"
+            )
 
         try:
             if self._listen_port is not None and nixl_agent_config:
