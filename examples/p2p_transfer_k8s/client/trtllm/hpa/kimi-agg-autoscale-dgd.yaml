@@ -87,7 +87,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - customer-gpu-w0e
+                  - <GPU_NODE_POOL>
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -101,7 +101,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.3.0"
+          image: "<REGISTRY>/<NAME>:<TAG>"
           imagePullPolicy: Always
           workingDir: /workspace/
           securityContext:
@@ -118,7 +118,7 @@ spec:
             - --extra-engine-args
             - /config/agg.yaml
             - --model-express-url
-            - modelexpress-server-decode.kavin.svc.cluster.local:8001
+            - modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001
             - --tensor-parallel-size
             - "8"
           env:
@@ -127,11 +127,11 @@ spec:
                 fieldRef:
                   fieldPath: metadata.uid
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.saperiyasamy.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.<NAMESPACE>.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.saperiyasamy.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.<NAMESPACE>.svc.cluster.local:2379"
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.kavin.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: WORLD_SIZE
@@ -221,7 +221,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: kavin-compute-domain-channel
+            resourceClaimTemplateName: <NAMESPACE>-compute-domain-channel
         volumes:
           - name: infiniband
             hostPath:

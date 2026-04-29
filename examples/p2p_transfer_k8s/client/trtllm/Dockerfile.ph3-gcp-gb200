@@ -75,7 +75,15 @@ RUN TRTLLM_PKG=/opt/dynamo/venv/lib/python3.12/site-packages/tensorrt_llm && \
     grep -q "model_express_url" /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm/engine.py && \
     echo "engine.py model_express_url OK" && \
     grep -q "p2p_succeeded" "$TRTLLM_PKG/_torch/pyexecutor/model_loader.py" && \
-    echo "model_loader.py MX patch OK" && \
+    echo "model_loader.py p2p_succeeded check OK" && \
+    grep -q "model=model" "$TRTLLM_PKG/_torch/pyexecutor/model_loader.py" && \
+    echo "model_loader.py model=model kwarg OK" && \
+    grep -q "publish_as_source" "$TRTLLM_PKG/_torch/pyexecutor/model_loader.py" && \
+    echo "model_loader.py publish_as_source hook OK" && \
+    grep -q '\*\*kwargs' "$TRTLLM_PKG/_torch/models/checkpoints/base_weight_loader.py" && \
+    echo "base_weight_loader.py **kwargs OK" && \
+    grep -q '\*\*kwargs' "$TRTLLM_PKG/_torch/models/checkpoints/hf/weight_loader.py" && \
+    echo "hf/weight_loader.py **kwargs OK" && \
     grep -q "MXCheckpointLoader" "$TRTLLM_PKG/_torch/models/checkpoints/__init__.py" && \
     echo "checkpoints/__init__.py patched OK" && \
     grep -q "MODEL_EXPRESS_URL" "$TRTLLM_PKG/executor/worker.py" && \

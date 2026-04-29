@@ -3,7 +3,7 @@
 
 # ModelExpress server + Redis for decode source (Phase 2 mixed TP)
 # Separate from prefill MX server so each source publishes to its own store
-# Deploys on customer-cpu nodes (amd64)
+# Deploys on <CPU_NODE_POOL> nodes (amd64)
 # Namespace: default
 ---
 apiVersion: apps/v1
@@ -24,7 +24,7 @@ spec:
     spec:
       # Update node pool names for your cluster
       nodeSelector:
-        cloud.google.com/gke-nodepool: customer-cpu
+        cloud.google.com/gke-nodepool: <CPU_NODE_POOL>
       tolerations:
         - key: dedicated
           operator: Equal
@@ -69,7 +69,7 @@ spec:
     spec:
       # Update node pool names for your cluster
       nodeSelector:
-        cloud.google.com/gke-nodepool: customer-cpu
+        cloud.google.com/gke-nodepool: <CPU_NODE_POOL>
       tolerations:
         - key: dedicated
           operator: Equal
@@ -85,10 +85,16 @@ spec:
               value: "redis"
             - name: REDIS_URL
               value: "redis://redis-decode:6379"
+            # MX reaper defaults (90s heartbeat, 3600s GC) are too aggressive
+            # for TRT-LLM sources that don't send heartbeats and can take 20+
+            # minutes to load large models from disk. Set these to ~2x your
+            # expected source disk-load time. Example: 4500s (75 min) covers
+            # 685B-class models with safety margin. For shorter-lived demos
+            # or smaller models, the upstream defaults are fine.
             - name: MX_HEARTBEAT_TIMEOUT_SECS
-              value: "999999"
+              value: "4500"
             - name: MX_GC_TIMEOUT_SECS
-              value: "999999"
+              value: "4500"
           resources:
             requests:
               cpu: "1"

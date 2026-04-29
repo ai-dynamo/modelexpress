@@ -166,6 +166,24 @@ Patch scripts (in `trtllm_patches/`):
 
 ## Customization
 
+The yamls in this directory use placeholders for cluster-specific
+values. Before applying, replace the following:
+
+| Placeholder | Replace with | Where |
+|-------------|--------------|-------|
+| `<REGISTRY>/<NAME>:<TAG>` | Your container registry path + tag | All DGD yamls (`image:` field) |
+| `<NAMESPACE>` | The Kubernetes namespace where Dynamo platform runs | `NATS_SERVER`, `ETCD_ENDPOINTS`, `MODEL_EXPRESS_URL`, `resourceClaimTemplateName` |
+| `<GPU_NODE_POOL>` | Your GPU node pool name | `cloud.google.com/gke-nodepool` in worker yamls |
+| `<CPU_NODE_POOL>` | Your CPU node pool name | `cloud.google.com/gke-nodepool` in `mx-infra-decode.yaml` |
+
+A pre-built image we have validated end-to-end:
+
+```
+nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.3.0
+```
+
+(ARM64, GB200; `tensorrtllm-runtime:1.1.0-dev.3` base; TRT-LLM 1.3.0rc11)
+
 ### Different model
 
 Update in the DGD yamls:
@@ -173,19 +191,6 @@ Update in the DGD yamls:
 - `MODEL_NAME` env var
 - `model_kwargs.num_hidden_layers` in the ConfigMap
 - Ensure the model is on the `shared-model-cache` PVC
-
-### Different namespace
-
-Update FQDN references for services:
-- `modelexpress-server-decode.<namespace>.svc.cluster.local`
-- `dynamo-platform-nats.<namespace>.svc.cluster.local`
-- `dynamo-platform-etcd.<namespace>.svc.cluster.local`
-- `resourceClaimTemplateName` for compute domain
-
-### Different cluster / node pools
-
-Update `nodeSelector` and `nodeAffinity` in the DGD yamls:
-- `cloud.google.com/gke-nodepool` values
 
 ## GCP GB200 Required Config
 
