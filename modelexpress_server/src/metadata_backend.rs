@@ -3,17 +3,19 @@
 
 //! Metadata backend abstraction for P2P model metadata.
 //!
-//! Supports two persistent backends:
+//! Supports multiple backends:
+//! - **Memory**: Volatile in-process storage for standalone/dev use
 //! - **Redis**: Persistent storage via Redis keys + atomic Lua merge
 //! - **Kubernetes**: CRDs and ConfigMaps for native K8s integration
 //!
-//! Select the backend via `MX_METADATA_BACKEND=redis` or `MX_METADATA_BACKEND=kubernetes`.
+//! Select the backend via `MX_METADATA_BACKEND=memory|redis|kubernetes`.
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
 use std::sync::Arc;
 
 pub mod kubernetes;
+pub mod memory;
 pub mod redis;
 
 /// Result type for metadata operations
@@ -263,6 +265,8 @@ pub trait MetadataBackend: Send + Sync {
 /// Configuration for metadata backends
 #[derive(Debug, Clone)]
 pub enum BackendConfig {
+    /// In-memory backend — volatile, process-local, zero external dependencies
+    Memory,
     /// Redis backend — persistent, horizontally scalable
     Redis { url: String },
     /// Kubernetes CRD backend — native K8s integration
@@ -272,6 +276,7 @@ pub enum BackendConfig {
 impl std::fmt::Display for BackendConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Memory => write!(f, "memory"),
             Self::Redis { .. } => write!(f, "redis"),
             Self::Kubernetes { .. } => write!(f, "kubernetes"),
         }
@@ -281,11 +286,13 @@ impl std::fmt::Display for BackendConfig {
 impl BackendConfig {
     /// Create backend config from environment variables.
     ///
-    /// `MX_METADATA_BACKEND` is required. Valid values:
+    /// `MX_METADATA_BACKEND` defaults to `memory`. Valid values:
+    /// - `memory`: in-process volatile storage
     /// - `redis`: Redis
     /// - `kubernetes` | `k8s` | `crd`: Kubernetes CRD
     pub fn from_env() -> Result<Self, String> {
-        let backend_type = std::env::var("MX_METADATA_BACKEND").unwrap_or_default();
+        let backend_type =
+            std::env::var("MX_METADATA_BACKEND").unwrap_or_else(|_| "memory".to_string());
         let redis_url = Self::redis_url_from_env();
         let k8s_namespace = Self::k8s_namespace_from_env();
         Self::from_type_str(&backend_type, &redis_url, &k8s_namespace)
@@ -298,6 +305,7 @@ impl BackendConfig {
         k8s_namespace: &str,
     ) -> Result<Self, String> {
         match backend_type.to_lowercase().as_str() {
+            "" | "memory" => Ok(Self::Memory),
             "redis" => Ok(Self::Redis {
                 url: redis_url.to_string(),
             }),
@@ -305,7 +313,7 @@ impl BackendConfig {
                 namespace: k8s_namespace.to_string(),
             }),
             other => Err(format!(
-                "MX_METADATA_BACKEND='{}' is not valid. Use 'redis' or 'kubernetes'.",
+                "MX_METADATA_BACKEND='{}' is not valid. Use 'memory', 'redis', or 'kubernetes'.",
                 other
             )),
         }
@@ -334,6 +342,11 @@ impl BackendConfig {
 /// Create a backend from configuration.
 pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn MetadataBackend>> {
     match config {
+        BackendConfig::Memory => {
+            let backend = memory::MemoryBackend::new();
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
+        }
         BackendConfig::Redis { url } => {
             let backend = redis::RedisBackend::new(&url);
             backend.connect().await?;

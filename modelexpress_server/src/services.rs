@@ -29,17 +29,17 @@ use tracing::{debug, error, info};
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
-/// Get the configured cache directory for model downloads
-fn get_server_cache_dir() -> Option<std::path::PathBuf> {
-    // Try to get cache configuration
-    if let Ok(config) = CacheConfig::discover() {
-        Some(config.local_path)
-    } else {
-        // Fall back to environment variable
-        std::env::var("HF_HUB_CACHE")
-            .ok()
-            .map(std::path::PathBuf::from)
-    }
+fn default_server_cache_dir() -> PathBuf {
+    CacheConfig::discover()
+        .map(|config| config.local_path)
+        .or_else(|_| std::env::var("HF_HUB_CACHE").map(PathBuf::from))
+        .unwrap_or_else(|_| CacheConfig::default().local_path)
+}
+
+fn default_server_database_path() -> PathBuf {
+    std::env::var("MODEL_EXPRESS_DATABASE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./models.db"))
 }
 
 /// Health service implementation
@@ -105,8 +105,27 @@ impl ApiService for ApiServiceImpl {
 }
 
 /// Model service implementation
-#[derive(Debug, Default)]
-pub struct ModelServiceImpl;
+#[derive(Debug, Clone)]
+pub struct ModelServiceImpl {
+    cache_dir: PathBuf,
+    tracker: ModelDownloadTracker,
+}
+
+impl Default for ModelServiceImpl {
+    fn default() -> Self {
+        Self::new(default_server_cache_dir(), default_server_database_path())
+    }
+}
+
+impl ModelServiceImpl {
+    #[must_use]
+    pub fn new(cache_dir: PathBuf, database_path: PathBuf) -> Self {
+        Self {
+            cache_dir,
+            tracker: ModelDownloadTracker::with_database_path(database_path),
+        }
+    }
+}
 
 /// Helper function to collect all files in a model directory recursively
 fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u64)> {
@@ -115,36 +134,40 @@ fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u
     if let Ok(entries) = std::fs::read_dir(current_path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = std::fs::metadata(&path) {
-                    // Get relative path from base_path
-                    if let Ok(relative) = path.strip_prefix(base_path) {
-                        // Validate that the relative path does not contain any '..' components or is absolute
-                        let mut is_safe = true;
-                        for comp in relative.components() {
-                            use std::path::Component;
-                            match comp {
-                                Component::ParentDir
-                                | Component::RootDir
-                                | Component::Prefix(_) => {
-                                    is_safe = false;
-                                    break;
-                                }
-                                _ => {}
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                tracing::warn!("Skipping symlink in model directory: {:?}", path);
+                continue;
+            }
+            if file_type.is_file() {
+                // Get relative path from base_path
+                if let Ok(relative) = path.strip_prefix(base_path) {
+                    // Validate that the relative path does not contain any '..' components or is absolute
+                    let mut is_safe = true;
+                    for comp in relative.components() {
+                        use std::path::Component;
+                        match comp {
+                            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                                is_safe = false;
+                                break;
                             }
-                        }
-                        if is_safe {
-                            files.push((relative.to_path_buf(), metadata.len()));
-                        } else {
-                            tracing::warn!(
-                                "Skipping potentially unsafe file path: {:?} (relative: {:?})",
-                                path,
-                                relative
-                            );
+                            _ => {}
                         }
                     }
+                    if is_safe {
+                        files.push((relative.to_path_buf(), metadata.len()));
+                    } else {
+                        tracing::warn!(
+                            "Skipping potentially unsafe file path: {:?} (relative: {:?})",
+                            path,
+                            relative
+                        );
+                    }
                 }
-            } else if path.is_dir() {
+            } else if file_type.is_dir() {
                 files.extend(collect_model_files(base_path, &path));
             }
         }
@@ -177,11 +200,13 @@ impl ModelService for ModelServiceImpl {
         let model_name = download::canonical_model_name(&model_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let ignore_weights = model_request.ignore_weights;
+        let tracker = self.tracker.clone();
+        let cache_dir = self.cache_dir.clone();
 
         // Spawn a task to handle the streaming download updates
         tokio::spawn(async move {
             // Check if the model is already downloaded
-            if let Some(status) = MODEL_TRACKER.get_status(&model_name) {
+            if let Some(status) = tracker.get_status(&model_name) {
                 let update = ModelStatusUpdate {
                     model_name: model_name.clone(),
                     status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
@@ -206,8 +231,8 @@ impl ModelService for ModelServiceImpl {
             }
 
             // Start or monitor the download process
-            let final_status = MODEL_TRACKER
-                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
+            let final_status = tracker
+                .ensure_model_downloaded(&model_name, provider, &tx, cache_dir, ignore_weights)
                 .await;
 
             // Send final status update
@@ -259,8 +284,7 @@ impl ModelService for ModelServiceImpl {
         );
 
         // Get the cache directory
-        let cache_dir = get_server_cache_dir()
-            .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
+        let cache_dir = self.cache_dir.clone();
 
         // Get the model path using the provider from the request
         let model_path = provider_impl
@@ -435,8 +459,7 @@ impl ModelService for ModelServiceImpl {
         info!("Listing files for model: {}", model_name);
 
         // Get the cache directory
-        let cache_dir = get_server_cache_dir()
-            .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
+        let cache_dir = self.cache_dir.clone();
 
         // Get the model path using the provider from the request
         let model_path = provider_impl
@@ -487,12 +510,22 @@ impl Default for ModelDownloadTracker {
 impl ModelDownloadTracker {
     #[must_use]
     pub fn new() -> Self {
-        // Initialize database in the current directory
-        let database = match ModelDatabase::new("./models.db") {
+        Self::with_database_path(default_server_database_path())
+    }
+
+    #[must_use]
+    pub fn with_database_path(database_path: PathBuf) -> Self {
+        let database = match ModelDatabase::new(&database_path.to_string_lossy()) {
             Ok(db) => db,
             Err(e) => {
-                error!("Critical error: Could not initialize model database at ./models.db: {e}");
-                panic!("Critical error: Could not initialize model database at ./models.db");
+                error!(
+                    "Critical error: Could not initialize model database at {}: {e}",
+                    database_path.display()
+                );
+                panic!(
+                    "Critical error: Could not initialize model database at {}",
+                    database_path.display()
+                );
             }
         };
 
@@ -607,6 +640,7 @@ impl ModelDownloadTracker {
         model_name: &str,
         provider: ModelProvider,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
+        cache_dir: PathBuf,
         ignore_weights: bool,
     ) -> ModelStatus {
         // Atomically try to claim this model for download using compare-and-swap
@@ -665,14 +699,14 @@ impl ModelDownloadTracker {
                 // We claimed the model, so we're responsible for downloading it
                 let tracker = self.clone();
                 let model_name_owned = model_name.to_string();
+                let cache_dir = cache_dir.clone();
 
                 // Perform the download in the background
                 tokio::spawn(async move {
-                    let cache_dir = get_server_cache_dir();
                     match download::download_model(
                         &model_name_owned,
                         provider,
-                        cache_dir,
+                        Some(cache_dir),
                         ignore_weights,
                     )
                     .await
@@ -728,13 +762,13 @@ impl ModelDownloadTracker {
             // Start the download
             let tracker = self.clone();
             let model_name_owned = model_name.to_string();
+            let cache_dir = cache_dir.clone();
 
             tokio::spawn(async move {
-                let cache_dir = get_server_cache_dir();
                 match download::download_model(
                     &model_name_owned,
                     provider,
-                    cache_dir,
+                    Some(cache_dir),
                     ignore_weights,
                 )
                 .await
@@ -776,10 +810,6 @@ impl ModelDownloadTracker {
     }
 }
 
-/// Global model download tracker
-pub static MODEL_TRACKER: std::sync::LazyLock<ModelDownloadTracker> =
-    std::sync::LazyLock::new(ModelDownloadTracker::new);
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -791,6 +821,14 @@ mod tests {
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
     use tonic::Request;
+
+    fn build_test_service() -> (ModelServiceImpl, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_dir = temp_dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("Failed to create cache dir");
+        let db_path = temp_dir.path().join("models.db");
+        (ModelServiceImpl::new(cache_dir, db_path), temp_dir)
+    }
 
     #[tokio::test]
     async fn test_health_service() {
@@ -915,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_service_already_downloaded() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -923,7 +961,7 @@ mod tests {
         let model_name = format!("test-already-downloaded-model-{timestamp}");
 
         // Pre-populate the model as downloaded
-        MODEL_TRACKER.set_status(
+        service.tracker.set_status(
             model_name.clone(),
             ModelStatus::DOWNLOADED,
             ModelProvider::HuggingFace,
@@ -955,7 +993,7 @@ mod tests {
         );
 
         // Cleanup
-        MODEL_TRACKER.delete_status(&model_name);
+        service.tracker.delete_status(&model_name);
     }
 
     #[test]
@@ -1024,7 +1062,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_service_stream_closes_properly() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
         let model_name = "test-stream-model";
 
         let request = Request::new(ModelDownloadRequest {
@@ -1053,7 +1091,7 @@ mod tests {
         assert!(update_count > 0);
 
         // Cleanup
-        MODEL_TRACKER.delete_status(model_name);
+        service.tracker.delete_status(model_name);
     }
 
     #[tokio::test]
@@ -1151,9 +1189,26 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("nested_file")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_model_files_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let outside = temp_dir.path().join("outside.txt");
+        std::fs::write(&outside, "outside").expect("Failed to write outside file");
+
+        let model_dir = temp_dir.path().join("model");
+        std::fs::create_dir(&model_dir).expect("Failed to create model dir");
+        symlink(&outside, model_dir.join("linked.bin")).expect("Failed to create symlink");
+
+        let files = collect_model_files(&model_dir, &model_dir);
+        assert!(files.is_empty(), "symlinked files must not be streamed");
+    }
+
     #[tokio::test]
     async fn test_list_model_files_not_found() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "non-existent-model-12345".to_string(),
@@ -1169,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_model_files_not_found() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "non-existent-model-12345".to_string(),
@@ -1185,7 +1240,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_model_downloaded_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
 
         let request = Request::new(ModelDownloadRequest {
             model_name: "test/model".to_string(),
@@ -1202,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_model_files_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
@@ -1219,7 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_model_files_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let (service, _temp_dir) = build_test_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
@@ -1239,11 +1294,6 @@ mod tests {
     async fn test_stream_model_files_hf_first_chunk_includes_commit_hash() {
         let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let _cache_dir_guard = EnvVarGuard::set(
-            &env_lock,
-            "MODEL_EXPRESS_CACHE_DIRECTORY",
-            temp_dir.path().to_str().expect("Expected temp dir path"),
-        );
         let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
 
         let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
@@ -1251,7 +1301,10 @@ mod tests {
         std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
             .expect("Failed to write model file");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().join("models.db"),
+        );
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1280,18 +1333,16 @@ mod tests {
     async fn test_stream_model_files_hf_emits_chunk_for_zero_byte_file() {
         let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let _cache_dir_guard = EnvVarGuard::set(
-            &env_lock,
-            "MODEL_EXPRESS_CACHE_DIRECTORY",
-            temp_dir.path().to_str().expect("Expected temp dir path"),
-        );
         let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
 
         let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("empty.bin"), []).expect("Failed to write empty file");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().join("models.db"),
+        );
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,

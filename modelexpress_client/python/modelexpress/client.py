@@ -23,16 +23,16 @@ from . import p2p_pb2_grpc
 logger = logging.getLogger("modelexpress.client")
 
 
-def _parse_server_address(address: str) -> str:
-    """Strip http:// or https:// prefix from server address for gRPC."""
+def _parse_server_address(address: str) -> tuple[str, bool]:
+    """Return normalized server address and whether TLS is required."""
     if address.startswith("http://"):
-        return address[7:]
+        return address[7:], False
     elif address.startswith("https://"):
-        return address[8:]
-    return address
+        return address[8:], True
+    return address, False
 
 
-def _get_server_url(explicit_url: str | None = None) -> str:
+def _get_server_url(explicit_url: str | None = None) -> tuple[str, bool]:
     """
     Resolve the ModelExpress server URL.
 
@@ -75,7 +75,7 @@ class MxClient:
         server_url: str | None = None,
         max_message_size: int = 100 * 1024 * 1024,  # 100 MB
     ):
-        self.server_url = _get_server_url(server_url)
+        self.server_url, self._use_tls = _get_server_url(server_url)
         self._max_message_size = max_message_size
         self._channel: grpc.Channel | None = None
         self._stub: p2p_pb2_grpc.P2pServiceStub | None = None
@@ -90,7 +90,15 @@ class MxClient:
                 ("grpc.max_send_message_length", self._max_message_size),
                 ("grpc.max_receive_message_length", self._max_message_size),
             ]
-            self._channel = grpc.insecure_channel(self.server_url, options=options)
+            if self._use_tls:
+                credentials = grpc.ssl_channel_credentials()
+                self._channel = grpc.secure_channel(
+                    self.server_url,
+                    credentials,
+                    options=options,
+                )
+            else:
+                self._channel = grpc.insecure_channel(self.server_url, options=options)
             self._stub = p2p_pb2_grpc.P2pServiceStub(self._channel)
             logger.debug("MxClient connected to %s", self.server_url)
         return self._stub

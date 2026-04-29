@@ -3,7 +3,7 @@
 
 //! State management for P2P model metadata.
 //!
-//! `P2pStateManager` wraps a metadata backend (Redis or Kubernetes CRD).
+//! `P2pStateManager` wraps a metadata backend (memory, Redis, or Kubernetes CRD).
 //! All state — model metadata and source status — is persisted to the backend,
 //! making the server stateless and horizontally scalable.
 
@@ -37,8 +37,8 @@ impl Default for P2pStateManager {
 impl P2pStateManager {
     /// Create a new state manager, resolving backend config from the environment.
     ///
-    /// Configure via `MX_METADATA_BACKEND` (required) and `REDIS_URL` /
-    /// `MX_REDIS_HOST` / `MX_REDIS_PORT` (for Redis).
+    /// Configure via `MX_METADATA_BACKEND` (defaults to `memory`) and
+    /// `REDIS_URL` / `MX_REDIS_HOST` / `MX_REDIS_PORT` (for Redis).
     pub fn new() -> Self {
         Self {
             backend: Arc::new(RwLock::new(None)),
@@ -66,7 +66,7 @@ impl P2pStateManager {
     /// Initialize the backend connection. Returns the backend type name on success.
     pub async fn connect(&self) -> MetadataResult<String> {
         let config = self.config.clone().ok_or(
-            "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
+            "MX_METADATA_BACKEND is invalid. Set it to 'memory', 'redis', or 'kubernetes'.",
         )?;
 
         let backend_name = config.to_string();
@@ -93,7 +93,7 @@ impl P2pStateManager {
         }
 
         let config = self.config.clone().ok_or(
-            "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
+            "MX_METADATA_BACKEND is invalid. Set it to 'memory', 'redis', or 'kubernetes'.",
         )?;
 
         let backend = create_backend(config.clone()).await?;
@@ -387,6 +387,12 @@ mod tests {
         let default_redis = "redis://localhost:6379";
         let default_ns = "default";
 
+        // Memory backend is the default and is also accepted explicitly
+        let config = BackendConfig::from_type_str("memory", default_redis, default_ns).expect("ok");
+        assert!(matches!(config, BackendConfig::Memory));
+        let config = BackendConfig::from_type_str("", default_redis, default_ns).expect("ok");
+        assert!(matches!(config, BackendConfig::Memory));
+
         // Redis
         let config =
             BackendConfig::from_type_str("redis", "redis://myhost:6379", default_ns).expect("ok");
@@ -402,8 +408,6 @@ mod tests {
 
         // Unknown returns Err
         assert!(BackendConfig::from_type_str("bogus", default_redis, default_ns).is_err());
-        assert!(BackendConfig::from_type_str("memory", default_redis, default_ns).is_err());
-        assert!(BackendConfig::from_type_str("", default_redis, default_ns).is_err());
 
         // Case insensitive
         let config = BackendConfig::from_type_str("REDIS", default_redis, default_ns).expect("ok");
