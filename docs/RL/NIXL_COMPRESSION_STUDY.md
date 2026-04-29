@@ -1,7 +1,7 @@
 # NIXL nvCOMP Compression Study — Reproducing with ModelExpress RL Workflows
 
 **Last Updated**: April 29, 2026
-**Audience**: NIXL compression team (`eschmidt@nvidia.com`)
+**Audience**: NIXL compression team
 **Purpose**: Guide the NIXL team to capture and study real RL weight-transfer payloads using our validated PRIME-RL and verl workflows with ModelExpress (MX).
 
 ---
@@ -94,7 +94,7 @@ The capture scripts in [`scripts/`](./scripts/) snapshot the bytes that cross th
 
 ## Option 1: Request the pre-captured data package (fastest)
 
-We have a ready-made data package captured from a live PRIME-RL deployment on GB200. **It's not in this repo** (binary tensors at GB scale aren't appropriate to commit) — request access from `kavink@nvidia.com` and we'll share via the appropriate channel (NV S3 bucket, internal share, or direct upload to your `eschmidt@nvidia.com` inbox per the original request).
+We have a ready-made data package captured from a live PRIME-RL deployment on GB200. **It's not in this repo** (binary tensors at GB scale aren't appropriate to commit) — request access from `kavink@nvidia.com` and we'll share via the appropriate channel (NV S3 bucket, internal share, or direct upload).
 
 Package contents:
 
