@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ModelExpress RL Weight Update Integration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-dark: #0a0e17;
+  --bg-slide: #0f1420;
+  --accent-green: #76b900;
+  --accent-cyan: #00bcd4;
+  --accent-orange: #ff6f00;
+  --accent-red: #ef5350;
+  --accent-purple: #9c27b0;
+  --text-primary: #e8eaf0;
+  --text-muted: #8892a4;
+  --text-dim: #4a5568;
+  --border: #1e293b;
+  --card-bg: #151c2c;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--bg-dark);
+  color: var(--text-primary);
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+}
+
+.deck { position: relative; width: 100vw; height: 100vh; }
+
+.slide {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 48px 64px;
+  opacity: 0;
+  transform: translateX(60px);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+  pointer-events: none;
+  background: var(--bg-slide);
+  overflow-y: auto;
+}
+
+.slide.active {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: all;
+}
+
+.slide-number {
+  position: fixed;
+  bottom: 24px; right: 40px;
+  font-family: 'Space Mono', monospace;
+  font-size: 13px;
+  color: var(--text-dim);
+  z-index: 100;
+  letter-spacing: 2px;
+}
+
+.nav {
+  position: fixed;
+  bottom: 24px; left: 50%;
+  transform: translateX(-50%);
+  display: flex; gap: 8px;
+  z-index: 100;
+}
+
+.nav-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.3s;
+  border: none; outline: none;
+}
+
+.nav-dot.active {
+  background: var(--accent-green);
+  box-shadow: 0 0 12px rgba(118,185,0,0.5);
+  transform: scale(1.3);
+}
+
+.nav-arrows {
+  position: fixed;
+  bottom: 20px; left: 40px;
+  display: flex; gap: 12px;
+  z-index: 100;
+}
+
+.nav-arrows button {
+  background: var(--border);
+  border: 1px solid var(--text-dim);
+  color: var(--text-muted);
+  width: 36px; height: 36px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 16px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+}
+
+.nav-arrows button:hover {
+  background: var(--accent-green);
+  color: var(--bg-dark);
+  border-color: var(--accent-green);
+}
+
+.slide-label {
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 4px;
+  color: var(--accent-green);
+  margin-bottom: 12px;
+}
+
+h1 {
+  font-size: 48px; font-weight: 700;
+  line-height: 1.1; margin-bottom: 16px;
+}
+
+h1 .hl { color: var(--accent-green); }
+
+h2 {
+  font-size: 36px; font-weight: 700;
+  margin-bottom: 24px; line-height: 1.2;
+}
+
+h2 .hl { color: var(--accent-green); }
+
+.subtitle {
+  font-size: 20px; color: var(--text-muted);
+  font-weight: 300; max-width: 700px; line-height: 1.6;
+}
+
+.subtitle strong { color: var(--text-primary); font-weight: 500; }
+
+p.body-text {
+  font-size: 17px; color: var(--text-muted);
+  line-height: 1.7; max-width: 800px;
+}
+
+.card-row {
+  display: flex; gap: 20px;
+  margin-top: 28px; flex-wrap: wrap;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px 28px; flex: 1; min-width: 200px;
+}
+
+.card h3 { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+.card p { font-size: 14px; color: var(--text-muted); line-height: 1.5; }
+
+.card .stat {
+  font-family: 'Space Mono', monospace;
+  font-size: 28px; font-weight: 700;
+  color: var(--accent-green); margin-bottom: 4px;
+}
+
+.card .stat-label {
+  font-size: 12px; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 1px;
+}
+
+.comp-table {
+  width: 100%; margin-top: 24px;
+  border-collapse: separate; border-spacing: 0;
+  font-size: 14px;
+}
+
+.comp-table th {
+  background: var(--card-bg); padding: 12px 16px;
+  text-align: left; font-weight: 700; font-size: 12px;
+  text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-muted);
+  border-bottom: 2px solid var(--accent-green);
+}
+
+.comp-table th:first-child { border-radius: 8px 0 0 0; }
+.comp-table th:last-child { border-radius: 0 8px 0 0; }
+
+.comp-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.comp-table td:first-child { color: var(--text-primary); font-weight: 500; }
+.comp-table tr:last-child td { border-bottom: none; }
+
+.fw-tag {
+  display: inline-block; padding: 2px 10px;
+  border-radius: 4px; font-size: 12px; font-weight: 600;
+  font-family: 'Space Mono', monospace;
+}
+
+.tag-nemo { background: rgba(118,185,0,0.15); color: var(--accent-green); }
+.tag-verl { background: rgba(0,188,212,0.15); color: var(--accent-cyan); }
+.tag-prime { background: rgba(156,39,176,0.15); color: var(--accent-purple); }
+
+ul.clean { list-style: none; margin-top: 16px; }
+
+ul.clean li {
+  position: relative; padding-left: 24px;
+  margin-bottom: 14px; font-size: 16px;
+  color: var(--text-muted); line-height: 1.6;
+}
+
+ul.clean li::before {
+  content: ''; position: absolute;
+  left: 0; top: 8px; width: 8px; height: 8px;
+  background: var(--accent-green);
+  border-radius: 2px; transform: rotate(45deg);
+}
+
+ul.clean li strong { color: var(--text-primary); }
+
+.phase-row { display: flex; gap: 16px; margin-top: 28px; }
+
+.phase-card {
+  flex: 1; background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px; padding: 24px;
+  position: relative; overflow: hidden;
+}
+
+.phase-card::before {
+  content: ''; position: absolute;
+  top: 0; left: 0; right: 0; height: 3px;
+}
+
+.phase-card.p1::before { background: var(--accent-green); }
+.phase-card.p2::before { background: var(--accent-cyan); }
+.phase-card.p3::before { background: var(--accent-orange); }
+
+.phase-card .phase-label {
+  font-family: 'Space Mono', monospace;
+  font-size: 11px; text-transform: uppercase;
+  letter-spacing: 2px; margin-bottom: 8px;
+}
+
+.phase-card.p1 .phase-label { color: var(--accent-green); }
+.phase-card.p2 .phase-label { color: var(--accent-cyan); }
+.phase-card.p3 .phase-label { color: var(--accent-orange); }
+
+.phase-card h3 { font-size: 18px; font-weight: 700; margin-bottom: 12px; }
+.phase-card ul { list-style: none; padding: 0; }
+
+.phase-card li {
+  font-size: 13px; color: var(--text-muted);
+  padding: 4px 0; padding-left: 16px; position: relative;
+}
+
+.phase-card li::before {
+  content: '\2022'; position: absolute;
+  left: 0; color: var(--text-dim);
+}
+
+.title-slide { justify-content: center; align-items: flex-start; }
+
+.logo-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 40px; }
+
+.nx-badge {
+  font-family: 'Space Mono', monospace;
+  font-size: 14px; font-weight: 700;
+  padding: 6px 14px; border-radius: 6px;
+  background: rgba(118,185,0,0.12);
+  color: var(--accent-green);
+  border: 1px solid rgba(118,185,0,0.3);
+}
+
+.title-slide .meta {
+  margin-top: 40px;
+  font-family: 'Space Mono', monospace;
+  font-size: 12px; color: var(--text-dim); letter-spacing: 1px;
+}
+
+.bottleneck-vis {
+  display: flex; align-items: center; gap: 0;
+  margin-top: 20px; width: 100%; max-width: 800px;
+  height: 48px; border-radius: 8px; overflow: hidden;
+}
+
+.bottleneck-vis .seg {
+  height: 100%; display: flex;
+  align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600;
+  font-family: 'Space Mono', monospace;
+}
+
+.seg-rollout { background: rgba(0,188,212,0.25); color: var(--accent-cyan); flex: 4; }
+.seg-train { background: rgba(118,185,0,0.25); color: var(--accent-green); flex: 2; }
+.seg-refit { background: rgba(239,83,80,0.4); color: var(--accent-red); flex: 3; border: 2px dashed var(--accent-red); }
+.seg-reward { background: rgba(156,39,176,0.2); color: var(--accent-purple); flex: 1; }
+
+.bottleneck-arrow {
+  text-align: center; margin-top: 8px;
+  font-size: 12px; color: var(--accent-red);
+  font-family: 'Space Mono', monospace;
+}
+
+.latency-bars { margin-top: 24px; max-width: 700px; }
+
+.lat-row { display: flex; align-items: center; margin-bottom: 10px; gap: 12px; }
+
+.lat-label {
+  width: 200px; text-align: right;
+  font-size: 13px; color: var(--text-muted); flex-shrink: 0;
+}
+
+.lat-bar-wrap {
+  flex: 1; height: 24px;
+  background: var(--border); border-radius: 4px;
+  overflow: hidden;
+}
+
+.lat-bar {
+  height: 100%; border-radius: 4px;
+  display: flex; align-items: center; padding-left: 8px;
+  font-size: 11px; font-family: 'Space Mono', monospace; font-weight: 700;
+}
+
+.lat-bar.disk { background: var(--accent-red); width: 100%; }
+.lat-bar.nccl { background: var(--accent-orange); width: 50%; }
+.lat-bar.zmq { background: var(--accent-cyan); width: 25%; }
+.lat-bar.mx { background: var(--accent-green); width: 15%; color: #fff; }
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.slide.active .anim { animation: fadeInUp 0.5s ease forwards; }
+.slide.active .d1 { animation-delay: 0.1s; opacity: 0; }
+.slide.active .d2 { animation-delay: 0.25s; opacity: 0; }
+.slide.active .d3 { animation-delay: 0.4s; opacity: 0; }
+.slide.active .d4 { animation-delay: 0.55s; opacity: 0; }
+.slide.active .d5 { animation-delay: 0.7s; opacity: 0; }
+
+@media (max-width: 1000px) {
+  .slide { padding: 32px 36px; }
+  h1 { font-size: 36px; }
+  h2 { font-size: 28px; }
+  .card-row, .phase-row { flex-direction: column; }
+}
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+  <!-- ===== SLIDE 1: Title ===== -->
+  <div class="slide title-slide active" data-slide="0">
+    <div class="logo-bar anim d1">
+      <span class="nx-badge">NVIDIA NIXL</span>
+      <span class="nx-badge" style="background:rgba(0,188,212,0.12);color:var(--accent-cyan);border-color:rgba(0,188,212,0.3)">ModelExpress</span>
+      <span class="nx-badge" style="background:rgba(156,39,176,0.12);color:var(--accent-purple);border-color:rgba(156,39,176,0.3)">RL Post-Training</span>
+    </div>
+    <h1 class="anim d2">ModelExpress for<br><span class="hl">RL Weight Updates</span></h1>
+    <p class="subtitle anim d3">
+      Extending GPU-to-GPU RDMA transfers from <strong>inference scaling</strong> to the <strong>training&rarr;inference refit boundary</strong> in reinforcement learning post-training.
+    </p>
+    <p class="subtitle anim d4" style="margin-top:16px;font-size:16px;">
+      Target frameworks: <strong>NeMo RL</strong> &middot; <strong>verl</strong> &middot; <strong>PRIME-RL</strong>
+    </p>
+    <div class="meta anim d5">April 2026 &mdash; Integration Design Overview</div>
+  </div>
+
+  <!-- ===== SLIDE 2: The Problem ===== -->
+  <div class="slide" data-slide="1">
+    <div class="slide-label anim d1">The Problem</div>
+    <h2 class="anim d1">The <span class="hl">Weight Sync Bottleneck</span></h2>
+
+    <p class="body-text anim d2">
+      On-policy RL (GRPO, PPO, DAPO) alternates between rollout generation on inference GPUs and gradient updates on training GPUs. After every training step, updated weights must reach inference before the next rollout &mdash; this <strong>refit phase</strong> stalls both sides.
+    </p>
+
+    <div class="anim d3">
+      <div style="margin-top:20px;font-family:'Space Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:2px;">Wall-clock time breakdown (illustrative)</div>
+      <div class="bottleneck-vis">
+        <div class="seg seg-rollout">Rollout</div>
+        <div class="seg seg-reward">Rew</div>
+        <div class="seg seg-train">Train</div>
+        <div class="seg seg-refit">REFIT</div>
+      </div>
+      <div class="bottleneck-arrow">&#9650; Up to 30&ndash;40% of wall-clock for large models</div>
+    </div>
+
+    <div style="margin-top:20px;font-family:'Space Mono',monospace;font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:2px;" class="anim d4">Current refit latency (70B-class model, multi-node)</div>
+    <div class="latency-bars anim d4">
+      <div class="lat-row">
+        <div class="lat-label">Filesystem (PRIME-RL)</div>
+        <div class="lat-bar-wrap"><div class="lat-bar disk">~20s+</div></div>
+      </div>
+      <div class="lat-row">
+        <div class="lat-label">NCCL Broadcast (NeMo RL)</div>
+        <div class="lat-bar-wrap"><div class="lat-bar nccl">~10s</div></div>
+      </div>
+      <div class="lat-row">
+        <div class="lat-label">ZMQ IPC (NeMo RL, co-loc)</div>
+        <div class="lat-bar-wrap"><div class="lat-bar zmq">~3-5s</div></div>
+      </div>
+      <div class="lat-row">
+        <div class="lat-label" style="color:var(--accent-green);font-weight:600;">MX RDMA P2P (target)</div>
+        <div class="lat-bar-wrap"><div class="lat-bar mx">~5s</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== SLIDE 3: The Solution ===== -->
+  <div class="slide" data-slide="2">
+    <div class="slide-label anim d1">The Solution</div>
+    <h2 class="anim d1"><span class="hl">ModelExpress</span> for Training&rarr;Inference Refit</h2>
+
+    <p class="body-text anim d2">
+      Extend MX from inference-to-inference P2P to the training&rarr;inference boundary. Training workers register updated weights with NIXL, publish metadata to the MX Server, and RDMA-WRITE directly into inference GPU memory &mdash; bypassing CPU, disk, and collective overheads.
+    </p>
+
+    <div class="anim d3" style="margin-top:16px;text-align:center;">
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:12px;padding:24px;text-align:left;max-width:800px;margin:0 auto;">
+        <div style="display:flex;align-items:center;gap:24px;justify-content:center;flex-wrap:wrap;">
+          <div style="text-align:center;">
+            <div style="font-weight:700;color:var(--accent-green);font-size:14px;">Training Workers</div>
+            <div style="font-size:12px;color:var(--text-muted);">FSDP2 / Megatron</div>
+            <div style="font-size:12px;color:var(--text-muted);">WeightExtractor</div>
+            <div style="font-size:12px;color:var(--accent-green);">MxTrainingPublisher</div>
+            <div style="font-size:11px;color:var(--text-dim);">NIXL Agent per GPU</div>
+          </div>
+          <div style="font-size:32px;color:var(--accent-green);">&xrarr;</div>
+          <div style="text-align:center;">
+            <div style="font-weight:700;color:var(--accent-cyan);font-size:14px;">MX Server</div>
+            <div style="font-size:12px;color:var(--text-muted);">gRPC Metadata Coord</div>
+            <div style="font-size:12px;color:var(--text-muted);">Redis / K8s CRD</div>
+            <div style="font-size:12px;color:var(--text-muted);">Version Tracking</div>
+          </div>
+          <div style="font-size:32px;color:var(--accent-green);">&xrarr;</div>
+          <div style="text-align:center;">
+            <div style="font-weight:700;color:var(--accent-purple);font-size:14px;">Inference Workers</div>
+            <div style="font-size:12px;color:var(--text-muted);">vLLM / SGLang</div>
+            <div style="font-size:12px;color:var(--accent-purple);">MxRefitReceiver</div>
+            <div style="font-size:11px;color:var(--text-dim);">NIXL Agent per GPU</div>
+          </div>
+        </div>
+        <div style="text-align:center;margin-top:16px;padding-top:12px;border-top:2px solid var(--accent-green);">
+          <span style="font-family:'Space Mono',monospace;font-size:13px;color:var(--accent-green);font-weight:700;">RDMA WRITE &mdash; GPU VRAM &rarr; GPU VRAM &mdash; bypasses CPU &amp; disk</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card-row anim d4" style="margin-top:12px;">
+      <div class="card">
+        <div class="stat">~5s</div>
+        <div class="stat-label">Llama-3.3-70B (140 GB)</div>
+      </div>
+      <div class="card">
+        <div class="stat">~15s</div>
+        <div class="stat-label">DeepSeek-V3 MoE (681 GB)</div>
+      </div>
+      <div class="card">
+        <div class="stat">0</div>
+        <div class="stat-label">CPU staging required</div>
+      </div>
+      <div class="card">
+        <div class="stat">Auto</div>
+        <div class="stat-label">IPC &rarr; RDMA &rarr; TCP fallback</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== SLIDE 4: Architecture Deep-Dive ===== -->
+  <div class="slide" data-slide="3">
+    <div class="slide-label anim d1">Architecture</div>
+    <h2 class="anim d1">Component <span class="hl">Deep-Dive</span></h2>
+
+    <div class="anim d2" style="flex:1;display:flex;align-items:flex-start;justify-content:center;margin-top:8px;">
+      <svg viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" fill="none" style="width:100%;max-width:940px;max-height:calc(100vh - 200px);">
+        <!-- ===== TRAINING COLUMN ===== -->
+        <rect x="10" y="12" width="280" height="450" rx="14" fill="#76b90008" stroke="#76b900" stroke-width="2"/>
+        <text x="150" y="6" text-anchor="middle" fill="#76b900" font-family="Space Mono,monospace" font-size="10" font-weight="700" letter-spacing="2.5">TRAINING WORKERS</text>
+
+        <!-- RL Framework -->
+        <rect x="28" y="32" width="244" height="44" rx="8" fill="#1e293b"/>
+        <text x="150" y="50" text-anchor="middle" fill="#8892a4" font-family="Space Mono,monospace" font-size="9" letter-spacing="1">RL FRAMEWORK</text>
+        <text x="150" y="66" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="13" font-weight="600">NeMo RL / verl / PRIME-RL</text>
+
+        <!-- Training Backend -->
+        <rect x="28" y="86" width="244" height="44" rx="8" fill="#1e293b"/>
+        <text x="150" y="104" text-anchor="middle" fill="#8892a4" font-family="Space Mono,monospace" font-size="9" letter-spacing="1">TRAINING BACKEND</text>
+        <text x="150" y="120" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="13" font-weight="600">FSDP2 / Megatron-LM</text>
+
+        <!-- Down arrow -->
+        <line x1="150" y1="130" x2="150" y2="144" stroke="#4a5568" stroke-width="1.5"/>
+        <polygon points="145,140 150,148 155,140" fill="#4a5568"/>
+
+        <!-- WeightExtractor -->
+        <rect x="28" y="150" width="244" height="52" rx="8" fill="#1e293b" stroke="#76b900" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="150" y="168" text-anchor="middle" fill="#76b900" font-family="DM Sans,sans-serif" font-size="13" font-weight="700">WeightExtractor</text>
+        <text x="150" y="188" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Gather params &bull; Bucket iteration</text>
+        <text x="272" y="148" text-anchor="end" fill="#76b900" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <!-- Down arrow -->
+        <line x1="150" y1="202" x2="150" y2="216" stroke="#4a5568" stroke-width="1.5"/>
+        <polygon points="145,212 150,220 155,212" fill="#4a5568"/>
+
+        <!-- MxTrainingPublisher -->
+        <rect x="28" y="222" width="244" height="64" rx="8" fill="#76b90015" stroke="#76b900" stroke-width="1.5"/>
+        <text x="150" y="242" text-anchor="middle" fill="#76b900" font-family="DM Sans,sans-serif" font-size="14" font-weight="700">MxTrainingPublisher</text>
+        <text x="150" y="260" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Register tensors with NIXL</text>
+        <text x="150" y="276" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Publish metadata (gRPC) &bull; Version tag</text>
+        <text x="272" y="220" text-anchor="end" fill="#76b900" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <!-- Down arrow -->
+        <line x1="150" y1="286" x2="150" y2="300" stroke="#4a5568" stroke-width="1.5"/>
+        <polygon points="145,296 150,304 155,296" fill="#4a5568"/>
+
+        <!-- ResharderPlugin -->
+        <rect x="28" y="306" width="244" height="44" rx="8" fill="#1e293b" stroke="#ff6f00" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="150" y="324" text-anchor="middle" fill="#ff6f00" font-family="DM Sans,sans-serif" font-size="12" font-weight="700">ResharderPlugin</text>
+        <text x="150" y="342" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Gather-then-shard &bull; Direct-match</text>
+        <text x="272" y="304" text-anchor="end" fill="#ff6f00" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <!-- Down arrow -->
+        <line x1="150" y1="350" x2="150" y2="364" stroke="#4a5568" stroke-width="1.5"/>
+        <polygon points="145,360 150,368 155,360" fill="#4a5568"/>
+
+        <!-- NIXL Agent -->
+        <rect x="28" y="370" width="244" height="44" rx="8" fill="#1e293b"/>
+        <text x="150" y="388" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="13" font-weight="600">NIXL Agent</text>
+        <text x="150" y="406" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">UCX backend &bull; Per-GPU &bull; RDMA WRITE</text>
+        <text x="272" y="368" text-anchor="end" fill="#8892a4" font-family="Space Mono,monospace" font-size="8">EXISTING</text>
+
+        <!-- ===== MX SERVER COLUMN ===== -->
+        <rect x="330" y="80" width="280" height="310" rx="14" fill="#00bcd408" stroke="#00bcd4" stroke-width="2"/>
+        <text x="470" y="72" text-anchor="middle" fill="#00bcd4" font-family="Space Mono,monospace" font-size="10" font-weight="700" letter-spacing="2.5">MODELEXPRESS SERVER</text>
+
+        <rect x="348" y="100" width="244" height="38" rx="7" fill="#1e293b"/>
+        <text x="470" y="124" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="12" font-weight="600">gRPC P2P Service</text>
+        <text x="592" y="98" text-anchor="end" fill="#8892a4" font-family="Space Mono,monospace" font-size="8">EXISTING</text>
+
+        <rect x="348" y="148" width="244" height="38" rx="7" fill="#1e293b"/>
+        <text x="470" y="172" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="12" font-weight="600">Redis / K8s CRD Backend</text>
+        <text x="592" y="146" text-anchor="end" fill="#8892a4" font-family="Space Mono,monospace" font-size="8">EXISTING</text>
+
+        <rect x="348" y="196" width="244" height="38" rx="7" fill="#00bcd412" stroke="#00bcd4" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="470" y="220" text-anchor="middle" fill="#00bcd4" font-family="DM Sans,sans-serif" font-size="12" font-weight="700">Refit Version Tracking</text>
+        <text x="592" y="194" text-anchor="end" fill="#00bcd4" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <rect x="348" y="244" width="244" height="38" rx="7" fill="#00bcd412" stroke="#00bcd4" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="470" y="268" text-anchor="middle" fill="#00bcd4" font-family="DM Sans,sans-serif" font-size="12" font-weight="700">Bucket Coordination</text>
+        <text x="592" y="242" text-anchor="end" fill="#00bcd4" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <rect x="348" y="292" width="244" height="38" rx="7" fill="#1e293b"/>
+        <text x="470" y="316" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="12" font-weight="600">Heartbeat / Reaper</text>
+        <text x="592" y="290" text-anchor="end" fill="#8892a4" font-family="Space Mono,monospace" font-size="8">EXISTING</text>
+
+        <rect x="348" y="340" width="244" height="38" rx="7" fill="#1e293b"/>
+        <text x="470" y="364" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="12" font-weight="600">p2p.proto (extended)</text>
+        <text x="592" y="338" text-anchor="end" fill="#ff6f00" font-family="Space Mono,monospace" font-size="8" font-weight="700">MODIFIED</text>
+
+        <!-- ===== INFERENCE COLUMN ===== -->
+        <rect x="650" y="12" width="280" height="450" rx="14" fill="#9c27b008" stroke="#9c27b0" stroke-width="2"/>
+        <text x="790" y="6" text-anchor="middle" fill="#9c27b0" font-family="Space Mono,monospace" font-size="10" font-weight="700" letter-spacing="2.5">INFERENCE WORKERS</text>
+
+        <!-- Inference Engine -->
+        <rect x="668" y="32" width="244" height="44" rx="8" fill="#1e293b"/>
+        <text x="790" y="50" text-anchor="middle" fill="#8892a4" font-family="Space Mono,monospace" font-size="9" letter-spacing="1">INFERENCE ENGINE</text>
+        <text x="790" y="66" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="13" font-weight="600">vLLM / SGLang</text>
+
+        <!-- MxRefitReceiver -->
+        <rect x="668" y="86" width="244" height="64" rx="8" fill="#9c27b015" stroke="#9c27b0" stroke-width="1.5"/>
+        <text x="790" y="106" text-anchor="middle" fill="#9c27b0" font-family="DM Sans,sans-serif" font-size="14" font-weight="700">MxRefitReceiver</text>
+        <text x="790" y="124" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Poll for new weight versions</text>
+        <text x="790" y="140" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Coordinate with MX Server</text>
+        <text x="912" y="84" text-anchor="end" fill="#9c27b0" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <!-- NIXL Agent -->
+        <rect x="668" y="160" width="244" height="44" rx="8" fill="#1e293b"/>
+        <text x="790" y="178" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="13" font-weight="600">NIXL Agent</text>
+        <text x="790" y="196" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">UCX backend &bull; Pre-registered buffers</text>
+        <text x="912" y="158" text-anchor="end" fill="#8892a4" font-family="Space Mono,monospace" font-size="8">EXISTING</text>
+
+        <!-- Apply weights -->
+        <rect x="668" y="214" width="244" height="44" rx="8" fill="#1e293b"/>
+        <text x="790" y="232" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="13" font-weight="600">Apply Weights In-Place</text>
+        <text x="790" y="250" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">FP8 quantization on receiver</text>
+
+        <!-- Sync Policy -->
+        <rect x="668" y="268" width="244" height="44" rx="8" fill="#1e293b" stroke="#ff6f00" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="790" y="286" text-anchor="middle" fill="#ff6f00" font-family="DM Sans,sans-serif" font-size="12" font-weight="700">SyncPolicyController</text>
+        <text x="790" y="304" text-anchor="middle" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Sync &bull; One-step-off &bull; Async</text>
+        <text x="912" y="266" text-anchor="end" fill="#ff6f00" font-family="Space Mono,monospace" font-size="8" font-weight="700">NEW</text>
+
+        <!-- Resume -->
+        <rect x="668" y="322" width="244" height="38" rx="8" fill="#1e293b"/>
+        <text x="790" y="346" text-anchor="middle" fill="#e8eaf0" font-family="DM Sans,sans-serif" font-size="12" font-weight="600">Resume Rollout Generation</text>
+
+        <!-- ===== ARROWS ===== -->
+        <!-- gRPC: Training -> Server -->
+        <line x1="272" y1="254" x2="330" y2="216" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <polygon points="326,213 334,216 328,221" fill="#00bcd4"/>
+        <text x="294" y="228" text-anchor="middle" fill="#00bcd4" font-family="Space Mono,monospace" font-size="8">gRPC</text>
+
+        <!-- gRPC: Server -> Inference -->
+        <line x1="610" y1="216" x2="668" y2="118" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+        <polygon points="664,115 672,118 666,123" fill="#00bcd4"/>
+        <text x="646" y="160" text-anchor="middle" fill="#00bcd4" font-family="Space Mono,monospace" font-size="8">gRPC</text>
+
+        <!-- RDMA WRITE: Training NIXL -> Inference NIXL -->
+        <rect x="310" y="413" width="320" height="32" rx="6" fill="#76b90012" stroke="#76b900" stroke-width="2"/>
+        <line x1="272" y1="392" x2="310" y2="429" stroke="#76b900" stroke-width="3"/>
+        <line x1="630" y1="429" x2="668" y2="182" stroke="#76b900" stroke-width="3"/>
+        <polygon points="664,178 672,182 666,188" fill="#76b900"/>
+        <text x="470" y="434" text-anchor="middle" fill="#76b900" font-family="Space Mono,monospace" font-size="12" font-weight="700">RDMA WRITE (per bucket)</text>
+
+        <!-- Legend -->
+        <rect x="668" y="378" width="244" height="76" rx="8" fill="#0a0e17" stroke="#1e293b" stroke-width="1"/>
+        <text x="790" y="396" text-anchor="middle" fill="#4a5568" font-family="Space Mono,monospace" font-size="9" letter-spacing="1">LEGEND</text>
+        <rect x="682" y="406" width="10" height="10" rx="2" fill="#76b900"/>
+        <text x="700" y="415" fill="#76b900" font-family="DM Sans,sans-serif" font-size="10" font-weight="600">New component</text>
+        <rect x="800" y="406" width="10" height="10" rx="2" fill="#ff6f00"/>
+        <text x="818" y="415" fill="#ff6f00" font-family="DM Sans,sans-serif" font-size="10" font-weight="600">Modified</text>
+        <rect x="682" y="425" width="10" height="10" rx="2" fill="#1e293b" stroke="#8892a4" stroke-width="1"/>
+        <text x="700" y="434" fill="#8892a4" font-family="DM Sans,sans-serif" font-size="10">Existing</text>
+        <line x1="800" y1="430" x2="830" y2="430" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="4,3"/>
+        <text x="838" y="434" fill="#00bcd4" font-family="DM Sans,sans-serif" font-size="10">Metadata</text>
+        <line x1="682" y1="448" x2="712" y2="448" stroke="#76b900" stroke-width="3"/>
+        <text x="720" y="452" fill="#76b900" font-family="DM Sans,sans-serif" font-size="10" font-weight="600">Data plane (RDMA)</text>
+      </svg>
+    </div>
+  </div>
+
+  <!-- ===== SLIDE 5: Framework Integration ===== -->
+  <div class="slide" data-slide="4">
+    <div class="slide-label anim d1">Integration Map</div>
+    <h2 class="anim d1">Three Frameworks, <span class="hl">One Abstraction</span></h2>
+
+    <p class="body-text anim d2">
+      A framework-agnostic <strong>WeightSyncBackend</strong> decouples the transfer mechanism from each framework's orchestration and sync policy.
+    </p>
+
+    <table class="comp-table anim d3">
+      <thead>
+        <tr>
+          <th style="width:170px;">Dimension</th>
+          <th><span class="fw-tag tag-nemo">NeMo RL</span></th>
+          <th><span class="fw-tag tag-verl">verl</span></th>
+          <th><span class="fw-tag tag-prime">PRIME-RL</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Training Backend</td><td>DTensor / Megatron</td><td>FSDP / FSDP2 / Megatron</td><td>FSDP2 (EP/CP)</td></tr>
+        <tr><td>Inference Backend</td><td>vLLM, SGLang</td><td>vLLM, SGLang, HF</td><td>vLLM</td></tr>
+        <tr><td>Current Sync</td><td>ZMQ IPC / HTTP / NCCL</td><td>NCCL / CheckpointEngine</td><td>Filesystem + HTTP</td></tr>
+        <tr><td>MX Insertion Point</td><td style="color:var(--accent-green);">refit_policy_generation()</td><td style="color:var(--accent-cyan);">CheckpointEngine ABC</td><td style="color:var(--accent-purple);">Orchestrator relay</td></tr>
+        <tr><td>Primary Benefit</td><td>RDMA replaces ZMQ/NCCL</td><td>Multi-node sans filesystem</td><td>Eliminates disk I/O</td></tr>
+      </tbody>
+    </table>
+
+    <div class="card-row anim d4" style="margin-top:16px;">
+      <div class="card" style="border-left: 3px solid var(--accent-green);">
+        <h3 style="color:var(--accent-green);">NeMo RL</h3>
+        <p>New branch alongside ZMQ IPC and NCCL in refit function. Bucket-streamed transfer maps to MX publish. Ray actor integration.</p>
+      </div>
+      <div class="card" style="border-left: 3px solid var(--accent-cyan);">
+        <h3 style="color:var(--accent-cyan);">verl</h3>
+        <p>ModelExpressCheckpointEngine implements v0.7 CheckpointEngine ABC. Targets async server mode. Engine mode stays NCCL.</p>
+      </div>
+      <div class="card" style="border-left: 3px solid var(--accent-purple);">
+        <h3 style="color:var(--accent-purple);">PRIME-RL</h3>
+        <p>Replaces filesystem relay in orchestrator. For cross-DC, MX acts as fast intra-cluster delivery under SHARDCAST.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== SLIDE 6: Delivery Plan ===== -->
+  <div class="slide" data-slide="5">
+    <div class="slide-label anim d1">Delivery</div>
+    <h2 class="anim d1">Phased <span class="hl">Integration Plan</span></h2>
+
+    <div class="phase-row anim d2">
+      <div class="phase-card p1">
+        <div class="phase-label">Phase 1 &mdash; Weeks 1-4</div>
+        <h3>Foundation</h3>
+        <ul>
+          <li>WeightExtractor abstraction (FSDP2 + Megatron)</li>
+          <li>MxTrainingPublisher with NIXL + gRPC</li>
+          <li>Proto extensions (RL_REFIT, training_step)</li>
+          <li>Single-node RDMA validation</li>
+          <li>Benchmark vs. ZMQ IPC baseline</li>
+        </ul>
+      </div>
+      <div class="phase-card p2">
+        <div class="phase-label">Phase 2 &mdash; Weeks 5-10</div>
+        <h3>Framework Integrations</h3>
+        <ul>
+          <li>NeMo RL: MX branch in refit function</li>
+          <li>verl: ModelExpressCheckpointEngine</li>
+          <li>PRIME-RL: Orchestrator MX relay</li>
+          <li>Fallback to existing mechanisms</li>
+          <li>E2E GRPO/PPO correctness tests</li>
+        </ul>
+      </div>
+      <div class="phase-card p3">
+        <div class="phase-label">Phase 3 &mdash; Weeks 11-13</div>
+        <h3>Hardening</h3>
+        <ul>
+          <li>ResharderPlugin (gather-then-shard)</li>
+          <li>Error handling + fallback paths</li>
+          <li>MoE bucket completion tracking</li>
+          <li>FP8 quantization validation</li>
+          <li>Multi-node benchmarks (70B, MoE)</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card-row anim d3" style="margin-top:16px;">
+      <div class="card">
+        <h3>Llama-3.1-8B</h3>
+        <p>2 nodes &middot; NCCL ~3s &rarr; <span style="color:var(--accent-green);font-weight:700;">MX ~1s</span></p>
+      </div>
+      <div class="card">
+        <h3>Llama-3.3-70B</h3>
+        <p>4 nodes &middot; ~10-20s &rarr; <span style="color:var(--accent-green);font-weight:700;">MX ~5s</span></p>
+      </div>
+      <div class="card">
+        <h3>DeepSeek-V3 MoE</h3>
+        <p>8+ nodes &middot; ~30s+ &rarr; <span style="color:var(--accent-green);font-weight:700;">MX ~15s</span></p>
+      </div>
+    </div>
+
+    <ul class="clean anim d4" style="margin-top:16px;">
+      <li><strong>Key risk:</strong> Parallelism layout mismatch &mdash; mitigated by ResharderPlugin and config alignment guidance</li>
+      <li><strong>Dependency:</strong> InfiniBand for full RDMA benefit; clean fallback to NCCL/TCP/filesystem</li>
+    </ul>
+  </div>
+
+</div>
+
+<div class="slide-number" id="slideNum">01 / 06</div>
+<div class="nav" id="navDots"></div>
+<div class="nav-arrows">
+  <button onclick="go(-1)">&#x2190;</button>
+  <button onclick="go(1)">&#x2192;</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const dotsEl = document.getElementById('navDots');
+const numEl = document.getElementById('slideNum');
+let cur = 0;
+
+slides.forEach((_, i) => {
+  const d = document.createElement('button');
+  d.className = 'nav-dot' + (i === 0 ? ' active' : '');
+  d.onclick = () => goTo(i);
+  dotsEl.appendChild(d);
+});
+
+function goTo(n) {
+  if (n < 0 || n >= slides.length) return;
+  slides[cur].classList.remove('active');
+  dotsEl.children[cur].classList.remove('active');
+  cur = n;
+  slides[cur].classList.add('active');
+  dotsEl.children[cur].classList.add('active');
+  numEl.textContent = String(cur+1).padStart(2,'0') + ' / ' + String(slides.length).padStart(2,'0');
+}
+
+function go(dir) { goTo(cur + dir); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+});
+</script>
+</body>
+</html>
