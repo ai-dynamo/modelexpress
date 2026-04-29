@@ -123,7 +123,8 @@ spec:
           value: "INFO"
         - name: UCX_TLS
           value: "rc_x,rc,dc_x,dc,cuda_copy"
-        # Uncomment and set to your cluster's IB HCA devices if needed:
+        # Optional: pin UCX to specific compute-fabric HCAs if your cluster
+        # exposes multiple IB fabrics. Device list is cluster-specific.
         # - name: UCX_NET_DEVICES
         #   value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1"
         - name: UCX_RNDV_SCHEME
