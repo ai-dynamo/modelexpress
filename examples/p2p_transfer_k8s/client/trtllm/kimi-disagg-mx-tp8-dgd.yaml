@@ -98,12 +98,12 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - <GPU_NODE_POOL>
+                  - customer-gpu-w0e
         containers: null
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.1.0"
           command:
             - python3
           args:
@@ -122,9 +122,9 @@ spec:
             - name: HF_HOME
               value: /model-cache
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
           volumeMounts:
             - mountPath: /model-cache
               name: model-cache
@@ -196,7 +196,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - <GPU_NODE_POOL>
+                  - customer-gpu-w0e
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -210,7 +210,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.1.0"
           workingDir: /workspace/
           securityContext:
             privileged: true
@@ -232,9 +232,7 @@ spec:
             - --disaggregation-mode
             - prefill
             - --model-express-url
-            - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - target
+            - modelexpress-server-decode.kavin.svc.cluster.local:8001
             - --tensor-parallel-size
             - "8"
             - --publish-events-and-metrics
@@ -258,13 +256,15 @@ spec:
             - name: HF_MODULES_CACHE
               value: /tmp/hf_modules
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.default.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.kavin.svc.cluster.local:8001"
+            - name: MODEL_EXPRESS_TARGET
+              value: "1"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -346,7 +346,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: my-compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
         volumes:
           - name: shared-model-cache
             persistentVolumeClaim:
@@ -400,7 +400,7 @@ spec:
                 - key: cloud.google.com/gke-nodepool
                   operator: In
                   values:
-                  - <GPU_NODE_POOL>
+                  - customer-gpu-w0e
           podAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -414,7 +414,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.1.0"
           workingDir: /workspace/
           securityContext:
             privileged: true
@@ -436,9 +436,7 @@ spec:
             - --disaggregation-mode
             - decode
             - --model-express-url
-            - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - target
+            - modelexpress-server-decode.kavin.svc.cluster.local:8001
             - --tensor-parallel-size
             - "8"
             - --publish-events-and-metrics
@@ -462,13 +460,15 @@ spec:
             - name: HF_MODULES_CACHE
               value: /tmp/hf_modules
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.default.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.kavin.svc.cluster.local:8001"
+            - name: MODEL_EXPRESS_TARGET
+              value: "1"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.kavin.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.kavin.svc.cluster.local:2379"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -552,7 +552,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: my-compute-domain-channel
+            resourceClaimTemplateName: kavin-compute-domain-channel
         volumes:
           - name: shared-model-cache
             persistentVolumeClaim:
