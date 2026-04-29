@@ -24,6 +24,74 @@ Both produce the **exact same kind of data** the NIXL team requested: raw BF16 w
 
 ---
 
+## Component View
+
+Where the data being studied actually lives + what writes/reads it. Green is what the compression team would compress; purple is the existing RL stack producing it.
+
+```mermaid
+flowchart TB
+    subgraph trainer_node["Trainer node — GB200"]
+        direction TB
+        T_FSDP["FSDP2 trainer<br/>optimizer.step()"]
+        T_PUB["MxTrainingPublisher<br/>+ NIXLWeightBroadcast"]
+        T_NIXL(["NIXL agent (UCX rc_mlx5)"])
+        T_FSDP --> T_PUB --> T_NIXL
+    end
+
+    subgraph mx_meta["Metadata plane — MX Server"]
+        MX["MX Server<br/>(gRPC)"]
+        REDIS[("Redis")]
+        MX --> REDIS
+    end
+
+    subgraph inference_node["Inference node — GB200"]
+        direction TB
+        I_NIXL(["NIXL agent (UCX rc_mlx5)"])
+        I_RECV["MxRefitReceiver<br/>+ NIXLWeightUpdateWorker"]
+        VLLM["vLLM engine<br/>(live params)"]
+        I_NIXL --> I_RECV --> VLLM
+    end
+
+    subgraph prefill_node["Prefill worker — GB200 (disagg inference)"]
+        direction TB
+        P_FWD["vLLM prefill pass"]
+        P_KV["KV cache buffer<br/>(per-layer key/value)"]
+        P_FWD --> P_KV
+    end
+
+    subgraph decode_node["Decode worker — GB200"]
+        direction TB
+        D_KV["KV cache import"]
+        D_GEN["Token generation"]
+        D_KV --> D_GEN
+    end
+
+    T_PUB -. "publish metadata<br/>(SourceIdentity, agent blob)" .-> MX
+    MX -. "discover" .-> I_RECV
+
+    T_NIXL ==> |"① RL REFIT<br/>weights (BF16)<br/>~3 GB / step (1.5B model)<br/>~140 GB / step (70B)"| I_NIXL
+    P_KV ==> |"② KV CACHE<br/>tensors (BF16)<br/>~14 MB at seq=512<br/>~3.5 GB at seq=131K"| D_KV
+
+    style T_FSDP fill:#533483,stroke:#e94560,color:#fff
+    style T_PUB fill:#533483,stroke:#e94560,color:#fff
+    style T_NIXL fill:#1b5e20,stroke:#4caf50,color:#fff
+    style I_NIXL fill:#1b5e20,stroke:#4caf50,color:#fff
+    style I_RECV fill:#533483,stroke:#e94560,color:#fff
+    style VLLM fill:#533483,stroke:#e94560,color:#fff
+    style P_FWD fill:#533483,stroke:#e94560,color:#fff
+    style P_KV fill:#1b5e20,stroke:#4caf50,color:#fff
+    style D_KV fill:#1b5e20,stroke:#4caf50,color:#fff
+    style D_GEN fill:#533483,stroke:#e94560,color:#fff
+    style MX fill:#533483,stroke:#e94560,color:#fff
+    style REDIS fill:#162447,stroke:#533483,color:#e0e0e0
+```
+
+**Compression target = the green edges.** ① is the RL-refit path between trainer and inference NIXL agents; ② is the KV cache transfer between prefill and decode. Everything purple — the trainer, the MX Server, vLLM, the receiver — is RL-stack infrastructure that wouldn't change if nvCOMP is added at the NIXL layer (compression would slot in transparently between `register` and `RDMA WRITE` on either edge).
+
+The capture scripts in [`scripts/`](./scripts/) snapshot the bytes that cross those green edges, plus pre/post weight tensors for delta-compression analysis.
+
+---
+
 ## Option 1: Request the pre-captured data package (fastest)
 
 We have a ready-made data package captured from a live PRIME-RL deployment on GB200. **It's not in this repo** (binary tensors at GB scale aren't appropriate to commit) — request access from `kavink@nvidia.com` and we'll share via the appropriate channel (NV S3 bucket, internal share, or direct upload to your `eschmidt@nvidia.com` inbox per the original request).
@@ -82,13 +150,14 @@ Run our validated PRIME-RL overlay workflow and capture weights mid-flight using
 
 ### Prerequisites
 
-- GKE cluster with GB200 nodes (ARM64, `customer-gpu-o7v` pool or equivalent)
-- `kavin` namespace (or your own) with:
-  - MX Server running: `modelexpress-server.<ns>.svc.cluster.local:8001`
+- A GB200 cluster (ARM64) with at least 2 nodes, container runtime, and an RDMA-capable interconnect (InfiniBand or RoCE) between nodes. Cluster orchestration is Kubernetes-based; manifests assume `kubectl` access and a working namespace.
+- A namespace where you'll deploy the overlay, with the following bound:
+  - MX Server reachable at `modelexpress-server.<your-ns>.svc.cluster.local:8001` (Helm chart in this repo, or use an existing deployment)
   - Redis backing the MX Server
-  - `shared-model-cache` PVC for HF model cache
-  - `nvcr-imagepullsecret` for pulling the overlay image
-- `tsh` auth for `nvcr.io/nvidian/dynamo-dev/`
+  - A shared model-cache PVC for HuggingFace downloads
+  - An image pull secret for the registry hosting the overlay image (we publish to `nvcr.io/nvidian/dynamo-dev/`; you can also build locally)
+
+The included K8s manifests under `prime-rl/k8s/prime-rl-mx-on-nixl/` may need light edits (namespace, node selectors, image pull secret name, RDMA network annotations) for your cluster — they're examples, not portable across all GB200 deployments. The capture flow itself is cluster-agnostic.
 
 ### Step 1: Deploy the PRIME-RL overlay
 
@@ -97,24 +166,26 @@ git clone git@github.com:KavinKrishnan/prime-rl.git
 cd prime-rl
 git checkout kavink/mx-on-nixl
 
-# Build the ARM64 image (or use the pre-built one)
+# Use the pre-built ARM64 image, or build locally
 # Pre-built: nvcr.io/nvidian/dynamo-dev/prime-rl-mx-on-nixl:v0.2
 docker buildx build --platform linux/arm64 \
   -f docker/Dockerfile.mx-on-nixl \
-  -t nvcr.io/nvidian/dynamo-dev/prime-rl-mx-on-nixl:v0.2 \
+  -t <your-registry>/prime-rl-mx-on-nixl:v0.2 \
   --push .
 
-# Deploy scenario A (baseline — PI's NIXL transport, no MX env vars)
+# Edit k8s/prime-rl-mx-on-nixl/*.yaml for your namespace, node selectors,
+# RDMA network annotations, and image registry. Then:
 cd k8s/prime-rl-mx-on-nixl
-./run.sh deploy A
-./run.sh status   # wait until all 3 pods are Running
+./run.sh deploy A          # scenario A = PI's NIXL transport, no MX env vars
+./run.sh status            # wait until all 3 pods are Running
 ```
 
 ### Step 2: Verify the RL loop is running
 
 ```bash
-kubectl -n kavin logs prime-rl-mx-on-nixl-trainer-0 --tail=20 | grep "SUCCESS.*Step"
-kubectl -n kavin logs prime-rl-mx-on-nixl-inference-0 | grep "update_weights.*200"
+NS=<your-namespace>
+kubectl -n $NS logs prime-rl-mx-on-nixl-trainer-0 --tail=20 | grep "SUCCESS.*Step"
+kubectl -n $NS logs prime-rl-mx-on-nixl-inference-0 | grep "update_weights.*200"
 ```
 
 ### Step 3: Capture using the published script
@@ -122,19 +193,21 @@ kubectl -n kavin logs prime-rl-mx-on-nixl-inference-0 | grep "update_weights.*20
 We ship `capture_on_pod.py` in [`scripts/`](./scripts/) — same script that produced our pre-captured Qwen2.5-1.5B package. It captures pre/post RL weights, simulates one AdamW step, computes deltas, and dumps a KV cache prefill, all in one pass.
 
 ```bash
+NS=<your-namespace>
+
 # Copy the script into the trainer pod
 kubectl cp docs/RL/scripts/capture_on_pod.py \
-  kavin/prime-rl-mx-on-nixl-trainer-0:/tmp/capture.py
+  $NS/prime-rl-mx-on-nixl-trainer-0:/tmp/capture.py
 
 # Run it inside the pod (overlay image's interpreter is /app/.venv/bin/python)
-kubectl exec kavin/prime-rl-mx-on-nixl-trainer-0 -- /app/.venv/bin/python /tmp/capture.py \
+kubectl exec $NS/prime-rl-mx-on-nixl-trainer-0 -- /app/.venv/bin/python /tmp/capture.py \
   --model Qwen/Qwen2.5-1.5B \
   --out /tmp/nixl_capture \
   --kv-seq-len 512 \
   --lr 5e-6
 
 # Copy the results back
-kubectl cp kavin/prime-rl-mx-on-nixl-trainer-0:/tmp/nixl_capture ./RL_capture
+kubectl cp $NS/prime-rl-mx-on-nixl-trainer-0:/tmp/nixl_capture ./RL_capture
 ```
 
 Output `RL_capture/` contains four sub-directories (`weights_pre_rl/`, `weights_post_rl/`, `weight_deltas/`, `kv_cache/`) each with raw `.bin` files plus a `manifest.json`. See [`scripts/README.md`](./scripts/README.md) for the full layout + flag reference.
