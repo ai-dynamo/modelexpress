@@ -89,6 +89,10 @@ modelexpress-cli model download google-t5/t5-small \
   --provider hugging-face \
   --strategy server-only
 
+# Download from Google Cloud Storage
+modelexpress-cli model download gs://my-bucket/models/qwen/rev-1 \
+  --provider gcs
+
 # Direct download (bypass server)
 modelexpress-cli model download microsoft/DialoGPT-medium \
   --strategy direct
@@ -118,6 +122,9 @@ modelexpress-cli model status
 # Clear specific model from storage
 modelexpress-cli model clear google-t5/t5-small
 
+# Clear a Google Cloud Storage model from storage
+modelexpress-cli model clear --provider gcs gs://my-bucket/models/qwen/rev-1
+
 # Clear all models from storage (with confirmation)
 modelexpress-cli model clear-all
 
@@ -144,6 +151,10 @@ modelexpress-cli model stats --detailed
 
 **Providers:**
 - `hugging-face`: Hugging Face model hub (default)
+- `ngc`: NVIDIA NGC catalog
+- `gcs`: Google Cloud Storage object prefix. The model name must be a full `gs://<bucket>/<path>` URL. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for cache layout and provider behavior.
+
+For GCS downloads, configure Google Application Default Credentials on the process that performs the download: the server for `server-only`, the client for `direct`, and either process for `smart-fallback`. Common options are `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`, or Workload Identity on GKE.
 
 **Model Commands:**
 - `download`: Download model with automatic storage (use `--strategy` and `--provider` for options)

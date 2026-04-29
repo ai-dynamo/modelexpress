@@ -958,6 +958,44 @@ mod tests {
         MODEL_TRACKER.delete_status(&model_name);
     }
 
+    #[tokio::test]
+    async fn test_model_service_already_downloaded_gcs_trailing_slash_uses_canonical_name() {
+        let service = ModelServiceImpl;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_nanos();
+        let canonical_model_name = format!("gs://test-bucket-{timestamp}/org/model/rev-1");
+
+        MODEL_TRACKER.set_status(
+            canonical_model_name.clone(),
+            ModelStatus::DOWNLOADED,
+            ModelProvider::Gcs,
+        );
+
+        let request = Request::new(ModelDownloadRequest {
+            model_name: format!("{canonical_model_name}/"),
+            provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            ignore_weights: false,
+        });
+
+        let response = service.ensure_model_downloaded(request).await;
+        assert!(response.is_ok());
+
+        let mut stream = response.expect("Response should be ok").into_inner();
+        let update = stream.next().await.expect("Update should be present");
+        assert!(update.is_ok());
+
+        let status_update = update.expect("Status update should be ok");
+        assert_eq!(status_update.model_name, canonical_model_name);
+        assert_eq!(
+            status_update.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloaded as i32
+        );
+
+        MODEL_TRACKER.delete_status(&canonical_model_name);
+    }
+
     #[test]
     fn test_model_download_tracker_set_status_and_notify() {
         let _temp_dir = TempDir::new().expect("Failed to create temp dir");

@@ -83,9 +83,11 @@ pub trait ModelProviderTrait: Send + Sync {
     }
 }
 
+pub mod gcs;
 pub mod huggingface;
 pub mod ngc;
 
+pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
 
@@ -154,6 +156,18 @@ mod tests {
             canonical
                 .as_ref()
                 .is_ok_and(|model_name| model_name == "test/model"),
+            "Expected canonical model name, got {canonical:?}"
+        );
+    }
+
+    #[test]
+    fn test_canonical_model_name_gcs_trims_trailing_slash() {
+        let provider = GcsProvider;
+        let canonical = provider.canonical_model_name("gs://test-bucket/org/model/rev-1/");
+        assert!(
+            canonical
+                .as_ref()
+                .is_ok_and(|model_name| model_name == "gs://test-bucket/org/model/rev-1"),
             "Expected canonical model name, got {canonical:?}"
         );
     }

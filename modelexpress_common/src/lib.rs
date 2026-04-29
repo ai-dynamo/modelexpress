@@ -172,6 +172,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
         match provider {
             models::ModelProvider::HuggingFace => grpc::model::ModelProvider::HuggingFace,
             models::ModelProvider::Ngc => grpc::model::ModelProvider::Ngc,
+            models::ModelProvider::Gcs => grpc::model::ModelProvider::Gcs,
         }
     }
 }
@@ -181,6 +182,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
         match provider {
             grpc::model::ModelProvider::HuggingFace => models::ModelProvider::HuggingFace,
             grpc::model::ModelProvider::Ngc => models::ModelProvider::Ngc,
+            grpc::model::ModelProvider::Gcs => models::ModelProvider::Gcs,
         }
     }
 }
@@ -291,10 +293,15 @@ mod tests {
 
     #[test]
     fn test_model_provider_conversion_both_ways() {
-        let model_provider = models::ModelProvider::HuggingFace;
-        let grpc_provider: grpc::model::ModelProvider = model_provider.into();
-        let back_to_model: models::ModelProvider = grpc_provider.into();
-        assert_eq!(model_provider, back_to_model);
+        for model_provider in [
+            models::ModelProvider::HuggingFace,
+            models::ModelProvider::Ngc,
+            models::ModelProvider::Gcs,
+        ] {
+            let grpc_provider: grpc::model::ModelProvider = model_provider.into();
+            let back_to_model: models::ModelProvider = grpc_provider.into();
+            assert_eq!(model_provider, back_to_model);
+        }
     }
 
     #[test]

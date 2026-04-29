@@ -135,6 +135,8 @@ Cache directory resolution for HuggingFace: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `
 
 Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache/ngc`.
 
+GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached GCS models are stored under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for provider internals.
+
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
 ## Docker
@@ -203,6 +205,25 @@ kubectl create secret generic ngc-api-key-secret \
 ```
 
 Pass it to the server pod via `envFrom` or individual `env` entries in your deployment manifest.
+
+### Google Cloud Storage Credentials
+
+To download models from Google Cloud Storage with the direct `gcs` provider, use a full `gs://<bucket>/<object-prefix>` model name and configure Google Application Default Credentials for the process doing the download. The identity needs permission to list and read objects under the model prefix, for example `storage.objects.list` and `storage.objects.get`.
+
+Common credential options:
+
+1. Set `GOOGLE_APPLICATION_CREDENTIALS` to a mounted service account JSON key.
+2. Use `gcloud auth application-default login` for local development.
+3. Use GKE Workload Identity or another platform-provided ADC source in Kubernetes.
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/service-account.json
+kubectl create secret generic gcs-service-account-key \
+  --from-file=service-account.json=/path/to/service-account.json \
+  -n ${NAMESPACE}
+```
+
+Mount the secret into the server or client pod and set `GOOGLE_APPLICATION_CREDENTIALS` to the mounted file path. When using Workload Identity, no key secret is needed. For cache layout, manifest behavior, and failure modes, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
 
 ### Helm Chart
 
