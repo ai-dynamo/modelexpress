@@ -48,10 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize tracing with the configured log level
     let log_level = config.log_level();
-
+    let env_filter = EnvFilter::from_default_env().add_directive(log_level.into());
     let subscriber = FmtSubscriber::builder()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_max_level(log_level)
+        .with_env_filter(env_filter)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
