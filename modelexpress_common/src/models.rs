@@ -32,6 +32,8 @@ pub enum ModelProvider {
     HuggingFace,
     /// NVIDIA NGC catalog
     Ngc,
+    /// Google Cloud Storage
+    Gcs,
 }
 
 impl ModelProvider {
@@ -40,6 +42,7 @@ impl ModelProvider {
         match self {
             Self::HuggingFace => "hugging-face",
             Self::Ngc => "ngc",
+            Self::Gcs => "gcs",
         }
     }
 }
@@ -52,7 +55,7 @@ impl Display for ModelProvider {
 
 impl ValueEnum for ModelProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::HuggingFace, Self::Ngc]
+        &[Self::HuggingFace, Self::Ngc, Self::Gcs]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -84,12 +87,17 @@ mod tests {
 
     #[test]
     fn test_model_provider_serialization() {
-        let provider = ModelProvider::HuggingFace;
-        let serialized =
-            serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
-        let deserialized: ModelProvider =
-            serde_json::from_str(&serialized).expect("Failed to deserialize ModelProvider");
-        assert_eq!(provider, deserialized);
+        for provider in [
+            ModelProvider::HuggingFace,
+            ModelProvider::Ngc,
+            ModelProvider::Gcs,
+        ] {
+            let serialized =
+                serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
+            let deserialized: ModelProvider =
+                serde_json::from_str(&serialized).expect("Failed to deserialize ModelProvider");
+            assert_eq!(provider, deserialized);
+        }
     }
 
     #[test]
@@ -102,25 +110,20 @@ mod tests {
     fn test_model_provider_display() {
         assert_eq!(ModelProvider::HuggingFace.to_string(), "hugging-face");
         assert_eq!(ModelProvider::Ngc.to_string(), "ngc");
+        assert_eq!(ModelProvider::Gcs.to_string(), "gcs");
     }
 
     #[test]
     fn test_model_provider_value_enum_matches_display() {
-        for provider in [ModelProvider::HuggingFace, ModelProvider::Ngc] {
+        for provider in [
+            ModelProvider::HuggingFace,
+            ModelProvider::Ngc,
+            ModelProvider::Gcs,
+        ] {
             let parsed = ModelProvider::from_str(provider.as_str(), false)
                 .expect("Failed to parse ModelProvider from clap value");
             assert_eq!(parsed, provider);
         }
-    }
-
-    #[test]
-    fn test_model_provider_ngc_serialization() {
-        let provider = ModelProvider::Ngc;
-        let serialized =
-            serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
-        let deserialized: ModelProvider =
-            serde_json::from_str(&serialized).expect("Failed to deserialize ModelProvider");
-        assert_eq!(provider, deserialized);
     }
 
     #[test]

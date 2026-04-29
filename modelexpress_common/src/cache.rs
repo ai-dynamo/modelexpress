@@ -4,7 +4,9 @@
 use crate::{
     Utils, constants,
     models::ModelProvider,
-    providers::{huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache},
+    providers::{
+        gcs::GcsProviderCache, huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache,
+    },
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -230,7 +232,11 @@ impl CacheConfig {
             });
         }
 
-        for provider in [ModelProvider::HuggingFace, ModelProvider::Ngc] {
+        for provider in [
+            ModelProvider::HuggingFace,
+            ModelProvider::Ngc,
+            ModelProvider::Gcs,
+        ] {
             models.extend(cache_for_provider(provider).list_models(&self.local_path)?);
         }
 
@@ -338,6 +344,7 @@ pub(crate) fn cache_for_provider(provider: ModelProvider) -> &'static dyn Provid
     match provider {
         ModelProvider::HuggingFace => &HuggingFaceProviderCache,
         ModelProvider::Ngc => &NgcProviderCache,
+        ModelProvider::Gcs => &GcsProviderCache,
     }
 }
 
@@ -371,6 +378,7 @@ fn provider_sort_key(provider: ModelProvider) -> u8 {
     match provider {
         ModelProvider::HuggingFace => 0,
         ModelProvider::Ngc => 1,
+        ModelProvider::Gcs => 2,
     }
 }
 
@@ -437,8 +445,8 @@ mod tests {
                     path: PathBuf::from("/test/model1"),
                 },
                 ModelInfo {
-                    provider: ModelProvider::HuggingFace,
-                    name: "model2".to_string(),
+                    provider: ModelProvider::Gcs,
+                    name: "gs://bucket/model2".to_string(),
                     size: 1024 * 1024 * 3, // 3 MB
                     path: PathBuf::from("/test/model2"),
                 },
@@ -499,6 +507,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_model_path_gcs_uses_full_url_layout() {
+        let cache_root = Path::new("/tmp/cache");
+
+        assert_eq!(
+            resolve_model_path(
+                cache_root,
+                ModelProvider::Gcs,
+                "gs://envbucket/dev/bake/qwen/rev123",
+                None,
+            )
+            .expect("Expected GCS model path"),
+            PathBuf::from("/tmp/cache/gcs/envbucket/dev/bake/qwen/rev123")
+        );
+    }
+
+    #[test]
+    fn test_resolve_model_path_gcs_full_url_trailing_slash_normalizes() {
+        let cache_root = Path::new("/tmp/cache");
+
+        assert_eq!(
+            resolve_model_path(
+                cache_root,
+                ModelProvider::Gcs,
+                "gs://sourcebucket/dev/bake/qwen/rev123/",
+                None,
+            )
+            .expect("Expected GCS model path"),
+            PathBuf::from("/tmp/cache/gcs/sourcebucket/dev/bake/qwen/rev123")
+        );
+    }
+
     fn create_test_cache_config(local_path: PathBuf) -> CacheConfig {
         CacheConfig {
             local_path,
@@ -510,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_cache_stats_supports_hf_layout() {
+    fn test_get_cache_stats_supports_hf_and_gcs_layouts() {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let cache_path = temp_dir.path().join("cache");
         fs::create_dir_all(&cache_path).expect("Failed to create cache directory");
@@ -518,6 +558,28 @@ mod tests {
         let hf_model_dir = cache_path.join("models--google--t5-small");
         fs::create_dir_all(&hf_model_dir).expect("Failed to create HF model directory");
         fs::write(hf_model_dir.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let gcs_model_dir = resolve_model_path(
+            &cache_path,
+            ModelProvider::Gcs,
+            "gs://envbucket/dev/bake/qwen/rev123",
+            None,
+        )
+        .expect("Failed to resolve GCS path");
+        fs::create_dir_all(gcs_model_dir.join("weights"))
+            .expect("Failed to create GCS model directory");
+        fs::write(gcs_model_dir.join("tokenizer.json"), b"{}")
+            .expect("Failed to write GCS tokenizer");
+        fs::write(gcs_model_dir.join("weights/model.bin"), b"abcd")
+            .expect("Failed to write GCS weights");
+        let gcs_metadata_dir = gcs_model_dir.join(".mx");
+        fs::create_dir_all(&gcs_metadata_dir).expect("Failed to create GCS metadata directory");
+        fs::write(
+            gcs_metadata_dir.join("manifest.json"),
+            r#"{"version":1,"model":"gs://envbucket/dev/bake/qwen/rev123","files":[{"path":"tokenizer.json","size":2,"crc32c":"00000000","generation":null},{"path":"weights/model.bin","size":4,"crc32c":"00000000","generation":null}]}
+"#,
+        )
+        .expect("Failed to write GCS manifest");
 
         let ignored_dir = cache_path.join("tmp");
         fs::create_dir_all(&ignored_dir).expect("Failed to create ignored directory");
@@ -528,14 +590,18 @@ mod tests {
             .get_cache_stats()
             .expect("Failed to get cache stats");
 
-        assert_eq!(stats.total_models, 1);
-        assert_eq!(stats.total_size, 2);
-        assert_eq!(stats.models.len(), 1);
+        assert_eq!(stats.total_models, 2);
+        assert_eq!(stats.total_size, 8);
+        assert_eq!(stats.models.len(), 2);
 
         assert_eq!(stats.models[0].provider, ModelProvider::HuggingFace);
         assert_eq!(stats.models[0].name, "google/t5-small");
         assert_eq!(stats.models[0].size, 2);
         assert_eq!(stats.models[0].path, hf_model_dir);
+        assert_eq!(stats.models[1].provider, ModelProvider::Gcs);
+        assert_eq!(stats.models[1].name, "gs://envbucket/dev/bake/qwen/rev123");
+        assert_eq!(stats.models[1].size, 6);
+        assert_eq!(stats.models[1].path, gcs_model_dir);
         assert!(stats.models.iter().all(|model| model.name != "tmp"));
     }
 
@@ -549,7 +615,23 @@ mod tests {
         fs::create_dir_all(&hf_model_dir).expect("Failed to create HF model directory");
         fs::write(hf_model_dir.join("config.json"), b"{}").expect("Failed to write HF file");
 
+        let gcs_model_dir = resolve_model_path(
+            &cache_path,
+            ModelProvider::Gcs,
+            "gs://envbucket/org/model/rev1",
+            None,
+        )
+        .expect("Failed to resolve GCS path");
+        fs::create_dir_all(&gcs_model_dir).expect("Failed to create GCS model directory");
+        fs::write(gcs_model_dir.join("tokenizer.json"), b"{}").expect("Failed to write GCS file");
+
         let config = create_test_cache_config(cache_path);
+
+        config
+            .clear_model("gs://envbucket/org/model/rev1", ModelProvider::Gcs)
+            .expect("Failed to clear GCS model");
+        assert!(hf_model_dir.exists(), "HF model should remain");
+        assert!(!gcs_model_dir.exists(), "GCS model should be removed");
 
         config
             .clear_model("google/t5-small", ModelProvider::HuggingFace)
