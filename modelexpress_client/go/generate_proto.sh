@@ -35,6 +35,7 @@ for tool in protoc protoc-gen-go protoc-gen-go-grpc gofmt; do
 done
 
 mkdir -p "${GEN_DIR}"
+find "${GEN_DIR}" -type f \( -name "*.pb.go" -o -name "*_grpc.pb.go" \) -delete
 
 echo "Generating Go protobuf and gRPC bindings from ${PROTO_DIR}..."
 (
