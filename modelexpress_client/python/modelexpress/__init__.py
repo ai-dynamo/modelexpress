@@ -71,12 +71,16 @@ from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .heartbeat import HeartbeatThread  # noqa: F401
+from .training_publisher import MxTrainingPublisher  # noqa: F401
+from .refit_receiver import MxRefitReceiver  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
+    "MxRefitReceiver",
+    "MxTrainingPublisher",
     "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]
