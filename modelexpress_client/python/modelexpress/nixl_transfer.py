@@ -39,6 +39,27 @@ def is_nixl_available() -> bool:
     return NIXL_AVAILABLE
 
 
+class RegionLayoutMismatchError(Exception):
+    """Source and local contiguous-region layouts disagree.
+
+    The recv side registered a different set of contiguous memory regions
+    than the source (different region count, or same count but different
+    region sizes). This happens because PyTorch's CUDA caching allocator is
+    not deterministic across processes, so two workers loading the same
+    model weights can produce different region groupings.
+
+    The transfer cannot proceed in region mode because NIXL requires that
+    the N-th local region exactly matches the N-th remote region in size.
+    Callers should try the next source candidate (which may share our
+    layout) or fall through to a non-RDMA loading strategy.
+    """
+
+
+# Internal alias kept short for the raise site; re-exported via the public
+# name above for callers that want to catch it.
+_RegionLayoutMismatchError = RegionLayoutMismatchError
+
+
 class NixlTransferManager:
     """
     Manages a single NIXL agent and RDMA transfers for GPU tensors.
@@ -271,6 +292,61 @@ class NixlTransferManager:
 
         return regions
 
+    @staticmethod
+    def _validate_region_layout_match(
+        source_regions: list[TensorDescriptor],
+        local_regions: list[tuple[int, int]],
+    ) -> tuple[bool, str]:
+        """Check that two contiguous-region layouts agree on count and sizes.
+
+        Two layouts match iff they have the same number of regions and each
+        pair has the same size. (Addresses legitimately differ — they're
+        virtual addresses in different processes.)
+
+        Args:
+            source_regions: Region descriptors received from the source.
+            local_regions: ``(addr, size)`` tuples this worker registered.
+
+        Returns:
+            ``(True, "")`` when the layouts match; otherwise
+            ``(False, human_readable_summary)`` describing the first few
+            mismatches so callers can include it in an error message.
+        """
+        if len(source_regions) != len(local_regions):
+            return False, (
+                f"region count mismatch: source has {len(source_regions)}, "
+                f"local has {len(local_regions)} "
+                "(PyTorch CUDA allocator non-determinism produced different "
+                "contiguous-region groupings across processes)"
+            )
+
+        size_mismatches: list[tuple[int, int, int]] = []
+        for i, (src_region, (_local_addr, local_size)) in enumerate(
+            zip(source_regions, local_regions, strict=True)
+        ):
+            if src_region.size != local_size:
+                size_mismatches.append((i, src_region.size, local_size))
+
+        if size_mismatches:
+            # Log just the first few so errors stay readable.
+            head = size_mismatches[:5]
+            sample = ", ".join(
+                f"region {i}: source={s} local={l}" for i, s, l in head
+            )
+            suffix = (
+                f" (+{len(size_mismatches) - len(head)} more)"
+                if len(size_mismatches) > len(head)
+                else ""
+            )
+            return False, (
+                f"{len(size_mismatches)} region size mismatch(es) "
+                f"out of {len(source_regions)}: {sample}{suffix} "
+                "(PyTorch CUDA allocator non-determinism produced different "
+                "contiguous-region groupings across processes)"
+            )
+
+        return True, ""
+
     def fetch_remote_and_wait(
         self,
         remote_agent_name: str,
@@ -361,26 +437,37 @@ class NixlTransferManager:
 
             logger.info(f"Region-based transfer: {len(source_tensors)} source regions -> {len(self._registered_regions)} local regions")
 
-            # Validate region counts match
-            if len(source_tensors) != len(self._registered_regions):
-                logger.warning(
-                    f"Region count mismatch: source has {len(source_tensors)}, "
-                    f"local has {len(self._registered_regions)}. Proceeding with min."
-                )
+            # Validate the two region layouts are identical before matching.
+            #
+            # The contiguous-region layout is derived from each process's
+            # PyTorch CUDA allocator state, which is NOT deterministic across
+            # processes: fragmentation pattern, temporary buffers, and pinned-
+            # memory state vary between runs. Two workers that load the same
+            # model weights can therefore produce different region groupings.
+            #
+            # If source and local layouts disagree (region count differs, or
+            # any region size differs), naively pairing by index produces
+            # mismatched (src, local) pairs. NIXL will reject these with
+            # `makeXferReq: length mismatch ... NIXL_ERR_INVALID_PARAM` and
+            # abort the entire transfer. Previously we logged per-region
+            # WARNINGs but proceeded anyway; now we fail fast with a typed
+            # exception so the caller can try the next source candidate or
+            # fall through to a non-RDMA strategy.
+            layout_matches, mismatch_summary = self._validate_region_layout_match(
+                source_tensors, self._registered_regions,
+            )
+            if not layout_matches:
+                raise _RegionLayoutMismatchError(mismatch_summary)
 
-            # Build transfer lists by region index
+            # Build transfer lists by region index (layouts are validated equal)
             remote_descs = []
             local_descs = []  # Will be (addr, size, device_id) tuples
             total_bytes = 0
-            matched_count = min(len(source_tensors), len(self._registered_regions))
+            matched_count = len(source_tensors)
 
             for i in range(matched_count):
                 src_region = source_tensors[i]
                 local_addr, local_size = self._registered_regions[i]
-
-                # Verify sizes match (regions should be same size)
-                if src_region.size != local_size:
-                    logger.warning(f"Region {i} size mismatch: source={src_region.size}, local={local_size}")
 
                 remote_descs.append((src_region.addr, src_region.size, src_region.device_id))
                 local_descs.append((local_addr, local_size, self._device_id))

@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 
 from .base import LoadContext, LoadStrategy, SourceTransferError, register_tensors, publish_metadata
-from ..nixl_transfer import is_nixl_available
+from ..nixl_transfer import RegionLayoutMismatchError, is_nixl_available
 from ..tensor_utils import capture_tensor_attrs
 from ..transfer_safety import check_transfer_allowed
 from ..types import ManifestMismatchError, TensorDescriptor
@@ -284,6 +284,14 @@ class RdmaStrategy(LoadStrategy):
                 coalesce_transfers=coalesce,
                 remote_agent_name=remote_agent_name_override,
             )
+        except RegionLayoutMismatchError as e:
+            # Contiguous-region layouts differ between source and this worker
+            # (PyTorch CUDA allocator non-determinism). The source itself is
+            # healthy; raise ManifestMismatchError so the caller just tries
+            # the next candidate without marking the source STALE.
+            raise ManifestMismatchError(
+                f"region layout mismatch with source: {e}"
+            ) from e
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e
         transfer_time = time.perf_counter() - transfer_start
