@@ -295,6 +295,8 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 
 Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors from the central server. Validates `mx_source_id` to catch stale discovery.
 
+The same per-worker server also hosts `ModelService` (see above) via `PeerModelServiceServicer`, exposing `StreamModelFiles`, `ListModelFiles`, and `EnsureModelDownloaded` against the worker's local HuggingFace cache. Other Python or Rust clients can pull cached files directly from the worker without round-tripping through the central MX server. The peer servicer never initiates downloads: `EnsureModelDownloaded` returns `DOWNLOADED` on cache hit and `NOT_FOUND` otherwise. v1 is HuggingFace-only.
+
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
 ## Rust Server
