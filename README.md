@@ -46,7 +46,7 @@ ModelExpress is a model distribution layer for LLM inference. It manages how mod
 
 ModelExpress orchestrates the weight lifecycle from external source to GPU memory. It minimizes repeated provider traffic, keeps cache state coordinated across the cluster, and routes each load through the most efficient available path.
 
-1. **Download or stream from external storage** — The ModelExpress server pulls the model from Hugging Face, NGC, or GCS, or a client streams it through ModelStreamer from object storage or local disk; ModelExpress coordinates so no other node duplicates this work. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
+1. **Download or stream from external storage** — The ModelExpress server pulls the model from Hugging Face, NGC, or GCS, or a client streams it through ModelStreamer from S3, Azure Blob Storage, other object storage, or local disk; ModelExpress coordinates so no other node duplicates this work. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
 2. **Persist to disk** — Store in a cache backed by disk:
    - **Host-attached disk** — Local disk on the node (single-node or per-node cache).
    - **PVC** — RWO (ReadWriteOnce) for single-node; RWX (ReadWriteMany) for shared access across nodes.
@@ -264,6 +264,23 @@ cargo bench
 - **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
 - **Large model gRPC stream** — May not close automatically; use client timeout.
 - **MX_CONTIGUOUS_REG=1** — Blocked; use `0`.
+
+---
+
+## Roadmap
+
+### Priorities Under Development
+
+- **P2P compile/warmup caching**: torch.compile/deepGEMM cache for follower workers. Leader performs full warmup; followers consume caches and skip full warmup.
+- **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
+- **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
+- **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
+- **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
+- **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
+- **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
+- **Metrics and observability**: Cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
+- **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
+- **P2P transfer fault tolerance**: Auto-recovery from stale rkeys on source restart; retry and fallback to storage loading.
 
 ---
 
