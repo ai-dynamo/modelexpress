@@ -13,11 +13,16 @@ metadata:
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
 rules:
+  # P2P metadata (MX_METADATA_BACKEND=kubernetes)
   - apiGroups: ["modelexpress.nvidia.com"]
     resources: ["modelmetadatas", "modelmetadatas/status"]
     verbs: ["get", "list", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  # Model registry (MX_METADATA_BACKEND=kubernetes)
+  - apiGroups: ["modelexpress.nvidia.com"]
+    resources: ["modelcacheentries", "modelcacheentries/status"]
     verbs: ["get", "list", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

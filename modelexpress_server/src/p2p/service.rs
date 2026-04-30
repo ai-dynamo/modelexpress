@@ -6,9 +6,9 @@
 //! Metadata is keyed by mx_source_id, a 16-char hex hash of SourceIdentity.
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
-use crate::metadata_backend::SourceInstanceInfo;
-use crate::source_identity::{compute_mx_source_id, validate_identity};
-use crate::state::P2pStateManager;
+use crate::p2p::backend::SourceInstanceInfo;
+use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
+use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
     GetMetadataRequest, GetMetadataResponse, ListSourcesRequest, ListSourcesResponse,
     PublishMetadataRequest, PublishMetadataResponse, SourceInstanceRef, SourceStatus,
@@ -286,10 +286,10 @@ impl P2pService for P2pServiceImpl {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::metadata_backend::{
+    use crate::p2p::backend::{
         BackendMetadataRecord, MockMetadataBackend, ModelMetadataRecord, WorkerRecord,
     };
-    use crate::state::P2pStateManager;
+    use crate::p2p::state::P2pStateManager;
     use modelexpress_common::grpc::p2p::{MxSourceType, SourceIdentity, SourceStatus};
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {

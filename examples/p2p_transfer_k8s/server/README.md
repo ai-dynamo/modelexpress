@@ -21,10 +21,14 @@ Set `MX_METADATA_BACKEND=redis` and `REDIS_URL=redis://redis:6379` on the server
 ## Kubernetes CRD Backend
 
 ```bash
-kubectl apply -f kubernetes_backend/crd-modelmetadata.yaml
+# Consolidated CRD bundle: installs both the ModelMetadata (P2P) and
+# ModelCacheEntry (registry) CRDs in one apply.
+kubectl apply -f ../../crds.yaml
 kubectl apply -f kubernetes_backend/rbac-modelmetadata.yaml -n <namespace>
 kubectl apply -f kubernetes_backend/modelexpress-server-kubernetes.yaml -n <namespace>
 ```
 
 Set `MX_METADATA_BACKEND=kubernetes` on the server. Requires a ServiceAccount with
-permissions to create/read/update ModelMetadata custom resources.
+permissions to create/read/update both `ModelMetadata` (P2P metadata) and
+`ModelCacheEntry` (model registry) custom resources; see `rbac-modelmetadata.yaml`
+for the full rule set.

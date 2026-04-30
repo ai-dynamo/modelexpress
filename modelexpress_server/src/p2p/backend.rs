@@ -260,76 +260,7 @@ pub trait MetadataBackend: Send + Sync {
     ) -> MetadataResult<()>;
 }
 
-/// Configuration for metadata backends
-#[derive(Debug, Clone)]
-pub enum BackendConfig {
-    /// Redis backend — persistent, horizontally scalable
-    Redis { url: String },
-    /// Kubernetes CRD backend — native K8s integration
-    Kubernetes { namespace: String },
-}
-
-impl std::fmt::Display for BackendConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Redis { .. } => write!(f, "redis"),
-            Self::Kubernetes { .. } => write!(f, "kubernetes"),
-        }
-    }
-}
-
-impl BackendConfig {
-    /// Create backend config from environment variables.
-    ///
-    /// `MX_METADATA_BACKEND` is required. Valid values:
-    /// - `redis`: Redis
-    /// - `kubernetes` | `k8s` | `crd`: Kubernetes CRD
-    pub fn from_env() -> Result<Self, String> {
-        let backend_type = std::env::var("MX_METADATA_BACKEND").unwrap_or_default();
-        let redis_url = Self::redis_url_from_env();
-        let k8s_namespace = Self::k8s_namespace_from_env();
-        Self::from_type_str(&backend_type, &redis_url, &k8s_namespace)
-    }
-
-    /// Parse a backend type string into a config. Testable without env vars.
-    pub fn from_type_str(
-        backend_type: &str,
-        redis_url: &str,
-        k8s_namespace: &str,
-    ) -> Result<Self, String> {
-        match backend_type.to_lowercase().as_str() {
-            "redis" => Ok(Self::Redis {
-                url: redis_url.to_string(),
-            }),
-            "kubernetes" | "k8s" | "crd" => Ok(Self::Kubernetes {
-                namespace: k8s_namespace.to_string(),
-            }),
-            other => Err(format!(
-                "MX_METADATA_BACKEND='{}' is not valid. Use 'redis' or 'kubernetes'.",
-                other
-            )),
-        }
-    }
-
-    pub fn redis_url_from_env() -> String {
-        if let Ok(url) = std::env::var("REDIS_URL") {
-            return url;
-        }
-        let host = std::env::var("MX_REDIS_HOST")
-            .or_else(|_| std::env::var("REDIS_HOST"))
-            .unwrap_or_else(|_| "localhost".to_string());
-        let port = std::env::var("MX_REDIS_PORT")
-            .or_else(|_| std::env::var("REDIS_PORT"))
-            .unwrap_or_else(|_| "6379".to_string());
-        format!("redis://{}:{}", host, port)
-    }
-
-    fn k8s_namespace_from_env() -> String {
-        std::env::var("MX_METADATA_NAMESPACE")
-            .or_else(|_| std::env::var("POD_NAMESPACE"))
-            .unwrap_or_else(|_| "default".to_string())
-    }
-}
+pub use crate::backend_config::BackendConfig;
 
 /// Create a backend from configuration.
 pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn MetadataBackend>> {

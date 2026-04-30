@@ -5,7 +5,7 @@
 # Use when you want metadata to persist across server restarts via K8s CRDs.
 #
 # Prerequisites:
-#   - kubectl apply -f crd-modelmetadata.yaml
+#   - kubectl apply -f ../../../crds.yaml          # one-time, cluster-admin
 #   - kubectl apply -f rbac-modelmetadata.yaml -n <namespace>
 apiVersion: v1
 kind: Service

@@ -147,5 +147,3 @@ class ModelStreamerStrategy(LoadStrategy):
                 yield name, tensor.clone()
         elapsed = time.perf_counter() - start
         logger.info(f"[Worker {ctx.global_rank}] Streamed all weights in {elapsed:.1f}s")
-
-

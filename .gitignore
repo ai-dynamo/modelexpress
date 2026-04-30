@@ -48,8 +48,6 @@ logs/
 # Test artifacts
 *.profraw
 
-# Models database
-models.db
 **/__pycache__/
 docs/FEEDBACK.md
 docs/optimization-comparison.md

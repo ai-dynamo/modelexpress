@@ -10,7 +10,7 @@
 //!
 //! Safe to run on every server replica — all operations are idempotent.
 
-use crate::state::P2pStateManager;
+use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::SourceStatus;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -121,7 +121,7 @@ async fn reap_once(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::metadata_backend::{MockMetadataBackend, SourceInstanceInfo};
+    use crate::p2p::backend::{MockMetadataBackend, SourceInstanceInfo};
 
     #[tokio::test]
     async fn test_reap_marks_stale_when_heartbeat_expired() {

@@ -11,7 +11,7 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS with SQLite-backed tracking and LRU cache eviction.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
 
 ### Current Status
@@ -27,7 +27,7 @@ ModelExpress is a Rust-based model cache management service and GPU-to-GPU model
 graph TD
     subgraph "Model Cache Mode"
         C1[Client CLI / Library] -->|gRPC| S1[ModelExpress Server]
-        S1 --> DB[(SQLite)]
+        S1 --> R1[(Redis / K8s CRD)]
         S1 --> HF[HuggingFace Hub]
         S1 --> NGC[NVIDIA NGC]
         S1 --> GCS[Google Cloud Storage]
@@ -80,18 +80,26 @@ ModelExpress/
 │       ├── main.rs                     # Server startup, service registration
 │       ├── lib.rs                      # Module exports
 │       ├── config.rs                   # ServerConfig, layered loading, validation
-│       ├── database.rs                 # SQLite ModelDatabase, atomic claim
+│       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
-│       ├── state.rs                    # P2pStateManager wrapper
-│       ├── services.rs                 # Health, API, Model gRPC services
-│       ├── p2p_service.rs              # P2P gRPC service implementation
-│       ├── source_identity.rs          # SHA256-based mx_source_id computation
-│       ├── reaper.rs                   # Server-side stale source detection and GC
-│       ├── k8s_types.rs               # Kubernetes CRD type definitions
-│       ├── metadata_backend.rs         # MetadataBackend trait + types
-│       ├── metadata_backend/
-│       │   ├── redis.rs               # Redis backend implementation
-│       │   └── kubernetes.rs          # Kubernetes CRD backend implementation
+│       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
+│       ├── p2p/
+│       │   ├── state.rs                # P2pStateManager wrapper
+│       │   ├── service.rs              # P2P gRPC service implementation
+│       │   ├── source_identity.rs      # SHA256-based mx_source_id computation
+│       │   ├── reaper.rs               # Server-side stale source detection and GC
+│       │   ├── k8s_types.rs            # P2P CRD type definitions (ModelMetadata)
+│       │   ├── backend.rs              # MetadataBackend trait + types
+│       │   └── backend/
+│       │       ├── redis.rs            # P2P Redis backend
+│       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       ├── registry/
+│       │   ├── state.rs                # RegistryManager wrapper
+│       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
+│       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
+│       │   └── backend/
+│       │       ├── redis.rs            # Redis registry backend
+│       │       └── kubernetes.rs       # K8s ModelCacheEntry registry backend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -192,6 +200,7 @@ ModelExpress/
 │   │       └── vllm/
 │   │           ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
 │   │           └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
+│   ├── crds.yaml                       # ModelMetadata + ModelCacheEntry CRDs (cluster-admin)
 │   ├── aggregated_k8s/                 # Dynamo aggregated serving example
 │   │   ├── README.md
 │   │   └── agg.yaml
@@ -199,7 +208,6 @@ ModelExpress/
 │       ├── Dockerfile                   # dynamo vllm-runtime + MX client
 │       ├── README.md
 │       └── vllm/
-│           ├── crd-modelmetadata.yaml   # ModelMetadata CRD (cluster-admin)
 │           ├── rbac-modelmetadata.yaml  # ServiceAccount + Role + RoleBinding
 │           └── vllm-multi-node-aggregated.yaml  # DGD: MX server + Frontend + VllmWorker
 │
@@ -293,13 +301,14 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 1. Parse CLI args (`ServerArgs` via clap)
 2. Load config (`ServerConfig::load()`) - CLI > env vars > config file > defaults
 3. Initialize structured logging (tracing-subscriber)
-4. Create SQLite database (`ModelDatabase`)
-5. Optionally start `CacheEvictionService` background task
-6. Connect to metadata backend (Redis or Kubernetes CRD) for P2P state
-7. Start reaper background task for stale source detection and GC
-8. Register 4 gRPC services with tonic (max message size: 100MB)
-9. Listen on configured address (default `0.0.0.0:8001`)
-10. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
+4. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
+5. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
+6. Start `CacheEvictionService` background task (reads the same registry)
+7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
+8. Start reaper background task for stale source detection and GC
+9. Register 4 gRPC services with tonic (max message size: 100MB)
+10. Listen on configured address (default `0.0.0.0:8001`)
+11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
 
 ### ServerConfig
 
@@ -307,8 +316,6 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 server:
   host: "0.0.0.0"        # MODEL_EXPRESS_SERVER_HOST
   port: 8001              # MODEL_EXPRESS_SERVER_PORT
-database:
-  path: "./models.db"     # MODEL_EXPRESS_DATABASE_PATH
 cache:
   directory: "./cache"    # MODEL_EXPRESS_CACHE_DIRECTORY
   max_size_bytes: null
@@ -327,23 +334,27 @@ logging:
   structured: false
 ```
 
-### ModelDatabase (SQLite)
+Distributed backend selection lives outside the YAML, in env vars: `MX_METADATA_BACKEND` (drives both P2P and registry) plus the corresponding connection vars (`REDIS_URL` or `POD_NAMESPACE`). See [`DEPLOYMENT.md`](DEPLOYMENT.md#distributed-backend-selection).
 
-Schema: single `models` table with columns `model_name` (PK), `provider`, `status`, `created_at`, `last_used_at`, `message`. Indexed on `last_used_at` for LRU queries.
+### ModelRegistryBackend (Redis and Kubernetes CRD)
 
-Key operations:
+**Redis backend**: single Redis Hash per cached model at `mx:model:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
 
-| Method | Purpose |
-|--------|---------|
-| `get_status(name)` | Query download status |
-| `set_status(name, provider, status, msg)` | Create/update via INSERT OR REPLACE |
-| `try_claim_for_download(name, provider)` | Atomic compare-and-swap (INSERT OR IGNORE) |
-| `touch_model(name)` | Update `last_used_at` for LRU tracking |
-| `delete_model(name)` | Remove record |
-| `get_models_by_last_used(limit)` | LRU query, oldest first |
-| `get_status_counts()` | Count by status (downloading, downloaded, error) |
+**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names use the shared `sanitize_model_name` with an `mx-cache-` prefix to stay distinct from the P2P `ModelMetadata` CRs.
 
-Concurrency: `Arc<Mutex<Connection>>` with poison recovery.
+Key operations on the async `RegistryBackend` trait:
+
+| Method | Redis implementation |
+|--------|----------------------|
+| `get_status(name)` | `HGET mx:model:{name} status` |
+| `set_status(name, provider, status, msg)` | Lua `EVAL` updates status/provider/last_used_at/message atomically and `HSETNX`s `created_at` to preserve the first-write timestamp |
+| `try_claim_for_download(name, provider)` | `HSETNX status DOWNLOADING`; winner populates remaining fields without contention |
+| `touch_model(name)` | `HSET last_used_at {now}` (gated on `EXISTS` so touch is update-only, never create) |
+| `delete_model(name)` | `DEL` |
+| `get_models_by_last_used(limit)` | `SCAN mx:model:*` + pipelined `HGETALL` + Rust-side sort |
+| `get_status_counts()` | `SCAN mx:model:*` + pipelined `HGET status` + Rust-side tally |
+
+Concurrency: Redis backends use cloned async `ConnectionManager`s behind an `RwLock` for lazy initialization and reconnect caching.
 
 ### CacheEvictionService
 

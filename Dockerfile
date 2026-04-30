@@ -43,9 +43,11 @@ EXPOSE 8001
 # Set default environment variables (can be overridden)
 ENV MODEL_EXPRESS_SERVER_PORT=8001
 ENV MODEL_EXPRESS_LOG_LEVEL=info
-ENV MODEL_EXPRESS_DATABASE_PATH=/app/models.db
 ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
 ENV HF_HUB_CACHE=/app/cache
+# Distributed backend is required; operators must set MX_METADATA_BACKEND (drives both
+# the P2P and registry backends) plus the relevant connection env vars (REDIS_URL for
+# Redis, or POD_NAMESPACE for the Kubernetes backend).
 
 # Run the server by default
 CMD ["./modelexpress-server"]

@@ -1,14 +1,26 @@
 # ModelExpress Metadata Architecture
 
-This document describes the metadata storage and coordination layer for ModelExpress P2P transfers.
+This document describes the metadata storage and coordination layers for ModelExpress P2P transfers and model-cache lifecycle tracking.
 
 ## Overview
 
-ModelExpress P2P transfers require coordination between source and target GPU workers:
+ModelExpress stores two related classes of metadata:
 
-1. **Source** loads model weights, registers tensors with a transfer backend (NIXL or Mooncake), and publishes metadata to the MX server
-2. **Target** queries the MX server for available sources, fetches tensor metadata on demand, and executes RDMA transfers
-3. **Status** transitions (`INITIALIZING` -> `READY` -> `STALE`) signal when sources are available for transfers
+1. **P2P source metadata**: source workers publish tensor descriptors and transfer-engine metadata so target workers can receive weights over RDMA.
+2. **Model-cache lifecycle metadata**: the server tracks model download state (`DOWNLOADING`, `DOWNLOADED`, `ERROR`) so replicas coordinate downloads and LRU eviction.
+
+Both layers are selected by `MX_METADATA_BACKEND`, but they use separate storage namespaces:
+
+| Backend | P2P source metadata | Model-cache lifecycle metadata |
+|---------|---------------------|--------------------------------|
+| Redis | `mx:source:*` keys | `mx:model:*` keys |
+| Kubernetes | `ModelMetadata` CRDs + tensor ConfigMaps | `ModelCacheEntry` CRDs |
+
+For P2P transfers, coordination between source and target GPU workers works as follows:
+
+1. **Source** loads model weights, registers tensors with a transfer backend (NIXL or Mooncake), and publishes metadata to the MX server.
+2. **Target** queries the MX server for available sources, fetches tensor metadata on demand, and executes RDMA transfers.
+3. **Status** transitions (`INITIALIZING` -> `READY` -> `STALE`) signal when sources are available for transfers.
 
 ## Key Concepts
 
@@ -140,7 +152,9 @@ Configured via `MX_METADATA_BACKEND` environment variable:
 
 #### Storage Layout
 
-Two types of Redis keys per source:
+The Redis backend uses separate key prefixes for P2P source metadata and model-cache lifecycle metadata.
+
+Three types of Redis keys are relevant:
 
 **Source index key** -- `mx:source:{source_id}` (Redis Hash)
 
@@ -155,9 +169,20 @@ Two types of Redis keys per source:
 |-------|-------|---------|
 | `"{worker_rank}"` | JSON `WorkerRecordJson` | Full tensor metadata for one rank |
 
-Global listing uses `SCAN` with pattern `mx:source:????????????????` (exactly 16 hex chars) to enumerate source index keys without a secondary index.
+**Model lifecycle key** -- `mx:model:{model_name}` (Redis Hash)
 
-No Redis TTL is applied to keys. Stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above).
+| Field | Value | Purpose |
+|-------|-------|---------|
+| `provider` | `HuggingFace`, `Ngc`, or `Gcs` | Provider associated with the cached model |
+| `status` | `DOWNLOADING`, `DOWNLOADED`, or `ERROR` | Download lifecycle state |
+| `created_at` | RFC3339 timestamp | First write time, preserved across status updates |
+| `last_used_at` | RFC3339 timestamp | Last status write or cache hit time for LRU eviction |
+| `message` | Optional string | Download progress, retry, or error detail |
+
+Global listing uses `SCAN` with pattern `mx:source:????????????????` (exactly 16 hex chars) to enumerate source index keys without a secondary index.
+Model-cache listing uses `SCAN` with pattern `mx:model:*`; LRU ordering and status counts are computed by pipelined reads and Rust-side sorting/tallying.
+
+No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above). Model lifecycle entries are deleted when cache eviction removes a model.
 
 #### Example Redis State
 
@@ -174,6 +199,14 @@ mx:source:a1b2c3d4e5f67890:f3a2b1c4
 
 mx:source:a1b2c3d4e5f67890:e7d6c5b8
   "1"  ->  {"worker_rank":1,"backend_type":"nixl","nixl_metadata":[...],"tensors":[...],"status":2,...}
+
+# Model lifecycle -- download state for model-cache coordination
+mx:model:deepseek-ai/DeepSeek-V3
+  provider     ->  "HuggingFace"
+  status       ->  "DOWNLOADED"
+  created_at   ->  "2026-04-29T22:00:00Z"
+  last_used_at ->  "2026-04-29T22:10:00Z"
+  message      ->  "Model download completed successfully"
 ```
 
 #### JSON Schemas
@@ -203,15 +236,19 @@ mx:source:a1b2c3d4e5f67890:e7d6c5b8
 
 ### Kubernetes CRD Backend
 
-Uses `ModelMetadata` CRDs for metadata and `ConfigMap`s for tensor descriptors (to avoid etcd size limits).
+Uses `ModelMetadata` CRDs for P2P source metadata, `ConfigMap`s for tensor descriptors (to avoid etcd size limits), and `ModelCacheEntry` CRDs for model-cache lifecycle state.
 
-**CRD name format**: `mx-source-{source_id}-{worker_id}`
+**P2P CRD name format**: `mx-source-{source_id}-{worker_id}`
 
 **ConfigMap name format**: `mx-source-{source_id}-{worker_id}-tensors-worker-{rank}`
 
 ConfigMaps use `ownerReferences` pointing to the parent CRD so they are garbage-collected automatically.
 
-#### Example CRD
+**Model lifecycle CRD name format**: `mx-cache-{sanitized-model-name}-{hash}`
+
+`ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash.
+
+#### Example P2P CRD
 
 ```bash
 kubectl get modelmetadatas -n <namespace>
@@ -245,6 +282,28 @@ status:
       lastTransitionTime: "2025-11-14T22:13:20Z"
   observedGeneration: 1
   publishedAt: "2025-11-14T22:13:20Z"
+```
+
+#### Example Model Lifecycle CRD
+
+```bash
+kubectl get modelcacheentries -n <namespace>
+kubectl get modelcacheentry mx-cache-deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
+```
+
+```yaml
+apiVersion: modelexpress.nvidia.com/v1alpha1
+kind: ModelCacheEntry
+metadata:
+  name: mx-cache-deepseek-ai--deepseek-v3-<hash>
+spec:
+  modelName: deepseek-ai/DeepSeek-V3
+  provider: HuggingFace
+status:
+  phase: Downloaded
+  createdAt: "2026-04-29T22:00:00Z"
+  lastUsedAt: "2026-04-29T22:10:00Z"
+  message: Model download completed successfully
 ```
 
 ## Client Workflow
@@ -325,7 +384,7 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_REDIS_HOST` / `REDIS_HOST` | `localhost` | Redis host |
 | `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |
-| `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | `default` | K8s namespace for CRD backend |
+| `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | (required for Kubernetes) | K8s namespace for CRD backend |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
@@ -347,12 +406,15 @@ grpcurl -plaintext -d '{}' <server_host>:8001 model_express.p2p.P2pService/ListS
 redis-cli KEYS "mx:source:*"
 redis-cli HGETALL "mx:source:<source_id>"
 redis-cli HGETALL "mx:source:<source_id>:<worker_id>"
+redis-cli KEYS "mx:model:*"
+redis-cli HGETALL "mx:model:<model_name>"
 ```
 
 ### Inspect K8s state
 
 ```bash
 kubectl get modelmetadatas -n <namespace>
+kubectl get modelcacheentries -n <namespace>
 kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <namespace>
 ```
 
@@ -363,6 +425,7 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | `ListSources` returns empty | No source has published + updated status to READY yet |
 | `GetMetadata` returns `found: false` | Worker was garbage-collected by reaper, or wrong `mx_source_id`/`worker_id` |
 | Target stuck waiting | Source still loading (check source pod logs for progress) |
-| K8s CRs missing | RBAC issue -- check source logs and service account permissions |
-| Stale metadata after redeploy | Reaper marks stale within 90s. For immediate cleanup: `FLUSHDB` |
+| K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
+| Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
+| Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
 | Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. Target retries next candidate (max 3) |

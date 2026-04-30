@@ -9,10 +9,12 @@ use modelexpress_common::grpc::{
 use modelexpress_server::{
     cache::CacheEvictionService,
     config::{ServerArgs, ServerConfig},
-    database::ModelDatabase,
-    p2p_service::P2pServiceImpl,
-    services::{ApiServiceImpl, HealthServiceImpl, ModelServiceImpl},
-    state::P2pStateManager,
+    p2p::{service::P2pServiceImpl, state::P2pStateManager},
+    registry::state::RegistryManager,
+    services::{
+        ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl,
+        init_model_tracker,
+    },
 };
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -24,7 +26,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Parse command line arguments
     let args = ServerArgs::parse();
 
@@ -64,18 +66,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
-    // Initialize database
-    let database = match ModelDatabase::new(&config.database.path.to_string_lossy()) {
-        Ok(db) => db,
-        Err(e) => {
-            error!("Failed to initialize database: {}", e);
-            return Err(e);
+    // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
+    // MX_METADATA_BACKEND selector with the P2P state manager below.
+    let registry = Arc::new(RegistryManager::new());
+    match tokio::time::timeout(std::time::Duration::from_secs(10), registry.connect()).await {
+        Ok(Ok(backend)) => info!("Model registry connected (backend: {backend})"),
+        Ok(Err(e)) => {
+            error!("Failed to connect to model registry backend: {}", e);
+            return Err(e.to_string().into());
         }
-    };
+        Err(_) => {
+            error!("Timed out connecting to model registry backend");
+            return Err("model registry backend connection timed out".into());
+        }
+    }
+
+    // Initialize the process-wide download tracker, injected with the registry.
+    let tracker = Arc::new(ModelDownloadTracker::new(registry.clone()));
+    init_model_tracker(tracker)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     // Create cache eviction service
     let cache_service = CacheEvictionService::new(
-        database.clone(),
+        registry.clone(),
         config.cache.eviction.clone(),
         config.cache.directory.clone(),
     );
@@ -137,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
     let reaper_state = p2p_state.clone();
     let reaper_handle = tokio::spawn(async move {
-        modelexpress_server::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
+        modelexpress_server::p2p::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
     });
 
     // Setup graceful shutdown handler

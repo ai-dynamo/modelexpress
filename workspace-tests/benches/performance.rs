@@ -9,77 +9,10 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use modelexpress_common::models::{ModelProvider, ModelStatus, Status};
-use modelexpress_server::database::ModelDatabase;
 use std::hint::black_box;
-use tempfile::TempDir;
 
-fn benchmark_database_operations(c: &mut Criterion) {
-    c.bench_function("database_set_status", |b| {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("bench_models.db");
-        let db = ModelDatabase::new(db_path.to_str().unwrap()).unwrap();
-
-        let mut counter = 0;
-        b.iter(|| {
-            let model_name = format!("benchmark-model-{counter}");
-            counter += 1;
-            db.set_status(
-                black_box(&model_name),
-                black_box(ModelProvider::HuggingFace),
-                black_box(ModelStatus::DOWNLOADED),
-                black_box(Some("Benchmark test".to_string())),
-            )
-            .unwrap();
-        });
-    });
-
-    c.bench_function("database_get_status", |b| {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("bench_models.db");
-        let db = ModelDatabase::new(db_path.to_str().unwrap()).unwrap();
-
-        // Pre-populate with some data
-        for i in 0..1000 {
-            let model_name = format!("benchmark-model-{i}");
-            db.set_status(
-                &model_name,
-                ModelProvider::HuggingFace,
-                ModelStatus::DOWNLOADED,
-                None,
-            )
-            .unwrap();
-        }
-
-        let mut counter = 0;
-        b.iter(|| {
-            let model_name = format!("benchmark-model-{}", counter % 1000);
-            counter += 1;
-            db.get_status(black_box(&model_name)).unwrap();
-        });
-    });
-
-    c.bench_function("database_get_models_by_last_used", |b| {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("bench_models.db");
-        let db = ModelDatabase::new(db_path.to_str().unwrap()).unwrap();
-
-        // Pre-populate with data
-        for i in 0..100 {
-            let model_name = format!("benchmark-model-{i}");
-            db.set_status(
-                &model_name,
-                ModelProvider::HuggingFace,
-                ModelStatus::DOWNLOADED,
-                None,
-            )
-            .unwrap();
-        }
-
-        b.iter(|| {
-            db.get_models_by_last_used(black_box(Some(10))).unwrap();
-        });
-    });
-}
+// A RegistryBackend bench belongs in its own testcontainers-based harness so it can
+// drive a live Redis or Kubernetes CRD instance — tracked as a follow-up.
 
 fn benchmark_serialization(c: &mut Criterion) {
     c.bench_function("status_serialization", |b| {
@@ -126,7 +59,6 @@ fn benchmark_model_provider_operations(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    benchmark_database_operations,
     benchmark_serialization,
     benchmark_model_provider_operations
 );
