@@ -83,6 +83,16 @@ ModelExpress supports two storage-access paths:
 | ModelStreamer (`MX_MODEL_URI`) | S3 / S3-compatible, GCS, Azure Blob Storage, local filesystem, and Hugging Face cache-resolved model IDs |
 | GPUDirect Storage | Local filesystem or cached model files loaded directly to GPU |
 
+### Air-Gapped Environments
+
+ModelExpress supports air-gapped deployments when model files are already present inside the environment.
+
+- Use a pre-populated local cache or a mounted local/PVC path as the source of truth.
+- For Hugging Face cache-only operation, set `HF_HUB_OFFLINE=1`; ModelExpress resolves models from the local HF cache and does not attempt network access.
+- For fully disconnected runtime loading, point `MX_MODEL_URI` at a local filesystem path so ModelStreamer reads from local storage instead of external object stores.
+- Once one source pod has loaded the model, additional pods can receive the weights through P2P RDMA without re-downloading from an external provider.
+- External providers such as NGC, GCS, S3, and Azure Blob still require network reachability unless their contents are mirrored into local storage inside the air-gapped environment.
+
 ---
 
 ## ModelExpress Architecture
