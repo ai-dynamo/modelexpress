@@ -1,18 +1,65 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Patch Dynamo TRT-LLM backend for ModelExpress P2P support.
+"""Patch the Dynamo TRT-LLM backend for ModelExpress P2P support.
 
-Applies minimal patches to add --model-express-url CLI arg and
-checkpoint_format="MX" engine integration. Compatible with any
-Dynamo version that has the TRT-LLM backend.
+Why this script exists (TODO: delete after upstream merges):
+
+  This is a *temporary* shim so users can layer MX support on top of
+  the released ``nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime`` image
+  (or any other Dynamo-bundled image) without rebuilding Dynamo from
+  source. The actual code changes live in
+  https://github.com/ai-dynamo/dynamo/pull/8037 — once that PR merges
+  and a new tensorrtllm-runtime image is published, this script
+  becomes a no-op and this folder can be deleted.
+
+  Why patch instead of just COPY the rebased Dynamo files?
+  We tried that in earlier iterations of this image. It breaks because
+  the rebased ``llm_worker.py`` from the dynamo PR branch transitively
+  imports symbols (e.g., ``register_embedding_cache_metrics``) that
+  don't exist in the base image's older Dynamo. Patching only the
+  three lines we need (model_express_url plumbing) avoids dragging in
+  unrelated upstream churn.
+
+What this script patches:
+
+1. ``backend_args.py``: adds ``--model-express-url`` CLI arg
+2. ``engine.py``: when model_express_url is set, sets
+   ``engine_args["checkpoint_format"] = "MX"`` so the new
+   ``MXCheckpointLoader`` activates
+3. ``workers/llm_worker.py``:
+   - plumbs ``model_express_url`` through to ``get_llm_engine``
+   - adds compat guards for ``exclude_tools_when_tool_choice_none``
+     and ``RequestHandlerConfig`` kwargs so the script also works on
+     older base images where those fields don't exist
+
+Each ``str.replace()`` is validated; the script exits non-zero on any
+unmatched pattern so partial patching can't slip through to the image.
 """
 import importlib.util
+import sys
 from pathlib import Path
 
 spec = importlib.util.find_spec("dynamo.trtllm")
 TRTLLM_PKG = Path(spec.submodule_search_locations[0]) if spec else Path(
     "/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/trtllm"
 )
+
+
+def _replace_or_die(src: str, old: str, new: str, *, file: Path, label: str) -> str:
+    """Apply str.replace and fail loudly if the pattern was not found.
+
+    Catches Dynamo source drift instead of silently writing a
+    partially-patched file.
+    """
+    if old not in src:
+        print(
+            f"\n[ERROR] {file}: pattern not found for '{label}'.\n"
+            f"  This usually means the upstream Dynamo source has changed.\n"
+            f"  Expected pattern (first 100 chars): {old[:100]!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return src.replace(old, new, 1)
 
 
 def patch_backend_args():
@@ -22,7 +69,8 @@ def patch_backend_args():
         print("backend_args.py: already patched")
         return
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         '        add_argument(\n            g,\n            flag_name="--disaggregation-mode"',
         '        add_argument(\n'
         '            g,\n'
@@ -32,13 +80,16 @@ def patch_backend_args():
         '            help="ModelExpress P2P server URL (e.g., modelexpress-server:8001). "\n'
         '            "When set, auto-detects source/target role based on existing sources.",\n'
         '        )\n'
-        '        add_argument(\n            g,\n            flag_name="--disaggregation-mode"'
+        '        add_argument(\n            g,\n            flag_name="--disaggregation-mode"',
+        file=p, label="--model-express-url CLI arg",
     )
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         "    disaggregation_mode: DisaggregationMode",
         "    model_express_url: Optional[str] = None\n\n"
-        "    disaggregation_mode: DisaggregationMode"
+        "    disaggregation_mode: DisaggregationMode",
+        file=p, label="model_express_url config field",
     )
 
     p.write_text(src)
@@ -53,23 +104,31 @@ def patch_engine():
         return
 
     if "import os" not in src:
-        src = src.replace("import enum", "import enum\nimport os")
+        src = _replace_or_die(
+            src, "import enum", "import enum\nimport os",
+            file=p, label="import os",
+        )
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         "        disaggregation_mode: Optional[DisaggregationMode] = None,\n"
         "    ) -> None:",
         "        disaggregation_mode: Optional[DisaggregationMode] = None,\n"
         "        model_express_url: Optional[str] = None,\n"
-        "    ) -> None:"
+        "    ) -> None:",
+        file=p, label="TensorRTLLMEngine.__init__ signature",
     )
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         "        self.engine_args = engine_args\n",
         "        self.engine_args = engine_args\n"
-        "        self._model_express_url = model_express_url\n"
+        "        self._model_express_url = model_express_url\n",
+        file=p, label="store _model_express_url on engine",
     )
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         "    async def initialize(self) -> None:\n"
         "        if not self._llm:\n",
         "    async def initialize(self) -> None:\n"
@@ -81,22 +140,27 @@ def patch_engine():
         "                logger.info(\n"
         '                    "ModelExpress P2P enabled: checkpoint_format=MX, server=%s",\n'
         "                    self._model_express_url,\n"
-        "                )\n\n"
+        "                )\n\n",
+        file=p, label="checkpoint_format=MX in initialize()",
     )
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         "    disaggregation_mode: Optional[DisaggregationMode] = None,\n"
         "    component_gauges: Any = None,\n"
         ") -> AsyncGenerator[TensorRTLLMEngine, None]:",
         "    disaggregation_mode: Optional[DisaggregationMode] = None,\n"
         "    component_gauges: Any = None,\n"
         "    model_express_url: Optional[str] = None,\n"
-        ") -> AsyncGenerator[TensorRTLLMEngine, None]:"
+        ") -> AsyncGenerator[TensorRTLLMEngine, None]:",
+        file=p, label="get_llm_engine signature",
     )
 
-    src = src.replace(
+    src = _replace_or_die(
+        src,
         "    engine = TensorRTLLMEngine(engine_args, disaggregation_mode)",
-        "    engine = TensorRTLLMEngine(engine_args, disaggregation_mode, model_express_url)"
+        "    engine = TensorRTLLMEngine(engine_args, disaggregation_mode, model_express_url)",
+        file=p, label="get_llm_engine constructor call",
     )
 
     p.write_text(src)
@@ -110,24 +174,27 @@ def patch_llm_worker():
         print("llm_worker.py: already patched")
         return
 
-    if "model_express_url=config.model_express_url" not in src:
-        src = src.replace(
-            "        component_gauges=component_gauges,\n"
-            "    ) as engine:",
-            "        component_gauges=component_gauges,\n"
-            "        model_express_url=config.model_express_url,\n"
-            "    ) as engine:"
-        )
+    src = _replace_or_die(
+        src,
+        "        component_gauges=component_gauges,\n"
+        "    ) as engine:",
+        "        component_gauges=component_gauges,\n"
+        "        model_express_url=config.model_express_url,\n"
+        "    ) as engine:",
+        file=p, label="model_express_url in get_llm_engine call",
+    )
 
     if "hasattr(runtime_config" not in src and "exclude_tools_when_tool_choice_none" in src:
-        src = src.replace(
+        src = _replace_or_die(
+            src,
             "        runtime_config.exclude_tools_when_tool_choice_none = (\n"
             "            config.exclude_tools_when_tool_choice_none\n"
             "        )",
             '        if hasattr(runtime_config, "exclude_tools_when_tool_choice_none"):\n'
             "            runtime_config.exclude_tools_when_tool_choice_none = getattr(\n"
             '                config, "exclude_tools_when_tool_choice_none", True\n'
-            "            )"
+            "            )",
+            file=p, label="exclude_tools_when_tool_choice_none compat guard",
         )
 
     if "inspect.signature(RequestHandlerConfig" not in src:
