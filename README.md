@@ -36,7 +36,7 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
 | **Models take too long to load** | GPU-to-GPU transfer via NIXL/RDMA instead of loading from storage. In P2P mode, weights already serving inference act as the cache—no extra storage. |
-| **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
+| **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. This reduces ingress bandwidth from external providers such as Hugging Face and ensures only one model copy is downloaded even when multiple clients request the same model concurrently. |
 
 ### How ModelExpress manages weights in the cluster
 
