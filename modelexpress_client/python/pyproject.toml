@@ -28,7 +28,7 @@ dependencies = [
     "huggingface_hub>=0.20.0",
     "nixl[cu12]; sys_platform == 'linux'",
     "numpy>=1.24.0",
-    "protobuf>=5.27.0,<6.0.0", # protobuf 5.x compatibility
+    "protobuf>=5.27.0,<6.0.0",            # protobuf 5.x compatibility
     "pydantic>=2.0.0",
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
@@ -41,6 +41,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
+otel = ["opentelemetry-api>=1.20.0"]
 
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/modelexpress"
