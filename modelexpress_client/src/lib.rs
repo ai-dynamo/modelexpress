@@ -358,6 +358,9 @@ impl Client {
             model_name: model_name.to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             chunk_size,
+            // Whole-model fetch; selective `relative_paths` would be set by
+            // a future caller that wants per-file selection from a peer.
+            relative_paths: Vec::new(),
         });
 
         let mut stream = self

@@ -260,3 +260,69 @@ def test_servicer_init_uses_explicit_cache_root(tmp_path):
     s = PeerModelServiceServicer(cache_root=cache)
     # Internal attr access in tests is fine
     assert s._cache_root == cache
+
+
+# ---------------------------------------------------------------------------
+# relative_paths filter (P1)
+# ---------------------------------------------------------------------------
+
+
+def test_list_model_files_with_filter(model_stub):
+    request = model_pb2.ModelFilesRequest(
+        model_name="google/t5-small",
+        provider=model_pb2.HUGGING_FACE,
+        chunk_size=0,
+        relative_paths=["model.safetensors"],
+    )
+    response = model_stub.ListModelFiles(request)
+    paths = [f.relative_path for f in response.files]
+    assert paths == ["model.safetensors"]
+    sizes = {f.relative_path: f.size for f in response.files}
+    assert sizes["model.safetensors"] == 5120
+    assert response.total_size == 5120
+
+
+def test_list_model_files_filter_unknown_path_returns_not_found(model_stub):
+    request = model_pb2.ModelFilesRequest(
+        model_name="google/t5-small",
+        provider=model_pb2.HUGGING_FACE,
+        chunk_size=0,
+        relative_paths=["does-not-exist.bin"],
+    )
+    with pytest.raises(grpc.RpcError) as excinfo:
+        model_stub.ListModelFiles(request)
+    assert excinfo.value.code() == grpc.StatusCode.NOT_FOUND
+
+
+def test_stream_model_files_filter_emits_in_request_order(model_stub):
+    request = model_pb2.ModelFilesRequest(
+        model_name="google/t5-small",
+        provider=model_pb2.HUGGING_FACE,
+        chunk_size=4096,
+        relative_paths=["model.safetensors", "config.json"],
+    )
+    seen_paths: list[str] = []
+    accumulated: dict[str, bytearray] = {}
+    for chunk in model_stub.StreamModelFiles(request):
+        if chunk.relative_path not in seen_paths:
+            seen_paths.append(chunk.relative_path)
+        accumulated.setdefault(chunk.relative_path, bytearray()).extend(chunk.data)
+    # Order matches request, not directory walk.
+    assert seen_paths == ["model.safetensors", "config.json"]
+    assert bytes(accumulated["config.json"]) == b'{"model_type":"t5"}'
+    assert (
+        bytes(accumulated["model.safetensors"])
+        == b"\x00" * 4096 + b"\xab" * 1024
+    )
+
+
+def test_stream_model_files_filter_path_traversal_rejected(model_stub):
+    request = model_pb2.ModelFilesRequest(
+        model_name="google/t5-small",
+        provider=model_pb2.HUGGING_FACE,
+        chunk_size=4096,
+        relative_paths=["../../../etc/passwd"],
+    )
+    with pytest.raises(grpc.RpcError) as excinfo:
+        list(model_stub.StreamModelFiles(request))
+    assert excinfo.value.code() == grpc.StatusCode.NOT_FOUND

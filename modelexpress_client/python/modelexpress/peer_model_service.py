@@ -132,6 +132,35 @@ def _walk_files(root: Path) -> list[tuple[str, int]]:
     return entries
 
 
+def _apply_relative_paths_filter(
+    files: list[tuple[str, int]],
+    requested: "list[str] | object",
+    context: grpc.ServicerContext,
+) -> list[tuple[str, int]]:
+    """Optionally filter walker output by the request's relative_paths.
+
+    When `requested` is empty, returns `files` unchanged (whole-model behavior).
+    When non-empty, returns a list whose entries are exactly the requested paths
+    in request order, looking up sizes from the walker output. A requested path
+    that does not appear in the walker output aborts with NOT_FOUND. Paths that
+    would escape the model root (`..`, absolute, etc.) cannot match the walker
+    output and therefore also surface as NOT_FOUND, by construction.
+    """
+    if not list(requested):
+        return files
+    by_path = {rel: size for rel, size in files}
+    out: list[tuple[str, int]] = []
+    for rel in requested:
+        if rel not in by_path:
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"Requested file not found in model: {rel!r}",
+            )
+            return []
+        out.append((rel, by_path[rel]))
+    return out
+
+
 def _is_safe_relative(model_root: Path, rel_path: str) -> bool:
     """Reject path-traversal and symlink-escape attempts.
 
@@ -224,6 +253,7 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
             request.provider, request.model_name, None, context
         )
         files = _walk_files(model_path)
+        files = _apply_relative_paths_filter(files, request.relative_paths, context)
         total = sum(size for _, size in files)
         return model_pb2.ModelFileList(
             model_name=request.model_name,
@@ -254,6 +284,7 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
             commit_hash = model_path.name
 
         files = _walk_files(model_path)
+        files = _apply_relative_paths_filter(files, request.relative_paths, context)
         if not files:
             context.abort(
                 grpc.StatusCode.NOT_FOUND,

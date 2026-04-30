@@ -235,6 +235,7 @@ async fn drain_stream(
         model_name: spec.encode(),
         provider: 0,
         chunk_size,
+        relative_paths: Vec::new(),
     };
     let mut validator = if strict {
         Some(StrictValidator::new())

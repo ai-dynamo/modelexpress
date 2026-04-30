@@ -291,12 +291,28 @@ impl ModelService for ModelServiceImpl {
             ));
         }
 
-        // Collect all files to stream
-        let files = collect_model_files(&model_path, &model_path);
+        // Collect all files in the model directory. The walker only emits
+        // paths that pass relative-path safety, so any later filtering by
+        // client-supplied names can lookup against this set without re-validating.
+        let collected = collect_model_files(&model_path, &model_path);
 
-        if files.is_empty() {
-            return Err(Status::not_found("No files found in model directory"));
-        }
+        let files = if files_request.relative_paths.is_empty() {
+            if collected.is_empty() {
+                return Err(Status::not_found("No files found in model directory"));
+            }
+            collected
+        } else {
+            let by_path: HashMap<PathBuf, u64> = collected.into_iter().collect();
+            let mut filtered = Vec::with_capacity(files_request.relative_paths.len());
+            for rel in &files_request.relative_paths {
+                let rel_path = PathBuf::from(rel);
+                let size = by_path.get(&rel_path).ok_or_else(|| {
+                    Status::not_found(format!("Requested file not found in model: {rel:?}"))
+                })?;
+                filtered.push((rel_path, *size));
+            }
+            filtered
+        };
 
         let total_files = files.len();
         info!(
@@ -447,8 +463,25 @@ impl ModelService for ModelServiceImpl {
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
-        // Collect all files
-        let files = collect_model_files(&model_path, &model_path);
+        // Collect all files. When the client supplied `relative_paths` we
+        // filter against the walker's results, preserving request order and
+        // erroring on any unknown path.
+        let collected = collect_model_files(&model_path, &model_path);
+
+        let files: Vec<(PathBuf, u64)> = if files_request.relative_paths.is_empty() {
+            collected
+        } else {
+            let by_path: HashMap<PathBuf, u64> = collected.into_iter().collect();
+            let mut filtered = Vec::with_capacity(files_request.relative_paths.len());
+            for rel in &files_request.relative_paths {
+                let rel_path = PathBuf::from(rel);
+                let size = by_path.get(&rel_path).ok_or_else(|| {
+                    Status::not_found(format!("Requested file not found in model: {rel:?}"))
+                })?;
+                filtered.push((rel_path, *size));
+            }
+            filtered
+        };
 
         let file_infos: Vec<ModelFileInfo> = files
             .iter()
@@ -1089,6 +1122,7 @@ mod tests {
             model_name: "non-existent-model-12345".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 0,
+            relative_paths: vec![],
         });
 
         let result = service.list_model_files(request).await;
@@ -1105,6 +1139,7 @@ mod tests {
             model_name: "non-existent-model-12345".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            relative_paths: vec![],
         });
 
         let result = service.stream_model_files(request).await;
@@ -1138,6 +1173,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             chunk_size: 0,
+            relative_paths: vec![],
         });
 
         let result = service.list_model_files(request).await;
@@ -1155,6 +1191,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             chunk_size: 1024,
+            relative_paths: vec![],
         });
 
         let result = service.stream_model_files(request).await;
@@ -1186,6 +1223,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            relative_paths: vec![],
         });
 
         let response = service
@@ -1229,6 +1267,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            relative_paths: vec![],
         });
 
         let response = service
@@ -1254,5 +1293,114 @@ mod tests {
             first_chunk.blake3.as_deref(),
             Some("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_relative_paths_filter_emits_in_order() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("a.txt"), b"AAA").expect("write a");
+        std::fs::write(model_dir.join("b.txt"), b"BBBB").expect("write b");
+        std::fs::write(model_dir.join("c.txt"), b"CC").expect("write c");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+            relative_paths: vec!["b.txt".to_string(), "a.txt".to_string()],
+        });
+        let response = service
+            .stream_model_files(request)
+            .await
+            .expect("Expected stream response");
+        let mut stream = response.into_inner();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("chunk"));
+        }
+
+        assert_eq!(chunks.len(), 2);
+        // Order matches request order, not directory walk order.
+        assert_eq!(chunks[0].relative_path, "b.txt");
+        assert_eq!(chunks[0].data, b"BBBB");
+        assert!(chunks[0].is_last_chunk);
+        assert!(!chunks[0].is_last_file);
+        assert_eq!(chunks[1].relative_path, "a.txt");
+        assert_eq!(chunks[1].data, b"AAA");
+        assert!(chunks[1].is_last_chunk);
+        assert!(chunks[1].is_last_file);
+        // c.txt is filtered out.
+        assert!(chunks.iter().all(|c| c.relative_path != "c.txt"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_relative_paths_unknown_returns_not_found() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("a.txt"), b"A").expect("write a");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+            relative_paths: vec!["nope.txt".to_string()],
+        });
+        let result = service.stream_model_files(request).await;
+        let status = result.expect_err("Expected unknown filter path to fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("nope.txt"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_relative_paths_traversal_returns_not_found() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("a.txt"), b"A").expect("write a");
+        // Create a sibling file outside the snapshot dir; the filter must NOT
+        // be able to reach it via "../" in a relative_paths entry.
+        std::fs::write(temp_dir.path().join("secret.txt"), b"NOPE").expect("write secret");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+            relative_paths: vec!["../../secret.txt".to_string()],
+        });
+        let result = service.stream_model_files(request).await;
+        let status = result.expect_err("Expected traversal attempt to fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 }

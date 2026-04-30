@@ -55,6 +55,12 @@ message ModelFilesRequest {
   ModelProvider provider = 2;
   // Chunk size in bytes for streaming (0 = use server default)
   uint32 chunk_size = 3;
+  // Optional file selector. When empty, the server streams every file in
+  // the resolved model directory in directory-walk order. When non-empty,
+  // the server streams ONLY the listed relative paths, in the order given.
+  // A requested path that does not exist or escapes the model root is
+  // an error (NOT_FOUND or INVALID_ARGUMENT respectively).
+  repeated string relative_paths = 4;
 }
 
 // A chunk of file data for streaming transfers
