@@ -15,7 +15,7 @@ SPDX-License-Identifier: Apache-2.0
 <h1 align="center">Dynamo ModelExpress</h1>
 
 <p align="center">
-  <strong>Model weight management for LLM inference</strong> — cache, transfer, and serve weights at scale with GPU-to-GPU RDMA and multi-node coordination.
+  <strong>Accelerate LLM startup and scale-out with intelligent model distribution</strong>
 </p>
 
 <p align="center">
@@ -35,7 +35,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-ModelExpress is a Rust-based service that manages the complete model weight lifecycle in the cluster—from acquisition to GPU memory. It accelerates LLM inference by caching, routing, and transferring weights through the fastest available path. Deploy standalone or as a sidecar alongside vLLM, NVIDIA Dynamo, and other inference runtimes.
+ModelExpress is a model distribution layer for LLM inference. It manages how model weights are acquired, cached, shared, and transferred across a cluster so inference systems can start faster, scale more efficiently, and avoid repeated downloads from external model providers. Deploy it as a standalone service or alongside runtimes such as vLLM, NVIDIA Dynamo, and TensorRT-LLM.
 
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
@@ -44,7 +44,7 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 
 ### How ModelExpress manages weights in the cluster
 
-ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads or streams a model from external sources (for example Hugging Face, NGC, GCS, or object storage through ModelStreamer); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
+ModelExpress orchestrates the weight lifecycle from external source to GPU memory. It minimizes repeated provider traffic, keeps cache state coordinated across the cluster, and routes each load through the most efficient available path.
 
 1. **Download or stream from external storage** — The ModelExpress server pulls the model from Hugging Face, NGC, or GCS, or a client streams it through ModelStreamer from object storage or local disk; ModelExpress coordinates so no other node duplicates this work. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
 2. **Persist to disk** — Store in a cache backed by disk:
@@ -57,16 +57,15 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ## Features
 
-- **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
-- **Distributed registry** — model download state, cache lifecycle, and P2P metadata coordinated through Redis or Kubernetes CRDs
-- **Model store providers** — built-in providers for Hugging Face, NVIDIA NGC, and Google Cloud Storage
-- **ModelStreamer loading** — stream weights from S3, GCS, Azure Blob, local paths, or Hugging Face cache into vLLM with `MX_MODEL_URI`
-- **GPUDirect Storage** — direct file-to-GPU loading path when GDS hardware and software are available
-- **Cache and path resolution** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo, and provider-specific cache layouts
-- **P2P GPU transfer** — vLLM `mx` loader and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
-- **Metadata backends** — Redis or Kubernetes CRD for distributed coordination
-- **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
-- **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
+- **Reduce startup time** — shift model loads from storage-bound workflows to GPU-to-GPU RDMA over InfiniBand
+- **Reduce provider ingress** — coordinate downloads so concurrent requests share one external fetch instead of duplicating traffic
+- **Operate with distributed state** — keep model lifecycle state and P2P metadata in Redis or Kubernetes CRDs
+- **Support multiple model sources** — built-in providers for Hugging Face, NVIDIA NGC, and Google Cloud Storage
+- **Load from object storage** — use ModelStreamer with `MX_MODEL_URI` for S3, GCS, Azure Blob, local paths, or Hugging Face cache
+- **Use direct file-to-GPU loading** — enable GPUDirect Storage when hardware and software are available
+- **Integrate with inference runtimes** — vLLM `mx` loader and TensorRT-LLM `PRESHARDED` support for RDMA-based startup
+- **Deploy in Kubernetes** — use Helm, CRDs, Redis, shared storage, or no-shared-storage topologies
+- **Operate through CLI and APIs** — health, download, list, validate, and clear models with shared server/client interfaces
 
 ### Integrations
 
@@ -79,7 +78,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ### Model Store Providers
 
-ModelExpress supports two storage-access paths:
+ModelExpress exposes a small set of storage-access patterns, depending on how you want weights delivered:
 
 | Path | Supported sources |
 |------|-------------------|
@@ -89,7 +88,7 @@ ModelExpress supports two storage-access paths:
 
 ### Air-Gapped Environments
 
-ModelExpress supports air-gapped deployments when model files are already present inside the environment.
+ModelExpress supports air-gapped deployments when model files are already available inside the environment.
 
 - Use a pre-populated local cache or a mounted local/PVC path as the source of truth.
 - For Hugging Face cache-only operation, set `HF_HUB_OFFLINE=1`; ModelExpress resolves models from the local HF cache and does not attempt network access.
@@ -122,11 +121,11 @@ ModelExpress supports air-gapped deployments when model files are already presen
               └──────────────────┘         │       └──────────────────┘
 ```
 
-*Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
+*The server coordinates discovery and lifecycle state; the weight bytes move directly between GPUs.*
 
-- **modelexpress_server**: gRPC server with distributed metadata backends (Redis or Kubernetes CRD)
-- **modelexpress_client**: Rust CLI for cache management; Python package with vLLM loaders and `MxClient`
-- **modelexpress_common**: Protobuf definitions, provider abstractions, and shared configuration
+- **modelexpress_server**: control plane for downloads, cache state, and P2P coordination
+- **modelexpress_client**: Rust CLI and Python integration layer for runtime-facing workflows
+- **modelexpress_common**: shared protobufs, provider abstractions, and configuration types
 
 See [Architecture](docs/ARCHITECTURE.md).
 
