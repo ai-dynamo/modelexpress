@@ -44,7 +44,7 @@ modelexpress-cli [OPTIONS] <COMMAND>
 - `-q, --quiet`: Quiet mode (suppress all output except errors)
 - `--cache-path <PATH>`: Model storage path override
 - `--no-shared-storage`: Disable shared storage mode (will transfer files from server to client)
-- `--transfer-chunk-size <SIZE>`: Chunk size in bytes for file transfer when shared storage is disabled (default: 32768)
+- `--transfer-chunk-size <SIZE>`: Chunk size in bytes for file transfer when shared storage is disabled (default: 262144)
 - `-h, --help`: Print help information
 - `-V, --version`: Print version
 

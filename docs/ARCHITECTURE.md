@@ -458,7 +458,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 | `models` | `Status`, `ModelProvider`, `ModelStatus`, `ModelStatusResponse` |
 | `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` + `GcsProvider` |
 | `grpc` | Generated tonic stubs for all 4 services |
-| `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (32KB) |
+| `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (256KB) |
 
 ### ModelProviderTrait
 
