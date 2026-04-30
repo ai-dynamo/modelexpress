@@ -57,3 +57,9 @@ include = ["modelexpress*"]
 
 [tool.setuptools.package-data]
 modelexpress = ["py.typed"]
+
+[dependency-groups]
+dev = [
+    "opentelemetry-api>=1.41.1",
+    "opentelemetry-sdk>=1.41.1",
+]
