@@ -54,6 +54,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
+- **Distributed registry** — model download state, cache lifecycle, and P2P metadata coordinated through Redis or Kubernetes CRDs
 - **Model store providers** — built-in providers for Hugging Face, NVIDIA NGC, and Google Cloud Storage
 - **ModelStreamer loading** — stream weights from S3, GCS, Azure Blob, local paths, or Hugging Face cache into vLLM with `MX_MODEL_URI`
 - **GPUDirect Storage** — direct file-to-GPU loading path when GDS hardware and software are available
@@ -158,6 +159,19 @@ helm install modelexpress ./helm --namespace modelexpress --create-namespace
 
 Override [values-production.yaml](helm/values-production.yaml) for your env. Full config: [helm/README.md](helm/README.md).
 
+### Distributed Backend Prerequisites
+
+ModelExpress requires a distributed backend for model registry state and P2P coordination:
+
+- `redis` for Redis-backed deployments
+- `kubernetes` for CRD-backed deployments
+
+For the Kubernetes backend, install the CRDs before starting the server:
+
+```bash
+kubectl apply -f examples/crds.yaml
+```
+
 ### P2P GPU Transfer (vLLM)
 
 ```python
@@ -167,6 +181,12 @@ register_modelexpress_loaders()
 ```
 
 First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
+
+### Example Deployments
+
+- [vLLM P2P transfer](examples/p2p_transfer_k8s/README.md)
+- [Dynamo P2P transfer](examples/dynamo_p2p_transfer_k8s/README.md)
+- [TensorRT-LLM beta examples](examples/p2p_transfer_k8s/client/trtllm/README.md)
 
 ### Docker
 
