@@ -65,9 +65,12 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `cargo run --bin config_gen -- --output model-express.yaml` | Generate server config |
 | `cargo run --bin test_client -- --test-model "google-t5/t5-small"` | Run test client |
 | `cargo run --bin fallback_test` | Run fallback tests |
+| `cargo build -p modelexpress-bench` | Build the benchmark harness crate |
+| `cargo test -p modelexpress-bench` | Run the benchmark harness unit tests |
+| `cargo run --bin bench_grpc_streaming -- serve --addr 0.0.0.0:8001` | Run a local synthetic bench server |
 | `./run_integration_tests.sh` | Integration tests (starts server) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
-| `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
+| `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs for both `p2p.proto` and `model.proto` |
 | `pre-commit run` | Run hooks on staged files |
 | `pre-commit run --all-files` | Run hooks on all files |
 
@@ -150,7 +153,16 @@ docker-compose up --build
 # Build P2P client image
 docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
   -t your-registry/IMAGE_NAME:TAG .
+
+# Build the Rust bench harness image (synthetic-source gRPC bench server)
+docker build -f Dockerfile.bench -t your-registry/modelexpress-bench:bench-latest .
+
+# Build the Python bench harness image (slim, no torch/NIXL footprint)
+docker build -f Dockerfile.bench-python \
+  -t your-registry/modelexpress-bench-python:bench-py-latest .
 ```
+
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) (Benchmark Harness section) for the full bench workflow.
 
 ### Helm
 

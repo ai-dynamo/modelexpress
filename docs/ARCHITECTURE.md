@@ -62,7 +62,7 @@ graph TD
 
 ```text
 ModelExpress/
-├── Cargo.toml                          # Workspace root (4 members)
+├── Cargo.toml                          # Workspace root (5 members)
 ├── Cargo.lock
 ├── Dockerfile                          # Multi-stage production image
 ├── docker-compose.yml                  # Single-service dev setup
@@ -139,7 +139,12 @@ ModelExpress/
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── metadata.py                 # Metadata building and publishing
 │       ├── rank_utils.py               # Rank detection utilities
-│       ├── worker_server.py            # WorkerGrpcServer (P2P tensor manifest)
+│       ├── worker_server.py            # WorkerGrpcServer (P2P tensor manifest + ModelService peer file serving)
+│       ├── peer_model_service.py       # PeerModelServiceServicer (serves local HF cache)
+│       ├── p2p_pb2.py                  # Generated stubs for p2p.proto
+│       ├── p2p_pb2_grpc.py
+│       ├── model_pb2.py                # Generated stubs for model.proto
+│       ├── model_pb2_grpc.py
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
@@ -248,7 +253,7 @@ ModelExpress/
 
 All cargo dependencies are declared in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively.
 
-The `modelexpress_bench` crate hosts benchmark-only binaries that target the production gRPC services with synthetic byte sources and in-memory sinks. It is `publish=false` and never linked into release artifacts. See [`examples/bench/README.md`](../examples/bench/README.md) for the gRPC streaming throughput harness, including same-node and cross-node Kubernetes manifests.
+The `modelexpress_bench` crate hosts benchmark-only binaries that target the production gRPC services with synthetic byte sources and in-memory sinks. It is `publish=false` and never linked into release artifacts. A sibling Python package at `modelexpress_bench/python/` implements the same `ModelService` proto and `bench:<bytes>:<files>` model_name encoding, so any client can target either implementation for cross-language throughput comparisons. See [`examples/bench/README.md`](../examples/bench/README.md) for the gRPC streaming throughput harness, including same-node and cross-node Kubernetes manifests, and [`DEPLOYMENT.md`](DEPLOYMENT.md) for the deployment workflow.
 
 ## gRPC Services
 
@@ -505,10 +510,12 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `metadata.py` | `build_source_identity`, `publish_metadata_and_ready`, retry logic |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
-| `worker_server.py` | `WorkerGrpcServer` - per-worker gRPC server for P2P tensor manifest exchange |
+| `worker_server.py` | `WorkerGrpcServer` - per-worker gRPC server hosting both `WorkerService` (P2P tensor manifest exchange) and `ModelService` (peer file serving) |
+| `peer_model_service.py` | `PeerModelServiceServicer` - serves the worker's local HuggingFace cache via `ModelService.StreamModelFiles` / `ListModelFiles` / `EnsureModelDownloaded`. Never initiates downloads. v1 HuggingFace-only. |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
-| `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
+| `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs for `p2p.proto` |
+| `model_pb2.py` / `model_pb2_grpc.py` | Generated protobuf/gRPC stubs for `model.proto` |
 
 ### MxClient
 

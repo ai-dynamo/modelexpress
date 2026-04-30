@@ -614,3 +614,65 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |
 | Llama 3.3 70B | 140 GB (8 GPUs) | ~5 seconds | ~28 Gbps |
+
+## Benchmark Harness
+
+The `examples/bench/` directory contains a synthetic-source gRPC streaming benchmark that exercises the production `ModelService.StreamModelFiles` path with no disk I/O on either end. Useful for measuring the network ceiling of the file-transfer plane on a real cluster.
+
+Two server implementations ship in the harness:
+
+- **Rust** - `bench_grpc_streaming` binary from the `modelexpress_bench` crate, packaged in `Dockerfile.bench`.
+- **Python** - `modelexpress_bench` Python package under `modelexpress_bench/python/`, packaged in `Dockerfile.bench-python`. Uses the same `ModelService` proto and `bench:<bytes>:<files>` model_name encoding as the Rust server, so any client can target either implementation for cross-language throughput comparisons.
+
+### Building the Images
+
+```bash
+# Rust bench server + client
+docker build -f Dockerfile.bench -t <your-registry>/modelexpress-bench:bench-$(git rev-parse --short HEAD) .
+docker push <your-registry>/modelexpress-bench:bench-$(git rev-parse --short HEAD)
+
+# Python bench server (synthetic mode only; no torch / NIXL footprint)
+docker build -f Dockerfile.bench-python -t <your-registry>/modelexpress-bench-python:bench-py-$(git rev-parse --short HEAD) .
+docker push <your-registry>/modelexpress-bench-python:bench-py-$(git rev-parse --short HEAD)
+```
+
+### Manifests
+
+| File | Purpose |
+|------|---------|
+| `examples/bench/grpc-server.yaml` | Rust bench server Deployment + headless Service. Hosts `bench_grpc_streaming` and an `iperf3` sidecar for fabric calibration. |
+| `examples/bench/grpc-server-python.yaml` | Python bench server Deployment + Service. Same shape as the Rust server. |
+| `examples/bench/grpc-client-same-node.yaml` | Client Pod with `podAffinity` to the bench server's hostname. |
+| `examples/bench/grpc-client-cross-node.yaml` | Client Pod with `podAntiAffinity` from the bench server's hostname. |
+
+The example manifests tolerate the standard `nvidia.com/gpu` taint so the bench pods land on GPU worker nodes and ride the same fabric production traffic uses, without requesting GPU resources. Add cluster-specific tolerations or `nodeSelector` rules as needed for your environment, and replace the `<your-registry>` image references with your registry path.
+
+### Running a Sweep
+
+`examples/bench/run.sh` orchestrates a chunk-size sweep:
+
+```bash
+NS=<your-namespace> \
+IMAGE=<your-registry>/modelexpress-bench:bench-$(git rev-parse --short HEAD) \
+TOTAL_BYTES=8G WARMUP_BYTES=512M \
+CHUNK_SIZES="32K 256K 1M 2M 3M" \
+./examples/bench/run.sh both --keep
+```
+
+Per topology, the script:
+
+1. Applies the server Deployment + Service.
+2. Applies the client Pod (same-node or cross-node).
+3. Discovers the egress interface from the client to the server via `ip route get` and `ethtool`.
+4. Captures an `iperf3` TCP-plane baseline so the MX-gRPC numbers can be sized as a percentage of the underlying fabric.
+5. Sweeps chunk sizes against the production gRPC path, emitting one JSON line per run.
+
+Results land at `/tmp/bench-grpc-{same-node,cross-node}.jsonl` inside the `run.sh` invocation environment. Each line is one JSON object with bytes/sec, gibibits/sec, chunks_received, ttfb_ns, and a chunk-receive-latency histogram.
+
+Tonic's default 4 MB max-message-size is intentionally not bumped on the production server, so chunk sizes above ~3 MB will be rejected. The sweep stays under that ceiling by default.
+
+### Notes
+
+- **Synthetic only.** The bench servers emit chunks from a pre-filled in-memory buffer; production endpoints reading real cached files will see additional disk overhead.
+- **Honest fabric calibration.** Always interpret MX-gRPC numbers against the iperf3 ceiling captured for the same pod pair. The bench does NOT bind to any specific NIC; it rides whatever interface the CNI bound for pod-to-pod traffic, which on many clusters is not the highest-rate fabric available.
+- See [`../examples/bench/README.md`](../examples/bench/README.md) for the harness's detailed usage notes and JSON schema for sweep output.

@@ -366,6 +366,48 @@ modelexpress-cli --format json model list | jq -r '.models[].name'
     ./target/release/modelexpress-cli model clear-all --yes
 ```
 
+## Bench Tools
+
+The `bench_grpc_streaming` binary from the `modelexpress_bench` crate measures throughput and per-chunk latency of the `ModelService.StreamModelFiles` path with synthetic byte sources and in-memory sinks (no disk on either end). See [`docs/DEPLOYMENT.md#benchmark-harness`](DEPLOYMENT.md) for the Kubernetes deployment workflow. For local single-host runs:
+
+### Server Mode
+
+```bash
+bench_grpc_streaming serve \
+  --addr 0.0.0.0:8001 \
+  --mpsc-cap 16 \
+  --source-buf-size 16777216
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--addr` | `0.0.0.0:8001` | Bind address |
+| `--mpsc-cap` | `16` | mpsc channel capacity for per-RPC streaming |
+| `--source-buf-size` | `16777216` | Source-buffer size in bytes; must be >= the largest chunk size any client will request |
+
+### Client Mode
+
+```bash
+bench_grpc_streaming client \
+  --server-addr http://10.0.0.1:8001 \
+  --total-bytes 8G \
+  --warmup-bytes 512M \
+  --chunk-size 256K \
+  --label same-node-256K
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--server-addr` | (required) | Server URL, e.g. `http://10.0.0.1:8001` |
+| `--total-bytes` | `1G` | Total bytes to transfer in the measured run; accepts K, M, G suffixes |
+| `--file-count` | `1` | Number of synthetic files to split the payload across |
+| `--chunk-size` | `1M` | Chunk size in bytes; accepts K, M, G suffixes |
+| `--warmup-bytes` | `0` | Optional warmup payload before the timed run; discarded from results |
+| `--strict` | (flag) | Run production client validation invariants on every chunk (offset, total_size, sequential write, terminator) |
+| `--label` | (empty) | Free-form label written into the result JSON |
+
+The client emits a single JSON line on stdout suitable for concatenation into a sweep file.
+
 ## Configuration
 
 ### Environment Variables
