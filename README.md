@@ -19,6 +19,10 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 <p align="center">
+  Reduce repeated ingress from external model providers by ensuring only one copy of a model is downloaded even when many clients request it concurrently.
+</p>
+
+<p align="center">
   <a href="#features">Features</a> •
   <a href="#dynamo-modelexpress-architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
