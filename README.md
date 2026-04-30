@@ -35,7 +35,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-ModelExpress is a model distribution layer for LLM inference. It manages how model weights are acquired, cached, shared, and transferred across a cluster so inference systems can start faster, scale more efficiently, and avoid repeated downloads from external model providers. Deploy it as a standalone service or alongside runtimes such as vLLM, NVIDIA Dynamo, and TensorRT-LLM.
+ModelExpress is a model distribution layer for large-model workloads. It manages how model weights are acquired, cached, shared, and transferred across a cluster so systems can start faster, scale more efficiently, and avoid repeated downloads from external model providers. Deploy it as a standalone service or alongside runtimes such as vLLM, NVIDIA Dynamo, and TensorRT-LLM.
 
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
@@ -63,7 +63,7 @@ ModelExpress orchestrates the weight lifecycle from external source to GPU memor
 - **Support multiple model sources** — built-in providers for Hugging Face, NVIDIA NGC, and Google Cloud Storage
 - **Load from object storage** — use ModelStreamer with `MX_MODEL_URI` for S3, GCS, Azure Blob, local paths, or Hugging Face cache
 - **Use direct file-to-GPU loading** — enable GPUDirect Storage when hardware and software are available
-- **Integrate with inference runtimes** — vLLM `mx` loader and TensorRT-LLM `PRESHARDED` support for RDMA-based startup
+- **Integrate with runtime platforms** — vLLM `mx` loader and TensorRT-LLM `PRESHARDED` support for RDMA-based startup
 - **Deploy in Kubernetes** — use Helm, CRDs, Redis, shared storage, or no-shared-storage topologies
 - **Operate through CLI and APIs** — health, download, list, validate, and clear models with shared server/client interfaces
 
