@@ -34,6 +34,7 @@ import os
 from pathlib import Path
 from typing import Iterator, Optional
 
+import blake3
 import grpc
 
 from . import model_pb2
@@ -271,6 +272,10 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
                 )
                 return
             full_path = model_path / rel_path
+            # Per-file streaming hasher. Hex of digest is emitted on the
+            # chunk where is_last_chunk=True so consumers receive it after
+            # all bytes they hash.
+            hasher = blake3.blake3()
             if total_size == 0:
                 emit_commit = commit_hash if is_first_chunk else None
                 is_first_chunk = False
@@ -282,6 +287,7 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
                     is_last_chunk=True,
                     is_last_file=is_last_file,
                     commit_hash=emit_commit,
+                    blake3=hasher.hexdigest(),
                 )
                 continue
 
@@ -300,10 +306,12 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
                     buf = f.read(chunk_size)
                     if not buf:
                         break
+                    hasher.update(buf)
                     chunk_len = len(buf)
                     is_last_chunk = (offset + chunk_len) >= total_size
                     emit_commit = commit_hash if is_first_chunk else None
                     is_first_chunk = False
+                    chunk_blake3 = hasher.hexdigest() if is_last_chunk else None
                     yield model_pb2.FileChunk(
                         relative_path=rel_path,
                         data=buf,
@@ -312,6 +320,7 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
                         is_last_chunk=is_last_chunk,
                         is_last_file=is_last_file and is_last_chunk,
                         commit_hash=emit_commit,
+                        blake3=chunk_blake3,
                     )
                     offset += chunk_len
             finally:

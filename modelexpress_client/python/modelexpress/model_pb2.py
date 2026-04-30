@@ -27,17 +27,17 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bmodel.proto\x12\x13model_express.model\"x\n\x14ModelDownloadRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x34\n\x08provider\x18\x02 \x01(\x0e\x32\".model_express.model.ModelProvider\x12\x16\n\x0eignore_weights\x18\x03 \x01(\x08\"\xb1\x01\n\x11ModelStatusUpdate\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x30\n\x06status\x18\x02 \x01(\x0e\x32 .model_express.model.ModelStatus\x12\x14\n\x07message\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x34\n\x08provider\x18\x04 \x01(\x0e\x32\".model_express.model.ModelProviderB\n\n\x08_message\"q\n\x11ModelFilesRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x34\n\x08provider\x18\x02 \x01(\x0e\x32\".model_express.model.ModelProvider\x12\x12\n\nchunk_size\x18\x03 \x01(\r\"\xab\x01\n\tFileChunk\x12\x15\n\rrelative_path\x18\x01 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\x12\x0e\n\x06offset\x18\x03 \x01(\x04\x12\x12\n\ntotal_size\x18\x04 \x01(\x04\x12\x15\n\ris_last_chunk\x18\x05 \x01(\x08\x12\x14\n\x0cis_last_file\x18\x06 \x01(\x08\x12\x18\n\x0b\x63ommit_hash\x18\x07 \x01(\tH\x00\x88\x01\x01\x42\x0e\n\x0c_commit_hash\"j\n\rModelFileList\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x31\n\x05\x66iles\x18\x02 \x03(\x0b\x32\".model_express.model.ModelFileInfo\x12\x12\n\ntotal_size\x18\x03 \x01(\x04\"4\n\rModelFileInfo\x12\x15\n\rrelative_path\x18\x01 \x01(\t\x12\x0c\n\x04size\x18\x02 \x01(\x04*9\n\x0bModelStatus\x12\x0f\n\x0b\x44OWNLOADING\x10\x00\x12\x0e\n\nDOWNLOADED\x10\x01\x12\t\n\x05\x45RROR\x10\x02*3\n\rModelProvider\x12\x10\n\x0cHUGGING_FACE\x10\x00\x12\x07\n\x03NGC\x10\x01\x12\x07\n\x03GCS\x10\x02\x32\xb8\x02\n\x0cModelService\x12l\n\x15\x45nsureModelDownloaded\x12).model_express.model.ModelDownloadRequest\x1a&.model_express.model.ModelStatusUpdate0\x01\x12\\\n\x10StreamModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\x1e.model_express.model.FileChunk0\x01\x12\\\n\x0eListModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\".model_express.model.ModelFileListb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bmodel.proto\x12\x13model_express.model\"x\n\x14ModelDownloadRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x34\n\x08provider\x18\x02 \x01(\x0e\x32\".model_express.model.ModelProvider\x12\x16\n\x0eignore_weights\x18\x03 \x01(\x08\"\xb1\x01\n\x11ModelStatusUpdate\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x30\n\x06status\x18\x02 \x01(\x0e\x32 .model_express.model.ModelStatus\x12\x14\n\x07message\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x34\n\x08provider\x18\x04 \x01(\x0e\x32\".model_express.model.ModelProviderB\n\n\x08_message\"q\n\x11ModelFilesRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x34\n\x08provider\x18\x02 \x01(\x0e\x32\".model_express.model.ModelProvider\x12\x12\n\nchunk_size\x18\x03 \x01(\r\"\xcb\x01\n\tFileChunk\x12\x15\n\rrelative_path\x18\x01 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\x12\x0e\n\x06offset\x18\x03 \x01(\x04\x12\x12\n\ntotal_size\x18\x04 \x01(\x04\x12\x15\n\ris_last_chunk\x18\x05 \x01(\x08\x12\x14\n\x0cis_last_file\x18\x06 \x01(\x08\x12\x18\n\x0b\x63ommit_hash\x18\x07 \x01(\tH\x00\x88\x01\x01\x12\x13\n\x06\x62lake3\x18\x08 \x01(\tH\x01\x88\x01\x01\x42\x0e\n\x0c_commit_hashB\t\n\x07_blake3\"j\n\rModelFileList\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x31\n\x05\x66iles\x18\x02 \x03(\x0b\x32\".model_express.model.ModelFileInfo\x12\x12\n\ntotal_size\x18\x03 \x01(\x04\"4\n\rModelFileInfo\x12\x15\n\rrelative_path\x18\x01 \x01(\t\x12\x0c\n\x04size\x18\x02 \x01(\x04*9\n\x0bModelStatus\x12\x0f\n\x0b\x44OWNLOADING\x10\x00\x12\x0e\n\nDOWNLOADED\x10\x01\x12\t\n\x05\x45RROR\x10\x02*3\n\rModelProvider\x12\x10\n\x0cHUGGING_FACE\x10\x00\x12\x07\n\x03NGC\x10\x01\x12\x07\n\x03GCS\x10\x02\x32\xb8\x02\n\x0cModelService\x12l\n\x15\x45nsureModelDownloaded\x12).model_express.model.ModelDownloadRequest\x1a&.model_express.model.ModelStatusUpdate0\x01\x12\\\n\x10StreamModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\x1e.model_express.model.FileChunk0\x01\x12\\\n\x0eListModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\".model_express.model.ModelFileListb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'model_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_MODELSTATUS']._serialized_start=789
-  _globals['_MODELSTATUS']._serialized_end=846
-  _globals['_MODELPROVIDER']._serialized_start=848
-  _globals['_MODELPROVIDER']._serialized_end=899
+  _globals['_MODELSTATUS']._serialized_start=821
+  _globals['_MODELSTATUS']._serialized_end=878
+  _globals['_MODELPROVIDER']._serialized_start=880
+  _globals['_MODELPROVIDER']._serialized_end=931
   _globals['_MODELDOWNLOADREQUEST']._serialized_start=36
   _globals['_MODELDOWNLOADREQUEST']._serialized_end=156
   _globals['_MODELSTATUSUPDATE']._serialized_start=159
@@ -45,11 +45,11 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_MODELFILESREQUEST']._serialized_start=338
   _globals['_MODELFILESREQUEST']._serialized_end=451
   _globals['_FILECHUNK']._serialized_start=454
-  _globals['_FILECHUNK']._serialized_end=625
-  _globals['_MODELFILELIST']._serialized_start=627
-  _globals['_MODELFILELIST']._serialized_end=733
-  _globals['_MODELFILEINFO']._serialized_start=735
-  _globals['_MODELFILEINFO']._serialized_end=787
-  _globals['_MODELSERVICE']._serialized_start=902
-  _globals['_MODELSERVICE']._serialized_end=1214
+  _globals['_FILECHUNK']._serialized_end=657
+  _globals['_MODELFILELIST']._serialized_start=659
+  _globals['_MODELFILELIST']._serialized_end=765
+  _globals['_MODELFILEINFO']._serialized_start=767
+  _globals['_MODELFILEINFO']._serialized_end=819
+  _globals['_MODELSERVICE']._serialized_start=934
+  _globals['_MODELSERVICE']._serialized_end=1246
 # @@protoc_insertion_point(module_scope)

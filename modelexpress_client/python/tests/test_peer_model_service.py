@@ -177,6 +177,8 @@ def test_list_model_files(model_stub):
 
 
 def test_stream_model_files_reconstructs_payload(model_stub):
+    import blake3 as _blake3
+
     request = model_pb2.ModelFilesRequest(
         model_name="google/t5-small",
         provider=model_pb2.HUGGING_FACE,
@@ -185,12 +187,22 @@ def test_stream_model_files_reconstructs_payload(model_stub):
     accumulated: dict[str, bytearray] = {}
     saw_final = False
     first_commit = None
+    blake3_announced: dict[str, str] = {}
     for chunk in model_stub.StreamModelFiles(request):
         if first_commit is None and chunk.commit_hash:
             first_commit = chunk.commit_hash
         buf = accumulated.setdefault(chunk.relative_path, bytearray())
         assert chunk.offset == len(buf)
         buf.extend(chunk.data)
+        if chunk.is_last_chunk:
+            assert chunk.HasField("blake3"), (
+                f"server should populate blake3 on final chunk of {chunk.relative_path!r}"
+            )
+            blake3_announced[chunk.relative_path] = chunk.blake3
+        else:
+            assert not chunk.HasField("blake3"), (
+                f"server populated blake3 mid-stream for {chunk.relative_path!r}"
+            )
         if chunk.is_last_file and chunk.is_last_chunk:
             saw_final = True
     assert saw_final
@@ -199,6 +211,35 @@ def test_stream_model_files_reconstructs_payload(model_stub):
     assert (
         bytes(accumulated["model.safetensors"])
         == b"\x00" * 4096 + b"\xab" * 1024
+    )
+    # Independently re-hash the bytes we received and compare to the
+    # server-announced hex.
+    for path, payload in accumulated.items():
+        h = _blake3.blake3()
+        h.update(bytes(payload))
+        assert blake3_announced[path] == h.hexdigest(), (
+            f"blake3 mismatch for {path!r}"
+        )
+
+
+def test_stream_model_files_blake3_zero_byte_file(hf_cache, model_stub):
+    folder = hf_cache / "models--google--t5-small" / "snapshots" / "abc123"
+    (folder / "empty.txt").write_bytes(b"")
+    request = model_pb2.ModelFilesRequest(
+        model_name="google/t5-small",
+        provider=model_pb2.HUGGING_FACE,
+        chunk_size=1024,
+    )
+    chunks_by_path: dict[str, list] = {}
+    for chunk in model_stub.StreamModelFiles(request):
+        chunks_by_path.setdefault(chunk.relative_path, []).append(chunk)
+    empty = chunks_by_path["empty.txt"]
+    assert len(empty) == 1
+    assert empty[0].is_last_chunk is True
+    assert empty[0].HasField("blake3")
+    # blake3 of zero bytes is well-known.
+    assert empty[0].blake3 == (
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
     )
 
 

@@ -17,6 +17,7 @@ keywords.workspace = true
 modelexpress-common = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }

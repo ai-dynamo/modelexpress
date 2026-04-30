@@ -73,6 +73,11 @@ message FileChunk {
   bool is_last_file = 6;
   // Commit hash of the model snapshot (populated in first chunk)
   optional string commit_hash = 7;
+  // Hex-encoded blake3 hash of the file's full content. Servers populate
+  // this only on the chunk where is_last_chunk=true so consumers receive
+  // it after the bytes they hash. Optional; absent when the server cannot
+  // or does not compute the hash (e.g., synthetic bench source).
+  optional string blake3 = 8;
 }
 
 // List of files in a model

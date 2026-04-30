@@ -17,6 +17,7 @@ publish = false
 modelexpress-common = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 prost = { workspace = true }

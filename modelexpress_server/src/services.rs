@@ -332,6 +332,10 @@ impl ModelService for ModelServiceImpl {
 
                 let mut reader = tokio::io::BufReader::new(file);
                 let mut offset: u64 = 0;
+                // Per-file streaming blake3 hasher. Hex of finalize() is
+                // emitted on the chunk where is_last_chunk=true so consumers
+                // receive it strictly after all bytes they hash.
+                let mut hasher = blake3::Hasher::new();
 
                 if *total_size == 0 {
                     let first_chunk = std::mem::replace(&mut is_first_chunk, false);
@@ -347,6 +351,7 @@ impl ModelService for ModelServiceImpl {
                         } else {
                             None
                         },
+                        blake3: Some(hasher.finalize().to_hex().to_string()),
                     };
 
                     if tx.send(Ok(chunk)).await.is_err() {
@@ -370,9 +375,17 @@ impl ModelService for ModelServiceImpl {
                         }
                     };
 
+                    hasher.update(&buffer[..bytes_read]);
+
                     let is_last_chunk = offset.saturating_add(bytes_read as u64) >= *total_size;
 
                     let first_chunk = std::mem::replace(&mut is_first_chunk, false);
+
+                    let blake3 = if is_last_chunk {
+                        Some(hasher.finalize().to_hex().to_string())
+                    } else {
+                        None
+                    };
 
                     let chunk = FileChunk {
                         relative_path: relative_path.to_string_lossy().to_string(),
@@ -386,6 +399,7 @@ impl ModelService for ModelServiceImpl {
                         } else {
                             None
                         },
+                        blake3,
                     };
 
                     if tx.send(Ok(chunk)).await.is_err() {
@@ -1189,6 +1203,9 @@ mod tests {
         assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
         assert!(first_chunk.is_last_chunk);
         assert!(first_chunk.is_last_file);
+        // Server populates blake3 on the chunk where is_last_chunk=true.
+        let expected_hex = blake3::hash(br#"{"model":"test"}"#).to_hex().to_string();
+        assert_eq!(first_chunk.blake3.as_deref(), Some(expected_hex.as_str()));
     }
 
     #[tokio::test]
@@ -1232,5 +1249,10 @@ mod tests {
         assert_eq!(first_chunk.commit_hash.as_deref(), Some("abc123"));
         assert!(first_chunk.is_last_chunk);
         assert!(first_chunk.is_last_file);
+        // blake3 of empty bytes is well-known.
+        assert_eq!(
+            first_chunk.blake3.as_deref(),
+            Some("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"),
+        );
     }
 }

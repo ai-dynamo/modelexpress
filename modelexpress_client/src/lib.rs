@@ -150,6 +150,11 @@ struct StreamedFileState {
     expected_size: u64,
     bytes_written: u64,
     saw_last_chunk: bool,
+    /// Streaming blake3 hasher updated as bytes arrive. Verified against the
+    /// server-supplied hash on the chunk where `is_last_chunk=true` when the
+    /// server populated `FileChunk.blake3`. Servers that do not populate the
+    /// field skip verification (treated as a soft promise, not enforcement).
+    hasher: blake3::Hasher,
 }
 
 async fn sync_streamed_file(state: StreamedFileState) -> CommonResult<()> {
@@ -486,6 +491,7 @@ impl Client {
                     expected_size: chunk_result.total_size,
                     bytes_written: 0,
                     saw_last_chunk: false,
+                    hasher: blake3::Hasher::new(),
                 });
             }
 
@@ -523,6 +529,7 @@ impl Client {
                     .into());
                 }
 
+                state.hasher.update(&chunk_result.data);
                 state
                     .file
                     .write_all(&chunk_result.data)
@@ -540,6 +547,16 @@ impl Client {
                             chunk_result.relative_path, state.bytes_written, state.expected_size
                         ))
                         .into());
+                    }
+                    if let Some(expected_hex) = chunk_result.blake3.as_deref() {
+                        let actual_hex = state.hasher.finalize().to_hex().to_string();
+                        if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+                            return Err(modelexpress_common::Error::Validation(format!(
+                                "blake3 mismatch for file {:?}: server={} actual={}",
+                                chunk_result.relative_path, expected_hex, actual_hex
+                            ))
+                            .into());
+                        }
                     }
                     state.saw_last_chunk = true;
                 } else if state.bytes_written == state.expected_size {
@@ -940,6 +957,7 @@ mod tests {
                 is_last_chunk: true,
                 is_last_file: true,
                 commit_hash: None,
+                blake3: None,
             };
 
             Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
@@ -1285,6 +1303,7 @@ mod tests {
                 is_last_chunk: true,
                 is_last_file: false,
                 commit_hash: Some("abc123".to_string()),
+                blake3: None,
             }],
         })
         .await;
@@ -1322,6 +1341,7 @@ mod tests {
                     is_last_chunk: false,
                     is_last_file: true,
                     commit_hash: Some("abc123".to_string()),
+                    blake3: None,
                 },
                 FileChunk {
                     relative_path: "config.json".to_string(),
@@ -1331,6 +1351,7 @@ mod tests {
                     is_last_chunk: true,
                     is_last_file: true,
                     commit_hash: None,
+                    blake3: None,
                 },
             ],
         })
@@ -1369,6 +1390,7 @@ mod tests {
                     is_last_chunk: false,
                     is_last_file: false,
                     commit_hash: Some("abc123".to_string()),
+                    blake3: None,
                 },
                 FileChunk {
                     relative_path: "tokenizer.json".to_string(),
@@ -1378,6 +1400,7 @@ mod tests {
                     is_last_chunk: true,
                     is_last_file: true,
                     commit_hash: None,
+                    blake3: None,
                 },
             ],
         })

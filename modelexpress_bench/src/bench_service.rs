@@ -137,6 +137,7 @@ impl ModelService for BenchModelService {
                         is_last_chunk: true,
                         is_last_file,
                         commit_hash: None,
+                        blake3: None,
                     };
                     if tx.send(Ok(chunk)).await.is_err() {
                         return;
@@ -158,6 +159,7 @@ impl ModelService for BenchModelService {
                         is_last_chunk,
                         is_last_file: is_last_file && is_last_chunk,
                         commit_hash: None,
+                        blake3: None,
                     };
                     if tx.send(Ok(chunk)).await.is_err() {
                         return;
