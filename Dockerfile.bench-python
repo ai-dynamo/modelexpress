@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Slim Python image for the ModelExpress synthetic bench peer.
+#
+# Vendors only the proto stubs and the bench synthetic-source code rather
+# than installing the full modelexpress package, which transitively pulls
+# torch, NIXL, runai-model-streamer, etc. The bench server does not need
+# any of that; isolating it keeps the image small (~150 MB vs ~5 GB).
+
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iperf3 \
+        iproute2 \
+        ethtool \
+        iputils-ping \
+        tcpdump && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+        "grpcio>=1.66.2" \
+        "protobuf>=5.27.0,<6.0.0"
+
+# Build a minimal `modelexpress` shadow package containing only the proto
+# stubs the bench synthetic servicer imports.
+RUN mkdir -p /app/modelexpress
+COPY modelexpress_client/python/modelexpress/model_pb2.py /app/modelexpress/
+COPY modelexpress_client/python/modelexpress/model_pb2_grpc.py /app/modelexpress/
+COPY modelexpress_client/python/modelexpress/p2p_pb2.py /app/modelexpress/
+COPY modelexpress_client/python/modelexpress/p2p_pb2_grpc.py /app/modelexpress/
+RUN echo "" > /app/modelexpress/__init__.py
+
+COPY modelexpress_bench/python/modelexpress_bench /app/modelexpress_bench
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8001
+EXPOSE 5201
+
+ENTRYPOINT ["python", "-m", "modelexpress_bench.server_main"]
+CMD ["--addr", "[::]:8001", "--max-workers", "16"]
