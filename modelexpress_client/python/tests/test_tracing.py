@@ -75,6 +75,6 @@ def test_load_chain_emits_real_span(real_tracer_and_exporter, load_result, expec
     assert span.attributes["model_name"] == "test/model"
     assert span.attributes["global_rank"] == 3
     assert span.attributes["eligible_strategies"] == ("default",)
-    assert ("strategy_used" in span.attributes) is expect_used
+    assert ("weight_loading_strategy" in span.attributes) is expect_used
     if expect_used:
-        assert span.attributes["strategy_used"] == "default"
+        assert span.attributes["weight_loading_strategy"] == "default"

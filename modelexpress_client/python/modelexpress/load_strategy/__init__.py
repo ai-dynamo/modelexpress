@@ -103,7 +103,7 @@ class LoadStrategyChain:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
                 try:
                     if strategy.load(model, ctx):
-                        span.set_attribute("strategy_used", strategy.name)
+                        span.set_attribute("weight_loading_strategy", strategy.name)
                         return model
                 except Exception as e:
                     logger.warning(
