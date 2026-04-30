@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Slim image carrying just the modelexpress benchmark binaries plus iperf3
+# for fabric-baseline calibration. Not for production use.
+
+FROM rust:1.90 AS builder
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN cargo build --release -p modelexpress-bench --bin bench_grpc_streaming
+
+FROM nvcr.io/nvidia/base/ubuntu:noble-20250619 AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iperf3 \
+        iproute2 \
+        ethtool \
+        iputils-ping \
+        tcpdump && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/bench_grpc_streaming /usr/local/bin/bench_grpc_streaming
+COPY ATTRIBUTIONS_Rust.md /app/
+
+EXPOSE 8001
+EXPOSE 5201
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["echo 'Use: bench_grpc_streaming serve|client, or iperf3 -s|-c'; sleep infinity"]

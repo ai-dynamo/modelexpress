@@ -243,9 +243,12 @@ ModelExpress/
 | `modelexpress_server` | `modelexpress-server` | lib + bin | `modelexpress-server`, `config_gen` |
 | `modelexpress_client` | `modelexpress-client` | lib + bin | `modelexpress-cli`, `test_client`, `fallback_test` |
 | `modelexpress_common` | `modelexpress-common` | lib | (none) |
+| `modelexpress_bench` | `modelexpress-bench` (`publish=false`) | lib + bin | `bench_grpc_streaming` |
 | `workspace-tests` | `workspace-tests` | test + bench | (integration tests, criterion benchmarks) |
 
 All cargo dependencies are declared in the root `Cargo.toml`. Sub-crates use workspace dependencies exclusively.
+
+The `modelexpress_bench` crate hosts benchmark-only binaries that target the production gRPC services with synthetic byte sources and in-memory sinks. It is `publish=false` and never linked into release artifacts. See [`examples/bench/README.md`](../examples/bench/README.md) for the gRPC streaming throughput harness, including same-node and cross-node Kubernetes manifests.
 
 ## gRPC Services
 

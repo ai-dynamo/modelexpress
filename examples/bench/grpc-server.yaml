@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bench gRPC streaming server: synthetic source, no GPU usage.
+# Lands on GPU worker nodes (via tolerations) so that pod-to-pod traffic
+# rides whichever fabric the CNI bound for those nodes, matching what
+# production model-streaming traffic would see in real deployments.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bench-grpc-server
+  labels:
+    app: bench-grpc-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bench-grpc-server
+  template:
+    metadata:
+      labels:
+        app: bench-grpc-server
+    spec:
+      restartPolicy: Always
+      # Tolerate the standard NVIDIA GPU taint so the bench pod can land
+      # on a GPU node and exercise the same fabric production traffic
+      # uses. Add cluster-specific tolerations here if your nodes have
+      # additional taints.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: bench-server
+          image: <your-registry>/modelexpress-bench:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/bench_grpc_streaming
+          args:
+            - serve
+            - --addr
+            - 0.0.0.0:8001
+            - --mpsc-cap
+            - "16"
+            - --source-buf-size
+            - "16777216"
+          ports:
+            - containerPort: 8001
+              name: grpc
+          resources:
+            requests:
+              cpu: "2"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "2Gi"
+        - name: iperf3-server
+          image: <your-registry>/modelexpress-bench:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/bin/iperf3
+          args:
+            - -s
+            - -p
+            - "5201"
+          ports:
+            - containerPort: 5201
+              name: iperf3
+          resources:
+            requests:
+              cpu: "1"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bench-grpc-server
+spec:
+  selector:
+    app: bench-grpc-server
+  clusterIP: None  # headless; client targets pod IP directly to bypass kube-proxy
+  ports:
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+    - name: iperf3
+      port: 5201
+      targetPort: 5201

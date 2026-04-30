@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Bench client pinned to a DIFFERENT physical node from bench-grpc-server.
+# Measures the actual cross-node fabric (whichever interface the CNI bound
+# pod traffic to), which is the production-shaped number for the no-shared-
+# storage MX file streaming path.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-grpc-client-cross-node
+  labels:
+    app: bench-grpc-client
+    topology: cross-node
+spec:
+  restartPolicy: Never
+  # Tolerate the standard NVIDIA GPU taint so the bench pod can land
+  # on a GPU node and exercise the same fabric production traffic uses.
+  # Add cluster-specific tolerations here if your nodes have additional taints.
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app: bench-grpc-server
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: bench-client
+      image: <your-registry>/modelexpress-bench:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          echo "bench-client pod ready on $(hostname)"
+          echo "server pod IP: ${BENCH_SERVER_IP:-unset}"
+          sleep infinity
+      env:
+        - name: BENCH_SERVER_IP
+          value: ""
+      resources:
+        requests:
+          cpu: "2"
+          memory: "1Gi"
+        limits:
+          cpu: "4"
+          memory: "2Gi"
