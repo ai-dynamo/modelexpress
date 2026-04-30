@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Deployment Guide
 
-User-facing guide for configuring and deploying ModelExpress. For architecture details, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For development setup, see [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+User-facing guide for configuring and deploying ModelExpress. For architecture details, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For development setup, see [`../CONTRIBUTING.md`](../CONTRIBUTING.md). For a concise overview of offline operation, see the air-gapped section in [`../README.md`](../README.md).
 
 ## Server Configuration
 
