@@ -111,6 +111,7 @@ impl KubernetesRegistryBackend {
             ModelProvider::HuggingFace => "HuggingFace",
             ModelProvider::Ngc => "Ngc",
             ModelProvider::Gcs => "Gcs",
+            ModelProvider::Local => "Local",
         }
     }
 
@@ -119,6 +120,7 @@ impl KubernetesRegistryBackend {
             "HuggingFace" => Ok(ModelProvider::HuggingFace),
             "Ngc" => Ok(ModelProvider::Ngc),
             "Gcs" => Ok(ModelProvider::Gcs),
+            "Local" => Ok(ModelProvider::Local),
             other => Err(format!("unknown provider in CR spec: {other:?}").into()),
         }
     }

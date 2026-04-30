@@ -180,15 +180,30 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
 
     Constructed with the local cache root (HF cache layout). Any HF model
     present under that root is automatically servable.
+
+    Optionally takes a `local_mounts` mapping of logical id -> Path. When
+    a request specifies `provider=LOCAL`, the servicer looks up
+    `model_name` in the mounts and serves the registered directory
+    directly. Use this for serving non-HuggingFace payloads (config-only
+    metadata files, etc.) without the HF cache layout.
     """
 
-    def __init__(self, cache_root: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        cache_root: Optional[Path] = None,
+        local_mounts: Optional[dict[str, Path]] = None,
+    ) -> None:
         resolved = _hf_cache_root(cache_root)
         if resolved is None:
             raise RuntimeError("Could not resolve HuggingFace cache root")
         self._cache_root = Path(resolved)
+        self._local_mounts: dict[str, Path] = {
+            name: Path(path) for name, path in (local_mounts or {}).items()
+        }
         logger.info(
-            "PeerModelServiceServicer: HF cache root = %s", self._cache_root
+            "PeerModelServiceServicer: HF cache root = %s, %d LOCAL mount(s)",
+            self._cache_root,
+            len(self._local_mounts),
         )
 
     # ------------------------------------------------------------------
@@ -209,10 +224,19 @@ class PeerModelServiceServicer(model_pb2_grpc.ModelServiceServicer):
                 )
             except FileNotFoundError as exc:
                 context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+        elif provider == model_pb2.LOCAL:
+            mount = self._local_mounts.get(model_name)
+            if mount is None:
+                context.abort(
+                    grpc.StatusCode.NOT_FOUND,
+                    f"No LOCAL mount registered for {model_name!r}",
+                )
+            else:
+                return mount
         elif provider in (model_pb2.NGC, model_pb2.GCS):
             context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
-                "Peer model serving is HuggingFace-only in v1",
+                "Peer model serving is HuggingFace+LOCAL only in v1",
             )
         else:
             context.abort(

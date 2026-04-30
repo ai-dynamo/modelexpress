@@ -105,9 +105,35 @@ impl ApiService for ApiServiceImpl {
     }
 }
 
-/// Model service implementation
-#[derive(Debug, Default)]
-pub struct ModelServiceImpl;
+/// Model service implementation.
+///
+/// `local_mounts` lets the server expose arbitrary local directories under
+/// logical ids via `provider=LOCAL`. Empty by default (no LOCAL serving),
+/// populated by callers via [`ModelServiceImpl::with_local_mounts`].
+#[derive(Debug, Default, Clone)]
+pub struct ModelServiceImpl {
+    local_mounts: Arc<HashMap<String, PathBuf>>,
+}
+
+impl ModelServiceImpl {
+    /// Build a service with a registered set of LOCAL mounts. Each entry
+    /// maps a logical id (used as `model_name` in `LOCAL` requests) to an
+    /// absolute directory path that the server will walk and stream from.
+    #[must_use]
+    pub fn with_local_mounts(mounts: HashMap<String, PathBuf>) -> Self {
+        Self {
+            local_mounts: Arc::new(mounts),
+        }
+    }
+
+    /// Resolve a `LOCAL` model_name to its registered mount path, or
+    /// return a NOT_FOUND status if no mount exists for that id.
+    fn resolve_local_mount(&self, model_name: &str) -> Result<PathBuf, Status> {
+        self.local_mounts.get(model_name).cloned().ok_or_else(|| {
+            Status::not_found(format!("No LOCAL mount registered for {model_name:?}"))
+        })
+    }
+}
 
 /// Helper function to collect all files in a model directory recursively
 fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u64)> {
@@ -238,58 +264,71 @@ impl ModelService for ModelServiceImpl {
             ))
         })?;
         let provider = ModelProvider::from(grpc_provider);
-        let model_name = download::canonical_model_name(&files_request.model_name, provider)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
+
+        // Resolve (model_name, model_path, commit_hash) per provider. LOCAL
+        // bypasses canonical_model_name + provider_impl + resolve_model_path
+        // entirely - the mount registry is the path source of truth, with
+        // no cache layout or commit_hash semantics.
+        let (model_name, model_path, commit_hash): (String, PathBuf, Option<String>) = if provider
+            == ModelProvider::Local
+        {
+            let path = self.resolve_local_mount(&files_request.model_name)?;
+            (files_request.model_name.clone(), path, None)
+        } else {
+            let model_name = download::canonical_model_name(&files_request.model_name, provider)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let provider_impl = download::get_provider(provider);
+
+            let cache_dir = get_server_cache_dir()
+                .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
+
+            let model_path = provider_impl
+                .get_model_path(&model_name, cache_dir.clone())
+                .await
+                .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+
+            debug!("Model path resolved to: {:?}", model_path);
+
+            let commit_hash = if provider == ModelProvider::HuggingFace {
+                model_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(String::from)
+            } else {
+                None
+            };
+
+            if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
+                return Err(Status::internal(
+                    "Resolved Hugging Face model path did not contain a revision",
+                ));
+            }
+
+            let expected_model_path =
+                resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref())
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to resolve expected cache layout: {e}"))
+                    })?;
+
+            if model_path != expected_model_path {
+                error!(
+                    "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
+                    model_path.display(),
+                    expected_model_path.display(),
+                    model_name
+                );
+                return Err(Status::internal(
+                    "Resolved model path does not match expected cache layout",
+                ));
+            }
+
+            (model_name, model_path, commit_hash)
+        };
 
         info!(
             "Starting file stream for model: {} with chunk size: {} bytes",
             model_name, chunk_size
         );
-
-        // Get the cache directory
-        let cache_dir = get_server_cache_dir()
-            .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
-
-        // Get the model path using the provider from the request
-        let model_path = provider_impl
-            .get_model_path(&model_name, cache_dir.clone())
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
-
-        debug!("Model path resolved to: {:?}", model_path);
-
-        let commit_hash = if provider == ModelProvider::HuggingFace {
-            model_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(String::from)
-        } else {
-            None
-        };
-
-        if provider == ModelProvider::HuggingFace && commit_hash.is_none() {
-            return Err(Status::internal(
-                "Resolved Hugging Face model path did not contain a revision",
-            ));
-        }
-
-        let expected_model_path =
-            resolve_model_path(&cache_dir, provider, &model_name, commit_hash.as_deref()).map_err(
-                |e| Status::internal(format!("Failed to resolve expected cache layout: {e}")),
-            )?;
-
-        if model_path != expected_model_path {
-            error!(
-                "Resolved model path '{}' does not match expected cache layout '{}' for model '{}'",
-                model_path.display(),
-                expected_model_path.display(),
-                model_name
-            );
-            return Err(Status::internal(
-                "Resolved model path does not match expected cache layout",
-            ));
-        }
 
         // Collect all files in the model directory. The walker only emits
         // paths that pass relative-path safety, so any later filtering by
@@ -447,21 +486,26 @@ impl ModelService for ModelServiceImpl {
             ))
         })?;
         let provider = ModelProvider::from(grpc_provider);
-        let model_name = download::canonical_model_name(&files_request.model_name, provider)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let provider_impl = download::get_provider(provider);
+
+        let (model_name, model_path): (String, PathBuf) = if provider == ModelProvider::Local {
+            let path = self.resolve_local_mount(&files_request.model_name)?;
+            (files_request.model_name.clone(), path)
+        } else {
+            let model_name = download::canonical_model_name(&files_request.model_name, provider)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let provider_impl = download::get_provider(provider);
+
+            let cache_dir = get_server_cache_dir()
+                .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
+
+            let model_path = provider_impl
+                .get_model_path(&model_name, cache_dir)
+                .await
+                .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
+            (model_name, model_path)
+        };
 
         info!("Listing files for model: {}", model_name);
-
-        // Get the cache directory
-        let cache_dir = get_server_cache_dir()
-            .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
-
-        // Get the model path using the provider from the request
-        let model_path = provider_impl
-            .get_model_path(&model_name, cache_dir)
-            .await
-            .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
         // Collect all files. When the client supplied `relative_paths` we
         // filter against the walker's results, preserving request order and
@@ -1116,7 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_model_files_not_found() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "non-existent-model-12345".to_string(),
@@ -1133,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_model_files_not_found() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "non-existent-model-12345".to_string(),
@@ -1150,7 +1194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_model_downloaded_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
 
         let request = Request::new(ModelDownloadRequest {
             model_name: "test/model".to_string(),
@@ -1167,7 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_model_files_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
@@ -1185,7 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_model_files_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
@@ -1218,7 +1262,7 @@ mod tests {
         std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
             .expect("Failed to write model file");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1262,7 +1306,7 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("empty.bin"), []).expect("Failed to write empty file");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1313,7 +1357,7 @@ mod tests {
         std::fs::write(model_dir.join("b.txt"), b"BBBB").expect("write b");
         std::fs::write(model_dir.join("c.txt"), b"CC").expect("write c");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1360,7 +1404,7 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("a.txt"), b"A").expect("write a");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1371,6 +1415,104 @@ mod tests {
         let status = result.expect_err("Expected unknown filter path to fail");
         assert_eq!(status.code(), tonic::Code::NotFound);
         assert!(status.message().contains("nope.txt"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_local_serves_from_mount() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mount_dir = temp_dir.path().join("metadata");
+        std::fs::create_dir_all(&mount_dir).expect("Failed to create mount dir");
+        std::fs::write(mount_dir.join("tokenizer.json"), b"TOKEN").expect("write");
+        std::fs::write(mount_dir.join("config.json"), b"{}").expect("write");
+
+        let mut mounts = HashMap::new();
+        mounts.insert("metadata-bundle".to_string(), mount_dir.clone());
+        let service = ModelServiceImpl::with_local_mounts(mounts);
+
+        let request = Request::new(ModelFilesRequest {
+            model_name: "metadata-bundle".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::Local as i32,
+            chunk_size: 1024,
+            relative_paths: vec![],
+        });
+        let response = service
+            .stream_model_files(request)
+            .await
+            .expect("Expected stream response");
+        let mut stream = response.into_inner();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("chunk"));
+        }
+
+        // Both files were served; no commit_hash because LOCAL has none.
+        let paths: Vec<&str> = chunks.iter().map(|c| c.relative_path.as_str()).collect();
+        assert!(paths.contains(&"tokenizer.json"));
+        assert!(paths.contains(&"config.json"));
+        for chunk in &chunks {
+            assert!(
+                chunk.commit_hash.is_none(),
+                "LOCAL must not emit commit_hash"
+            );
+        }
+        // Server-emitted blake3 must match independent re-hash.
+        for chunk in &chunks {
+            if chunk.is_last_chunk {
+                let expected_hex = blake3::hash(&chunk.data).to_hex().to_string();
+                assert_eq!(chunk.blake3.as_deref(), Some(expected_hex.as_str()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_model_files_local_unknown_mount_returns_not_found() {
+        // Empty mount registry -> any LOCAL request 404s before touching disk.
+        let service = ModelServiceImpl::default();
+        let request = Request::new(ModelFilesRequest {
+            model_name: "missing-bundle".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::Local as i32,
+            chunk_size: 1024,
+            relative_paths: vec![],
+        });
+        let result = service.stream_model_files(request).await;
+        let status = result.expect_err("Expected unknown LOCAL mount to fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("missing-bundle"));
+    }
+
+    #[tokio::test]
+    async fn test_list_model_files_local_serves_from_mount() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mount_dir = temp_dir.path().join("payload");
+        std::fs::create_dir_all(&mount_dir).expect("Failed to create mount dir");
+        std::fs::write(mount_dir.join("a.txt"), b"AA").expect("write");
+        std::fs::write(mount_dir.join("b.txt"), b"BBB").expect("write");
+
+        let mut mounts = HashMap::new();
+        mounts.insert("payload".to_string(), mount_dir);
+        let service = ModelServiceImpl::with_local_mounts(mounts);
+
+        let request = Request::new(ModelFilesRequest {
+            model_name: "payload".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::Local as i32,
+            chunk_size: 0,
+            relative_paths: vec![],
+        });
+        let response = service
+            .list_model_files(request)
+            .await
+            .expect("Expected list response");
+        let inner = response.into_inner();
+        assert_eq!(inner.total_size, 5);
+        assert_eq!(inner.files.len(), 2);
+        let paths: Vec<&str> = inner
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert!(paths.contains(&"a.txt"));
+        assert!(paths.contains(&"b.txt"));
     }
 
     #[tokio::test]
@@ -1392,7 +1534,7 @@ mod tests {
         // be able to reach it via "../" in a relative_paths entry.
         std::fs::write(temp_dir.path().join("secret.txt"), b"NOPE").expect("write secret");
 
-        let service = ModelServiceImpl;
+        let service = ModelServiceImpl::default();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,

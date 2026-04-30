@@ -173,6 +173,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
             models::ModelProvider::HuggingFace => grpc::model::ModelProvider::HuggingFace,
             models::ModelProvider::Ngc => grpc::model::ModelProvider::Ngc,
             models::ModelProvider::Gcs => grpc::model::ModelProvider::Gcs,
+            models::ModelProvider::Local => grpc::model::ModelProvider::Local,
         }
     }
 }
@@ -183,6 +184,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
             grpc::model::ModelProvider::HuggingFace => models::ModelProvider::HuggingFace,
             grpc::model::ModelProvider::Ngc => models::ModelProvider::Ngc,
             grpc::model::ModelProvider::Gcs => models::ModelProvider::Gcs,
+            grpc::model::ModelProvider::Local => models::ModelProvider::Local,
         }
     }
 }

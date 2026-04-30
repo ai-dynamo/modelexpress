@@ -45,6 +45,13 @@ enum ModelProvider {
   HUGGING_FACE = 0;
   NGC = 1;
   GCS = 2;
+  // Peer-served arbitrary directory: `model_name` is interpreted as a
+  // logical id that the serving peer maps to a local directory at
+  // startup time (a "mount"). The server does not download; it just
+  // serves files from the registered directory. Use this to expose
+  // metadata-only payloads (tokenizer configs, etc.) without the HF
+  // cache layout assumptions.
+  LOCAL = 3;
 }
 
 // Request for streaming model files

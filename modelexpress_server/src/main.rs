@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create service implementations
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
-    let model_service = ModelServiceImpl;
+    let model_service = ModelServiceImpl::default();
 
     // Create standard gRPC health service (grpc.health.v1.Health)
     let (health_reporter, health_service_v1) = tonic_health::server::health_reporter();

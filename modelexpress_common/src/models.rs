@@ -34,6 +34,10 @@ pub enum ModelProvider {
     Ngc,
     /// Google Cloud Storage
     Gcs,
+    /// Peer-served arbitrary directory. The model name is a logical id
+    /// that the serving peer maps to a local directory ("mount") at
+    /// startup time. No download semantics; LOCAL is for serving only.
+    Local,
 }
 
 impl ModelProvider {
@@ -43,6 +47,7 @@ impl ModelProvider {
             Self::HuggingFace => "hugging-face",
             Self::Ngc => "ngc",
             Self::Gcs => "gcs",
+            Self::Local => "local",
         }
     }
 }
@@ -55,7 +60,7 @@ impl Display for ModelProvider {
 
 impl ValueEnum for ModelProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::HuggingFace, Self::Ngc, Self::Gcs]
+        &[Self::HuggingFace, Self::Ngc, Self::Gcs, Self::Local]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {

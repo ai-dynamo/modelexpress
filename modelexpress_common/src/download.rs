@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::models::ModelProvider;
-use crate::providers::{GcsProvider, HuggingFaceProvider, ModelProviderTrait, NgcProvider};
+use crate::providers::{
+    GcsProvider, HuggingFaceProvider, LocalProvider, ModelProviderTrait, NgcProvider,
+};
 use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -14,6 +16,10 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
         ModelProvider::HuggingFace => Box::new(HuggingFaceProvider),
         ModelProvider::Ngc => Box::new(NgcProvider),
         ModelProvider::Gcs => Box::new(GcsProvider),
+        // LOCAL is intercepted by the gRPC server before reaching this
+        // factory; the stub here keeps the match exhaustive and returns
+        // structured errors if a future caller forgets to intercept.
+        ModelProvider::Local => Box::new(LocalProvider),
     }
 }
 

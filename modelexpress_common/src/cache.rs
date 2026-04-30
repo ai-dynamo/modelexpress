@@ -5,7 +5,8 @@ use crate::{
     Utils, constants,
     models::ModelProvider,
     providers::{
-        gcs::GcsProviderCache, huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache,
+        gcs::GcsProviderCache, huggingface::HuggingFaceProviderCache, local::LocalProviderCache,
+        ngc::NgcProviderCache,
     },
 };
 use anyhow::{Context, Result};
@@ -345,6 +346,7 @@ pub(crate) fn cache_for_provider(provider: ModelProvider) -> &'static dyn Provid
         ModelProvider::HuggingFace => &HuggingFaceProviderCache,
         ModelProvider::Ngc => &NgcProviderCache,
         ModelProvider::Gcs => &GcsProviderCache,
+        ModelProvider::Local => &LocalProviderCache,
     }
 }
 
@@ -379,6 +381,7 @@ fn provider_sort_key(provider: ModelProvider) -> u8 {
         ModelProvider::HuggingFace => 0,
         ModelProvider::Ngc => 1,
         ModelProvider::Gcs => 2,
+        ModelProvider::Local => 3,
     }
 }
 

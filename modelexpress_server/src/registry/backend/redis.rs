@@ -42,6 +42,7 @@ fn provider_str(p: ModelProvider) -> &'static str {
         ModelProvider::HuggingFace => "HuggingFace",
         ModelProvider::Ngc => "Ngc",
         ModelProvider::Gcs => "Gcs",
+        ModelProvider::Local => "Local",
     }
 }
 
@@ -50,6 +51,7 @@ fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         "HuggingFace" => Ok(ModelProvider::HuggingFace),
         "Ngc" => Ok(ModelProvider::Ngc),
         "Gcs" => Ok(ModelProvider::Gcs),
+        "Local" => Ok(ModelProvider::Local),
         other => Err(format!("unknown provider in Redis record: {other:?}").into()),
     }
 }
