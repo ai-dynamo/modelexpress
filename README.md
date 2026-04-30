@@ -46,7 +46,7 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 
 ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads or streams a model from external sources (for example Hugging Face, NGC, GCS, or object storage through ModelStreamer); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
 
-1. **Download or stream from external storage** — One node pulls or streams the model from Hugging Face, NGC, GCS, or object storage through ModelStreamer; ModelExpress coordinates so no other node duplicates this work. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
+1. **Download or stream from external storage** — The ModelExpress server pulls the model from Hugging Face, NGC, or GCS, or a client streams it through ModelStreamer from object storage or local disk; ModelExpress coordinates so no other node duplicates this work. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
 2. **Persist to disk** — Store in a cache backed by disk:
    - **Host-attached disk** — Local disk on the node (single-node or per-node cache).
    - **PVC** — RWO (ReadWriteOnce) for single-node; RWX (ReadWriteMany) for shared access across nodes.
