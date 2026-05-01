@@ -221,6 +221,7 @@ docker-compose up --build
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (`redis` backend only) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server (P2P) |
 | `MX_MODEL_URI` | (none) | Enable ModelStreamer with `s3://`, `gs://`, `az://`, absolute local paths, or Hugging Face model IDs |
+| `MX_SKIP_FEATURE_CHECK` | `0` | Set to `1` to bypass the MLA transfer block (see Known Issues) |
 | `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | InfiniBand transports |
 
 ```bash
@@ -259,7 +260,7 @@ cargo bench
 
 ## Known Issues
 
-- **MLA models blocked from P2P transfer** — Models using Multi-head Latent Attention (DeepSeek-V2/V3, Kimi K2/K2.5) are automatically blocked from GPU-to-GPU transfer and fall back to disk loading. Bytes transfer correctly but inference produces corrupted output. Set `MX_SKIP_FEATURE_CHECK=1` to bypass for debugging. See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
+- **MLA models blocked from P2P transfer** — Models using Multi-head Latent Attention (DeepSeek-V2/V3, Kimi K2/K2.5, GLM-5.1) are blocked from GPU-to-GPU transfer by default and fall back through the load strategy chain (ModelStreamer → GDS → disk). The root cause of post-transfer inference divergence is still under investigation. However, a workaround was merged (`adopt_hidden_tensors` + storage-level transfer for non-contiguous MLA projections) and P2P transfer has been verified correct for Kimi-K2.5-NVFP4. Set `MX_SKIP_FEATURE_CHECK=1` to enable P2P for MLA models; see [ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 - **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
 - **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
 - **Large model gRPC stream** — May not close automatically; use client timeout.
@@ -275,6 +276,7 @@ cargo bench
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
 - **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
+- **MLA P2P transfer**: Resolve root cause of post-transfer inference divergence on MLA models (DeepSeek-V2/V3, Kimi K2/K2.5) and lift the default block.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
 - **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
