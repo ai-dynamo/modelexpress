@@ -1,29 +1,38 @@
 # Autoscaling TRT-LLM with ModelExpress P2P
 
 End-to-end demo showing how to autoscale a TRT-LLM serving deployment
-where new replicas receive their weights via NIXL RDMA instead of
-loading from disk — turning a ~20 minute cold-start into ~5 minutes.
+where new replicas receive their weights via ModelExpress/NIXL P2P
+instead of loading from disk.
 
 The first replica loads the model from disk and publishes via MX.
 Every subsequent replica that HPA brings up auto-detects the existing
-MX source and pulls weights over the network, **~750× faster than disk**
-for the loading phase.
+MX source and pulls weights over the network. The measured benefit is
+visible at two levels: the weight path itself is much faster, and the
+end-to-end scale-up readiness time drops even after TRT-LLM runtime and
+readiness overheads are included.
 
 ## Validated Results
 
-Kimi K2.5 (TP=8, 2 nodes per replica), GCP GB200, 4× 400G RoCE:
+Latest validated run, 2026-05-01:
 
-| Replica | Weight loading | End-to-end ready |
-|---------|---------------|------------------|
-| Initial (disk) | ~20 minutes | ~22 minutes |
-| HPA scale-up #1 (RDMA) | **~1.6 seconds per rank** | **~4.5 minutes** |
+- Model: `nvidia/Kimi-K2.5-NVFP4`
+- Topology: aggregated TRT-LLM, TP=8, 2 nodes per replica, 4 GPUs/node
+- Cluster: GCP GB200, GPU node pool `customer-gpu-o7v`
+- Model cache: `shared-model-cache` PVC backed by Lustre CSI PV
+  `shared-model-cache-zheng`, RWX, 36000Gi
+- Traffic: Mooncake inputs, continuous AIPerf concurrency ramp 1 -> 128,
+  900s total, 30s reporting slices
 
-Per-rank RDMA throughput on the new replica: **361–583 Gbps**
-(8 ranks × 90.75 GB = 726 GB transferred end-to-end).
+| Metric | Disk / vanilla TRT-LLM | MX P2P | Delta |
+|--------|-------------------------|--------|-------|
+| Overall scale-up startup latency | 542s | 305s | **44% drop** |
+| Startup phase: pre-weight init | 204s | 205s | same |
+| Startup phase: weight load / P2P transfer | 296s | 13s | **283s saved** |
+| Startup phase: post-weight to Ready | 42s | 88s | +46s MX overhead |
 
-AIPerf Mooncake trace replay, 2 replicas, 200 requests, 0 errors:
-avg ISL **34,985** tokens, max ISL **169,993** tokens, avg OSL
-**98** tokens, benchmark duration **243s**, throughput **0.82 req/s**.
+The startup phase breakdown reconciles the numbers: MX saves ~283s on
+the weight path, but gives back ~46s in post-weight runtime/readiness
+work, so the measured net startup saving is 237s.
 
 ## Files
 
@@ -35,6 +44,10 @@ avg ISL **34,985** tokens, max ISL **169,993** tokens, avg OSL
 | `run_synthetic_traffic.sh` | Helper that waits for readiness, creates the AIPerf Job, and streams logs |
 | `run_autoscale_collection.sh` | Orchestrates an apples-to-apples autoscale run: starts traffic, triggers scale-up, samples metrics, and collects artifacts |
 | `build_time_series.py` | Builds dashboard-ready time-sliced request, replica, P2P, and GPU CSVs from a run directory |
+| `collect_demo_metrics.sh` | Captures pod timelines, logs, ModelMetadata, Kubernetes events, HPA state, and summary artifacts |
+| `kimi-agg-vanilla-autoscale-dgd.yaml` | Vanilla Dynamo TRT-LLM DGD used for disk-loading comparison |
+| `kimi-trtllm-image-prewarm.yaml` | Optional image prewarm helper to avoid image-pull noise in startup measurements |
+| `aiperf.Dockerfile` | Reproducible AIPerf image definition when the job startup path is too slow |
 
 ## Pre-built Container Image
 
@@ -295,6 +308,213 @@ Key demo metrics to report:
 | RDMA weight-load time | Per-rank `seconds` in `rdma_transfers.csv` |
 | RDMA throughput | Per-rank and average `gbps` in `rdma_transfers.csv` |
 | Autoscaler behavior | `hpa.describe.txt`, `events.txt`, and DGDSA/DGD replica counts |
+
+## Preparing the Next Customer Demo
+
+Use this checklist when preparing a repeatable MX P2P vs vanilla TRT-LLM
+demo. The goal is to keep all variables identical except the weight
+loading path.
+
+### 1. Cluster and storage prerequisites
+
+Verify these before applying either DGD:
+
+```bash
+kubectl get nodes -L cloud.google.com/gke-nodepool,kubernetes.io/arch
+kubectl -n <namespace> get pvc shared-model-cache -o wide
+kubectl get pv <bound-pv-name> -o yaml | grep -E 'driver:|filesystem:|storage:|accessModes:|volumeHandle:'
+kubectl -n <namespace> get secret nvcr-imagepullsecret hf-token-secret
+kubectl get crd modelmetadatas.model-express.ai
+kubectl -n <namespace> get role modelexpress-metadata
+kubectl -n <namespace> get rolebinding modelexpress-metadata
+kubectl -n <namespace> get serviceaccount modelexpress
+```
+
+For the latest validated run, the model cache was:
+
+- PVC: `shared-model-cache`
+- PV: `shared-model-cache-zheng`
+- Driver: `lustre.csi.storage.gke.io`
+- Filesystem: `model`
+- Access: RWX
+- Size: 36000Gi
+
+Keep the MX and vanilla runs on the same GPU node pool and storage
+backend. Image-pull and scheduling delays can easily dominate the story,
+so prewarm the runtime images before the customer run if the nodes are
+fresh:
+
+```bash
+kubectl apply -n <namespace> -f kimi-trtllm-image-prewarm.yaml
+kubectl -n <namespace> rollout status ds/kimi-trtllm-image-prewarm --timeout=20m
+kubectl delete -n <namespace> -f kimi-trtllm-image-prewarm.yaml
+```
+
+### 2. Reset cleanly between runs
+
+Before each run, return to exactly one source replica and remove stale
+metadata. Stale ModelMetadata can make a new first replica attempt P2P
+against a deleted source and fail with `NIXL_ERR_REMOTE_DISCONNECT`.
+
+```bash
+kubectl patch dgdsa -n <namespace> <dgd-name>-source \
+  --type=merge -p '{"spec":{"replicas":1}}'
+
+# For MX runs only, clear old model metadata when doing a clean reset.
+kubectl -n <namespace> delete modelmetadata \
+  -l modelName=nvidia/Kimi-K2.5-NVFP4 --ignore-not-found
+```
+
+If labels are not present on the ModelMetadata CRs, inspect and delete by
+model name:
+
+```bash
+kubectl -n <namespace> get modelmetadata -o json \
+  | jq -r '.items[]
+      | select(.spec.modelName == "nvidia/Kimi-K2.5-NVFP4")
+      | .metadata.name' \
+  | while read -r name; do
+      [ -n "$name" ] && kubectl -n <namespace> delete modelmetadata "$name"
+    done
+```
+
+Wait for the baseline source leader and worker to be ready before
+starting traffic:
+
+```bash
+kubectl -n <namespace> get pods \
+  -l app.kubernetes.io/part-of=<dgd-name> -w
+```
+
+### 3. Run MX and vanilla with the same collector profile
+
+Use `run_autoscale_collection.sh` for both runs. It starts AIPerf,
+samples Kubernetes/frontend/GPU state, triggers the controlled scale-up,
+collects logs, and builds `time_series_30s.csv`.
+
+Latest validated MX profile:
+
+```bash
+NAMESPACE=zheng \
+RUN_TYPE=mx \
+DGD_NAME=kimi-agg-autoscale \
+FRONTEND_SERVICE=kimi-agg-autoscale-frontend:8000 \
+SCALE_TRIGGER_MODE=log_marker \
+SCALE_DELAY_SECONDS=0 \
+BASELINE_CONCURRENCY=1 \
+SURGE_CONCURRENCY=128 \
+BASELINE_DURATION_SECONDS=90 \
+SURGE_DURATION_SECONDS=810 \
+CONCURRENCY_RAMP_DURATION_SECONDS=90 \
+TRACE_REQUEST_COUNT=20000 \
+TRACE_MAX_ISL=256000 \
+TRACE_MAX_OSL=8000 \
+./run_autoscale_collection.sh
+```
+
+Run vanilla immediately after with the same traffic knobs:
+
+```bash
+NAMESPACE=zheng \
+RUN_TYPE=vanilla \
+DGD_NAME=kimi-agg-vanilla-autoscale \
+DGDSA_NAME=kimi-agg-vanilla-autoscale-source \
+FRONTEND_SERVICE=kimi-agg-vanilla-autoscale-frontend:8000 \
+SCALE_TRIGGER_MODE=log_marker \
+SCALE_DELAY_SECONDS=0 \
+BASELINE_CONCURRENCY=1 \
+SURGE_CONCURRENCY=128 \
+BASELINE_DURATION_SECONDS=90 \
+SURGE_DURATION_SECONDS=810 \
+CONCURRENCY_RAMP_DURATION_SECONDS=90 \
+TRACE_REQUEST_COUNT=20000 \
+TRACE_MAX_ISL=256000 \
+TRACE_MAX_OSL=8000 \
+./run_autoscale_collection.sh
+```
+
+Use the same model, PVC/PV, node pool, TP, node count, traffic duration,
+concurrency, ISL cap, OSL cap, and scale trigger mode for both runs.
+
+### 4. Interpret the startup metrics correctly
+
+Do not compare MX P2P transfer time directly with pod Ready time. They
+measure different scopes.
+
+- **Overall startup latency**: controlled scale-up trigger -> new
+  TRT-LLM leader pod Ready. This includes scheduling, pre-weight init,
+  model load/transfer, CUDA graph/runtime work, and readiness.
+- **Weight load / P2P phase**: wall-clock phase inside startup. Disk is
+  first `Start to load safetensor file` -> last `Memory used after
+  loading model weights`; MX is first `MX sources detected` -> last
+  `MX P2P weight transfer succeeded`.
+
+For the latest run:
+
+```text
+Disk:   204s pre-weight + 296s weight load + 42s post-weight = 542s
+MX P2P: 205s pre-weight +  13s P2P       + 88s post-weight = 305s
+```
+
+The weight path saved 283s, but MX had 46s more post-weight overhead, so
+the net overall startup saving was 237s, or a 44% drop.
+
+### 5. Generate customer-facing data and graphs
+
+The collector produces the raw data needed for plotting:
+
+- `time_series_30s.csv`: latency, throughput, errors, concurrency,
+  ready replicas, GPU samples, P2P events
+- `pod_timeline.csv`: pod creation/scheduled/initialized/ready
+- `p2p_weight_transfer_events.csv`: MX rank-level transfer timing
+- `logs/*.k8s.log`: TRT-LLM phase boundaries for disk load and P2P
+- `run_config.json`: model, traffic, scale, and collection settings
+
+For the customer chart, use 30s time-series buckets and drop drain
+buckets after traffic has stopped. In the latest run, buckets at
+`seconds_from_traffic_start >= 900` were drain/shutdown buckets where
+`started_requests=0` but completions were still arriving; including them
+made request latency look artificially odd.
+
+Recommended panels:
+
+| Row | Panels |
+|-----|--------|
+| 1 | TTFT p50, TTFT p90 |
+| 2 | Request latency p50, Request latency p90 |
+| 3 | Output token throughput, Request throughput |
+| 4 | Overall startup latency, Startup phase breakdown |
+
+Include a short context subtitle at the top:
+
+```text
+Model: nvidia/Kimi-K2.5-NVFP4 | TP=8 | Nodes=2 | PV: Lustre CSI (RWX shared model cache)
+```
+
+### 6. Known pitfalls from the latest run
+
+- **Image pull noise**: A new node without the runtime image adds
+  minutes. Prewarm images or keep node affinity on warmed nodes.
+- **SchedulingGated/Pending pods**: usually node resources, compute
+  domain capacity, affinity, or ephemeral-storage requests. Check
+  `kubectl describe pod` before changing model/runtime settings.
+- **Frontend and ModelExpress placement**: these should run on CPU nodes
+  when possible; source workers should consume the GPU nodes.
+- **Readiness probe delay**: a 300s startup probe delay hides the real
+  P2P readiness improvement. Use a short initial delay such as 30s with
+  a generous failure threshold.
+- **Grove init latency**: first pod startup can include Grove/container
+  setup and image pull. Do not include it in weight-load-only metrics.
+- **AIPerf drain buckets**: remove buckets after the traffic duration
+  when plotting request latency.
+- **Mooncake multi-turn traces**: make sampled rows independent
+  requests; otherwise accumulated session context can exceed
+  `max_seq_len` and produce negative `default_max_tokens` errors.
+- **ITL diff was not compelling** in this profile, so the final chart
+  focuses on TTFT and request latency quantiles.
+- **CPU HPA target is only a demo trigger**. For production-like scaling,
+  prefer Prometheus adapter metrics such as queue depth, request rate, or
+  p95/p99 latency.
 
 ## Cleanup
 
