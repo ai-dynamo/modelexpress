@@ -106,15 +106,38 @@ ModelExpress supports air-gapped deployments when model files are already availa
 
 ```mermaid
 flowchart TB
-    server["**ModelExpress Server**\nHealth · P2P Metadata · Redis / K8s CRD backends"]
+    subgraph ext["External Model Sources"]
+        direction LR
+        HF["Hugging Face Hub"]
+        NGC["NVIDIA NGC"]
+        GCS["Google Cloud Storage"]
+    end
 
-    source["**Source pod (vLLM)**\nmx loader\nLoad weights → NIXL\nPublish metadata"]
+    subgraph mx["ModelExpress Server  ·  Redis / K8s CRD backend"]
+        api["gRPC API  ·  Download  ·  Cache management  ·  P2P coordination"]
+    end
 
-    target["**Target pod (vLLM)**\nmx loader\nReceive weights\nServe inference"]
+    subgraph source["Source Pod  ·  vLLM + mx loader  (1 pod)"]
+        sl["Load from cache  →  post-process  →  NIXL registration\nPublish P2P metadata to server"]
+    end
 
-    server -->|metadata| source
-    server -->|metadata| target
-    source -- "GPU-to-GPU RDMA / NIXL" --> target
+    subgraph targets["Target Pods  ·  vLLM + mx loader  ·  ordered fallback  (scales to N pods)"]
+        direction LR
+        t1["① RDMA / NIXL\nGPU-to-GPU\n~15 s / 681 GB"]
+        t2["② ModelStreamer\nS3 · GCS · Azure"]
+        t3["③ GPUDirect\nStorage"]
+        t4["④ Default\ndisk load"]
+        t1 -.->|fallback| t2 -.->|fallback| t3 -.->|fallback| t4
+    end
+
+    scale["Scale impact: 1 external download  →  N pods loaded via P2P\nno repeated ingress · each target pod loads in ~15 s regardless of N"]
+
+    ext -->|"downloaded once\nno duplicate ingress"| mx
+    mx -->|cached weights| source
+    source <-->|P2P metadata| mx
+    mx -->|P2P metadata| targets
+    source -->|"GPU-to-GPU RDMA / NIXL\n~45 Gbps per IB link"| targets
+    targets --- scale
 ```
 
 *The server coordinates discovery and lifecycle state; the weight bytes move directly between GPUs.*
