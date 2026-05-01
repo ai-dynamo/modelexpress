@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: zheng-compute-domain-o7v
+spec:
+  numNodes: 2
+  channel:
+    allocationMode: Single
+    resourceClaimTemplate:
+      name: zheng-compute-domain-channel-o7v

@@ -72,3 +72,5 @@ docs/troubleshooting_*.md
 docs/trtllm_*.md
 docs/weight_correctness_*.md
 docs/CONTEXT.md
+
+examples/p2p_transfer_k8s/client/trtllm/hpa/metrics

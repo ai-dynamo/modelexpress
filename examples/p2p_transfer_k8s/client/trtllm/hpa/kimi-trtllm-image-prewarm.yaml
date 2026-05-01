@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Temporary image prewarmer for the Kimi TRT-LLM autoscaling demo.
+#
+# This is a DaemonSet, not a Deployment, so Kubernetes schedules one pod on each
+# matching GPU node and pulls the large TRT-LLM image into the node-local cache.
+# Delete it after prewarming if you want to remove the sleeping pods:
+#
+#   kubectl delete -n <namespace> -f kimi-trtllm-image-prewarm.yaml
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kimi-trtllm-image-prewarm
+  labels:
+    app: kimi-trtllm-image-prewarm
+spec:
+  selector:
+    matchLabels:
+      app: kimi-trtllm-image-prewarm
+  template:
+    metadata:
+      labels:
+        app: kimi-trtllm-image-prewarm
+    spec:
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+      nodeSelector:
+        cloud.google.com/gke-nodepool: customer-gpu-o7v
+        kubernetes.io/arch: arm64
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoExecute
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          operator: Exists
+        - effect: NoSchedule
+          key: kubernetes.io/arch
+          operator: Exists
+      containers:
+        - name: prewarm
+          image: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.0.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - sleep 3600
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

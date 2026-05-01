@@ -1,36 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Aggregated Kimi K2.5 worker DGD designed for HPA-driven autoscaling.
+# Aggregated Kimi K2.5 worker DGD for the vanilla Dynamo TRT-LLM autoscaling baseline.
 #
-# Each replica is an 8-GPU TP=8 group across 2 nodes × 4 GPUs.
-# `MXCheckpointLoader` auto-detects source vs target via _has_existing_sources():
-#   - First replica: no MX sources found → loads from disk → publishes via MX
-#   - Subsequent replicas: MX sources detected → RDMA receive (~5s vs ~22min)
+# This intentionally mirrors kimi-agg-autoscale-dgd.yaml while removing ModelExpress:
+#   - no ModelExpress metadata service
+#   - no --model-express-url argument
+#   - no MODEL_EXPRESS_URL / MX metadata env
+#   - base Dynamo TRT-LLM runtime image instead of the MX-patched image
 #
-# Same yaml works for replicas 1, 2, ..., N. Use the companion
-# kimi-agg-autoscale-hpa.yaml to drive replica count via HPA.
+# Each replica is a TP=8 group across 2 nodes x 4 GPUs. On scale-up, every new
+# replica loads model weights from disk/PVC, which is the baseline we compare
+# against MX P2P weight transfer.
 #
-# Prerequisites:
-#   - ModelMetadata CRD installed:
-#     kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/crd-modelmetadata.yaml
-#   - ModelExpress RBAC applied in the namespace:
-#     kubectl apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml -n <namespace>
-#   - shared-model-cache PVC with Kimi model in HF cache layout
-#   - Dynamo platform (etcd + NATS) reachable via FQDN
-#   - DGD operator + DGDSA controller installed (part of Dynamo platform)
-#   - ComputeDomain large enough for maxReplicas × multinode.nodeCount nodes
-#
-# Update before applying:
-#   - Image tag: nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.0.0
-#   - Node pool: cloud.google.com/gke-nodepool value (line ~74)
-#   - NATS_SERVER / ETCD_ENDPOINTS namespace FQDNs (lines ~117-119)
-#   - resourceClaimTemplateName: your namespace's compute-domain-channel
+# Apply only when you are ready to run the vanilla baseline:
+#   kubectl apply -n <namespace> -f kimi-agg-vanilla-autoscale-dgd.yaml
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: kimi-agg-autoscale-config
+  name: kimi-agg-vanilla-autoscale-config
 data:
   agg.yaml: |
     otlp_traces_endpoint: "http://10.57.209.4:4317"
@@ -75,57 +64,9 @@ data:
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
-  name: kimi-agg-autoscale
+  name: kimi-agg-vanilla-autoscale
 spec:
   services:
-    # ModelExpress P2P metadata server (kubernetes CRD backend).
-    # Manages source discovery, heartbeats, and stale metadata reaping.
-    ModelExpress:
-      componentType: frontend
-      replicas: 1
-      livenessProbe:
-        tcpSocket:
-          port: 8000
-        initialDelaySeconds: 10
-        periodSeconds: 10
-      readinessProbe:
-        tcpSocket:
-          port: 8000
-        initialDelaySeconds: 10
-        periodSeconds: 10
-      extraPodSpec:
-        schedulerName: default-scheduler
-        serviceAccountName: modelexpress
-        containers: null
-        imagePullSecrets:
-          - name: nvcr-imagepullsecret
-        mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
-          imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-          args:
-            - exec /app/modelexpress-server --port 8000
-          env:
-            - name: MX_METADATA_BACKEND
-              value: "kubernetes"
-            - name: MX_METADATA_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-        nodeSelector:
-          cloud.google.com/gke-nodepool: customer-cpu
-        tolerations:
-          - effect: NoSchedule
-            key: dedicated
-            operator: Equal
-            value: user-workload
-          - effect: NoExecute
-            key: dedicated
-            operator: Equal
-            value: user-workload
-
     Frontend:
       componentType: frontend
       replicas: 1
@@ -135,8 +76,8 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.0.0"
-          imagePullPolicy: Always
+          image: "nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.1.0-dev.3"
+          imagePullPolicy: IfNotPresent
           command:
             - python3
           args:
@@ -173,7 +114,7 @@ spec:
             - name: HF_HOME
               value: /model-cache
             - name: OTEL_SERVICE_NAME
-              value: "dynamo-frontend-kimi-agg-autoscale"
+              value: "dynamo-frontend-kimi-agg-vanilla-autoscale"
             - name: NATS_SERVER
               value: "nats://dynamo-platform-nats.saperiyasamy.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
@@ -189,8 +130,7 @@ spec:
             - mountPath: /model-cache
               name: model-cache
         nodeSelector:
-          cloud.google.com/gke-nodepool: customer-gpu-o7v
-          kubernetes.io/arch: arm64
+          cloud.google.com/gke-nodepool: customer-cpu
         tolerations:
           - effect: NoSchedule
             key: dedicated
@@ -233,7 +173,6 @@ spec:
         dnsPolicy: ClusterFirstWithHostNet
         securityContext: {}
         affinity:
-          # Update node pool names for your cluster
           nodeAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
               nodeSelectorTerms:
@@ -249,14 +188,14 @@ spec:
                 - key: app.kubernetes.io/part-of
                   operator: In
                   values:
-                  - kimi-agg-autoscale
+                  - kimi-agg-vanilla-autoscale
               topologyKey: nvidia.com/gpu.clique
         containers: null
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "nvcr.io/nvidian/dynamo-dev/kavink:dynamo-trtllm-mx-v3.0.0"
-          imagePullPolicy: Always
+          image: "nvcr.io/nvidia/ai-dynamo/tensorrtllm-runtime:1.1.0-dev.3"
+          imagePullPolicy: IfNotPresent
           workingDir: /workspace/
           securityContext:
             privileged: true
@@ -271,8 +210,6 @@ spec:
             - nvidia/Kimi-K2.5-NVFP4
             - --extra-engine-args
             - /config/agg.yaml
-            - --model-express-url
-            - kimi-agg-autoscale-modelexpress:8000
             - --tensor-parallel-size
             - "8"
             - --discovery-backend
@@ -301,14 +238,12 @@ spec:
               value: "nats://dynamo-platform-nats.saperiyasamy.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
               value: "dynamo-platform-etcd.saperiyasamy.svc.cluster.local:2379"
-            - name: MODEL_EXPRESS_URL
-              value: "kimi-agg-autoscale-modelexpress:8000"
             - name: MODEL_NAME
               value: "nvidia/Kimi-K2.5-NVFP4"
             - name: WORLD_SIZE
               value: "8"
             - name: HOME
-              value: "/root"
+              value: "/tmp"
             - name: HF_HOME
               value: /model-cache
             - name: HF_HUB_OFFLINE
@@ -317,8 +252,6 @@ spec:
               value: /tmp/hf_modules
             - name: TRITON_CACHE_DIR
               value: /model-cache/.triton-cache
-            - name: NIXL_LOG_LEVEL
-              value: "INFO"
             - name: TRTLLM_UCX_INTERFACE
               value: "eth0"
             - name: UCX_TLS
@@ -368,7 +301,7 @@ spec:
             - name: TLLM_OVERRIDE_LAYER_NUM
               value: "61"
             - name: OTEL_SERVICE_NAME
-              value: "dynamo-agg-kimi-autoscale"
+              value: "dynamo-agg-kimi-vanilla-autoscale"
             - name: DYN_REASONING_PARSER
               value: "kimi_k25"
             - name: DYN_TOOL_CALL_PARSER
@@ -435,4 +368,4 @@ spec:
               claimName: shared-model-cache
           - name: trtllm-config
             configMap:
-              name: kimi-agg-autoscale-config
+              name: kimi-agg-vanilla-autoscale-config

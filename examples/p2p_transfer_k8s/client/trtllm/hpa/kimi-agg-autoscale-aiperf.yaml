@@ -1,0 +1,414 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# AIPerf Mooncake trace benchmark for the Kimi TRT-LLM HPA demo.
+#
+# Modeled after Dynamo's deepseek-v32-fp4 perf.yaml:
+#   - wait for the OpenAI-compatible frontend /v1/models endpoint
+#   - prepare bounded Mooncake inputs from the shared trace
+#   - run one continuous AIPerf concurrency ramp to avoid phase-transition gaps
+#   - save artifacts under the shared model cache PVC
+#
+# Create with:
+#   kubectl create -n <namespace> -f kimi-agg-autoscale-aiperf.yaml
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: kimi-agg-aiperf-
+  labels:
+    app: kimi-agg-aiperf
+spec:
+  backoffLimit: 1
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: kimi-agg-aiperf
+    spec:
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+      nodeSelector:
+        cloud.google.com/gke-nodepool: customer-cpu
+      tolerations:
+        - effect: NoSchedule
+          key: dedicated
+          operator: Equal
+          value: user-workload
+        - effect: NoExecute
+          key: dedicated
+          operator: Equal
+          value: user-workload
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: nvidia.com/dynamo-graph-deployment-name
+                      operator: In
+                      values:
+                        - kimi-agg-autoscale
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: perf
+          image: nvcr.io/nvidian/dynamo-dev/model-express-dev-containers:aiperf-0.7.0-py312-amd64-v1
+          imagePullPolicy: IfNotPresent
+          workingDir: /workspace
+          command:
+            - /bin/bash
+            - -c
+          args:
+            - |
+              set -euo pipefail
+              ulimit -n 600000 || true
+
+              export COLUMNS=200
+              export HF_HOME="${HF_HOME:-/model-cache}"
+              export PYTHONUNBUFFERED=1
+              EPOCH="$(date +%s)"
+
+              : "${TRACE_SOURCE_FILE:?TRACE_SOURCE_FILE must point to the raw Mooncake trace on the PVC}"
+              : "${TRACE_FILE:?TRACE_FILE must point to the prepared trace output path}"
+
+              wait_for_model_ready() {
+                echo "Waiting for model '${TARGET_MODEL}' at http://${ENDPOINT}/v1/models ..."
+                while ! curl -sf "http://${ENDPOINT}/v1/models" | jq -e --arg model "${TARGET_MODEL}" '.data[]? | select(.id == $model)' >/dev/null 2>&1; do
+                  echo "[$(date '+%H:%M:%S')] model not ready yet; sleeping 5s"
+                  sleep 5
+                done
+                curl -s "http://${ENDPOINT}/v1/models" | jq .
+              }
+
+              prepare_mooncake_trace() {
+                if [ ! -f "${TRACE_SOURCE_FILE}" ]; then
+                  echo "Raw Mooncake trace does not exist at ${TRACE_SOURCE_FILE}"
+                  exit 1
+                fi
+
+                mkdir -p "$(dirname "${TRACE_FILE}")"
+                echo "Preparing bounded Mooncake concurrency trace ${TRACE_FILE} from ${TRACE_SOURCE_FILE}"
+                python3 - "${TRACE_SOURCE_FILE}" "${TRACE_FILE}" <<'PY'
+              import json
+              import os
+              import statistics
+              import sys
+
+              src, dst = sys.argv[1], sys.argv[2]
+              max_requests = int(os.environ.get("TRACE_REQUEST_COUNT", "20000"))
+              max_isl = int(os.environ.get("TRACE_MAX_ISL", "256000"))
+              max_osl = int(os.environ.get("TRACE_MAX_OSL", "8000"))
+              stats_dst = dst + ".stats.json"
+
+              def percentile(values, pct):
+                  if not values:
+                      return 0
+                  idx = round((len(values) - 1) * pct / 100)
+                  return values[idx]
+
+              def summarize(values):
+                  values = sorted(values)
+                  if not values:
+                      return {"count": 0}
+                  return {
+                      "count": len(values),
+                      "min": values[0],
+                      "p50": percentile(values, 50),
+                      "p90": percentile(values, 90),
+                      "p95": percentile(values, 95),
+                      "p99": percentile(values, 99),
+                      "max": values[-1],
+                      "avg": round(statistics.fmean(values), 2),
+                  }
+
+              kept = 0
+              input_lengths = []
+              output_lengths = []
+              with open(src, "r", encoding="utf-8") as inp, open(dst, "w", encoding="utf-8") as out:
+                  for line in inp:
+                      if kept >= max_requests:
+                          break
+                      line = line.strip()
+                      if not line:
+                          continue
+                      row = json.loads(line)
+                      isl = int(row.get("input_length", row.get("input_len", 0)) or 0)
+                      if isl <= 0 or isl > max_isl:
+                          continue
+                      osl = int(row.get("output_length", row.get("output_len", max_osl)) or max_osl)
+                      row["input_length"] = isl
+                      row["output_length"] = max(1, min(osl, max_osl))
+                      input_lengths.append(row["input_length"])
+                      output_lengths.append(row["output_length"])
+                      row.pop("timestamp", None)
+                      row.pop("delay", None)
+                      # The raw Mooncake trace contains multi-turn sessions. AIPerf
+                      # replays prior turns as context for a session, which can push
+                      # Kimi past max_seq_len even when each row's input_length is
+                      # capped. Make each sampled row an independent request.
+                      row["session_id"] = f"mooncake-{kept}"
+                      row.pop("conversation_id", None)
+                      row.pop("turn_index", None)
+                      out.write(json.dumps(row, separators=(",", ":")) + "\n")
+                      kept += 1
+
+              if kept == 0:
+                  raise SystemExit(f"no usable trace rows found in {src} with TRACE_MAX_ISL={max_isl}")
+              stats = {
+                  "trace_file": dst,
+                  "source_file": src,
+                  "requested_max_requests": max_requests,
+                  "trace_max_isl": max_isl,
+                  "trace_max_osl": max_osl,
+                  "input_sequence_length_tokens": summarize(input_lengths),
+                  "output_sequence_length_tokens": summarize(output_lengths),
+                  "total_sequence_length_tokens": summarize([i + o for i, o in zip(input_lengths, output_lengths)]),
+              }
+              with open(stats_dst, "w", encoding="utf-8") as stats_out:
+                  json.dump(stats, stats_out, indent=2, sort_keys=True)
+                  stats_out.write("\n")
+              print(
+                  f"prepared {kept} trace rows -> {dst}; "
+                  "timestamps removed so AIPerf uses concurrency scheduling"
+              )
+              print(
+                  "TRACE_STATS "
+                  f"ISL avg={stats['input_sequence_length_tokens']['avg']} "
+                  f"p50={stats['input_sequence_length_tokens']['p50']} "
+                  f"p95={stats['input_sequence_length_tokens']['p95']} "
+                  f"p99={stats['input_sequence_length_tokens']['p99']} "
+                  f"max={stats['input_sequence_length_tokens']['max']} | "
+                  f"OSL avg={stats['output_sequence_length_tokens']['avg']} "
+                  f"p50={stats['output_sequence_length_tokens']['p50']} "
+                  f"p95={stats['output_sequence_length_tokens']['p95']} "
+                  f"p99={stats['output_sequence_length_tokens']['p99']} "
+                  f"max={stats['output_sequence_length_tokens']['max']}"
+              )
+              PY
+              }
+
+              prepare_mooncake_trace
+              wait_for_model_ready
+
+              ROOT="${ROOT_ARTIFACT_DIR}/${EPOCH}_${JOB_NAME}"
+              mkdir -p "${ROOT}"
+              cp "${TRACE_FILE}.stats.json" "${ROOT}/trace_stats.json"
+              jq -n \
+                --arg deployment "kimi-agg-autoscale" \
+                --arg model "${TARGET_MODEL}" \
+                --arg endpoint "${ENDPOINT}" \
+                --arg trace_file "${TRACE_FILE}" \
+                --arg baseline_concurrency "${BASELINE_CONCURRENCY}" \
+                --arg surge_concurrency "${SURGE_CONCURRENCY}" \
+                --arg baseline_duration_seconds "${BASELINE_DURATION_SECONDS}" \
+                --arg surge_duration_seconds "${SURGE_DURATION_SECONDS}" \
+                --arg total_duration_seconds "$((BASELINE_DURATION_SECONDS + SURGE_DURATION_SECONDS))" \
+                --arg concurrency_ramp_duration_seconds "${CONCURRENCY_RAMP_DURATION_SECONDS}" \
+                --arg benchmark_grace_period_seconds "${BENCHMARK_GRACE_PERIOD_SECONDS}" \
+                --arg trace_request_count "${TRACE_REQUEST_COUNT}" \
+                --arg trace_max_isl "${TRACE_MAX_ISL}" \
+                --arg trace_max_osl "${TRACE_MAX_OSL}" \
+                --arg ttft_threshold_ms "${TTFT_THRESHOLD_MS}" \
+                --arg itl_threshold_ms "${ITL_THRESHOLD_MS}" \
+                --arg progress_interval_seconds "${PROGRESS_INTERVAL_SECONDS}" \
+                --slurpfile trace_stats "${ROOT}/trace_stats.json" \
+                '{deployment:$deployment, model:$model, endpoint:$endpoint, trace_file:$trace_file,
+                  baseline_concurrency:($baseline_concurrency|tonumber),
+                  surge_concurrency:($surge_concurrency|tonumber),
+                  baseline_duration_seconds:($baseline_duration_seconds|tonumber),
+                  surge_duration_seconds:($surge_duration_seconds|tonumber),
+                  total_duration_seconds:($total_duration_seconds|tonumber),
+                  concurrency_ramp_duration_seconds:($concurrency_ramp_duration_seconds|tonumber),
+                  traffic_mode:"continuous_concurrency_ramp",
+                  benchmark_grace_period_seconds:($benchmark_grace_period_seconds|tonumber),
+                  trace_request_count:($trace_request_count|tonumber),
+                  trace_max_isl:($trace_max_isl|tonumber), trace_max_osl:($trace_max_osl|tonumber),
+                  ttft_threshold_ms:($ttft_threshold_ms|tonumber),
+                  itl_threshold_ms:($itl_threshold_ms|tonumber),
+                  progress_interval_seconds:($progress_interval_seconds|tonumber),
+                  trace_stats:($trace_stats[0] // {})}' \
+                > "${ROOT}/input_config.json"
+
+              SERVER_METRICS_ARGS=()
+              if [ -n "${AIPERF_SERVER_METRICS_URLS:-}" ]; then
+                IFS=',' read -r -a server_metrics_urls <<< "${AIPERF_SERVER_METRICS_URLS}"
+                if [ "${#server_metrics_urls[@]}" -gt 0 ]; then
+                  SERVER_METRICS_ARGS+=(--server-metrics "${server_metrics_urls[@]}")
+                fi
+              fi
+
+              run_continuous_ramp() {
+                local trace_base_name
+                local total_duration
+                local ramp_duration
+                local artifact_dir
+                local marker_pid
+                local progress_pid
+                local aiperf_rc
+                trace_base_name="$(basename "${TRACE_FILE}" .jsonl)"
+                total_duration=$((BASELINE_DURATION_SECONDS + SURGE_DURATION_SECONDS))
+                ramp_duration="${CONCURRENCY_RAMP_DURATION_SECONDS}"
+                if [ "${ramp_duration}" = "0" ]; then
+                  ramp_duration="${BASELINE_DURATION_SECONDS}"
+                fi
+                artifact_dir="${ROOT}/${trace_base_name}_continuous_ramp_c${SURGE_CONCURRENCY}"
+                mkdir -p "${artifact_dir}"
+                echo "Running Mooncake continuous concurrency ramp: target_concurrency=${SURGE_CONCURRENCY}, ramp_duration=${ramp_duration}s, total_duration=${total_duration}s, trace=${TRACE_FILE}"
+                (
+                  sleep "${ramp_duration}"
+                  echo "Running Mooncake concurrency surge: ramp target concurrency=${SURGE_CONCURRENCY}"
+                ) &
+                marker_pid="$!"
+                progress_loop() {
+                  local start_ts now elapsed phase estimated_concurrency progress_percent completed_records
+                  start_ts="$(date +%s)"
+                  while true; do
+                    now="$(date +%s)"
+                    elapsed=$((now - start_ts))
+                    if [ "${elapsed}" -lt "${ramp_duration}" ]; then
+                      phase="ramp"
+                      estimated_concurrency=$((1 + ((SURGE_CONCURRENCY - 1) * elapsed / ramp_duration)))
+                    elif [ "${elapsed}" -lt "${total_duration}" ]; then
+                      phase="steady"
+                      estimated_concurrency="${SURGE_CONCURRENCY}"
+                    else
+                      phase="draining"
+                      estimated_concurrency="${SURGE_CONCURRENCY}"
+                    fi
+                    progress_percent=$((elapsed * 100 / total_duration))
+                    if [ "${progress_percent}" -gt 100 ]; then
+                      progress_percent=100
+                    fi
+                    completed_records="$(python3 - "${artifact_dir}" <<'PY'
+              from pathlib import Path
+              import sys
+
+              root = Path(sys.argv[1])
+              total = 0
+              for path in root.rglob("*.jsonl"):
+                  if not any(part in {"raw_records", "records"} or "raw" in part for part in path.parts):
+                      continue
+                  try:
+                      with path.open("r", encoding="utf-8", errors="ignore") as f:
+                          total += sum(1 for _ in f)
+                  except OSError:
+                      pass
+              print(total)
+              PY
+                    )"
+                    printf '[%s] AIPERF_PROGRESS elapsed=%ss total=%ss progress=%s%% phase=%s estimated_concurrency=%s completed_records=%s artifact_dir=%s\n' \
+                      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                      "${elapsed}" \
+                      "${total_duration}" \
+                      "${progress_percent}" \
+                      "${phase}" \
+                      "${estimated_concurrency}" \
+                      "${completed_records}" \
+                      "${artifact_dir}"
+                    sleep "${PROGRESS_INTERVAL_SECONDS}"
+                  done
+                }
+                progress_loop &
+                progress_pid="$!"
+                set +e
+                aiperf profile \
+                  -m "${TARGET_MODEL}" \
+                  --use-server-token-count \
+                  --tokenizer-trust-remote-code \
+                  --input-file "${TRACE_FILE}" \
+                  --custom-dataset-type mooncake_trace \
+                  --url "http://${ENDPOINT}" \
+                  --streaming \
+                  --random-seed 42 \
+                  --ui none \
+                  --artifact-dir "${artifact_dir}" \
+                  --concurrency "${SURGE_CONCURRENCY}" \
+                  --benchmark-duration "${total_duration}" \
+                  --benchmark-grace-period "${BENCHMARK_GRACE_PERIOD_SECONDS}" \
+                  --concurrency-ramp-duration "${ramp_duration}" \
+                  --workers-max "${WORKERS_MAX}" \
+                  --request-timeout-seconds "${REQUEST_TIMEOUT_SECONDS}" \
+                  --profile-export-level raw \
+                  --record-processors 8 \
+                  --export-http-trace \
+                  --synthesis-max-isl "${TRACE_MAX_ISL}" \
+                  --synthesis-max-osl "${TRACE_MAX_OSL}" \
+                  "${SERVER_METRICS_ARGS[@]}" \
+                  --goodput "time_to_first_token:${TTFT_THRESHOLD_MS} inter_token_latency:${ITL_THRESHOLD_MS}"
+                aiperf_rc="$?"
+                set -e
+
+                kill "${progress_pid}" 2>/dev/null || true
+                wait "${progress_pid}" 2>/dev/null || true
+                kill "${marker_pid}" 2>/dev/null || true
+                wait "${marker_pid}" 2>/dev/null || true
+                echo "Results: ${artifact_dir}"
+                ls -la "${artifact_dir}" || true
+                return "${aiperf_rc}"
+              }
+
+              run_continuous_ramp
+          env:
+            - name: TARGET_MODEL
+              value: nvidia/Kimi-K2.5-NVFP4
+            - name: ENDPOINT
+              value: kimi-agg-autoscale-frontend:8000
+            - name: TRACE_FILE
+              value: /model-cache/perf/traces/mooncake_trace_kimi_subset.jsonl
+            - name: TRACE_SOURCE_FILE
+              value: /model-cache/perf/traces/mooncake_trace_raw.jsonl
+            - name: TRACE_REQUEST_COUNT
+              value: "20000"
+            - name: TRACE_MAX_ISL
+              value: "256000"
+            - name: TRACE_MAX_OSL
+              value: "8000"
+            - name: BASELINE_CONCURRENCY
+              value: "1"
+            - name: SURGE_CONCURRENCY
+              value: "128"
+            - name: BASELINE_DURATION_SECONDS
+              value: "90"
+            - name: SURGE_DURATION_SECONDS
+              value: "810"
+            - name: CONCURRENCY_RAMP_DURATION_SECONDS
+              value: "90"
+            - name: BENCHMARK_GRACE_PERIOD_SECONDS
+              value: "600"
+            - name: PROGRESS_INTERVAL_SECONDS
+              value: "30"
+            - name: WORKERS_MAX
+              value: "200"
+            - name: REQUEST_TIMEOUT_SECONDS
+              value: "1000"
+            - name: TTFT_THRESHOLD_MS
+              value: "20000"
+            - name: ITL_THRESHOLD_MS
+              value: "50"
+            - name: AIPERF_HTTP_CONNECTION_LIMIT
+              value: "200"
+            - name: AIPERF_HTTP_SO_RCVTIMEO
+              value: "120"
+            - name: AIPERF_SERVER_METRICS_URLS
+              value: "http://kimi-agg-autoscale-source:9090/metrics"
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.labels['job-name']
+            - name: ROOT_ARTIFACT_DIR
+              value: /model-cache/perf
+            - name: HF_HOME
+              value: /model-cache
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+      restartPolicy: Never
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: shared-model-cache

@@ -13,23 +13,16 @@
 #   - New pods auto-detect existing MX source via `_has_existing_sources()`
 #   - Weights arrive via NIXL RDMA in ~1-2s per rank instead of ~20 min disk load
 #
-# Apply AFTER the first replica is fully ready (1/1, all 8 workers
-# published to Redis), otherwise scale-ups will fall back to disk loading.
----
-apiVersion: nvidia.com/v1alpha1
-kind: DynamoGraphDeploymentScalingAdapter
-metadata:
-  name: kimi-agg-autoscale-source
-spec:
-  dgdRef:
-    name: kimi-agg-autoscale
-    serviceName: source
-  replicas: 1
+# Apply AFTER the DGD has `source.scalingAdapter.enabled: true` and the
+# first replica is fully ready (1/1, all 8 workers published to
+# ModelMetadata), otherwise scale-ups will fall back to disk loading.
 ---
 # HPA targets the DGDSA's scale subresource.
-# CPU utilization is a placeholder metric for the demo. In production,
-# use a Prometheus adapter and scale on TRT-LLM queue depth, request
-# rate, or P99 latency for better signal on a GPU-bound workload.
+# Raw CPU average is a placeholder metric for the demo. The TRT-LLM
+# pods request GPUs but do not request CPU, so percentage utilization
+# cannot be computed by HPA. In production, use a Prometheus adapter and
+# scale on TRT-LLM queue depth, request rate, or P99 latency for better
+# signal on a GPU-bound workload.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -40,14 +33,14 @@ spec:
     kind: DynamoGraphDeploymentScalingAdapter
     name: kimi-agg-autoscale-source
   minReplicas: 1
-  maxReplicas: 3
+  maxReplicas: 2
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
-          type: Utilization
-          averageUtilization: 50
+          type: AverageValue
+          averageValue: 6800m
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 30
@@ -56,7 +49,7 @@ spec:
           value: 1
           periodSeconds: 60
     scaleDown:
-      stabilizationWindowSeconds: 300
+      stabilizationWindowSeconds: 0
       policies:
         - type: Pods
           value: 1
