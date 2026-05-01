@@ -102,45 +102,57 @@ ModelExpress supports air-gapped deployments when model files are already availa
 
 ![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](model-express-architecture.png)
 
-*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format mx` for inference.
+**Phase 1 — External download and cache:** ModelExpress ensures only one node pulls from external providers; all others read from the shared cache.
 
 ```mermaid
-flowchart TB
+flowchart LR
     subgraph ext["External Model Sources"]
-        direction LR
+        direction TB
         HF["Hugging Face Hub"]
         NGC["NVIDIA NGC"]
         GCS["Google Cloud Storage"]
     end
 
-    subgraph mx["ModelExpress Server  ·  Redis / K8s CRD backend"]
-        api["gRPC API  ·  Download  ·  Cache management  ·  P2P coordination"]
+    subgraph mx["ModelExpress Server"]
+        api["Download · Cache management\ngRPC API"]
+        be[("Redis / K8s CRD\nmetadata backend")]
+        api --- be
     end
 
-    subgraph source["Source Pod  ·  vLLM + mx loader  (1 pod)"]
-        sl["Load from cache  →  post-process  →  NIXL registration\nPublish P2P metadata to server"]
+    cache[("Model Cache\nlocal disk / PVC")]
+
+    ext -->|"one-time download\nno duplicate ingress"| mx
+    mx -->|"store weights"| cache
+    cache -->|"subsequent\nrequests served\nfrom cache"| mx
+```
+
+**Phase 2 — Autoscale and rolling update:** A single source pod loads from cache and serves weights to all new pods via GPU-to-GPU RDMA — each target pod loads in ~15 s regardless of cluster size.
+
+```mermaid
+flowchart LR
+    subgraph mx["ModelExpress Server · Redis / K8s CRD"]
+        coord["P2P coordination\nmetadata registry"]
     end
 
-    subgraph targets["Target Pods  ·  vLLM + mx loader  ·  ordered fallback  (scales to N pods)"]
-        direction LR
-        t1["① RDMA / NIXL\nGPU-to-GPU\n~15 s / 681 GB"]
-        t2["② ModelStreamer\nS3 · GCS · Azure"]
-        t3["③ GPUDirect\nStorage"]
-        t4["④ Default\ndisk load"]
+    subgraph source["Source Pod · vLLM + mx loader"]
+        sl["Load from cache\n→ post-process\n→ NIXL registration\n→ publish metadata"]
+    end
+
+    subgraph targets["Target Pods × N · vLLM + mx loader"]
+        direction TB
+        t1["① RDMA / NIXL  GPU-to-GPU  ~15 s / 681 GB"]
+        t2["② ModelStreamer  S3 · GCS · Azure Blob"]
+        t3["③ GPUDirect Storage  NVMe → GPU"]
+        t4["④ Default  disk → CPU → GPU"]
         t1 -.->|fallback| t2 -.->|fallback| t3 -.->|fallback| t4
     end
 
-    scale["Scale impact: 1 external download  →  N pods loaded via P2P\nno repeated ingress · each target pod loads in ~15 s regardless of N"]
-
-    ext -->|"downloaded once\nno duplicate ingress"| mx
-    mx -->|cached weights| source
-    source <-->|P2P metadata| mx
-    mx -->|P2P metadata| targets
-    source -->|"GPU-to-GPU RDMA / NIXL\n~45 Gbps per IB link"| targets
-    targets --- scale
+    source <-->|"P2P metadata"| mx
+    mx -->|"P2P metadata"| targets
+    source -->|"GPU-to-GPU RDMA / NIXL · ~45 Gbps per IB link"| targets
 ```
 
-*The server coordinates discovery and lifecycle state; the weight bytes move directly between GPUs.*
+*The server coordinates discovery and lifecycle state; weight bytes transfer directly between GPUs.*
 
 - **modelexpress_server**: control plane for downloads, cache state, and P2P coordination
 - **modelexpress_client**: Rust CLI and Python integration layer for runtime-facing workflows
