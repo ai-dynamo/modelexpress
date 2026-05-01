@@ -74,17 +74,31 @@ ModelExpress orchestrates the weight lifecycle from external source to GPU memor
 | vLLM | `--load-format mx` for P2P weight transfer |
 | NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
-| SGLang | Coming soon |
+| SGLang | `--load-format mx_gds` for GPUDirect Storage loading (beta, [in progress](https://github.com/sgl-project/sglang/pull/20288)) |
 
-### Model Store Providers
+### Model Sources
 
-ModelExpress exposes a small set of storage-access patterns, depending on how you want weights delivered:
+ModelExpress routes each load through the fastest available path. There are two access patterns: server-side provider downloads and client-side ModelStreamer streaming.
 
-| Path | Supported sources |
-|------|-------------------|
-| Model providers | Hugging Face, NVIDIA NGC, Google Cloud Storage |
-| ModelStreamer (`MX_MODEL_URI`) | S3 / S3-compatible, GCS, Azure Blob Storage, local filesystem, and Hugging Face cache-resolved model IDs |
-| GPUDirect Storage | Local filesystem or cached model files loaded directly to GPU |
+**Server-side providers** — the ModelExpress server pulls the model once; all other nodes read from the shared cache:
+
+| Provider | How to use |
+|----------|------------|
+| Hugging Face Hub | Default; set `HF_TOKEN` for gated models |
+| NVIDIA NGC | Set `NGC_API_KEY`; use `ngc://org/team/model:version` style paths |
+| Google Cloud Storage | Set `GOOGLE_APPLICATION_CREDENTIALS`; use `gs://bucket/path` |
+
+**ModelStreamer** (`MX_MODEL_URI`) — streams safetensors directly from object storage or local disk into GPU memory, bypassing the server cache. Activate by setting `MX_MODEL_URI`:
+
+| Backend | URI format | Notes |
+|---------|-----------|-------|
+| Amazon S3 / S3-compatible | `s3://bucket/path/to/model` | MinIO, Ceph, and other S3-compatible stores work |
+| Google Cloud Storage | `gs://bucket/path/to/model` | |
+| Azure Blob Storage | `az://container/path/to/model` | |
+| Local filesystem | `/absolute/path/to/model` | Useful for NVMe, NFS, or pre-staged volumes |
+| Hugging Face cache | `org/model-name` (e.g. `deepseek-ai/DeepSeek-V3`) | Resolved via `HF_HUB_CACHE` or `~/.cache/huggingface/hub` |
+
+**GPUDirect Storage (GDS)** — loads directly from NVMe into GPU memory, bypassing CPU and DRAM. Activated automatically when `cuFile` and compatible hardware are detected.
 
 ### Air-Gapped Environments
 
