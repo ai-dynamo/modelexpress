@@ -104,21 +104,17 @@ ModelExpress supports air-gapped deployments when model files are already availa
 
 *Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format mx` for inference.
 
-```
-                    ┌─────────────────────────────────────────────────────────────────┐
-                    │                    ModelExpress Server                          │
-                    │   Health • Model • P2P Metadata • Redis/K8s CRD backends        │
-                    └──────────────────────┬──────────────────────────────────────────┘
-                                           │
-                         ┌─────────────────┼─────────────────┐
-                         │ metadata        │                 │ metadata
-                         ▼                 │                 ▼
-              ┌──────────────────┐         │       ┌──────────────────┐
-              │  Source (vLLM)   │  RDMA   │       │  Target (vLLM)   │
-              │  mx loader       │════════►│       │  mx loader       │
-              │  Load → NIXL     │  NIXL   │       │  Receive → FP8   │
-              │  Publish metadata│         │       │  Serve inference │
-              └──────────────────┘         │       └──────────────────┘
+```mermaid
+flowchart TB
+    server["**ModelExpress Server**\nHealth · P2P Metadata · Redis / K8s CRD backends"]
+
+    source["**Source pod (vLLM)**\nmx loader\nLoad weights → NIXL\nPublish metadata"]
+
+    target["**Target pod (vLLM)**\nmx loader\nReceive weights\nServe inference"]
+
+    server -->|metadata| source
+    server -->|metadata| target
+    source -- "GPU-to-GPU RDMA / NIXL" --> target
 ```
 
 *The server coordinates discovery and lifecycle state; the weight bytes move directly between GPUs.*
