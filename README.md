@@ -149,7 +149,7 @@ flowchart LR
 
     source <-->|"P2P metadata"| mx
     mx -->|"P2P metadata"| targets
-    source -->|"GPU-to-GPU RDMA / NIXL · ~45 Gbps per IB link"| targets
+    source -->|"GPU-to-GPU RDMA / NIXL · NVIDIA ConnectX / fast interconnect"| targets
 ```
 
 *The server coordinates discovery and lifecycle state; weight bytes transfer directly between GPUs.*
