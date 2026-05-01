@@ -126,7 +126,7 @@ flowchart LR
     cache -->|"subsequent\nrequests served\nfrom cache"| mx
 ```
 
-**Phase 2 — Autoscale and rolling update:** A single source pod loads from cache and serves weights to all new pods via GPU-to-GPU RDMA — each target pod loads in ~15 s regardless of cluster size.
+**Phase 2 — Autoscale and rolling update:** A single source pod loads from cache and serves weights to all new pods via GPU-to-GPU RDMA — each target pod loads in the same time regardless of cluster size.
 
 ```mermaid
 flowchart LR
@@ -140,7 +140,7 @@ flowchart LR
 
     subgraph targets["Target Pods × N · vLLM + mx loader"]
         direction TB
-        t1["① RDMA / NIXL  GPU-to-GPU  ~15 s / 681 GB"]
+        t1["① RDMA / NIXL  GPU-to-GPU"]
         t2["② ModelStreamer  S3 · GCS · Azure Blob"]
         t3["③ GPUDirect Storage  NVMe → GPU"]
         t4["④ Default  disk → CPU → GPU"]
