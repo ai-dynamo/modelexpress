@@ -38,6 +38,8 @@ dependencies = [
 dev = [
     # Use grpcio-tools<=1.66.2 for protobuf 5.x, >=1.67.0 for protobuf 6.x
     "grpcio-tools>=1.60.0,<=1.66.2",
+    "opentelemetry-api>=1.41.1",
+    "opentelemetry-sdk>=1.41.1",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
@@ -59,9 +61,3 @@ include = ["modelexpress*"]
 
 [tool.setuptools.package-data]
 modelexpress = ["py.typed"]
-
-[dependency-groups]
-dev = [
-    "opentelemetry-api>=1.41.1",
-    "opentelemetry-sdk>=1.41.1",
-]
