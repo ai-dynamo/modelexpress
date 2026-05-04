@@ -11,7 +11,6 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
-from re import I
 
 import torch
 import torch.nn as nn
