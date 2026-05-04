@@ -302,6 +302,7 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MX_CONTIGUOUS_REG` | `0` | Contiguous region registration (experimental) |
+| `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -317,6 +318,21 @@ ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances u
 | `VLLM_PLUGINS` | - | Set to `modelexpress` to register the mx loader |
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### NIXL Backend Selection
+
+`MX_NIXL_BACKEND` selects the NIXL plugin used for GPU-to-GPU RDMA.
+The default `UCX` covers InfiniBand and RoCE clusters. Set
+`MX_NIXL_BACKEND=LIBFABRIC` on AWS EFA, where the UCX backend can
+silently fall back to TCP depending on the libibverbs / EFA installer
+combination on the host.
+
+Both source and target workers must use the same backend — backends
+do not interoperate. Confirm via worker logs:
+
+```
+NIXL agent 'mx-auto-worker0-...' created on device 0 (backend=LIBFABRIC)
+```
 
 ### NIC Pinning (UCX Workaround)
 
