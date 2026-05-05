@@ -35,9 +35,29 @@ except ImportError:
     pass
 
 
+SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
+DEFAULT_NIXL_BACKEND = "UCX"
+
+
 def is_nixl_available() -> bool:
     """Check if NIXL is available."""
     return NIXL_AVAILABLE
+
+
+def _resolve_nixl_backend() -> str:
+    """Resolve the NIXL backend from MX_NIXL_BACKEND.
+
+    Defaults to UCX. Set MX_NIXL_BACKEND=LIBFABRIC on AWS EFA.
+    """
+    import os
+
+    raw = os.environ.get("MX_NIXL_BACKEND", DEFAULT_NIXL_BACKEND).strip().upper()
+    if raw not in SUPPORTED_NIXL_BACKENDS:
+        raise ValueError(
+            f"MX_NIXL_BACKEND={raw!r} is not supported. "
+            f"Expected one of {SUPPORTED_NIXL_BACKENDS}."
+        )
+    return raw
 
 
 class NixlTransferManager:
@@ -58,6 +78,9 @@ class NixlTransferManager:
         self._agent_name = agent_name
         self._device_id = device_id
         self._listen_port = listen_port
+
+        self._backend = _resolve_nixl_backend()
+        self._backends = [self._backend]
 
         self._agent: Any = None
         self._metadata: bytes = b""
@@ -123,7 +146,7 @@ class NixlTransferManager:
         try:
             if self._listen_port is not None and nixl_agent_config:
                 config = nixl_agent_config(
-                    backends=["UCX"],
+                    backends=self._backends,
                     enable_listen_thread=True,
                     listen_port=self._listen_port,
                 )
@@ -131,11 +154,14 @@ class NixlTransferManager:
                     f"NIXL listen thread enabled on port {self._listen_port}"
                 )
             elif nixl_agent_config:
-                config = nixl_agent_config(backends=["UCX"])
+                config = nixl_agent_config(backends=self._backends)
             else:
                 config = None
             self._agent = NixlAgent(self._agent_name, config)
-            logger.info(f"NIXL agent '{self._agent_name}' created on device {self._device_id}")
+            logger.info(
+                f"NIXL agent '{self._agent_name}' created on device "
+                f"{self._device_id} (backend={self._backend})"
+            )
         finally:
             if saved_ucx_tls is not None:
                 os.environ["UCX_TLS"] = saved_ucx_tls
@@ -200,7 +226,7 @@ class NixlTransferManager:
             # Register regions using raw address tuples
             # Format: (addr, size, device_id, mem_type) - 4-tuple required by NIXL API
             region_tuples = [(r[0], r[1], self._device_id, "cuda") for r in regions]
-            self._agent.register_memory(region_tuples, mem_type="cuda", backends=["UCX"])
+            self._agent.register_memory(region_tuples, mem_type="cuda", backends=self._backends)
             self._registered_regions = regions
             logger.info(f"Registered {len(regions)} contiguous regions with NIXL")
             # Debug: Log first few registered region addresses
@@ -209,7 +235,7 @@ class NixlTransferManager:
         else:
             # Traditional: register individual tensors
             tensor_list = list(tensors.values())
-            self._agent.register_memory(tensor_list, backends=["UCX"])
+            self._agent.register_memory(tensor_list, backends=self._backends)
             self._registered_regions = None
             logger.info(f"Registered {len(tensor_list)} individual tensors with NIXL")
 
@@ -462,7 +488,7 @@ class NixlTransferManager:
             agent_name=remote_agent_name,
             xfer_list=remote_descs,
             mem_type="cuda",
-            backends=["UCX"],
+            backends=self._backends,
         )
 
         if use_raw_descriptors:
@@ -471,7 +497,7 @@ class NixlTransferManager:
                 agent_name="",
                 xfer_list=local_descs,
                 mem_type="cuda",
-                backends=["UCX"],
+                backends=self._backends,
             )
         else:
             # Use tensor objects
@@ -479,7 +505,7 @@ class NixlTransferManager:
                 agent_name="",
                 xfer_list=local_descs,
                 mem_type="cuda",
-                backends=["UCX"],
+                backends=self._backends,
             )
 
         indices = list(range(len(remote_descs)))
@@ -491,7 +517,7 @@ class NixlTransferManager:
             local_indices=indices,
             remote_xfer_side=src_prepped,
             remote_indices=indices,
-            backends=["UCX"],
+            backends=self._backends,
         )
         self._agent.transfer(handle)
 
