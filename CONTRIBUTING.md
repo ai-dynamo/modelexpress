@@ -60,6 +60,8 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `cargo test` | Run all tests |
 | `cargo clippy` | Lint (must pass with no warnings) |
 | `cargo bench` | Run Criterion benchmarks |
+| `python3 scripts/bench_perf_history.py` | Pull post-merge bench timings from GitHub Actions over time (see `--help`) |
+| `python3 scripts/bench_perf_history.py --format json \| python3 scripts/plot_bench_perf.py` | Render bench timings as `bench_perf.svg` (one subplot per bench, stdlib only) |
 | `cargo run --bin modelexpress-server` | Run the gRPC server |
 | `cargo run --bin modelexpress-cli` | Run the CLI client |
 | `cargo run --bin config_gen -- --output model-express.yaml` | Generate server config |
