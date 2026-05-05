@@ -65,7 +65,27 @@ def build_source_identity(
         expert_parallel_size=ep_size,
         dtype=dtype,
         quantization=quantization,
+        revision=_resolve_model_revision(model_config),
     )
+
+
+def _resolve_model_revision(model_config) -> str:
+    """Resolve the model revision for content-addressed identity.
+
+    Priority:
+    1. MX_MODEL_REVISION env var (explicit deployer override, useful
+       for local checkpoints or non-HF sources).
+    2. model_config.revision (from vLLM's ModelConfig; typically the
+       HuggingFace commit SHA or branch/tag that was loaded).
+    3. Empty string (unknown revision; handshake relies on the other
+       identity fields only, and decentralized deployments lose the
+       bit-identical guarantee).
+    """
+    override = os.environ.get("MX_MODEL_REVISION", "")
+    if override:
+        return override
+    revision = getattr(model_config, "revision", None)
+    return revision or ""
 
 
 def build_tensor_protos(
@@ -125,7 +145,7 @@ def publish_metadata_and_ready(
         nixl_manager, tensors, device_id, global_rank,
     )
 
-    if _is_p2p_metadata_enabled():
+    if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer
 
         host = _get_worker_host()
@@ -151,6 +171,9 @@ def publish_metadata_and_ready(
             tensor_protos=tensor_protos,
             mx_source_id=mx_source_id,
             port=worker_grpc_port,
+            metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
+            agent_name=nixl_manager.agent_name,
+            worker_rank=global_rank,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
@@ -238,8 +261,31 @@ def _publish_metadata_to_server(
     raise RuntimeError(f"{message}: {last_error}") from last_error
 
 
-def _is_p2p_metadata_enabled() -> bool:
-    """Check if P2P metadata exchange is enabled via env var."""
+def _is_p2p_metadata_enabled(mx_client) -> bool:
+    """Whether to take the P2P metadata exchange path.
+
+    Some metadata backends (e.g. ``k8s-service``) have no central
+    store and REQUIRE this path regardless of the env var: they
+    expose a class-level ``REQUIRES_P2P_METADATA = True`` and this
+    function returns True for them unconditionally.
+
+    For backends that DON'T force it (``MxClient`` backed by the
+    central server), the ``MX_P2P_METADATA`` env var controls
+    whether the source publishes lightweight pointers (and serves
+    the full metadata itself) or full metadata to the server.
+    """
+    # Strict identity check against True so MagicMock's auto-attribute
+    # (and any other non-literal truthy value) doesn't accidentally
+    # force the P2P path in tests or misconfigured clients.
+    if getattr(mx_client, "REQUIRES_P2P_METADATA", False) is True:
+        env_value = os.environ.get("MX_P2P_METADATA", "")
+        if env_value not in ("", "1"):
+            logger.warning(
+                "MX_P2P_METADATA=%r is ignored for backend %s which "
+                "always uses the P2P metadata path",
+                env_value, type(mx_client).__name__,
+            )
+        return True
     return os.environ.get("MX_P2P_METADATA", "0") == "1"
 
 
