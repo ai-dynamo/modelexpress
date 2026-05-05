@@ -22,12 +22,7 @@ pub fn setup_logging(verbose: u8, quiet: bool) {
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
-        .with_writer(if quiet {
-            // In quiet mode, redirect tracing to stderr to keep stdout clean
-            std::io::stderr
-        } else {
-            std::io::stderr
-        })
+        .with_writer(std::io::stderr)
         .init();
 }
 
