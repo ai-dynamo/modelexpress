@@ -1,47 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Default loading strategy: vLLM DefaultModelLoader (CPU-staged, HF Hub download)."""
+"""Default loading strategy: engine-native disk or hub loading."""
 
 from __future__ import annotations
 
-import copy
 import logging
 
-import torch.nn as nn
-
-from .base import LoadContext, LoadStrategy, register_tensors, publish_metadata
-from ..tensor_utils import capture_tensor_attrs
+from ..adapter import EngineAdapter
+from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_default")
 
 
 class DefaultStrategy(LoadStrategy):
-    """Load weights via vLLM DefaultModelLoader (CPU-staged, HF Hub download)."""
+    """Load weights via the engine's native fallback loader."""
 
     name = "default"
+    requires = (EngineAdapter.load_via_native,)
 
     def is_available(self, ctx: LoadContext) -> bool:
-        return True
+        return super().is_available(ctx)
 
-    def load(self, model: nn.Module, ctx: LoadContext) -> bool:
-        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-        from vllm.model_executor.model_loader.utils import process_weights_after_loading
-
-        disk_config = copy.copy(ctx.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
-
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        result = _as_load_result(result)
         logger.info(f"[Worker {ctx.global_rank}] Loading weights from disk...")
-        default_loader = DefaultModelLoader(disk_config)
-        default_loader.load_weights(model, ctx.model_config)
+        result = ctx.adapter.load_via_native(result)
         logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
 
-        with capture_tensor_attrs():
-            process_weights_after_loading(model, ctx.model_config, ctx.target_device)
-
-        register_tensors(model, ctx)
-        publish_metadata(ctx)
-        return True
+        result = ctx.adapter.after_native_load(result)
+        register_tensors(result, ctx)
+        return result

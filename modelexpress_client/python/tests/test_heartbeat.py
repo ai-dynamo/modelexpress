@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from modelexpress.heartbeat import HeartbeatThread
+from modelexpress.metadata.heartbeat import HeartbeatThread
 
 
 @pytest.fixture

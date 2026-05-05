@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
+from modelexpress.adapter import EngineAdapter
+from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
 
 
@@ -24,11 +26,11 @@ from modelexpress.nixl_transfer import NixlTransferManager
 
 def _make_loader():
     """Return an MxModelLoader with a fresh mock MxClient."""
-    with patch("modelexpress.vllm_loader.DefaultModelLoader"):
+    with patch("modelexpress.engines.vllm.loader.DefaultModelLoader"):
         load_config = MagicMock()
         load_config.load_format = "mx"
         load_config.device = None
-        from modelexpress.vllm_loader import MxModelLoader
+        from modelexpress.engines.vllm.loader import MxModelLoader
         loader = MxModelLoader(load_config)
     loader._mx_client = MagicMock()
     return loader
@@ -55,6 +57,33 @@ def _make_instance_ref(mx_source_id="abc123def456abcd", worker_id="inst-1", mode
     )
 
 
+class _FakeAdapter(EngineAdapter):
+    def build_identity(self):
+        return _make_identity()
+
+    def get_worker_rank(self) -> int:
+        return 0
+
+    def get_device_id(self) -> int:
+        return 0
+
+    def discover_tensors(self, result: LoadResult):
+        return {}
+
+    def apply_weight_iter(self, result: LoadResult, weights_iter):
+        if result.model is not None:
+            result.model.load_weights(weights_iter)
+        return result
+
+    def load_via_native(self, result: LoadResult):
+        if result.model is not None:
+            result.model.load_weights([])
+        return result
+
+    def reinit_for_retry(self, result: LoadResult):
+        return result
+
+
 def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", worker_id="inst-1"):
     worker = _make_worker(rank=rank) if found else None
     return p2p_pb2.GetMetadataResponse(
@@ -78,6 +107,7 @@ def _make_load_context(**overrides):
         identity=_make_identity(),
         mx_client=MagicMock(),
         worker_id="test-worker",
+        adapter=_FakeAdapter(),
     )
     defaults.update(overrides)
     return LoadContext(**defaults)
@@ -190,21 +220,21 @@ class TestAbstractMethodCompleteness:
         assert _make_loader() is not None
 
     def test_no_remaining_abstract_methods(self):
-        from modelexpress.vllm_loader import MxModelLoader
+        from modelexpress.engines.vllm.loader import MxModelLoader
         remaining = getattr(MxModelLoader, "__abstractmethods__", frozenset())
         assert remaining == frozenset()
 
     def test_download_model_delegates(self):
         loader = _make_loader()
         cfg = MagicMock()
-        with patch("modelexpress.vllm_loader.DefaultModelLoader") as mock_cls:
+        with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
             loader.download_model(cfg)
             mock_cls.return_value.download_model.assert_called_once_with(cfg)
 
     def test_load_weights_delegates(self):
         loader = _make_loader()
         model, cfg = MagicMock(), MagicMock()
-        with patch("modelexpress.vllm_loader.DefaultModelLoader") as mock_cls:
+        with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
             loader.load_weights(model, cfg)
             mock_cls.return_value.load_weights.assert_called_once_with(model, cfg)
 
@@ -332,6 +362,57 @@ class TestLoadStrategyChainRunErrorHandling:
             LoadStrategyChain.run(model, ctx)
 
         assert call_order == ["exploding", "fallback"]
+
+    def test_strategy_false_runs_rollback_before_next(self):
+        from modelexpress.load_strategy import LoadStrategyChain
+
+        call_order = []
+
+        def false_load(self_or_model, *args, **kwargs):
+            call_order.append("false")
+            return False
+
+        def rollback(self_or_ctx, *args, **kwargs):
+            call_order.append("rollback")
+            return True
+
+        def fallback_load(self_or_model, *args, **kwargs):
+            call_order.append("fallback")
+            return True
+
+        ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
+        model = MagicMock()
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.load",
+            false_load,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.rollback",
+            rollback,
+        ), patch(
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
+            fallback_load,
+        ):
+            LoadStrategyChain.run(model, ctx)
+
+        assert call_order == ["false", "rollback", "fallback"]
+        ctx.adapter.reinit_for_retry.assert_called_once()
 
 
 class TestRdmaStrategyAvailability:
@@ -503,10 +584,11 @@ class TestRdmaStrategyLoad:
 
         original_load_as_target = strategy._load_as_target
 
-        def fake_load_as_target(_m, _ctx, _worker, _mx_id, worker_id):
+        def fake_load_as_target(_result, _ctx, _worker, _mx_id, worker_id):
             attempts.append(worker_id)
             if load_raises_for and worker_id in load_raises_for:
                 raise SourceTransferError(f"transfer failed: {worker_id}")
+            return _result
 
         strategy._load_as_target = fake_load_as_target
         return strategy, attempts
@@ -520,7 +602,7 @@ class TestRdmaStrategyLoad:
              patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
             result = strategy.load(MagicMock(), ctx)
 
-        assert result is True
+        assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
     def test_tries_next_on_source_transfer_error(self):
@@ -540,7 +622,7 @@ class TestRdmaStrategyLoad:
              patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
             result = strategy.load(MagicMock(), ctx)
 
-        assert result is True
+        assert isinstance(result, LoadResult)
         assert attempts == ["w-1", "w-2"]
 
     def test_returns_false_when_no_candidates(self):
@@ -576,7 +658,7 @@ class TestRdmaStrategyLoad:
 
 class TestPublishMetadataAndReady:
     def test_calls_publish_and_starts_heartbeat(self):
-        from modelexpress.metadata import publish_metadata_and_ready
+        from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
         mx_client.publish_metadata.return_value = "abc123def456abcd"
@@ -596,7 +678,7 @@ class TestPublishMetadataAndReady:
         identity = _make_identity("my-model")
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
+             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
             publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
 
         mx_client.publish_metadata.assert_called_once()
@@ -614,7 +696,7 @@ class TestPublishMetadataAndReady:
         mock_hb.start.assert_called_once()
 
     def test_retries_publish_before_starting_heartbeat(self):
-        from modelexpress.metadata import publish_metadata_and_ready
+        from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
         mx_client.publish_metadata.side_effect = [
@@ -629,8 +711,8 @@ class TestPublishMetadataAndReady:
         identity = _make_identity()
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
+             patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
+             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
             publish_metadata_and_ready(
                 mx_client,
                 nixl_manager,
@@ -654,7 +736,7 @@ class TestPublishMetadataAndReady:
 
     def test_publish_failure_after_retries_raises_runtime_error(self):
         """If publish_metadata keeps failing, heartbeat should not be started."""
-        from modelexpress.metadata import publish_metadata_and_ready
+        from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
         mx_client.publish_metadata.side_effect = [
@@ -669,8 +751,8 @@ class TestPublishMetadataAndReady:
         identity = _make_identity()
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
+             patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
+             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
                 publish_metadata_and_ready(
                     mx_client,
@@ -687,7 +769,7 @@ class TestPublishMetadataAndReady:
         hb_cls.assert_not_called()
 
     def test_non_retryable_grpc_failure_fails_immediately(self):
-        from modelexpress.metadata import publish_metadata_and_ready
+        from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
         mx_client.publish_metadata.side_effect = _FakeRpcError(
@@ -701,8 +783,8 @@ class TestPublishMetadataAndReady:
         identity = _make_identity()
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
+             patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
+             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(_FakeRpcError, match="permission denied"):
                 publish_metadata_and_ready(
                     mx_client,
@@ -907,12 +989,12 @@ class TestConfigureVllmLogging:
             self._reset_mx_logger()
             configure_vllm_logging()
 
-            child = logging.getLogger("modelexpress.heartbeat")
+            child = logging.getLogger("modelexpress.metadata.heartbeat")
             child.info("Heartbeat started")
 
             assert len(buf.buffer) == 1
             assert "Heartbeat started" in buf.buffer[0].getMessage()
-            assert buf.buffer[0].name == "modelexpress.heartbeat"
+            assert buf.buffer[0].name == "modelexpress.metadata.heartbeat"
         finally:
             vllm_logger.removeHandler(buf)
             self._cleanup(vllm_logger)

@@ -10,6 +10,9 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 import torch
 
+from modelexpress.adapter import EngineAdapter
+from modelexpress.load_strategy.context import LoadResult
+
 
 # ---------------------------------------------------------------------------
 # GDS availability detection
@@ -202,6 +205,15 @@ class TestResolveSafetensorsFiles:
 class TestGdsStrategyIntegration:
     """Tests for GdsStrategy loading behavior."""
 
+    class _FakeAdapter(EngineAdapter):
+        def discover_tensors(self, result: LoadResult):
+            return {}
+
+        def apply_weight_iter(self, result: LoadResult, weights_iter):
+            if result.model is not None:
+                result.model.load_weights(weights_iter)
+            return result
+
     def _make_context(self):
         from modelexpress.load_strategy import LoadContext
         return LoadContext(
@@ -214,6 +226,7 @@ class TestGdsStrategyIntegration:
             identity=MagicMock(),
             mx_client=MagicMock(),
             worker_id="test-worker",
+            adapter=self._FakeAdapter(),
         )
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
@@ -234,7 +247,8 @@ class TestGdsStrategyIntegration:
         model = MagicMock()
         result = strategy.load(model, ctx)
 
-        assert result is True
+        assert isinstance(result, LoadResult)
+        assert result.model is model
         mock_gds.load_iter.assert_called_once()
         model.load_weights.assert_called_once()
         mock_gds.shutdown.assert_called_once()

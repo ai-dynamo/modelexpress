@@ -13,15 +13,15 @@ from typing import TYPE_CHECKING
 import grpc
 import torch
 
-from .client import MxClient
 from .heartbeat import HeartbeatThread
-from . import p2p_pb2
+from ..client import MxClient
+from .. import p2p_pb2
 
 if TYPE_CHECKING:
-    from .nixl_transfer import NixlTransferManager
+    from ..nixl_transfer import NixlTransferManager
     from .worker_server import WorkerGrpcServer
 
-logger = logging.getLogger("modelexpress.metadata")
+logger = logging.getLogger("modelexpress.metadata.publish")
 
 PUBLISH_METADATA_MAX_ATTEMPTS = 3
 PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS = 1.0

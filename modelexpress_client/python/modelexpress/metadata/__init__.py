@@ -1,8 +1,4 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compatibility import path for the vLLM ModelExpress loader."""
-
-from .engines.vllm.loader import MxModelLoader
-
-__all__ = ["MxModelLoader"]
+"""Metadata coordination helpers for ModelExpress."""

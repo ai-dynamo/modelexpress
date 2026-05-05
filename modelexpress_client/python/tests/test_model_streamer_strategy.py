@@ -9,11 +9,23 @@ import pytest
 import torch
 
 from modelexpress import p2p_pb2
+from modelexpress.adapter import EngineAdapter
+from modelexpress.load_strategy.context import LoadResult
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _FakeAdapter(EngineAdapter):
+    def discover_tensors(self, result: LoadResult):
+        return {}
+
+    def apply_weight_iter(self, result: LoadResult, weights_iter):
+        if result.model is not None:
+            result.model.load_weights(weights_iter)
+        return result
 
 
 def _make_load_context(**overrides):
@@ -30,6 +42,7 @@ def _make_load_context(**overrides):
         identity=p2p_pb2.SourceIdentity(model_name="test-model"),
         mx_client=MagicMock(),
         worker_id="test-worker",
+        adapter=_FakeAdapter(),
     )
     defaults.update(overrides)
     return LoadContext(**defaults)
@@ -105,13 +118,8 @@ class TestModelStreamerLoad:
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    @patch("modelexpress.load_strategy.model_streamer_strategy.capture_tensor_attrs")
-    def test_success_path_s3(self, mock_capture, mock_register, mock_publish):
-        mock_capture.return_value.__enter__ = MagicMock()
-        mock_capture.return_value.__exit__ = MagicMock(return_value=False)
-
+    def test_success_path_s3(self, mock_register):
         model = MagicMock()
         ctx = _make_load_context()
         strategy = self._make_strategy()
@@ -125,24 +133,16 @@ class TestModelStreamerLoad:
                     ("layer.0.weight", torch.randn(4, 4)),
                     ("layer.1.weight", torch.randn(4, 4)),
                 ])
-                with patch(
-                    "vllm.model_executor.model_loader.utils.process_weights_after_loading"
-                ):
-                    result = strategy.load(model, ctx)
+                result = strategy.load(model, ctx)
 
-        assert result is True
+        assert isinstance(result, LoadResult)
+        assert result.model is model
         model.load_weights.assert_called_once()
-        mock_register.assert_called_once_with(model, ctx)
-        mock_publish.assert_called_once_with(ctx)
+        mock_register.assert_called_once_with(result, ctx)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    @patch("modelexpress.load_strategy.model_streamer_strategy.capture_tensor_attrs")
-    def test_success_path_local(self, mock_capture, mock_register, mock_publish):
+    def test_success_path_local(self, mock_register):
         """load() works with a local path in MX_MODEL_URI."""
-        mock_capture.return_value.__enter__ = MagicMock()
-        mock_capture.return_value.__exit__ = MagicMock(return_value=False)
-
         model = MagicMock()
         ctx = _make_load_context()
         strategy = self._make_strategy()
@@ -155,17 +155,13 @@ class TestModelStreamerLoad:
                 mock_stream.return_value = iter([
                     ("layer.0.weight", torch.randn(4, 4)),
                 ])
-                with patch(
-                    "vllm.model_executor.model_loader.utils.process_weights_after_loading"
-                ):
-                    result = strategy.load(model, ctx)
+                result = strategy.load(model, ctx)
 
-        assert result is True
+        assert isinstance(result, LoadResult)
         mock_stream.assert_called_once_with("/models/llama", ctx)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_env_overrides_model_config(self, mock_register, mock_publish):
+    def test_env_overrides_model_config(self, mock_register):
         """MX_MODEL_URI takes priority over model_config.model."""
         model = MagicMock()
         model_config = MagicMock()
@@ -183,9 +179,8 @@ class TestModelStreamerLoad:
 
         mock_stream.assert_called_once_with("s3://bucket/model", ctx)
 
-    @patch("modelexpress.load_strategy.model_streamer_strategy.publish_metadata")
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_returns_false_on_error(self, mock_register, mock_publish):
+    def test_returns_false_on_error(self, mock_register):
         model = MagicMock()
         ctx = _make_load_context()
         strategy = self._make_strategy()
@@ -200,7 +195,6 @@ class TestModelStreamerLoad:
 
         assert result is False
         mock_register.assert_not_called()
-        mock_publish.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

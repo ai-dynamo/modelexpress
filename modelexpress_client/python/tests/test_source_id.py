@@ -12,7 +12,7 @@ sides' tests will fail together and catch it.
 from __future__ import annotations
 
 from modelexpress import p2p_pb2
-from modelexpress.source_id import compute_mx_source_id
+from modelexpress.metadata.source_id import compute_mx_source_id
 
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
