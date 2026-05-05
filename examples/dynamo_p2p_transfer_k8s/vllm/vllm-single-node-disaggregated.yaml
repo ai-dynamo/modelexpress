@@ -104,10 +104,6 @@ spec:
           value: "mx-vllm-disagg-sn-modelexpress:8000"
         - name: MX_CONTIGUOUS_REG
           value: "0"
-        # Kimi-K2.5-NVFP4 uses MLA which is blocked by default.
-        # P2P inference verified correct with adopt_hidden_tensors fix.
-        - name: MX_SKIP_FEATURE_CHECK
-          value: "1"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL
@@ -191,10 +187,6 @@ spec:
           value: "mx-vllm-disagg-sn-modelexpress:8000"
         - name: MX_CONTIGUOUS_REG
           value: "0"
-        # Kimi-K2.5-NVFP4 uses MLA which is blocked by default.
-        # P2P inference verified correct with adopt_hidden_tensors fix.
-        - name: MX_SKIP_FEATURE_CHECK
-          value: "1"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL

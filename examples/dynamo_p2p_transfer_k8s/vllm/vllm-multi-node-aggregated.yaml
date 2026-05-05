@@ -113,10 +113,6 @@ spec:
           value: "mx-vllm-modelexpress:8000"
         - name: MX_CONTIGUOUS_REG
           value: "0"
-        # Kimi-K2.5-NVFP4 uses MLA which is blocked by default.
-        # P2P inference verified correct with adopt_hidden_tensors fix.
-        - name: MX_SKIP_FEATURE_CHECK
-          value: "1"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN
           value: "auto"

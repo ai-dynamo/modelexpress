@@ -544,7 +544,7 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
-| p0 | `RdmaStrategy` | NIXL available + MLA check passes | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError` or `ManifestMismatchError`, try next. |
+| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError` or `ManifestMismatchError`, try next. |
 | p1 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
 | p3 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
@@ -553,9 +553,9 @@ Each strategy is fully self-contained: it handles weight loading, post-processin
 
 ### Transfer Safety
 
-`RdmaStrategy.is_available()` checks `transfer_safety.check_transfer_allowed()` before attempting P2P transfer. Currently the only blocked feature is MLA (Multi-head Latent Attention), detected via `kv_lora_rank` in the HF model config. MLA models (DeepSeek-V2/V3, Kimi K2/K2.5, GLM-5.1, and any future model using MLA) fall back to GDS or disk loading automatically.
+`RdmaStrategy.is_available()` calls `transfer_safety.check_transfer_allowed()` before attempting P2P transfer. The function logs the model's detected features (attention type, quantization, MoE) and currently allows all combinations — no feature is blocked. The function is kept as a hook for future safety gates.
 
-NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. Note DeepSeek-V3 (MLA + FP8) is not affected — FP8 scale state lives on Modules and is already captured. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned CUDA tensors and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4. Set `MX_SKIP_FEATURE_CHECK=1` to bypass the MLA feature gate for models in this class.
+NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned CUDA tensors and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4 and on DeepSeek-V3 (MLA + FP8).
 
 During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match. This triggers trying the next source candidate rather than marking the source as stale, which is important during rolling updates where pods may run different image versions.
 
