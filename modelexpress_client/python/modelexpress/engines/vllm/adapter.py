@@ -8,7 +8,7 @@ from __future__ import annotations
 import copy
 import logging
 import uuid
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 
@@ -16,10 +16,13 @@ from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...metadata.publish import build_source_identity
-from ...rank_utils import get_global_rank, get_worker_rank
+from ...rank_utils import get_device_id, get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 class VllmAdapter(EngineAdapter):
@@ -35,13 +38,13 @@ class VllmAdapter(EngineAdapter):
         return build_source_identity(self.vllm_config, self.model_config)
 
     def get_worker_rank(self) -> int:
-        return get_worker_rank(self.target_device)
+        return _get_vllm_worker_rank(self.vllm_config)
 
     def get_global_rank(self) -> int:
         return get_global_rank(self.target_device)
 
     def get_device_id(self) -> int:
-        return get_worker_rank(self.target_device)
+        return get_device_id(self.target_device)
 
     def get_target_device(self) -> torch.device:
         return self.target_device
@@ -148,6 +151,27 @@ class VllmAdapter(EngineAdapter):
         compilation_config.disabled_custom_ops.clear()
         compilation_config.traced_files.clear()
         compilation_config.compilation_time = 0.0
+
+
+def _get_vllm_worker_rank(vllm_config: VllmConfig) -> int:
+    """Return the vLLM model-shard key used for source/target matching.
+
+    vLLM's parallel_config.rank is flattened in model-parallel order. Modulo the
+    model-parallel size keeps the TP/PP shard identity and ignores DP replicas,
+    whose weights are interchangeable.
+    """
+    parallel_config = vllm_config.parallel_config
+    rank = parallel_config.rank
+    tp_size = int(parallel_config.tensor_parallel_size)
+    pp_size = int(parallel_config.pipeline_parallel_size)
+    model_parallel_size = max(1, tp_size * pp_size)
+    worker_rank = int(rank) % model_parallel_size
+    logger.debug(
+        "Got vLLM worker rank from parallel_config: "
+        "rank=%d worker_rank=%d model_parallel_size=%d",
+        rank, worker_rank, model_parallel_size,
+    )
+    return worker_rank
 
 
 def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
