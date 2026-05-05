@@ -67,7 +67,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 | vLLM | `--load-format mx` for P2P weight transfer |
 | NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
-| SGLang | Coming soon |
+| SGLang | `--modelexpress-config` with `transport=nixl` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
 
 ---
 

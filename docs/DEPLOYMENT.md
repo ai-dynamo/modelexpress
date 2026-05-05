@@ -574,6 +574,13 @@ kubectl -n $NAMESPACE delete -f examples/k8s_service_sources/sources-tp2-single-
 
 See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_sources/README.md) for the annotated manifests and [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale.
 
+#### SGLang Clients
+
+ModelExpress also works as the remote-instance weight loader for SGLang via
+upstream [sgl-project/sglang#23105](https://github.com/sgl-project/sglang/pull/23105),
+supporting both Mooncake TransferEngine and NIXL transports. See
+[`SGLANG.md`](SGLANG.md) for the user-facing guide.
+
 ## Debugging
 
 ```bash
