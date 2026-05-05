@@ -22,7 +22,12 @@ class UnsupportedCapability(NotImplementedError):
 
 
 class StrategyFailed(RuntimeError):
-    """A strategy failed but the chain may try the next strategy."""
+    """Expected strategy miss that lets the chain try the next strategy.
+
+    Set mutated=True when the current strategy may have changed model weights
+    or model structure before failing. The chain will run rollback() for
+    strategy-owned cleanup, then ask the adapter to re-initialize the model.
+    """
 
     def __init__(self, message: str, *, mutated: bool = False):
         super().__init__(message)
@@ -55,6 +60,10 @@ class EngineAdapter:
 
     @gated_capability
     def get_worker_rank(self) -> int:
+        ...
+
+    @gated_capability
+    def get_global_rank(self) -> int:
         ...
 
     @gated_capability

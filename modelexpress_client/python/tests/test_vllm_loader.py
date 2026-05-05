@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
-from modelexpress.adapter import EngineAdapter
+from modelexpress.adapter import EngineAdapter, StrategyFailed
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
 
@@ -238,6 +238,37 @@ class TestAbstractMethodCompleteness:
             loader.load_weights(model, cfg)
             mock_cls.return_value.load_weights.assert_called_once_with(model, cfg)
 
+    def test_load_model_clears_stale_nixl_manager_when_none_registered(self):
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        loader = _make_loader()
+        stale_manager = MagicMock()
+        model = MagicMock()
+        ctx = _make_load_context(device_id=3)
+        ctx.tensors = {"w": MagicMock()}
+        ctx.nixl_manager = None
+        loader_mod._nixl_managers[3] = stale_manager
+
+        try:
+            with patch(
+                "modelexpress.engines.vllm.loader.build_vllm_load_context",
+                return_value=ctx,
+            ), patch(
+                "modelexpress.engines.vllm.loader.initialize_model",
+                return_value=model,
+            ), patch(
+                "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+                return_value=model,
+            ):
+                loaded = loader.load_model(MagicMock(), MagicMock(dtype=torch.float32))
+
+            assert loaded is model.eval.return_value
+            assert loader_mod._tensor_registry[3] == ctx.tensors
+            assert 3 not in loader_mod._nixl_managers
+        finally:
+            loader_mod._nixl_managers.pop(3, None)
+            loader_mod._tensor_registry.pop(3, None)
+
 
 # ---------------------------------------------------------------------------
 # register_tensors (load_strategy.base)
@@ -322,7 +353,7 @@ class TestPublishMetadataErrorHandling:
 class TestLoadStrategyChainRunErrorHandling:
     """Verify LoadStrategyChain.run catches exceptions from strategy.load()."""
 
-    def test_strategy_exception_falls_through_to_next(self):
+    def test_unexpected_strategy_exception_rolls_back_before_next(self):
         from modelexpress.load_strategy import LoadStrategyChain
 
         call_order = []
@@ -331,9 +362,12 @@ class TestLoadStrategyChainRunErrorHandling:
             call_order.append("exploding")
             raise RuntimeError("unexpected crash")
 
+        def rollback(self_or_ctx, *args, **kwargs):
+            call_order.append("rollback")
+
         def fallback_load(self_or_model, *args, **kwargs):
             call_order.append("fallback")
-            return True
+            return args[0]
 
         ctx = _make_load_context()
         model = MagicMock()
@@ -350,6 +384,10 @@ class TestLoadStrategyChainRunErrorHandling:
             "ModelStreamerStrategy.load",
             exploding_load,
         ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.rollback",
+            rollback,
+        ), patch(
             "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
             return_value=False,
         ), patch(
@@ -361,24 +399,23 @@ class TestLoadStrategyChainRunErrorHandling:
         ):
             LoadStrategyChain.run(model, ctx)
 
-        assert call_order == ["exploding", "fallback"]
+        assert call_order == ["exploding", "rollback", "fallback"]
 
-    def test_strategy_false_runs_rollback_before_next(self):
+    def test_strategy_failed_runs_rollback_before_next(self):
         from modelexpress.load_strategy import LoadStrategyChain
 
         call_order = []
 
-        def false_load(self_or_model, *args, **kwargs):
-            call_order.append("false")
-            return False
+        def failed_load(self_or_model, *args, **kwargs):
+            call_order.append("failed")
+            raise StrategyFailed("expected miss")
 
         def rollback(self_or_ctx, *args, **kwargs):
             call_order.append("rollback")
-            return True
 
         def fallback_load(self_or_model, *args, **kwargs):
             call_order.append("fallback")
-            return True
+            return args[0]
 
         ctx = _make_load_context()
         ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
@@ -394,7 +431,7 @@ class TestLoadStrategyChainRunErrorHandling:
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
-            false_load,
+            failed_load,
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.rollback",
@@ -411,8 +448,111 @@ class TestLoadStrategyChainRunErrorHandling:
         ):
             LoadStrategyChain.run(model, ctx)
 
-        assert call_order == ["false", "rollback", "fallback"]
-        ctx.adapter.reinit_for_retry.assert_called_once()
+        assert call_order == ["failed", "rollback", "fallback"]
+        ctx.adapter.reinit_for_retry.assert_not_called()
+
+    def test_strategy_failed_runs_rollback_and_reinit_when_mutated(self):
+        from modelexpress.load_strategy import LoadStrategyChain
+
+        call_order = []
+
+        def failed_load(self_or_model, *args, **kwargs):
+            call_order.append("failed")
+            raise StrategyFailed("mutated failure", mutated=True)
+
+        def rollback(self_or_ctx, *args, **kwargs):
+            call_order.append("rollback")
+
+        def reinit(result):
+            call_order.append("reinit")
+            return result
+
+        def fallback_load(self_or_model, *args, **kwargs):
+            call_order.append("fallback")
+            return args[0]
+
+        ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=reinit)
+        model = MagicMock()
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.load",
+            failed_load,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.rollback",
+            rollback,
+        ), patch(
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
+            fallback_load,
+        ):
+            LoadStrategyChain.run(model, ctx)
+
+        assert call_order == ["failed", "rollback", "reinit", "fallback"]
+
+    def test_strategy_failed_runs_rollback_without_reinit_when_clean(self):
+        from modelexpress.load_strategy import LoadStrategyChain
+
+        call_order = []
+
+        def failed_load(self_or_model, *args, **kwargs):
+            call_order.append("failed")
+            raise StrategyFailed("clean failure", mutated=False)
+
+        def rollback(self_or_ctx, *args, **kwargs):
+            call_order.append("rollback")
+
+        def fallback_load(self_or_model, *args, **kwargs):
+            call_order.append("fallback")
+            return args[0]
+
+        ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
+        model = MagicMock()
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.load",
+            failed_load,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.rollback",
+            rollback,
+        ), patch(
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
+            fallback_load,
+        ):
+            LoadStrategyChain.run(model, ctx)
+
+        assert call_order == ["failed", "rollback", "fallback"]
+        ctx.adapter.reinit_for_retry.assert_not_called()
 
 
 class TestRdmaStrategyAvailability:
@@ -573,7 +713,6 @@ class TestFetchWorkerMetadata:
 class TestRdmaStrategyLoad:
     def _setup(self, ctx, candidates, metadata_side_effects, load_raises_for=None):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
-        from modelexpress.load_strategy import SourceTransferError
 
         strategy = RdmaStrategy()
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
@@ -582,18 +721,16 @@ class TestRdmaStrategyLoad:
         ctx.mx_client.get_metadata.side_effect = metadata_side_effects
         attempts = []
 
-        original_load_as_target = strategy._load_as_target
-
         def fake_load_as_target(_result, _ctx, _worker, _mx_id, worker_id):
             attempts.append(worker_id)
             if load_raises_for and worker_id in load_raises_for:
-                raise SourceTransferError(f"transfer failed: {worker_id}")
+                raise StrategyFailed(f"transfer failed: {worker_id}", mutated=True)
             return _result
 
         strategy._load_as_target = fake_load_as_target
         return strategy, attempts
 
-    def test_returns_true_on_first_success(self):
+    def test_returns_result_on_first_success(self):
         ctx = _make_load_context()
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [_make_metadata_resp(rank=0, worker_id="w-1")])
@@ -605,7 +742,7 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_tries_next_on_source_transfer_error(self):
+    def test_propagates_strategy_failed_after_target_mutation(self):
         ctx = _make_load_context()
         candidates = [
             _make_instance_ref(worker_id="w-1"),
@@ -620,35 +757,72 @@ class TestRdmaStrategyLoad:
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
              patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
-            result = strategy.load(MagicMock(), ctx)
+            with pytest.raises(StrategyFailed, match="transfer failed: w-1") as exc:
+                strategy.load(MagicMock(), ctx)
 
-        assert isinstance(result, LoadResult)
-        assert attempts == ["w-1", "w-2"]
+        assert exc.value.mutated is True
+        assert attempts == ["w-1"]
 
-    def test_returns_false_when_no_candidates(self):
+    def test_raises_strategy_failed_when_no_candidates(self):
         ctx = _make_load_context()
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[])
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
         strategy = RdmaStrategy()
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True):
-            result = strategy.load(MagicMock(), ctx)
-        assert result is False
+            with pytest.raises(StrategyFailed, match="No RDMA source available") as exc:
+                strategy.load(MagicMock(), ctx)
+        assert exc.value.mutated is False
 
-    def test_returns_false_when_all_fail(self):
+    def test_raises_strategy_failed_when_all_sources_fail(self):
         ctx = _make_load_context()
         candidates = [_make_instance_ref(worker_id=f"w-{i}") for i in range(3)]
         strategy, _ = self._setup(
             ctx, candidates,
-            [_make_metadata_resp(rank=0, worker_id=f"w-{i}") for i in range(3)],
-            load_raises_for={"w-0", "w-1", "w-2"},
+            [
+                p2p_pb2.GetMetadataResponse(found=False)
+                for _ in range(3)
+            ],
         )
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
              patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
-            result = strategy.load(MagicMock(), ctx)
+            with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
+                strategy.load(MagicMock(), ctx)
 
-        assert result is False
+        assert exc.value.mutated is False
+
+    def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        result = LoadResult(value=MagicMock(), model=MagicMock())
+        strategy = RdmaStrategy()
+        source_worker = _make_worker()
+
+        ctx.adapter.prepare_rdma_target = MagicMock(side_effect=lambda result: result)
+        ctx.adapter.before_rdma_receive = MagicMock(
+            side_effect=RuntimeError("post-prepare failure")
+        )
+
+        with pytest.raises(StrategyFailed, match="post-prepare failure") as exc:
+            strategy._load_as_target(result, ctx, source_worker, "src", "worker")
+
+        assert exc.value.mutated is True
+
+    def test_rollback_shuts_down_nixl_manager(self):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.tensors = {"w": MagicMock()}
+        manager = MagicMock()
+        ctx.nixl_manager = manager
+
+        RdmaStrategy().rollback(ctx)
+
+        manager.shutdown.assert_called_once()
+        assert ctx.nixl_manager is None
+        assert ctx.tensors == {}
 
 
 # ---------------------------------------------------------------------------

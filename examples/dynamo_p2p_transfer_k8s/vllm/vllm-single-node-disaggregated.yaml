@@ -150,8 +150,6 @@ spec:
             - --trust-remote-code
             - --disaggregation-mode
             - decode
-            - --kv-transfer-config
-            - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
       volumeMounts:
         - name: shared-model-cache
           mountPoint: /models

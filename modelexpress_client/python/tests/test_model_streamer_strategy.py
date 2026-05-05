@@ -10,6 +10,7 @@ import torch
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import EngineAdapter
+from modelexpress.adapter import StrategyFailed
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -175,12 +176,13 @@ class TestModelStreamerLoad:
                 "ModelStreamerStrategy._stream_weights"
             ) as mock_stream:
                 mock_stream.side_effect = RuntimeError("expected")
-                strategy.load(model, ctx)
+                with pytest.raises(StrategyFailed, match="expected"):
+                    strategy.load(model, ctx)
 
         mock_stream.assert_called_once_with("s3://bucket/model", ctx)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_returns_false_on_error(self, mock_register):
+    def test_raises_strategy_failed_on_error(self, mock_register):
         model = MagicMock()
         ctx = _make_load_context()
         strategy = self._make_strategy()
@@ -191,9 +193,30 @@ class TestModelStreamerLoad:
                 "ModelStreamerStrategy._stream_weights",
                 side_effect=RuntimeError("S3 connection failed"),
             ):
-                result = strategy.load(model, ctx)
+                with pytest.raises(StrategyFailed, match="S3 connection failed") as exc:
+                    strategy.load(model, ctx)
 
-        assert result is False
+        assert exc.value.mutated is False
+        mock_register.assert_not_called()
+
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    def test_apply_weight_iter_failure_is_mutated(self, mock_register):
+        model = MagicMock()
+        adapter = _FakeAdapter()
+        adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
+        ctx = _make_load_context(adapter=adapter)
+        strategy = self._make_strategy()
+
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights",
+                return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
+            ):
+                with pytest.raises(StrategyFailed, match="partial load") as exc:
+                    strategy.load(model, ctx)
+
+        assert exc.value.mutated is True
         mock_register.assert_not_called()
 
 
@@ -333,7 +356,9 @@ class TestChainOrder:
         def track_load(strategy_name):
             def _load(self_or_model, *args, **kwargs):
                 call_order.append(strategy_name)
-                return strategy_name == "default"
+                if strategy_name != "default":
+                    raise StrategyFailed(f"{strategy_name} miss")
+                return args[0]
             return _load
 
         model = MagicMock()
@@ -382,7 +407,9 @@ class TestChainOrder:
         def track_load(strategy_name):
             def _load(self_or_model, *args, **kwargs):
                 call_order.append(strategy_name)
-                return strategy_name == "default"
+                if strategy_name != "default":
+                    raise StrategyFailed(f"{strategy_name} miss")
+                return args[0]
             return _load
 
         model = MagicMock()

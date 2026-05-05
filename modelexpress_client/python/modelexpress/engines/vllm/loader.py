@@ -30,8 +30,9 @@ import torch
 import torch.nn as nn
 
 from ... import configure_vllm_logging
-from ...load_strategy import build_load_context, LoadContext, LoadStrategyChain
+from ...load_strategy import LoadContext, LoadStrategyChain
 from ...nixl_transfer import NixlTransferManager
+from .adapter import build_vllm_load_context
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -71,7 +72,7 @@ class MxModelLoader(BaseModelLoader):
         """Load model, auto-detecting the best loading strategy."""
         load_start = time.perf_counter()
 
-        ctx = build_load_context(vllm_config, model_config)
+        ctx = build_vllm_load_context(vllm_config, model_config)
         self._ctx = ctx
 
         logger.info(f"[Worker {ctx.global_rank}] MxModelLoader starting (model={ctx.identity.model_name})")
@@ -88,6 +89,8 @@ class MxModelLoader(BaseModelLoader):
             _tensor_registry[ctx.device_id] = ctx.tensors
             if ctx.nixl_manager is not None:
                 _nixl_managers[ctx.device_id] = ctx.nixl_manager
+            else:
+                _nixl_managers.pop(ctx.device_id, None)
 
         total_time = time.perf_counter() - load_start
         logger.info(

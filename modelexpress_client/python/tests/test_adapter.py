@@ -35,6 +35,9 @@ def test_inherited_gated_capability_raises_unsupported_capability():
     with pytest.raises(UnsupportedCapability, match="discover_tensors"):
         adapter.discover_tensors(LoadResult(value=None))
 
+    with pytest.raises(UnsupportedCapability, match="get_global_rank"):
+        adapter.get_global_rank()
+
 
 def test_strategy_unavailable_when_required_capability_is_inherited_default():
     strategy = _DiscoverTensorsStrategy()

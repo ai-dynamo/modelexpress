@@ -18,7 +18,7 @@ from typing import Iterator
 
 import torch
 
-from ..adapter import EngineAdapter
+from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
 
@@ -89,20 +89,27 @@ class ModelStreamerStrategy(LoadStrategy):
             return False
         return True
 
-    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult | bool:
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
         model_uri = _resolve_model_uri(os.environ["MX_MODEL_URI"])
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:
             weights_iter = self._stream_weights(model_uri, ctx)
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
+            )
+            raise StrategyFailed(str(e), mutated=False) from e
+
+        try:
             result = ctx.adapter.apply_weight_iter(result, weights_iter)
             logger.info(f"[Worker {ctx.global_rank}] Model streamer weight loading complete")
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
             )
-            return False
+            raise StrategyFailed(str(e), mutated=True) from e
 
         result = ctx.adapter.after_weight_iter_load(result)
         register_tensors(result, ctx)

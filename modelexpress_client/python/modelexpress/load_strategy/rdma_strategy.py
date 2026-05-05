@@ -12,7 +12,7 @@ import time
 
 import torch
 
-from ..adapter import EngineAdapter
+from ..adapter import EngineAdapter, StrategyFailed
 from .base import (
     LoadContext,
     LoadStrategy,
@@ -23,7 +23,7 @@ from .base import (
 from .context import LoadResult
 from ..nixl_transfer import is_nixl_available
 from ..transfer_safety import check_transfer_allowed
-from ..types import ManifestMismatchError, TensorDescriptor
+from ..types import TensorDescriptor
 from .. import p2p_pb2
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
@@ -41,17 +41,17 @@ class RdmaStrategy(LoadStrategy):
     name = "rdma"
     requires = (EngineAdapter.discover_tensors,)
 
-    def rollback(self, ctx: LoadContext) -> bool:
-        """Clean up NIXL state from a failed RDMA target attempt.
-
-        Returns True if the target path registered tensors or initialized a
-        NIXL manager during the attempt.
-        """
-        if ctx.tensors or ctx.nixl_manager is not None:
-            ctx.tensors = {}
-            ctx.nixl_manager = None
-            return True
-        return False
+    def rollback(self, ctx: LoadContext) -> None:
+        """Clean up NIXL state from a failed RDMA target attempt."""
+        if ctx.nixl_manager is not None:
+            try:
+                ctx.nixl_manager.shutdown()
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager: {e}"
+                )
+        ctx.tensors = {}
+        ctx.nixl_manager = None
 
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):
@@ -78,12 +78,20 @@ class RdmaStrategy(LoadStrategy):
 
         return True
 
-    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult | bool:
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        """Load from a READY source or raise StrategyFailed for fallback.
+
+        Source discovery and metadata misses do not mutate the target model and
+        therefore raise clean StrategyFailed errors. Once _load_as_target()
+        prepares target storage, failures are treated as mutated because the
+        engine may have initialized or transformed model tensors, and those
+        failures are raised immediately instead of trying another source.
+        """
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
         if not candidates:
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
-            return False
+            raise StrategyFailed("No RDMA source available", mutated=False)
 
         for instance in candidates[:MAX_SOURCE_RETRIES]:
             mx_source_id = instance.mx_source_id
@@ -108,28 +116,22 @@ class RdmaStrategy(LoadStrategy):
                 f"({len(source_worker.tensors)} tensors)"
             )
 
-            try:
-                result = self._load_as_target(
-                    result, ctx, source_worker, mx_source_id, worker_id,
-                )
-                return result
-            except SourceTransferError as e:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Source transfer failed for worker {worker_id}: {e}. "
-                    f"Trying next candidate."
-                )
-            except ManifestMismatchError as e:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Manifest mismatch with worker {worker_id}: {e}. "
-                    f"Trying next candidate."
-                )
+            # Do not try another source after target preparation starts. The
+            # adapter may have initialized or transformed model tensors, and a
+            # failed receive may have partially written weights. The chain will
+            # re-initialize the model before trying the next loading strategy.
+            return self._load_as_target(
+                result, ctx, source_worker, mx_source_id, worker_id,
+            )
 
         tried = min(len(candidates), MAX_SOURCE_RETRIES)
         logger.warning(
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
-        return False
+        # Only pre-target metadata/discovery misses reach here. Failures after
+        # target preparation are raised from _load_as_target() as mutated=True.
+        raise StrategyFailed("No RDMA source succeeded", mutated=False)
 
     def _find_source_instances(
         self, ctx: LoadContext,
@@ -202,10 +204,15 @@ class RdmaStrategy(LoadStrategy):
         source_worker_id: str,
     ) -> LoadResult:
         """Receive fully-processed weights via RDMA from an existing source."""
-        result = ctx.adapter.prepare_rdma_target(result)
-        result = ctx.adapter.before_rdma_receive(result)
-        self._receive_from_peer(result, ctx, source_worker, mx_source_id)
-        return ctx.adapter.after_rdma_receive(result)
+        try:
+            result = ctx.adapter.prepare_rdma_target(result)
+            result = ctx.adapter.before_rdma_receive(result)
+            self._receive_from_peer(result, ctx, source_worker, mx_source_id)
+            return ctx.adapter.after_rdma_receive(result)
+        except StrategyFailed:
+            raise
+        except Exception as e:
+            raise StrategyFailed(str(e), mutated=True) from e
 
     def _receive_from_peer(
         self,

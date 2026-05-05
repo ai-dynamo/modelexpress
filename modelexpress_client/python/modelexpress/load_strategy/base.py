@@ -34,21 +34,17 @@ class SourceTransferError(Exception):
     """
 
 
-def build_load_context(
-    vllm_config,
-    model_config,
-) -> LoadContext:
-    """Compatibility wrapper for the vLLM context builder."""
-    from ..engines.vllm.adapter import build_vllm_load_context
-
-    return build_vllm_load_context(vllm_config, model_config)
-
-
 class LoadStrategy(ABC):
     """Base class for weight-loading strategies.
 
     Each strategy is fully self-contained for one loading path. Source
     publication is handled by the chain after a strategy succeeds.
+
+    Contract:
+      - return LoadResult only after successful loading
+      - raise StrategyFailed(mutated=False) for expected fallback paths
+      - raise StrategyFailed(mutated=True) after mutating the model
+      - reserve unexpected errors for rare defensive fallback in the chain
     """
 
     name: str
@@ -64,20 +60,20 @@ class LoadStrategy(ABC):
         return all(getattr(cls, m.__name__) is not m for m in self.requires)
 
     @abstractmethod
-    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult | bool:
-        """Attempt to load weights and return the updated result."""
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        """Attempt to load weights and return the updated result.
 
-    def rollback(self, ctx: LoadContext) -> bool:
-        """Clean up after a failed load attempt.
-
-        Called by the chain when load() returns False or raises. Strategies
-        that mutate the model before their failure point should override this
-        to clean up their state and return True so the chain can re-initialize
-        the model for the next strategy.
-
-        Returns True if the model was mutated and needs re-initialization.
+        Do not return booleans for fallback. Use StrategyFailed so the chain
+        can distinguish clean misses from failures that require re-init.
         """
-        return False
+
+    def rollback(self, ctx: LoadContext) -> None:
+        """Clean up strategy-owned state after a failed load attempt.
+
+        This hook must not decide whether the model is dirty. Strategies report
+        that through StrategyFailed(mutated=True).
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------

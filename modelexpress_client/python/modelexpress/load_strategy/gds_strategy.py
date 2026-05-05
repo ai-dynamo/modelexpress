@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 
-from ..adapter import EngineAdapter
+from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
 
@@ -29,25 +29,33 @@ class GdsStrategy(LoadStrategy):
             logger.info(f"[Worker {ctx.global_rank}] GDS not available, skipping")
         return available
 
-    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult | bool:
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
         from ..gds_loader import MxGdsLoader
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting GDS loading...")
         gds_loader = MxGdsLoader()
         try:
-            use_tqdm = getattr(ctx.load_config, "use_tqdm_on_load", True)
-            revision = getattr(ctx.model_config, "revision", None)
-            weights_iter = gds_loader.load_iter(
-                ctx.model_config.model, use_tqdm=use_tqdm, revision=revision
-            )
-            result = ctx.adapter.apply_weight_iter(result, weights_iter)
-            logger.info(f"[Worker {ctx.global_rank}] GDS weight loading complete")
-        except Exception as e:
-            logger.warning(
-                f"[Worker {ctx.global_rank}] GDS loading failed, falling through: {e}"
-            )
-            return False
+            try:
+                use_tqdm = getattr(ctx.load_config, "use_tqdm_on_load", True)
+                revision = getattr(ctx.model_config, "revision", None)
+                weights_iter = gds_loader.load_iter(
+                    ctx.model_config.model, use_tqdm=use_tqdm, revision=revision
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] GDS loading failed, falling through: {e}"
+                )
+                raise StrategyFailed(str(e), mutated=False) from e
+
+            try:
+                result = ctx.adapter.apply_weight_iter(result, weights_iter)
+                logger.info(f"[Worker {ctx.global_rank}] GDS weight loading complete")
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] GDS loading failed, falling through: {e}"
+                )
+                raise StrategyFailed(str(e), mutated=True) from e
         finally:
             gds_loader.shutdown()
 

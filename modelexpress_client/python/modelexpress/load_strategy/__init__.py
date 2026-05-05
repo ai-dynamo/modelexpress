@@ -20,7 +20,6 @@ from .base import (
     LoadResult,
     LoadStrategy,
     SourceTransferError,
-    build_load_context,
     publish_source_if_supported,
     register_tensors,
     publish_metadata,
@@ -33,7 +32,6 @@ __all__ = [
     "LoadStrategy",
     "LoadStrategyChain",
     "SourceTransferError",
-    "build_load_context",
     "register_tensors",
     "publish_metadata",
     "unpublish_metadata",
@@ -53,6 +51,11 @@ class LoadStrategyChain:
     def run(model: nn.Module, ctx: LoadContext) -> nn.Module:
         """Build the chain and execute strategies until one succeeds.
 
+        Strategies return LoadResult on success. Expected misses raise
+        StrategyFailed; mutated failures trigger adapter re-initialization
+        before the next strategy runs. Unexpected exceptions are rolled back
+        and treated as fallback to preserve the existing chain behavior.
+
         Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
@@ -71,18 +74,10 @@ class LoadStrategyChain:
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
         result = LoadResult(value=model, model=model)
-        del model
         for strategy in eligible:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
             try:
-                loaded = strategy.load(result, ctx)
-                if loaded is False:
-                    if strategy.rollback(ctx):
-                        result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
-                    continue
-                if loaded is True:
-                    loaded = result
-                result = loaded
+                result = strategy.load(result, ctx)
                 publish_source_if_supported(result, ctx)
                 return result.value
             except StrategyFailed as e:
@@ -90,17 +85,19 @@ class LoadStrategyChain:
                     f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
                     f"trying next: {e}"
                 )
+                strategy.rollback(ctx)
                 if e.mutated:
                     result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
                 continue
             except Exception as e:
+                # Unexpected strategy errors should be rare. Keep the engine
+                # alive by falling through to the next strategy; expected
+                # fallback paths should use StrategyFailed instead.
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
                     f"raised unexpected error, trying next: {e}"
                 )
-
-            if strategy.rollback(ctx):
-                result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
+                strategy.rollback(ctx)
 
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy succeeded "
