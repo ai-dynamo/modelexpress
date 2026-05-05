@@ -372,17 +372,17 @@ spec:
             - name: BASELINE_DURATION_SECONDS
               value: "90"
             - name: SURGE_DURATION_SECONDS
-              value: "810"
+              value: "1710"
             - name: CONCURRENCY_RAMP_DURATION_SECONDS
               value: "90"
             - name: BENCHMARK_GRACE_PERIOD_SECONDS
-              value: "600"
+              value: "900"
             - name: PROGRESS_INTERVAL_SECONDS
               value: "30"
             - name: WORKERS_MAX
               value: "200"
             - name: REQUEST_TIMEOUT_SECONDS
-              value: "1000"
+              value: "1800"
             - name: TTFT_THRESHOLD_MS
               value: "20000"
             - name: ITL_THRESHOLD_MS

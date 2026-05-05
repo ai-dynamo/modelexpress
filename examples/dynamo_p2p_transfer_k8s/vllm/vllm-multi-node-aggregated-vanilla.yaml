@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-node vanilla vLLM DynamoGraphDeployment for disk-loading baseline.
+#
+# Mirrors vllm-multi-node-aggregated.yaml but removes ModelExpress:
+#   - no ModelExpress service
+#   - no modelexpress vLLM plugin env
+#   - no --load-format mx
+#
+# Each replica spans 2 nodes with TP=4, PP=2. On scale-up, the new replica
+# loads model weights from the shared PVC rather than from an MX P2P source.
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: vanilla-vllm
+spec:
+  backendFramework: vllm
+  pvcs:
+    - create: false
+      name: shared-model-cache
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        schedulerName: default-scheduler
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/model-express-dev-containers:vllm-runtime-f99ead6-arm64
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --http-port
+            - "8000"
+        nodeSelector:
+          cloud.google.com/gke-nodepool: customer-gpu-o7v
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models
+
+    VllmWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      multinode:
+        nodeCount: 2
+      sharedMemory:
+        size: 179Gi
+      resources:
+        limits:
+          gpu: "4"
+      envs:
+        - name: VLLM_RPC_TIMEOUT
+          value: "7200000"
+        - name: HF_HOME
+          value: "/models"
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+        - name: HF_MODULES_CACHE
+          value: "/tmp/hf_modules"
+        - name: TRANSFORMERS_CACHE
+          value: "/models"
+        - name: TRITON_CACHE_DIR
+          value: "/tmp/triton-cache"
+        - name: MODEL_NAME
+          value: "nvidia/Kimi-K2.5-NVFP4"
+        - name: NCCL_DEBUG
+          value: "INFO"
+        - name: NCCL_SOCKET_IFNAME
+          value: "eth0"
+        - name: GLOO_SOCKET_IFNAME
+          value: "eth0"
+        - name: NCCL_STORE_TIMEOUT
+          value: "7200"
+        - name: NCCL_NET_PLUGIN
+          value: "none"
+        - name: NCCL_IB_DISABLE
+          value: "1"
+        - name: NCCL_MNNVL_ENABLE
+          value: "0"
+      extraPodSpec:
+        schedulerName: default-scheduler
+        imagePullSecrets:
+          - name: nvcr-imagepullsecret
+        nodeSelector:
+          cloud.google.com/gke-nodepool: customer-gpu-o7v
+          kubernetes.io/arch: arm64
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoExecute
+            key: dedicated
+            operator: Equal
+            value: user-workload
+          - effect: NoSchedule
+            key: nvidia.com/gpu
+            operator: Exists
+          - effect: NoSchedule
+            key: kubernetes.io/arch
+            operator: Exists
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/model-express-dev-containers:vllm-runtime-f99ead6-arm64
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          resources:
+            requests:
+              ephemeral-storage: "50Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              ephemeral-storage: "50Gi"
+              nvidia.com/gpu: "4"
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - /models/hub/models--nvidia--Kimi-K2.5-NVFP4/snapshots/c0285e649c34d4386b01e38abca642c06cbe014e
+            - --served-model-name
+            - nvidia/Kimi-K2.5-NVFP4
+            - --tensor-parallel-size
+            - "4"
+            - --pipeline-parallel-size
+            - "2"
+            - --max-model-len
+            - "256000"
+            - --trust-remote-code
+      volumeMounts:
+        - name: shared-model-cache
+          mountPoint: /models

@@ -393,6 +393,7 @@ def build_worker_routing_series(
 
 def build_time_series(out_dir: Path, slice_seconds: int) -> Path:
     run_config = load_run_config(out_dir)
+    scaled_pod_name_re = re.compile(str(run_config.get("scaled_pod_name_regex") or "source"))
     profile_jsonls = find_profile_jsonls(out_dir)
     if not profile_jsonls:
         raise SystemExit(f"No profile_export.jsonl found under {out_dir / 'aiperf_artifacts'}")
@@ -530,7 +531,7 @@ def build_time_series(out_dir: Path, slice_seconds: int) -> Path:
                 idx = bin_idx(timestamp)
                 if (
                     0 <= idx < len(bins)
-                    and "source-" in row.get("pod", "")
+                    and scaled_pod_name_re.search(row.get("pod", ""))
                     and str(row.get("container_ready", "")).lower() == "true"
                 ):
                     bins[idx]["ready_source_pods"].append(row.get("pod", ""))

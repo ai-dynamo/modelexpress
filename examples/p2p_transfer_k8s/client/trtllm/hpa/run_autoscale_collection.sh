@@ -48,10 +48,10 @@ Important environment:
   BASELINE_CONCURRENCY  AIPerf baseline concurrency metadata. Default: 1
   SURGE_CONCURRENCY     AIPerf target concurrency. Default: 128
   BASELINE_DURATION_SECONDS  Baseline phase duration. Default: 90
-  SURGE_DURATION_SECONDS     Surge phase duration. Default: 810
+  SURGE_DURATION_SECONDS     Surge phase duration. Default: 1710
   CONCURRENCY_RAMP_DURATION_SECONDS  AIPerf concurrency ramp duration.
                                       Default: BASELINE_DURATION_SECONDS
-  BENCHMARK_GRACE_PERIOD_SECONDS     AIPerf benchmark grace period. Default: 600
+  BENCHMARK_GRACE_PERIOD_SECONDS     AIPerf benchmark grace period. Default: 900
   PROGRESS_INTERVAL_SECONDS           AIPerf progress log interval. Default: 30
   TRACE_REQUEST_COUNT   Max Mooncake rows to use. Default: 20000
   TRACE_MAX_ISL         Raw Mooncake input length cap. Default: 256000
@@ -68,8 +68,22 @@ Important environment:
   PATCH_GROVE_DIRECT      If 1, also patch the Grove PodCliqueScalingGroup
                           replica count. Useful when DGD reconcile is wedged.
                           Default: 0
+  PATCH_DGD_DIRECT        If 1, patch DGD service replicas directly.
+                          Useful for Grove-backed DGD services without DGDScaleAdapter.
+                          Default: 0
+  DGD_SERVICE_KEY         DGD service key to patch when PATCH_DGD_DIRECT=1.
+                          Default: ${SERVICE_NAME}
   GROVE_PCSG_NAME         Default: ${DGD_NAME}-0-${SERVICE_NAME}
-  AIPERF_TIMEOUT        Default: 90m
+  SCALE_PATCH_TARGET      dgdsa, grove, or both. Default: dgdsa
+  SCALED_POD_NAME_REGEX   Regex for pods counted as scaled workers.
+                          Default: source
+  AIPERF_TIMEOUT        Default: 120m
+  AIPERF_ARTIFACT_FILES Space-separated artifact files to copy from the
+                        AIPerf result directory. Default: structured metrics
+                        only; excludes huge raw input dumps.
+  AIPERF_FALLBACK_ARTIFACT_ROOTS Space-separated PVC mount roots to try when
+                        the logged result path is not mounted by the frontend.
+                        Default: /models /model-cache
   OUT_ROOT              Default: ./metrics
   RUN_ID                Default: <utc timestamp>_<run_type>
 
@@ -116,9 +130,9 @@ TRAFFIC_PROFILE_ID="${TRAFFIC_PROFILE_ID:-mooncake-kimi-concurrency-1-128}"
 BASELINE_CONCURRENCY="${BASELINE_CONCURRENCY:-1}"
 SURGE_CONCURRENCY="${SURGE_CONCURRENCY:-128}"
 BASELINE_DURATION_SECONDS="${BASELINE_DURATION_SECONDS:-90}"
-SURGE_DURATION_SECONDS="${SURGE_DURATION_SECONDS:-810}"
+SURGE_DURATION_SECONDS="${SURGE_DURATION_SECONDS:-1710}"
 CONCURRENCY_RAMP_DURATION_SECONDS="${CONCURRENCY_RAMP_DURATION_SECONDS:-${BASELINE_DURATION_SECONDS}}"
-BENCHMARK_GRACE_PERIOD_SECONDS="${BENCHMARK_GRACE_PERIOD_SECONDS:-600}"
+BENCHMARK_GRACE_PERIOD_SECONDS="${BENCHMARK_GRACE_PERIOD_SECONDS:-900}"
 PROGRESS_INTERVAL_SECONDS="${PROGRESS_INTERVAL_SECONDS:-30}"
 TRACE_REQUEST_COUNT="${TRACE_REQUEST_COUNT:-20000}"
 TRACE_MAX_ISL="${TRACE_MAX_ISL:-256000}"
@@ -131,8 +145,14 @@ SLICE_SECONDS="${SLICE_SECONDS:-30}"
 SOURCE_PODS_PER_REPLICA="${SOURCE_PODS_PER_REPLICA:-2}"
 WAIT_FOR_DGD_READY="${WAIT_FOR_DGD_READY:-1}"
 PATCH_GROVE_DIRECT="${PATCH_GROVE_DIRECT:-0}"
+PATCH_DGD_DIRECT="${PATCH_DGD_DIRECT:-0}"
+DGD_SERVICE_KEY="${DGD_SERVICE_KEY:-${SERVICE_NAME}}"
 GROVE_PCSG_NAME="${GROVE_PCSG_NAME:-${DGD_NAME}-0-${SERVICE_NAME}}"
-AIPERF_TIMEOUT="${AIPERF_TIMEOUT:-90m}"
+SCALE_PATCH_TARGET="${SCALE_PATCH_TARGET:-dgdsa}"
+SCALED_POD_NAME_REGEX="${SCALED_POD_NAME_REGEX:-source}"
+AIPERF_TIMEOUT="${AIPERF_TIMEOUT:-120m}"
+AIPERF_ARTIFACT_FILES="${AIPERF_ARTIFACT_FILES:-profile_export.jsonl profile_export_aiperf.csv profile_export_aiperf.json server_metrics_export.csv server_metrics_export.json trace_stats.json input_config.json}"
+AIPERF_FALLBACK_ARTIFACT_ROOTS="${AIPERF_FALLBACK_ARTIFACT_ROOTS:-/models /model-cache}"
 CLEAN_MX_METADATA="${CLEAN_MX_METADATA:-0}"
 SAMPLE_GPU="${SAMPLE_GPU:-1}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -188,7 +208,13 @@ cat > "${OUT_DIR}/run_config.json" <<EOF
   "source_pods_per_replica": ${SOURCE_PODS_PER_REPLICA},
   "wait_for_dgd_ready": ${WAIT_FOR_DGD_READY},
   "patch_grove_direct": ${PATCH_GROVE_DIRECT},
+  "patch_dgd_direct": ${PATCH_DGD_DIRECT},
+  "dgd_service_key": "${DGD_SERVICE_KEY}",
   "grove_pcsg_name": "${GROVE_PCSG_NAME}",
+  "scale_patch_target": "${SCALE_PATCH_TARGET}",
+  "scaled_pod_name_regex": "${SCALED_POD_NAME_REGEX}",
+  "aiperf_artifact_files": "${AIPERF_ARTIFACT_FILES}",
+  "aiperf_fallback_artifact_roots": "${AIPERF_FALLBACK_ARTIFACT_ROOTS}",
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -197,10 +223,17 @@ echo "run_id,run_type,traffic_profile_id,baseline_concurrency,surge_concurrency,
 echo "${RUN_ID},${RUN_TYPE},${TRAFFIC_PROFILE_ID},${BASELINE_CONCURRENCY},${SURGE_CONCURRENCY},${BASELINE_DURATION_SECONDS},${SURGE_DURATION_SECONDS},${TRACE_REQUEST_COUNT},${SCALE_FROM},${SCALE_TO},${SCALE_DELAY_SECONDS}" >> "${OUT_DIR}/comparison_key.csv"
 
 reset_to_baseline() {
-  echo "Resetting ${DGDSA_NAME} to replicas=${SCALE_FROM}"
-  kubectl patch dgdsa -n "${NAMESPACE}" "${DGDSA_NAME}" \
-    --type=merge -p "{\"spec\":{\"replicas\":${SCALE_FROM}}}"
-  if [[ "${PATCH_GROVE_DIRECT}" == "1" ]]; then
+  if [[ "${SCALE_PATCH_TARGET}" == "dgdsa" || "${SCALE_PATCH_TARGET}" == "both" ]]; then
+    echo "Resetting ${DGDSA_NAME} to replicas=${SCALE_FROM}"
+    kubectl patch dgdsa -n "${NAMESPACE}" "${DGDSA_NAME}" \
+      --type=merge -p "{\"spec\":{\"replicas\":${SCALE_FROM}}}"
+  fi
+  if [[ "${PATCH_DGD_DIRECT}" == "1" ]]; then
+    echo "Patching DGD ${DGD_NAME}/${DGD_SERVICE_KEY} to replicas=${SCALE_FROM}"
+    kubectl patch dgd -n "${NAMESPACE}" "${DGD_NAME}" \
+      --type=merge -p "{\"spec\":{\"services\":{\"${DGD_SERVICE_KEY}\":{\"replicas\":${SCALE_FROM}}}}}"
+  fi
+  if [[ "${PATCH_GROVE_DIRECT}" == "1" || "${SCALE_PATCH_TARGET}" == "grove" || "${SCALE_PATCH_TARGET}" == "both" ]]; then
     echo "Patching Grove ${GROVE_PCSG_NAME} to replicas=${SCALE_FROM}"
     kubectl patch podcliquescalinggroup -n "${NAMESPACE}" "${GROVE_PCSG_NAME}" \
       --type=merge -p "{\"spec\":{\"replicas\":${SCALE_FROM}}}"
@@ -226,14 +259,14 @@ wait_for_ready_source_pods() {
     *) timeout_seconds=${timeout} ;;
   esac
   deadline=$((SECONDS + timeout_seconds))
-  echo "Waiting for ${expected_pods} ready source pod(s) at baseline"
+  echo "Waiting for ${expected_pods} ready scaled pod(s) matching /${SCALED_POD_NAME_REGEX}/ at baseline"
   while (( SECONDS < deadline )); do
     ready_count="$(
       kubectl get pods -n "${NAMESPACE}" -l "${APP_LABEL}" -o json 2>/dev/null \
-        | jq -r '
+        | jq -r --arg pod_regex "${SCALED_POD_NAME_REGEX}" '
             [
               .items[]
-              | select((.metadata.name | test("source")) and (.status.phase == "Running"))
+              | select((.metadata.name | test($pod_regex)) and (.status.phase == "Running"))
               | select(((.status.containerStatuses // [])[0].ready // false) == true)
             ] | length'
     )"
@@ -241,10 +274,10 @@ wait_for_ready_source_pods() {
       echo "Ready source pods: ${ready_count}/${expected_pods}"
       return 0
     fi
-    echo "Ready source pods: ${ready_count}/${expected_pods}; sleeping 10s"
+    echo "Ready scaled pods: ${ready_count}/${expected_pods}; sleeping 10s"
     sleep 10
   done
-  echo "Timed out waiting for source pod readiness" >&2
+  echo "Timed out waiting for scaled pod readiness" >&2
   return 1
 }
 
@@ -262,13 +295,97 @@ find_frontend_pod() {
     | head -1
 }
 
+copy_aiperf_artifact_file() {
+  local pod result_dir file dest_dir remote root stripped tmp_file
+  pod="$1"
+  result_dir="$2"
+  file="$3"
+  dest_dir="$4"
+  tmp_file="${dest_dir}/${file}.tmp"
+
+  for remote in "${result_dir%/}/${file}"; do
+    rm -f "${tmp_file}"
+    if kubectl exec -n "${NAMESPACE}" "${pod}" -- cat "${remote}" > "${tmp_file}" 2>/dev/null; then
+      mv "${tmp_file}" "${dest_dir}/${file}"
+      return 0
+    fi
+  done
+
+  read -r -a roots <<< "${AIPERF_FALLBACK_ARTIFACT_ROOTS}"
+  for root in "${roots[@]}"; do
+    if [[ "${result_dir}" == /model-cache/* ]]; then
+      stripped="${result_dir#/model-cache/}"
+    elif [[ "${result_dir}" == /models/* ]]; then
+      stripped="${result_dir#/models/}"
+    else
+      stripped="${result_dir#/}"
+    fi
+    remote="${root%/}/${stripped}/${file}"
+    rm -f "${tmp_file}"
+    if kubectl exec -n "${NAMESPACE}" "${pod}" -- cat "${remote}" > "${tmp_file}" 2>/dev/null; then
+      mv "${tmp_file}" "${dest_dir}/${file}"
+      return 0
+    fi
+  done
+
+  rm -f "${tmp_file}"
+  return 1
+}
+
+copy_aiperf_artifacts() {
+  local aiperf_log_file fallback_pod result_dir safe_name dest_dir file copied missing_count result_list
+  aiperf_log_file="$1"
+  fallback_pod="$(find_frontend_pod || true)"
+  if [[ -z "${fallback_pod}" ]]; then
+    echo "No frontend pod found; skipping AIPerf artifact copy" >&2
+    return
+  fi
+
+  mkdir -p "${OUT_DIR}/aiperf_artifacts"
+  result_list="${OUT_DIR}/aiperf_result_dirs.txt"
+  if ! grep -E 'Results: ' "${aiperf_log_file}" \
+    | awk '{print $NF}' \
+    | sort -u > "${result_list}"; then
+    echo "No AIPerf result directory found in ${aiperf_log_file}" | tee -a "${OUT_DIR}/aiperf_artifact_copy.log"
+    return
+  fi
+
+  while IFS= read -r result_dir; do
+        [[ -z "${result_dir}" ]] && continue
+        safe_name="$(echo "${result_dir}" | sed -E 's#^/##; s#[^A-Za-z0-9._-]+#_#g')"
+        dest_dir="${OUT_DIR}/aiperf_artifacts/${safe_name}"
+        mkdir -p "${dest_dir}"
+
+        copied=0
+        missing_count=0
+        read -r -a artifact_files <<< "${AIPERF_ARTIFACT_FILES}"
+        for file in "${artifact_files[@]}"; do
+          [[ -z "${file}" ]] && continue
+          if copy_aiperf_artifact_file "${fallback_pod}" "${result_dir}" "${file}" "${dest_dir}"; then
+            copied=$((copied + 1))
+          else
+            missing_count=$((missing_count + 1))
+          fi
+        done
+
+        echo "Copied ${copied} AIPerf artifact(s) from ${result_dir} via ${fallback_pod}; missing ${missing_count}" \
+          | tee -a "${OUT_DIR}/aiperf_artifact_copy.log"
+  done < "${result_list}"
+}
+
 sample_once() {
   local ts frontend_pod metrics_file
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  kubectl get dgdsa -n "${NAMESPACE}" "${DGDSA_NAME}" -o json 2>/dev/null \
-    | jq -r --arg ts "${ts}" '[$ts, (.spec.replicas // ""), (.status.replicas // ""), (.status.selector // "")] | @csv' \
-    >> "${SAMPLE_DIR}/replica_timeline.csv" || true
+  if [[ "${SCALE_PATCH_TARGET}" == "grove" ]]; then
+    kubectl get podcliquescalinggroup -n "${NAMESPACE}" "${GROVE_PCSG_NAME}" -o json 2>/dev/null \
+      | jq -r --arg ts "${ts}" '[$ts, (.spec.replicas // ""), (.status.replicas // ""), ""] | @csv' \
+      >> "${SAMPLE_DIR}/replica_timeline.csv" || true
+  else
+    kubectl get dgdsa -n "${NAMESPACE}" "${DGDSA_NAME}" -o json 2>/dev/null \
+      | jq -r --arg ts "${ts}" '[$ts, (.spec.replicas // ""), (.status.replicas // ""), (.status.selector // "")] | @csv' \
+      >> "${SAMPLE_DIR}/replica_timeline.csv" || true
+  fi
 
   kubectl get pods -n "${NAMESPACE}" -l "${APP_LABEL}" -o json 2>/dev/null \
     | jq -r --arg ts "${ts}" '
@@ -298,7 +415,7 @@ sample_once() {
 
   if [[ "${SAMPLE_GPU}" == "1" ]]; then
     kubectl get pods -n "${NAMESPACE}" -l "${APP_LABEL}" -o json 2>/dev/null \
-      | jq -r '.items[] | select(.metadata.name | test("source|worker|trtllm")) | .metadata.name' \
+      | jq -r --arg pod_regex "${SCALED_POD_NAME_REGEX}" '.items[] | select(.metadata.name | test($pod_regex)) | .metadata.name' \
       | while IFS= read -r pod; do
           [[ -z "${pod}" ]] && continue
           kubectl exec -n "${NAMESPACE}" "${pod}" -- sh -lc \
@@ -380,6 +497,7 @@ wait_for_aiperf_marker() {
       | grep -E "${AIPERF_SCALE_MARKER}" > "${OUT_DIR}/aiperf_scale_marker.log"; then
       now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       echo "${now}" > "${OUT_DIR}/scale_marker_time.txt"
+      echo "${now}" > "${OUT_DIR}/traffic_marker_time.txt"
       echo "AIPerf marker observed at ${now}"
       return 0
     fi
@@ -405,9 +523,16 @@ patch_scale_up() {
 }
 EOF
   echo "Scaling ${DGDSA_NAME} to replicas=${SCALE_TO} at ${ts}"
-  kubectl patch dgdsa -n "${NAMESPACE}" "${DGDSA_NAME}" \
-    --type=merge -p "{\"spec\":{\"replicas\":${SCALE_TO}}}"
-  if [[ "${PATCH_GROVE_DIRECT}" == "1" ]]; then
+  if [[ "${SCALE_PATCH_TARGET}" == "dgdsa" || "${SCALE_PATCH_TARGET}" == "both" ]]; then
+    kubectl patch dgdsa -n "${NAMESPACE}" "${DGDSA_NAME}" \
+      --type=merge -p "{\"spec\":{\"replicas\":${SCALE_TO}}}"
+  fi
+  if [[ "${PATCH_DGD_DIRECT}" == "1" ]]; then
+    echo "Patching DGD ${DGD_NAME}/${DGD_SERVICE_KEY} to replicas=${SCALE_TO} at ${ts}"
+    kubectl patch dgd -n "${NAMESPACE}" "${DGD_NAME}" \
+      --type=merge -p "{\"spec\":{\"services\":{\"${DGD_SERVICE_KEY}\":{\"replicas\":${SCALE_TO}}}}}"
+  fi
+  if [[ "${PATCH_GROVE_DIRECT}" == "1" || "${SCALE_PATCH_TARGET}" == "grove" || "${SCALE_PATCH_TARGET}" == "both" ]]; then
     echo "Patching Grove ${GROVE_PCSG_NAME} to replicas=${SCALE_TO} at ${ts}"
     kubectl patch podcliquescalinggroup -n "${NAMESPACE}" "${GROVE_PCSG_NAME}" \
       --type=merge -p "{\"spec\":{\"replicas\":${SCALE_TO}}}"
@@ -472,26 +597,7 @@ fi
 AIPERF_LOG_FILE="${OUT_DIR}/logs/${JOB_NAME}.log"
 kubectl logs -n "${NAMESPACE}" "job/${JOB_NAME}" --timestamps > "${AIPERF_LOG_FILE}" 2>&1 || true
 
-AIPERF_POD="$(kubectl get pods -n "${NAMESPACE}" -l "job-name=${JOB_NAME}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-if [[ -n "${AIPERF_POD}" ]]; then
-  mkdir -p "${OUT_DIR}/aiperf_artifacts"
-  grep -E 'Results: ' "${AIPERF_LOG_FILE}" \
-    | awk '{print $NF}' \
-    | sort -u \
-    | while IFS= read -r result_dir; do
-        [[ -z "${result_dir}" ]] && continue
-        safe_name="$(echo "${result_dir}" | sed -E 's#^/##; s#[^A-Za-z0-9._-]+#_#g')"
-        mkdir -p "${OUT_DIR}/aiperf_artifacts/${safe_name}"
-        if ! kubectl cp -n "${NAMESPACE}" "${AIPERF_POD}:${result_dir}/." \
-          "${OUT_DIR}/aiperf_artifacts/${safe_name}" >/dev/null 2>&1; then
-          fallback_pod="$(find_frontend_pod || true)"
-          if [[ -n "${fallback_pod}" ]]; then
-            kubectl cp -n "${NAMESPACE}" "${fallback_pod}:${result_dir}/." \
-              "${OUT_DIR}/aiperf_artifacts/${safe_name}" >/dev/null 2>&1 || true
-          fi
-        fi
-      done
-fi
+copy_aiperf_artifacts "${AIPERF_LOG_FILE}"
 
 stop_sampler
 
