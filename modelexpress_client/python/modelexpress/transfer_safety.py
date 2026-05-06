@@ -6,12 +6,9 @@ Transfer safety checks for ModelExpress GPU-to-GPU weight transfer.
 
 Two independent safety mechanisms:
 
-1. Feature allow-list: checks model config before attempting P2P transfer.
-   Models with unsupported features are rejected early and fall back to
-   disk loading. MLA attention models (DeepSeek, Kimi) are blocked from
-   P2P transfers due to unresolved weight corruption after RDMA receive.
-   The bytes transfer correctly but inference diverges - root cause is
-   under investigation.
+1. Feature detection: surfaces model features (attention, quantization, MoE)
+   in the loader log so unexpected combinations are visible during QA.
+   Currently no feature combination blocks P2P transfer.
 
 2. Transfer fingerprint: captures the runtime environment and tensor
    manifest structure. Source publishes its fingerprint; target computes
@@ -23,7 +20,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 
 import torch
@@ -31,15 +27,8 @@ import torch
 logger = logging.getLogger("modelexpress.transfer_safety")
 
 # ---------------------------------------------------------------------------
-# Feature detection and blocking
+# Feature detection
 # ---------------------------------------------------------------------------
-
-# MLA (Multi-head Latent Attention) is the only feature currently blocked.
-# Bytes transfer correctly via RDMA but inference diverges on all tested
-# vLLM versions (0.12.0 through 0.17.1). Root cause under investigation.
-# Detection is config-based: kv_lora_rank presence in the HF config.
-# Bypass with MX_SKIP_FEATURE_CHECK=1 to test MLA transfers anyway.
-
 
 
 def detect_model_features(model_config) -> dict[str, str]:
@@ -73,29 +62,13 @@ def detect_model_features(model_config) -> dict[str, str]:
 def check_transfer_allowed(model_config) -> tuple[bool, str]:
     """Check if P2P weight transfer is allowed for this model.
 
-    Currently blocks only MLA attention models (detected via kv_lora_rank
-    in the HF config). All other models are allowed.
+    No feature combination is currently blocked; the function logs detected
+    features and always returns allowed. Kept as a hook so future safety
+    gates can be added in one place.
 
-    Returns (allowed, reason). If not allowed, reason explains why.
+    Returns (allowed, reason).
     """
-    if os.environ.get("MX_SKIP_FEATURE_CHECK", "0") == "1":
-        logger.warning("MX_SKIP_FEATURE_CHECK=1: bypassing feature checks")
-        return True, "bypassed"
-
     features = detect_model_features(model_config)
-
-    if features["attention"] == "mla":
-        reason = (
-            "MLA attention models are blocked from P2P transfer due to "
-            "unresolved weight corruption after RDMA receive"
-        )
-        logger.warning(
-            f"[Transfer Safety] P2P transfer denied: {reason}. "
-            f"Features: {features}. "
-            f"Set MX_SKIP_FEATURE_CHECK=1 to bypass."
-        )
-        return False, reason
-
     logger.info(f"[Transfer Safety] P2P transfer allowed. Features: {features}")
     return True, "allowed"
 

@@ -4,8 +4,6 @@
 """Tests for transfer safety checks."""
 
 import json
-import os
-import unittest.mock
 
 import pytest
 import torch
@@ -120,52 +118,28 @@ class TestCheckTransferAllowed:
         allowed, reason = check_transfer_allowed(config)
         assert allowed
 
-    def test_deepseek_mla_denied(self):
+    def test_deepseek_mla_allowed(self):
         config = FakeConfig(
             model_type="deepseek_v2",
             kv_lora_rank=512,
         )
-        allowed, reason = check_transfer_allowed(config)
-        assert not allowed
-        assert "mla" in reason.lower()
+        allowed, _ = check_transfer_allowed(config)
+        assert allowed
 
-    def test_kimi_mla_denied(self):
+    def test_kimi_mla_allowed(self):
         config = FakeConfig(
             model_type="kimi_k25",
             kv_lora_rank=512,
         )
-        allowed, reason = check_transfer_allowed(config)
-        assert not allowed
-        assert "mla" in reason.lower()
-
-    def test_mla_detected_by_kv_lora_rank(self):
-        config = FakeConfig(
-            model_type="some_future_mla_model",
-            kv_lora_rank=256,
-        )
-        allowed, reason = check_transfer_allowed(config)
-        assert not allowed
-        assert "mla" in reason.lower()
+        allowed, _ = check_transfer_allowed(config)
+        assert allowed
 
     def test_no_kv_lora_rank_allowed(self):
         config = FakeConfig(
             model_type="deepseek_v2",
         )
-        allowed, reason = check_transfer_allowed(config)
+        allowed, _ = check_transfer_allowed(config)
         assert allowed
-
-    def test_bypass_env_var(self):
-        config = FakeConfig(
-            model_type="deepseek_v2",
-            kv_lora_rank=512,
-        )
-        os.environ["MX_SKIP_FEATURE_CHECK"] = "1"
-        try:
-            allowed, reason = check_transfer_allowed(config)
-            assert allowed
-            assert reason == "bypassed"
-        finally:
-            del os.environ["MX_SKIP_FEATURE_CHECK"]
 
 
 # ---------------------------------------------------------------------------

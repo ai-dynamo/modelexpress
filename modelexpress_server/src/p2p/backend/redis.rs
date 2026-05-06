@@ -692,6 +692,7 @@ mod tests {
             dtype: "bfloat16".to_string(),
             quantization: "fp8".to_string(),
             extra_parameters: Default::default(),
+            revision: String::new(),
         }
     }
 

@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from ..client import MxClient
+from ..client import MxClientBase
+from ..client_factory import create_metadata_client
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import adopt_hidden_tensors, collect_module_tensors, log_tensor_summary
 from ..metadata import build_source_identity, publish_metadata_and_ready
@@ -56,7 +57,7 @@ class LoadContext:
     global_rank: int
     device_id: int
     identity: p2p_pb2.SourceIdentity
-    mx_client: MxClient
+    mx_client: MxClientBase
     worker_id: str
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -96,7 +97,7 @@ def build_load_context(
         global_rank=global_rank,
         device_id=device_id,
         identity=build_source_identity(vllm_config, model_config),
-        mx_client=MxClient(),
+        mx_client=create_metadata_client(worker_rank=global_rank),
         worker_id=uuid.uuid4().hex[:8],
     )
 
@@ -198,8 +199,14 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] No NIXL manager, skipping metadata publish"
         )
         return
+    # Decentralized backends (k8s-service) have no central server
+    # address; their metadata path is entirely peer-to-peer.
+    # Only bail on missing MODEL_EXPRESS_URL / MX_SERVER_ADDRESS when the
+    # client actually needs a central coordinator. Strict `is True`
+    # check so MagicMock's auto-attribute doesn't masquerade as the flag.
     server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
-    if not server_addr:
+    requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
+    if not server_addr and not requires_p2p:
         logger.info(
             f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
         )
