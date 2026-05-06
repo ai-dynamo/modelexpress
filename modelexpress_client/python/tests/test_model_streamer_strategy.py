@@ -23,6 +23,9 @@ class _FakeAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult):
         return {}
 
+    def after_weight_iter_load(self, result: LoadResult):
+        return result
+
     def apply_weight_iter(self, result: LoadResult, weights_iter):
         if result.model is not None:
             result.model.load_weights(weights_iter)
@@ -39,6 +42,7 @@ def _make_load_context(**overrides):
         load_config=MagicMock(),
         target_device=torch.device("cpu"),
         global_rank=0,
+        worker_rank=0,
         device_id=0,
         identity=p2p_pb2.SourceIdentity(model_name="test-model"),
         mx_client=MagicMock(),
@@ -214,6 +218,26 @@ class TestModelStreamerLoad:
                 return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
             ):
                 with pytest.raises(StrategyFailed, match="partial load") as exc:
+                    strategy.load(model, ctx)
+
+        assert exc.value.mutated is True
+        mock_register.assert_not_called()
+
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    def test_after_weight_iter_failure_is_mutated(self, mock_register):
+        model = MagicMock()
+        adapter = _FakeAdapter()
+        adapter.after_weight_iter_load = MagicMock(side_effect=RuntimeError("post load"))
+        ctx = _make_load_context(adapter=adapter)
+        strategy = self._make_strategy()
+
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights",
+                return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
+            ):
+                with pytest.raises(StrategyFailed, match="post load") as exc:
                     strategy.load(model, ctx)
 
         assert exc.value.mutated is True

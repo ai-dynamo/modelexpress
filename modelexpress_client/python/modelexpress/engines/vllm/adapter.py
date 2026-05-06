@@ -145,6 +145,13 @@ class VllmAdapter(EngineAdapter):
 
     def _reset_compilation_state(self) -> None:
         compilation_config = self.vllm_config.compilation_config
+        # vLLM registers each attention / MLA / Mamba / FusedMoE layer into
+        # fields on vllm_config.compilation_config during initialize_model().
+        # Those fields live on the config object, not the model, so they survive
+        # del model and trip duplicate registration on the next initialize_model().
+        # Clear them so re-init starts from a clean slate. Audited against vLLM
+        # 0.17.1; other versions may add init=False fields that need similar
+        # treatment.
         compilation_config.static_forward_context.clear()
         compilation_config.static_all_moe_layers.clear()
         compilation_config.enabled_custom_ops.clear()

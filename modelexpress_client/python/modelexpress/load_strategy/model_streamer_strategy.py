@@ -105,13 +105,13 @@ class ModelStreamerStrategy(LoadStrategy):
         try:
             result = ctx.adapter.apply_weight_iter(result, weights_iter)
             logger.info(f"[Worker {ctx.global_rank}] Model streamer weight loading complete")
+            result = ctx.adapter.after_weight_iter_load(result)
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
             )
             raise StrategyFailed(str(e), mutated=True) from e
 
-        result = ctx.adapter.after_weight_iter_load(result)
         register_tensors(result, ctx)
         return result
 

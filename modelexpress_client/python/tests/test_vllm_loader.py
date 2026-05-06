@@ -70,6 +70,12 @@ class _FakeAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult):
         return {}
 
+    def after_weight_iter_load(self, result: LoadResult):
+        return result
+
+    def after_native_load(self, result: LoadResult):
+        return result
+
     def apply_weight_iter(self, result: LoadResult, weights_iter):
         if result.model is not None:
             result.model.load_weights(weights_iter)
@@ -103,6 +109,7 @@ def _make_load_context(**overrides):
         load_config=MagicMock(),
         target_device=torch.device("cpu"),
         global_rank=0,
+        worker_rank=0,
         device_id=0,
         identity=_make_identity(),
         mx_client=MagicMock(),
@@ -307,12 +314,18 @@ class TestRegisterTensorsErrorHandling:
         assert ctx.nixl_manager is None
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
-    @patch("modelexpress.load_strategy.base.collect_module_tensors", return_value={})
+    def test_requires_adapter_when_nixl_available(self, _mock):
+        from modelexpress.load_strategy.base import register_tensors
+        ctx = _make_load_context(adapter=None)
+        with pytest.raises(RuntimeError, match="engine adapter"):
+            register_tensors(MagicMock(), ctx)
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
     @patch(
         "modelexpress.load_strategy.base._init_nixl_manager",
         side_effect=RuntimeError("NIXL_ERR_BACKEND"),
     )
-    def test_nixl_init_failure_does_not_raise(self, _init, _collect, _avail):
+    def test_nixl_init_failure_does_not_raise(self, _init, _avail):
         from modelexpress.load_strategy.base import register_tensors
         ctx = _make_load_context()
         model = MagicMock()
@@ -320,15 +333,15 @@ class TestRegisterTensorsErrorHandling:
         assert ctx.nixl_manager is None
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
-    @patch("modelexpress.load_strategy.base.collect_module_tensors", return_value={"t": MagicMock()})
     @patch("modelexpress.load_strategy.base._init_nixl_manager")
-    def test_tensor_registration_failure_does_not_raise(self, mock_init, _collect, _avail):
+    def test_tensor_registration_failure_does_not_raise(self, mock_init, _avail):
         from modelexpress.load_strategy.base import register_tensors
         mock_mgr = MagicMock()
         mock_mgr.tensor_descriptors = []
         mock_mgr.register_tensors.side_effect = RuntimeError("memory registration failed")
         mock_init.return_value = mock_mgr
         ctx = _make_load_context()
+        ctx.adapter.discover_tensors = MagicMock(return_value={"t": MagicMock()})
         model = MagicMock()
         register_tensors(model, ctx)
 
@@ -348,6 +361,21 @@ class TestPublishMetadataErrorHandling:
         ctx = _make_load_context()
         ctx.nixl_manager = MagicMock()
         publish_metadata(ctx)
+
+    def test_unpublish_uses_worker_rank_for_heartbeat_lifecycle(self):
+        from modelexpress.load_strategy.base import unpublish_metadata
+        from modelexpress.metadata.publish import _heartbeat_threads, _worker_servers
+
+        ctx = _make_load_context(global_rank=4, worker_rank=0)
+        heartbeat = MagicMock()
+        _heartbeat_threads[ctx.worker_rank] = heartbeat
+        try:
+            unpublish_metadata(ctx)
+        finally:
+            _heartbeat_threads.pop(ctx.worker_rank, None)
+            _worker_servers.pop(ctx.device_id, None)
+
+        heartbeat.stop.assert_called_once()
 
 
 class TestLoadStrategyChainRunErrorHandling:
@@ -553,6 +581,21 @@ class TestLoadStrategyChainRunErrorHandling:
 
         assert call_order == ["failed", "rollback", "fallback"]
         ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+class TestDefaultStrategy:
+    @patch("modelexpress.load_strategy.default_strategy.register_tensors")
+    def test_after_native_load_failure_is_mutated(self, mock_register):
+        from modelexpress.load_strategy.default_strategy import DefaultStrategy
+
+        ctx = _make_load_context()
+        ctx.adapter.after_native_load = MagicMock(side_effect=RuntimeError("post load"))
+
+        with pytest.raises(StrategyFailed, match="post load") as exc:
+            DefaultStrategy().load(MagicMock(), ctx)
+
+        assert exc.value.mutated is True
+        mock_register.assert_not_called()
 
 
 class TestRdmaStrategyAvailability:
@@ -853,7 +896,7 @@ class TestPublishMetadataAndReady:
         mock_hb = MagicMock()
         with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
              patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
+            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
 
         mx_client.publish_metadata.assert_called_once()
         call_args = mx_client.publish_metadata.call_args
@@ -891,7 +934,7 @@ class TestPublishMetadataAndReady:
                 mx_client,
                 nixl_manager,
                 {},
-                global_rank=0,
+                worker_rank=0,
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
@@ -932,7 +975,7 @@ class TestPublishMetadataAndReady:
                     mx_client,
                     nixl_manager,
                     {},
-                    global_rank=0,
+                    worker_rank=0,
                     device_id=0,
                     identity=identity,
                     worker_id="w-1",
@@ -964,7 +1007,7 @@ class TestPublishMetadataAndReady:
                     mx_client,
                     nixl_manager,
                     {},
-                    global_rank=0,
+                    worker_rank=0,
                     device_id=0,
                     identity=identity,
                     worker_id="w-1",

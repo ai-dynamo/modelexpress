@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 
-from ..adapter import EngineAdapter
+from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
 
@@ -26,9 +26,13 @@ class DefaultStrategy(LoadStrategy):
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
         logger.info(f"[Worker {ctx.global_rank}] Loading weights from disk...")
-        result = ctx.adapter.load_via_native(result)
-        logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
+        try:
+            result = ctx.adapter.load_via_native(result)
+            logger.info(f"[Worker {ctx.global_rank}] Weights loaded from disk")
 
-        result = ctx.adapter.after_native_load(result)
+            result = ctx.adapter.after_native_load(result)
+        except Exception as e:
+            raise StrategyFailed(str(e), mutated=True) from e
+
         register_tensors(result, ctx)
         return result

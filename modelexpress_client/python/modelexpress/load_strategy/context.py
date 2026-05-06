@@ -47,15 +47,11 @@ class LoadContext:
     load_config: LoadConfig
     target_device: torch.device
     global_rank: int
+    worker_rank: int
     device_id: int
     identity: p2p_pb2.SourceIdentity
     mx_client: MxClientBase
     worker_id: str
     adapter: EngineAdapter | None = None
-    worker_rank: int | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.worker_rank is None:
-            self.worker_rank = self.global_rank

@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import adopt_hidden_tensors, collect_module_tensors, log_tensor_summary
+from ..tensor_utils import log_tensor_summary
 from ..metadata.publish import publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -114,6 +114,8 @@ def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) 
     if not is_nixl_available():
         logger.warning(f"[Worker {ctx.global_rank}] NIXL not available, skipping registration")
         return
+    if ctx.adapter is None:
+        raise RuntimeError("NIXL registration requires an engine adapter")
 
     try:
         result = _as_load_result(result_or_model)
@@ -123,12 +125,7 @@ def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) 
             )
             return
 
-        if ctx.adapter is not None:
-            ctx.tensors = ctx.adapter.discover_tensors(result)
-        else:
-            # Compatibility path for tests and legacy callers.
-            adopt_hidden_tensors(result.model)
-            ctx.tensors = collect_module_tensors(result.model)
+        ctx.tensors = ctx.adapter.discover_tensors(result)
         log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
@@ -197,7 +194,7 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     """
     from ..metadata.publish import _heartbeat_threads, _worker_servers
 
-    hb = _heartbeat_threads.pop(ctx.global_rank, None)
+    hb = _heartbeat_threads.pop(ctx.worker_rank, None)
     if hb is not None:
         try:
             hb.stop()  # also marks STALE on MX server

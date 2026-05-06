@@ -209,6 +209,9 @@ class TestGdsStrategyIntegration:
         def discover_tensors(self, result: LoadResult):
             return {}
 
+        def after_weight_iter_load(self, result: LoadResult):
+            return result
+
         def apply_weight_iter(self, result: LoadResult, weights_iter):
             if result.model is not None:
                 result.model.load_weights(weights_iter)
@@ -222,6 +225,7 @@ class TestGdsStrategyIntegration:
             load_config=MagicMock(),
             target_device=torch.device("cpu"),
             global_rank=0,
+            worker_rank=0,
             device_id=0,
             identity=MagicMock(),
             mx_client=MagicMock(),
@@ -287,6 +291,26 @@ class TestGdsStrategyIntegration:
 
         strategy = GdsStrategy()
         with pytest.raises(StrategyFailed, match="partial load") as exc:
+            strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is True
+        mock_gds.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_after_weight_iter_failure_is_mutated(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        mock_gds = MagicMock()
+        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_gds_cls.return_value = mock_gds
+
+        ctx = self._make_context()
+        ctx.adapter.after_weight_iter_load = MagicMock(side_effect=RuntimeError("post load"))
+        ctx.model_config.model = "test-model"
+
+        strategy = GdsStrategy()
+        with pytest.raises(StrategyFailed, match="post load") as exc:
             strategy.load(MagicMock(), ctx)
 
         assert exc.value.mutated is True
