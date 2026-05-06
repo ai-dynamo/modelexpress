@@ -14,6 +14,8 @@ import logging
 
 import torch.nn as nn
 
+from modelexpress.tracing import tracer
+
 from ..adapter import StrategyFailed, UnsupportedCapability
 from .base import (
     LoadContext,
@@ -74,30 +76,36 @@ class LoadStrategyChain:
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
         result = LoadResult(value=model, model=model)
-        for strategy in eligible:
-            logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
-            try:
-                result = strategy.load(result, ctx)
-                publish_source_if_supported(result, ctx)
-                return result.value
-            except StrategyFailed as e:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
-                    f"trying next: {e}"
-                )
-                strategy.rollback(ctx)
-                if e.mutated:
-                    result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
-                continue
-            except Exception as e:
-                # Unexpected strategy errors should be rare. Keep the engine
-                # alive by falling through to the next strategy; expected
-                # fallback paths should use StrategyFailed instead.
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
-                    f"raised unexpected error, trying next: {e}"
-                )
-                strategy.rollback(ctx)
+        with tracer.start_as_current_span("Load model") as span:
+            span.set_attribute("model_name", ctx.identity.model_name)
+            span.set_attribute("global_rank", ctx.global_rank)
+            span.set_attribute("eligible_strategies", [s.name for s in eligible])
+
+            for strategy in eligible:
+                logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
+                try:
+                    result = strategy.load(result, ctx)
+                    publish_source_if_supported(result, ctx)
+                    span.set_attribute("weight_loading_strategy", strategy.name)
+                    return result.value
+                except StrategyFailed as e:
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
+                        f"trying next: {e}"
+                    )
+                    strategy.rollback(ctx)
+                    if e.mutated:
+                        result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
+                    continue
+                except Exception as e:
+                    # Unexpected strategy errors should be rare. Keep the engine
+                    # alive by falling through to the next strategy; expected
+                    # fallback paths should use StrategyFailed instead.
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
+                        f"raised unexpected error, trying next: {e}"
+                    )
+                    strategy.rollback(ctx)
 
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy succeeded "
