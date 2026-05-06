@@ -9,23 +9,18 @@ import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.nn as nn
 
-from ..client import MxClientBase
-from ..client_factory import create_metadata_client
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import adopt_hidden_tensors, collect_module_tensors, log_tensor_summary
-from ..metadata import build_source_identity, publish_metadata_and_ready
-from .. import p2p_pb2
+from ..tensor_utils import log_tensor_summary
+from ..metadata.publish import publish_metadata_and_ready
+from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
     from ..nixl_transfer import NixlTransferManager
-    from vllm.config import ModelConfig, VllmConfig
-    from vllm.config.load import LoadConfig
 
 logger = logging.getLogger("modelexpress.load_strategy")
 
@@ -39,99 +34,46 @@ class SourceTransferError(Exception):
     """
 
 
-@dataclass
-class LoadContext:
-    """Shared state passed to all loading strategies.
-
-    Rank semantics:
-        global_rank: unique rank across all TP/PP groups (torch.distributed.get_rank()).
-            Used for WorkerMetadata.worker_rank and source/target matching in RDMA.
-        device_id: local CUDA device ordinal / TP rank (get_tensor_model_parallel_rank()).
-            Used for CUDA device selection, port offsets (metadata_port + device_id).
-    """
-
-    vllm_config: VllmConfig
-    model_config: ModelConfig
-    load_config: LoadConfig
-    target_device: torch.device
-    global_rank: int
-    device_id: int
-    identity: p2p_pb2.SourceIdentity
-    mx_client: MxClientBase
-    worker_id: str
-    nixl_manager: NixlTransferManager | None = None
-    tensors: dict[str, torch.Tensor] = field(default_factory=dict)
-
-
-def build_load_context(
-    vllm_config: VllmConfig,
-    model_config: ModelConfig,
-) -> LoadContext:
-    """Build a LoadContext from vLLM config objects.
-
-    Resolves device, ranks, builds source identity, and creates MX client
-    and worker ID. Used by both MxModelLoader and GMS loader to avoid
-    duplicating context construction logic.
-
-    Args:
-        vllm_config: vLLM engine configuration.
-        model_config: Model configuration (name, dtype, quantization).
-    """
-    from ..rank_utils import get_global_rank, get_worker_rank
-
-    load_config = vllm_config.load_config
-    load_device = (
-        vllm_config.device_config.device
-        if load_config.device is None
-        else load_config.device
-    )
-    target_device = torch.device(load_device)
-    device_id = get_worker_rank(target_device)
-    global_rank = get_global_rank(target_device)
-
-    return LoadContext(
-        vllm_config=vllm_config,
-        model_config=model_config,
-        load_config=load_config,
-        target_device=target_device,
-        global_rank=global_rank,
-        device_id=device_id,
-        identity=build_source_identity(vllm_config, model_config),
-        mx_client=create_metadata_client(worker_rank=global_rank),
-        worker_id=uuid.uuid4().hex[:8],
-    )
-
-
 class LoadStrategy(ABC):
     """Base class for weight-loading strategies.
 
-    Each strategy is fully self-contained: load() handles weight loading,
-    post-processing, NIXL registration, and metadata publishing.
-    Publish failures should not fail the worker.
+    Each strategy is fully self-contained for one loading path. Source
+    publication is handled by the chain after a strategy succeeds.
+
+    Contract:
+      - return LoadResult only after successful loading
+      - raise StrategyFailed(mutated=False) for expected fallback paths
+      - raise StrategyFailed(mutated=True) after mutating the model
+      - reserve unexpected errors for rare defensive fallback in the chain
     """
 
     name: str
+    requires: ClassVar[tuple] = ()
 
-    @abstractmethod
     def is_available(self, ctx: LoadContext) -> bool:
         """Check environment: is this strategy usable right now?"""
+        if not self.requires:
+            return True
+        if ctx.adapter is None:
+            return False
+        cls = type(ctx.adapter)
+        return all(getattr(cls, m.__name__) is not m for m in self.requires)
 
     @abstractmethod
-    def load(self, model: nn.Module, ctx: LoadContext) -> bool:
-        """Attempt to load weights. Return True on success, False to try next."""
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        """Attempt to load weights and return the updated result.
 
-    def rollback(self, ctx: LoadContext) -> bool:
-        """Clean up after a failed load attempt.
-
-        Called by the chain when load() returns False or raises. Strategies
-        that mutate the model before their failure point (e.g. RDMA runs
-        process_weights_after_loading before the transfer) should override
-        this to clean up their state and return True so the chain can
-        re-initialize the model for the next strategy.
-
-        Returns True if the model was mutated and needs re-initialization.
+        Do not return booleans for fallback. Use StrategyFailed so the chain
+        can distinguish clean misses from failures that require re-init.
         """
-        return False
+
+    def rollback(self, ctx: LoadContext) -> None:
+        """Clean up strategy-owned state after a failed load attempt.
+
+        This hook must not decide whether the model is dirty. Strategies report
+        that through StrategyFailed(mutated=True).
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +99,13 @@ def _init_nixl_manager(
     return manager
 
 
-def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
+def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
+    if isinstance(result_or_model, LoadResult):
+        return result_or_model
+    return LoadResult(value=result_or_model, model=result_or_model)
+
+
+def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) -> None:
     """Collect model tensors and register them with NIXL.
 
     Failures are logged but do not raise — the worker continues without
@@ -166,12 +114,18 @@ def register_tensors(model: nn.Module, ctx: LoadContext) -> None:
     if not is_nixl_available():
         logger.warning(f"[Worker {ctx.global_rank}] NIXL not available, skipping registration")
         return
+    if ctx.adapter is None:
+        raise RuntimeError("NIXL registration requires an engine adapter")
 
     try:
-        # Order matters: adopt first so hidden tensors appear in named_buffers()
-        # before collect_module_tensors iterates them.
-        adopt_hidden_tensors(model)
-        ctx.tensors = collect_module_tensors(model)
+        result = _as_load_result(result_or_model)
+        if result.model is None:
+            logger.info(
+                f"[Worker {ctx.global_rank}] No model available, skipping NIXL registration"
+            )
+            return
+
+        ctx.tensors = ctx.adapter.discover_tensors(result)
         log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
@@ -214,13 +168,20 @@ def publish_metadata(ctx: LoadContext) -> None:
     try:
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
-            ctx.global_rank, ctx.device_id, ctx.identity, ctx.worker_id,
+            ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
         )
     except Exception as e:
         logger.warning(
             f"[Worker {ctx.global_rank}] Failed to publish metadata, "
             f"worker will continue without P2P serving: {e}"
         )
+
+
+def publish_source_if_supported(result: LoadResult, ctx: LoadContext) -> None:
+    """Best-effort source publication after a successful load."""
+    if result.model_for_publish is None:
+        return
+    publish_metadata(ctx)
 
 
 def unpublish_metadata(ctx: LoadContext) -> None:
@@ -231,9 +192,9 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     Call publish_metadata() again after memory is valid to re-enter the
     P2P network.
     """
-    from ..metadata import _heartbeat_threads, _worker_servers
+    from ..metadata.publish import _heartbeat_threads, _worker_servers
 
-    hb = _heartbeat_threads.pop(ctx.global_rank, None)
+    hb = _heartbeat_threads.pop(ctx.worker_rank, None)
     if hb is not None:
         try:
             hb.stop()  # also marks STALE on MX server

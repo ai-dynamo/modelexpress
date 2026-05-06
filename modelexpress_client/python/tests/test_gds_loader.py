@@ -10,6 +10,9 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 import torch
 
+from modelexpress.adapter import EngineAdapter, StrategyFailed
+from modelexpress.load_strategy.context import LoadResult
+
 
 # ---------------------------------------------------------------------------
 # GDS availability detection
@@ -202,6 +205,18 @@ class TestResolveSafetensorsFiles:
 class TestGdsStrategyIntegration:
     """Tests for GdsStrategy loading behavior."""
 
+    class _FakeAdapter(EngineAdapter):
+        def discover_tensors(self, result: LoadResult):
+            return {}
+
+        def after_weight_iter_load(self, result: LoadResult):
+            return result
+
+        def apply_weight_iter(self, result: LoadResult, weights_iter):
+            if result.model is not None:
+                result.model.load_weights(weights_iter)
+            return result
+
     def _make_context(self):
         from modelexpress.load_strategy import LoadContext
         return LoadContext(
@@ -210,10 +225,12 @@ class TestGdsStrategyIntegration:
             load_config=MagicMock(),
             target_device=torch.device("cpu"),
             global_rank=0,
+            worker_rank=0,
             device_id=0,
             identity=MagicMock(),
             mx_client=MagicMock(),
             worker_id="test-worker",
+            adapter=self._FakeAdapter(),
         )
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
@@ -234,14 +251,15 @@ class TestGdsStrategyIntegration:
         model = MagicMock()
         result = strategy.load(model, ctx)
 
-        assert result is True
+        assert isinstance(result, LoadResult)
+        assert result.model is model
         mock_gds.load_iter.assert_called_once()
         model.load_weights.assert_called_once()
         mock_gds.shutdown.assert_called_once()
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
     @patch("modelexpress.gds_loader.MxGdsLoader")
-    def test_gds_failure_returns_false(self, mock_gds_cls, _mock_avail):
+    def test_gds_failure_raises_strategy_failed(self, mock_gds_cls, _mock_avail):
         from modelexpress.load_strategy.gds_strategy import GdsStrategy
 
         mock_gds = MagicMock()
@@ -252,9 +270,50 @@ class TestGdsStrategyIntegration:
         ctx.model_config.model = "test-model"
 
         strategy = GdsStrategy()
-        result = strategy.load(MagicMock(), ctx)
+        with pytest.raises(StrategyFailed, match="GDS error") as exc:
+            strategy.load(MagicMock(), ctx)
 
-        assert result is False
+        assert exc.value.mutated is False
+        mock_gds.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_apply_weight_iter_failure_is_mutated(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        mock_gds = MagicMock()
+        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_gds_cls.return_value = mock_gds
+
+        ctx = self._make_context()
+        ctx.adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
+        ctx.model_config.model = "test-model"
+
+        strategy = GdsStrategy()
+        with pytest.raises(StrategyFailed, match="partial load") as exc:
+            strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is True
+        mock_gds.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_after_weight_iter_failure_is_mutated(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        mock_gds = MagicMock()
+        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_gds_cls.return_value = mock_gds
+
+        ctx = self._make_context()
+        ctx.adapter.after_weight_iter_load = MagicMock(side_effect=RuntimeError("post load"))
+        ctx.model_config.model = "test-model"
+
+        strategy = GdsStrategy()
+        with pytest.raises(StrategyFailed, match="post load") as exc:
+            strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is True
         mock_gds.shutdown.assert_called_once()
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=False)

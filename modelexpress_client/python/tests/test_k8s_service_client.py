@@ -14,10 +14,10 @@ import pytest
 from modelexpress import p2p_pb2
 from modelexpress import p2p_pb2_grpc
 from modelexpress.client import MxClient
-from modelexpress.client_factory import create_metadata_client
-from modelexpress.k8s_service_client import MxK8sServiceClient
-from modelexpress.source_id import compute_mx_source_id
-from modelexpress.metadata import _is_p2p_metadata_enabled
+from modelexpress.metadata.client_factory import create_metadata_client
+from modelexpress.metadata.k8s_service_client import MxK8sServiceClient
+from modelexpress.metadata.publish import _is_p2p_metadata_enabled
+from modelexpress.metadata.source_id import compute_mx_source_id
 
 
 def _base_identity() -> p2p_pb2.SourceIdentity:

@@ -12,15 +12,17 @@ from __future__ import annotations
 
 import logging
 
-import torch
 import torch.nn as nn
 
 from modelexpress.tracing import tracer
+
+from ..adapter import StrategyFailed, UnsupportedCapability
 from .base import (
     LoadContext,
+    LoadResult,
     LoadStrategy,
     SourceTransferError,
-    build_load_context,
+    publish_source_if_supported,
     register_tensors,
     publish_metadata,
     unpublish_metadata,
@@ -28,40 +30,16 @@ from .base import (
 
 __all__ = [
     "LoadContext",
+    "LoadResult",
     "LoadStrategy",
     "LoadStrategyChain",
     "SourceTransferError",
-    "build_load_context",
     "register_tensors",
     "publish_metadata",
     "unpublish_metadata",
 ]
 
 logger = logging.getLogger("modelexpress.load_strategy")
-
-
-def _reset_vllm_compilation_state(compilation_config) -> None:
-    """Reset per-model mutable state on vLLM's CompilationConfig.
-
-    vLLM registers attention / MLA / Mamba / FusedMoE layers and accumulates
-    compile stats into dicts / sets / counters on ``compilation_config``
-    during ``initialize_model()``. These live on the config object, not the
-    model, so they survive ``del model`` and either crash the next
-    ``initialize_model()`` (``static_forward_context`` has an explicit
-    duplicate-name guard) or silently corrupt subsequent state (MoE layer
-    list, custom op counters, traced files, compilation time).
-
-    Called from the chain's re-init path so the next strategy sees a clean
-    config. Audited against vLLM 0.17.1; newer vLLM versions may add
-    additional ``init=False`` fields on ``CompilationConfig`` that need
-    similar treatment.
-    """
-    compilation_config.static_forward_context.clear()
-    compilation_config.static_all_moe_layers.clear()
-    compilation_config.enabled_custom_ops.clear()
-    compilation_config.disabled_custom_ops.clear()
-    compilation_config.traced_files.clear()
-    compilation_config.compilation_time = 0.0
 
 
 class LoadStrategyChain:
@@ -75,10 +53,14 @@ class LoadStrategyChain:
     def run(model: nn.Module, ctx: LoadContext) -> nn.Module:
         """Build the chain and execute strategies until one succeeds.
 
+        Strategies return LoadResult on success. Expected misses raise
+        StrategyFailed; mutated failures trigger adapter re-initialization
+        before the next strategy runs. Unexpected exceptions are rolled back
+        and treated as fallback to preserve the existing chain behavior.
+
         Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
-        from vllm.model_executor.model_loader.utils import initialize_model
         from .rdma_strategy import RdmaStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
@@ -93,6 +75,7 @@ class LoadStrategyChain:
         eligible = [s for s in all_strategies if s.is_available(ctx)]
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
+        result = LoadResult(value=model, model=model)
         with tracer.start_as_current_span("Load model") as span:
             span.set_attribute("model_name", ctx.identity.model_name)
             span.set_attribute("global_rank", ctx.global_rank)
@@ -101,30 +84,49 @@ class LoadStrategyChain:
             for strategy in eligible:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
                 try:
-                    if strategy.load(model, ctx):
-                        span.set_attribute("weight_loading_strategy", strategy.name)
-                        return model
+                    result = strategy.load(result, ctx)
+                    publish_source_if_supported(result, ctx)
+                    span.set_attribute("weight_loading_strategy", strategy.name)
+                    return result.value
+                except StrategyFailed as e:
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
+                        f"trying next: {e}"
+                    )
+                    strategy.rollback(ctx)
+                    if e.mutated:
+                        result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
+                    continue
                 except Exception as e:
+                    # Unexpected strategy errors should be rare. Keep the engine
+                    # alive by falling through to the next strategy; expected
+                    # fallback paths should use StrategyFailed instead.
                     logger.warning(
                         f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
                         f"raised unexpected error, trying next: {e}"
                     )
+                    strategy.rollback(ctx)
 
-                if strategy.rollback(ctx):
-                    del model
-                    torch.cuda.empty_cache()
-                    _reset_vllm_compilation_state(ctx.vllm_config.compilation_config)
-                    logger.info(
-                        f"[Worker {ctx.global_rank}] Re-initializing model after "
-                        f"failed strategy '{strategy.name}'"
-                    )
-                    with ctx.target_device:
-                        model = initialize_model(
-                            vllm_config=ctx.vllm_config,
-                            model_config=ctx.model_config,
-                        )
+        raise RuntimeError(
+            f"[Worker {ctx.global_rank}] No loading strategy succeeded "
+            f"for model '{ctx.identity.model_name}'"
+        )
 
+    @staticmethod
+    def _reinit_for_retry(
+        result: LoadResult,
+        ctx: LoadContext,
+        strategy: LoadStrategy,
+    ) -> LoadResult:
+        if ctx.adapter is None:
             raise RuntimeError(
-                f"[Worker {ctx.global_rank}] No loading strategy succeeded "
-                f"for model '{ctx.identity.model_name}'"
+                f"[Worker {ctx.global_rank}] Strategy '{strategy.name}' mutated "
+                "the model but no adapter can reinitialize it"
             )
+        try:
+            return ctx.adapter.reinit_for_retry(result)
+        except UnsupportedCapability as exc:
+            raise RuntimeError(
+                f"[Worker {ctx.global_rank}] Strategy '{strategy.name}' mutated "
+                "the model but adapter does not support retry reinitialization"
+            ) from exc
