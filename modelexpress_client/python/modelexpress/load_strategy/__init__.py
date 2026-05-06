@@ -15,6 +15,7 @@ import logging
 import torch
 import torch.nn as nn
 
+from modelexpress.tracing import tracer
 from .base import (
     LoadContext,
     LoadStrategy,
@@ -92,32 +93,38 @@ class LoadStrategyChain:
         eligible = [s for s in all_strategies if s.is_available(ctx)]
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
-        for strategy in eligible:
-            logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
-            try:
-                if strategy.load(model, ctx):
-                    return model
-            except Exception as e:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
-                    f"raised unexpected error, trying next: {e}"
-                )
+        with tracer.start_as_current_span("Load model") as span:
+            span.set_attribute("model_name", ctx.identity.model_name)
+            span.set_attribute("global_rank", ctx.global_rank)
+            span.set_attribute("eligible_strategies", [s.name for s in eligible])
 
-            if strategy.rollback(ctx):
-                del model
-                torch.cuda.empty_cache()
-                _reset_vllm_compilation_state(ctx.vllm_config.compilation_config)
-                logger.info(
-                    f"[Worker {ctx.global_rank}] Re-initializing model after "
-                    f"failed strategy '{strategy.name}'"
-                )
-                with ctx.target_device:
-                    model = initialize_model(
-                        vllm_config=ctx.vllm_config,
-                        model_config=ctx.model_config,
+            for strategy in eligible:
+                logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
+                try:
+                    if strategy.load(model, ctx):
+                        span.set_attribute("weight_loading_strategy", strategy.name)
+                        return model
+                except Exception as e:
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
+                        f"raised unexpected error, trying next: {e}"
                     )
 
-        raise RuntimeError(
-            f"[Worker {ctx.global_rank}] No loading strategy succeeded "
-            f"for model '{ctx.identity.model_name}'"
-        )
+                if strategy.rollback(ctx):
+                    del model
+                    torch.cuda.empty_cache()
+                    _reset_vllm_compilation_state(ctx.vllm_config.compilation_config)
+                    logger.info(
+                        f"[Worker {ctx.global_rank}] Re-initializing model after "
+                        f"failed strategy '{strategy.name}'"
+                    )
+                    with ctx.target_device:
+                        model = initialize_model(
+                            vllm_config=ctx.vllm_config,
+                            model_config=ctx.model_config,
+                        )
+
+            raise RuntimeError(
+                f"[Worker {ctx.global_rank}] No loading strategy succeeded "
+                f"for model '{ctx.identity.model_name}'"
+            )
