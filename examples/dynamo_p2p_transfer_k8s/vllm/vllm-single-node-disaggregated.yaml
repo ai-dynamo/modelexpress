@@ -102,8 +102,6 @@ spec:
           value: "modelexpress"
         - name: MX_SERVER_ADDRESS
           value: "mx-vllm-disagg-sn-modelexpress:8000"
-        - name: MX_CONTIGUOUS_REG
-          value: "0"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL
@@ -185,8 +183,6 @@ spec:
           value: "modelexpress"
         - name: MX_SERVER_ADDRESS
           value: "mx-vllm-disagg-sn-modelexpress:8000"
-        - name: MX_CONTIGUOUS_REG
-          value: "0"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL

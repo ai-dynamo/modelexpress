@@ -595,8 +595,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity("my-model")
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
+        with patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
             publish_metadata_and_ready(mx_client, nixl_manager, tensors, global_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
 
         mx_client.publish_metadata.assert_called_once()
@@ -628,8 +627,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
+        with patch("modelexpress.metadata.time.sleep") as sleep_mock, \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
             publish_metadata_and_ready(
                 mx_client,
@@ -668,8 +666,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
+        with patch("modelexpress.metadata.time.sleep") as sleep_mock, \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
                 publish_metadata_and_ready(
@@ -700,8 +697,7 @@ class TestPublishMetadataAndReady:
 
         identity = _make_identity()
         mock_hb = MagicMock()
-        with patch.dict("os.environ", {"MX_CONTIGUOUS_REG": "0"}), \
-             patch("modelexpress.metadata.time.sleep") as sleep_mock, \
+        with patch("modelexpress.metadata.time.sleep") as sleep_mock, \
              patch("modelexpress.metadata.HeartbeatThread", return_value=mock_hb) as hb_cls:
             with pytest.raises(_FakeRpcError, match="permission denied"):
                 publish_metadata_and_ready(
