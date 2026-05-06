@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 
 from modelexpress.nixl_transfer import (
@@ -26,31 +24,56 @@ def _desc(name: str, addr: int, size: int) -> TensorDescriptor:
     )
 
 
-class _FakeCuda:
-    """Stand-in for ctypes.CDLL('libcuda.so').
+class _FakeDriver:
+    """Stand-in for cuda.bindings.driver.cuMemGetAddressRange.
 
-    Maintains a list of (alloc_base, alloc_size) regions and a return-code
-    override for the next cuMemGetAddressRange_v2 call. The mock identifies
-    which allocation an address belongs to by linear scan, mirroring what
-    cuMemGetAddressRange_v2 returns from the CUDA driver.
+    Maintains a list of (alloc_base, alloc_size) regions. On each call,
+    locates the allocation containing the queried address (mirroring what
+    the real CUDA driver does) and returns the (err, base, size) triple
+    matching the cuda-python binding's signature.
     """
 
-    def __init__(self, allocations: list[tuple[int, int]], ret: int = 0) -> None:
+    def __init__(
+        self,
+        allocations: list[tuple[int, int]],
+        err_override=None,
+    ) -> None:
         self._allocations = allocations
-        self._ret = ret
+        self._err_override = err_override
         self.calls = 0
 
-    def cuMemGetAddressRange_v2(self, base_ref, size_ref, addr) -> int:
+    def cuMemGetAddressRange(self, addr: int):
+        from cuda.bindings import driver
+
         self.calls += 1
-        if self._ret != 0:
-            return self._ret
-        addr_value = addr.value if hasattr(addr, "value") else int(addr)
+        if self._err_override is not None:
+            return (self._err_override, 0, 0)
         for alloc_base, alloc_size in self._allocations:
-            if alloc_base <= addr_value < alloc_base + alloc_size:
-                base_ref._obj.value = alloc_base
-                size_ref._obj.value = alloc_size
-                return 0
-        return 1  # CUDA_ERROR_INVALID_VALUE
+            if alloc_base <= addr < alloc_base + alloc_size:
+                return (driver.CUresult.CUDA_SUCCESS, alloc_base, alloc_size)
+        return (driver.CUresult.CUDA_ERROR_INVALID_VALUE, 0, 0)
+
+
+@pytest.fixture
+def fake_driver(monkeypatch):
+    """Replace cuda.bindings.driver.cuMemGetAddressRange with a fake.
+
+    The fake is returned so tests can inspect call counts. The real
+    `CUresult` enum is preserved so `err.name` formatting in the function
+    under test exercises the same code path as production.
+    """
+    from cuda.bindings import driver
+
+    def _make(allocations, err_override=None):
+        fake = _FakeDriver(allocations, err_override)
+        monkeypatch.setattr(
+            driver,
+            "cuMemGetAddressRange",
+            fake.cuMemGetAddressRange,
+        )
+        return fake
+
+    return _make
 
 
 class TestPoolRegEnabled:
@@ -86,83 +109,77 @@ class TestFindCudaAllocations:
     def test_empty_returns_empty(self):
         assert NixlTransferManager._find_cuda_allocations([]) == []
 
-    def test_single_tensor_single_allocation(self):
+    def test_single_tensor_single_allocation(self, fake_driver):
         # Tensor at 0x1100 inside a 4 KiB allocation starting at 0x1000.
-        allocations = [(0x1000, 0x1000)]
-        fake = _FakeCuda(allocations)
-        with patch("ctypes.CDLL", return_value=fake):
-            result = NixlTransferManager._find_cuda_allocations(
-                [_desc("w", 0x1100, 64)]
-            )
+        fake = fake_driver([(0x1000, 0x1000)])
+        result = NixlTransferManager._find_cuda_allocations(
+            [_desc("w", 0x1100, 64)]
+        )
         assert result == [(0x1000, 0x1000)]
         assert fake.calls == 1
 
-    def test_multiple_tensors_same_allocation_dedup(self):
+    def test_multiple_tensors_same_allocation_dedup(self, fake_driver):
         # Three tensors all inside the same 4 KiB allocation.
-        allocations = [(0x1000, 0x1000)]
-        fake = _FakeCuda(allocations)
+        fake = fake_driver([(0x1000, 0x1000)])
         descriptors = [
             _desc("w0", 0x1000, 64),
             _desc("w1", 0x1100, 64),
             _desc("w2", 0x1200, 64),
         ]
-        with patch("ctypes.CDLL", return_value=fake):
-            result = NixlTransferManager._find_cuda_allocations(descriptors)
+        result = NixlTransferManager._find_cuda_allocations(descriptors)
         # All three queries hit, but the result is deduplicated by alloc_base.
         assert result == [(0x1000, 0x1000)]
         assert fake.calls == 3
 
-    def test_multiple_allocations_sorted(self):
+    def test_multiple_allocations_sorted(self, fake_driver):
         # Three distinct allocations in non-sorted order; result must be
         # sorted by alloc_base.
-        allocations = [
+        fake_driver([
             (0x3000, 0x1000),
             (0x1000, 0x1000),
             (0x2000, 0x1000),
-        ]
-        fake = _FakeCuda(allocations)
+        ])
         descriptors = [
             _desc("w0", 0x3010, 64),
             _desc("w1", 0x1010, 64),
             _desc("w2", 0x2010, 64),
         ]
-        with patch("ctypes.CDLL", return_value=fake):
-            result = NixlTransferManager._find_cuda_allocations(descriptors)
+        result = NixlTransferManager._find_cuda_allocations(descriptors)
         assert result == [
             (0x1000, 0x1000),
             (0x2000, 0x1000),
             (0x3000, 0x1000),
         ]
 
-    def test_adjacent_allocations_not_merged(self):
+    def test_adjacent_allocations_not_merged(self, fake_driver):
         # Two allocations that happen to be adjacent in virtual address space
         # must remain separate. Merging them is what the (now-removed)
         # MX_CONTIGUOUS_REG path did, and it broke UCX rcache rkey lookup.
-        allocations = [
+        fake_driver([
             (0x1000, 0x1000),  # ends at 0x2000
             (0x2000, 0x1000),  # starts where the previous ends
-        ]
-        fake = _FakeCuda(allocations)
+        ])
         descriptors = [
             _desc("w0", 0x1010, 64),
             _desc("w1", 0x2010, 64),
         ]
-        with patch("ctypes.CDLL", return_value=fake):
-            result = NixlTransferManager._find_cuda_allocations(descriptors)
+        result = NixlTransferManager._find_cuda_allocations(descriptors)
         assert result == [(0x1000, 0x1000), (0x2000, 0x1000)]
 
-    def test_driver_error_raises_runtime_error(self):
-        fake = _FakeCuda(allocations=[], ret=999)  # CUDA_ERROR_UNKNOWN
-        with patch("ctypes.CDLL", return_value=fake):
-            with pytest.raises(RuntimeError, match="cuMemGetAddressRange_v2 failed"):
-                NixlTransferManager._find_cuda_allocations(
-                    [_desc("w", 0x1000, 64)]
-                )
+    def test_driver_error_raises_runtime_error(self, fake_driver):
+        from cuda.bindings import driver
 
-    def test_driver_error_includes_tensor_name(self):
-        fake = _FakeCuda(allocations=[], ret=1)
-        with patch("ctypes.CDLL", return_value=fake):
-            with pytest.raises(RuntimeError, match="'w_named'"):
-                NixlTransferManager._find_cuda_allocations(
-                    [_desc("w_named", 0x1000, 64)]
-                )
+        fake_driver(allocations=[], err_override=driver.CUresult.CUDA_ERROR_UNKNOWN)
+        with pytest.raises(RuntimeError, match="cuMemGetAddressRange failed"):
+            NixlTransferManager._find_cuda_allocations(
+                [_desc("w", 0x1000, 64)]
+            )
+
+    def test_driver_error_includes_tensor_name(self, fake_driver):
+        from cuda.bindings import driver
+
+        fake_driver(allocations=[], err_override=driver.CUresult.CUDA_ERROR_INVALID_VALUE)
+        with pytest.raises(RuntimeError, match="'w_named'"):
+            NixlTransferManager._find_cuda_allocations(
+                [_desc("w_named", 0x1000, 64)]
+            )

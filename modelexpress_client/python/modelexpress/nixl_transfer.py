@@ -274,12 +274,12 @@ class NixlTransferManager:
         """
         Find unique CUDA allocations backing the tensor descriptors.
 
-        Uses cuMemGetAddressRange_v2 to query each tensor's containing
-        cudaMalloc block. Adjacent allocations in virtual address space
-        are NOT merged: UCX's rcache produces broken rkeys when a single
-        registered region spans multiple cudaMalloc blocks, even when
-        they happen to be adjacent. Each unique allocation is registered
-        independently.
+        Uses cuMemGetAddressRange (cuda-python binding for the v2 driver
+        ABI) to query each tensor's containing cudaMalloc block. Adjacent
+        allocations in virtual address space are NOT merged: UCX's rcache
+        produces broken rkeys when a single registered region spans
+        multiple cudaMalloc blocks, even when they happen to be adjacent.
+        Each unique allocation is registered independently.
 
         Args:
             descriptors: List of tensor descriptors
@@ -291,25 +291,20 @@ class NixlTransferManager:
         if not descriptors:
             return []
 
-        import ctypes
+        from cuda.bindings import driver as cuda_driver
 
-        cuda = ctypes.CDLL("libcuda.so")
         seen: dict[int, int] = {}  # alloc_base -> alloc_size
 
         for desc in descriptors:
-            base = ctypes.c_uint64()
-            alloc_size = ctypes.c_size_t()
-            ret = cuda.cuMemGetAddressRange_v2(
-                ctypes.byref(base), ctypes.byref(alloc_size), ctypes.c_uint64(desc.addr)
-            )
-            if ret != 0:
+            err, alloc_base, alloc_size = cuda_driver.cuMemGetAddressRange(desc.addr)
+            if err != cuda_driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(
-                    f"cuMemGetAddressRange_v2 failed (error {ret}) for tensor "
+                    f"cuMemGetAddressRange failed ({err.name}) for tensor "
                     f"'{desc.name}' at 0x{desc.addr:x}. Is the tensor on a CUDA device?"
                 )
-            alloc_base = base.value
-            if alloc_base not in seen:
-                seen[alloc_base] = alloc_size.value
+            base_int = int(alloc_base)
+            if base_int not in seen:
+                seen[base_int] = int(alloc_size)
 
         return sorted(seen.items())
 
