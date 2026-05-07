@@ -23,10 +23,10 @@ from __future__ import annotations
 import logging
 import os
 
-from .client import MxClient, MxClientBase
+from ..client import MxClient, MxClientBase
 from .k8s_service_client import MxK8sServiceClient
 
-logger = logging.getLogger("modelexpress.client_factory")
+logger = logging.getLogger("modelexpress.metadata.client_factory")
 
 _CENTRAL_BACKEND_ALIASES = frozenset({
     "", "server", "redis", "kubernetes", "k8s", "crd",

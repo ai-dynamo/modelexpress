@@ -18,10 +18,10 @@ import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .client import MxClient
-    from .nixl_transfer import NixlTransferManager
+    from ..client import MxClient
+    from ..nixl_transfer import NixlTransferManager
 
-logger = logging.getLogger("modelexpress.heartbeat")
+logger = logging.getLogger("modelexpress.metadata.heartbeat")
 
 
 class HeartbeatThread:
@@ -97,7 +97,7 @@ class HeartbeatThread:
         if not self._started:
             return
         try:
-            from . import p2p_pb2
+            from .. import p2p_pb2
             self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
             logger.info(f"[Worker {self._worker_rank}] Marked STALE on shutdown")
             self._started = False
@@ -119,7 +119,7 @@ class HeartbeatThread:
 
     def _tick(self) -> None:
         """Single heartbeat tick: check health and send READY if healthy."""
-        from . import p2p_pb2
+        from .. import p2p_pb2
 
         if not self._nixl_manager.is_healthy():
             return

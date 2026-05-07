@@ -123,23 +123,35 @@ ModelExpress/
 │   └── modelexpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
-│       ├── heartbeat.py                # Client-side heartbeat for source liveness
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader
-│       ├── vllm_loader.py              # MxModelLoader (thin orchestration)
+│       ├── adapter.py                  # EngineAdapter contract and strategy errors
+│       ├── vllm_loader.py              # Compatibility shim for engines.vllm.loader
+│       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
+│       │   ├── __init__.py
+│       │   ├── publish.py              # Source identity + metadata publication
+│       │   ├── heartbeat.py            # Client-side heartbeat for source liveness
+│       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor manifest)
+│       │   ├── source_id.py            # Python mx_source_id computation
+│       │   ├── client_factory.py       # Selects central vs k8s-service metadata client
+│       │   └── k8s_service_client.py   # Decentralized k8s-service metadata client
 │       ├── load_strategy/              # Loading strategy chain
 │       │   ├── __init__.py             # LoadStrategyChain.run()
-│       │   ├── base.py                 # LoadStrategy ABC, LoadContext, shared helpers
+│       │   ├── context.py              # LoadContext and LoadResult
+│       │   ├── base.py                 # LoadStrategy ABC and shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
 │       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3/GCS/Azure/local)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
-│       │   └── default_strategy.py     # DefaultStrategy (vLLM DefaultModelLoader)
+│       │   └── default_strategy.py     # DefaultStrategy (engine-native fallback)
+│       ├── engines/
+│       │   └── vllm/                   # vLLM integration
+│       │       ├── __init__.py         # vLLM loader registration
+│       │       ├── adapter.py          # VllmAdapter and context builder
+│       │       └── loader.py           # MxModelLoader implementation
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
-│       ├── metadata.py                 # Metadata building and publishing
 │       ├── rank_utils.py               # Rank detection utilities
-│       ├── worker_server.py            # WorkerGrpcServer (P2P tensor manifest)
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
@@ -491,16 +503,16 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `heartbeat.py` | `HeartbeatThread` - background thread sending periodic `UpdateStatus(READY)` and `STALE` on shutdown |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
-| `vllm_loader.py` | `MxModelLoader` - thin orchestration, delegates to `LoadStrategyChain` |
-| `load_strategy/` | Loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
+| `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
+| `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
-| `metadata.py` | `build_source_identity`, `publish_metadata_and_ready`, retry logic |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
-| `worker_server.py` | `WorkerGrpcServer` - per-worker gRPC server for P2P tensor manifest exchange |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
@@ -539,16 +551,16 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 **LoadStrategyChain** (`load_strategy/`):
 
-Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(model, ctx)` methods. The chain filters to eligible strategies and runs them in order until one succeeds:
+Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(result, ctx)` methods. Engine-specific work is delegated to `ctx.adapter`; `LoadResult` carries the value returned to the engine plus the model used for tensor discovery and publication. The chain filters to eligible strategies and runs them in order until one succeeds:
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError` or `ManifestMismatchError`, try next. |
 | p1 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
-| p3 | `DefaultStrategy` | Always | vLLM `DefaultModelLoader` (CPU-staged, auto-downloads from HF Hub). |
+| p3 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
-Each strategy is fully self-contained: it handles weight loading, post-processing (`process_weights_after_loading`), NIXL tensor registration, and metadata publishing. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+Strategies handle the loading path and NIXL tensor registration. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
 ### Transfer Safety
 

@@ -17,10 +17,10 @@ from concurrent import futures
 
 import grpc
 
-from . import p2p_pb2
-from . import p2p_pb2_grpc
+from .. import p2p_pb2
+from .. import p2p_pb2_grpc
 
-logger = logging.getLogger("modelexpress.worker_server")
+logger = logging.getLogger("modelexpress.metadata.worker_server")
 
 
 class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):

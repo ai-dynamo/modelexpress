@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-from . import p2p_pb2
+from .. import p2p_pb2
 
 
 def compute_mx_source_id(identity: p2p_pb2.SourceIdentity) -> str:

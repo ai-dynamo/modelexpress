@@ -46,12 +46,12 @@ import time
 
 import grpc
 
-from . import p2p_pb2
-from . import p2p_pb2_grpc
-from .client import MxClientBase
+from .. import p2p_pb2
+from .. import p2p_pb2_grpc
+from ..client import MxClientBase
 from .source_id import compute_mx_source_id
 
-logger = logging.getLogger("modelexpress.k8s_service_client")
+logger = logging.getLogger("modelexpress.metadata.k8s_service_client")
 
 _DEFAULT_SERVICE_PATTERN = "mx-sources"
 _DEFAULT_WORKER_GRPC_PORT = 6555
@@ -108,7 +108,7 @@ class MxK8sServiceClient(MxClientBase):
     ) -> str:
         """Compute mx_source_id locally - there is no central store to hit.
 
-        Caller (metadata.py) is responsible for starting the local
+        Caller (metadata.publish) is responsible for starting the local
         WorkerGrpcServer; this method only produces the ID so caller
         has something to key against. Also records ``worker_rank`` so
         the DNS pattern can be resolved without a separate call.

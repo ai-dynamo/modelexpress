@@ -13,15 +13,15 @@ from typing import TYPE_CHECKING
 import grpc
 import torch
 
-from .client import MxClient
 from .heartbeat import HeartbeatThread
-from . import p2p_pb2
+from ..client import MxClient
+from .. import p2p_pb2
 
 if TYPE_CHECKING:
-    from .nixl_transfer import NixlTransferManager
+    from ..nixl_transfer import NixlTransferManager
     from .worker_server import WorkerGrpcServer
 
-logger = logging.getLogger("modelexpress.metadata")
+logger = logging.getLogger("modelexpress.metadata.publish")
 
 PUBLISH_METADATA_MAX_ATTEMPTS = 3
 PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS = 1.0
@@ -111,17 +111,17 @@ def publish_metadata_and_ready(
     mx_client: MxClient,
     nixl_manager: "NixlTransferManager",
     tensors: dict[str, torch.Tensor],
-    global_rank: int,
+    worker_rank: int,
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
 ) -> None:
     """Publish tensor metadata and ready flag to the ModelExpress server."""
     logger.info(
-        f"[Worker {global_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {worker_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
-    tensor_protos = build_tensor_protos(tensors, device_id, global_rank)
+    tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
 
     if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer
@@ -132,7 +132,7 @@ def publish_metadata_and_ready(
         worker_grpc_port = grpc_base + device_id
 
         worker = p2p_pb2.WorkerMetadata(
-            worker_rank=global_rank,
+            worker_rank=worker_rank,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint="",
@@ -142,7 +142,7 @@ def publish_metadata_and_ready(
             identity=identity,
             worker=worker,
             worker_id=worker_id,
-            global_rank=global_rank,
+            worker_rank=worker_rank,
         )
 
         grpc_server = WorkerGrpcServer(
@@ -151,13 +151,13 @@ def publish_metadata_and_ready(
             port=worker_grpc_port,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
-            worker_rank=global_rank,
+            worker_rank=worker_rank,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
 
         worker = p2p_pb2.WorkerMetadata(
-            worker_rank=global_rank,
+            worker_rank=worker_rank,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
@@ -167,15 +167,15 @@ def publish_metadata_and_ready(
             identity=identity,
             worker=worker,
             worker_id=worker_id,
-            global_rank=global_rank,
+            worker_rank=worker_rank,
         )
         logger.info(
-            f"[Worker {global_rank}] Published P2P metadata to MX server "
+            f"[Worker {worker_rank}] Published P2P metadata to MX server "
             f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
         )
     else:
         worker = p2p_pb2.WorkerMetadata(
-            worker_rank=global_rank,
+            worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensors=tensor_protos,
         )
@@ -184,10 +184,10 @@ def publish_metadata_and_ready(
             identity=identity,
             worker=worker,
             worker_id=worker_id,
-            global_rank=global_rank,
+            worker_rank=worker_rank,
         )
         logger.info(
-            f"[Worker {global_rank}] Published metadata to MX server "
+            f"[Worker {worker_rank}] Published metadata to MX server "
             f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
         )
 
@@ -195,11 +195,11 @@ def publish_metadata_and_ready(
         mx_client=mx_client,
         mx_source_id=mx_source_id,
         worker_id=worker_id,
-        worker_rank=global_rank,
+        worker_rank=worker_rank,
         nixl_manager=nixl_manager,
     )
     heartbeat.start()
-    _heartbeat_threads[global_rank] = heartbeat
+    _heartbeat_threads[worker_rank] = heartbeat
 
 
 def _publish_metadata_to_server(
@@ -207,7 +207,7 @@ def _publish_metadata_to_server(
     identity: "p2p_pb2.SourceIdentity",
     worker: "p2p_pb2.WorkerMetadata",
     worker_id: str,
-    global_rank: int,
+    worker_rank: int,
 ) -> str:
     """Publish metadata with bounded retries and exponential backoff."""
     last_error: grpc.RpcError | None = None
@@ -225,14 +225,14 @@ def _publish_metadata_to_server(
 
             backoff_seconds = PUBLISH_METADATA_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
             logger.warning(
-                f"[Worker {global_rank}] Publish metadata attempt {attempt}/"
+                f"[Worker {worker_rank}] Publish metadata attempt {attempt}/"
                 f"{PUBLISH_METADATA_MAX_ATTEMPTS} failed with retryable gRPC status "
                 f"{exc.code().name}: {exc}. Retrying in {backoff_seconds:.1f}s"
             )
             time.sleep(backoff_seconds)
 
     message = (
-        f"[Worker {global_rank}] Failed to publish metadata after "
+        f"[Worker {worker_rank}] Failed to publish metadata after "
         f"{PUBLISH_METADATA_MAX_ATTEMPTS} attempts"
     )
     logger.error("%s: %s", message, last_error)

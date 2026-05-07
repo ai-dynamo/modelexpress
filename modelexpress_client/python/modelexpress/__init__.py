@@ -60,8 +60,9 @@ def register_modelexpress_loaders():
     if _loaders_registered:
         return
 
-    # Import triggers @register_model_loader decorators on the classes
-    from . import vllm_loader  # noqa: F401
+    from .engines.vllm import register_modelexpress_loaders as register_vllm_loaders
+
+    register_vllm_loaders()
 
     _loaders_registered = True
     _logger.debug("ModelExpress loader registered: mx")
@@ -70,7 +71,7 @@ def register_modelexpress_loaders():
 from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
-from .heartbeat import HeartbeatThread  # noqa: F401
+from .metadata.heartbeat import HeartbeatThread  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",

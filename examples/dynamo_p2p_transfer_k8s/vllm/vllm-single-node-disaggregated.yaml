@@ -117,13 +117,6 @@ spec:
         - name: UCX_RNDV_THRESH
           value: "0"
       extraPodSpec:
-        tolerations:
-          - key: nvidia.com/gpu
-            operator: Exists
-            effect: NoSchedule
-          - key: dra
-            operator: Exists
-            effect: NoSchedule
         # Keep decode replicas apart, but allow one decode and one prefill
         # worker to share an 8-GPU node so all GPUs can be utilized.
         affinity:
@@ -195,13 +188,6 @@ spec:
         - name: UCX_RNDV_THRESH
           value: "0"
       extraPodSpec:
-        tolerations:
-          - key: nvidia.com/gpu
-            operator: Exists
-            effect: NoSchedule
-          - key: dra
-            operator: Exists
-            effect: NoSchedule
         # Keep prefill replicas apart, but allow one decode and one prefill
         # worker to share an 8-GPU node so all GPUs can be utilized.
         affinity:

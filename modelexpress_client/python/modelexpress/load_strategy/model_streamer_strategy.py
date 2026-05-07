@@ -17,10 +17,10 @@ import time
 from typing import Iterator
 
 import torch
-import torch.nn as nn
 
-from .base import LoadContext, LoadStrategy, register_tensors, publish_metadata
-from ..tensor_utils import capture_tensor_attrs
+from ..adapter import EngineAdapter, StrategyFailed
+from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
@@ -70,8 +70,11 @@ class ModelStreamerStrategy(LoadStrategy):
     """
 
     name = "model_streamer"
+    requires = (EngineAdapter.apply_weight_iter,)
 
     def is_available(self, ctx: LoadContext) -> bool:
+        if not super().is_available(ctx):
+            return False
         if importlib.util.find_spec("runai_model_streamer") is None:
             logger.info(
                 f"[Worker {ctx.global_rank}] runai_model_streamer not installed, skipping"
@@ -86,27 +89,31 @@ class ModelStreamerStrategy(LoadStrategy):
             return False
         return True
 
-    def load(self, model: nn.Module, ctx: LoadContext) -> bool:
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        result = _as_load_result(result)
         model_uri = _resolve_model_uri(os.environ["MX_MODEL_URI"])
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:
             weights_iter = self._stream_weights(model_uri, ctx)
-            model.load_weights(weights_iter)
-            logger.info(f"[Worker {ctx.global_rank}] Model streamer weight loading complete")
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
             )
-            return False
+            raise StrategyFailed(str(e), mutated=False) from e
 
-        from vllm.model_executor.model_loader.utils import process_weights_after_loading
-        with capture_tensor_attrs():
-            process_weights_after_loading(model, ctx.model_config, ctx.target_device)
+        try:
+            result = ctx.adapter.apply_weight_iter(result, weights_iter)
+            logger.info(f"[Worker {ctx.global_rank}] Model streamer weight loading complete")
+            result = ctx.adapter.after_weight_iter_load(result)
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
+            )
+            raise StrategyFailed(str(e), mutated=True) from e
 
-        register_tensors(model, ctx)
-        publish_metadata(ctx)
-        return True
+        register_tensors(result, ctx)
+        return result
 
     def _stream_weights(
         self, model_uri: str, ctx: LoadContext
