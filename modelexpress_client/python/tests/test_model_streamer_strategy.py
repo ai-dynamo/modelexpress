@@ -123,58 +123,63 @@ class TestModelStreamerLoad:
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
 
+    def _make_ctx_with_uri(self, *, model_weights=None, model="ignored"):
+        model_config = MagicMock()
+        model_config.model_weights = model_weights
+        model_config.model = model
+        return _make_load_context(model_config=model_config)
+
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_success_path_s3(self, mock_register):
         model = MagicMock()
-        ctx = _make_load_context()
+        ctx = self._make_ctx_with_uri(model_weights="s3://bucket/model")
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
-            with patch(
-                "modelexpress.load_strategy.model_streamer_strategy."
-                "ModelStreamerStrategy._stream_weights"
-            ) as mock_stream:
-                mock_stream.return_value = iter([
-                    ("layer.0.weight", torch.randn(4, 4)),
-                    ("layer.1.weight", torch.randn(4, 4)),
-                ])
-                result = strategy.load(model, ctx)
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights"
+        ) as mock_stream:
+            mock_stream.return_value = iter([
+                ("layer.0.weight", torch.randn(4, 4)),
+                ("layer.1.weight", torch.randn(4, 4)),
+            ])
+            result = strategy.load(model, ctx)
 
         assert isinstance(result, LoadResult)
         assert result.model is model
+        mock_stream.assert_called_once_with("s3://bucket/model", ctx)
         model.load_weights.assert_called_once()
         mock_register.assert_called_once_with(result, ctx)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_success_path_local(self, mock_register):
-        """load() works with a local path in MX_MODEL_URI."""
+    def test_success_path_local_falls_back_to_model(self, mock_register):
+        """When model_weights is unset, the URI comes from model_config.model."""
         model = MagicMock()
-        ctx = _make_load_context()
+        ctx = self._make_ctx_with_uri(model_weights=None, model="/models/llama")
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "/models/llama"}):
-            with patch(
-                "modelexpress.load_strategy.model_streamer_strategy."
-                "ModelStreamerStrategy._stream_weights"
-            ) as mock_stream:
-                mock_stream.return_value = iter([
-                    ("layer.0.weight", torch.randn(4, 4)),
-                ])
-                result = strategy.load(model, ctx)
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights"
+        ) as mock_stream:
+            mock_stream.return_value = iter([
+                ("layer.0.weight", torch.randn(4, 4)),
+            ])
+            result = strategy.load(model, ctx)
 
         assert isinstance(result, LoadResult)
         mock_stream.assert_called_once_with("/models/llama", ctx)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_env_overrides_model_config(self, mock_register):
-        """MX_MODEL_URI takes priority over model_config.model."""
+    def test_uri_from_model_weights_not_from_env(self, mock_register):
+        """The streaming URI comes from model_config, not from MX_MODEL_URI."""
         model = MagicMock()
-        model_config = MagicMock()
-        model_config.model = "/models/local-llama"
-        ctx = _make_load_context(model_config=model_config)
+        ctx = self._make_ctx_with_uri(
+            model_weights="s3://bucket/from-config", model="/ignored"
+        )
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://other/path-in-env"}):
             with patch(
                 "modelexpress.load_strategy.model_streamer_strategy."
                 "ModelStreamerStrategy._stream_weights"
@@ -183,22 +188,21 @@ class TestModelStreamerLoad:
                 with pytest.raises(StrategyFailed, match="expected"):
                     strategy.load(model, ctx)
 
-        mock_stream.assert_called_once_with("s3://bucket/model", ctx)
+        mock_stream.assert_called_once_with("s3://bucket/from-config", ctx)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_raises_strategy_failed_on_error(self, mock_register):
         model = MagicMock()
-        ctx = _make_load_context()
+        ctx = self._make_ctx_with_uri(model_weights="s3://bucket/model")
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
-            with patch(
-                "modelexpress.load_strategy.model_streamer_strategy."
-                "ModelStreamerStrategy._stream_weights",
-                side_effect=RuntimeError("S3 connection failed"),
-            ):
-                with pytest.raises(StrategyFailed, match="S3 connection failed") as exc:
-                    strategy.load(model, ctx)
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights",
+            side_effect=RuntimeError("S3 connection failed"),
+        ):
+            with pytest.raises(StrategyFailed, match="S3 connection failed") as exc:
+                strategy.load(model, ctx)
 
         assert exc.value.mutated is False
         mock_register.assert_not_called()
@@ -249,88 +253,25 @@ class TestModelStreamerLoad:
 # ---------------------------------------------------------------------------
 
 
-class TestResolveModelUri:
-    def _resolve(self, uri, **env_overrides):
-        from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
-        with patch.dict("os.environ", env_overrides, clear=True):
-            return _resolve_model_uri(uri)
-
-    def test_s3_passthrough(self):
-        assert self._resolve("s3://bucket/model") == "s3://bucket/model"
-
-    def test_gs_passthrough(self):
-        assert self._resolve("gs://bucket/model") == "gs://bucket/model"
-
-    def test_az_passthrough(self):
-        assert self._resolve("az://container/model") == "az://container/model"
-
-    def test_absolute_path_passthrough(self):
-        assert self._resolve("/models/deepseek-ai/DeepSeek-V3") == "/models/deepseek-ai/DeepSeek-V3"
-
-    def _mock_hf_cache(self, repos):
-        mock_cache = MagicMock()
-        mock_cache.repos = repos
-        mock_scan = MagicMock(return_value=mock_cache)
-        mock_hf_hub = MagicMock()
-        mock_hf_hub.scan_cache_dir = mock_scan
-        return mock_hf_hub, mock_scan
-
-    def test_hf_model_id_resolved_via_cache(self):
-        mock_rev = MagicMock()
-        mock_rev.snapshot_path = "/cache/models--org--name/snapshots/abc123"
-        mock_rev.last_modified = 1000
-        mock_repo = MagicMock()
-        mock_repo.repo_id = "org/name"
-        mock_repo.revisions = [mock_rev]
-
-        mock_hf_hub, mock_scan = self._mock_hf_cache([mock_repo])
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
-            result = self._resolve("org/name", HF_HUB_CACHE="/cache")
-
-        assert result == "/cache/models--org--name/snapshots/abc123"
-        mock_scan.assert_called_once_with("/cache")
-
-    def test_hf_home_fallback_appends_hub(self):
-        mock_hf_hub, mock_scan = self._mock_hf_cache([])
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
-            self._resolve("org/name", HF_HOME="/home/user/.cache/huggingface")
-
-        mock_scan.assert_called_once_with("/home/user/.cache/huggingface/hub")
-
-    def test_unresolved_hf_id_returned_as_is(self):
-        mock_hf_hub, _ = self._mock_hf_cache([])
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
-            assert self._resolve("org/unknown-model", HF_HUB_CACHE="/cache") == "org/unknown-model"
-
-    def test_no_cache_env_scans_default_cache(self):
-        """When no cache env is set, scan_cache_dir() is called with no args (uses ~/.cache/huggingface/hub)."""
-        mock_hf_hub, mock_scan = self._mock_hf_cache([])
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
-            assert self._resolve("org/unknown") == "org/unknown"
-
-        mock_scan.assert_called_once_with()
-
-    def test_no_cache_env_resolves_via_default_cache(self):
-        """Model IDs can be resolved via the default HF cache even when no env vars are set."""
-        mock_rev = MagicMock()
-        mock_rev.snapshot_path = "/home/user/.cache/huggingface/hub/models--org--name/snapshots/abc123"
-        mock_rev.last_modified = 1000
-        mock_repo = MagicMock()
-        mock_repo.repo_id = "org/name"
-        mock_repo.revisions = [mock_rev]
-
-        mock_hf_hub, mock_scan = self._mock_hf_cache([mock_repo])
-        with patch.dict("sys.modules", {"huggingface_hub": mock_hf_hub}):
-            result = self._resolve("org/name")
-
-        assert result == "/home/user/.cache/huggingface/hub/models--org--name/snapshots/abc123"
-        mock_scan.assert_called_once_with()
-
-
 class TestStreamWeights:
     def _make_strategy(self):
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
+
+    def _make_streamer_module(self, file_uris, tensors):
+        mock_streamer_instance = MagicMock()
+        mock_streamer_instance.__enter__ = MagicMock(return_value=mock_streamer_instance)
+        mock_streamer_instance.__exit__ = MagicMock(return_value=False)
+        mock_streamer_instance.files_to_tensors_metadata = {f: [MagicMock()] for f in file_uris}
+        mock_streamer_instance.get_tensors.return_value = iter(tensors)
+        mock_streamer_cls = MagicMock(return_value=mock_streamer_instance)
+        return (
+            MagicMock(
+                list_safetensors=MagicMock(return_value=file_uris),
+                SafetensorsStreamer=mock_streamer_cls,
+            ),
+            mock_streamer_instance,
+        )
 
     def test_raises_when_no_files(self):
         strategy = self._make_strategy()
@@ -347,6 +288,94 @@ class TestStreamWeights:
         }):
             with pytest.raises(FileNotFoundError, match="No safetensors files found"):
                 list(strategy._stream_weights("s3://empty-bucket/model", ctx))
+
+    def _make_ctx_with_tp(self, tp_size: int, device_id: int = 2):
+        ctx = _make_load_context(device_id=device_id)
+        parallel_config = MagicMock()
+        parallel_config.tensor_parallel_size = tp_size
+        ctx.vllm_config.parallel_config = parallel_config
+        return ctx
+
+    def _patch_cuda_alike(self, is_cuda: bool):
+        mock_platform = MagicMock()
+        mock_platform.is_cuda_alike.return_value = is_cuda
+        mock_platforms_mod = MagicMock()
+        mock_platforms_mod.current_platform = mock_platform
+        return patch.dict("sys.modules", {"vllm.platforms": mock_platforms_mod})
+
+    def test_distributed_disabled_by_default(self):
+        strategy = self._make_strategy()
+        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2)
+        file_uris = ["s3://bucket/model.safetensors"]
+        tensors = [("w", torch.randn(2, 2))]
+
+        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
+        with patch.dict("sys.modules", {"runai_model_streamer": module}):
+            with self._patch_cuda_alike(True):
+                with patch.dict("os.environ", {}, clear=True):
+                    list(strategy._stream_weights("s3://bucket/model", ctx))
+
+        streamer_instance.stream_files.assert_called_once_with(file_uris)
+
+    def test_distributed_enabled_by_mx_ms_distributed_1(self):
+        strategy = self._make_strategy()
+        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2)
+        file_uris = ["s3://bucket/model.safetensors"]
+        tensors = [("w", torch.randn(2, 2))]
+
+        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
+        with patch.dict("sys.modules", {"runai_model_streamer": module}):
+            with self._patch_cuda_alike(True):
+                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                    list(strategy._stream_weights("s3://bucket/model", ctx))
+
+        streamer_instance.stream_files.assert_called_once_with(
+            file_uris, device="cuda:2", is_distributed=True
+        )
+
+    def test_distributed_disabled_when_tp_is_1(self):
+        strategy = self._make_strategy()
+        ctx = self._make_ctx_with_tp(tp_size=1, device_id=0)
+        file_uris = ["s3://bucket/model.safetensors"]
+        tensors = [("w", torch.randn(2, 2))]
+
+        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
+        with patch.dict("sys.modules", {"runai_model_streamer": module}):
+            with self._patch_cuda_alike(True):
+                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                    list(strategy._stream_weights("s3://bucket/model", ctx))
+
+        streamer_instance.stream_files.assert_called_once_with(file_uris)
+
+    def test_distributed_disabled_on_non_cuda_platform(self):
+        strategy = self._make_strategy()
+        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2)
+        file_uris = ["s3://bucket/model.safetensors"]
+        tensors = [("w", torch.randn(2, 2))]
+
+        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
+        with patch.dict("sys.modules", {"runai_model_streamer": module}):
+            with self._patch_cuda_alike(False):
+                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                    list(strategy._stream_weights("s3://bucket/model", ctx))
+
+        streamer_instance.stream_files.assert_called_once_with(file_uris)
+
+    def test_distributed_device_id_used_in_cuda_device(self):
+        strategy = self._make_strategy()
+        ctx = self._make_ctx_with_tp(tp_size=8, device_id=5)
+        file_uris = ["s3://bucket/model.safetensors"]
+        tensors = [("w", torch.randn(2, 2))]
+
+        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
+        with patch.dict("sys.modules", {"runai_model_streamer": module}):
+            with self._patch_cuda_alike(True):
+                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                    list(strategy._stream_weights("s3://bucket/model", ctx))
+
+        streamer_instance.stream_files.assert_called_once_with(
+            file_uris, device="cuda:5", is_distributed=True
+        )
 
 
 # ---------------------------------------------------------------------------

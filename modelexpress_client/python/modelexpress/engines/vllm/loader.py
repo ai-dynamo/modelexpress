@@ -31,6 +31,7 @@ import torch.nn as nn
 
 from ... import configure_vllm_logging
 from ...load_strategy import LoadContext, LoadStrategyChain
+from ...load_strategy.model_streamer_strategy import _patch_vllm_s3_format_check
 from ...nixl_transfer import NixlTransferManager
 from .adapter import build_vllm_load_context
 
@@ -48,6 +49,11 @@ logger = logging.getLogger("modelexpress.engines.vllm.loader")
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
+
+
+# Install eagerly: vllm calls try_verify_and_update_config during engine init,
+# before LoadStrategyChain.run() would lazily import the strategy module.
+_patch_vllm_s3_format_check()
 
 
 @register_model_loader("mx")

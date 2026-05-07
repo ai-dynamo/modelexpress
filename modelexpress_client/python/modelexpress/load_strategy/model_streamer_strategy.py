@@ -27,46 +27,57 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 _LOG_INTERVAL_SECS = 30
 
 
-_REMOTE_SCHEMES = ("s3://", "gs://", "az://")
+def _patch_vllm_s3_format_check() -> None:
+    """Allow 'mx' as a valid load format when the model path is an object storage URI.
 
+    vllm's `try_verify_and_update_config` rejects any `load_format` other than
+    'runai_streamer'/'runai_streamer_sharded' when `model_config.model_weights`
+    is an object-storage URI. The guard is the only place inside that method
+    that consults `model_weights`, so we temporarily detach the attribute for
+    the duration of the call and restore it afterwards. This keeps
+    `load_format == 'mx'` truthful throughout verification.
 
-def _resolve_model_uri(uri: str) -> str:
-    """Resolve MX_MODEL_URI to a path that runai-model-streamer can read.
+    Co-located with ModelStreamerStrategy because that strategy is the only
+    consumer of object-storage URIs in the mx pathway. Installed eagerly from
+    `vllm_loader` at module-import time, before vllm runs verification.
 
-    - s3://, gs://, az:// -> pass through (remote storage)
-    - /absolute/path -> pass through (local filesystem)
-    - org/model-name -> resolve via HuggingFace Hub cache
-      (HF_HUB_CACHE, HF_HOME/hub, or ~/.cache/huggingface/hub)
+    No-ops gracefully if the vllm version does not have this check.
     """
-    if any(uri.startswith(s) for s in _REMOTE_SCHEMES) or os.path.isabs(uri):
-        return uri
-
     try:
-        from huggingface_hub import scan_cache_dir
-        cache_dir = os.environ.get("HF_HUB_CACHE")
-        if not cache_dir:
-            hf_home = os.environ.get("HF_HOME")
-            if hf_home:
-                cache_dir = os.path.join(hf_home, "hub")
-        cache_info = scan_cache_dir(cache_dir) if cache_dir else scan_cache_dir()
-        for repo in cache_info.repos:
-            if repo.repo_id == uri:
-                rev = max(repo.revisions, key=lambda r: r.last_modified)
-                logger.info(f"Resolved HF model '{uri}' -> {rev.snapshot_path}")
-                return str(rev.snapshot_path)
-    except Exception as e:
-        logger.warning(f"Failed to resolve HF cache for '{uri}': {e}")
+        from vllm.config import VllmConfig
+        from vllm.transformers_utils.runai_utils import is_runai_obj_uri
+    except ImportError:
+        return
 
-    return uri
+    original = VllmConfig.try_verify_and_update_config
+
+    def patched(self: VllmConfig) -> None:
+        if (
+            self.load_config.load_format == "mx"
+            and hasattr(self.model_config, "model_weights")
+            and is_runai_obj_uri(self.model_config.model_weights)
+        ):
+            saved = self.model_config.model_weights
+            del self.model_config.model_weights
+            try:
+                original(self)
+            finally:
+                self.model_config.model_weights = saved
+        else:
+            original(self)
+
+    VllmConfig.try_verify_and_update_config = patched
+    logger.debug("Patched VllmConfig.try_verify_and_update_config to allow 'mx' for object storage URIs")
 
 
 class ModelStreamerStrategy(LoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
-    Activated by setting MX_MODEL_URI. Supported formats:
-      - Remote: s3://bucket/model, gs://bucket/model, az://container/model
-      - Local absolute path: /models/deepseek-ai/DeepSeek-V3
-      - HF model ID: deepseek-ai/DeepSeek-V3 (resolved via HF_HUB_CACHE)
+    Activated by setting MX_MODEL_URI (gate only). The actual URI used to
+    stream weights is taken from `model_config.model_weights` if set
+    (object-storage URIs: s3://, gs://, az://) and falls back to
+    `model_config.model` otherwise (local paths, HF-resolved snapshots).
+    This mirrors vllm's runai_streamer_loader.
     """
 
     name = "model_streamer"
@@ -91,7 +102,7 @@ class ModelStreamerStrategy(LoadStrategy):
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
-        model_uri = _resolve_model_uri(os.environ["MX_MODEL_URI"])
+        model_uri = getattr(ctx.model_config, "model_weights", None) or ctx.model_config.model
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:
@@ -129,9 +140,22 @@ class ModelStreamerStrategy(LoadStrategy):
             f"from {model_uri}"
         )
 
+        from vllm.platforms import current_platform
+
+        tp_size = getattr(ctx.vllm_config.parallel_config, "tensor_parallel_size", 1)
+        distributed = (
+            tp_size > 1
+            and current_platform.is_cuda_alike()
+            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+        )
+        stream_kwargs: dict = {}
+        if distributed:
+            stream_kwargs["device"] = f"cuda:{ctx.device_id}"
+            stream_kwargs["is_distributed"] = True
+
         start = time.perf_counter()
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(file_uris)
+            streamer.stream_files(file_uris, **stream_kwargs)
             total_tensors = sum(
                 len(meta) for meta in streamer.files_to_tensors_metadata.values()
             )
