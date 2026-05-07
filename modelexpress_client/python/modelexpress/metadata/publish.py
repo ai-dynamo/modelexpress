@@ -89,42 +89,22 @@ def _resolve_model_revision(model_config) -> str:
 
 
 def build_tensor_protos(
-    nixl_manager: "NixlTransferManager",
     tensors: dict[str, torch.Tensor],
     device_id: int,
     global_rank: int,
 ) -> list["p2p_pb2.TensorDescriptor"]:
-    """Build tensor descriptor protos from registered tensors."""
-    use_contiguous = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
-
-    if use_contiguous:
-        region_descriptors = nixl_manager.get_registered_descriptors()
-        protos = [
-            p2p_pb2.TensorDescriptor(
-                name=desc.name,
-                addr=desc.addr,
-                size=desc.size,
-                device_id=desc.device_id,
-                dtype=desc.dtype,
-            )
-            for desc in region_descriptors
-        ]
-        logger.info(
-            f"[Worker {global_rank}] Built {len(protos)} REGION descriptors "
-            f"(MX_CONTIGUOUS_REG=1)"
+    """Build per-tensor descriptor protos from registered tensors."""
+    del global_rank  # unused, kept for caller-symmetry with publish_metadata_and_ready
+    return [
+        p2p_pb2.TensorDescriptor(
+            name=name,
+            addr=t.data_ptr(),
+            size=t.numel() * t.element_size(),
+            device_id=device_id,
+            dtype=str(t.dtype),
         )
-    else:
-        protos = [
-            p2p_pb2.TensorDescriptor(
-                name=name,
-                addr=t.data_ptr(),
-                size=t.numel() * t.element_size(),
-                device_id=device_id,
-                dtype=str(t.dtype),
-            )
-            for name, t in tensors.items()
-        ]
-    return protos
+        for name, t in tensors.items()
+    ]
 
 
 def publish_metadata_and_ready(
@@ -141,9 +121,7 @@ def publish_metadata_and_ready(
         f"[Worker {worker_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
-    tensor_protos = build_tensor_protos(
-        nixl_manager, tensors, device_id, worker_rank,
-    )
+    tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
 
     if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer

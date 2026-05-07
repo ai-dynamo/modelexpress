@@ -281,15 +281,12 @@ class RdmaStrategy(LoadStrategy):
             f"{' (P2P)' if is_p2p else ''}"
         )
 
-        coalesce = os.environ.get("MX_CONTIGUOUS_REG", "0") == "1"
-
         transfer_start = time.perf_counter()
         try:
             bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
                 source_metadata=source_worker.nixl_metadata,
                 source_tensors=source_tensors,
                 timeout_seconds=300.0,
-                coalesce_transfers=coalesce,
                 remote_agent_name=remote_agent_name_override,
             )
         except Exception as e:

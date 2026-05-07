@@ -81,7 +81,6 @@ Feature branches use `<username>/feature-name` format, forked from `main`.
 - Always read files to understand context before making changes.
 - Do not implement changes eagerly. When discussing a problem or new feature, investigate thoroughly first, report findings, propose changes, and ask if they are acceptable before writing code.
 - Flush Redis on redeploy: stale metadata causes P2P transfer failures.
-- Use baseline mode (`MX_CONTIGUOUS_REG=0`) until contiguous region transfers are fixed.
 - Long startup times are normal: DeepSeek-V3 takes ~40 min to warm up.
 - Set `UCX_LOG_LEVEL=DEBUG` for NIXL/RDMA diagnostics.
 - NIXL agents must match ranks: source rank 0 -> target rank 0.

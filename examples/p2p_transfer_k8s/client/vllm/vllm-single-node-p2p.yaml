@@ -66,8 +66,6 @@ spec:
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            - name: MX_CONTIGUOUS_REG
-              value: "0"
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
