@@ -147,6 +147,9 @@ mod tests {
 
         let parsed = ModelProvider::from_str("gcs", false).expect("Failed to parse gcs provider");
         assert_eq!(parsed, ModelProvider::Gcs);
+
+        let parsed = ModelProvider::from_str("oci", false).expect("Failed to parse oci provider");
+        assert_eq!(parsed, ModelProvider::Oci);
     }
 
     #[test]

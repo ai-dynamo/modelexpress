@@ -36,6 +36,8 @@ pub enum ModelProvider {
     Gcs,
     /// S3-compatible object storage
     S3,
+    /// File or archive model artifact in an OCI registry
+    Oci,
 }
 
 impl ModelProvider {
@@ -46,6 +48,7 @@ impl ModelProvider {
             Self::Ngc => "ngc",
             Self::Gcs => "gcs",
             Self::S3 => "s3",
+            Self::Oci => "oci",
         }
     }
 
@@ -81,7 +84,13 @@ impl Display for ModelProvider {
 
 impl ValueEnum for ModelProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::HuggingFace, Self::Ngc, Self::Gcs, Self::S3]
+        &[
+            Self::HuggingFace,
+            Self::Ngc,
+            Self::Gcs,
+            Self::S3,
+            Self::Oci,
+        ]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -118,6 +127,7 @@ mod tests {
             ModelProvider::Ngc,
             ModelProvider::Gcs,
             ModelProvider::S3,
+            ModelProvider::Oci,
         ] {
             let serialized =
                 serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
@@ -139,6 +149,7 @@ mod tests {
         assert_eq!(ModelProvider::Ngc.to_string(), "ngc");
         assert_eq!(ModelProvider::Gcs.to_string(), "gcs");
         assert_eq!(ModelProvider::S3.to_string(), "s3");
+        assert_eq!(ModelProvider::Oci.to_string(), "oci");
     }
 
     #[test]
@@ -177,6 +188,7 @@ mod tests {
             ModelProvider::Ngc,
             ModelProvider::Gcs,
             ModelProvider::S3,
+            ModelProvider::Oci,
         ] {
             let parsed = ModelProvider::from_str(provider.as_str(), false)
                 .expect("Failed to parse ModelProvider from clap value");

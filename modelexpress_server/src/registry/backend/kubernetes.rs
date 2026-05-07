@@ -33,11 +33,12 @@ use tracing::{debug, info, warn};
 const CR_NAME_PREFIX: &str = "mx-cache-";
 
 /// Every provider, for enumerating candidate CR names in name-addressed lookups.
-const ALL_PROVIDERS: [ModelProvider; 4] = [
+const ALL_PROVIDERS: [ModelProvider; 5] = [
     ModelProvider::HuggingFace,
     ModelProvider::Ngc,
     ModelProvider::Gcs,
     ModelProvider::S3,
+    ModelProvider::Oci,
 ];
 
 /// DNS-1123 `metadata.name` hard limit.
@@ -289,6 +290,7 @@ impl KubernetesRegistryBackend {
             ModelProvider::Ngc => "Ngc",
             ModelProvider::Gcs => "Gcs",
             ModelProvider::S3 => "S3",
+            ModelProvider::Oci => "Oci",
         }
     }
 
@@ -298,6 +300,7 @@ impl KubernetesRegistryBackend {
             "Ngc" => Ok(ModelProvider::Ngc),
             "Gcs" => Ok(ModelProvider::Gcs),
             "S3" => Ok(ModelProvider::S3),
+            "Oci" => Ok(ModelProvider::Oci),
             other => Err(format!("unknown provider in CR spec: {other:?}").into()),
         }
     }
@@ -939,6 +942,16 @@ mod tests {
             sanitize_registry_name("meta-llama/Llama-3.1-70B")
                 .starts_with("meta-llama--llama-3.1-70b-")
         );
+    }
+
+    #[test]
+    fn provider_roundtrip() {
+        for provider in ALL_PROVIDERS {
+            let stored = KubernetesRegistryBackend::provider_str(provider);
+            let parsed = KubernetesRegistryBackend::provider_from_str(stored);
+            assert!(matches!(parsed, Ok(parsed) if parsed == provider));
+        }
+        assert!(KubernetesRegistryBackend::provider_from_str("bogus").is_err());
     }
 
     #[test]
