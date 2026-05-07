@@ -73,6 +73,11 @@ from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.heartbeat import HeartbeatThread  # noqa: F401
+from .nemo_rl_v2 import (  # noqa: F401
+    MxV2RefitReceiver,
+    MxV2TrainingPublisher,
+    TrainerWorldLayout,
+)
 from .training_publisher import MxTrainingPublisher  # noqa: F401
 from .refit_receiver import MxRefitReceiver  # noqa: F401
 
@@ -83,6 +88,9 @@ __all__ = [
     "MxGdsLoader",
     "MxRefitReceiver",
     "MxTrainingPublisher",
+    "MxV2RefitReceiver",
+    "MxV2TrainingPublisher",
+    "TrainerWorldLayout",
     "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]

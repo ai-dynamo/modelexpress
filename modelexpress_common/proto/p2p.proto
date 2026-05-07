@@ -277,6 +277,13 @@ message GetMetadataResponse {
 
   // Echoed worker_id
   string worker_id = 4;
+
+  // Source identity (mirrors the SourceIdentity that produced mx_source_id).
+  // Required by v2 (NemoRL) clients that store framework metadata
+  // (training_step, role, shape registry, ...) in extra_parameters.
+  // Pre-v2 clients ignore this field; populating it on existing servers is
+  // backward-compatible.
+  SourceIdentity identity = 5;
 }
 
 // ============================================================================
