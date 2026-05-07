@@ -4,7 +4,8 @@
 # Single-node vLLM deployment with ModelExpress ModelStreamer (local disk).
 # Streams weights from PVC via runai-model-streamer with concurrent I/O.
 #
-# MX_MODEL_URI accepts:
+# MX_MODEL_URI activates the streamer; its value is passed to vllm via --model.
+# Accepts:
 #   - HF model ID: "deepseek-ai/DeepSeek-V3" (resolved via HF_HUB_CACHE)
 #   - Absolute path: "/models/my-model"
 #   - Remote URI: "s3://bucket/model" (see vllm-single-node-streamer-s3.yaml)
@@ -56,8 +57,6 @@ spec:
           env:
             - name: VLLM_RPC_TIMEOUT
               value: "7200000"
-            - name: MODEL_NAME
-              value: "deepseek-ai/DeepSeek-V3"
             - name: HF_HUB_CACHE
               value: "/models"
             # HF model ID — resolved to snapshot path via HF_HUB_CACHE
@@ -70,7 +69,7 @@ spec:
             #   value: "modelexpress-server:8001"
           args:
             - --model
-            - $(MODEL_NAME)
+            - $(MX_MODEL_URI)
             - --load-format
             - mx
             - --tensor-parallel-size
