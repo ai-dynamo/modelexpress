@@ -4,7 +4,7 @@
 use crate::models::ModelProvider;
 use crate::providers::{
     GcsProvider, HuggingFaceProvider, ModelDownloadOutcome, ModelProviderTrait, NgcProvider,
-    S3Provider,
+    OciProvider, S3Provider,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ pub fn get_provider(provider: ModelProvider) -> Box<dyn ModelProviderTrait> {
         ModelProvider::Ngc => Box::new(NgcProvider),
         ModelProvider::Gcs => Box::new(GcsProvider),
         ModelProvider::S3 => Box::new(S3Provider),
+        ModelProvider::Oci => Box::new(OciProvider),
     }
 }
 
@@ -166,6 +167,9 @@ mod tests {
 
         let provider = get_provider(ModelProvider::S3);
         assert_eq!(provider.provider_name(), "S3");
+
+        let provider = get_provider(ModelProvider::Oci);
+        assert_eq!(provider.provider_name(), "OCI");
     }
 
     #[test]
@@ -184,6 +188,14 @@ mod tests {
             canonical_model_name("s3://test-bucket/org/model/rev-1/", ModelProvider::S3)
                 .expect("Expected canonical model name"),
             "s3://test-bucket/org/model/rev-1"
+        );
+        assert_eq!(
+            canonical_model_name(
+                "oci://registry.example.com/team/model:v1",
+                ModelProvider::Oci,
+            )
+            .expect("Expected canonical OCI model name"),
+            "registry.example.com/team/model:v1"
         );
     }
 

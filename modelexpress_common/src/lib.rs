@@ -189,6 +189,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
             models::ModelProvider::Ngc => grpc::model::ModelProvider::Ngc,
             models::ModelProvider::Gcs => grpc::model::ModelProvider::Gcs,
             models::ModelProvider::S3 => grpc::model::ModelProvider::S3,
+            models::ModelProvider::Oci => grpc::model::ModelProvider::Oci,
         }
     }
 }
@@ -200,6 +201,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
             grpc::model::ModelProvider::Ngc => models::ModelProvider::Ngc,
             grpc::model::ModelProvider::Gcs => models::ModelProvider::Gcs,
             grpc::model::ModelProvider::S3 => models::ModelProvider::S3,
+            grpc::model::ModelProvider::Oci => models::ModelProvider::Oci,
         }
     }
 }
@@ -316,6 +318,7 @@ mod tests {
             models::ModelProvider::Ngc,
             models::ModelProvider::Gcs,
             models::ModelProvider::S3,
+            models::ModelProvider::Oci,
         ] {
             let grpc_provider: grpc::model::ModelProvider = model_provider.into();
             let back_to_model: models::ModelProvider = grpc_provider.into();
