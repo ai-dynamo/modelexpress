@@ -39,11 +39,12 @@ mod fields {
 }
 
 /// Every provider, for enumerating candidate keys in name-addressed lookups.
-const ALL_PROVIDERS: [ModelProvider; 4] = [
+const ALL_PROVIDERS: [ModelProvider; 5] = [
     ModelProvider::HuggingFace,
     ModelProvider::Ngc,
     ModelProvider::Gcs,
     ModelProvider::S3,
+    ModelProvider::Oci,
 ];
 
 /// Provider-scoped key: `mx:model:{Provider}:{model_name}`.
@@ -74,6 +75,7 @@ fn provider_str(p: ModelProvider) -> &'static str {
         ModelProvider::Ngc => "Ngc",
         ModelProvider::Gcs => "Gcs",
         ModelProvider::S3 => "S3",
+        ModelProvider::Oci => "Oci",
     }
 }
 
@@ -83,6 +85,7 @@ fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         "Ngc" => Ok(ModelProvider::Ngc),
         "Gcs" => Ok(ModelProvider::Gcs),
         "S3" => Ok(ModelProvider::S3),
+        "Oci" => Ok(ModelProvider::Oci),
         other => Err(format!("unknown provider in Redis record: {other:?}").into()),
     }
 }
@@ -664,11 +667,7 @@ mod tests {
 
     #[test]
     fn provider_roundtrip() {
-        for p in [
-            ModelProvider::HuggingFace,
-            ModelProvider::Ngc,
-            ModelProvider::Gcs,
-        ] {
+        for p in ALL_PROVIDERS {
             let s = provider_str(p);
             assert_eq!(provider_from_str(s).expect("roundtrip"), p);
         }

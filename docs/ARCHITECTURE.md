@@ -5,13 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Architecture
 
-Detailed reference document for the ModelExpress codebase. For deployment and configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage, see [`CLI.md`](CLI.md). For GCS provider internals, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
+Detailed reference document for the ModelExpress codebase. For deployment and configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage, see [`CLI.md`](CLI.md). For provider internals, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md) and [`OCI_PROVIDER.md`](OCI_PROVIDER.md).
 
 ## Project Overview
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, GCS, S3, and OCI artifact registries. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between inference replicas using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models. The Python client includes engine adapters for vLLM and SGLang.
 
 ### Current Status
@@ -31,6 +31,7 @@ graph TD
         S1 --> HF[HuggingFace Hub]
         S1 --> NGC[NVIDIA NGC]
         S1 --> GCS[Google Cloud Storage]
+        S1 --> OCI[OCI Registry]
         S1 --> Cache[Model Cache Dir]
     end
 
@@ -217,7 +218,8 @@ ModelExpress/
 │           ├── gcs.rs                  # GcsProvider implementation
 │           ├── gcs/                    # GCS manifest, cache layout, locking, download helpers
 │           ├── huggingface.rs          # HuggingFaceProvider implementation
-│           └── ngc.rs                  # NgcProvider implementation
+│           ├── ngc.rs                  # NgcProvider implementation
+│           └── oci.rs                  # OciProvider implementation
 │
 ├── workspace-tests/
 │   ├── Cargo.toml
@@ -776,7 +778,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 | `config` | Config trait utilities |
 | `download` | Download orchestration with strategy pattern |
 | `models` | `Status`, `ModelProvider`, `ModelStatus`, `ModelStatusResponse` |
-| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` + `GcsProvider` |
+| `providers` | Model source implementations, including OCI artifacts |
 | `grpc` | Generated tonic stubs for all 4 services |
 | `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (32KB) |
 
@@ -807,10 +809,11 @@ pub trait ModelProviderTrait: Send + Sync {
 
 `ModelDownloadOutcome` carries the snapshot `path` plus the `resolved_revision` the request landed on (`None` for providers with no revision concept).
 
-Three implementations:
+Provider implementations include:
 - `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode. Implements the revision-aware methods: it resolves a branch, tag, or SHA through `/api/models/<repo>/revision/<rev>`, downloads every file from the resolved commit, and writes `refs/<requested-revision>` so the snapshot stays resolvable by the name the caller used. `delete_model_revision` removes a single snapshot, and drops the whole repository directory once its last snapshot is gone.
 - `NgcProvider` - downloads from NVIDIA NGC via the files-manifest endpoint `…/v2/org/{org}[/team/{team}]/{type}/{name}/{version}/files` (no `versions/` segment), which returns self-authenticating presigned URLs paired with relative paths for every file, for both V1 and V2 storage and both org and team scopes (so nested paths and downloads need no per-file URL construction or Authorization forwarding). Falls back to `checksums.blake3` manifest enumeration against the versioned `…/versions/{version}/files` endpoint (Bearer-authenticated `/files/{path}` downloads) when the listing returns 400/401, as some UAM-gated orgs (e.g. the `nim` catalog) do. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 - `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
+- `OciProvider` - materializes files from raw, tar, or tar+zstd OCI layers. See [`OCI_PROVIDER.md`](OCI_PROVIDER.md).
 
 ### ClientConfig / ClientArgs
 

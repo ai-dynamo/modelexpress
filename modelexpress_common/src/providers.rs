@@ -227,11 +227,13 @@ pub mod gcs;
 pub mod huggingface;
 pub(crate) mod lock_file;
 pub mod ngc;
+pub mod oci;
 pub mod s3;
 
 pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
+pub use oci::OciProvider;
 pub use s3::S3Provider;
 
 #[cfg(not(feature = "gcs"))]

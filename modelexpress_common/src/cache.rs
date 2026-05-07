@@ -8,7 +8,7 @@ use crate::{
     models::ModelProvider,
     providers::{
         gcs::GcsProviderCache, huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache,
-        s3::S3ProviderCache,
+        oci::OciProviderCache, s3::S3ProviderCache,
     },
 };
 use anyhow::{Context, Result};
@@ -236,6 +236,7 @@ impl CacheConfig {
             ModelProvider::Ngc,
             ModelProvider::Gcs,
             ModelProvider::S3,
+            ModelProvider::Oci,
         ] {
             models.extend(cache_for_provider(provider).list_models(&self.local_path)?);
         }
@@ -346,6 +347,7 @@ pub(crate) fn cache_for_provider(provider: ModelProvider) -> &'static dyn Provid
         ModelProvider::Ngc => &NgcProviderCache,
         ModelProvider::Gcs => &GcsProviderCache,
         ModelProvider::S3 => &S3ProviderCache,
+        ModelProvider::Oci => &OciProviderCache,
     }
 }
 
@@ -381,6 +383,7 @@ fn provider_sort_key(provider: ModelProvider) -> u8 {
         ModelProvider::Ngc => 1,
         ModelProvider::Gcs => 2,
         ModelProvider::S3 => 3,
+        ModelProvider::Oci => 4,
     }
 }
 

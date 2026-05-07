@@ -219,6 +219,7 @@ spec:
                     - Ngc
                     - Gcs
                     - S3
+                    - Oci
             status:
               type: object
               properties:

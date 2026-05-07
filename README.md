@@ -63,14 +63,14 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **Capability-driven loading** — Automatic priority chain: P2P RDMA → ModelStreamer → GDS → native loader, with safe fallback
-- **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
+- **Model source caching** — Hugging Face, NGC, GCS, S3, and OCI artifact providers with PVC-backed cache support
 - **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `checkpoint_format="MX"` with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
 - **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
 - **Metadata backends** — Redis, Kubernetes CRD, or decentralized Kubernetes Service routing
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
 - **ModelStreamer integration** — Pipeline concurrent reads from S3, Azure Blob, GCS, or local storage into vLLM and SGLang
-- **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
+- **Expanded model pull providers**: NGC, GCS, S3, and OCI artifact registries in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
 - **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
 
@@ -100,7 +100,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 - **modelexpress_client**: Rust CLI for cache management; Python package with inference engine loaders and `MxClient` for gRPC.
 - **modelexpress_common**: Protobuf definitions, model-provider traits, and shared configuration.
 
-See [Architecture](docs/ARCHITECTURE.md).
+See [Architecture](docs/ARCHITECTURE.md) and [OCI provider](docs/OCI_PROVIDER.md).
 
 ---
 
