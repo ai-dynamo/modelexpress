@@ -28,10 +28,3 @@ def get_global_rank(device: torch.device) -> int:
         return device.index
 
     return 0
-
-
-def get_device_id(device: torch.device) -> int:
-    """Get the local CUDA device ordinal used for CUDA and NIXL operations."""
-    if hasattr(device, "index") and device.index is not None:
-        return device.index
-    return 0

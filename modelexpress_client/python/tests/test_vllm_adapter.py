@@ -3,12 +3,12 @@
 
 """Tests for the vLLM engine adapter."""
 
+import sys
 from types import SimpleNamespace
 
 import torch
 
-from modelexpress.engines.vllm.adapter import _get_vllm_worker_rank
-from modelexpress.rank_utils import get_device_id
+from modelexpress.engines.vllm.adapter import VllmAdapter, _get_vllm_worker_rank
 
 
 def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
@@ -37,5 +37,17 @@ def test_worker_rank_ignores_dp_component():
     assert _get_vllm_worker_rank(dp1) == 5
 
 
-def test_device_id_uses_local_cuda_ordinal():
-    assert get_device_id(torch.device("cuda:3")) == 3
+def test_vllm_device_id_uses_current_platform_device(monkeypatch):
+    fake_platforms = SimpleNamespace(
+        current_platform=SimpleNamespace(
+            current_device=lambda: 2,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cuda"),
+        load_config=SimpleNamespace(device=None),
+    )
+    adapter = VllmAdapter(vllm_config, SimpleNamespace())
+
+    assert adapter.get_device_id() == 2
