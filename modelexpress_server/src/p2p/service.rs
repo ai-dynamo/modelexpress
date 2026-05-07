@@ -179,6 +179,7 @@ impl P2pService for P2pServiceImpl {
                 worker: None,
                 mx_source_id: String::new(),
                 worker_id: String::new(),
+                identity: None,
             }));
         }
 
@@ -189,20 +190,23 @@ impl P2pService for P2pServiceImpl {
         {
             Ok(Some(record)) => {
                 // Each worker_id maps to exactly one worker record; take the first.
+                let identity = record.identity.clone();
                 let worker = record.workers.into_iter().next().map(WorkerMetadata::from);
                 let found = worker.is_some();
                 info!(
-                    "GetMetadata '{}' (source_id={}, worker_id={}): {} tensors",
+                    "GetMetadata '{}' (source_id={}, worker_id={}): {} tensors, identity_present={}",
                     record.model_name,
                     req.mx_source_id,
                     req.worker_id,
                     worker.as_ref().map_or(0, |w| w.tensors.len()),
+                    identity.is_some(),
                 );
                 Ok(Response::new(GetMetadataResponse {
                     found,
                     worker,
                     mx_source_id: req.mx_source_id,
                     worker_id: req.worker_id,
+                    identity,
                 }))
             }
             Ok(None) => {
@@ -215,6 +219,7 @@ impl P2pService for P2pServiceImpl {
                     worker: None,
                     mx_source_id: req.mx_source_id,
                     worker_id: req.worker_id,
+                    identity: None,
                 }))
             }
             Err(e) => {
@@ -224,6 +229,7 @@ impl P2pService for P2pServiceImpl {
                     worker: None,
                     mx_source_id: String::new(),
                     worker_id: String::new(),
+                    identity: None,
                 }))
             }
         }
@@ -461,6 +467,7 @@ mod tests {
                         worker_grpc_endpoint: String::new(),
                     }],
                     published_at: 1234567890,
+                    identity: None,
                 }))
             });
 
@@ -744,6 +751,7 @@ mod tests {
                     model_name: "my-model".to_string(),
                     workers: vec![],
                     published_at: 0,
+                    identity: None,
                 }))
             });
 

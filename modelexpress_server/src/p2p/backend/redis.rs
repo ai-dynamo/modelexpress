@@ -54,6 +54,12 @@ struct SourceAttributesJson {
     pub dtype: String,
     #[serde(default)]
     pub quantization: String,
+    /// Framework-specific config from `SourceIdentity.extra_parameters`.
+    /// Required by v2 RL clients (NemoRL `update_weights_via_mx`) that stash
+    /// version, role, shape registry, etc. here. Older records (pre-v2)
+    /// deserialize to an empty map via `#[serde(default)]`.
+    #[serde(default)]
+    pub extra_parameters: std::collections::HashMap<String, String>,
 }
 
 impl From<&SourceIdentity> for SourceAttributesJson {
@@ -68,6 +74,26 @@ impl From<&SourceIdentity> for SourceAttributesJson {
             expert_parallel_size: id.expert_parallel_size,
             dtype: id.dtype.clone(),
             quantization: id.quantization.clone(),
+            extra_parameters: id.extra_parameters.clone(),
+        }
+    }
+}
+
+impl SourceAttributesJson {
+    /// Round-trip back to a SourceIdentity proto. Used by GetMetadata to
+    /// populate ``GetMetadataResponse.identity``.
+    fn to_source_identity(&self) -> SourceIdentity {
+        SourceIdentity {
+            mx_version: self.mx_version.clone(),
+            mx_source_type: self.mx_source_type,
+            model_name: self.model_name.clone(),
+            backend_framework: self.backend_framework,
+            tensor_parallel_size: self.tensor_parallel_size,
+            pipeline_parallel_size: self.pipeline_parallel_size,
+            expert_parallel_size: self.expert_parallel_size,
+            dtype: self.dtype.clone(),
+            quantization: self.quantization.clone(),
+            extra_parameters: self.extra_parameters.clone(),
         }
     }
 }
@@ -382,13 +408,16 @@ impl MetadataBackend for RedisBackend {
             return Ok(None);
         }
 
-        // Fetch model_name from the source index key's __attributes__ field.
+        // Fetch the full SourceAttributesJson from the source index key's
+        // __attributes__ field. This carries model_name, framework knobs, and
+        // (for v2 RL clients) extra_parameters.
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let attr_json: Option<String> = conn.hget(&source_key, keys::ATTRIBUTES_FIELD).await?;
-        let model_name = attr_json
+        let attrs = attr_json
             .and_then(|v| serde_json::from_str::<SourceAttributesJson>(&v).ok())
-            .map(|a| a.model_name)
             .unwrap_or_default();
+        let model_name = attrs.model_name.clone();
+        let identity = Some(attrs.to_source_identity());
 
         let mut workers: Vec<WorkerRecord> = Vec::with_capacity(fields.len());
         for value in fields.values() {
@@ -410,6 +439,7 @@ impl MetadataBackend for RedisBackend {
             model_name,
             workers,
             published_at: 0,
+            identity,
         }))
     }
 
