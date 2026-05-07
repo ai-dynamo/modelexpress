@@ -37,6 +37,10 @@ google-cloud-storage = { workspace = true }
 rustls = { workspace = true }
 crc32c = { workspace = true }
 fd-lock = { workspace = true }
+oci-client = { workspace = true }
+tar = { workspace = true }
+uuid = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 google-cloud-auth = { version = "1.7.0", default-features = false }
@@ -45,6 +49,7 @@ mockall = "0.13"
 tempfile = { workspace = true }
 tokio-test = "0.4"
 wiremock = "0.6.5"
+sha2 = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

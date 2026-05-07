@@ -173,7 +173,7 @@ Three types of Redis keys are relevant:
 
 | Field | Value | Purpose |
 |-------|-------|---------|
-| `provider` | `HuggingFace`, `Ngc`, or `Gcs` | Provider associated with the cached model |
+| `provider` | `HuggingFace`, `Ngc`, `Gcs`, or `Oci` | Provider associated with the cached model |
 | `status` | `DOWNLOADING`, `DOWNLOADED`, or `ERROR` | Download lifecycle state |
 | `created_at` | RFC3339 timestamp | First write time, preserved across status updates |
 | `last_used_at` | RFC3339 timestamp | Last status write or cache hit time for LRU eviction |

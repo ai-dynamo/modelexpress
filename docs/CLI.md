@@ -97,6 +97,11 @@ modelexpress-cli model download gs://my-bucket/models/qwen/rev-1 \
 modelexpress-cli model download microsoft/DialoGPT-medium \
   --strategy direct
 
+# Download an OCI artifact from a registry
+modelexpress-cli model download registry.example.com/team/model:v1 \
+  --provider oci \
+  --strategy direct
+
 # Download with file transfer when no shared storage exists
 # Note: Global options must come before the subcommand
 modelexpress-cli --no-shared-storage --transfer-chunk-size 65536 \
@@ -153,8 +158,11 @@ modelexpress-cli model stats --detailed
 - `hugging-face`: Hugging Face model hub (default)
 - `ngc`: NVIDIA NGC catalog
 - `gcs`: Google Cloud Storage object prefix. The model name must be a full `gs://<bucket>/<path>` URL. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for cache layout and provider behavior.
+- `oci`: OCI model artifact with raw file blobs or simple `tar`/`tar+zstd` archive layers. References must be registry-qualified and include a tag or digest, for example `oci://registry.example.com/team/model:v1` or `registry.example.com/team/model@sha256:...`. See [`OCI_PROVIDER.md`](OCI_PROVIDER.md) for artifact format, cache layout, and publish behavior.
 
 For GCS downloads, configure Google Application Default Credentials on the process that performs the download: the server for `server-only`, the client for `direct`, and either process for `smart-fallback`. Common options are `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`, or Workload Identity on GKE.
+
+For OCI downloads, set `MODEL_EXPRESS_OCI_*` credentials on the process that performs the download when anonymous registry access is not enough. See [`OCI_PROVIDER.md`](OCI_PROVIDER.md) for the exact auth precedence.
 
 **Model Commands:**
 - `download`: Download model with automatic storage (use `--strategy` and `--provider` for options)

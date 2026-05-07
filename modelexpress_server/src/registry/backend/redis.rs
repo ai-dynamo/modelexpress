@@ -42,6 +42,7 @@ fn provider_str(p: ModelProvider) -> &'static str {
         ModelProvider::HuggingFace => "HuggingFace",
         ModelProvider::Ngc => "Ngc",
         ModelProvider::Gcs => "Gcs",
+        ModelProvider::Oci => "Oci",
     }
 }
 
@@ -50,6 +51,7 @@ fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         "HuggingFace" => Ok(ModelProvider::HuggingFace),
         "Ngc" => Ok(ModelProvider::Ngc),
         "Gcs" => Ok(ModelProvider::Gcs),
+        "Oci" => Ok(ModelProvider::Oci),
         other => Err(format!("unknown provider in Redis record: {other:?}").into()),
     }
 }
@@ -449,6 +451,7 @@ mod tests {
             ModelProvider::HuggingFace,
             ModelProvider::Ngc,
             ModelProvider::Gcs,
+            ModelProvider::Oci,
         ] {
             let s = provider_str(p);
             assert_eq!(provider_from_str(s).expect("roundtrip"), p);

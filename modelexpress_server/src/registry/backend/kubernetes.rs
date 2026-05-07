@@ -36,7 +36,7 @@ const NAME_BUDGET: usize = K8S_NAME_MAX - CR_NAME_PREFIX.len();
 /// Hex chars of SHA256 suffix appended when the sanitized name exceeds the budget.
 const HASH_SUFFIX_LEN: usize = 12;
 
-/// Sanitize a HuggingFace/NGC model name into a DNS-1123 `metadata.name` component.
+/// Sanitize a model name into a DNS-1123 `metadata.name` component.
 ///
 /// Transform rules:
 /// - `/` → `--`
@@ -111,6 +111,7 @@ impl KubernetesRegistryBackend {
             ModelProvider::HuggingFace => "HuggingFace",
             ModelProvider::Ngc => "Ngc",
             ModelProvider::Gcs => "Gcs",
+            ModelProvider::Oci => "Oci",
         }
     }
 
@@ -119,6 +120,7 @@ impl KubernetesRegistryBackend {
             "HuggingFace" => Ok(ModelProvider::HuggingFace),
             "Ngc" => Ok(ModelProvider::Ngc),
             "Gcs" => Ok(ModelProvider::Gcs),
+            "Oci" => Ok(ModelProvider::Oci),
             other => Err(format!("unknown provider in CR spec: {other:?}").into()),
         }
     }
@@ -488,6 +490,21 @@ impl RegistryBackend for KubernetesRegistryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_roundtrip() {
+        for provider in [
+            ModelProvider::HuggingFace,
+            ModelProvider::Ngc,
+            ModelProvider::Gcs,
+            ModelProvider::Oci,
+        ] {
+            let stored = KubernetesRegistryBackend::provider_str(provider);
+            let parsed = KubernetesRegistryBackend::provider_from_str(stored);
+            assert!(matches!(parsed, Ok(parsed) if parsed == provider));
+        }
+        assert!(KubernetesRegistryBackend::provider_from_str("bogus").is_err());
+    }
 
     #[test]
     fn sanitize_preserves_readable_prefix() {

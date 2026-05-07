@@ -73,7 +73,7 @@ _model_express_cli_completions() {
             elif [[ "${words[i+1]}" == "download" ]]; then
                 case "${prev}" in
                     --provider|-p)
-                        COMPREPLY=($(compgen -W "hugging-face" -- "$cur"))
+                        COMPREPLY=($(compgen -W "hugging-face ngc gcs oci" -- "$cur"))
                         ;;
                     --strategy|-s)
                         COMPREPLY=($(compgen -W "smart-fallback server-only direct" -- "$cur"))
@@ -108,13 +108,16 @@ _model_express_cli_completions() {
                 fi
             elif [[ "${words[i+1]}" == "clear" ]]; then
                 case "${prev}" in
+                    --provider|-p)
+                        COMPREPLY=($(compgen -W "hugging-face ngc gcs oci" -- "$cur"))
+                        ;;
                     clear)
                         # Could potentially list actual downloaded models here
                         COMPREPLY=($(compgen -W "google-t5/t5-small microsoft/DialoGPT-small" -- "$cur"))
                         ;;
                     *)
                         if [[ "$cur" == -* ]]; then
-                            COMPREPLY=($(compgen -W "--help" -- "$cur"))
+                            COMPREPLY=($(compgen -W "--provider --help" -- "$cur"))
                         fi
                         ;;
                 esac
