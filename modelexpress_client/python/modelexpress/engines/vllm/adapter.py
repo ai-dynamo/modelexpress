@@ -16,7 +16,7 @@ from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...metadata.publish import build_source_identity
-from ...rank_utils import get_device_id, get_global_rank
+from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
@@ -44,7 +44,7 @@ class VllmAdapter(EngineAdapter):
         return get_global_rank(self.target_device)
 
     def get_device_id(self) -> int:
-        return get_device_id(self.target_device)
+        return _get_vllm_device_id()
 
     def get_target_device(self) -> torch.device:
         return self.target_device
@@ -179,6 +179,15 @@ def _get_vllm_worker_rank(vllm_config: VllmConfig) -> int:
         rank, worker_rank, model_parallel_size,
     )
     return worker_rank
+
+
+def _get_vllm_device_id() -> int:
+    """Return the local CUDA ordinal vLLM assigned to this worker."""
+    from vllm.platforms import current_platform
+
+    device_id = int(current_platform.current_device())
+    logger.debug("Got vLLM device id from current_platform: %d", device_id)
+    return device_id
 
 
 def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
