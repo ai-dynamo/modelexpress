@@ -44,7 +44,7 @@ class VllmAdapter(EngineAdapter):
         return get_global_rank(self.target_device)
 
     def get_device_id(self) -> int:
-        return _get_vllm_device_id()
+        return _get_vllm_device_id(self.target_device)
 
     def get_target_device(self) -> torch.device:
         return self.target_device
@@ -181,8 +181,13 @@ def _get_vllm_worker_rank(vllm_config: VllmConfig) -> int:
     return worker_rank
 
 
-def _get_vllm_device_id() -> int:
+def _get_vllm_device_id(target_device: torch.device) -> int:
     """Return the local CUDA ordinal vLLM assigned to this worker."""
+    if target_device.index is not None:
+        device_id = int(target_device.index)
+        logger.debug("Got vLLM device id from target_device: %d", device_id)
+        return device_id
+
     from vllm.platforms import current_platform
 
     device_id = int(current_platform.current_device())
