@@ -1,17 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for allocation discovery (cuMemGetAddressRange) and the MX_POOL_REG toggle."""
+"""Tests for allocation discovery (cuMemGetAddressRange), the MX_POOL_REG toggle,
+and receive_from_source manifest validation."""
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
+import torch
 
 from modelexpress.nixl_transfer import (
     NixlTransferManager,
     _pool_reg_enabled,
 )
-from modelexpress.types import TensorDescriptor
+from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
 
 def _desc(name: str, addr: int, size: int) -> TensorDescriptor:
@@ -183,3 +187,62 @@ class TestFindCudaAllocations:
             NixlTransferManager._find_cuda_allocations(
                 [_desc("w_named", 0x1000, 64)]
             )
+
+
+class TestReceiveFromSourceManifestValidation:
+    """receive_from_source must reject size/dtype mismatches before building
+    RDMA descriptors. Catching these here prevents silent memory corruption
+    when stale source metadata or model skew sneaks past the name match.
+    """
+
+    def _make_manager(self, monkeypatch, local_tensors):
+        # Bypass torch.cuda.set_device since the test runs on a CPU host.
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
+        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr._agent = MagicMock()  # non-None so the early null check passes
+        mgr._tensors = local_tensors
+        return mgr
+
+    def test_size_mismatch_raises_manifest_mismatch(self, monkeypatch):
+        # Local tensor: 40 bytes (10 float32). Source claims 80 bytes.
+        local = torch.zeros(10, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        bogus = TensorDescriptor(
+            name="w", addr=0x1000, size=80, device_id=0, dtype=str(local.dtype),
+        )
+        with pytest.raises(ManifestMismatchError, match="size mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[bogus],
+                remote_agent_name="dummy",
+            )
+
+    def test_dtype_mismatch_raises_manifest_mismatch(self, monkeypatch):
+        # Local tensor float32 (40 bytes). Source size matches but dtype lies.
+        local = torch.zeros(10, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        bogus = TensorDescriptor(
+            name="w", addr=0x1000, size=40, device_id=0, dtype="torch.bfloat16",
+        )
+        with pytest.raises(ManifestMismatchError, match="dtype mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[bogus],
+                remote_agent_name="dummy",
+            )
+
+    def test_unmatched_name_skips_silently(self, monkeypatch):
+        # No matching local tensor for the source's "w". Loop should `continue`
+        # without raising; the caller decides whether the empty match list is
+        # an error. We just verify the validation doesn't fire spuriously.
+        mgr = self._make_manager(monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)})
+        wrong_name = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+        # Empty match -> early-return (0, 0, 0.0); no exception.
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[wrong_name],
+            remote_agent_name="dummy",
+        )
+        assert result == (0, 0, 0.0)

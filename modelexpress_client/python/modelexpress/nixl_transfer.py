@@ -21,7 +21,7 @@ from typing import Any
 import torch
 
 from . import ucx_utils
-from .types import TensorDescriptor
+from .types import ManifestMismatchError, TensorDescriptor
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
 
@@ -400,13 +400,25 @@ class NixlTransferManager:
             local_tensor = self._tensors.get(src_tensor.name)
             if local_tensor is None:
                 continue
+            local_size = local_tensor.numel() * local_tensor.element_size()
+            if local_size != src_tensor.size:
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' size mismatch: "
+                    f"source={src_tensor.size} bytes, local={local_size} bytes"
+                )
+            local_dtype = str(local_tensor.dtype)
+            if local_dtype != src_tensor.dtype:
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' dtype mismatch: "
+                    f"source={src_tensor.dtype!r}, local={local_dtype!r}"
+                )
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
             local_descs.append(
                 (
                     local_tensor.data_ptr(),
-                    local_tensor.numel() * local_tensor.element_size(),
+                    local_size,
                     self._device_id,
                 )
             )
