@@ -183,6 +183,8 @@ spec:
                   enum:
                     - HuggingFace
                     - Ngc
+                    - Gcs
+                    - Oci
             status:
               type: object
               properties:

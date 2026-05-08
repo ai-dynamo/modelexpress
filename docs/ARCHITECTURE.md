@@ -11,7 +11,7 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
-- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
+- **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, GCS, and file/archive OCI artifacts. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
 
 ### Current Status
@@ -31,6 +31,7 @@ graph TD
         S1 --> HF[HuggingFace Hub]
         S1 --> NGC[NVIDIA NGC]
         S1 --> GCS[Google Cloud Storage]
+        S1 --> OCI[OCI Registry]
         S1 --> Cache[Model Cache Dir]
     end
 
@@ -177,7 +178,8 @@ ModelExpress/
 │           ├── gcs.rs                  # GcsProvider implementation
 │           ├── gcs/                    # GCS manifest, cache layout, locking, download helpers
 │           ├── huggingface.rs          # HuggingFaceProvider implementation
-│           └── ngc.rs                  # NgcProvider implementation
+│           ├── ngc.rs                  # NgcProvider implementation
+│           └── oci.rs                  # OciProvider implementation
 │
 ├── workspace-tests/
 │   ├── Cargo.toml
@@ -283,7 +285,7 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
 
-Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
+Key message types: `ModelProvider` (HuggingFace, NGC, GCS, OCI), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 ### p2p.proto - P2pService
 
@@ -465,7 +467,7 @@ Output formats: `--format human` (default), `--format json`, `--format json-pret
 | `config` | Config trait utilities |
 | `download` | Download orchestration with strategy pattern |
 | `models` | `Status`, `ModelProvider`, `ModelStatus`, `ModelStatusResponse` |
-| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` + `GcsProvider` |
+| `providers` | `ModelProviderTrait` + `HuggingFaceProvider` + `NgcProvider` + `GcsProvider` + `OciProvider` |
 | `grpc` | Generated tonic stubs for all 4 services |
 | `constants` | `DEFAULT_GRPC_PORT` (8001), `DEFAULT_TIMEOUT_SECS` (30), `DEFAULT_TRANSFER_CHUNK_SIZE` (32KB) |
 
@@ -484,10 +486,11 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
-Three implementations:
-- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode.
-- `NgcProvider` - downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
-- `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
+Provider implementations:
+- `HuggingFaceProvider` — uses the `hf-hub` crate with high-CPU download mode.
+- `NgcProvider` — downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
+- `GcsProvider` — downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
+- `OciProvider` — downloads OCI model artifacts via `oci-client`. Raw layers use `org.opencontainers.image.title` or `org.cncf.model.filepath` as the output file path; simple `tar` and `tar+zstd` layers are safely extracted. ModelExpress atomically publishes the completed `files` directory. Container image unpacking remains out of scope: no whiteouts or rootfs layer merging. See [`OCI_PROVIDER.md`](OCI_PROVIDER.md).
 
 ### ClientConfig / ClientArgs
 

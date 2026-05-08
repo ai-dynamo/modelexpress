@@ -40,9 +40,9 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 
 ### How ModelExpress manages weights in the cluster
 
-ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads a model from external sources (e.g., HuggingFace); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
+ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads a model from external sources (e.g., HuggingFace, NGC, GCS, or OCI registries); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
 
-1. **Download from HuggingFace** — One node pulls the model; ModelExpress coordinates so no other node duplicates this download, reducing external ingress. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
+1. **Download from a model source** — One node pulls the model from HuggingFace, NGC, GCS, or a file/archive OCI artifact; ModelExpress coordinates so no other node duplicates this download, reducing external ingress. In air-gapped HuggingFace mode, serve from cache only (`HF_HUB_OFFLINE=1`).
 2. **Persist to disk** — Store in a cache backed by disk:
    - **Host-attached disk** — Local disk on the node (single-node or per-node cache).
    - **PVC** — RWO (ReadWriteOnce) for single-node; RWX (ReadWriteMany) for shared access across nodes.
@@ -54,7 +54,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
-- **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
+- **Model source caching** — HuggingFace, NGC, GCS, and OCI artifact providers with PVC-backed cache support, `ignore_weights`, and `get_model_path` for Dynamo
 - **P2P GPU transfer** — vLLM `mx` loader and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
@@ -98,9 +98,9 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 - **modelexpress_server**: gRPC server with configurable metadata backends (Redis, Kubernetes CRD).
 - **modelexpress_client**: Rust CLI for cache management; Python package with vLLM loaders and `MxClient` for gRPC.
-- **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
+- **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace, NGC, GCS, OCI), shared configuration.
 
-See [Architecture](docs/ARCHITECTURE.md).
+See [Architecture](docs/ARCHITECTURE.md), [GCS provider](docs/GCS_PROVIDER.md), and [OCI provider](docs/OCI_PROVIDER.md).
 
 ---
 
@@ -240,7 +240,6 @@ cargo bench
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
 - **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
-- **Expanded model pull providers**: Support NGC in addition to Hugging Face.
 - **GDS (GPUDirect Storage) integration**: Load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
