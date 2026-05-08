@@ -37,14 +37,16 @@ def _make_load_context(**overrides):
     from modelexpress.load_strategy import LoadContext
 
     defaults = dict(
-        vllm_config=MagicMock(),
         model_config=MagicMock(),
         load_config=MagicMock(),
         target_device=torch.device("cpu"),
         global_rank=0,
         worker_rank=0,
         device_id=0,
-        identity=p2p_pb2.SourceIdentity(model_name="test-model"),
+        identity=p2p_pb2.SourceIdentity(
+            model_name="test-model",
+            tensor_parallel_size=1,
+        ),
         mx_client=MagicMock(),
         worker_id="test-worker",
         adapter=_FakeAdapter(),
@@ -289,19 +291,20 @@ class TestStreamWeights:
             with pytest.raises(FileNotFoundError, match="No safetensors files found"):
                 list(strategy._stream_weights("s3://empty-bucket/model", ctx))
 
-    def _make_ctx_with_tp(self, tp_size: int, device_id: int = 2):
-        ctx = _make_load_context(device_id=device_id)
-        parallel_config = MagicMock()
-        parallel_config.tensor_parallel_size = tp_size
-        ctx.vllm_config.parallel_config = parallel_config
-        return ctx
-
-    def _patch_cuda_alike(self, is_cuda: bool):
-        mock_platform = MagicMock()
-        mock_platform.is_cuda_alike.return_value = is_cuda
-        mock_platforms_mod = MagicMock()
-        mock_platforms_mod.current_platform = mock_platform
-        return patch.dict("sys.modules", {"vllm.platforms": mock_platforms_mod})
+    def _make_ctx_with_tp(
+        self,
+        tp_size: int,
+        device_id: int = 2,
+        device: str = "cuda",
+    ):
+        return _make_load_context(
+            device_id=device_id,
+            target_device=torch.device(device),
+            identity=p2p_pb2.SourceIdentity(
+                model_name="test-model",
+                tensor_parallel_size=tp_size,
+            ),
+        )
 
     def test_distributed_disabled_by_default(self):
         strategy = self._make_strategy()
@@ -311,9 +314,8 @@ class TestStreamWeights:
 
         module, streamer_instance = self._make_streamer_module(file_uris, tensors)
         with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with self._patch_cuda_alike(True):
-                with patch.dict("os.environ", {}, clear=True):
-                    list(strategy._stream_weights("s3://bucket/model", ctx))
+            with patch.dict("os.environ", {}, clear=True):
+                list(strategy._stream_weights("s3://bucket/model", ctx))
 
         streamer_instance.stream_files.assert_called_once_with(file_uris)
 
@@ -325,9 +327,8 @@ class TestStreamWeights:
 
         module, streamer_instance = self._make_streamer_module(file_uris, tensors)
         with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with self._patch_cuda_alike(True):
-                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                    list(strategy._stream_weights("s3://bucket/model", ctx))
+            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                list(strategy._stream_weights("s3://bucket/model", ctx))
 
         streamer_instance.stream_files.assert_called_once_with(
             file_uris, device="cuda:2", is_distributed=True
@@ -341,23 +342,21 @@ class TestStreamWeights:
 
         module, streamer_instance = self._make_streamer_module(file_uris, tensors)
         with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with self._patch_cuda_alike(True):
-                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                    list(strategy._stream_weights("s3://bucket/model", ctx))
+            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                list(strategy._stream_weights("s3://bucket/model", ctx))
 
         streamer_instance.stream_files.assert_called_once_with(file_uris)
 
     def test_distributed_disabled_on_non_cuda_platform(self):
         strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2)
+        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2, device="cpu")
         file_uris = ["s3://bucket/model.safetensors"]
         tensors = [("w", torch.randn(2, 2))]
 
         module, streamer_instance = self._make_streamer_module(file_uris, tensors)
         with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with self._patch_cuda_alike(False):
-                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                    list(strategy._stream_weights("s3://bucket/model", ctx))
+            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                list(strategy._stream_weights("s3://bucket/model", ctx))
 
         streamer_instance.stream_files.assert_called_once_with(file_uris)
 
@@ -369,9 +368,8 @@ class TestStreamWeights:
 
         module, streamer_instance = self._make_streamer_module(file_uris, tensors)
         with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with self._patch_cuda_alike(True):
-                with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                    list(strategy._stream_weights("s3://bucket/model", ctx))
+            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+                list(strategy._stream_weights("s3://bucket/model", ctx))
 
         streamer_instance.stream_files.assert_called_once_with(
             file_uris, device="cuda:5", is_distributed=True

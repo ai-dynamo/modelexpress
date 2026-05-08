@@ -36,6 +36,7 @@ _K8S_SERVICE_ALIASES = frozenset({"k8s-service", "service"})
 
 def create_metadata_client(
     worker_rank: int | None = None,
+    server_url: str | None = None,
 ) -> MxClientBase:
     """Create the metadata client dictated by ``MX_METADATA_BACKEND``.
 
@@ -46,7 +47,7 @@ def create_metadata_client(
     backend = os.environ.get("MX_METADATA_BACKEND", "").lower().strip()
     if backend in _CENTRAL_BACKEND_ALIASES:
         logger.debug("create_metadata_client: central MxClient (backend=%r)", backend)
-        return MxClient()
+        return MxClient(server_url=server_url)
     if backend in _K8S_SERVICE_ALIASES:
         logger.info(
             "create_metadata_client: MxK8sServiceClient "

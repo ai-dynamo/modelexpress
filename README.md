@@ -67,7 +67,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 | vLLM | `--load-format mx` for P2P weight transfer |
 | NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
-| SGLang | `--modelexpress-config` with `transport=nixl` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
+| SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
 
 ---
 
@@ -97,7 +97,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 *Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
 
 - **modelexpress_server**: gRPC server with configurable metadata backends (Redis, Kubernetes CRD).
-- **modelexpress_client**: Rust CLI for cache management; Python package with vLLM loaders and `MxClient` for gRPC.
+- **modelexpress_client**: Rust CLI for cache management; Python package with inference engine loaders and `MxClient` for gRPC.
 - **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
 
 See [Architecture](docs/ARCHITECTURE.md).

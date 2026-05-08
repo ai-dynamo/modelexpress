@@ -26,7 +26,6 @@ def tracer_and_exporter():
 
 def _ctx():
     return LoadContext(
-        vllm_config=MagicMock(),
         model_config=MagicMock(),
         load_config=MagicMock(),
         target_device=torch.device("cpu"),

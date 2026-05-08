@@ -140,12 +140,10 @@ class ModelStreamerStrategy(LoadStrategy):
             f"from {model_uri}"
         )
 
-        from vllm.platforms import current_platform
-
-        tp_size = getattr(ctx.vllm_config.parallel_config, "tensor_parallel_size", 1)
+        tp_size = getattr(ctx.identity, "tensor_parallel_size", 1) or 1
         distributed = (
             tp_size > 1
-            and current_platform.is_cuda_alike()
+            and ctx.target_device.type == "cuda"
             and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
         )
         stream_kwargs: dict = {}

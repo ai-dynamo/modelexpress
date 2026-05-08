@@ -291,7 +291,7 @@ See [`../examples/aggregated_k8s/README.md`](../examples/aggregated_k8s/README.m
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA. Use `--load-format mx`, which auto-detects whether to load from disk or receive via RDMA.
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM uses `--load-format mx`, which auto-detects whether to load from disk or receive via RDMA. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Choosing a Metadata Backend
 
@@ -577,7 +577,7 @@ See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_source
 #### SGLang Clients
 
 ModelExpress also works as the remote-instance weight loader for SGLang via
-upstream [sgl-project/sglang#23105](https://github.com/sgl-project/sglang/pull/23105),
+upstream [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723),
 supporting both Mooncake TransferEngine and NIXL transports. See
 [`SGLANG.md`](SGLANG.md) for the user-facing guide.
 

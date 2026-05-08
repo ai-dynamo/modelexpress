@@ -1,0 +1,275 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the SGLang ModelExpress adapter and loader entrypoint."""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+import torch.nn as nn
+
+from modelexpress import p2p_pb2
+from modelexpress.engines.sglang.adapter import (
+    SglangAdapter,
+    build_sglang_load_context,
+    collect_sglang_tensors,
+)
+from modelexpress.engines.sglang.loader import MxModelLoader
+
+
+def _load_config(**overrides):
+    defaults = dict(
+        tp_rank=3,
+        modelexpress_url="modelexpress-server:8001",
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _model_config(**overrides):
+    defaults = dict(
+        model_path="deepseek-ai/DeepSeek-V3",
+        dtype=torch.bfloat16,
+        quantization="fp8",
+        revision="abc123",
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _device_config(**overrides):
+    defaults = dict(device="cpu", gpu_id=0)
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def test_sglang_adapter_builds_identity_from_sglang_configs():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    with patch(
+        "modelexpress.engines.sglang.adapter._get_parallel_size",
+        side_effect=lambda name: {
+            "get_tensor_model_parallel_world_size": 8,
+            "get_pipeline_model_parallel_world_size": 2,
+            "get_moe_expert_parallel_world_size": 4,
+        }[name],
+    ):
+        identity = adapter.build_identity()
+
+    assert identity.model_name == "deepseek-ai/DeepSeek-V3"
+    assert identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    assert identity.tensor_parallel_size == 8
+    assert identity.pipeline_parallel_size == 2
+    assert identity.expert_parallel_size == 4
+    assert identity.dtype == "bfloat16"
+    assert identity.quantization == "fp8"
+    assert identity.revision == "abc123"
+
+
+def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
+    ctx = build_sglang_load_context(
+        _load_config(tp_rank=5, modelexpress_url="mx.example:9000"),
+        _model_config(),
+        _device_config(),
+    )
+
+    assert ctx.worker_rank == 5
+    assert ctx.global_rank == 5
+    assert ctx.mx_client.server_url == "mx.example:9000"
+
+
+def test_collect_sglang_tensors_preserves_non_contiguous_storage_names():
+    model = nn.Module()
+    model.weight_t = nn.Parameter(torch.randn(4, 3).T)
+
+    tensors = collect_sglang_tensors(model)
+
+    assert "weight_t.__storage" in tensors
+    assert tensors["weight_t.__storage"].dtype == torch.uint8
+
+
+def test_collect_sglang_tensors_deduplicates_tied_parameters():
+    model = nn.Module()
+    shared = nn.Parameter(torch.randn(4, 3))
+    model.first = shared
+    model.second = shared
+
+    tensors = collect_sglang_tensors(model)
+
+    assert list(tensors) == ["first"]
+
+
+def test_sglang_adapter_post_load_delegates_to_child_module():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    class ChildModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.post_load_called = False
+
+        def post_load_weights(self):
+            self.post_load_called = True
+
+    model = nn.Module()
+    model.child = ChildModel()
+
+    adapter.after_rdma_receive(SimpleNamespace(model=model))
+
+    assert model.child.post_load_called
+
+
+def test_sglang_adapter_post_load_prefers_top_level_hook():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    class TopLevelModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.child = nn.Module()
+            self.child.post_load_called = False
+            self.post_load_called = False
+
+        def post_load_weights(self):
+            self.post_load_called = True
+
+    def child_post_load_weights():
+        model.child.post_load_called = True
+
+    model = TopLevelModel()
+    model.child.post_load_weights = child_post_load_weights
+
+    adapter.after_rdma_receive(SimpleNamespace(model=model))
+
+    assert model.post_load_called
+    assert not model.child.post_load_called
+
+
+def test_mx_model_loader_delegates_to_shared_strategy_chain():
+    model = nn.Linear(2, 2)
+    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
+
+    with patch.object(
+        MxModelLoader,
+        "_load_model_via_nixl",
+        return_value=model,
+    ) as load_via_nixl:
+        loaded = loader.load_model(
+            model=model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is model
+    load_via_nixl.assert_called_once_with(
+        model=model,
+        model_config=_model_config(),
+        device_config=_device_config(),
+    )
+
+
+def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
+    model = nn.Linear(2, 2)
+    loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
+
+    with patch(
+        "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
+        return_value=model,
+    ) as run:
+        loaded = loader._load_model_via_nixl(
+            model=model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is model
+    run.assert_called_once()
+    assert run.call_args.args[0] is model
+    ctx = run.call_args.args[1]
+    assert ctx.adapter.__class__ is SglangAdapter
+    assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+
+
+def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
+    model = nn.Linear(2, 2)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+
+    with patch.object(
+        MxModelLoader,
+        "_load_model_via_transfer_engine",
+        return_value=model,
+    ) as load_via_transfer_engine:
+        loaded = loader.load_model(
+            model=model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is model
+    load_via_transfer_engine.assert_called_once_with(
+        model=model,
+        model_config=_model_config(),
+        device_config=_device_config(),
+    )
+
+
+def test_mx_model_loader_rejects_unknown_transport_in_mx_package():
+    loader = MxModelLoader(_load_config(modelexpress_transport="unknown"))
+
+    try:
+        loader.load_model(
+            model=nn.Linear(2, 2),
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+    except ValueError as exc:
+        assert "unknown" in str(exc)
+    else:
+        raise AssertionError("Expected unsupported transport to fail")
+
+
+def test_transfer_engine_publish_starts_non_nixl_heartbeat():
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = SimpleNamespace(
+        global_rank=9,
+        worker_rank=3,
+        worker_id="worker-id",
+        device_id=1,
+        identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
+        mx_client=SimpleNamespace(),
+    )
+    published = {}
+
+    def publish_metadata(identity, worker, worker_id):
+        published["identity"] = identity
+        published["worker"] = worker
+        published["worker_id"] = worker_id
+        return "mx-source-id"
+
+    def update_status(**kwargs):
+        published["status"] = kwargs
+        return True
+
+    ctx.mx_client.publish_metadata = publish_metadata
+    ctx.mx_client.update_status = update_status
+
+    class FakeHeartbeat:
+        def __init__(self, **kwargs):
+            published["heartbeat"] = kwargs
+
+        def start(self):
+            published["heartbeat_started"] = True
+
+    with patch(
+        "modelexpress.engines.sglang.loader.HeartbeatThread",
+        FakeHeartbeat,
+    ):
+        loader._publish_transfer_engine_source(
+            ctx=ctx,
+            session_id="te-session",
+            weight_info={"weight": (1000, 4, 2)},
+        )
+
+    assert published["worker"].transfer_engine_session_id == "te-session"
+    assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
+    assert published["heartbeat"]["nixl_manager"] is None
+    assert published["heartbeat_started"]

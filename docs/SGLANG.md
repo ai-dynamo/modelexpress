@@ -7,62 +7,113 @@ SPDX-License-Identifier: Apache-2.0
 
 ModelExpress can serve as the remote-instance weight loader for SGLang,
 streaming weights GPU-to-GPU over RDMA between SGLang processes instead
-of loading from disk on every replica. The integration is contributed by
-upstream [sgl-project/sglang#23105](https://github.com/sgl-project/sglang/pull/23105),
-which adds the `--modelexpress-config` flag and supports two transports:
+of loading from disk on every replica. The SGLang-side delegation hook is
+proposed in upstream [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723),
+which adds the `--modelexpress-config` flag and delegates ModelExpress loading
+to the ModelExpress package:
 
-- **Mooncake TransferEngine** — SGLang's existing remote-instance path.
-- **NIXL** — selected with `transport: "nixl"`.
+SGLang does not run separate source and target modes. Every server uses the
+same `remote_instance` command, and `modelexpress.engines.sglang.MxModelLoader`
+decides whether to load natively and publish metadata or receive weights from
+an existing ModelExpress source.
 
-## 1. Install SGLang
+## 1. Build an SGLang image
 
-Install SGLang either way:
+Use an SGLang image that contains the upstream ModelExpress delegation hook:
 
 - **Pull the official image** — use a recent `lmsysorg/sglang` tag from
-  Docker Hub. PR #23105 was merged on `main`, so any image built from
-  `main` after the merge contains it.
+  Docker Hub after PR #24723 or an equivalent delegation patch is included.
 - **Build from `main`** — follow SGLang's official install guide at
-  [docs.sglang.ai/start/install](https://docs.sglang.ai/start/install.html).
+  [docs.sglang.io/docs/get_started/install](https://docs.sglang.io/docs/get_started/install).
 
-Either way, confirm the flag is present before running:
+Install the ModelExpress Python package into the SGLang image:
 
-## 2. Install the ModelExpress Python client
+```dockerfile
+FROM lmsysorg/sglang:<tag-with-modelexpress-delegation>
 
-```bash
-pip install "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python"
+RUN python3 -m pip install --no-cache-dir \
+    "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python"
 ```
 
-## 3. Start a ModelExpress server
+If you build SGLang from a local PR branch for e2e testing, install the local
+ModelExpress package into that image:
+
+```dockerfile
+FROM sglang-source:modelexpress
+
+COPY modelexpress_client/python /tmp/modelexpress_client_python
+RUN python3 -m pip install --no-cache-dir /tmp/modelexpress_client_python
+```
+
+Confirm the SGLang delegation flag is present before running:
+
+```bash
+python -m sglang.launch_server --help | grep modelexpress-config
+```
+
+For local SGLang source builds before the delegation patch is upstream:
+
+```bash
+cd /Users/zheluo/workspace/sglang
+
+docker build --platform linux/amd64 \
+  -f docker/Dockerfile \
+  --target runtime \
+  --build-arg BRANCH_TYPE=local \
+  --build-arg CUDA_VERSION=13.0.1 \
+  --build-arg BUILD_TYPE=all \
+  -t sglang-source:modelexpress \
+  .
+```
+
+Then use the local-package Dockerfile snippet above to install ModelExpress.
+
+## 2. Start a ModelExpress server
 
 ModelExpress server should be reachable at
 `modelexpress-server:8001`. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for how
 to start one (Docker, Helm, or Kubernetes).
 
-## 4. Launch SGLang
+## 3. Launch SGLang
 
-### NIXL transport
-
-**Seed:**
+Use the same command for the first and later replicas. The first replica
+finds no READY source, loads natively through SGLang, and publishes itself.
+Later replicas discover the source and load via the selected ModelExpress
+transport.
 
 ```bash
+export MODEL_EXPRESS_URL=modelexpress-server:8001
+
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30000 \
-  --load-format auto \
-  --modelexpress-config '{"url": "modelexpress-server:8001", "source": true, "transport": "nixl"}'
-```
-
-**Client:**
-
-```bash
-python -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30001 \
   --load-format remote_instance \
   --remote-instance-weight-loader-backend modelexpress \
   --modelexpress-config '{"url": "modelexpress-server:8001", "transport": "nixl"}'
 ```
 
+`modelexpress-config` is intentionally small and only controls the SGLang
+handoff into ModelExpress:
+
+- `url` sets or overrides the ModelExpress server URL for this SGLang process.
+- `transport` selects the ModelExpress package transport. Supported values are
+  `nixl` and `transfer_engine`.
+
+All other ModelExpress settings are environment variables, matching vLLM:
+`MX_METADATA_BACKEND`, `MX_MODEL_REVISION`, `MX_P2P_METADATA`,
+`MX_NIXL_BACKEND`, `MX_RDMA_NIC_PIN`, `MX_METADATA_PORT`,
+`MX_WORKER_GRPC_PORT`, and `MODEL_EXPRESS_LOG_LEVEL`.
+
+For TransferEngine, use the same command shape and change only the transport:
+
+```bash
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30000 \
+  --load-format remote_instance \
+  --remote-instance-weight-loader-backend modelexpress \
+  --modelexpress-config '{"url": "modelexpress-server:8001", "transport": "transfer_engine"}'
+```
 
 ## See also
 
-- Upstream PR: [sgl-project/sglang#23105](https://github.com/sgl-project/sglang/pull/23105).
+- Upstream PR: [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723).
 - [`DEPLOYMENT.md`](DEPLOYMENT.md) — running the ModelExpress server, NIXL/UCX tuning, performance reference.

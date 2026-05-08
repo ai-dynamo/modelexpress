@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
 import torch
 import torch.nn as nn
@@ -17,8 +17,16 @@ from ..client import MxClientBase
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter
     from ..nixl_transfer import NixlTransferManager
-    from vllm.config import ModelConfig, VllmConfig
-    from vllm.config.load import LoadConfig
+    from sglang.srt.configs.load_config import LoadConfig as SglangLoadConfig
+    from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
+    from vllm.config import ModelConfig as VllmModelConfig
+    from vllm.config.load import LoadConfig as VllmLoadConfig
+
+    EngineModelConfig: TypeAlias = VllmModelConfig | SglangModelConfig
+    EngineLoadConfig: TypeAlias = VllmLoadConfig | SglangLoadConfig
+else:
+    EngineModelConfig = object
+    EngineLoadConfig = object
 
 
 T = TypeVar("T")
@@ -42,9 +50,8 @@ class LoadResult(Generic[T]):
 class LoadContext:
     """Shared state passed to all loading strategies."""
 
-    vllm_config: VllmConfig
-    model_config: ModelConfig
-    load_config: LoadConfig
+    model_config: EngineModelConfig
+    load_config: EngineLoadConfig
     target_device: torch.device
     global_rank: int
     worker_rank: int

@@ -104,7 +104,6 @@ def _make_load_context(**overrides):
     """Return a LoadContext with mocked dependencies."""
     from modelexpress.load_strategy import LoadContext
     defaults = dict(
-        vllm_config=MagicMock(),
         model_config=MagicMock(),
         load_config=MagicMock(),
         target_device=torch.device("cpu"),

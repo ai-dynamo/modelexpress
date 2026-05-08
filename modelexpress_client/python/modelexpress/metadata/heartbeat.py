@@ -39,8 +39,9 @@ class HeartbeatThread:
         mx_client: gRPC client for UpdateStatus calls.
         mx_source_id: Source identity hash returned by PublishMetadata.
         worker_id: Unique worker identifier.
-        worker_rank: Global rank of this worker.
-        nixl_manager: NIXL transfer manager for agent health checks.
+        worker_rank: Model-shard rank used for metadata/status keying.
+        nixl_manager: Optional NIXL transfer manager for agent health checks.
+            Non-NIXL transports pass None and heartbeat unconditionally.
     """
 
     def __init__(
@@ -49,8 +50,7 @@ class HeartbeatThread:
         mx_source_id: str,
         worker_id: str,
         worker_rank: int,
-        nixl_manager: NixlTransferManager,
-
+        nixl_manager: NixlTransferManager | None,
     ):
         self._mx_client = mx_client
         self._mx_source_id = mx_source_id
@@ -121,7 +121,7 @@ class HeartbeatThread:
         """Single heartbeat tick: check health and send READY if healthy."""
         from .. import p2p_pb2
 
-        if not self._nixl_manager.is_healthy():
+        if self._nixl_manager is not None and not self._nixl_manager.is_healthy():
             return
 
         self._update_status(p2p_pb2.SOURCE_STATUS_READY)

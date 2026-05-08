@@ -202,7 +202,6 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
     return LoadContext(
-        vllm_config=vllm_config,
         model_config=model_config,
         load_config=vllm_config.load_config,
         target_device=adapter.get_target_device(),
