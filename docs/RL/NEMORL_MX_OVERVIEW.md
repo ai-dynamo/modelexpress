@@ -13,8 +13,6 @@ This document is the technical companion to the upstream PR. It covers:
 6. What was tested vs what is still on paper.
 7. End-to-end deployment recipe for the next session.
 
-> **Internal pensieve cross-references.** This doc is intended to be self-contained for upstream review. The longer-form running design notes live in `pensieve/RL/NemoRL/{00–06}*.md` for internal context — those won't be needed by an upstream reader.
-
 ---
 
 ## 1. Motivation
@@ -27,7 +25,7 @@ NeMo-RL today has two weight-sync paths — **`update_weights_via_ipc_zmq`** (CU
 | **Static NCCL group** | NCCL barrier locks the trainer + all rollout replicas into a fixed world. Spot/elastic rollout, mid-run rebalancing, cross-DC — all blocked. |
 | **No MoE awareness** | Every rank receives every expert weight, even if its EP shard only needs 1/8th of them. Composer 2 reports this as the dominant refit cost on Kimi K2.5 (1.04T / 32B active). |
 
-PrimeRL PR [#2389](https://github.com/PrimeIntellect-ai/prime-rl/pull/2389) is the closest framework analog. We live-debugged it on GB200 in early May (`pensieve/RL/PrimeRL/06_status_2026_05_06.md`) and learned two things the hard way:
+PrimeRL PR [#2389](https://github.com/PrimeIntellect-ai/prime-rl/pull/2389) is the closest framework analog. We live-debugged it on GB200 in early May and learned two things the hard way:
 
 1. **Cross-subnet full-mesh in `TransportPlan` ≠ routable.** GCP GB200's four `mlx5_N` NICs each sit on their own L3 subnet (`rdma-0..rdma-3`); the full-mesh `add_remote_agent` loop hits `NIXL_ERR_REMOTE_DISCONNECT` whenever (trainer rank N → inference rank M ≠ N). For the 1-to-1 dp-only layout that NeMo-RL also uses, **same-rank-only writes** are both topologically correct and 3× cheaper in NIXL connection count.
 
@@ -733,9 +731,8 @@ Then open PRs against the respective repos. The MX-side PR description can pull 
 
 ## 11. References
 
-- **Internal pensieve** (running notes): `pensieve/RL/NemoRL/{00–06}*.md`. `06_prototype_status.md` is the living implementation snapshot.
-- **PrimeRL learnings** (the GB200 multi-subnet RDMA topology lessons that shaped v2 defaults): `pensieve/RL/PrimeRL/06_status_2026_05_06.md`, `07_pr_2389_review_comments.md`.
+- **PrimeRL PR #2389** (the GB200 multi-subnet RDMA topology lessons that shaped v2 defaults): [PrimeIntellect-ai/prime-rl#2389](https://github.com/PrimeIntellect-ai/prime-rl/pull/2389).
 - **TensorHub paper** (ROS, mutability contract, retention protocol, pipeline replication): [arXiv 2604.09107v1](https://arxiv.org/pdf/2604.09107v1).
 - **Composer 2 technical report** (router replay + per-expert delta compression): [Cursor Composer 2](https://cursor.com/resources/Composer2.pdf).
 - **Sister framework integrations**: `docs/RL/PRIMERL_MX_OVERVIEW.md`, `docs/RL/VERL_MX_OVERVIEW.md`.
-- **Internal MX architecture**: `docs/ARCHITECTURE.md`, `docs/metadata.md`, `docs/DEPLOYMENT.md`.
+- **MX architecture**: `docs/ARCHITECTURE.md`, `docs/metadata.md`, `docs/DEPLOYMENT.md`.
