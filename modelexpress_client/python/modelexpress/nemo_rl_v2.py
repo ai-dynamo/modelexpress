@@ -278,6 +278,9 @@ class MxV2TrainingPublisher:
 
         # Build the v2 sidecar payload (preserves all the same data as
         # extra_parameters but in a transport the server actually echoes).
+        # ``shape_registry`` is intentionally embedded as a nested JSON string
+        # inside this JSON document — receivers parse the outer JSON with
+        # decode_registry's matching call to handle the inner blob.
         sidecar_payload = json.dumps(
             {
                 "mx_v2": "1",
@@ -286,6 +289,7 @@ class MxV2TrainingPublisher:
                 "training_step": int(version),
                 "world_layout": self._world_layout.encode(),
                 "framework": "nemo_rl",
+                "shape_registry": registry_blob,
             },
             separators=(",", ":"),
         )
