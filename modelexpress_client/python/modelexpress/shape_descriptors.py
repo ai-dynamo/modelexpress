@@ -175,17 +175,37 @@ def describe_tensor(
         )
 
     if isinstance(p, Shard):
-        # tensor.shape is the *local* shape on a DTensor. Reconstruct the
-        # global shape by multiplying out along the shard dim.
-        local_shape = list(int(s) for s in tensor.shape)
-        global_shape = list(local_shape)
-        global_shape[p.dim] = local_shape[p.dim] * fsdp_world_size
-        local_extent = local_shape[p.dim]
+        # ``tensor.shape`` semantics differ between real DTensors and plain
+        # tensors:
+        #   * Real ``torch.distributed.tensor.DTensor.shape`` is the GLOBAL
+        #     (un-sharded) shape; the local view is ``tensor.to_local().shape``.
+        #   * A plain tensor (or a stand-in object with ``.placements`` but no
+        #     ``.to_local``) has shape == local-view by construction.
+        # Compute global vs local accordingly.
+        try:
+            from torch.distributed.tensor import DTensor as _RealDTensor
+        except ImportError:  # pragma: no cover — handled at module import
+            _RealDTensor = None  # type: ignore[assignment]
+
+        if _RealDTensor is not None and isinstance(tensor, _RealDTensor):
+            global_shape = tuple(int(s) for s in tensor.shape)
+            try:
+                local_extent = int(tensor.to_local().shape[p.dim])
+            except Exception:
+                # Fallback: assume even sharding.
+                local_extent = global_shape[p.dim] // fsdp_world_size
+        else:
+            local_shape = list(int(s) for s in tensor.shape)
+            global_shape_list = list(local_shape)
+            global_shape_list[p.dim] = local_shape[p.dim] * fsdp_world_size
+            global_shape = tuple(global_shape_list)
+            local_extent = local_shape[p.dim]
+
         start = rank * local_extent
         end = start + local_extent
         return TensorDescriptorV2(
             name=name,
-            global_shape=tuple(global_shape),
+            global_shape=global_shape,
             dtype=dtype_str,
             placement_kind=PLACEMENT_SHARD,
             shard_axis=int(p.dim),
