@@ -20,8 +20,14 @@ from modelexpress.load_strategy.context import LoadResult
 
 
 class _FakeAdapter(EngineAdapter):
+    def __init__(self, *, is_cuda_alike: bool = True):
+        self._is_cuda_alike = is_cuda_alike
+
     def discover_tensors(self, result: LoadResult):
         return {}
+
+    def is_cuda_alike(self) -> bool:
+        return self._is_cuda_alike
 
     def after_weight_iter_load(self, result: LoadResult):
         return result
@@ -295,11 +301,11 @@ class TestStreamWeights:
         self,
         tp_size: int,
         device_id: int = 2,
-        device: str = "cuda",
+        is_cuda_alike: bool = True,
     ):
         return _make_load_context(
+            adapter=_FakeAdapter(is_cuda_alike=is_cuda_alike),
             device_id=device_id,
-            target_device=torch.device(device),
             identity=p2p_pb2.SourceIdentity(
                 model_name="test-model",
                 tensor_parallel_size=tp_size,
@@ -347,9 +353,13 @@ class TestStreamWeights:
 
         streamer_instance.stream_files.assert_called_once_with(file_uris)
 
-    def test_distributed_disabled_on_non_cuda_platform(self):
+    def test_distributed_disabled_when_adapter_is_not_cuda_alike(self):
         strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2, device="cpu")
+        ctx = self._make_ctx_with_tp(
+            tp_size=4,
+            device_id=2,
+            is_cuda_alike=False,
+        )
         file_uris = ["s3://bucket/model.safetensors"]
         tensors = [("w", torch.randn(2, 2))]
 

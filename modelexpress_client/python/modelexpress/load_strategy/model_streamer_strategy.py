@@ -143,7 +143,8 @@ class ModelStreamerStrategy(LoadStrategy):
         tp_size = getattr(ctx.identity, "tensor_parallel_size", 1) or 1
         distributed = (
             tp_size > 1
-            and ctx.target_device.type == "cuda"
+            and ctx.adapter is not None
+            and ctx.adapter.is_cuda_alike()
             and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
         )
         stream_kwargs: dict = {}

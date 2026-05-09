@@ -49,6 +49,11 @@ class VllmAdapter(EngineAdapter):
     def get_target_device(self) -> torch.device:
         return self.target_device
 
+    def is_cuda_alike(self) -> bool:
+        from vllm.platforms import current_platform
+
+        return bool(current_platform.is_cuda_alike())
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")

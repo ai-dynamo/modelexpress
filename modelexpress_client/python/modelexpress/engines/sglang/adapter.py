@@ -47,7 +47,7 @@ class SglangAdapter(EngineAdapter):
         )
 
     def get_worker_rank(self) -> int:
-        return int(getattr(self.load_config, "tp_rank", 0) or 0)
+        return _get_sglang_worker_rank(self.load_config)
 
     def get_global_rank(self) -> int:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -64,6 +64,11 @@ class SglangAdapter(EngineAdapter):
 
     def get_target_device(self) -> torch.device:
         return self.target_device
+
+    def is_cuda_alike(self) -> bool:
+        from sglang.srt.utils import is_cuda_alike
+
+        return bool(is_cuda_alike())
 
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
@@ -254,6 +259,19 @@ def _get_parallel_size(name: str) -> int:
         return int(getattr(distributed, name)())
     except Exception:
         return 1
+
+
+def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
+    """Return the SGLang model-parallel shard key, excluding DP replicas."""
+    try:
+        from sglang.srt import distributed
+
+        tp_rank = int(distributed.get_tensor_model_parallel_rank())
+        pp_rank = int(distributed.get_pipeline_model_parallel_rank())
+        tp_size = int(distributed.get_tensor_model_parallel_world_size())
+        return pp_rank * tp_size + tp_rank
+    except Exception:
+        return int(getattr(load_config, "tp_rank", 0) or 0)
 
 
 def build_sglang_load_context(

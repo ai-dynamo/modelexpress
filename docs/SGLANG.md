@@ -54,7 +54,7 @@ python -m sglang.launch_server --help | grep modelexpress-config
 For local SGLang source builds before the delegation patch is upstream:
 
 ```bash
-cd /Users/zheluo/workspace/sglang
+cd /path/to/sglang
 
 docker build --platform linux/amd64 \
   -f docker/Dockerfile \

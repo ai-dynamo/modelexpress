@@ -3,6 +3,8 @@
 
 """Tests for the SGLang ModelExpress adapter and loader entrypoint."""
 
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -77,6 +79,47 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
     assert ctx.worker_rank == 5
     assert ctx.global_rank == 5
     assert ctx.mx_client.server_url == "mx.example:9000"
+
+
+def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    distributed_mod = ModuleType("sglang.srt.distributed")
+    distributed_mod.get_tensor_model_parallel_rank = lambda: 1
+    distributed_mod.get_pipeline_model_parallel_rank = lambda: 2
+    distributed_mod.get_tensor_model_parallel_world_size = lambda: 4
+    srt_mod.distributed = distributed_mod
+
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.distributed", distributed_mod)
+
+    with patch("torch.distributed.is_available", return_value=True), patch(
+        "torch.distributed.is_initialized", return_value=True,
+    ), patch("torch.distributed.get_rank", return_value=17):
+        ctx = build_sglang_load_context(
+            _load_config(tp_rank=5, modelexpress_url="mx.example:9000"),
+            _model_config(),
+            _device_config(),
+        )
+
+    assert ctx.worker_rank == 9
+    assert ctx.global_rank == 17
+    assert ctx.mx_client.server_url == "mx.example:9000"
+
+
+def test_sglang_is_cuda_alike_uses_sglang_platform_helper(monkeypatch):
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    utils_mod = ModuleType("sglang.srt.utils")
+    utils_mod.is_cuda_alike = lambda: True
+
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils", utils_mod)
+
+    assert adapter.is_cuda_alike() is True
 
 
 def test_collect_sglang_tensors_preserves_non_contiguous_storage_names():
@@ -227,6 +270,77 @@ def test_mx_model_loader_rejects_unknown_transport_in_mx_package():
         raise AssertionError("Expected unsupported transport to fail")
 
 
+def test_transfer_engine_registers_discovered_tensor_map():
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    tensor = torch.randn(2, 3)
+    calls = []
+
+    class FakeTransferEngine:
+        def register_memory(self, addr, size):
+            calls.append((addr, size))
+            return 0
+
+    weight_info = loader._register_transfer_engine_tensors(
+        {"weight.__storage": tensor},
+        FakeTransferEngine(),
+    )
+
+    assert calls == [(tensor.data_ptr(), tensor.numel() * tensor.element_size())]
+    assert weight_info == {
+        "weight.__storage": (
+            tensor.data_ptr(),
+            tensor.numel(),
+            tensor.element_size(),
+        )
+    }
+
+
+def test_transfer_engine_receive_uses_discovered_tensor_map():
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    tensor = torch.randn(2, 3)
+    ctx = SimpleNamespace(global_rank=0)
+    transferred = {}
+    source_worker = p2p_pb2.WorkerMetadata(
+        transfer_engine_session_id="te-session",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight.__storage",
+                addr=1234,
+                size=tensor.numel() * tensor.element_size(),
+                device_id=0,
+            )
+        ],
+    )
+
+    class FakeTransferEngine:
+        def batch_transfer_sync_read(
+            self,
+            session_id,
+            client_ptr_list,
+            seed_ptr_list,
+            client_len_list,
+        ):
+            transferred["session_id"] = session_id
+            transferred["client_ptr_list"] = client_ptr_list
+            transferred["seed_ptr_list"] = seed_ptr_list
+            transferred["client_len_list"] = client_len_list
+            return 0
+
+    loader._receive_via_transfer_engine(
+        {"weight.__storage": tensor},
+        FakeTransferEngine(),
+        source_worker,
+        ctx,
+    )
+
+    assert transferred == {
+        "session_id": "te-session",
+        "client_ptr_list": [tensor.data_ptr()],
+        "seed_ptr_list": [1234],
+        "client_len_list": [tensor.numel() * tensor.element_size()],
+    }
+
+
 def test_transfer_engine_publish_starts_non_nixl_heartbeat():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = SimpleNamespace(
@@ -263,13 +377,36 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         "modelexpress.engines.sglang.loader.HeartbeatThread",
         FakeHeartbeat,
     ):
-        loader._publish_transfer_engine_source(
+        published_ok = loader._publish_transfer_engine_source(
             ctx=ctx,
             session_id="te-session",
             weight_info={"weight": (1000, 4, 2)},
         )
 
+    assert published_ok
     assert published["worker"].transfer_engine_session_id == "te-session"
     assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
     assert published["heartbeat"]["nixl_manager"] is None
     assert published["heartbeat_started"]
+
+
+def test_transfer_engine_publish_failure_is_non_fatal():
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = SimpleNamespace(
+        global_rank=9,
+        worker_rank=3,
+        worker_id="worker-id",
+        device_id=1,
+        identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
+        mx_client=SimpleNamespace(
+            publish_metadata=lambda *args: (_ for _ in ()).throw(
+                RuntimeError("metadata down")
+            )
+        ),
+    )
+
+    assert not loader._publish_transfer_engine_source(
+        ctx=ctx,
+        session_id="te-session",
+        weight_info={"weight": (1000, 4, 2)},
+    )

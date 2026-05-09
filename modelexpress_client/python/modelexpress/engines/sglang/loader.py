@@ -117,10 +117,6 @@ class MxModelLoader:
         device_config: DeviceConfig,
     ) -> nn.Module:
         """Load SGLang weights via ModelExpress metadata and TransferEngine."""
-        from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-            register_memory_region,
-        )
-
         load_start = time.perf_counter()
         ctx = build_sglang_load_context(
             self.load_config,
@@ -159,11 +155,16 @@ class MxModelLoader:
                 ctx.global_rank,
             )
             result = ctx.adapter.load_via_native(result)
+            tensors = ctx.adapter.discover_tensors(result)
         else:
             result = ctx.adapter.before_rdma_receive(result)
-            weight_info = register_memory_region(result.model, transfer_engine)
+            tensors = ctx.adapter.discover_tensors(result)
+            weight_info = self._register_transfer_engine_tensors(
+                tensors,
+                transfer_engine,
+            )
             self._receive_via_transfer_engine(
-                result.model,
+                tensors,
                 transfer_engine,
                 source_worker,
                 ctx,
@@ -171,13 +172,23 @@ class MxModelLoader:
             result = ctx.adapter.after_rdma_receive(result)
 
         if weight_info is None:
-            weight_info = register_memory_region(result.model, transfer_engine)
+            weight_info = self._register_transfer_engine_tensors(
+                tensors,
+                transfer_engine,
+            )
+        ctx.tensors = tensors
         self.remote_instance_transfer_engine_weight_info = weight_info
-        self._publish_transfer_engine_source(
+        publish_ok = self._publish_transfer_engine_source(
             ctx=ctx,
             session_id=session_id,
             weight_info=weight_info,
         )
+        if not publish_ok:
+            logger.warning(
+                "[Worker %s] TransferEngine source advertisement failed; "
+                "model load will continue",
+                ctx.global_rank,
+            )
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -220,7 +231,7 @@ class MxModelLoader:
 
     def _receive_via_transfer_engine(
         self,
-        model: nn.Module,
+        tensors: dict[str, torch.Tensor],
         transfer_engine,
         source_worker,
         ctx: LoadContext,
@@ -233,7 +244,7 @@ class MxModelLoader:
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
-        for name, tensor in model.named_parameters():
+        for name, tensor in tensors.items():
             weight_info = seed_weight_info.get(name)
             if weight_info is None:
                 raise RuntimeError(
@@ -268,47 +279,112 @@ class MxModelLoader:
                 f"with error={ret}"
             )
 
+    def _register_transfer_engine_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        transfer_engine,
+    ) -> dict[str, tuple[int, int, int]]:
+        weight_info = {}
+        registered_ptrs = set()
+        for name, tensor in tensors.items():
+            addr = tensor.data_ptr()
+            numel = tensor.numel()
+            element_size = tensor.element_size()
+            size = numel * element_size
+            if addr not in registered_ptrs:
+                ret = transfer_engine.register_memory(addr, size)
+                if ret != 0:
+                    raise RuntimeError(
+                        "ModelExpress transfer_engine: register_memory failed "
+                        f"for tensor {name!r}, error={ret}"
+                    )
+                registered_ptrs.add(addr)
+            weight_info[name] = (addr, numel, element_size)
+        return weight_info
+
     def _publish_transfer_engine_source(
         self,
         *,
         ctx: LoadContext,
         session_id: str,
         weight_info,
-    ) -> None:
-        tensors = [
-            p2p_pb2.TensorDescriptor(
-                name=name,
-                addr=addr,
-                size=numel * element_size,
-                device_id=ctx.device_id,
+    ) -> bool:
+        try:
+            tensors = [
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=ctx.device_id,
+                )
+                for name, (addr, numel, element_size) in weight_info.items()
+            ]
+            worker = p2p_pb2.WorkerMetadata(
+                worker_rank=ctx.worker_rank,
+                transfer_engine_session_id=session_id,
+                tensors=tensors,
             )
-            for name, (addr, numel, element_size) in weight_info.items()
-        ]
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=ctx.worker_rank,
-            transfer_engine_session_id=session_id,
-            tensors=tensors,
-        )
-        mx_source_id = ctx.mx_client.publish_metadata(
-            ctx.identity,
-            worker,
-            ctx.worker_id,
-        )
-        ctx.mx_client.update_status(
-            mx_source_id=mx_source_id,
-            worker_id=ctx.worker_id,
-            worker_rank=ctx.worker_rank,
-            status=p2p_pb2.SOURCE_STATUS_READY,
-        )
-        heartbeat = HeartbeatThread(
-            mx_client=ctx.mx_client,
-            mx_source_id=mx_source_id,
-            worker_id=ctx.worker_id,
-            worker_rank=ctx.worker_rank,
-            nixl_manager=None,
-        )
-        heartbeat.start()
-        _heartbeat_threads[ctx.worker_rank] = heartbeat
+        except Exception:
+            logger.exception(
+                "[Worker %s] TransferEngine metadata payload build failed "
+                "(worker_id=%s, worker_rank=%s)",
+                ctx.global_rank,
+                ctx.worker_id,
+                ctx.worker_rank,
+            )
+            return False
+        try:
+            mx_source_id = ctx.mx_client.publish_metadata(
+                ctx.identity,
+                worker,
+                ctx.worker_id,
+            )
+        except Exception:
+            logger.exception(
+                "[Worker %s] TransferEngine publish_metadata failed "
+                "(worker_id=%s, worker_rank=%s)",
+                ctx.global_rank,
+                ctx.worker_id,
+                ctx.worker_rank,
+            )
+            return False
+        try:
+            ctx.mx_client.update_status(
+                mx_source_id=mx_source_id,
+                worker_id=ctx.worker_id,
+                worker_rank=ctx.worker_rank,
+                status=p2p_pb2.SOURCE_STATUS_READY,
+            )
+        except Exception:
+            logger.exception(
+                "[Worker %s] TransferEngine update_status failed "
+                "(mx_source_id=%s, worker_id=%s, worker_rank=%s)",
+                ctx.global_rank,
+                mx_source_id,
+                ctx.worker_id,
+                ctx.worker_rank,
+            )
+            return False
+        try:
+            heartbeat = HeartbeatThread(
+                mx_client=ctx.mx_client,
+                mx_source_id=mx_source_id,
+                worker_id=ctx.worker_id,
+                worker_rank=ctx.worker_rank,
+                nixl_manager=None,
+            )
+            heartbeat.start()
+            _heartbeat_threads[ctx.worker_rank] = heartbeat
+        except Exception:
+            logger.exception(
+                "[Worker %s] TransferEngine heartbeat startup failed "
+                "(mx_source_id=%s, worker_id=%s, worker_rank=%s)",
+                ctx.global_rank,
+                mx_source_id,
+                ctx.worker_id,
+                ctx.worker_rank,
+            )
+            return False
         logger.info(
             "[Worker %s] Published TransferEngine metadata to MX server "
             "(mx_source_id=%s, worker_id=%s)",
@@ -316,6 +392,7 @@ class MxModelLoader:
             mx_source_id,
             ctx.worker_id,
         )
+        return True
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
