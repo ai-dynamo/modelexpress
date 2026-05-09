@@ -1,7 +1,7 @@
 # ModelExpress × NeMo-RL — Design + Validation Overview (v2)
 
 **Last Updated**: May 8, 2026
-**Status**: **End-to-end NIXL RDMA refit working on real GB200**, prototyped on `kavink/nemo_rl_moe` (MX) + `kavink/mx_integration` ([NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL)). 4 ranks × 2 cycles × toy tensors verified byte-correct (sentinels match). 4 ranks × 1.6 GB Qwen3-30B-A3B-shaped tensors land in 11–16 ms each. 15/15 unit tests passing. arm64 NemoRL overlay image (`nvcr.io/nvidian/dynamo-dev/nemo-rl:kavink-v2`) built and smoke-tested but not yet pushed to a registry, so the actual Ray-orchestrated NemoRL training loop on Qwen3 hasn't been driven yet — that's the next milestone, gated only on image push + a K8s manifest.
+**Status**: **End-to-end NIXL RDMA refit working on real GB200**, prototyped on `kavink/nemo_rl_moe` (MX) + `kavink/mx_integration` ([NVIDIA-NeMo/RL](https://github.com/NVIDIA-NeMo/RL)). 4 ranks × 2 cycles × toy tensors verified byte-correct (sentinels match). 4 ranks × 1.6 GB Qwen3-30B-A3B-shaped tensors land in 11–16 ms each. **4 ranks × 2 cycles × real `torch.distributed.tensor.DTensor` (Shard(0) FSDP placement) verified byte-correct AND verified that the receiver's reconstructed shape registry reports the correct un-sharded `global_shape` plus per-rank `local_shard_range` for every tensor.** 15/15 unit tests passing. arm64 NemoRL overlay image (`nvcr.io/nvidian/dynamo-dev/nemo-rl:kavink-v2`) built and smoke-tested but not yet pushed to a registry, so the actual Ray-orchestrated NemoRL training loop on Qwen3 hasn't been driven yet — that's the next milestone, gated only on image push + a K8s manifest.
 
 This document is the technical companion to the upstream PR. It covers:
 
@@ -563,7 +563,38 @@ Output (abridged):
 
 This validates end-to-end: `MxV2TrainingPublisher.publish` over real gRPC, NIXL register, the **sidecar transport** (`__mx_v2_meta__`) round-trips through the server, `discover_v2_sources` finds the right rank, `pick_best_source` selects the freshest, `receive_from` does a real RDMA WRITE, byte-level sentinels match, and `publish_self_as_source` (tree fan-out) successfully republishes. Per-rank NIC pinning via `MX_RDMA_NIC_PIN=auto` correctly mapped rank N → `mlx5_N:1`.
 
-### 8.4 Live E2E on GB200 — production scale (Qwen3-30B-A3B-shaped)
+### 8.4 Live E2E on GB200 — real DTensors (`torch.distributed.tensor`)
+
+`scripts/v2_dtensor_e2e_demo.py` mirrors the previous test but uses **real DTensors** instead of fake stand-ins, exercising the exact codepath that `DTensorPolicyWorker.stream_weights_via_mx` runs in production: `init_device_mesh("cuda", (WORLD_SIZE,))`, `distribute_tensor(t, mesh, [Shard(0)])`, then `MxV2TrainingPublisher.add_tensor(tensor=sharded_dt)`.
+
+```bash
+WORLD_SIZE=4 HIDDEN=1024 INTER=2048 N_REFIT_CYCLES=2 python3 v2_dtensor_e2e_demo.py
+```
+
+Result on `prime-rl-nixl-mx-trainer-0`:
+
+```
+[trainer R0] DTensor: global=(1024, 2048) local=(256, 2048) sentinel=8
+[trainer R1] DTensor: global=(1024, 2048) local=(256, 2048) sentinel=16
+[trainer R2] DTensor: global=(1024, 2048) local=(256, 2048) sentinel=24
+[trainer R3] DTensor: global=(1024, 2048) local=(256, 2048) sentinel=32
+
+[inference R0] registry: global=(1024, 2048) placement=SHARD shard_axis=0 local_range=(0, 256)
+[inference R1] registry: global=(1024, 2048) placement=SHARD shard_axis=0 local_range=(256, 512)
+[inference R2] registry: global=(1024, 2048) placement=SHARD shard_axis=0 local_range=(512, 768)
+[inference R3] registry: global=(1024, 2048) placement=SHARD shard_axis=0 local_range=(768, 1024)
+[inference R0..R3] all_elem_match=True  for v=0 and v=1
+=== ALL RANKS OK ===
+```
+
+This validates two things v2_moe_e2e_demo.py couldn't:
+
+1. **`shape_descriptors.describe_tensor` correctly handles real DTensors.** The fix is in commit `9aa4b93` — the previous version assumed `tensor.shape` was the local view (true for plain tensors, **false for DTensors**, where `.shape` is the global un-sharded shape). On a real DTensor, we now read `tensor.to_local().shape[shard_dim]` for the local extent.
+2. **The shape registry reaches the receiver via the sidecar.** Previously the registry only travelled through `SourceIdentity.extra_parameters` (which the running server drops). Same commit (`9aa4b93`) embeds `shape_registry` inside the sidecar JSON. Receivers now see `chosen.registry["tensors"]` with correct `global_shape`, `placement_kind=SHARD`, `shard_axis=0`, and rank-correct `local_shard_range`.
+
+Both are real bugs that the test caught before they would have shipped. They demonstrate why the DTensor E2E test (vs the fake-DTensor toy demo) is essential for closing the validation gap on the NemoRL-wrapper code paths.
+
+### 8.5 Live E2E on GB200 — production scale (Qwen3-30B-A3B-shaped)
 
 Same demo, scaled up: **WORLD_SIZE=4, NUM_EXPERTS=192, HIDDEN=4096** → `(48, 4096, 4096)` bf16 ≈ **1.6 GB / rank**. This is the per-rank shard size for Qwen3-30B-A3B with EP=4.
 
@@ -577,7 +608,7 @@ Same demo, scaled up: **WORLD_SIZE=4, NUM_EXPERTS=192, HIDDEN=4096** → `(48, 4
 
 The 100+ GB/s figures are intra-node `cuda_ipc` (the test pod runs all 4 ranks on one host), not over-the-wire RDMA. So this validates **correctness at production-shape volumes** but not over-the-wire NIC bandwidth — for cross-node we'd see ~7–8 GB/s per NIC, matching what PrimeRL PR #2389 reports.
 
-### 8.5 Docker overlay image
+### 8.6 Docker overlay image
 
 ```bash
 cd ~/Work/Github/RL/RL  # or upstream NemoRL clone
@@ -610,11 +641,11 @@ Image: 34.6 GB on disk (`v0.6.0` base + ~6 MB our overlay). Build time on x86 ho
 
 The Dockerfile is intentionally minimal — it overlays the entire `nemo_rl/` package (not just the modified files) because v0.6.0 is older than `main` and partial overlays cause missing-symbol import errors (e.g. `resolve_generation_worker_cls` isn't in v0.6.0's `vllm_generation/utils.py`). The MX wheel is `pip install --no-deps` (the venv already has compatible `grpcio` / `protobuf`).
 
-### 8.6 What was NOT validated end-to-end
+### 8.7 What was NOT validated end-to-end
 
 These compile + import + pass linting but no integration test drove the codepath yet:
 
-- `DTensorPolicyWorker.stream_weights_via_mx` — the trainer-side bridge from NemoRL DTensor world to `MxV2TrainingPublisher.add_tensor`. Lower layer (`MxV2TrainingPublisher` itself) was exercised in §8.3+8.4, but the NemoRL-side wrapper that walks `model.state_dict()`, calls `tensor.to_local()`, runs the MoE detection heuristic, handles `cpu_offload` — that exact glue was not driven.
+- `DTensorPolicyWorker.stream_weights_via_mx` — the **inner mechanics** (DTensor → `to_local()` → `add_tensor` → publish, plus shape-registry placement metadata) are now exercised by §8.4. What's still untouched: the NemoRL-specific outer glue — `model.state_dict()` walk over an actual NemoRL-wrapped HF model, the MoE detection heuristic on real expert layer naming, `cpu_offload` lifecycle. None of these change the v2 protocol; they're integration-level.
 - `VllmInternalWorkerExtension.update_weights_via_mx` — the inference-side bridge that registers `model_runner.model.named_parameters()`, calls `_load_weights`, applies the GptOss transpose fix, `_maybe_process_fp8_kv_cache`. Same — receiver was driven, but not the vLLM glue around it.
 - `refit_policy_generation`'s `mx` branch (the Ray fan-out: `policy.stream_weights_via_mx` ‖ `policy_generation.update_weights_via_mx`, then `ray.get`).
 - `lm_policy.Policy.stream_weights_via_mx` — Ray actor fan-out wrapper.
