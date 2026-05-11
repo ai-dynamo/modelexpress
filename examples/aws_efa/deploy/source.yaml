@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Source pool for AWS EFA + libfabric NIXL backend demo.
+#
+# Highlights the EFA-specific delta from a standard MX source deployment:
+#   - resources request vpc.amazonaws.com/efa NICs from the AWS EFA device plugin
+#   - MX_NIXL_BACKEND=LIBFABRIC selects the libfabric NIXL plugin
+#     (default is UCX, which can silently fall back to TCP on EFA)
+#   - FI_PROVIDER=efa + FI_EFA_* env vars steer libfabric onto the EFA fabric
+#   - IPC_LOCK capability lets libfabric pin pages for RDMA registration
+#
+# Prerequisites:
+#   - AWS EKS / dgxc-k8s cluster with EFA-capable nodes (p5.48xlarge, p6e-gb200.36xlarge, ...)
+#   - aws-efa-k8s-device-plugin DaemonSet running (exposes vpc.amazonaws.com/efa resource)
+#   - EFA driver >= 3.0.0g on the nodes
+#   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-efa-source
+  labels:
+    app: mx-efa-source
+spec:
+  type: ClusterIP
+  ports:
+    - name: metadata-grpc
+      port: 50051
+      targetPort: 50051
+  selector:
+    app: mx-efa-source
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-efa-source
+  labels:
+    app: mx-efa-source
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-efa-source
+  template:
+    metadata:
+      labels:
+        app: mx-efa-source
+    spec:
+      containers:
+        - name: vllm
+          image: <YOUR_REGISTRY>/modelexpress-aws-efa:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+
+            # --- EFA / libfabric setup ----------------------------------
+            # Select the libfabric NIXL plugin instead of the default UCX.
+            - name: MX_NIXL_BACKEND
+              value: "LIBFABRIC"
+            # Force libfabric onto the EFA provider; required on mixed-NIC
+            # instances where libfabric might otherwise auto-select a
+            # bonded Ethernet interface.
+            - name: FI_PROVIDER
+              value: "efa"
+            # Use device-level RDMA (GPUDirect) rather than CPU-bounced
+            # transfers. Requires the nvidia-peermem kernel module loaded
+            # on the host - verify with `lsmod | grep nvidia_peermem`.
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            # Disable libfabric's shared-memory transport so all cross-pod
+            # traffic actually goes through the EFA NIC. Without this,
+            # libfabric may try /dev/shm and never touch the fabric.
+            - name: FI_EFA_ENABLE_SHM_TRANSFER
+              value: "0"
+            - name: FI_LOG_LEVEL
+              value: "info"
+            # ------------------------------------------------------------
+
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          # The vllm-runtime-efa base image's entrypoint is the generic
+          # nvidia_entrypoint.sh wrapper that just execs whatever is passed.
+          # Spell out the vLLM CLI explicitly so args are routed correctly.
+          command: ["vllm", "serve"]
+          args:
+            - $(MODEL_NAME)
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+          ports:
+            - name: metadata-grpc
+              containerPort: 50051
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              # Number of EFA NICs to expose to the pod. p6e-gb200.36xlarge
+              # has 4 EFA NICs per node; p5.48xlarge has 32. Pick a count
+              # that matches what your workload can saturate.
+              vpc.amazonaws.com/efa: 4
+            requests:
+              nvidia.com/gpu: 1
+              vpc.amazonaws.com/efa: 4
