@@ -136,6 +136,10 @@ class EngineAdapter:
         """Return the torch device where target model state should live."""
         return torch.device(f"cuda:{self.get_device_id()}")
 
+    def is_cuda_alike(self) -> bool:
+        """Return whether this engine is running on a CUDA-like platform."""
+        return False
+
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""
         return result

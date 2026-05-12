@@ -12,7 +12,7 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
 
 - **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
-- **P2P Weight Transfer** - GPU-to-GPU model weight transfers between vLLM instances using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models.
+- **P2P Weight Transfer** - GPU-to-GPU model weight transfers between inference replicas using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models. The Python client includes engine adapters for vLLM and SGLang.
 
 ### Current Status
 
@@ -36,10 +36,10 @@ graph TD
 
     subgraph "P2P Transfer Mode"
         subgraph "Node A"
-            A[vLLM + MxModelLoader]
+            A[Inference Engine + MxModelLoader]
         end
         subgraph "Node B"
-            B[vLLM + MxModelLoader]
+            B[Inference Engine + MxModelLoader]
         end
         A -->|gRPC metadata| S2[ModelExpress Server]
         B -->|gRPC metadata| S2
@@ -54,7 +54,7 @@ graph TD
 |-----------|----------|----------|---------|
 | Server | Rust | `modelexpress_server/` | gRPC server: model downloads, cache eviction, P2P coordination |
 | Rust Client | Rust | `modelexpress_client/src/` | Client library and CLI tool |
-| Python Client | Python | `modelexpress_client/python/` | vLLM loaders, NIXL transfer manager, gRPC client |
+| Python Client | Python | `modelexpress_client/python/` | Inference engine loaders, NIXL transfer manager, gRPC client |
 | Common | Rust | `modelexpress_common/` | Protobuf definitions, shared types, provider trait, config |
 | Workspace Tests | Rust | `workspace-tests/` | Integration tests and Criterion benchmarks |
 
@@ -145,10 +145,14 @@ ModelExpress/
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (engine-native fallback)
 │       ├── engines/
-│       │   └── vllm/                   # vLLM integration
-│       │       ├── __init__.py         # vLLM loader registration
-│       │       ├── adapter.py          # VllmAdapter and context builder
-│       │       └── loader.py           # MxModelLoader implementation
+│       │   ├── vllm/                   # vLLM integration
+│       │   │   ├── __init__.py         # vLLM loader registration
+│       │   │   ├── adapter.py          # VllmAdapter and context builder
+│       │   │   └── loader.py           # MxModelLoader implementation
+│       │   └── sglang/                 # SGLang integration
+│       │       ├── __init__.py
+│       │       ├── adapter.py          # SglangAdapter and context builder
+│       │       └── loader.py           # MxModelLoader for remote_instance backend
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── rank_utils.py               # Rank detection utilities
@@ -511,6 +515,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
+| `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
@@ -548,6 +553,19 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 **MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
+
+### SGLang Loader
+
+**MxModelLoader** is instantiated by SGLang's `remote_instance` loader when
+`--remote-instance-weight-loader-backend modelexpress` is used. SGLang
+initializes the model, then delegates to this loader. The loader builds a
+`LoadContext` from SGLang config, runs `LoadStrategyChain.run()`, and updates
+global registries.
+`SglangAdapter` owns SGLang-specific rank/device mapping, native fallback
+loading, quantized-weight post-processing, and tensor discovery, including the
+storage-view naming used for non-contiguous SGLang parameters.
+The SGLang side does not expose separate source and target modes; transport
+selection and source discovery remain inside the ModelExpress package.
 
 **LoadStrategyChain** (`load_strategy/`):
 

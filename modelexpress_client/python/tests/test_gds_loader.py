@@ -220,7 +220,6 @@ class TestGdsStrategyIntegration:
     def _make_context(self):
         from modelexpress.load_strategy import LoadContext
         return LoadContext(
-            vllm_config=MagicMock(),
             model_config=MagicMock(),
             load_config=MagicMock(),
             target_device=torch.device("cpu"),

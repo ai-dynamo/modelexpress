@@ -10,6 +10,7 @@ import torch
 
 from modelexpress.engines.vllm.adapter import (
     VllmAdapter,
+    _get_vllm_device_id,
     _get_vllm_worker_rank,
     build_vllm_load_context,
 )
@@ -48,13 +49,20 @@ def test_vllm_device_id_uses_current_platform_device(monkeypatch):
         ),
     )
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
-    vllm_config = SimpleNamespace(
-        device_config=SimpleNamespace(device="cuda"),
-        load_config=SimpleNamespace(device=None),
-    )
-    adapter = VllmAdapter(vllm_config, SimpleNamespace())
 
-    assert adapter.get_device_id() == 2
+    assert _get_vllm_device_id(torch.device("cuda")) == 2
+
+
+def test_vllm_is_cuda_alike_uses_current_platform(monkeypatch):
+    fake_platforms = SimpleNamespace(
+        current_platform=SimpleNamespace(
+            is_cuda_alike=lambda: True,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+
+    assert adapter.is_cuda_alike() is True
 
 
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
