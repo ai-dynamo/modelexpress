@@ -91,6 +91,33 @@ class SglangAdapter(EngineAdapter):
         result.model.load_weights(weights_iter)
         return result
 
+    def build_model_streamer_weight_iter(
+        self,
+        model_uri: str,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if model is None:
+            raise RuntimeError("SGLang ModelStreamer loading requires result.model")
+
+        from sglang.srt.configs.load_config import LoadFormat
+        from sglang.srt.model_loader.loader import RunaiModelStreamerLoader
+
+        stream_config = copy.copy(self.load_config)
+        _set_load_config_attr(stream_config, "load_format", LoadFormat.RUNAI_STREAMER)
+        extra_config = dict(
+            getattr(stream_config, "model_loader_extra_config", None) or {}
+        )
+        if self._model_streamer_distributed_enabled():
+            extra_config["distributed"] = True
+        _set_load_config_attr(stream_config, "model_loader_extra_config", extra_config)
+
+        stream_model_config = copy.copy(self.model_config)
+        _set_load_config_attr(stream_model_config, "model_weights", model_uri)
+
+        loader = RunaiModelStreamerLoader(stream_config)
+        loader.target_device_str = str(self.target_device)
+        return loader._get_all_weights(stream_model_config, model)
+
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
         return self._process_weights_after_loading(result)
 
@@ -154,6 +181,21 @@ class SglangAdapter(EngineAdapter):
             raise RuntimeError("SGLang post-load fixup requires result.model")
         _call_sglang_post_load_weights(result.model)
         return result
+
+    def _model_streamer_distributed_enabled(self) -> bool:
+        tp_size = int(getattr(self.build_identity(), "tensor_parallel_size", 1) or 1)
+        return (
+            tp_size > 1
+            and self.is_cuda_alike()
+            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+        )
+
+
+def _set_load_config_attr(obj, name: str, value) -> None:
+    try:
+        setattr(obj, name, value)
+    except AttributeError:
+        object.__setattr__(obj, name, value)
 
 
 def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:

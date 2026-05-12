@@ -3,6 +3,8 @@
 
 """Tests for ModelStreamerStrategy."""
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,6 +38,9 @@ class _FakeAdapter(EngineAdapter):
         if result.model is not None:
             result.model.load_weights(weights_iter)
         return result
+
+    def build_model_streamer_weight_iter(self, model_uri: str, model=None):
+        return iter(())
 
 
 def _make_load_context(**overrides):
@@ -155,7 +160,7 @@ class TestModelStreamerLoad:
 
         assert isinstance(result, LoadResult)
         assert result.model is model
-        mock_stream.assert_called_once_with("s3://bucket/model", ctx)
+        mock_stream.assert_called_once_with("s3://bucket/model", ctx, model)
         model.load_weights.assert_called_once()
         mock_register.assert_called_once_with(result, ctx)
 
@@ -176,7 +181,7 @@ class TestModelStreamerLoad:
             result = strategy.load(model, ctx)
 
         assert isinstance(result, LoadResult)
-        mock_stream.assert_called_once_with("/models/llama", ctx)
+        mock_stream.assert_called_once_with("/models/llama", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_uri_from_model_weights_not_from_env(self, mock_register):
@@ -196,7 +201,7 @@ class TestModelStreamerLoad:
                 with pytest.raises(StrategyFailed, match="expected"):
                     strategy.load(model, ctx)
 
-        mock_stream.assert_called_once_with("s3://bucket/from-config", ctx)
+        mock_stream.assert_called_once_with("s3://bucket/from-config", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_raises_strategy_failed_on_error(self, mock_register):
@@ -266,124 +271,92 @@ class TestStreamWeights:
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
 
-    def _make_streamer_module(self, file_uris, tensors):
-        mock_streamer_instance = MagicMock()
-        mock_streamer_instance.__enter__ = MagicMock(return_value=mock_streamer_instance)
-        mock_streamer_instance.__exit__ = MagicMock(return_value=False)
-        mock_streamer_instance.files_to_tensors_metadata = {f: [MagicMock()] for f in file_uris}
-        mock_streamer_instance.get_tensors.return_value = iter(tensors)
-        mock_streamer_cls = MagicMock(return_value=mock_streamer_instance)
-        return (
-            MagicMock(
-                list_safetensors=MagicMock(return_value=file_uris),
-                SafetensorsStreamer=mock_streamer_cls,
-            ),
-            mock_streamer_instance,
+    def test_delegates_to_adapter_without_cloning(self):
+        strategy = self._make_strategy()
+        tensor = torch.randn(2, 2)
+        adapter = _FakeAdapter()
+        adapter.build_model_streamer_weight_iter = MagicMock(
+            return_value=iter([("w", tensor)])
         )
+        ctx = _make_load_context(adapter=adapter)
 
-    def test_raises_when_no_files(self):
-        strategy = self._make_strategy()
-        ctx = _make_load_context()
+        model = torch.nn.Module()
+        weights = list(strategy._stream_weights("s3://bucket/model", ctx, model))
 
-        mock_list = MagicMock(return_value=[])
-        mock_streamer = MagicMock()
-
-        with patch.dict("sys.modules", {
-            "runai_model_streamer": MagicMock(
-                list_safetensors=mock_list,
-                SafetensorsStreamer=mock_streamer,
-            ),
-        }):
-            with pytest.raises(FileNotFoundError, match="No safetensors files found"):
-                list(strategy._stream_weights("s3://empty-bucket/model", ctx))
-
-    def _make_ctx_with_tp(
-        self,
-        tp_size: int,
-        device_id: int = 2,
-        is_cuda_alike: bool = True,
-    ):
-        return _make_load_context(
-            adapter=_FakeAdapter(is_cuda_alike=is_cuda_alike),
-            device_id=device_id,
-            identity=p2p_pb2.SourceIdentity(
-                model_name="test-model",
-                tensor_parallel_size=tp_size,
-            ),
+        adapter.build_model_streamer_weight_iter.assert_called_once_with(
+            "s3://bucket/model",
+            model=model,
         )
+        assert weights[0][0] == "w"
+        assert weights[0][1] is tensor
 
-    def test_distributed_disabled_by_default(self):
-        strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2)
-        file_uris = ["s3://bucket/model.safetensors"]
-        tensors = [("w", torch.randn(2, 2))]
 
-        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
-        with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with patch.dict("os.environ", {}, clear=True):
-                list(strategy._stream_weights("s3://bucket/model", ctx))
+class TestVllmModelStreamerIterator:
+    def _make_adapter(self, *, tp_size: int = 8, extra_config=None):
+        from modelexpress.engines.vllm.adapter import VllmAdapter
 
-        streamer_instance.stream_files.assert_called_once_with(file_uris)
-
-    def test_distributed_enabled_by_mx_ms_distributed_1(self):
-        strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(tp_size=4, device_id=2)
-        file_uris = ["s3://bucket/model.safetensors"]
-        tensors = [("w", torch.randn(2, 2))]
-
-        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
-        with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                list(strategy._stream_weights("s3://bucket/model", ctx))
-
-        streamer_instance.stream_files.assert_called_once_with(
-            file_uris, device="cuda:2", is_distributed=True
+        load_config = SimpleNamespace(
+            device=None,
+            model_loader_extra_config=extra_config,
         )
+        vllm_config = MagicMock()
+        vllm_config.load_config = load_config
+        vllm_config.device_config.device = "cuda"
+        vllm_config.parallel_config.tensor_parallel_size = tp_size
+        model_config = SimpleNamespace(revision="main")
+        return VllmAdapter(vllm_config, model_config), load_config
 
-    def test_distributed_disabled_when_tp_is_1(self):
-        strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(tp_size=1, device_id=0)
-        file_uris = ["s3://bucket/model.safetensors"]
-        tensors = [("w", torch.randn(2, 2))]
+    def _patch_runai_loader(self, tensors):
+        loader_instance = MagicMock()
+        loader_instance._get_weights_iterator.return_value = iter(tensors)
+        loader_cls = MagicMock(return_value=loader_instance)
+        module = SimpleNamespace(RunaiModelStreamerLoader=loader_cls)
+        return patch.dict(
+            sys.modules,
+            {"vllm.model_executor.model_loader.runai_streamer_loader": module},
+        ), loader_cls, loader_instance
 
-        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
-        with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                list(strategy._stream_weights("s3://bucket/model", ctx))
+    def test_uses_vllm_native_iterator_and_enables_distributed(self):
+        tensor = torch.randn(2, 2)
+        adapter, _load_config = self._make_adapter(tp_size=8)
+        patcher, loader_cls, loader_instance = self._patch_runai_loader([("w", tensor)])
 
-        streamer_instance.stream_files.assert_called_once_with(file_uris)
+        with patcher, patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+            weights = list(adapter.build_model_streamer_weight_iter("az://models/model"))
 
-    def test_distributed_disabled_when_adapter_is_not_cuda_alike(self):
-        strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(
-            tp_size=4,
-            device_id=2,
-            is_cuda_alike=False,
+        native_load_config = loader_cls.call_args.args[0]
+        assert native_load_config.model_loader_extra_config["distributed"] is True
+        loader_instance._get_weights_iterator.assert_called_once_with(
+            "az://models/model", "main"
         )
-        file_uris = ["s3://bucket/model.safetensors"]
-        tensors = [("w", torch.randn(2, 2))]
+        assert weights[0][0] == "w"
+        assert weights[0][1] is tensor
 
-        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
-        with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                list(strategy._stream_weights("s3://bucket/model", ctx))
-
-        streamer_instance.stream_files.assert_called_once_with(file_uris)
-
-    def test_distributed_device_id_used_in_cuda_device(self):
-        strategy = self._make_strategy()
-        ctx = self._make_ctx_with_tp(tp_size=8, device_id=5)
-        file_uris = ["s3://bucket/model.safetensors"]
-        tensors = [("w", torch.randn(2, 2))]
-
-        module, streamer_instance = self._make_streamer_module(file_uris, tensors)
-        with patch.dict("sys.modules", {"runai_model_streamer": module}):
-            with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
-                list(strategy._stream_weights("s3://bucket/model", ctx))
-
-        streamer_instance.stream_files.assert_called_once_with(
-            file_uris, device="cuda:5", is_distributed=True
+    def test_preserves_existing_extra_config_when_distributed_disabled(self):
+        adapter, _load_config = self._make_adapter(
+            tp_size=1,
+            extra_config={"concurrency": 4},
         )
+        patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
+
+        with patcher, patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+            list(adapter.build_model_streamer_weight_iter("az://models/model"))
+
+        native_load_config = loader_cls.call_args.args[0]
+        assert native_load_config.model_loader_extra_config == {"concurrency": 4}
+
+    def test_distributed_disabled_by_default_even_with_tp_gt_one(self):
+        adapter, _load_config = self._make_adapter(
+            tp_size=8,
+            extra_config={"concurrency": 4},
+        )
+        patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
+
+        with patcher, patch.dict("os.environ", {}, clear=True):
+            list(adapter.build_model_streamer_weight_iter("az://models/model"))
+
+        native_load_config = loader_cls.call_args.args[0]
+        assert native_load_config.model_loader_extra_config == {"concurrency": 4}
 
 
 # ---------------------------------------------------------------------------

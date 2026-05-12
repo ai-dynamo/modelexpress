@@ -117,6 +117,21 @@ class EngineAdapter:
         ...
 
     @gated_capability
+    def build_model_streamer_weight_iter(
+        self,
+        model_uri: str,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Return the engine-native ModelStreamer weight iterator.
+
+        The shared strategy owns fallback and registration policy. Engines own
+        the concrete ModelStreamer integration because native loader APIs and
+        distributed-device selection are framework-specific. Some engine-native
+        loaders need the initialized model to discover secondary weight sources.
+        """
+        ...
+
+    @gated_capability
     def load_via_native(self, result: LoadResult) -> LoadResult:
         """Load the model using the engine's native disk/checkpoint loader."""
         ...
