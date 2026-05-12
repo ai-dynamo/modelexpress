@@ -1,14 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Source pool for AWS EFA + libfabric NIXL backend demo.
-#
-# Highlights the EFA-specific delta from a standard MX source deployment:
-#   - resources request vpc.amazonaws.com/efa NICs from the AWS EFA device plugin
-#   - MX_NIXL_BACKEND=LIBFABRIC selects the libfabric NIXL plugin
-#     (default is UCX, which can silently fall back to TCP on EFA)
-#   - FI_PROVIDER=efa + FI_EFA_* env vars steer libfabric onto the EFA fabric
-#   - IPC_LOCK capability lets libfabric pin pages for RDMA registration
+# vLLM source on AWS EFA with the libfabric NIXL backend.
+# Selects libfabric via MX_NIXL_BACKEND=LIBFABRIC; the default UCX
+# backend can silently fall back to TCP on EFA. FI_PROVIDER + FI_EFA_*
+# steer libfabric onto the EFA fabric, and IPC_LOCK lets libfabric
+# pin pages for RDMA registration.
 #
 # Prerequisites:
 #   - AWS EKS / dgxc-k8s cluster with EFA-capable nodes (p5.48xlarge, p6e-gb200.36xlarge, ...)
@@ -19,9 +16,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-efa-source
+  name: mx-aws-efa-source
   labels:
-    app: mx-efa-source
+    app: mx-aws-efa-source
 spec:
   type: ClusterIP
   ports:
@@ -29,23 +26,23 @@ spec:
       port: 50051
       targetPort: 50051
   selector:
-    app: mx-efa-source
+    app: mx-aws-efa-source
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-efa-source
+  name: mx-aws-efa-source
   labels:
-    app: mx-efa-source
+    app: mx-aws-efa-source
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-efa-source
+      app: mx-aws-efa-source
   template:
     metadata:
       labels:
-        app: mx-efa-source
+        app: mx-aws-efa-source
     spec:
       containers:
         - name: vllm

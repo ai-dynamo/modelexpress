@@ -20,7 +20,7 @@ libfabric plugin instead, which is the supported AWS path.
 - `nvidia-peermem` kernel module loaded on the worker nodes (required for
   GPUDirect RDMA). Verify with `lsmod | grep nvidia_peermem`.
 - HuggingFace token secret in the target namespace:
-  ```
+  ```bash
   kubectl create secret generic hf-token-secret \
     --from-literal=HF_TOKEN=<your-token>
   ```
@@ -35,21 +35,21 @@ From the repository root:
 
 ```bash
 docker build \
-  -f examples/aws_efa/Dockerfile \
+  -f examples/p2p_transfer_k8s/client/vllm/aws_efa/Dockerfile \
   -t <YOUR_REGISTRY>/modelexpress-aws-efa:latest \
   .
 
 docker push <YOUR_REGISTRY>/modelexpress-aws-efa:latest
 ```
 
-Edit the `image:` field in `deploy/source.yaml` and `deploy/target.yaml` to
-point at your pushed tag.
+Edit the `image:` field in `source.yaml` and `target.yaml` to point at your
+pushed tag.
 
 ## Deploy
 
 ```bash
-kubectl apply -f examples/aws_efa/deploy/source.yaml
-kubectl apply -f examples/aws_efa/deploy/target.yaml
+kubectl apply -f examples/p2p_transfer_k8s/client/vllm/aws_efa/source.yaml
+kubectl apply -f examples/p2p_transfer_k8s/client/vllm/aws_efa/target.yaml
 ```
 
 The source worker loads the model from HuggingFace and exposes the metadata
@@ -62,8 +62,8 @@ The libfabric backend is selected at MX startup, before any transfer. Confirm
 on both pods:
 
 ```bash
-kubectl logs deploy/mx-efa-source | grep 'NIXL agent.*created'
-kubectl logs deploy/mx-efa-target | grep 'NIXL agent.*created'
+kubectl logs deploy/mx-aws-efa-source | grep 'NIXL agent.*created'
+kubectl logs deploy/mx-aws-efa-target | grep 'NIXL agent.*created'
 ```
 
 Both lines should contain `(backend=LIBFABRIC)`. If they say `(backend=UCX)`,
@@ -74,7 +74,7 @@ TCP fallback), look for the libfabric provider's EFA memory-registration
 log lines on either pod:
 
 ```bash
-kubectl logs deploy/mx-efa-source | grep 'efa:mr:efa_mr_reg_impl' | head -3
+kubectl logs deploy/mx-aws-efa-source | grep 'efa:mr:efa_mr_reg_impl' | head -3
 ```
 
 These lines come from libfabric's EFA provider registering CUDA memory
@@ -90,7 +90,7 @@ all; the libfabric provider log is the verification path.
 The other strong signal is the target's transfer-complete log line:
 
 ```bash
-kubectl logs deploy/mx-efa-target | grep 'Transfer complete'
+kubectl logs deploy/mx-aws-efa-target | grep 'Transfer complete'
 ```
 
 It reports tensor count, total bytes, and elapsed time, e.g.

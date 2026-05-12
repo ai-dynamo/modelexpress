@@ -1,30 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Target worker for AWS EFA + libfabric NIXL backend demo.
+# vLLM target on AWS EFA. Pulls weights from the source over the
+# libfabric NIXL backend. The EFA / libfabric env vars must match
+# the source side - backends do not interoperate, and FI_PROVIDER
+# mismatches lead to silent TCP fallback on one side.
 #
-# Pulls weights from the source pool via NIXL over EFA's libfabric backend.
-# The EFA / libfabric env vars must match the source side - backends do not
-# interoperate, and FI_PROVIDER mismatches between source and target lead
-# to silent TCP fallback on one side.
-#
-# Prerequisites: same as deploy/source.yaml.
+# Prerequisites: same as source.yaml.
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-efa-target
+  name: mx-aws-efa-target
   labels:
-    app: mx-efa-target
+    app: mx-aws-efa-target
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-efa-target
+      app: mx-aws-efa-target
   template:
     metadata:
       labels:
-        app: mx-efa-target
+        app: mx-aws-efa-target
     spec:
       containers:
         - name: vllm
@@ -44,7 +42,7 @@ spec:
 
             # Point the client at the source Service.
             - name: MX_METADATA_ADDR
-              value: "mx-efa-source:50051"
+              value: "mx-aws-efa-source:50051"
 
             # --- EFA / libfabric setup (must match source side) ---------
             - name: MX_NIXL_BACKEND
@@ -64,7 +62,7 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
-          # See deploy/source.yaml for the command rationale.
+          # See source.yaml for the command rationale.
           command: ["vllm", "serve"]
           args:
             - $(MODEL_NAME)
