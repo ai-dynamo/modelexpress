@@ -6,7 +6,7 @@
 import sys
 from types import ModuleType
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
@@ -185,6 +185,113 @@ def test_sglang_adapter_post_load_prefers_top_level_hook():
 
     assert model.post_load_called
     assert not model.child.post_load_called
+
+
+def _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    configs_mod = ModuleType("sglang.srt.configs")
+    load_config_mod = ModuleType("sglang.srt.configs.load_config")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+
+    load_config_mod.LoadFormat = load_format
+    loader_mod.RunaiModelStreamerLoader = loader_cls
+
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs", configs_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.configs.load_config",
+        load_config_mod,
+    )
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+
+
+def test_sglang_adapter_uses_native_model_streamer_loader(monkeypatch):
+    tensor = torch.randn(2, 2)
+    loader_instance = MagicMock()
+    loader_instance._get_all_weights.return_value = iter([("w", tensor)])
+    loader_cls = MagicMock(return_value=loader_instance)
+    load_format = SimpleNamespace(RUNAI_STREAMER="runai_streamer")
+    _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format)
+
+    load_config = _load_config(model_loader_extra_config={"concurrency": 4})
+    model_config = _model_config()
+    adapter = SglangAdapter(
+        load_config,
+        model_config,
+        _device_config(device="cuda:2", gpu_id=2),
+    )
+    model = nn.Linear(2, 2)
+
+    weights = list(
+        adapter.build_model_streamer_weight_iter(
+            "az://models/deepseek-ai/DeepSeek-V3",
+            model=model,
+        )
+    )
+
+    stream_config = loader_cls.call_args.args[0]
+    assert stream_config is not load_config
+    assert stream_config.load_format == "runai_streamer"
+    assert stream_config.model_loader_extra_config == {"concurrency": 4}
+    stream_model_config = loader_instance._get_all_weights.call_args.args[0]
+    assert stream_model_config is not model_config
+    assert stream_model_config.model_weights == "az://models/deepseek-ai/DeepSeek-V3"
+    assert loader_instance._get_all_weights.call_args.args[1] is model
+    assert loader_instance.target_device_str == "cuda:2"
+    assert weights == [("w", tensor)]
+
+
+def test_sglang_adapter_enables_distributed_model_streamer(monkeypatch):
+    loader_instance = MagicMock()
+    loader_instance._get_all_weights.return_value = iter([])
+    loader_cls = MagicMock(return_value=loader_instance)
+    load_format = SimpleNamespace(RUNAI_STREAMER="runai_streamer")
+    _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format)
+
+    adapter = SglangAdapter(
+        _load_config(model_loader_extra_config={"concurrency": 4}),
+        _model_config(),
+        _device_config(device="cuda:0", gpu_id=0),
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.adapter._get_parallel_size",
+        return_value=8,
+    ), patch.object(adapter, "is_cuda_alike", return_value=True), patch.dict(
+        "os.environ", {"MX_MS_DISTRIBUTED": "1"}
+    ):
+        list(
+            adapter.build_model_streamer_weight_iter(
+                "s3://bucket/deepseek-ai/DeepSeek-V3",
+                model=nn.Linear(2, 2),
+            )
+        )
+
+    stream_config = loader_cls.call_args.args[0]
+    assert stream_config.model_loader_extra_config == {
+        "concurrency": 4,
+        "distributed": True,
+    }
+
+
+def test_sglang_model_streamer_requires_initialized_model(monkeypatch):
+    loader_cls = MagicMock()
+    load_format = SimpleNamespace(RUNAI_STREAMER="runai_streamer")
+    _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format)
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    try:
+        list(adapter.build_model_streamer_weight_iter("s3://bucket/model"))
+    except RuntimeError as exc:
+        assert "requires result.model" in str(exc)
+    else:
+        raise AssertionError("Expected missing model to fail")
 
 
 def test_mx_model_loader_delegates_to_shared_strategy_chain():

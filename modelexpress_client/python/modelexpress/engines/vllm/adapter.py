@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import uuid
 from typing import TYPE_CHECKING, Iterator
 
@@ -87,6 +88,25 @@ class VllmAdapter(EngineAdapter):
         result.model.load_weights(weights_iter)
         return result
 
+    def build_model_streamer_weight_iter(
+        self,
+        model_uri: str,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        from vllm.model_executor.model_loader.runai_streamer_loader import (
+            RunaiModelStreamerLoader,
+        )
+
+        load_config = copy.copy(self.load_config)
+        extra_config = dict(getattr(load_config, "model_loader_extra_config", None) or {})
+        if self._model_streamer_distributed_enabled():
+            extra_config["distributed"] = True
+        _set_load_config_extra_config(load_config, extra_config)
+
+        loader = RunaiModelStreamerLoader(load_config)
+        revision = getattr(self.model_config, "revision", None)
+        return loader._get_weights_iterator(model_uri, revision)
+
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM native loading requires result.model")
@@ -163,6 +183,20 @@ class VllmAdapter(EngineAdapter):
         compilation_config.disabled_custom_ops.clear()
         compilation_config.traced_files.clear()
         compilation_config.compilation_time = 0.0
+
+    def _model_streamer_distributed_enabled(self) -> bool:
+        tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
+        return (
+            tp_size > 1
+            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+        )
+
+
+def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
+    try:
+        load_config.model_loader_extra_config = extra_config
+    except AttributeError:
+        object.__setattr__(load_config, "model_loader_extra_config", extra_config)
 
 
 def _get_vllm_worker_rank(vllm_config: VllmConfig) -> int:

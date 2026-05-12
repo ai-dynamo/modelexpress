@@ -304,20 +304,31 @@ class TestInitNixlManager:
 class TestRegisterTensorsErrorHandling:
     """Verify register_tensors never raises — failures are logged as warnings."""
 
+    @patch("modelexpress.load_strategy.base.is_nixl_available")
+    def test_skips_when_no_metadata_path_configured(self, mock_available):
+        from modelexpress.load_strategy.base import register_tensors
+        ctx = _make_load_context()
+        model = MagicMock()
+        register_tensors(model, ctx)
+        mock_available.assert_not_called()
+        assert ctx.nixl_manager is None
+
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=False)
     def test_skips_when_nixl_unavailable(self, _mock):
         from modelexpress.load_strategy.base import register_tensors
         ctx = _make_load_context()
         model = MagicMock()
-        register_tensors(model, ctx)
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(model, ctx)
         assert ctx.nixl_manager is None
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
     def test_requires_adapter_when_nixl_available(self, _mock):
         from modelexpress.load_strategy.base import register_tensors
         ctx = _make_load_context(adapter=None)
-        with pytest.raises(RuntimeError, match="engine adapter"):
-            register_tensors(MagicMock(), ctx)
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            with pytest.raises(RuntimeError, match="engine adapter"):
+                register_tensors(MagicMock(), ctx)
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
     @patch(
@@ -328,7 +339,8 @@ class TestRegisterTensorsErrorHandling:
         from modelexpress.load_strategy.base import register_tensors
         ctx = _make_load_context()
         model = MagicMock()
-        register_tensors(model, ctx)
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(model, ctx)
         assert ctx.nixl_manager is None
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
@@ -342,7 +354,8 @@ class TestRegisterTensorsErrorHandling:
         ctx = _make_load_context()
         ctx.adapter.discover_tensors = MagicMock(return_value={"t": MagicMock()})
         model = MagicMock()
-        register_tensors(model, ctx)
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(model, ctx)
 
 
 class TestPublishMetadataErrorHandling:
@@ -359,7 +372,8 @@ class TestPublishMetadataErrorHandling:
         from modelexpress.load_strategy.base import publish_metadata
         ctx = _make_load_context()
         ctx.nixl_manager = MagicMock()
-        publish_metadata(ctx)
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            publish_metadata(ctx)
 
     def test_unpublish_uses_worker_rank_for_heartbeat_lifecycle(self):
         from modelexpress.load_strategy.base import unpublish_metadata

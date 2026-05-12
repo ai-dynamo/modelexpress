@@ -105,12 +105,26 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
     return LoadResult(value=result_or_model, model=result_or_model)
 
 
+def _metadata_publication_configured(ctx: LoadContext) -> bool:
+    """Return whether this worker has a metadata path for P2P serving."""
+    server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+    if server_addr:
+        return True
+    return getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
+
+
 def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) -> None:
     """Collect model tensors and register them with NIXL.
 
     Failures are logged but do not raise — the worker continues without
     P2P serving capability.
     """
+    if not _metadata_publication_configured(ctx):
+        logger.info(
+            f"[Worker {ctx.global_rank}] No MX metadata path configured, "
+            "skipping NIXL registration"
+        )
+        return
     if not is_nixl_available():
         logger.warning(f"[Worker {ctx.global_rank}] NIXL not available, skipping registration")
         return
@@ -158,9 +172,7 @@ def publish_metadata(ctx: LoadContext) -> None:
     # Only bail on missing MODEL_EXPRESS_URL / MX_SERVER_ADDRESS when the
     # client actually needs a central coordinator. Strict `is True`
     # check so MagicMock's auto-attribute doesn't masquerade as the flag.
-    server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
-    requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
-    if not server_addr and not requires_p2p:
+    if not _metadata_publication_configured(ctx):
         logger.info(
             f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
         )

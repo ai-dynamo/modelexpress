@@ -31,7 +31,6 @@ import torch.nn as nn
 
 from ... import configure_vllm_logging
 from ...load_strategy import LoadContext, LoadStrategyChain
-from ...load_strategy.model_streamer_strategy import _patch_vllm_s3_format_check
 from ...nixl_transfer import NixlTransferManager
 from .adapter import build_vllm_load_context
 
@@ -44,6 +43,43 @@ from vllm.model_executor.model_loader.utils import initialize_model
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = logging.getLogger("modelexpress.engines.vllm.loader")
+
+
+def _patch_vllm_s3_format_check() -> None:
+    """Allow 'mx' as a valid load format when model weights use object storage.
+
+    vLLM's verification path only allows object-storage `model_weights` for its
+    native RunAI load formats. The MX loader still delegates the ModelStreamer
+    path back to vLLM after strategy selection, so verification needs to accept
+    the temporary `load_format == "mx"` configuration.
+    """
+    try:
+        from vllm.transformers_utils.runai_utils import is_runai_obj_uri
+    except ImportError:
+        return
+
+    original = VllmConfig.try_verify_and_update_config
+
+    def patched(self: VllmConfig) -> None:
+        if (
+            self.load_config.load_format == "mx"
+            and hasattr(self.model_config, "model_weights")
+            and is_runai_obj_uri(self.model_config.model_weights)
+        ):
+            saved = self.model_config.model_weights
+            del self.model_config.model_weights
+            try:
+                original(self)
+            finally:
+                self.model_config.model_weights = saved
+        else:
+            original(self)
+
+    VllmConfig.try_verify_and_update_config = patched
+    logger.debug(
+        "Patched VllmConfig.try_verify_and_update_config to allow 'mx' "
+        "for object storage URIs"
+    )
 
 
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
