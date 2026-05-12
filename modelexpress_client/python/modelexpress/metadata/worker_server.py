@@ -29,7 +29,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
     def __init__(
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
-        mx_source_id: str,
+        mx_source_id: str | None = None,
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
@@ -40,6 +40,9 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._agent_name = agent_name
         self._worker_rank = worker_rank
 
+    def set_mx_source_id(self, mx_source_id: str) -> None:
+        self._mx_source_id = mx_source_id
+
     def GetTensorManifest(self, request, context):
         if request.mx_source_id and request.mx_source_id != self._mx_source_id:
             context.abort(
@@ -49,7 +52,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             )
         return p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
-            mx_source_id=self._mx_source_id,
+            mx_source_id=self._mx_source_id or "",
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
@@ -62,7 +65,7 @@ class WorkerGrpcServer:
     def __init__(
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
-        mx_source_id: str,
+        mx_source_id: str | None = None,
         port: int = 0,
         metadata_endpoint: str = "",
         agent_name: str = "",
@@ -75,23 +78,30 @@ class WorkerGrpcServer:
         self._agent_name = agent_name
         self._worker_rank = worker_rank
         self._server: grpc.Server | None = None
+        self._servicer: WorkerServiceServicer | None = None
         self._port: int | None = None
 
     @property
     def port(self) -> int | None:
         return self._port
 
+    def set_mx_source_id(self, mx_source_id: str) -> None:
+        if self._servicer is None:
+            raise RuntimeError("Server must be started before setting mx_source_id")
+        self._mx_source_id = mx_source_id
+        self._servicer.set_mx_source_id(mx_source_id)
+
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
-        servicer = WorkerServiceServicer(
+        self._servicer = WorkerServiceServicer(
             tensor_protos=self._tensor_protos,
             mx_source_id=self._mx_source_id,
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
         )
-        p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, self._server)
+        p2p_pb2_grpc.add_WorkerServiceServicer_to_server(self._servicer, self._server)
 
         if self._requested_port:
             self._port = self._server.add_insecure_port(f"[::]:{self._requested_port}")

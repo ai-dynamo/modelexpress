@@ -91,6 +91,59 @@ class TestHeartbeatSendsReady:
         assert len(ready_calls) >= 2
 
 
+class TestHeartbeatPublishAndReady:
+    def test_first_tick_publishes_then_ready(self, mx_client, nixl_manager):
+        with patch.dict("os.environ", {"MX_HEARTBEAT_INTERVAL_SECS": "1"}):
+            hb = HeartbeatThread(
+                mx_client=mx_client,
+                worker_id="w1",
+                worker_rank=0,
+                nixl_manager=nixl_manager,
+                publish_fn=lambda: "abc123",
+            )
+
+        hb.start()
+        time.sleep(2.5)
+        hb.stop()
+
+        assert hb.mx_source_id == "abc123"
+        ready_calls = [
+            c for c in mx_client.update_status.call_args_list
+            if c == call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+            )
+        ]
+        assert len(ready_calls) >= 1
+
+    def test_publish_failure_retries(self, mx_client, nixl_manager):
+        attempt = {"count": 0}
+
+        def failing_then_ok():
+            attempt["count"] += 1
+            if attempt["count"] < 3:
+                raise RuntimeError("server down")
+            return "abc123"
+
+        with patch.dict("os.environ", {"MX_HEARTBEAT_INTERVAL_SECS": "1"}):
+            hb = HeartbeatThread(
+                mx_client=mx_client,
+                worker_id="w1",
+                worker_rank=0,
+                nixl_manager=nixl_manager,
+                publish_fn=failing_then_ok,
+            )
+
+        hb.start()
+        time.sleep(3.5)
+        hb.stop()
+
+        assert hb.mx_source_id == "abc123"
+        assert attempt["count"] == 3
+
+
 class TestHeartbeatStop:
     def test_stop_marks_stale(self, heartbeat, mx_client):
         heartbeat.start()

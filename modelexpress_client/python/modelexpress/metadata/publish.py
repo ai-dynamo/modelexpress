@@ -116,9 +116,13 @@ def publish_metadata_and_ready(
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
 ) -> None:
-    """Publish tensor metadata and ready flag to the ModelExpress server."""
+    """Prepare metadata publication and start the heartbeat thread.
+
+    The heartbeat thread performs the initial PublishMetadata RPC so a
+    transient MX server failure can be retried after the model has loaded.
+    """
     logger.info(
-        f"[Worker {worker_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {worker_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
@@ -126,28 +130,19 @@ def publish_metadata_and_ready(
     if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer
 
+        if nixl_manager._listen_port is None:
+            raise RuntimeError(
+                "P2P metadata exchange requires a NIXL listen port, "
+                "but the NIXL manager was initialized without one."
+            )
+
         host = _get_worker_host()
 
         grpc_base = int(os.environ.get("MX_WORKER_GRPC_PORT", "6555"))
         worker_grpc_port = grpc_base + device_id
 
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=worker_rank,
-            metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
-            agent_name=nixl_manager.agent_name,
-            worker_grpc_endpoint="",
-        )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            worker_rank=worker_rank,
-        )
-
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
-            mx_source_id=mx_source_id,
             port=worker_grpc_port,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
@@ -162,41 +157,48 @@ def publish_metadata_and_ready(
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
         )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            worker_rank=worker_rank,
-        )
-        logger.info(
-            f"[Worker {worker_rank}] Published P2P metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
-        )
+
+        def publish_fn() -> str:
+            mx_source_id = _publish_metadata_to_server(
+                mx_client=mx_client,
+                identity=identity,
+                worker=worker,
+                worker_id=worker_id,
+                worker_rank=worker_rank,
+            )
+            grpc_server.set_mx_source_id(mx_source_id)
+            logger.info(
+                f"[Worker {worker_rank}] Published P2P metadata to MX server "
+                f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
+            )
+            return mx_source_id
     else:
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensors=tensor_protos,
         )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            worker_rank=worker_rank,
-        )
-        logger.info(
-            f"[Worker {worker_rank}] Published metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
-        )
+
+        def publish_fn() -> str:
+            mx_source_id = _publish_metadata_to_server(
+                mx_client=mx_client,
+                identity=identity,
+                worker=worker,
+                worker_id=worker_id,
+                worker_rank=worker_rank,
+            )
+            logger.info(
+                f"[Worker {worker_rank}] Published metadata to MX server "
+                f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+            )
+            return mx_source_id
 
     heartbeat = HeartbeatThread(
         mx_client=mx_client,
-        mx_source_id=mx_source_id,
         worker_id=worker_id,
         worker_rank=worker_rank,
         nixl_manager=nixl_manager,
+        publish_fn=publish_fn,
     )
     heartbeat.start()
     _heartbeat_threads[worker_rank] = heartbeat
