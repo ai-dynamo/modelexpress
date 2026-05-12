@@ -1,66 +1,88 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# vLLM source on AWS EFA with the libfabric NIXL backend.
-# Selects libfabric via MX_NIXL_BACKEND=LIBFABRIC; the default UCX
-# backend can silently fall back to TCP on EFA. FI_PROVIDER + FI_EFA_*
-# steer libfabric onto the EFA fabric, and IPC_LOCK lets libfabric
-# pin pages for RDMA registration.
+# Single-node vLLM deployment on AWS EFA with the libfabric NIXL backend
+# and P2P metadata exchange. Same shape as vllm-single-node-p2p.yaml,
+# with the EFA-specific delta:
+#   - vpc.amazonaws.com/efa resource for the AWS EFA device plugin
+#   - MX_NIXL_BACKEND=LIBFABRIC selects the libfabric NIXL plugin; the
+#     default UCX can silently fall back to TCP on EFA
+#   - FI_PROVIDER=efa + FI_EFA_* env vars steer libfabric onto the EFA fabric
+#   - IPC_LOCK lets libfabric pin pages for RDMA registration
+#
+# replicas=1 loads the model from HuggingFace and registers as a P2P source.
+# Scale to N>=2 (kubectl scale deploy/mx-vllm-aws-efa --replicas=2) for new
+# replicas to pull weights from existing replicas over EFA via NIXL.
 #
 # Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
 #   - AWS EKS / dgxc-k8s cluster with EFA-capable nodes (p5.48xlarge, p6e-gb200.36xlarge, ...)
 #   - aws-efa-k8s-device-plugin DaemonSet running (exposes vpc.amazonaws.com/efa resource)
-#   - EFA driver >= 3.0.0g on the nodes
-#   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
-
+#   - EFA driver >= 3.0.0g on the worker nodes
+#   - nvidia-peermem kernel module loaded on the worker nodes (required for GPUDirect RDMA)
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-aws-efa-source
+  name: mx-vllm-aws-efa
   labels:
-    app: mx-aws-efa-source
+    app: mx-vllm-aws-efa
 spec:
   type: ClusterIP
   ports:
-    - name: metadata-grpc
-      port: 50051
-      targetPort: 50051
+    - port: 8000
+      targetPort: 8000
+      name: http
   selector:
-    app: mx-aws-efa-source
+    app: mx-vllm-aws-efa
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-aws-efa-source
+  name: mx-vllm-aws-efa
   labels:
-    app: mx-aws-efa-source
+    app: mx-vllm-aws-efa
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-aws-efa-source
+      app: mx-vllm-aws-efa
   template:
     metadata:
       labels:
-        app: mx-aws-efa-source
+        app: mx-vllm-aws-efa
     spec:
       containers:
         - name: vllm
-          image: <YOUR_REGISTRY>/modelexpress-aws-efa:latest
+          # Build via examples/p2p_transfer_k8s/client/vllm/aws_efa/Dockerfile.
+          image: <your-registry>/modelexpress-aws-efa:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
               add:
                 - IPC_LOCK
           env:
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
-            - name: MX_MODEL_REVISION
-              value: "REPLACE_WITH_COMMIT_SHA"
             - name: VLLM_PLUGINS
               value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            # P2P metadata exchange: source workers serve NIXL metadata and
+            # tensor manifests directly to targets instead of via the server.
+            - name: MX_P2P_METADATA
+              value: "1"
+            # Fixed ports for NIXL listen thread and worker gRPC server.
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
 
-            # --- EFA / libfabric setup ----------------------------------
+            # --- AWS EFA / libfabric setup --------------------------------
             # Select the libfabric NIXL plugin instead of the default UCX.
             - name: MX_NIXL_BACKEND
               value: "LIBFABRIC"
@@ -70,18 +92,16 @@ spec:
             - name: FI_PROVIDER
               value: "efa"
             # Use device-level RDMA (GPUDirect) rather than CPU-bounced
-            # transfers. Requires the nvidia-peermem kernel module loaded
-            # on the host - verify with `lsmod | grep nvidia_peermem`.
+            # transfers. Requires nvidia-peermem on the host.
             - name: FI_EFA_USE_DEVICE_RDMA
               value: "1"
             # Disable libfabric's shared-memory transport so all cross-pod
-            # traffic actually goes through the EFA NIC. Without this,
-            # libfabric may try /dev/shm and never touch the fabric.
+            # traffic actually goes through the EFA NIC.
             - name: FI_EFA_ENABLE_SHM_TRANSFER
               value: "0"
             - name: FI_LOG_LEVEL
               value: "info"
-            # ------------------------------------------------------------
+            # --------------------------------------------------------------
 
             - name: HF_TOKEN
               valueFrom:
@@ -99,8 +119,8 @@ spec:
             - --tensor-parallel-size
             - "1"
           ports:
-            - name: metadata-grpc
-              containerPort: 50051
+            - name: http
+              containerPort: 8000
           resources:
             limits:
               nvidia.com/gpu: 1
