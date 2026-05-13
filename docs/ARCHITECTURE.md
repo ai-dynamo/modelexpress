@@ -541,7 +541,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | Method | Purpose |
 |--------|---------|
 | `__init__(agent_name, device_id, listen_port)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread |
-| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1`, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually |
+| `register_tensors(tensors, vmm_range=None)` | Register GPU tensors for RDMA, return serialized metadata. Three modes (best to worst): (1) `vmm_range` set: caller-provided `(base, size)` VMM arena, one `ibv_reg_mr` regardless of tensor count - used by `MX_VMM_COMPACT` path; (2) `MX_POOL_REG=1`: register each unique cudaMalloc allocation backing the tensors; (3) default: register each tensor individually |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
@@ -701,6 +701,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
 | `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged |
+| `MX_VMM_COMPACT` | `0` | After `process_weights_after_loading`, compact all post-loaded tensors into a single contiguous CUDA VMM range (`cuMemAddressReserve` + per-segment `cuMemCreate`/`cuMemMap`), making the whole model registerable as one NIXL region (one `ibv_reg_mr` call). Falls back to `MX_POOL_REG` or per-tensor on compaction failure. Disabled by default; experimental |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers. Opt-in on central-coordinator backends; auto-enabled (env var ignored) on decentralized backends |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
