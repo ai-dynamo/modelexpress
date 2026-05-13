@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Setup ModelExpress vCluster'
+description: |
+  Bootstraps a persistent vCluster on the host AKS cluster.
+  Only runs on first use — idempotent on re-runs via --upgrade.
+
+  Installs the ModelExpress CRD (cluster-scoped, one-time).
+  All namespace-scoped resources (RBAC, secrets, mx-server) are managed
+  per test run by run-mx-p2p-test.
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for host cluster access'
+    required: true
+  vcluster_name:
+    description: 'Name for the vCluster instance'
+    required: false
+    default: 'mx-ci-cluster'
+  vcluster_namespace:
+    description: 'Host namespace where the vCluster will be created'
+    required: false
+    default: 'mx-ci'
+  vcluster_k8s_version:
+    description: 'Kubernetes version for the vCluster control plane'
+    required: false
+    default: 'v1.32.13'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup host kubeconfig
+      shell: bash
+      run: |
+        echo "${{ inputs.kubeconfig_base64 }}" | base64 -d > ${{ github.workspace }}/.kubeconfig-host
+        chmod 600 ${{ github.workspace }}/.kubeconfig-host
+        echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-host" >> $GITHUB_ENV
+
+    - name: Install vCluster CLI
+      uses: ./.github/actions/install-vcluster-cli
+
+    - name: Create host namespace
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Create host namespace ${NAMESPACE}"
+        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label namespaces ${NAMESPACE} \
+          nscleanup/enabled=true \
+          nscleanup/ttl=604800 \
+          ngc-api=enabled \
+          nvcr-imagepull=enabled \
+          --overwrite
+        echo "::endgroup::"
+
+    - name: Create vCluster
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
+        # GPU workloads require syncing host nodes into the vCluster so the GPU
+        # device plugin and resource limits are visible to the scheduler.
+        vcluster create ${VCLUSTER_NAME} \
+          --namespace ${NAMESPACE} \
+          --connect=false \
+          --upgrade \
+          --set controlPlane.distro.k8s.enabled=true \
+          --set controlPlane.distro.k8s.version=${{ inputs.vcluster_k8s_version }} \
+          --set sync.fromHost.nodes.enabled=true \
+          --set sync.fromHost.nodes.selector.all=true
+        echo "::endgroup::"
+
+    - name: Wait for vCluster pod to be ready
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Wait for vCluster pod"
+        sleep 20
+        kubectl wait --for=condition=ready pod \
+          -l app=vcluster,release=${VCLUSTER_NAME} \
+          -n ${NAMESPACE} \
+          --timeout=900s
+        echo "::endgroup::"
+
+    - name: Connect to vCluster
+      uses: ./.github/actions/connect-vcluster
+      with:
+        host_kubeconfig_base64: ${{ inputs.kubeconfig_base64 }}
+        vcluster_name: ${{ inputs.vcluster_name }}
+        vcluster_namespace: ${{ inputs.vcluster_namespace }}
+
+    - name: Install ModelExpress CRD
+      shell: bash
+      run: |
+        echo "::group::Apply ModelExpress CRD inside vCluster"
+        # CRD is cluster-scoped — applied once here on bootstrap.
+        # run-mx-p2p-test also applies it on every run for idempotency.
+        kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-vcluster apply \
+          -f ci/k8s/server/crd-modelmetadata.yaml
+        echo "::endgroup::"
+
+    - name: Debug failure
+      if: failure()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+      run: |
+        set +eo pipefail
+        echo "::group::Pod status (host namespace)"
+        kubectl get pods -n ${NAMESPACE} -o wide 2>&1 || true
+        echo "::endgroup::"
+        echo "::group::Events (host namespace)"
+        kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' 2>&1 || true
+        echo "::endgroup::"
+        VC_KC=${{ github.workspace }}/.kubeconfig-vcluster
+        if [ -f "${VC_KC}" ]; then
+          echo "::group::Pod status (vCluster)"
+          kubectl --kubeconfig=${VC_KC} get pods -A -o wide 2>&1 || true
+          echo "::endgroup::"
+        fi

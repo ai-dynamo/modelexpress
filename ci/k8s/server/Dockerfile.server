@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI image for the ModelExpress gRPC coordination server.
+# Builds from source so no NGC org access is required at build time.
+
+FROM rust:1.90 AS builder
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+RUN cargo build --release --bin modelexpress-server
+
+FROM ubuntu:24.04 AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/modelexpress-server .
+
+EXPOSE 8000
+
+CMD ["./modelexpress-server", "--port", "8000"]

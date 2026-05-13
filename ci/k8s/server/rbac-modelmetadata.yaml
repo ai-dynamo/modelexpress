@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI version of examples/dynamo_p2p_transfer_k8s/vllm/rbac-modelmetadata.yaml.
+#
+# The upstream file hardcodes namespace: default in the RoleBinding subject, which
+# causes a 403 when the MX server runs in any other namespace.  This file uses
+# ${NAMESPACE} so envsubst substitutes the correct value before kubectl apply.
+#
+# Apply with:
+#   NAMESPACE=<your-ns> envsubst < ci/k8s/rbac-modelmetadata.yaml | kubectl apply -n <your-ns> -f -
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  labels:
+    app.kubernetes.io/name: modelexpress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: modelexpress-metadata
+  labels:
+    app.kubernetes.io/name: modelexpress
+rules:
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelmetadatas
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelmetadatas/status
+    verbs:
+      - get
+      - update
+      - patch
+  # NOTE: grants access to ALL ConfigMaps in the namespace — use a dedicated
+  # namespace for ModelExpress workloads in shared clusters.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: modelexpress-metadata
+  labels:
+    app.kubernetes.io/name: modelexpress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: modelexpress-metadata
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+    namespace: ${NAMESPACE}
