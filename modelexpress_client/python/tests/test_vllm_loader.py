@@ -358,6 +358,78 @@ class TestRegisterTensorsErrorHandling:
             register_tensors(model, ctx)
 
 
+class TestRegisterTensorsReuseDiscovered:
+    """Verify the reuse_discovered flag skips adapter discovery.
+
+    Used on wake / CRIU-restore paths where the weight set is unchanged
+    since initial load. Skipping discovery avoids tripping on
+    post-warmup artifacts (e.g. torch._dynamo AOT compiled functions).
+    """
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_reuse_skips_discovery_when_ctx_has_tensors(self, mock_init, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        ctx.adapter.discover_tensors = MagicMock()
+        cached = {"weight_0": MagicMock(), "weight_1": MagicMock()}
+        ctx.tensors = cached
+
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+        ctx.adapter.discover_tensors.assert_not_called()
+        assert ctx.tensors is cached
+        mock_mgr.register_tensors.assert_called_once_with(cached)
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_reuse_falls_back_to_discovery_when_ctx_tensors_empty(
+        self, mock_init, _avail,
+    ):
+        """If reuse requested but no cache, fall through to discovery."""
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        fresh = {"fresh_w": MagicMock()}
+        ctx.adapter.discover_tensors = MagicMock(return_value=fresh)
+        # ctx.tensors defaults to {} in LoadContext.
+
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+        ctx.adapter.discover_tensors.assert_called_once()
+        assert ctx.tensors == fresh
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_default_behavior_unchanged(self, mock_init, _avail):
+        """Default (reuse_discovered=False) must still run discovery."""
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        fresh = {"w": MagicMock()}
+        ctx.adapter.discover_tensors = MagicMock(return_value=fresh)
+        # Pre-populate ctx.tensors so we can prove discovery still runs.
+        ctx.tensors = {"stale": MagicMock()}
+
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx)
+
+        ctx.adapter.discover_tensors.assert_called_once()
+        assert ctx.tensors == fresh
+
+
 class TestPublishMetadataErrorHandling:
     """Verify publish_metadata never raises."""
 
