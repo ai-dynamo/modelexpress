@@ -236,7 +236,7 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] P2P mode: fetching tensor manifest from "
                 f"{source_worker.worker_grpc_endpoint}"
             )
-            tensor_protos = fetch_tensor_manifest(
+            tensor_protos, manifest_bytes = fetch_tensor_manifest(
                 endpoint=source_worker.worker_grpc_endpoint,
                 mx_source_id=mx_source_id,
             )
@@ -250,7 +250,8 @@ class RdmaStrategy(LoadStrategy):
             ]
             logger.info(
                 f"[Worker {ctx.global_rank}] [TIMING] P2P tensor manifest: "
-                f"{manifest_time:.3f}s ({len(source_tensors)} tensors)"
+                f"{manifest_time:.3f}s ({len(source_tensors)} tensors, "
+                f"{manifest_bytes} bytes)"
             )
 
             nixl_fetch_start = time.perf_counter()
