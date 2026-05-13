@@ -6,12 +6,10 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
-import torch
 import torch.nn as nn
 
 from ..nixl_transfer import is_nixl_available
@@ -107,8 +105,7 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
 
 def _metadata_publication_configured(ctx: LoadContext) -> bool:
     """Return whether this worker has a metadata path for P2P serving."""
-    server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
-    if server_addr:
+    if getattr(ctx, "metadata_server_url", None):
         return True
     return getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
 
@@ -143,8 +140,7 @@ def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) 
         log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
-            base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
-            listen_port = base_port + ctx.device_id
+            listen_port = ctx.metadata_port + ctx.device_id
             ctx.nixl_manager = _init_nixl_manager(
                 ctx.global_rank, ctx.device_id, "auto", listen_port
             )
@@ -174,11 +170,11 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] No NIXL manager, skipping metadata publish"
         )
         return
-    # Decentralized backends (k8s-service) have no central server
-    # address; their metadata path is entirely peer-to-peer.
-    # Only bail on missing MODEL_EXPRESS_URL / MX_SERVER_ADDRESS when the
-    # client actually needs a central coordinator. Strict `is True`
-    # check so MagicMock's auto-attribute doesn't masquerade as the flag.
+    # Decentralized backends (k8s-service) have no central server address;
+    # their metadata path is entirely peer-to-peer. Only bail on missing
+    # metadata_server_url when the client actually needs a central coordinator.
+    # Strict `is True` check so MagicMock's auto-attribute doesn't masquerade as
+    # the flag.
     if not _metadata_publication_configured(ctx):
         logger.info(
             f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
@@ -196,11 +192,46 @@ def publish_metadata(ctx: LoadContext) -> None:
         )
 
 
+def publish_loaded_model(result: LoadResult, ctx: LoadContext) -> None:
+    """Register and publish an already-loaded model as a reusable source.
+
+    Some engine lifecycles load weights outside the strategy chain and only
+    have a publish callback after the model is ready. Keep the source context
+    reachable from the model so its NIXL manager, identity, and metadata client
+    remain alive while the engine owns the model object.
+    """
+    if not result.publishable:
+        return
+
+    register_tensors(result, ctx)
+    publish_metadata(ctx)
+
+    model = result.model
+    if model is None:
+        return
+
+    _retain_source_runtime(model, ctx)
+
+
+def _retain_source_runtime(model: nn.Module, ctx: LoadContext) -> None:
+    """Keep source-serving runtime objects alive for the model lifetime.
+
+    Publishing metadata advertises this process as a live source, but the actual
+    source still depends on local runtime state. The context owns the NIXL
+    manager, registered memory endpoints, worker identity, and metadata client.
+    Some engine lifecycles, notably TRT-LLM post-load publish, create this
+    context inside a short callback rather than storing it on a ModelExpress
+    loader instance. Attach the current context to the model so Python does not
+    collect the source runtime while the engine is still serving the model.
+    """
+    setattr(model, "_mx_load_context", ctx)
+
+
 def publish_source_if_supported(result: LoadResult, ctx: LoadContext) -> None:
     """Best-effort source publication after a successful load."""
     if result.model_for_publish is None:
         return
-    publish_metadata(ctx)
+    publish_loaded_model(result, ctx)
 
 
 def unpublish_metadata(ctx: LoadContext) -> None:

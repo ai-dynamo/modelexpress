@@ -65,6 +65,26 @@ def test_factory_unknown_backend_raises(monkeypatch):
         create_metadata_client()
 
 
+def test_resolve_metadata_server_url_uses_explicit_before_env(monkeypatch):
+    from modelexpress.metadata.client_factory import resolve_metadata_server_url
+
+    monkeypatch.setenv("MODEL_EXPRESS_URL", "mx-from-env:8001")
+
+    assert resolve_metadata_server_url("https://mx-explicit:9000") == "mx-explicit:9000"
+
+
+def test_resolve_metadata_server_url_uses_env_without_default(monkeypatch):
+    from modelexpress.metadata.client_factory import resolve_metadata_server_url
+
+    monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
+    monkeypatch.delenv("MX_SERVER_ADDRESS", raising=False)
+
+    assert resolve_metadata_server_url() is None
+
+    monkeypatch.setenv("MX_SERVER_ADDRESS", "http://mx-from-env:8001")
+    assert resolve_metadata_server_url() == "mx-from-env:8001"
+
+
 # ---------------------------------------------------------------------------
 # publish_metadata / list_sources / update_status behavior
 # ---------------------------------------------------------------------------

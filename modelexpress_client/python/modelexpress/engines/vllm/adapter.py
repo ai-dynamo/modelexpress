@@ -14,8 +14,16 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from ...adapter import EngineAdapter
-from ...load_strategy.context import LoadContext, LoadResult
-from ...metadata.client_factory import create_metadata_client
+from ...load_strategy.context import (
+    LoadContext,
+    LoadResult,
+    resolve_model_streamer_uri,
+)
+from ...metadata.client_factory import (
+    create_metadata_client,
+    resolve_metadata_port,
+    resolve_metadata_server_url,
+)
 from ...metadata.publish import build_source_identity
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
@@ -34,6 +42,9 @@ class VllmAdapter(EngineAdapter):
         self.model_config = model_config
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
+        self.model_streamer_distributed = (
+            os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+        )
 
     def build_identity(self):
         return build_source_identity(self.vllm_config, self.model_config)
@@ -188,7 +199,7 @@ class VllmAdapter(EngineAdapter):
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
         return (
             tp_size > 1
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and self.model_streamer_distributed
         )
 
 
@@ -240,6 +251,7 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
     adapter = VllmAdapter(vllm_config, model_config)
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
+    server_url = resolve_metadata_server_url()
     return LoadContext(
         model_config=model_config,
         load_config=vllm_config.load_config,
@@ -248,7 +260,10 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         worker_rank=worker_rank,
         device_id=adapter.get_device_id(),
         identity=adapter.build_identity(),
-        mx_client=create_metadata_client(worker_rank=worker_rank),
+        mx_client=create_metadata_client(worker_rank=worker_rank, server_url=server_url),
         worker_id=uuid.uuid4().hex[:8],
+        metadata_server_url=server_url,
+        metadata_port=resolve_metadata_port(),
+        model_streamer_uri=resolve_model_streamer_uri(model_config),
         adapter=adapter,
     )

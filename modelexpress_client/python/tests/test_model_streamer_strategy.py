@@ -77,53 +77,58 @@ class TestModelStreamerIsAvailable:
         return ModelStreamerStrategy()
 
     def test_available_with_s3_uri(self):
-        ctx = _make_load_context()
+        ctx = _make_load_context(model_streamer_uri="s3://bucket/model")
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                assert strategy.is_available(ctx) is True
+        with patch("importlib.util.find_spec", return_value=MagicMock()):
+            assert strategy.is_available(ctx) is True
 
     def test_available_with_local_path_env(self):
-        ctx = _make_load_context()
+        ctx = _make_load_context(model_streamer_uri="/models/deepseek")
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_MODEL_URI": "/models/deepseek"}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                assert strategy.is_available(ctx) is True
+        with patch("importlib.util.find_spec", return_value=MagicMock()):
+            assert strategy.is_available(ctx) is True
 
     def test_available_with_gcs_uri(self):
-        ctx = _make_load_context()
+        ctx = _make_load_context(model_streamer_uri="gs://bucket/model")
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_MODEL_URI": "gs://bucket/model"}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                assert strategy.is_available(ctx) is True
+        with patch("importlib.util.find_spec", return_value=MagicMock()):
+            assert strategy.is_available(ctx) is True
 
     def test_available_with_local_path(self):
-        ctx = _make_load_context()
+        ctx = _make_load_context(model_streamer_uri="/models/deepseek-ai/DeepSeek-V3")
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_MODEL_URI": "/models/deepseek-ai/DeepSeek-V3"}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                assert strategy.is_available(ctx) is True
+        with patch("importlib.util.find_spec", return_value=MagicMock()):
+            assert strategy.is_available(ctx) is True
 
     def test_available_with_hf_model_id(self):
-        ctx = _make_load_context()
+        ctx = _make_load_context(model_streamer_uri="deepseek-ai/DeepSeek-V3")
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_MODEL_URI": "deepseek-ai/DeepSeek-V3"}):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                assert strategy.is_available(ctx) is True
+        with patch("importlib.util.find_spec", return_value=MagicMock()):
+            assert strategy.is_available(ctx) is True
 
-    def test_unavailable_no_env(self):
+    def test_unavailable_no_context_uri(self):
         ctx = _make_load_context()
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {}, clear=True):
-            with patch("importlib.util.find_spec", return_value=MagicMock()):
-                assert strategy.is_available(ctx) is False
+        with patch("importlib.util.find_spec", return_value=MagicMock()):
+            assert strategy.is_available(ctx) is False
 
     def test_unavailable_no_package(self):
-        ctx = _make_load_context()
+        ctx = _make_load_context(model_streamer_uri="s3://bucket/model")
         strategy = self._make_strategy()
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
-            with patch("importlib.util.find_spec", return_value=None):
-                assert strategy.is_available(ctx) is False
+        with patch("importlib.util.find_spec", return_value=None):
+            assert strategy.is_available(ctx) is False
+
+
+def test_resolve_model_streamer_uri_keeps_mx_model_uri_as_gate(monkeypatch):
+    from modelexpress.load_strategy.context import resolve_model_streamer_uri
+
+    model_config = SimpleNamespace(
+        model="deepseek-ai/DeepSeek-V3",
+        model_weights="s3://bucket/deepseek-ai/DeepSeek-V3",
+    )
+    monkeypatch.setenv("MX_MODEL_URI", "1")
+
+    assert resolve_model_streamer_uri(model_config) == model_config.model_weights
 
 
 # ---------------------------------------------------------------------------
@@ -136,16 +141,25 @@ class TestModelStreamerLoad:
         from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
         return ModelStreamerStrategy()
 
-    def _make_ctx_with_uri(self, *, model_weights=None, model="ignored"):
+    def _make_ctx_with_uri(
+        self,
+        *,
+        model_streamer_uri="s3://bucket/model",
+        model_weights=None,
+        model="ignored",
+    ):
         model_config = MagicMock()
         model_config.model_weights = model_weights
         model_config.model = model
-        return _make_load_context(model_config=model_config)
+        return _make_load_context(
+            model_config=model_config,
+            model_streamer_uri=model_streamer_uri,
+        )
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_success_path_s3(self, mock_register):
         model = MagicMock()
-        ctx = self._make_ctx_with_uri(model_weights="s3://bucket/model")
+        ctx = self._make_ctx_with_uri(model_streamer_uri="s3://bucket/model")
         strategy = self._make_strategy()
 
         with patch(
@@ -165,10 +179,10 @@ class TestModelStreamerLoad:
         mock_register.assert_called_once_with(result, ctx)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_success_path_local_falls_back_to_model(self, mock_register):
-        """When model_weights is unset, the URI comes from model_config.model."""
+    def test_success_path_local_uses_context_uri(self, mock_register):
+        """The streaming URI comes from LoadContext."""
         model = MagicMock()
-        ctx = self._make_ctx_with_uri(model_weights=None, model="/models/llama")
+        ctx = self._make_ctx_with_uri(model_streamer_uri="/models/llama")
         strategy = self._make_strategy()
 
         with patch(
@@ -184,29 +198,30 @@ class TestModelStreamerLoad:
         mock_stream.assert_called_once_with("/models/llama", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_uri_from_model_weights_not_from_env(self, mock_register):
-        """The streaming URI comes from model_config, not from MX_MODEL_URI."""
+    def test_context_uri_wins_over_model_config(self, mock_register):
+        """LoadContext keeps loader config immutable after context creation."""
         model = MagicMock()
         ctx = self._make_ctx_with_uri(
-            model_weights="s3://bucket/from-config", model="/ignored"
+            model_streamer_uri="s3://bucket/from-context",
+            model_weights="s3://bucket/from-config",
+            model="/ignored",
         )
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://other/path-in-env"}):
-            with patch(
-                "modelexpress.load_strategy.model_streamer_strategy."
-                "ModelStreamerStrategy._stream_weights"
-            ) as mock_stream:
-                mock_stream.side_effect = RuntimeError("expected")
-                with pytest.raises(StrategyFailed, match="expected"):
-                    strategy.load(model, ctx)
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights"
+        ) as mock_stream:
+            mock_stream.side_effect = RuntimeError("expected")
+            with pytest.raises(StrategyFailed, match="expected"):
+                strategy.load(model, ctx)
 
-        mock_stream.assert_called_once_with("s3://bucket/from-config", ctx, model)
+        mock_stream.assert_called_once_with("s3://bucket/from-context", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_raises_strategy_failed_on_error(self, mock_register):
         model = MagicMock()
-        ctx = self._make_ctx_with_uri(model_weights="s3://bucket/model")
+        ctx = self._make_ctx_with_uri(model_streamer_uri="s3://bucket/model")
         strategy = self._make_strategy()
 
         with patch(
@@ -225,17 +240,19 @@ class TestModelStreamerLoad:
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
-        ctx = _make_load_context(adapter=adapter)
+        ctx = _make_load_context(
+            adapter=adapter,
+            model_streamer_uri="s3://bucket/model",
+        )
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
-            with patch(
-                "modelexpress.load_strategy.model_streamer_strategy."
-                "ModelStreamerStrategy._stream_weights",
-                return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
-            ):
-                with pytest.raises(StrategyFailed, match="partial load") as exc:
-                    strategy.load(model, ctx)
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights",
+            return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
+        ):
+            with pytest.raises(StrategyFailed, match="partial load") as exc:
+                strategy.load(model, ctx)
 
         assert exc.value.mutated is True
         mock_register.assert_not_called()
@@ -245,17 +262,19 @@ class TestModelStreamerLoad:
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.after_weight_iter_load = MagicMock(side_effect=RuntimeError("post load"))
-        ctx = _make_load_context(adapter=adapter)
+        ctx = _make_load_context(
+            adapter=adapter,
+            model_streamer_uri="s3://bucket/model",
+        )
         strategy = self._make_strategy()
 
-        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
-            with patch(
-                "modelexpress.load_strategy.model_streamer_strategy."
-                "ModelStreamerStrategy._stream_weights",
-                return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
-            ):
-                with pytest.raises(StrategyFailed, match="post load") as exc:
-                    strategy.load(model, ctx)
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights",
+            return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
+        ):
+            with pytest.raises(StrategyFailed, match="post load") as exc:
+                strategy.load(model, ctx)
 
         assert exc.value.mutated is True
         mock_register.assert_not_called()
@@ -318,10 +337,11 @@ class TestVllmModelStreamerIterator:
 
     def test_uses_vllm_native_iterator_and_enables_distributed(self):
         tensor = torch.randn(2, 2)
-        adapter, _load_config = self._make_adapter(tp_size=8)
+        with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+            adapter, _load_config = self._make_adapter(tp_size=8)
         patcher, loader_cls, loader_instance = self._patch_runai_loader([("w", tensor)])
 
-        with patcher, patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+        with patcher:
             weights = list(adapter.build_model_streamer_weight_iter("az://models/model"))
 
         native_load_config = loader_cls.call_args.args[0]
@@ -333,26 +353,28 @@ class TestVllmModelStreamerIterator:
         assert weights[0][1] is tensor
 
     def test_preserves_existing_extra_config_when_distributed_disabled(self):
-        adapter, _load_config = self._make_adapter(
-            tp_size=1,
-            extra_config={"concurrency": 4},
-        )
+        with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+            adapter, _load_config = self._make_adapter(
+                tp_size=1,
+                extra_config={"concurrency": 4},
+            )
         patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
 
-        with patcher, patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+        with patcher:
             list(adapter.build_model_streamer_weight_iter("az://models/model"))
 
         native_load_config = loader_cls.call_args.args[0]
         assert native_load_config.model_loader_extra_config == {"concurrency": 4}
 
     def test_distributed_disabled_by_default_even_with_tp_gt_one(self):
-        adapter, _load_config = self._make_adapter(
-            tp_size=8,
-            extra_config={"concurrency": 4},
-        )
+        with patch.dict("os.environ", {}, clear=True):
+            adapter, _load_config = self._make_adapter(
+                tp_size=8,
+                extra_config={"concurrency": 4},
+            )
         patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
 
-        with patcher, patch.dict("os.environ", {}, clear=True):
+        with patcher:
             list(adapter.build_model_streamer_weight_iter("az://models/model"))
 
         native_load_config = loader_cls.call_args.args[0]

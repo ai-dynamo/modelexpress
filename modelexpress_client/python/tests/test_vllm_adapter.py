@@ -89,6 +89,40 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     assert ctx.device_id == ctx.target_device.index
 
 
+def test_build_vllm_load_context_populates_metadata_url_from_env(monkeypatch):
+    _stub_vllm_current_device(monkeypatch, current_device=0)
+    captured = {}
+
+    def fake_create_metadata_client(worker_rank, server_url=None):
+        captured["worker_rank"] = worker_rank
+        captured["server_url"] = server_url
+        return object()
+
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.create_metadata_client",
+        fake_create_metadata_client,
+    )
+    monkeypatch.setenv("MODEL_EXPRESS_URL", "http://mx.example:8001")
+    vllm_config = _context_config(load_device=None)
+
+    ctx = build_vllm_load_context(vllm_config, _model_config())
+
+    assert ctx.metadata_server_url == "mx.example:8001"
+    assert captured["server_url"] == "mx.example:8001"
+
+
+def test_build_vllm_load_context_preserves_mx_model_uri_gate(monkeypatch):
+    _stub_vllm_current_device(monkeypatch, current_device=0)
+    _stub_metadata_client(monkeypatch)
+    monkeypatch.setenv("MX_MODEL_URI", "1")
+    model_config = _model_config()
+    model_config.model_weights = "s3://bucket/from-config"
+
+    ctx = build_vllm_load_context(_context_config(load_device=None), model_config)
+
+    assert ctx.model_streamer_uri == "s3://bucket/from-config"
+
+
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
@@ -101,7 +135,7 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
 def _stub_metadata_client(monkeypatch) -> None:
     monkeypatch.setattr(
         "modelexpress.engines.vllm.adapter.create_metadata_client",
-        lambda worker_rank: object(),
+        lambda worker_rank, server_url=None: object(),
     )
 
 
