@@ -142,6 +142,21 @@ def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) 
         ctx.tensors = ctx.adapter.discover_tensors(result)
         log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
+        # Optional VMM compaction: move all tensors into a single contiguous
+        # CUDA VA range so NIXL only needs one ibv_reg_mr call. Runs AFTER
+        # discover_tensors (post-load, post-process_weights_after_loading) so
+        # we operate on the final tensor set. Disabled by default; enable
+        # with MX_VMM_COMPACT=1.
+        vmm_range: tuple[int, int] | None = None
+        if os.environ.get("MX_VMM_COMPACT", "0") == "1":
+            from ..vmm_compact import compact_tensors
+
+            va_base, va_size, ctx.tensors, ctx.vmm_arena = compact_tensors(
+                result.model, ctx.tensors, ctx.device_id
+            )
+            if ctx.vmm_arena is not None:
+                vmm_range = (va_base, va_size)
+
         if ctx.nixl_manager is None:
             base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
             listen_port = base_port + ctx.device_id
@@ -151,7 +166,7 @@ def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) 
 
         if not ctx.nixl_manager.tensor_descriptors:
             logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
-            ctx.nixl_manager.register_tensors(ctx.tensors)
+            ctx.nixl_manager.register_tensors(ctx.tensors, vmm_range=vmm_range)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
         logger.warning(

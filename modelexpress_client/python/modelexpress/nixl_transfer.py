@@ -173,21 +173,29 @@ class NixlTransferManager:
             elif "UCX_TLS" in os.environ:
                 os.environ.pop("UCX_TLS")
 
-    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+    def register_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        vmm_range: tuple[int, int] | None = None,
+    ) -> bytes:
         """
         Register tensors with NIXL for RDMA access.
 
-        With MX_POOL_REG=1, discovers the unique cudaMalloc allocations
-        backing the tensors via cuMemGetAddressRange and registers each
-        allocation as a single NIXL block. This dramatically reduces the
-        number of memory registrations (kernel ibv_reg_mr calls, rkeys,
-        and bytes in the agent metadata blob) without changing transfer
-        semantics: receive_from_source still matches by tensor name and
-        builds per-tensor RDMA descriptors that target addresses inside
-        the registered allocations.
+        Three registration modes, best to worst:
 
-        With MX_POOL_REG unset (default), falls back to per-tensor
-        registration.
+        1. VMM range (vmm_range is set): caller provides a single
+           (base, size) VA range that covers all tensors, typically from
+           vmm_compact.compact_tensors. One ibv_reg_mr call regardless of
+           tensor count.
+        2. Pool registration (MX_POOL_REG=1): discover the unique
+           cudaMalloc allocations backing the tensors via
+           cuMemGetAddressRange and register each allocation as a single
+           NIXL block. One ibv_reg_mr per cudaMalloc block.
+        3. Per-tensor (MX_POOL_REG unset, default): one ibv_reg_mr per
+           tensor.
+
+        Per-tensor descriptors are always preserved for application-level
+        name-based matching during transfers regardless of mode.
 
         CRITICAL: self._tensors must hold the SAME tensor objects as
         param.data in vLLM. Do NOT call .contiguous() here - that would
@@ -195,6 +203,10 @@ class NixlTransferManager:
 
         Args:
             tensors: Dictionary of tensor name -> tensor
+            vmm_range: Optional (base_addr, total_size) of a contiguous
+                VMM arena. When provided, registers this single range
+                instead of discovering allocations or registering
+                per-tensor.
 
         Returns:
             NIXL metadata bytes for this agent
@@ -221,9 +233,17 @@ class NixlTransferManager:
 
         self._tensor_descriptors = tensor_descriptors
 
-        # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
+        # Phase 1: Determine registration regions
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled():
+        if vmm_range is not None:
+            # VMM mode: caller provided a contiguous VA range that
+            # already covers all tensors. Register it as one block.
+            allocations = [vmm_range]
+            logger.info(
+                f"VMM range registration: base=0x{vmm_range[0]:x}, "
+                f"size={vmm_range[1] / 1e9:.2f} GB (one region)"
+            )
+        elif _pool_reg_enabled():
             allocations = self._find_cuda_allocations(tensor_descriptors)
         else:
             allocations = None

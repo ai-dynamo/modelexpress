@@ -17,6 +17,7 @@ from ..client import MxClientBase
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter
     from ..nixl_transfer import NixlTransferManager
+    from ..vmm_compact import VmmArena
     from sglang.srt.configs.load_config import LoadConfig as SglangLoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from vllm.config import ModelConfig as VllmModelConfig
@@ -62,3 +63,4 @@ class LoadContext:
     adapter: EngineAdapter | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    vmm_arena: VmmArena | None = None
