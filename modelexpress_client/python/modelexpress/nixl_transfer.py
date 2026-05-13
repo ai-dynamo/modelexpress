@@ -193,6 +193,11 @@ class NixlTransferManager:
         param.data in vLLM. Do NOT call .contiguous() here - that would
         create copies and RDMA writes would land in the wrong memory.
 
+        We take a shallow copy of the caller's dict (``dict(tensors)``)
+        so shutdown's cleanup cannot mutate the caller's container.
+        The tensor VALUES are the same objects as ``param.data``;
+        only the dict container is owned by the manager.
+
         Args:
             tensors: Dictionary of tensor name -> tensor
 
@@ -202,7 +207,7 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        self._tensors = tensors
+        self._tensors = dict(tensors)
         tensor_descriptors = []
 
         for name, tensor in tensors.items():
@@ -502,9 +507,16 @@ class NixlTransferManager:
         return self._agent is not None and len(self._metadata) > 0
 
     def shutdown(self) -> None:
-        """Clean up NIXL resources."""
+        """Clean up NIXL resources.
+
+        Rebinds ``_tensor_descriptors`` and ``_tensors`` to fresh empty
+        containers instead of mutating in place. Belt-and-suspenders:
+        even if a future caller bypasses ``register_tensors`` and
+        aliases ``_tensors`` directly, shutdown will not mutate the
+        shared container out from under them.
+        """
         self._agent = None
         self._metadata = b""
-        self._tensor_descriptors.clear()
-        self._tensors.clear()
+        self._tensor_descriptors = []
+        self._tensors = {}
         logger.info("NixlTransferManager shutdown complete")
