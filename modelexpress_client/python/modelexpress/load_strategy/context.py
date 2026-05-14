@@ -17,6 +17,7 @@ from ..client import MxClientBase
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter
     from ..nixl_transfer import NixlTransferManager
+    from ..vmm_arena import VmmArena
     from sglang.srt.configs.load_config import LoadConfig as SglangLoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from vllm.config import ModelConfig as VllmModelConfig
@@ -62,3 +63,9 @@ class LoadContext:
     adapter: EngineAdapter | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    # When MX_VMM_ARENA=1, _maybe_enter_vmm_arena populates this with the
+    # active VmmArena. Strategies that register tensors with NIXL can use
+    # the arena's (base, used_bytes) range as a single registration via
+    # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
+    # O(plugin_calls) MRs to 1.
+    vmm_arena: VmmArena | None = None

@@ -150,8 +150,15 @@ def register_tensors(result_or_model: LoadResult | nn.Module, ctx: LoadContext) 
             )
 
         if not ctx.nixl_manager.tensor_descriptors:
-            logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
-            ctx.nixl_manager.register_tensors(ctx.tensors)
+            if ctx.vmm_arena is not None:
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] Registering arena with NIXL "
+                    "(single MR via dmabuf)..."
+                )
+                ctx.nixl_manager.register_arena(ctx.vmm_arena, ctx.tensors)
+            else:
+                logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
+                ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
         logger.warning(

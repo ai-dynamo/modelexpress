@@ -267,6 +267,88 @@ class NixlTransferManager:
 
         return self._metadata
 
+    def register_arena(self, arena: Any, tensors: dict[str, torch.Tensor]) -> bytes:
+        """Register a VmmArena's full bump range as a single NIXL region.
+
+        The arena owns a contiguous VA range; at end-of-load the bump
+        pointer's [base, base+used) covers every allocation we've ever
+        made (including holes from intervening frees). NIXL's
+        `register_memory` with `mem_type="cuda"` over this range
+        consumes a dmabuf via `ibv_reg_dmabuf_mr` and produces ONE
+        lkey/rkey covering all live tensors.
+
+        Empirically validated on Blackwell + ConnectX over InfiniBand
+        against a CUDA VMM range with multiple cuMemCreate handles and
+        mid-range holes (chunks unmapped + released after the export):
+        registration succeeds, the dmabuf attach pins the currently-
+        mapped physical pages, and the HCA translation table survives
+        subsequent CUDA-side unmaps.
+
+        Per-tensor descriptors are still built (tensor name -> addr,
+        size, dtype) because the receiver matches by name and computes
+        an offset into the single registered region.
+
+        Requires `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` on the deployment
+        until the upstream UCX cuda_copy_md fix ships, otherwise UCX
+        internally truncates the requested length via
+        cuMemGetAddressRange (which on multi-handle VMM returns
+        per-handle bounds, not the full reserve).
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        self._tensors = tensors
+        tensor_descriptors = []
+        for name, tensor in tensors.items():
+            if not tensor.is_contiguous():
+                raise RuntimeError(
+                    f"Tensor '{name}' is not contiguous. "
+                    "Non-contiguous tensors cannot be used for RDMA transfers."
+                )
+            tensor_descriptors.append(TensorDescriptor(
+                name=name,
+                addr=tensor.data_ptr(),
+                size=tensor.numel() * tensor.element_size(),
+                device_id=self._device_id,
+                dtype=str(tensor.dtype),
+            ))
+        self._tensor_descriptors = tensor_descriptors
+
+        base, used = arena.registered_range()
+        if used == 0:
+            logger.warning(
+                "register_arena called with empty arena (used=0); falling back "
+                "to per-tensor registration"
+            )
+            return self.register_tensors(tensors)
+
+        nixl_reg_start = time.perf_counter()
+        self._agent.register_memory(
+            [(base, used, self._device_id, "")],
+            mem_type="cuda",
+            backends=self._backends,
+        )
+        nixl_reg_time = time.perf_counter() - nixl_reg_start
+
+        metadata_start = time.perf_counter()
+        self._metadata = self._agent.get_agent_metadata()
+        metadata_time = time.perf_counter() - metadata_start
+
+        total_bytes = sum(d.size for d in tensor_descriptors)
+        reduction = (1 - 1 / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
+        logger.info(
+            f"[TIMING] register_arena: {nixl_reg_time + metadata_time:.3f}s total "
+            f"(nixl_register={nixl_reg_time:.3f}s [1 region, {used / 1e9:.2f} GB], "
+            f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
+        )
+        logger.info(
+            f"Registered arena as 1 region from {len(tensor_descriptors)} tensors "
+            f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB live in "
+            f"{used / 1e9:.2f} GB arena bump range"
+        )
+
+        return self._metadata
+
     @staticmethod
     def _find_cuda_allocations(
         descriptors: list[TensorDescriptor],

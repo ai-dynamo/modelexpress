@@ -46,6 +46,11 @@ dev = [
 otel = [
     "opentelemetry-api>=1.20.0",
 ]
+# Required for the VmmArena allocator (CudaVmmBackend uses cuMem* APIs).
+# The pure-Python VmmArena tests don't need it; CudaVmmBackend does.
+vmm = [
+    "cuda-python>=12.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/modelexpress"

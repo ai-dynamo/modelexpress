@@ -318,7 +318,9 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` backend) |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
-| `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor (typically 80-99% fewer registrations) without changing transfer semantics. |
+| `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
+| `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `_vmm_alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
+| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
@@ -377,6 +379,43 @@ for clusters with multiple rate tiers in the compute fabric.
 `MX_RDMA_NIC_PIN` also accepts a comma-separated NIC list indexed by
 `device_id` for unusual topologies where the auto-probe can't infer
 the mapping.
+
+### VMM Arena (Single-MR Registration)
+
+`MX_VMM_ARENA=1` installs a `CUDAPluggableAllocator` that routes weight
+allocations issued during `initialize_model`, `load_weights`, and
+`process_weights_after_loading` into a CUDA VMM arena. The arena reserves
+16.0 TiB of virtual address space at startup with `cuMemAddressReserve`.
+That reservation only consumes VA. It does not commit VRAM until an
+allocation is mapped with `cuMemMap`, so the large default is safe on CUDA
+systems with a 49-bit device VA space.
+
+Each allocation from PyTorch maps its own physical VMM handle at the next
+arena address. Frees unmap and release that handle, so replacement tensors
+created during post-processing can return physical memory before the final
+registration step. At end-of-load, ModelExpress registers the used arena
+range once through dmabuf and publishes all tensor descriptors against
+that single MR.
+
+Recommended source-worker setting:
+
+```bash
+MX_VMM_ARENA=1
+UCX_CUDA_COPY_REG_WHOLE_ALLOC=off
+```
+
+`MX_POOL_REG=1` is not required for the arena path. Pool-reg still helps
+non-arena deployments by deduplicating normal cudaMalloc allocations, but
+arena registration bypasses the pool-reg path and calls `register_arena`
+directly. The arena produces one MR for the used range regardless of the
+pool-reg setting.
+
+Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` until the upstream UCX
+`cuda_copy_md` length-truncation fix ships. Without it, UCX can truncate
+a multi-handle VMM registration to the first physical handle, and RDMA
+operations that cross into later handles fail. See the reproducer and
+fix notes in this gist:
+<https://gist.github.com/nicolasnoble/e0e57eb5a1b902057ae3d1df59c039cf>.
 
 ### P2P Metadata Exchange (Opt-In)
 
