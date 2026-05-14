@@ -8,11 +8,12 @@ without crashing at import time. The backend itself only works on a host
 with CUDA + GPUs; instantiating CudaVmmBackend will raise if cuda-python
 is not installed or the runtime is not available.
 
-GMS reference: dynamo lib/gpu_memory_service/common/cuda_utils.py for the
-analogous primitives. We diverge from GMS in that each backend.allocate
-call creates and maps exactly one physical chunk at the requested VA,
-matching the per-PyTorch-segment shape rather than GMS's per-handle
-IPC-export shape.
+Allocation shape: each ``backend.allocate`` call creates and maps exactly
+one physical chunk at the requested VA, matching the per-PyTorch-segment
+shape. Multi-chunk-per-allocation patterns (e.g. for IPC export of
+sub-handles) are out of scope here; PyTorch's caching allocator already
+amortizes tensor allocations into segments before reaching us, so one
+plugin call == one physical handle.
 """
 
 from __future__ import annotations

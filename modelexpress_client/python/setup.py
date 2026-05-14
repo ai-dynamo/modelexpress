@@ -7,9 +7,9 @@ Project metadata lives in pyproject.toml. This setup.py only adds the
 ext_modules entry that pyproject.toml can't express. Setuptools merges
 the two when both are present.
 
-Pattern follows dynamo's GMS setup.py - pure setuptools build, no CUDA
-or PyTorch dependency in the extension itself (the shim only uses the
-Python C API and dispatches to Python callbacks).
+Pure setuptools build, no CUDA or PyTorch dependency in the extension
+itself: the shim only uses the Python C API and dispatches to Python
+callbacks, so it builds anywhere with a C++ toolchain.
 
 Build-time failure of the C extension is non-fatal: pip install
 succeeds without it, and modelexpress.vmm.hook detects the missing

@@ -206,7 +206,7 @@ def publish_source_if_supported(result: LoadResult, ctx: LoadContext) -> None:
 def unpublish_metadata(ctx: LoadContext) -> None:
     """Stop heartbeat, stop worker gRPC server, and mark STALE on MX server.
 
-    Call before memory becomes invalid (e.g., GMS unmap during sleep).
+    Call before memory becomes invalid (e.g., VMM unmap during sleep).
     The NIXL agent stays alive — only the P2P serving state is torn down.
     Call publish_metadata() again after memory is valid to re-enter the
     P2P network.
