@@ -204,6 +204,63 @@ jobs:
         cargo-deny --version || cargo install cargo-deny@0.16.4
         cargo-deny --no-default-features check --hide-inclusion-graph licenses bans --config ${{ github.workspace }}/deny.toml
 
+  helm-chart:
+    name: Helm Chart Lint & Build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+      with:
+        version: v3.14.4
+
+    - name: Helm dependency build
+      run: helm dependency build helm/
+
+    - name: Helm lint (default values)
+      run: helm lint helm/
+
+    - name: Helm lint (all values variants)
+      run: |
+        for v in helm/values-development.yaml helm/values-production.yaml helm/values-local-storage.yaml helm/test-values.yaml; do
+          echo "=== Linting with $v ==="
+          helm lint helm/ -f "$v"
+        done
+
+    - name: Render templates for every values file
+      run: |
+        mkdir -p helm-artifacts/rendered
+        helm template modelexpress helm/ -f helm/values.yaml > helm-artifacts/rendered/values.rendered.yaml
+        for v in helm/values-development.yaml helm/values-production.yaml helm/values-local-storage.yaml helm/test-values.yaml; do
+          name=$(basename "$v" .yaml)
+          helm template modelexpress helm/ -f "$v" > "helm-artifacts/rendered/${name}.rendered.yaml"
+        done
+
+    - name: Package chart
+      run: |
+        mkdir -p helm-artifacts/package
+        helm package helm/ --destination helm-artifacts/package
+
+    - name: Build dependency manifest
+      run: |
+        cp helm/Chart.yaml helm-artifacts/Chart.yaml
+        if [ -f helm/Chart.lock ]; then cp helm/Chart.lock helm-artifacts/Chart.lock; fi
+        grep -hE '^\s*image:\s*' helm-artifacts/rendered/*.rendered.yaml \
+          | sed -E 's/^[[:space:]]*image:[[:space:]]*"?([^"]+)"?[[:space:]]*$/\1/' \
+          | sort -u > helm-artifacts/images.txt
+        echo "=== Images referenced by the chart ==="
+        cat helm-artifacts/images.txt
+
+    - name: Upload helm chart dependencies artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: helm-chart-dependencies
+        path: helm-artifacts/
+        retention-days: 30
+
   code-coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
