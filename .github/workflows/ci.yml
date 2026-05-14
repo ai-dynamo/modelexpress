@@ -5,11 +5,10 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
-  pull_request:
     branches:
       - main
       - 'release/*'
+      - 'pull-request/*'
 
 env:
   CARGO_TERM_COLOR: always
