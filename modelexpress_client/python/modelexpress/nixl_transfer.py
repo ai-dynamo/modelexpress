@@ -176,6 +176,38 @@ class NixlTransferManager:
             elif "UCX_TLS" in os.environ:
                 os.environ.pop("UCX_TLS")
 
+    def _build_tensor_descriptors(
+        self, tensors: dict[str, torch.Tensor]
+    ) -> list[TensorDescriptor]:
+        """Build NIXL TensorDescriptors from a name -> tensor mapping.
+
+        Validates each tensor is contiguous (non-contiguous tensors would
+        require copies that misalign RDMA writes) and records the tensor
+        objects + descriptor list on self for the receiver path to resolve
+        descriptors back by name.
+
+        CRITICAL: self._tensors must hold the SAME tensor objects as
+        param.data in vLLM. Do NOT call .contiguous() here - that would
+        create copies and RDMA writes would land in the wrong memory.
+        """
+        self._tensors = tensors
+        tensor_descriptors = []
+        for name, tensor in tensors.items():
+            if not tensor.is_contiguous():
+                raise RuntimeError(
+                    f"Tensor '{name}' is not contiguous. "
+                    "Non-contiguous tensors cannot be used for RDMA transfers."
+                )
+            tensor_descriptors.append(TensorDescriptor(
+                name=name,
+                addr=tensor.data_ptr(),
+                size=tensor.numel() * tensor.element_size(),
+                device_id=self._device_id,
+                dtype=str(tensor.dtype),
+            ))
+        self._tensor_descriptors = tensor_descriptors
+        return tensor_descriptors
+
     def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
         """
         Register tensors with NIXL for RDMA access.
@@ -205,24 +237,7 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        self._tensors = tensors
-        tensor_descriptors = []
-
-        for name, tensor in tensors.items():
-            if not tensor.is_contiguous():
-                raise RuntimeError(
-                    f"Tensor '{name}' is not contiguous. "
-                    "Non-contiguous tensors cannot be used for RDMA transfers."
-                )
-            tensor_descriptors.append(TensorDescriptor(
-                name=name,
-                addr=tensor.data_ptr(),
-                size=tensor.numel() * tensor.element_size(),
-                device_id=self._device_id,
-                dtype=str(tensor.dtype),
-            ))
-
-        self._tensor_descriptors = tensor_descriptors
+        tensor_descriptors = self._build_tensor_descriptors(tensors)
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
@@ -300,22 +315,7 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        self._tensors = tensors
-        tensor_descriptors = []
-        for name, tensor in tensors.items():
-            if not tensor.is_contiguous():
-                raise RuntimeError(
-                    f"Tensor '{name}' is not contiguous. "
-                    "Non-contiguous tensors cannot be used for RDMA transfers."
-                )
-            tensor_descriptors.append(TensorDescriptor(
-                name=name,
-                addr=tensor.data_ptr(),
-                size=tensor.numel() * tensor.element_size(),
-                device_id=self._device_id,
-                dtype=str(tensor.dtype),
-            ))
-        self._tensor_descriptors = tensor_descriptors
+        tensor_descriptors = self._build_tensor_descriptors(tensors)
 
         base, used = arena.registered_range()
         if used == 0:
