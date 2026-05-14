@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from modelexpress.vmm_arena import (
+from modelexpress.vmm.arena import (
     DEFAULT_VA_RESERVE,
     VmmArena,
     VmmArenaError,

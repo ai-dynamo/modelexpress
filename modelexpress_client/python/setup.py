@@ -12,7 +12,7 @@ or PyTorch dependency in the extension itself (the shim only uses the
 Python C API and dispatches to Python callbacks).
 
 Build-time failure of the C extension is non-fatal: pip install
-succeeds without it, and modelexpress.vmm_hook detects the missing
+succeeds without it, and modelexpress.vmm.hook detects the missing
 extension at runtime and disables the arena allocator. Users without a
 working C++ compiler get the pool-reg path; users with one get the
 arena+pool-reg fast path.
@@ -39,12 +39,12 @@ _OPTIONAL_EXT_ERRORS = (
 class BuildExtension(build_ext):
     """Custom build extension that respects $CXX and is best-effort.
 
-    The _vmm_alloc_ext C extension is OPTIONAL. If compilation fails
-    for any reason (no compiler installed, header mismatch, sandbox
-    restrictions), this build_ext catches the error and emits a
-    warning instead of aborting the install. The resulting wheel is
-    pure-Python; the runtime detects the missing .so and falls back
-    gracefully.
+    The modelexpress.vmm._alloc_ext C extension is OPTIONAL. If
+    compilation fails for any reason (no compiler installed, header
+    mismatch, sandbox restrictions), this build_ext catches the error
+    and emits a warning instead of aborting the install. The resulting
+    wheel is pure-Python; the runtime detects the missing .so and falls
+    back gracefully.
     """
 
     def build_extensions(self):
@@ -64,7 +64,7 @@ class BuildExtension(build_ext):
             self._warn_optional_skip(e, ext_name=ext.name)
 
     @staticmethod
-    def _warn_optional_skip(exc, ext_name="modelexpress._vmm_alloc_ext"):
+    def _warn_optional_skip(exc, ext_name="modelexpress.vmm._alloc_ext"):
         msg = (
             f"Failed to build optional C extension {ext_name}: "
             f"{type(exc).__name__}: {exc}. "
@@ -80,8 +80,8 @@ def _ext_modules():
     extra_compile_args = ["-std=c++17", "-O3", "-fPIC"]
     return [
         Extension(
-            name="modelexpress._vmm_alloc_ext",
-            sources=["modelexpress/_vmm_alloc_ext.cpp"],
+            name="modelexpress.vmm._alloc_ext",
+            sources=["modelexpress/vmm/_alloc_ext.cpp"],
             extra_compile_args=extra_compile_args,
             optional=True,
         ),

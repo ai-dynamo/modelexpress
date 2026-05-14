@@ -17,7 +17,7 @@ from ..client import MxClientBase
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter
     from ..nixl_transfer import NixlTransferManager
-    from ..vmm_arena import VmmArena
+    from ..vmm import VmmArena
     from sglang.srt.configs.load_config import LoadConfig as SglangLoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from vllm.config import ModelConfig as VllmModelConfig

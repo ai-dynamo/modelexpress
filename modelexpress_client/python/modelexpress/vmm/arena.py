@@ -30,7 +30,7 @@ from typing import Protocol
 logger = logging.getLogger(__name__)
 
 try:
-    _vmm_alloc_ext = importlib.import_module("modelexpress._vmm_alloc_ext")
+    _vmm_alloc_ext = importlib.import_module("modelexpress.vmm._alloc_ext")
 except ImportError as e:  # pragma: no cover - covered through vmm_hook fallback tests
     _vmm_alloc_ext = None
     _EXT_IMPORT_ERROR = e

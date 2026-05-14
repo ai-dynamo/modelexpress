@@ -682,7 +682,7 @@ static PyModuleDef_Slot module_slots[] = {
 
 static struct PyModuleDef vmm_alloc_module = {
     PyModuleDef_HEAD_INIT,
-    "_vmm_alloc_ext",
+    "_alloc_ext",
     "CUDAPluggableAllocator shim for the VmmArena",
     0,
     module_methods,
@@ -696,7 +696,7 @@ static struct PyModuleDef vmm_alloc_module = {
     nullptr};
 
 PyMODINIT_FUNC
-PyInit__vmm_alloc_ext(void)
+PyInit__alloc_ext(void)
 {
 #if PY_VERSION_HEX >= 0x030D0000 && defined(Py_mod_gil)
   return PyModuleDef_Init(&vmm_alloc_module);

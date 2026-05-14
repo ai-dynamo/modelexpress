@@ -106,19 +106,19 @@ def _maybe_enter_vmm_arena(ctx: LoadContext) -> Iterator[None]:
     """If MX_VMM_ARENA=1 is set, install a VmmArena hook around the load
     envelope. Otherwise yield without installing anything.
 
-    Engine integration seam. The arena core (`vmm_arena.py`,
-    `vmm_backend.py`, `vmm_hook.py`, `_vmm_alloc_ext.cpp`) is
-    engine-agnostic - it only requires PyTorch's CUDAPluggableAllocator
-    interface. This function is the only vLLM-aware piece: it reads the
-    MX_VMM_ARENA* env vars, identifies vLLM's load envelope and target
-    device, manages per-device arena lifetime, and wraps
-    `vmm_hook.use_arena` around the load body. To add a different
-    PyTorch-based engine, write an equivalent helper in a sibling
-    `engines/<engine>/` module that knows the engine's load envelope and
-    device-context shape; reuse `use_arena` as-is. Non-PyTorch engines
-    would need a different dispatch shim - the bump allocator and cuMem*
-    backend would still be reusable, but the CUDAPluggableAllocator hook
-    layer would not apply.
+    Engine integration seam. The arena core (`modelexpress.vmm`
+    subpackage: `arena.py`, `backend.py`, `hook.py`, `_alloc_ext.cpp`)
+    is engine-agnostic - it only requires PyTorch's
+    CUDAPluggableAllocator interface. This function is the only
+    vLLM-aware piece: it reads the MX_VMM_ARENA* env vars, identifies
+    vLLM's load envelope and target device, manages per-device arena
+    lifetime, and wraps `vmm.use_arena` around the load body. To add a
+    different PyTorch-based engine, write an equivalent helper in a
+    sibling `engines/<engine>/` module that knows the engine's load
+    envelope and device-context shape; reuse `use_arena` as-is.
+    Non-PyTorch engines would need a different dispatch shim - the
+    bump allocator and cuMem* backend would still be reusable, but the
+    CUDAPluggableAllocator hook layer would not apply.
 
     Tunable:
         MX_VMM_ARENA=1                 enable. The only knob.
@@ -176,29 +176,31 @@ def _maybe_enter_vmm_arena(ctx: LoadContext) -> Iterator[None]:
                 stale_var,
             )
 
-    # The _vmm_alloc_ext C extension is built optional (see setup.py).
-    # If a working compiler wasn't available at install time, the .so is
-    # absent and the arena machinery cannot be installed. Fall back to
-    # the non-arena path with a clear warning rather than crashing the
-    # load.
-    from ...vmm_hook import ARENA_AVAILABLE
+    # The modelexpress.vmm._alloc_ext C extension is built optional (see
+    # setup.py). If a working compiler wasn't available at install time,
+    # the .so is absent and the arena machinery cannot be installed.
+    # Fall back to the non-arena path with a clear warning rather than
+    # crashing the load.
+    from ...vmm.hook import ARENA_AVAILABLE
 
     if not ARENA_AVAILABLE:
         logger.warning(
-            "[Worker %d] MX_VMM_ARENA=1 set but _vmm_alloc_ext C extension is "
-            "unavailable; falling back to the non-arena load path. Pool-reg "
-            "(MX_POOL_REG=1) still works. Reinstall modelexpress with a "
-            "working C++ compiler to enable the arena fast path.",
+            "[Worker %d] MX_VMM_ARENA=1 set but the modelexpress.vmm._alloc_ext "
+            "C extension is unavailable; falling back to the non-arena load "
+            "path. Pool-reg (MX_POOL_REG=1) still works. Reinstall "
+            "modelexpress with a working C++ compiler to enable the arena "
+            "fast path.",
             ctx.global_rank,
         )
         yield
         return
 
     # Lazy imports - keep the cuda-python dependency optional for users
-    # who don't enable the arena.
-    from ...vmm_arena import VmmArena
-    from ...vmm_backend import CudaVmmBackend
-    from ...vmm_hook import use_arena
+    # who don't enable the arena. Import from submodules directly so test
+    # monkeypatches on `modelexpress.vmm.{backend,hook}.X` are picked up.
+    from ...vmm.arena import VmmArena
+    from ...vmm.backend import CudaVmmBackend
+    from ...vmm.hook import use_arena
 
     if ctx.device_id in _vmm_arenas:
         # Pre-existing arena from a prior load_model on the same worker.

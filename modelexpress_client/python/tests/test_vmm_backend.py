@@ -66,14 +66,14 @@ def cuda_init():
 
 class TestConstruction:
     def test_can_construct(self, cuda_init):
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         assert backend.device == cuda_init
         assert backend.allocation_granularity() > 0
 
     def test_granularity_is_power_of_2(self, cuda_init):
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -98,7 +98,7 @@ class TestConstruction:
 
 class TestAllocationLifecycle:
     def test_reserve_returns_nonzero_va(self, cuda_init):
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         size = backend.allocation_granularity() * 4
@@ -111,7 +111,7 @@ class TestAllocationLifecycle:
             backend.release_reserve(base, size)
 
     def test_reserve_rounds_up(self, cuda_init):
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -126,7 +126,7 @@ class TestAllocationLifecycle:
     def test_allocate_basic(self, cuda_init):
         import torch
 
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -151,7 +151,7 @@ class TestAllocationLifecycle:
     def test_deallocate_releases_memory(self, cuda_init):
         import torch
 
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -182,8 +182,8 @@ class TestArenaWithRealBackend:
         """Confirm tensor writes/reads through the arena address."""
         import torch
 
-        from modelexpress.vmm_arena import VmmArena
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -208,8 +208,8 @@ class TestArenaWithRealBackend:
         """Each malloc maps one physical handle and increases mapped bytes."""
         import torch
 
-        from modelexpress.vmm_arena import VmmArena
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -235,8 +235,8 @@ class TestArenaWithRealBackend:
     def test_free_releases_one_allocation(self, cuda_init):
         import torch
 
-        from modelexpress.vmm_arena import VmmArena
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()
@@ -258,8 +258,8 @@ class TestArenaWithRealBackend:
     def test_close_releases_all_allocations(self, cuda_init):
         import torch
 
-        from modelexpress.vmm_arena import VmmArena
-        from modelexpress.vmm_backend import CudaVmmBackend
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
 
         backend = CudaVmmBackend(device=cuda_init)
         gran = backend.allocation_granularity()

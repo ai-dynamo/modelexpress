@@ -25,18 +25,18 @@ class TestExtensionLoad:
 
     @pytest.fixture(autouse=True)
     def _ensure_arena_available(self):
-        from modelexpress import vmm_hook
+        from modelexpress.vmm import hook as vmm_hook
 
         if not vmm_hook.ARENA_AVAILABLE:
             pytest.skip("C extension not built; arena fast path disabled")
 
     def test_can_import(self):
-        from modelexpress import _vmm_alloc_ext
+        from modelexpress.vmm import _alloc_ext as _vmm_alloc_ext
 
         assert hasattr(_vmm_alloc_ext, "init_module")
 
     def test_init_module_accepts_callables(self):
-        from modelexpress import _vmm_alloc_ext
+        from modelexpress.vmm import _alloc_ext as _vmm_alloc_ext
 
         called: dict[str, list] = {"malloc": [], "free": []}
 
@@ -51,7 +51,7 @@ class TestExtensionLoad:
         # init_module returns None on success.
 
     def test_init_module_rejects_non_callable(self):
-        from modelexpress import _vmm_alloc_ext
+        from modelexpress.vmm import _alloc_ext as _vmm_alloc_ext
 
         with pytest.raises(TypeError):
             _vmm_alloc_ext.init_module(42, 43)
@@ -71,7 +71,7 @@ class TestVmmHookPlumbing:
     """
 
     def test_malloc_with_no_arena_returns_zero(self):
-        from modelexpress import vmm_hook
+        from modelexpress.vmm import hook as vmm_hook
 
         # Reset state
         vmm_hook._active_arena = None
@@ -79,8 +79,8 @@ class TestVmmHookPlumbing:
         assert addr == 0
 
     def test_malloc_dispatches_to_active_arena(self):
-        from modelexpress import vmm_hook
-        from modelexpress.vmm_arena import VmmArena
+        from modelexpress.vmm import hook as vmm_hook
+        from modelexpress.vmm.arena import VmmArena
 
         arena = VmmArena(total_bytes=1 << 30)
         vmm_hook._active_arena = arena
@@ -95,15 +95,15 @@ class TestVmmHookPlumbing:
             vmm_hook._active_arena = None
 
     def test_free_with_no_arena_is_silent(self):
-        from modelexpress import vmm_hook
+        from modelexpress.vmm import hook as vmm_hook
 
         vmm_hook._active_arena = None
         # Must not raise
         vmm_hook._mx_free(0xDEADBEEF, 1024, 0, 0)
 
     def test_free_dispatches_to_arena(self):
-        from modelexpress import vmm_hook
-        from modelexpress.vmm_arena import VmmArena
+        from modelexpress.vmm import hook as vmm_hook
+        from modelexpress.vmm.arena import VmmArena
 
         arena = VmmArena(total_bytes=1 << 30)
         vmm_hook._active_arena = arena
@@ -165,9 +165,9 @@ class TestUseArenaWithMemPool:
         """Inside use_arena, torch.empty allocations must come from the arena."""
         import torch
 
-        from modelexpress.vmm_arena import VmmArena
-        from modelexpress.vmm_backend import CudaVmmBackend
-        from modelexpress.vmm_hook import use_arena
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
+        from modelexpress.vmm.hook import use_arena
 
         backend = CudaVmmBackend(device=0)
         gran = backend.allocation_granularity()
@@ -197,9 +197,9 @@ class TestUseArenaWithMemPool:
         assert t.numel() == 1024
 
     def test_nesting_raises(self):
-        from modelexpress.vmm_arena import VmmArena
-        from modelexpress.vmm_backend import CudaVmmBackend
-        from modelexpress.vmm_hook import use_arena
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
+        from modelexpress.vmm.hook import use_arena
 
         backend = CudaVmmBackend(device=0)
         gran = backend.allocation_granularity()
@@ -231,20 +231,20 @@ class TestOptionalExtension:
     """
 
     def test_arena_available_flag_is_bool(self):
-        from modelexpress import vmm_hook
+        from modelexpress.vmm import hook as vmm_hook
 
         assert isinstance(vmm_hook.ARENA_AVAILABLE, bool)
 
     def test_arena_unavailable_error_subclasses_runtimeerror(self):
-        from modelexpress.vmm_hook import ArenaUnavailableError
+        from modelexpress.vmm.hook import ArenaUnavailableError
 
         assert issubclass(ArenaUnavailableError, RuntimeError)
 
     def test_ensure_callbacks_raises_when_unavailable(self, monkeypatch):
         """Simulate a missing/unbuilt C extension and verify the hook
         raises ArenaUnavailableError instead of an opaque ImportError."""
-        from modelexpress import vmm_hook
-        from modelexpress.vmm_hook import ArenaUnavailableError
+        from modelexpress.vmm import hook as vmm_hook
+        from modelexpress.vmm.hook import ArenaUnavailableError
 
         # Reset _callbacks_initialized so the guard doesn't short-circuit.
         monkeypatch.setattr(vmm_hook, "_callbacks_initialized", False)
@@ -262,7 +262,7 @@ class TestOptionalExtension:
         """When MX_VMM_ARENA=1 but ARENA_AVAILABLE=False, the vllm loader
         helper should yield without installing arena machinery and emit a
         warning, not crash."""
-        from modelexpress import vmm_hook
+        from modelexpress.vmm import hook as vmm_hook
         from modelexpress.engines.vllm import loader as vllm_loader
 
         monkeypatch.setenv("MX_VMM_ARENA", "1")
@@ -285,7 +285,7 @@ class TestOptionalExtension:
 
         # And we must have surfaced a warning so the user can see why.
         assert any(
-            "MX_VMM_ARENA=1 set but _vmm_alloc_ext" in rec.message
+            "MX_VMM_ARENA=1 set but the modelexpress.vmm._alloc_ext" in rec.message
             for rec in caplog.records
         ), (
             "expected fallback warning in caplog; got: "
@@ -375,7 +375,7 @@ class TestLoaderLifecycle:
 
     @pytest.fixture(autouse=True)
     def _ensure_arena_available(self):
-        from modelexpress import vmm_hook
+        from modelexpress.vmm import hook as vmm_hook
 
         if not vmm_hook.ARENA_AVAILABLE:
             pytest.skip("C extension not built; loader tests need ARENA_AVAILABLE")
@@ -388,7 +388,7 @@ class TestLoaderLifecycle:
 
         monkeypatch.setattr(vllm_loader, "_vmm_arenas", {})
         monkeypatch.setattr(
-            "modelexpress.vmm_backend.CudaVmmBackend", _StubCudaVmmBackend
+            "modelexpress.vmm.backend.CudaVmmBackend", _StubCudaVmmBackend
         )
 
         if use_arena_factory is None:
@@ -397,9 +397,9 @@ class TestLoaderLifecycle:
             def _stub_use_arena(arena, device):
                 yield
 
-            monkeypatch.setattr("modelexpress.vmm_hook.use_arena", _stub_use_arena)
+            monkeypatch.setattr("modelexpress.vmm.hook.use_arena", _stub_use_arena)
         else:
-            monkeypatch.setattr("modelexpress.vmm_hook.use_arena", use_arena_factory)
+            monkeypatch.setattr("modelexpress.vmm.hook.use_arena", use_arena_factory)
 
         return vllm_loader
 

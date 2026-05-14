@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Iterator
 if TYPE_CHECKING:
     import torch
 
-    from .vmm_arena import VmmArena
+    from .arena import VmmArena
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def _probe_extension():
     Returns (module_or_None, available_bool, error_or_None).
     """
     try:
-        ext = importlib.import_module("modelexpress._vmm_alloc_ext")
+        ext = importlib.import_module("modelexpress.vmm._alloc_ext")
         return ext, True, None
     except ImportError as e:
         return None, False, e
