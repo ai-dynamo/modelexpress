@@ -16,12 +16,15 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from . import ucx_utils
 from .types import ManifestMismatchError, TensorDescriptor
+
+if TYPE_CHECKING:
+    from .vmm.arena import VmmArena
 
 logger = logging.getLogger("modelexpress.nixl_transfer")
 
@@ -267,7 +270,7 @@ class NixlTransferManager:
 
         return self._metadata
 
-    def register_arena(self, arena: Any, tensors: dict[str, torch.Tensor]) -> bytes:
+    def register_arena(self, arena: VmmArena, tensors: dict[str, torch.Tensor]) -> bytes:
         """Register a VmmArena's full bump range as a single NIXL region.
 
         The arena owns a contiguous VA range; at end-of-load the bump
