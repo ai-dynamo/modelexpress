@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+concurrency:
+  # The group name is the ref_name, so that workflows on the same PR/branch have the same group name for cancelling.
+  group: docker-build-test-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test1:
+    runs-on: prod-modelexpress-default-small-v1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Test
+        run: echo "Hello World"
+
+  test2:
+    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Test
+        run: echo "Hello World"
