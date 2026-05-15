@@ -183,9 +183,17 @@ class VmmArena:
             )
         if total_bytes <= 0:
             raise ValueError("total_bytes must be positive")
+        if backend is None:
+            raise ValueError(
+                "backend is required: pass CudaVmmBackend(device=...) for "
+                "production or _StubBackend() for tests. The previous "
+                "implicit-stub default made production callers silently "
+                "fall through to fake addresses if the backend kwarg was "
+                "forgotten."
+            )
 
         self._device = device
-        self._backend: VmmBackend = backend if backend is not None else _StubBackend()
+        self._backend: VmmBackend = backend
         self._granularity = self._backend.allocation_granularity()
         if self._granularity <= 0 or (self._granularity & (self._granularity - 1)) != 0:
             raise VmmArenaError(
@@ -196,13 +204,28 @@ class VmmArena:
         rounded = ((total_bytes + self._granularity - 1) // self._granularity) * self._granularity
         self._total_bytes = rounded
         self._base = self._backend.reserve(rounded)
-        self._capsule = _vmm_alloc_ext.arena_create(
-            self._base,
-            self._total_bytes,
-            self._granularity,
-            self._perform_cuda_alloc,
-            self._perform_cuda_dealloc,
-        )
+        try:
+            self._capsule = _vmm_alloc_ext.arena_create(
+                self._base,
+                self._total_bytes,
+                self._granularity,
+                self._perform_cuda_alloc,
+                self._perform_cuda_dealloc,
+            )
+        except BaseException:
+            # arena_create raised after reserve() succeeded; release the
+            # VA range so it doesn't leak.
+            try:
+                self._backend.release_reserve(self._base, self._total_bytes)
+            except Exception:
+                logger.warning(
+                    "failed to roll back reserved VA range for "
+                    "base=0x%x total=%d after arena_create failure",
+                    self._base,
+                    self._total_bytes,
+                    exc_info=True,
+                )
+            raise
 
         logger.debug(
             "VmmArena reserved base=0x%x total=%d granularity=%d device=%d",

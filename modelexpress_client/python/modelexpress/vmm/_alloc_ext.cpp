@@ -437,7 +437,11 @@ py_arena_free(PyObject* self, PyObject* args)
   if (!state) {
     return nullptr;
   }
-  arena_free_impl(state, static_cast<uintptr_t>(ptr), false);
+  // write_unraisable=true so dealloc errors surface via sys.unraisablehook
+  // instead of being silently cleared. Direct-Python callers (arena.free)
+  // get the same error visibility as the PyTorch CUDAPluggableAllocator
+  // path (mx_free).
+  arena_free_impl(state, static_cast<uintptr_t>(ptr), true);
   Py_RETURN_NONE;
 }
 

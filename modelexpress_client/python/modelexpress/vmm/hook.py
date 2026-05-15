@@ -183,8 +183,12 @@ def use_arena(arena: "VmmArena", device: "torch.device | int") -> Iterator[None]
                 "another VmmArena is already active; use_arena does not "
                 "support nesting or concurrent activation"
             )
-        _active_arena = arena
+        # Update the C extension first, then the Python mirror. If the
+        # extension call raises (bad capsule, type error), _active_arena
+        # stays None and subsequent use_arena() calls aren't permanently
+        # wedged with a stale "already active" error.
         _vmm_alloc_ext.set_active_arena(arena.capsule)
+        _active_arena = arena
 
     try:
         with torch.cuda.use_mem_pool(_mem_pool, device=device):

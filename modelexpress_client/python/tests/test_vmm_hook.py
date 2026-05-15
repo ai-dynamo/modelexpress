@@ -80,9 +80,9 @@ class TestVmmHookPlumbing:
 
     def test_malloc_dispatches_to_active_arena(self):
         from modelexpress.vmm import hook as vmm_hook
-        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.arena import VmmArena, _StubBackend
 
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         vmm_hook._active_arena = arena
         try:
             addr = vmm_hook._mx_malloc(1024, 0, 0)
@@ -103,9 +103,9 @@ class TestVmmHookPlumbing:
 
     def test_free_dispatches_to_arena(self):
         from modelexpress.vmm import hook as vmm_hook
-        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.arena import VmmArena, _StubBackend
 
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         vmm_hook._active_arena = arena
         try:
             addr = vmm_hook._mx_malloc(1024, 0, 0)

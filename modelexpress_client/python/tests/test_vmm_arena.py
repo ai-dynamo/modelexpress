@@ -38,7 +38,7 @@ _GRAN = 2 * 1024 * 1024
 
 class TestConstruction:
     def test_basic(self):
-        arena = VmmArena()
+        arena = VmmArena(backend=_StubBackend())
         assert arena.total_bytes == DEFAULT_VA_RESERVE
         assert arena.used_bytes == 0
         assert arena.mapped_bytes == 0
@@ -51,27 +51,27 @@ class TestConstruction:
         assert DEFAULT_VA_RESERVE == 16 * 1024 * 1024 * 1024 * 1024
 
     def test_explicit_total_bytes(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         assert arena.total_bytes == 1 << 30
 
     def test_rounds_total_up_to_granularity(self):
         # 300 MiB is not a multiple of 2 MiB; rounds up to 300 MiB
         # exactly (300 MiB IS a multiple of 2 MiB). Use a non-multiple
         # value to actually trigger rounding.
-        arena = VmmArena(total_bytes=300 * 1024 * 1024 + 1)
+        arena = VmmArena(total_bytes=300 * 1024 * 1024 + 1, backend=_StubBackend())
         assert arena.total_bytes == 300 * 1024 * 1024 + _GRAN
 
     def test_exact_granularity_multiple_not_padded(self):
-        arena = VmmArena(total_bytes=512 * 1024 * 1024)
+        arena = VmmArena(total_bytes=512 * 1024 * 1024, backend=_StubBackend())
         assert arena.total_bytes == 512 * 1024 * 1024
 
     def test_rejects_zero_total(self):
         with pytest.raises(ValueError):
-            VmmArena(total_bytes=0)
+            VmmArena(total_bytes=0, backend=_StubBackend())
 
     def test_rejects_negative_total(self):
         with pytest.raises(ValueError):
-            VmmArena(total_bytes=-1)
+            VmmArena(total_bytes=-1, backend=_StubBackend())
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +101,7 @@ class TestBackendOnConstruction:
 
 class TestMalloc:
     def test_returns_granularity_aligned_addresses(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         a = arena.malloc(1024)
         b = arena.malloc(1024)
         # Every malloc rounds size up to granularity, so a and b are
@@ -112,7 +112,7 @@ class TestMalloc:
         assert b - a >= _GRAN  # smallest possible step is one granularity unit
 
     def test_first_malloc_at_base(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         a = arena.malloc(1024)
         assert a == arena.base
 
@@ -128,17 +128,17 @@ class TestMalloc:
         # alignment <= granularity is acceptable; the bump pointer is
         # already granularity-aligned so any smaller alignment is
         # implicitly satisfied.
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.malloc(1, alignment=256)
         arena.malloc(1, alignment=4096)  # 4 KiB < 2 MiB granularity
 
     def test_alignment_exceeding_granularity_rejected(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         with pytest.raises(ValueError, match="exceeds backend granularity"):
             arena.malloc(1, alignment=_GRAN * 2)
 
     def test_tracks_live_allocation_count(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.malloc(100)
         arena.malloc(200)
         assert arena.live_allocation_count == 2
@@ -153,14 +153,14 @@ class TestMalloc:
         assert len(backend.allocations) == 10
 
     def test_used_bytes_advances_by_aligned_size(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.malloc(100)
         assert arena.used_bytes == _GRAN
         arena.malloc(200)
         assert arena.used_bytes == 2 * _GRAN
 
     def test_overflow_raises(self):
-        arena = VmmArena(total_bytes=4 * _GRAN)
+        arena = VmmArena(total_bytes=4 * _GRAN, backend=_StubBackend())
         arena.malloc(_GRAN)
         arena.malloc(_GRAN)
         arena.malloc(_GRAN)
@@ -169,29 +169,29 @@ class TestMalloc:
             arena.malloc(1)
 
     def test_overflow_at_boundary(self):
-        arena = VmmArena(total_bytes=_GRAN)
+        arena = VmmArena(total_bytes=_GRAN, backend=_StubBackend())
         arena.malloc(_GRAN)
         with pytest.raises(VmmArenaError):
             arena.malloc(1)
 
     def test_after_close_raises(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.close()
         with pytest.raises(VmmArenaError, match="closed"):
             arena.malloc(100)
 
     def test_zero_size_rejected(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         with pytest.raises(ValueError):
             arena.malloc(0)
 
     def test_negative_size_rejected(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         with pytest.raises(ValueError):
             arena.malloc(-1)
 
     def test_addresses_are_unique(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         addrs = [arena.malloc(1024) for _ in range(100)]
         assert len(set(addrs)) == 100
 
@@ -212,7 +212,7 @@ class TestFree:
         assert d_va == va
 
     def test_free_reduces_mapped_bytes(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         va1 = arena.malloc(1024)
         va2 = arena.malloc(1024)
         assert arena.mapped_bytes == 2 * _GRAN
@@ -223,14 +223,14 @@ class TestFree:
 
     def test_free_does_not_decrease_used_bytes(self):
         """Bump pointer is high-water; free reclaims VRAM but VA is not reused."""
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         va = arena.malloc(1024)
         used_after_alloc = arena.used_bytes
         arena.free(va)
         assert arena.used_bytes == used_after_alloc
 
     def test_free_unknown_ptr_is_silent(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         # PyTorch's caching allocator may free pointers we don't
         # recognize if our plugin was installed mid-stream. Must not
         # raise.
@@ -247,7 +247,7 @@ class TestFree:
         assert len(backend.deallocations) == 1
 
     def test_free_then_realloc_does_not_reuse_va(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         va1 = arena.malloc(1024)
         arena.free(va1)
         va2 = arena.malloc(1024)
@@ -261,20 +261,20 @@ class TestFree:
 
 class TestRegisteredRange:
     def test_returns_base_and_used_bytes(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.malloc(1024)
         base, used = arena.registered_range()
         assert base == arena.base
         assert used == _GRAN
 
     def test_empty_arena_zero_used(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         base, used = arena.registered_range()
         assert base == arena.base
         assert used == 0
 
     def test_grows_with_each_allocation(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.malloc(1024)
         _, u1 = arena.registered_range()
         arena.malloc(1024)
@@ -285,7 +285,7 @@ class TestRegisteredRange:
         """The registered range covers all VA ever allocated, including
         holes from frees. End-of-load registration via dmabuf pins the
         currently-mapped subset."""
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         va1 = arena.malloc(1024)
         arena.malloc(1024)
         _, u_before = arena.registered_range()
@@ -301,7 +301,7 @@ class TestRegisteredRange:
 
 class TestLifecycle:
     def test_close_idempotent(self):
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         arena.close()
         arena.close()  # must not raise
         assert arena.closed
@@ -412,10 +412,14 @@ class TestFailureHandling:
         va = arena.malloc(1024)
         assert va == arena.base + _GRAN
 
+    @pytest.mark.filterwarnings(
+        "ignore::pytest.PytestUnraisableExceptionWarning"
+    )
     def test_deallocate_failure_logged_not_raised(self):
-        """A backend deallocate error during free is logged but doesn't
-        propagate, because the only recovery is to drop our tracking
-        and let the user keep going."""
+        """A backend deallocate error during free does not propagate to
+        the caller, but it is no longer silently swallowed: the error
+        surfaces via sys.unraisablehook (which pytest captures as an
+        unraisable-exception warning) instead of PyErr_Clear()."""
         backend = _FailingDeallocateBackend()
         arena = VmmArena(total_bytes=1 << 30, backend=backend)
         va = arena.malloc(1024)
@@ -457,7 +461,7 @@ class TestRealisticWorkload:
         """Simulate the FP8 post-processing pattern: allocate BF16,
         free BF16, allocate FP8 replacement (smaller). mapped_bytes
         tracks the live state; used_bytes is the cumulative high-water."""
-        arena = VmmArena(total_bytes=1 << 30)
+        arena = VmmArena(total_bytes=1 << 30, backend=_StubBackend())
         # Pretend BF16 tensor.
         bf16 = arena.malloc(8 * 1024 * 1024)
         assert arena.mapped_bytes == 8 * 1024 * 1024
