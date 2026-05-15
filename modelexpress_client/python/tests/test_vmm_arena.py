@@ -121,7 +121,7 @@ class TestMalloc:
         arena = VmmArena(total_bytes=1 << 30, backend=backend)
         arena.malloc(1024)
         # Backend sees the granularity-rounded size, not the raw request.
-        va, size, handle = backend.allocations[0]
+        _va, size, _handle = backend.allocations[0]
         assert size == _GRAN
 
     def test_alignment_compatible_passes_through(self):
@@ -208,7 +208,7 @@ class TestFree:
         va = arena.malloc(1024)
         arena.free(va)
         assert len(backend.deallocations) == 1
-        d_va, d_size, d_handle = backend.deallocations[0]
+        d_va, _d_size, _d_handle = backend.deallocations[0]
         assert d_va == va
 
     def test_free_reduces_mapped_bytes(self):

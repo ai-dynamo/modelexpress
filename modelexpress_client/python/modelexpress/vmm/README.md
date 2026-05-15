@@ -16,12 +16,12 @@ on transfers that touch hundreds or thousands of tensors.
 
 Set one environment variable on the worker process:
 
-```
+```bash
 MX_VMM_ARENA=1
 ```
 
 That is the only knob. The arena enables itself on supported devices and
-falls back silently when the underlying C extension is missing.
+falls back with a warning when the underlying C extension is missing.
 
 ### Required deployment flag
 
@@ -31,7 +31,7 @@ against a multi-handle VMM range. Without the override, UCX truncates
 transfers to a single physical chunk. Until the upstream fix lands
 (openucx/ucx#11461), set:
 
-```
+```bash
 UCX_CUDA_COPY_REG_WHOLE_ALLOC=off
 ```
 
