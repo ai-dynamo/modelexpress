@@ -39,9 +39,8 @@ inputs:
     required: false
     default: 'Qwen/Qwen2.5-0.5B'
   hf_token:
-    description: 'HuggingFace token — written as hf-token-secret in the test namespace'
-    required: false
-    default: ''
+    description: 'HuggingFace token — written as hf-token-secret in the test namespace. Required: worker manifests reference the secret unconditionally.'
+    required: true
   source_extra_env:
     description: |
       KEY=VALUE pairs for the source manifest apply (one per line).
@@ -156,14 +155,6 @@ runs:
         kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
         echo "::endgroup::"
 
-    - name: Clear stale ModelMetadata CRs
-      if: inputs.source_extra_env != ''
-      shell: bash
-      env:
-        NAMESPACE: ${{ inputs.namespace }}
-      run: |
-        kubectl delete modelmetadata -n ${NAMESPACE} --all --ignore-not-found
-
     - name: Apply source manifest
       if: inputs.source_extra_env != ''
       shell: bash
@@ -205,6 +196,15 @@ runs:
           echo "No ModelMetadata CR yet, retrying in 10s..."
           sleep 10
         done
+        # The loop exits without error when the deadline fires. Without this
+        # final check, the next step would apply the target manifest against
+        # a namespace that has no ModelMetadata CR and the test would fail
+        # downstream with a confusing "no source worker for rank N" error
+        # instead of the actual root cause.
+        if ! kubectl get modelmetadata -n ${NAMESPACE} -o name 2>/dev/null | grep -q .; then
+          echo "ERROR: source did not publish metadata within ${TIMEOUT}s"
+          exit 1
+        fi
         echo "::endgroup::"
 
     - name: Apply manifest
@@ -304,5 +304,11 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
       run: |
         echo "::group::Delete namespace ${NAMESPACE}"
-        kubectl delete namespace ${NAMESPACE} --ignore-not-found --timeout=120s || true
+        # No `|| true` here on purpose: with per-run-id namespace names, an
+        # orphaned namespace from a failed cleanup would leak silently and
+        # accumulate over time (one new namespace per run, none ever GC'd).
+        # Surface the failure immediately so it can be investigated.
+        # 120s should be plenty for a normal delete; anything slower
+        # indicates a stuck finalizer.
+        kubectl delete namespace ${NAMESPACE} --ignore-not-found --timeout=120s
         echo "::endgroup::"

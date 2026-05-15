@@ -17,7 +17,7 @@ Both modes start an OpenAI-compatible HTTP server on WORKER_PORT.
 Environment variables:
   MODEL_NAME            — HuggingFace model id or local path
   WORKER_PORT           — port to serve on (default: 8000)
-  MX_SERVER_ADDRESS     — mx-server gRPC address (default: mx-server:8000)
+  MODEL_EXPRESS_URL     — mx-server gRPC address (default: mx-server:8000)
   TP_SIZE               — tensor parallel size (default: 1)
   MODEL_EXPRESS_SOURCE  — set to any non-empty value for source mode
 
@@ -44,7 +44,7 @@ def main() -> None:
 
     model = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-0.5B")
     port = int(os.environ.get("WORKER_PORT", "8000"))
-    mx_server = os.environ.get("MX_SERVER_ADDRESS", "mx-server:8000")
+    mx_server = os.environ.get("MODEL_EXPRESS_URL", "mx-server:8000")
     tp_size = int(os.environ.get("TP_SIZE", "1"))
 
     from tensorrt_llm.llmapi import LLM

@@ -23,14 +23,14 @@
 #
 # To add a new inference engine:
 #   1. Add ci/k8s/client/<engine>/Dockerfile
-#   2. Add ci/k8s/client/<engine>/manifest-gcp.yaml + test_p2p_k8s.py
+#   2. Add ci/k8s/client/<engine>/manifest-*.yaml + test_p2p_k8s.py
 #   3. Add an entry to the build and test matrix include lists below.
 #
 # Required secrets:
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
 #   MX_IMAGE_REPO                 — registry prefix (e.g. nvcr.io/nvidian/my-team)
 #   NGC_API_KEY                   — push/pull registry images + create in-cluster pull secret
-#   HF_TOKEN                      — HuggingFace token (optional; for gated models)
+#   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
 
 name: ModelExpress CI Tests
 
@@ -148,7 +148,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ensure-vcluster:
     name: Ensure vCluster
-    runs-on: prod-default-small-v2
+    runs-on: prod-modelexpress-default-small-v1
     permissions:
       contents: read
 
@@ -188,7 +188,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test:
     name: P2P test (${{ matrix.framework }})
-    runs-on: prod-default-small-v2
+    runs-on: prod-modelexpress-default-small-v1
     needs: [build, build-server, ensure-vcluster]
     permissions:
       contents: read
@@ -198,7 +198,7 @@ jobs:
       matrix:
         include:
           - framework: vllm
-            namespace: mx-ci-vllm
+            namespace: mx-ci-vllm-${{ github.run_id }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
             test_script: ci/k8s/client/test_p2p_k8s.py
             source_extra_env: "JOB_NAME=mx-source"
@@ -206,7 +206,7 @@ jobs:
             source_port: "8001"
             worker_port: "8002"
           - framework: trt-llm
-            namespace: mx-ci-trt-llm
+            namespace: mx-ci-trt-llm-${{ github.run_id }}
             manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
             test_script: ci/k8s/client/test_p2p_k8s.py
             pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
@@ -223,7 +223,7 @@ jobs:
           # delegates RDMA receive to the shared rdma_strategy.py which logs
           # the same line as vLLM. Uncomment once the base image is ready.
           # - framework: sglang
-          #   namespace: mx-ci-sglang
+          #   namespace: mx-ci-sglang-${{ github.run_id }}
           #   manifest: ci/k8s/client/sgl/manifest-azure.yaml
           #   test_script: ci/k8s/client/test_p2p_k8s.py
           #   source_extra_env: "JOB_NAME=mx-source"

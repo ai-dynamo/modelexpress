@@ -44,6 +44,12 @@ spec:
                   fieldPath: metadata.namespace
           ports:
             - containerPort: 8000
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              memory: "8Gi"
           readinessProbe:
             tcpSocket:
               port: 8000

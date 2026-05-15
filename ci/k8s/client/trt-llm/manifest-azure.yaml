@@ -97,13 +97,6 @@ spec:
               value: "${MX_CI_MODEL}"
             - name: WORKER_PORT
               value: "${WORKER_PORT}"
-            # MX_SERVER_ADDRESS is read by trtllm_p2p_launcher.py (target side
-            # via MxLiveCheckpointLoader). MODEL_EXPRESS_URL is read by
-            # publish_from_worker() on the source side. The two env var names
-            # are not aliased in trtllm_live_transfer.py, so both must be set
-            # to the same mx-server endpoint.
-            - name: MX_SERVER_ADDRESS
-              value: "mx-server:8000"
             - name: MODEL_EXPRESS_URL
               value: "mx-server:8000"
             - name: MODEL_EXPRESS_SOURCE
@@ -124,6 +117,11 @@ spec:
           ports:
             - containerPort: ${WORKER_PORT}
           resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
             limits:
               nvidia.com/gpu: "1"
               rdma/ib: "1"
