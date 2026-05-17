@@ -1,25 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Single-node vLLM deployment with ModelExpress P2P weight transfer.
-# Deploys Llama-3.1-405B-Instruct on 1 node (8 GPUs, TP=8).
+# Single-node SGLang deployment with ModelExpress P2P weight transfer.
 #
 # Prerequisites:
 #   - ModelExpress server deployed (see ../../server/)
+#   - SGLang image with modelexpress installed
 #   - PVC with model weights pre-downloaded
 #   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
-#
-# On startup, the mx loader queries the MX server:
-#   - If a ready source exists for this model -> receive weights via RDMA
-#   - If no source is available -> load weights from disk
-# Either way, the node registers with NIXL and publishes metadata so
-# future nodes can discover it as a source.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-vllm
+  name: mx-sglang
   labels:
-    app: mx-vllm
+    app: mx-sglang
 spec:
   type: ClusterIP
   ports:
@@ -27,110 +21,112 @@ spec:
       targetPort: 8000
       name: http
   selector:
-    app: mx-vllm
+    app: mx-sglang
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-vllm
+  name: mx-sglang
   labels:
-    app: mx-vllm
+    app: mx-sglang
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-vllm
+      app: mx-sglang
   template:
     metadata:
       labels:
-        app: mx-vllm
+        app: mx-sglang
     spec:
       containers:
-        - name: vllm
-          # Build a vLLM + ModelExpress client image using
-          # examples/p2p_transfer_k8s/client/vllm/Dockerfile
-          image: <your-registry>/modelexpress-client:latest
+        - name: sglang
+          # Build an SGLang + ModelExpress image using
+          # examples/p2p_transfer_k8s/client/sglang/Dockerfile
+          image: <your-registry>/sglang-modelexpress:latest
           imagePullPolicy: IfNotPresent
-          # Needed for GPUDirect RDMA to work.
           securityContext:
             capabilities:
               add:
                 - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+          args:
+            - --model-path
+            - $(MODEL_NAME)
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"url":"modelexpress-server:8001","transport":"nixl"}'
+            - --tp-size
+            - "8"
+            - --context-length
+            - "128000"
+            - --reasoning-parser
+            - kimi_k2
+            - --trust-remote-code
+          ports:
+            - containerPort: 8000
+              protocol: TCP
           env:
-            # Increase startup timeout to allow DeepGemm warmup to complete (2 hours)
-            - name: VLLM_RPC_TIMEOUT
-              value: "7200000"
-            - name: HF_HUB_CACHE
+            - name: HF_HOME
               value: "/models"
             - name: MODEL_NAME
-              value: "meta-llama/Llama-3.1-405B-Instruct"
-            # Register ModelExpress loaders via vLLM plugin system
-            - name: VLLM_PLUGINS
-              value: "modelexpress"
-            # Server address for metadata publishing
-            - name: MX_SERVER_ADDRESS
+              value: "nvidia/Kimi-K2.5-NVFP4"
+            - name: MODEL_EXPRESS_URL
               value: "modelexpress-server:8001"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+            # This also filters out bonded interfaces such as mlx5_bond_0.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            # Logging (set to DEBUG for troubleshooting)
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "INFO"
-            # UCX transport settings for GPUDirect RDMA
             - name: UCX_TLS
               value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
-          args:
-            - --model
-            - $(MODEL_NAME)
-            - --load-format
-            - mx
-            - --tensor-parallel-size
-            - "8"
           resources:
             limits:
+              cpu: "64"
+              memory: 1200Gi
               nvidia.com/gpu: "8"
               rdma/ib: "8"
             requests:
+              cpu: "64"
+              memory: 1200Gi
               nvidia.com/gpu: "8"
               rdma/ib: "8"
-              memory: "200Gi"
-              cpu: "16"
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
             - name: model-cache
               mountPath: /models
-
       volumes:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 64Gi
+            sizeLimit: 512Gi
         - name: model-cache
           persistentVolumeClaim:
             claimName: model-cache
       imagePullSecrets:
         - name: nvcr-imagepullsecret
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

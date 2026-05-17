@@ -72,7 +72,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          # Build using Dockerfile.client or dynamo repo (see README)
+          # Build using examples/dynamo_p2p_transfer_k8s/Dockerfile
           image: <your-registry>/modelexpress-vllm-runtime:latest
           command:
             - python3
@@ -130,7 +130,7 @@ spec:
           value: "0"
       extraPodSpec:
         mainContainer:
-          # Build using Dockerfile.client or dynamo repo (see README)
+          # Build using examples/dynamo_p2p_transfer_k8s/Dockerfile
           image: <your-registry>/modelexpress-vllm-runtime:latest
           securityContext:
             capabilities:
