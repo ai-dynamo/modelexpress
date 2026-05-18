@@ -3,39 +3,38 @@
 
 # Standalone model-streamer CI lane.
 #
-# This workflow exists as a smaller, faster validation path while the main
-# `ModelExpress CI Tests` workflow (.github/workflows/modelexpress-ci-tests.yml)
-# is still gated on GitHub-Actions-side cluster access for its vCluster /
-# mx-server / P2P jobs. The model-streamer test is the only part of the matrix
-# that does NOT need k8s — it runs as a single Docker container on a GPU
-# runner, streams safetensors from S3, and verifies inference. Isolating it
-# here lets us trigger and observe end-to-end on real GHA without depending
-# on the AKS access path.
+# Status — STAGE 1 (S3-upload only): the Docker daemon is not yet
+# provisioned on the GPU runner (prod-modelexpress-tester-amd-gpu-v1), so
+# `docker build` / `docker run` would fail. While ops works on enabling
+# DinD / socket-mount + GPU passthrough, this workflow runs only the parts
+# that don't need Docker:
+#   1. Checkout
+#   2. Install boto3 + huggingface-cli
+#   3. Download safetensors from HuggingFace (if not already cached in S3)
+#      and upload them to s3://${MX_CI_S3_BUCKET}/models/${MX_CI_MODEL}/
 #
-# Single job — runs entirely on the GPU runner:
-#   1. Build the vLLM worker image locally (no registry push)
-#   2. Stage safetensors in S3 if not already there
-#   3. Start the container, wait for model-streamer load, verify inference
+# What this validates today:
+#   - Runner picks up GHA jobs end-to-end
+#   - Self-hosted runner has internet egress for `pip install` + HF download
+#   - IRSA on the runner has the right S3 permissions (list / put / head)
 #
-# NGC workaround: this branch's GH Actions setup doesn't have NGC creds yet,
-# so we can't push/pull the worker image through nvcr.io. Instead we build
-# directly on the GPU runner and reference the local image tag — the test
-# never leaves the runner's Docker daemon. When NGC creds are provisioned,
-# revert to the two-job pattern (separate CPU `build-vllm-worker` job + GPU
-# `model-streamer` job pulling from the registry) — see the main workflow
-# .github/workflows/modelexpress-ci-tests.yml for the reference pattern.
+# What it does NOT validate yet (deferred to STAGE 2 once Docker is up):
+#   - vLLM image build
+#   - runai-model-streamer reading from S3 inside the container
+#   - --load-format mx + ModelExpress plugin loading
+#   - OpenAI inference endpoint comes up
 #
-# The test steps after the build are inlined from
-# .github/actions/run-mx-streamer-test/action.yml so we can hack on them
-# in isolation. Once stable, port any improvements back into that action.
+# When ops enables Docker on the runner, re-add the steps from the full
+# composite action at .github/actions/run-mx-streamer-test/action.yml
+# (build, docker run, wait, verify inference, cleanup) — they're already
+# written and tested in the main workflow's `model-streamer-vllm` job.
 #
-# Required secrets (only HF_TOKEN strictly needed for the current model):
-#   HF_TOKEN       — HuggingFace token; ignored when empty (Qwen2.5-0.5B
-#                    is public). Required if the model is gated.
+# Required secrets:
+#   HF_TOKEN  — HuggingFace token; ignored when empty (Qwen2.5-0.5B is
+#               public). Required only if the model is gated.
 #
 # Required IRSA on the GPU runner:
-#   IAM role with read + write access to s3://${MX_CI_S3_BUCKET}/models/
-#   (writes happen on the first run per model to seed the cache).
+#   IAM role with list / put / head on s3://${MX_CI_S3_BUCKET}/models/.
 
 name: ModelExpress Model Streamer Test
 
@@ -54,55 +53,24 @@ on:
       - tanushriyas/ci-tests-pt2
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
   MX_CI_S3_REGION: us-east-1
-  # Knobs previously passed as inputs to run-mx-streamer-test. Tweak here
-  # without touching the composite action.
-  MX_CI_VLLM_PORT: "18888"
-  MX_CI_STREAMER_CONCURRENCY: "16"
-  MX_CI_LOAD_TIMEOUT_SECONDS: "300"
 
 jobs:
-  model-streamer:
-    name: Model Streamer test (vLLM, S3)
+  s3-upload:
+    name: S3 upload (Stage 1, no Docker)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     permissions:
       contents: read
 
-    env:
-      # Local image tag, lives only in the GPU runner's Docker daemon.
-      # When NGC is wired up, swap this for `${{ secrets.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}`
-      # and re-introduce a separate CPU build job that pushes to that tag.
-      WORKER_IMAGE: mx-worker-vllm:local
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Build vLLM worker image (local, no registry)
-        # NGC creds aren't set up on GH Actions yet, so we can't push/pull
-        # through nvcr.io. Build directly on the GPU runner — the image lives
-        # in the local Docker daemon and is referenced by the `docker run`
-        # step below via the WORKER_IMAGE env above. Build context is the
-        # repo root (Dockerfile COPYs from modelexpress_client/python/).
-        run: |
-          docker build \
-            -f ci/k8s/client/vllm/Dockerfile \
-            -t "${WORKER_IMAGE}" \
-            .
-
-      # ---------------------------------------------------------------------
-      # Inlined from .github/actions/run-mx-streamer-test/action.yml so we
-      # can hack on the test in isolation while NGC wiring on GHA is still
-      # being set up. Keep changes mirrored back to the composite action
-      # once stable, OR delete this whole workflow file and resume using
-      # the composite from the main workflow.
-      # ---------------------------------------------------------------------
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -184,111 +152,3 @@ jobs:
                           )
                   print(f"Upload verified: {len(uploaded)} file(s).")
           EOF
-
-      - name: Start vLLM container with model streamer
-        env:
-          # WORKER_IMAGE comes from the job-level env (set to a local tag
-          # built in the step above) — no registry pull needed.
-          MODEL: ${{ env.MX_CI_MODEL }}
-          S3_BUCKET: ${{ env.MX_CI_S3_BUCKET }}
-          S3_REGION: ${{ env.MX_CI_S3_REGION }}
-          PORT: ${{ env.MX_CI_VLLM_PORT }}
-          STREAMER_CONCURRENCY: ${{ env.MX_CI_STREAMER_CONCURRENCY }}
-        run: |
-          set -euo pipefail
-          MODEL_S3_URI="s3://${S3_BUCKET}/models/${MODEL}"
-
-          # IRSA credentials don't auto-propagate into child containers. The EKS
-          # runner pod gets AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE wired in,
-          # but a `docker run` child sees neither unless we forward them: pass
-          # the role ARN as -e and mount the OIDC token file in as a volume.
-          # boto3 inside the container then does its own sts:AssumeRoleWithWebIdentity.
-          IRSA_TOKEN="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/eks.amazonaws.com/serviceaccount/token}"
-
-          CONTAINER_ID=$(docker run -d --gpus all --ipc=host \
-            -e AWS_ROLE_ARN="${AWS_ROLE_ARN}" \
-            -e AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks-token" \
-            -v "${IRSA_TOKEN}:/var/run/secrets/eks-token:ro" \
-            -e AWS_DEFAULT_REGION="${S3_REGION}" \
-            -e MX_MODEL_URI="${MODEL_S3_URI}" \
-            -e RUNAI_STREAMER_CONCURRENCY="${STREAMER_CONCURRENCY}" \
-            -e VLLM_PLUGINS=modelexpress \
-            -p "${PORT}:${PORT}" \
-            "${WORKER_IMAGE}" \
-            python3 -m vllm.entrypoints.openai.api_server \
-              --model "${MODEL}" \
-              --load-format mx \
-              --port "${PORT}")
-          echo "Container: ${CONTAINER_ID}"
-          echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
-
-      - name: Wait for model streamer to complete
-        env:
-          LOAD_TIMEOUT: ${{ env.MX_CI_LOAD_TIMEOUT_SECONDS }}
-        run: |
-          set -euo pipefail
-          deadline=$((SECONDS + LOAD_TIMEOUT))
-          while [ $SECONDS -lt $deadline ]; do
-            if docker logs "${CONTAINER_ID}" 2>&1 | grep -q "Model streamer weight loading complete"; then
-              echo "Model streamer loading confirmed."
-              exit 0
-            fi
-            if [ "$(docker inspect "${CONTAINER_ID}" --format '{{.State.Running}}')" != "true" ]; then
-              echo "ERROR: container exited before model streamer completed."
-              docker logs "${CONTAINER_ID}" 2>&1 | tail -80
-              exit 1
-            fi
-            echo "Still loading... (${SECONDS}s elapsed)"
-            sleep 10
-          done
-
-          echo "ERROR: model streamer did not complete within ${LOAD_TIMEOUT}s."
-          docker logs "${CONTAINER_ID}" 2>&1 | tail -80
-          exit 1
-
-      - name: Wait for OpenAI server to be ready
-        env:
-          PORT: ${{ env.MX_CI_VLLM_PORT }}
-        run: |
-          set -euo pipefail
-          timeout 60 bash -c \
-            "until curl -sf http://localhost:${PORT}/health > /dev/null; do sleep 2; done"
-          echo "Server ready on port ${PORT}."
-
-      - name: Verify inference
-        env:
-          MODEL: ${{ env.MX_CI_MODEL }}
-          PORT: ${{ env.MX_CI_VLLM_PORT }}
-        run: |
-          set -euo pipefail
-          RESPONSE=$(curl -sS --max-time 60 "http://localhost:${PORT}/v1/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\": \"${MODEL}\", \"prompt\": \"The capital of France is\", \"max_tokens\": 8}")
-          echo "Response: ${RESPONSE}"
-          echo "${RESPONSE}" | python3 -c "
-          import json, sys
-          body = json.load(sys.stdin)
-          choices = body.get('choices', [])
-          assert choices and choices[0].get('text'), f'No completion text in response: {body}'
-          print('Inference OK:', repr(choices[0]['text'][:60]))
-          "
-
-      - name: Cleanup container
-        if: always()
-        run: |
-          if [ -n "${CONTAINER_ID:-}" ]; then
-            echo "::group::Container logs (tail 200)"
-            docker logs "${CONTAINER_ID}" 2>&1 | tail -200 || true
-            echo "::endgroup::"
-            docker stop "${CONTAINER_ID}" 2>/dev/null || true
-            docker rm -f "${CONTAINER_ID}" 2>/dev/null || true
-          fi
-
-      - name: Cleanup local image
-        # `if: always()` so this also runs when the job is cancelled by
-        # cancel-in-progress concurrency. Without it, the locally built
-        # vLLM worker image (~15GB) accumulates in the GPU runner's Docker
-        # daemon across runs and eventually exhausts disk.
-        if: always()
-        run: |
-          docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
