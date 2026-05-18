@@ -129,8 +129,10 @@ Reading order for a fresh agent picking this up:
    debugging a free-while-allocating race or a layout issue).
 5. `backend.py` (CUDA driver calls; only relevant when debugging a
    `cuMem*` failure path).
-6. `../engines/vllm/loader.py::_maybe_enter_vmm_arena` (how the arena is
-   plumbed into vLLM's load envelope; the engine-side seam).
+6. `runtime.py::maybe_enter_vmm_arena` (engine-agnostic arena
+   lifecycle helper) plus `../engines/vllm/loader.py` (how the arena
+   is plumbed into vLLM's load envelope; the engine-side seam, just a
+   call into `maybe_enter_vmm_arena`).
 
 Key invariants:
 

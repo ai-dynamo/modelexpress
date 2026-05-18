@@ -63,7 +63,7 @@ class LoadContext:
     adapter: EngineAdapter | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
-    # When MX_VMM_ARENA=1, _maybe_enter_vmm_arena populates this with the
+    # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the
     # active VmmArena. Strategies that register tensors with NIXL can use
     # the arena's (base, used_bytes) range as a single registration via
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing

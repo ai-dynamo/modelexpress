@@ -34,6 +34,10 @@ from .hook import (
     is_active,
     use_arena,
 )
+from .runtime import (
+    log_arena_post_load,
+    maybe_enter_vmm_arena,
+)
 
 __all__ = [
     "ARENA_AVAILABLE",
@@ -48,5 +52,7 @@ __all__ = [
     "active_arena",
     "install_pluggable_allocator",
     "is_active",
+    "log_arena_post_load",
+    "maybe_enter_vmm_arena",
     "use_arena",
 ]

@@ -259,11 +259,11 @@ class TestOptionalExtension:
             vmm_hook._ensure_callbacks_initialized()
 
     def test_vllm_loader_falls_back_to_nullcontext(self, monkeypatch, caplog):
-        """When MX_VMM_ARENA=1 but ARENA_AVAILABLE=False, the vllm loader
-        helper should yield without installing arena machinery and emit a
-        warning, not crash."""
+        """When MX_VMM_ARENA=1 but ARENA_AVAILABLE=False, the arena
+        runtime helper should yield without installing arena machinery
+        and emit a warning, not crash."""
         from modelexpress.vmm import hook as vmm_hook
-        from modelexpress.engines.vllm import loader as vllm_loader
+        from modelexpress.vmm import runtime as vmm_runtime
 
         monkeypatch.setenv("MX_VMM_ARENA", "1")
         monkeypatch.setattr(vmm_hook, "ARENA_AVAILABLE", False)
@@ -274,12 +274,12 @@ class TestOptionalExtension:
             global_rank = 0
             device_id = 0
 
-        with caplog.at_level("WARNING", logger=vllm_loader.logger.name):
+        with caplog.at_level("WARNING", logger=vmm_runtime.logger.name):
             # Entering the context manager must not raise; the body must
             # execute; exiting must clean up without raising. This is the
             # behavioral contract of nullcontext-equivalent.
             entered = False
-            with vllm_loader._maybe_enter_vmm_arena(_Ctx()):
+            with vmm_runtime.maybe_enter_vmm_arena(_Ctx()):
                 entered = True
             assert entered
 
@@ -295,7 +295,7 @@ class TestOptionalExtension:
     def test_vllm_loader_no_op_when_env_unset(self, monkeypatch):
         """Baseline: with MX_VMM_ARENA unset, the helper yields without
         installing arena machinery, regardless of ARENA_AVAILABLE."""
-        from modelexpress.engines.vllm import loader as vllm_loader
+        from modelexpress.vmm import runtime as vmm_runtime
 
         monkeypatch.delenv("MX_VMM_ARENA", raising=False)
 
@@ -304,7 +304,7 @@ class TestOptionalExtension:
             device_id = 0
 
         entered = False
-        with vllm_loader._maybe_enter_vmm_arena(_Ctx()):
+        with vmm_runtime.maybe_enter_vmm_arena(_Ctx()):
             entered = True
         assert entered
 
@@ -384,9 +384,9 @@ class TestLoaderLifecycle:
         """Replace CudaVmmBackend + use_arena with stubs."""
         from contextlib import contextmanager
 
-        from modelexpress.engines.vllm import loader as vllm_loader
+        from modelexpress.vmm import runtime as vmm_runtime
 
-        monkeypatch.setattr(vllm_loader, "_vmm_arenas", {})
+        monkeypatch.setattr(vmm_runtime, "_vmm_arenas", {})
         monkeypatch.setattr(
             "modelexpress.vmm.backend.CudaVmmBackend", _StubCudaVmmBackend
         )
@@ -401,42 +401,40 @@ class TestLoaderLifecycle:
         else:
             monkeypatch.setattr("modelexpress.vmm.hook.use_arena", use_arena_factory)
 
-        return vllm_loader
+        return vmm_runtime
 
     def test_arena_published_on_successful_body(self, monkeypatch):
         """When the load body returns normally, the arena ends up in
         _vmm_arenas keyed by device_id."""
         monkeypatch.setenv("MX_VMM_ARENA", "1")
-        vllm_loader = self._patch_loader_deps(monkeypatch)
+        vmm_runtime = self._patch_loader_deps(monkeypatch)
 
-        with vllm_loader._maybe_enter_vmm_arena(_StubCtx()):
+        with vmm_runtime.maybe_enter_vmm_arena(_StubCtx()):
             pass  # success
 
-        assert 0 in vllm_loader._vmm_arenas
+        assert 0 in vmm_runtime._vmm_arenas
 
     def test_arena_not_published_on_body_exception(self, monkeypatch):
         """When the load body raises, the freshly-created arena is closed
         and NOT retained in _vmm_arenas. Re-running the helper starts
         from a clean slate."""
         monkeypatch.setenv("MX_VMM_ARENA", "1")
-        vllm_loader = self._patch_loader_deps(monkeypatch)
+        vmm_runtime = self._patch_loader_deps(monkeypatch)
 
         class _LoadError(RuntimeError):
             pass
 
         with pytest.raises(_LoadError):
-            with vllm_loader._maybe_enter_vmm_arena(_StubCtx()):
+            with vmm_runtime.maybe_enter_vmm_arena(_StubCtx()):
                 raise _LoadError("synthetic load failure")
 
-        assert 0 not in vllm_loader._vmm_arenas
+        assert 0 not in vmm_runtime._vmm_arenas
 
     def test_replace_arena_logs_warning(self, monkeypatch, caplog):
         """When _vmm_arenas already has an arena for the device, the
         helper logs a clear WARNING about replacement before closing it."""
-        from modelexpress.engines.vllm import loader as vllm_loader
-
         monkeypatch.setenv("MX_VMM_ARENA", "1")
-        vllm_loader_mod = self._patch_loader_deps(monkeypatch)
+        vmm_runtime = self._patch_loader_deps(monkeypatch)
 
         # Pre-populate with a stub "old" arena.
         class _StubOldArena:
@@ -446,10 +444,10 @@ class TestLoaderLifecycle:
                 self.closed = True
 
         old_arena = _StubOldArena()
-        vllm_loader_mod._vmm_arenas[0] = old_arena
+        vmm_runtime._vmm_arenas[0] = old_arena
 
-        with caplog.at_level("WARNING", logger=vllm_loader_mod.logger.name):
-            with vllm_loader_mod._maybe_enter_vmm_arena(_StubCtx()):
+        with caplog.at_level("WARNING", logger=vmm_runtime.logger.name):
+            with vmm_runtime.maybe_enter_vmm_arena(_StubCtx()):
                 pass
 
         assert old_arena.closed
