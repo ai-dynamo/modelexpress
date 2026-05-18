@@ -7,10 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 
 ModelExpress can serve as the remote-instance weight loader for SGLang,
 streaming weights GPU-to-GPU over RDMA between SGLang processes instead
-of loading from disk on every replica. The SGLang-side delegation hook is
-proposed in upstream [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723),
-which adds the `--modelexpress-config` flag and delegates ModelExpress loading
-to the ModelExpress package:
+of loading from disk on every replica. The SGLang-side delegation hook was
+added by upstream [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723):
+it adds the `--modelexpress-config` flag and delegates ModelExpress loading to
+the ModelExpress package.
 
 SGLang does not run separate source and target modes. Every server uses the
 same `remote_instance` command, and `modelexpress.engines.sglang.MxModelLoader`
@@ -26,12 +26,14 @@ Use an SGLang image that contains the upstream ModelExpress delegation hook:
 - **Build from `main`** — follow SGLang's official install guide at
   [docs.sglang.io/docs/get_started/install](https://docs.sglang.io/docs/get_started/install).
 
-Install the ModelExpress Python package into the SGLang image:
+Install the ModelExpress Python package into the SGLang image. The Kubernetes
+examples provide a Dockerfile at
+`examples/p2p_transfer_k8s/client/sglang/Dockerfile`.
 
 ```dockerfile
 FROM lmsysorg/sglang:<tag-with-modelexpress-delegation>
 
-RUN python3 -m pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir --no-deps \
     "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python"
 ```
 
@@ -42,7 +44,7 @@ ModelExpress package into that image:
 FROM sglang-source:modelexpress
 
 COPY modelexpress_client/python /tmp/modelexpress_client_python
-RUN python3 -m pip install --no-cache-dir /tmp/modelexpress_client_python
+RUN python3 -m pip install --no-cache-dir --no-deps /tmp/modelexpress_client_python
 ```
 
 Confirm the SGLang delegation flag is present before running:

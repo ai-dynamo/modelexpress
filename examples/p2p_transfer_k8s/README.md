@@ -1,16 +1,16 @@
-# P2P GPU Transfer Example
+# Kubernetes P2P Weight Transfer Examples
 
-This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between vLLM instances on Kubernetes. For the broader deployment guide and environment variable reference, see [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md). For NIXL architecture details, see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
+This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between inference engine replicas on Kubernetes. For the broader deployment guide and environment variable reference, see [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md). For NIXL architecture details, see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ## Architecture
 
 ```mermaid
 graph TD
     subgraph "Node A"
-        A[vLLM + MxModelLoader<br/>- Loads weights from disk<br/>- Registers tensors with NIXL<br/>- PublishMetadata + UpdateStatus]
+        A[Engine + MxModelLoader<br/>- Loads weights from storage<br/>- Registers tensors with NIXL<br/>- PublishMetadata + UpdateStatus]
     end
     subgraph "Node B"
-        B[vLLM + MxModelLoader<br/>- GetMetadata, checks worker status<br/>- Receives weights via NIXL<br/>- Runs FP8 processing]
+        B[Engine + MxModelLoader<br/>- Discovers READY source<br/>- Receives weights via NIXL<br/>- Runs engine post-load hooks]
     end
     A -- "RDMA via NIXL" --> B
     A --> S
@@ -20,10 +20,10 @@ graph TD
 
 ### Key Design Points
 
-1. **Custom vLLM Loader**: NIXL transfer logic runs inside vLLM via `--load-format mx`
-2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly)
-3. **FP8 Support**: Raw tensors (including `weight_scale_inv`) transfer BEFORE FP8 processing
-4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU)
+1. **Engine loader integration**: vLLM uses `--load-format mx`; SGLang uses `remote_instance` with backend `modelexpress`.
+2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly).
+3. **Engine post-load hooks**: The ModelExpress adapter handles engine-specific post-load processing and tensor discovery.
+4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU).
 
 ## Prerequisites
 
@@ -46,23 +46,25 @@ See [`server/`](server/) for backend-specific server manifests:
 - **Redis**: [`server/redis_backend/`](server/redis_backend/)
 - **Kubernetes CRD**: [`server/kubernetes_backend/`](server/kubernetes_backend/)
 
-### 3. Deploy vLLM Clients
+### 3. Deploy Clients
 
-See [`client/vllm/`](client/vllm/) for vLLM deployment manifests:
+See [`client/`](client/) for engine deployment manifests:
 - **Single-node** (TP only): [`client/vllm/vllm-single-node.yaml`](client/vllm/vllm-single-node.yaml)
 - **Multi-node** (TP + PP): [`client/vllm/vllm-multi-node.yaml`](client/vllm/vllm-multi-node.yaml)
+- **SGLang single-node**: [`client/sglang/sglang-single-node-p2p.yaml`](client/sglang/sglang-single-node-p2p.yaml)
 
-The `mx` loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from disk and becomes a source for future nodes.
+The ModelExpress loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from storage and becomes a source for future nodes.
+
+The vLLM ModelStreamer manifests under [`client/vllm/`](client/vllm/) are storage-loading examples. They do not require P2P by default; their comments show the extra environment variables and RDMA resources needed if you want those pods to publish as P2P sources after streaming from S3, Azure Blob Storage, or local disk.
 
 ## Environment Variables
 
-### vLLM Container
+### Client Container
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MX_ZMQ_ADDRESS` | Base ZMQ address (rank appended) | `ipc:///tmp/mx/vllm.sock` |
-
-With TP=4, this creates sockets: `/tmp/mx/vllm-0.sock`, `/tmp/mx/vllm-1.sock`, etc.
+| `MODEL_EXPRESS_URL` / `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration | `modelexpress-server:8001` |
+| `MX_RDMA_NIC_PIN` | Per-rank NIC pinning for RDMA-capable deployments | `auto` |
 
 ### ModelExpress Server
 

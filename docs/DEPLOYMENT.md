@@ -197,10 +197,21 @@ docker-compose up --build
 For GPU-to-GPU weight transfers with vLLM:
 
 ```bash
-docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
+docker build -f examples/p2p_transfer_k8s/client/vllm/Dockerfile \
   -t your-registry/mx-client:TAG .
 docker push your-registry/mx-client:TAG
 ```
+
+For SGLang:
+
+```bash
+docker build -f examples/p2p_transfer_k8s/client/sglang/Dockerfile \
+  -t your-registry/sglang-modelexpress:TAG .
+docker push your-registry/sglang-modelexpress:TAG
+```
+
+The Dynamo examples use their own runtime image Dockerfile:
+`examples/dynamo_p2p_transfer_k8s/Dockerfile`.
 
 ## Kubernetes
 
@@ -428,7 +439,7 @@ Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in 
 
 ### ModelStreamer (Object Storage & Local Disk)
 
-ModelStreamer streams safetensors directly to GPU memory via `runai-model-streamer`. Supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. The first pod streams from storage; subsequent pods use P2P RDMA from GPU memory.
+ModelStreamer streams safetensors directly to GPU memory via `runai-model-streamer`. Supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. This is a storage-loading path and does not require P2P by itself. If the same deployment also enables ModelExpress P2P metadata and RDMA resources, later replicas can receive weights from an already-loaded source instead of streaming from storage again.
 
 All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. The strategy activates when `MX_MODEL_URI` is set.
 

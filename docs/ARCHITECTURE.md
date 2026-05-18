@@ -207,15 +207,19 @@ ModelExpress/
 ├── examples/
 │   ├── p2p_transfer_k8s/               # GPU-to-GPU weight transfer example
 │   │   ├── README.md
-│   │   ├── Dockerfile.client           # vLLM + ModelExpress client image
 │   │   ├── model-download.yaml         # Model weights download job
 │   │   ├── server/
 │   │   │   ├── kubernetes_backend/     # CRD-based metadata (crd, rbac, server)
 │   │   │   └── redis_backend/          # Redis-based metadata (redis, server)
 │   │   └── client/
-│   │       └── vllm/
-│   │           ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
-│   │           └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
+│   │       ├── vllm/
+│   │       │   ├── Dockerfile          # vLLM + ModelExpress client image
+│   │       │   ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
+│   │       │   ├── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
+│   │       │   └── vllm-single-node-streamer-*.yaml # ModelStreamer storage loading
+│   │       └── sglang/
+│   │           ├── Dockerfile          # SGLang + ModelExpress client image
+│   │           └── sglang-single-node-p2p.yaml
 │   ├── crds.yaml                       # ModelMetadata + ModelCacheEntry CRDs (cluster-admin)
 │   ├── aggregated_k8s/                 # Dynamo aggregated serving example
 │   │   ├── README.md

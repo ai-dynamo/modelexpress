@@ -1,6 +1,13 @@
 # ModelExpress Client Deployment
 
-vLLM instances with ModelExpress P2P weight transfer support.
+Inference engine instances with ModelExpress P2P weight transfer support.
+
+## Client Images
+
+| Engine | Dockerfile |
+|--------|------------|
+| **vLLM** | [`vllm/Dockerfile`](vllm/Dockerfile) |
+| **SGLang** | [`sglang/Dockerfile`](sglang/Dockerfile) |
 
 ## vLLM Deployments
 
@@ -8,14 +15,21 @@ vLLM instances with ModelExpress P2P weight transfer support.
 |----------|----------|-------|---------------|
 | **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | Llama-3.1-405B-Instruct | TP=8, 1 node (8 GPUs) |
 | **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | Llama-3.1-405B-Instruct | TP=4, PP=2, 2 nodes (8 GPUs) |
+| **ModelStreamer** | [`vllm/vllm-single-node-streamer-s3.yaml`](vllm/vllm-single-node-streamer-s3.yaml), [`vllm/vllm-single-node-streamer-azure.yaml`](vllm/vllm-single-node-streamer-azure.yaml), [`vllm/vllm-single-node-streamer-local.yaml`](vllm/vllm-single-node-streamer-local.yaml) | Storage URI or local path | Storage loading only by default; optional P2P after load |
+
+## SGLang Deployments
+
+| Topology | Manifest | Model | Configuration |
+|----------|----------|-------|---------------|
+| **Single-node** | [`sglang/sglang-single-node-p2p.yaml`](sglang/sglang-single-node-p2p.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
 
 ## How It Works
 
-On startup, the `mx` loader (`--load-format mx`) auto-detects the best loading strategy:
+On startup, the engine-specific ModelExpress loader auto-detects the best loading strategy:
 
 1. **RDMA** -- If a ready source exists for this model/rank, receive weights via NIXL
 2. **GDS** -- If GPUDirect Storage is available, load directly from file to GPU
-3. **Disk** -- Standard vLLM weight loading as final fallback
+3. **Disk** -- Standard engine-native weight loading as final fallback
 
 After loading, every worker publishes its metadata so future instances can discover it as an RDMA source.
 
