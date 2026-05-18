@@ -9,11 +9,15 @@ _loaders_registered = False
 
 
 def register_modelexpress_loaders() -> None:
-    """Register ModelExpress's vLLM loader."""
+    """Register ModelExpress's vLLM loader when vLLM lacks native MX."""
     global _loaders_registered
     if _loaders_registered:
         return
-    from . import loader  # noqa: F401
+    from .registration import register_plugin_model_loader
+
+    # Needed for older vLLM versions before native `--load-format mx`
+    # registration is available.
+    register_plugin_model_loader()
 
     _loaders_registered = True
 
