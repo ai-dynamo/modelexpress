@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test1:
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: stg-modelexpress-builder-amd-v1
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -23,7 +23,7 @@ jobs:
         run: docker info
 
   test2:
-    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    runs-on: stg-modelexpress-tester-amd-gpu-v1
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
