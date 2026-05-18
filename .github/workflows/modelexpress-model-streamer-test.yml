@@ -39,20 +39,27 @@
 name: ModelExpress Model Streamer Test
 
 on:
-  # Scoped to the validation branch only. Every push to
-  # tanushriyas/ci-tests-pt2 fires the workflow so we can iterate quickly on
-  # GH Actions without firing on unrelated PRs. Broaden to `main` /
-  # `release/*.*.*` once the workflow is proven green.
-  #
-  # No `workflow_dispatch:` here on purpose — the UI/CLI "Run workflow"
-  # button only surfaces when the workflow file exists on the default
-  # branch, which this file does not. Push is the only viable trigger
-  # until this lands on main.
+  # Triggered indirectly via copy-pr-bot. PR-driven flow:
+  #   1. Open a PR (the PR itself does NOT fire this workflow — `pull_request`
+  #      events are forbidden on Velonix self-hosted runners because PR-head
+  #      code is untrusted).
+  #   2. Either:
+  #        a. All commits on the PR are GPG-signed → copy-pr-bot trusts the
+  #           author and auto-creates `pull-request/<N>` with the PR content.
+  #        b. Commits are unsigned or come from an external contributor →
+  #           a maintainer comments `/ok to test <commit_sha>` on the PR.
+  #   3. The bot pushes the PR content to `pull-request/<N>` in this repo.
+  #      That push (from the trusted bot identity, into an internal branch)
+  #      fires this workflow.
+  # See the dynamo reference: ai-dynamo/dynamo/.github/workflows/pr.yaml.
   push:
     branches:
-      - tanushriyas/ci-tests-pt2
+      - "pull-request/[0-9]+"
 
 concurrency:
+  # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so
+  # consecutive pushes to the same PR cancel earlier runs but pushes to
+  # different PRs don't fight for the same group.
   group: ${{ github.workflow }}-${{ github.ref_name }}
   cancel-in-progress: true
 
@@ -90,10 +97,15 @@ jobs:
           # self-hosted runners without assuming the runner image ships Python.
           # boto3 is ~3 MB and installs in seconds; avoids assuming aws-cli
           # or any other tool is present in the runner image.
-          pip install -q boto3 "huggingface_hub[cli]"
+          # Note: the `huggingface_hub[cli]` extra was removed in 1.x — the old
+          # `huggingface-cli` is now deprecated in favor of `hf`. We bypass the
+          # CLI entirely and call `snapshot_download` from the Python API, which
+          # is stable across hub versions.
+          pip install -q boto3 huggingface_hub
 
           python3 - <<'EOF'
-          import boto3, os, pathlib, subprocess, tempfile
+          import boto3, os, pathlib, tempfile
+          from huggingface_hub import snapshot_download
 
           bucket = os.environ["S3_BUCKET"]
           region = os.environ["S3_REGION"]
@@ -109,12 +121,10 @@ jobs:
           else:
               print(f"Downloading safetensors for {model} from HuggingFace...")
               with tempfile.TemporaryDirectory() as tmpdir:
-                  subprocess.run(
-                      ["huggingface-cli", "download", model,
-                       "--local-dir", tmpdir,
-                       "--include", "*.safetensors",
-                       "--include", "*.safetensors.index.json"],
-                      check=True,
+                  snapshot_download(
+                      repo_id=model,
+                      local_dir=tmpdir,
+                      allow_patterns=["*.safetensors", "*.safetensors.index.json"],
                   )
                   exts = (".safetensors", ".safetensors.index.json")
                   files = [f for f in pathlib.Path(tmpdir).rglob("*")
