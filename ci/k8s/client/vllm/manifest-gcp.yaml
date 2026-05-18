@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GCP GB200 single-job template for P2P RDMA weight-transfer CI tests.
+#
+# Applied twice by the workflow — once for the source, once for the target —
+# with different env var substitutions each time:
+#
+#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
+#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
+#
+# The workflow (via run-mx-test) gates target apply on the ModelMetadata CR
+# appearing in the namespace, replacing the need for an initContainer.
+#
+# GCP-specific additions vs the generic manifest:
+#   - GKE multi-network RDMA annotations attach rdma0-rdma3 interfaces
+#   - networking.gke.io.networks/rdma-* resource limits expose RDMA devices
+#   - UCX_TLS=cuda_ipc,cuda_copy,rc + UCX_IB_GID_INDEX=3 for GKE RoCE
+#   - 64Gi /dev/shm emptyDir for vLLM inter-process shared memory
+#
+# Environment variables substituted by envsubst before each apply:
+#   JOB_NAME      — mx-source or mx-target
+#   WORKER_IMAGE  — image built from examples/p2p_transfer_k8s/Dockerfile.client
+#   WORKER_PORT   — port the vLLM server listens on
+#   MX_CI_MODEL   — HuggingFace model id
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+      annotations:
+        networking.gke.io/default-interface: eth0
+        networking.gke.io/interfaces: |
+          [
+            {"interfaceName":"eth0","network":"default"},
+            {"interfaceName":"rdma0","network":"rdma-0"},
+            {"interfaceName":"rdma1","network":"rdma-1"},
+            {"interfaceName":"rdma2","network":"rdma-2"},
+            {"interfaceName":"rdma3","network":"rdma-3"}
+          ]
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: kubernetes.io/arch
+          value: arm64
+          effect: NoSchedule
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --trust-remote-code
+            - --port
+            - "${WORKER_PORT}"
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: UCX_TLS
+              value: "cuda_ipc,cuda_copy,rc"
+            - name: UCX_IB_GID_INDEX
+              value: "3"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              networking.gke.io.networks/rdma-0: "1"
+              networking.gke.io.networks/rdma-1: "1"
+              networking.gke.io.networks/rdma-2: "1"
+              networking.gke.io.networks/rdma-3: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Azure A100 single-job template for SGLang P2P RDMA weight-transfer CI tests.
+#
+# SGLang's MxModelLoader runs the SAME command on both source and target
+# pods. The first replica finds no READY source on the mx-server, loads
+# weights natively, and publishes its metadata. The second replica
+# discovers the source and loads via NIXL RDMA. No source/target branching
+# at the command/manifest level — unlike TRT-LLM, which needs MODEL_EXPRESS_SOURCE.
+#
+# Applied twice by the workflow with different envsubst values:
+#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
+#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
+#
+# Azure A100-specific differences vs GCP/upstream:
+#   - rdma/ib resource limit exposes the InfiniBand RDMA device
+#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand
+#   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (ucx#11259)
+#   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools
+#
+# Environment variables substituted by envsubst before each apply:
+#   JOB_NAME      — mx-source or mx-target
+#   WORKER_IMAGE  — image built from ci/k8s/client/sgl/Dockerfile
+#   WORKER_PORT   — port the SGLang server listens on
+#   MX_CI_MODEL   — HuggingFace model id
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      affinity:
+        # Source and target on different hosts so we exercise true cross-host
+        # RDMA over IB, not intra-node loopback through the same NIC.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # NOTE: on clusters that split GPU nodes across multiple InfiniBand
+        # partitions (e.g. the Azure AKS cluster used during initial dev had
+        # `a100a` and `a100b` node pools on different IB pkeys), you may also
+        # need a podAffinity rule to keep both pods in the same partition.
+        # Example (AKS-specific label key — adjust per cluster):
+        #   podAffinity:
+        #     requiredDuringSchedulingIgnoredDuringExecution:
+        #       - labelSelector:
+        #           matchLabels:
+        #             app: mx-p2p-worker
+        #         topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - "${MX_CI_MODEL}"
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "${WORKER_PORT}"
+            - --tp
+            - "1"
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"url": "mx-server:8000", "transport": "nixl"}'
+          env:
+            - name: MODEL_EXPRESS_URL
+              value: "mx-server:8000"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

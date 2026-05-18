@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Check vCluster Exists'
+description: 'Check whether a vCluster instance exists in the given namespace'
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for host cluster access'
+    required: true
+  vcluster_name:
+    description: 'Name of the vCluster to look for'
+    required: true
+  vcluster_namespace:
+    description: 'Host namespace to check'
+    required: true
+
+outputs:
+  exists:
+    description: '"true" if the vCluster exists, "false" otherwise'
+    value: ${{ steps.check.outputs.exists }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install vCluster CLI
+      uses: ./.github/actions/install-vcluster-cli
+
+    - name: Check if vCluster exists
+      id: check
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        # Use a unique temp file so concurrent runs on the same self-hosted
+        # runner don't clobber each other's kubeconfig. Trap on EXIT to
+        # remove the credential whether the step succeeds or fails.
+        KUBECONFIG_FILE=$(mktemp)
+        trap 'rm -f "${KUBECONFIG_FILE}"' EXIT
+        echo "${{ inputs.kubeconfig_base64 }}" | base64 -d > "${KUBECONFIG_FILE}"
+        chmod 600 "${KUBECONFIG_FILE}"
+        export KUBECONFIG="${KUBECONFIG_FILE}"
+        RESULT=$(vcluster list --output json -n ${NAMESPACE})
+        if echo "$RESULT" | jq -e 'arrays | map(select(.Name == "'"${VCLUSTER_NAME}"'")) | length > 0' &>/dev/null; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+          echo "vCluster not found in namespace ${NAMESPACE}"
+        fi

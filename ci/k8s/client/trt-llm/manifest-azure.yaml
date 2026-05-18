@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Azure A100 single-job template for TRT-LLM P2P RDMA weight-transfer CI tests.
+#
+# Applied twice by the workflow — once for the source, once for the target —
+# with different env var substitutions each time:
+#
+#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>  MODEL_EXPRESS_SOURCE=1
+#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>  MODEL_EXPRESS_SOURCE=""
+#
+# The trtllm_p2p_launcher.py entrypoint selects source or target mode based on
+# MODEL_EXPRESS_SOURCE being set (non-empty) or unset/empty.
+#
+# Source: loads model normally; patched executor/worker.py calls publish_from_worker()
+#         when MODEL_EXPRESS_SOURCE is set, registering GPU buffers with NIXL.
+# Target: uses MxLiveCheckpointLoader with LoadFormat.PRESHARDED to receive
+#         weights directly from the source via NIXL RDMA.
+#
+# Azure-specific differences vs GCP manifest:
+#   - No GKE multi-network annotations
+#   - rdma/ib resource limit exposes InfiniBand RDMA device (A100 SXM4 nodes)
+#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand (no GID index needed)
+#   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (workaround for ucx#11259)
+#   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools (amd64)
+#
+# Environment variables substituted by envsubst before each apply:
+#   JOB_NAME              — mx-source or mx-target
+#   WORKER_IMAGE          — image built from ci/k8s/client/trt-llm/Dockerfile
+#   WORKER_PORT           — port the TRT-LLM server listens on
+#   MX_CI_MODEL           — HuggingFace model id
+#   MODEL_EXPRESS_SOURCE  — "1" for source, "" for target
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      affinity:
+        # Source and target on different hosts so we exercise true cross-host
+        # RDMA over IB, not intra-node loopback through the same NIC.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # NOTE: on clusters that split GPU nodes across multiple InfiniBand
+        # partitions (e.g. the Azure AKS cluster used during initial dev had
+        # `a100a` and `a100b` node pools on different IB pkeys), you may also
+        # need a podAffinity rule to keep both pods in the same partition.
+        # Example (AKS-specific label key — adjust per cluster):
+        #   podAffinity:
+        #     requiredDuringSchedulingIgnoredDuringExecution:
+        #       - labelSelector:
+        #           matchLabels:
+        #             app: mx-p2p-worker
+        #         topologyKey: agentpool
+        # Symptom if pods land on different partitions: UCX errors with
+        # "local pkey 0x8018 differs from remote pkey 0x8019" →
+        # NIXL_ERR_BACKEND in loadRemoteMD.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          # Entrypoint and command come from the image:
+          #   ENTRYPOINT /opt/nvidia/nvidia_entrypoint.sh (sets up LD_LIBRARY_PATH etc.)
+          #   CMD       python3 /opt/modelexpress/trtllm_p2p_launcher.py
+          # Do NOT set `command:` here — that would skip nvidia_entrypoint.sh and
+          # break TensorRT shared library lookup (libnvonnxparser.so.10 etc.).
+          env:
+            - name: MODEL_NAME
+              value: "${MX_CI_MODEL}"
+            - name: WORKER_PORT
+              value: "${WORKER_PORT}"
+            - name: MODEL_EXPRESS_URL
+              value: "mx-server:8000"
+            - name: MODEL_EXPRESS_SOURCE
+              value: "${MODEL_EXPRESS_SOURCE}"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

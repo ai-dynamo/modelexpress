@@ -1,0 +1,259 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress K8s CI.
+#
+# Four jobs:
+#   build-server    — builds and pushes the MX coordination server image from
+#                     ci/k8s/server/Dockerfile.server.  Runs on ubuntu-latest.
+#
+#   build           — matrix over inference engine frameworks; builds and pushes
+#                     one worker image per framework.  Runs on ubuntu-latest.
+#                     Both build jobs run in parallel.
+#
+#   ensure-vcluster — bootstraps the persistent mx-ci-cluster vCluster on first
+#                     run (no-ops on re-runs).  Runs in parallel with build jobs.
+#
+#   test            — matrix over frameworks; needs build, build-server, and
+#                     ensure-vcluster.  Each matrix job creates its own isolated
+#                     namespace, deploys a full stack (mx-server + workers), runs
+#                     pytest, then deletes the namespace.  Currently sequential
+#                     (max-parallel: 1); remove that line to run in parallel once
+#                     each framework has been validated independently.
+#
+# To add a new inference engine:
+#   1. Add ci/k8s/client/<engine>/Dockerfile
+#   2. Add ci/k8s/client/<engine>/manifest-*.yaml + test_p2p_k8s.py
+#   3. Add an entry to the build and test matrix include lists below.
+#
+# Required secrets:
+#   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
+#   MX_IMAGE_REPO                 — registry prefix (e.g. nvcr.io/nvidian/my-team)
+#   NGC_API_KEY                   — push/pull registry images + create in-cluster pull secret
+#   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
+
+name: ModelExpress CI Tests
+
+on:
+  # Automatic triggers disabled while the workflow is being validated against
+  # the cluster. Re-enable by uncommenting the push and pull_request blocks
+  # once the workflow has been confirmed to run green end-to-end on a real PR.
+  # Keep workflow_dispatch so it can still be fired manually from the GitHub
+  # Actions UI in the meantime — GH Actions requires at least one trigger.
+  workflow_dispatch:
+  # push:
+  #   branches:
+  #     - main
+  #     - 'release/*.*.*'
+  # pull_request:
+  #   branches:
+  #     - main
+  #     - 'release/*.*.*'
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  VCLUSTER_NAME: mx-ci-cluster
+  VCLUSTER_NAMESPACE: mx-ci
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the MX coordination server image from source.
+  # Image tag convention: <MX_IMAGE_REPO>/mx-server:<sha>
+  # Uses a public ubuntu:24.04 runtime base — no NGC org access required.
+  # ---------------------------------------------------------------------------
+  build-server:
+    name: Build server image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login "${{ secrets.MX_IMAGE_REPO }}" -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        run: |
+          IMAGE="${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            -f ci/k8s/server/Dockerfile.server \
+            -t "${IMAGE}" \
+            --push \
+            .
+
+  # ---------------------------------------------------------------------------
+  # Build one worker image per inference engine framework.
+  # Image tag convention: <MX_IMAGE_REPO>/mx-worker-<framework>:<sha>
+  # The test job reconstructs this tag from the same inputs — no job output needed.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build worker image (${{ matrix.framework }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            dockerfile: ci/k8s/client/vllm/Dockerfile
+          # trt-llm — gated on the TRT-LLM ModelExpress adapter landing.
+          # Tracking: https://linear.app/nvidia/issue/MX-299/trt-llm-adapter
+          # Uncomment once the adapter is available in the base image.
+          # - framework: trt-llm
+          #   dockerfile: ci/k8s/client/trt-llm/Dockerfile
+          - framework: sglang
+            dockerfile: ci/k8s/client/sgl/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login "${{ secrets.MX_IMAGE_REPO }}" -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        # Build context is repo root — Dockerfiles COPY from modelexpress_client/python/.
+        run: |
+          IMAGE="${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            -f "${{ matrix.dockerfile }}" \
+            -t "${IMAGE}" \
+            --push \
+            .
+
+  # ---------------------------------------------------------------------------
+  # Ensure the persistent vCluster is ready.
+  # Bootstraps on first run, no-ops on re-runs.  Runs in parallel with build
+  # jobs — the vCluster does not depend on any built image.
+  # ---------------------------------------------------------------------------
+  ensure-vcluster:
+    name: Ensure vCluster
+    runs-on: prod-modelexpress-default-small-v1
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if vCluster exists
+        id: vcluster-check
+        uses: ./.github/actions/check-vcluster-exists
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Bootstrap vCluster (first run only)
+        if: steps.vcluster-check.outputs.exists != 'true'
+        uses: ./.github/actions/setup-mx-vcluster
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Connect to vCluster
+        # Always connect — verifies the vCluster is accessible on re-runs
+        # where bootstrap was skipped.
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+  # ---------------------------------------------------------------------------
+  # Run P2P weight-transfer test for each framework.
+  # Each matrix job creates its own namespace for full isolation, allowing
+  # parallel execution in the future (remove max-parallel: 1 to enable).
+  # ---------------------------------------------------------------------------
+  test:
+    name: P2P test (${{ matrix.framework }})
+    runs-on: prod-modelexpress-default-small-v1
+    needs: [build, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - framework: vllm
+            namespace: mx-ci-vllm-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8001"
+            worker_port: "8002"
+          # trt-llm — gated on the TRT-LLM ModelExpress adapter (MX-299:
+          # https://linear.app/nvidia/issue/MX-299/trt-llm-adapter).
+          # Uncomment once the adapter lands; see build matrix above.
+          # - framework: trt-llm
+          #   namespace: mx-ci-trt-llm-${{ github.run_id }}
+          #   manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
+          #   test_script: ci/k8s/client/test_p2p_k8s.py
+          #   pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
+          #   source_extra_env: |
+          #     JOB_NAME=mx-source
+          #     MODEL_EXPRESS_SOURCE=1
+          #   extra_env: "JOB_NAME=mx-target"
+          #   source_port: "8003"
+          #   worker_port: "8004"
+          - framework: sglang
+            namespace: mx-ci-sglang-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8005"
+            worker_port: "8006"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P RDMA transfer test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ${{ matrix.test_script }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: ${{ secrets.MX_IMAGE_REPO }}
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: ${{ matrix.source_extra_env }}
+          extra_env: ${{ matrix.extra_env }}
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          pytest_args: ${{ matrix.pytest_args }}

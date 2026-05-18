@@ -1,0 +1,314 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Run ModelExpress P2P CI Test'
+description: |
+  Self-contained action that owns the full lifecycle of a single test namespace:
+    1. Create namespace
+    2. Apply CRD (idempotent), RBAC, secrets, mx-server
+    3. Deploy source worker, wait for ModelMetadata CR
+    4. Deploy target worker, wait for pods to leave Pending
+    5. Run pytest against the deployed resources
+    6. Delete the namespace on exit (pass or fail)
+
+  Isolation: each framework gets its own namespace, so multiple matrix jobs
+  can run in parallel once max-parallel is removed from the workflow strategy.
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for the vCluster'
+    required: true
+  namespace:
+    description: 'Namespace to create inside the vCluster for this test run'
+    required: false
+    default: 'mx-ci-default'
+  server_image:
+    description: 'Fully-qualified MX server image (built from ci/k8s/server/Dockerfile.server)'
+    required: true
+  manifest:
+    description: 'Repo-root-relative path to the K8s manifest. Envsubst is run on it before apply.'
+    required: true
+  test_script:
+    description: 'Repo-root-relative path to the pytest file to run after pods are up'
+    required: true
+  worker_image:
+    description: 'Fully-qualified worker image (e.g. built from ci/k8s/client/vllm/Dockerfile)'
+    required: true
+  model:
+    description: 'HuggingFace model id — exposed as MX_CI_MODEL for envsubst and pytest'
+    required: false
+    default: 'Qwen/Qwen2.5-0.5B'
+  hf_token:
+    description: 'HuggingFace token — written as hf-token-secret in the test namespace. Required: worker manifests reference the secret unconditionally.'
+    required: true
+  source_extra_env:
+    description: |
+      KEY=VALUE pairs for the source manifest apply (one per line).
+      When set, enables P2P mode: source is applied first, the action waits for
+      the ModelMetadata CR, then the target manifest is applied.
+      Example: JOB_NAME=mx-source
+    required: false
+    default: ''
+  extra_env:
+    description: |
+      Additional KEY=VALUE pairs for the target (or only) manifest apply, one per line.
+      These are exported before envsubst runs on the manifest.
+      Example:
+        JOB_NAME=mx-target
+        S3_BUCKET=my-model-bucket
+    required: false
+    default: ''
+  source_port:
+    description: 'Port the source worker listens on — exported as WORKER_PORT for the source manifest and passed to pytest as --source-port'
+    required: false
+    default: '8001'
+  worker_port:
+    description: 'Port the target worker listens on — exported as WORKER_PORT for the target manifest and passed to pytest as --worker-port'
+    required: false
+    default: '8002'
+  pod_ready_timeout_seconds:
+    description: 'Seconds to wait for test pods to leave Pending state'
+    required: false
+    default: '900'
+  worker_registry:
+    description: 'Registry hostname for the worker image (used to create worker-registry imagePullSecret)'
+    required: false
+    default: ''
+  ngc_api_key:
+    description: 'NGC API key — used to create the worker-registry imagePullSecret'
+    required: false
+    default: ''
+  pytest_args:
+    description: 'Extra arguments forwarded verbatim to pytest'
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup vCluster kubeconfig
+      shell: bash
+      run: |
+        echo "${{ inputs.kubeconfig_base64 }}" | base64 -d > ${{ github.workspace }}/.kubeconfig-vcluster
+        chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
+        echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-vcluster" >> $GITHUB_ENV
+
+    - name: Setup test namespace
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
+        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+        # CRD is cluster-scoped — idempotent, safe to re-apply on every run.
+        kubectl apply -f ci/k8s/server/crd-modelmetadata.yaml
+
+        # RBAC scoped to this namespace.
+        NAMESPACE=${NAMESPACE} envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
+          kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Create worker registry pull secret
+      if: inputs.worker_registry != '' && inputs.ngc_api_key != ''
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.worker_registry }}
+        NGC_API_KEY: ${{ inputs.ngc_api_key }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create worker-registry pull secret"
+        # docker-server is hardcoded to nvcr.io so this single secret
+        # authenticates ALL nvcr.io images — both the team's worker images
+        # (nvcr.io/nvidian/...) and the public base images (nvcr.io/nvidia/...).
+        # Replaces the previous two-secret setup (worker-registry + ngc-registry).
+        kubectl create secret docker-registry worker-registry \
+          --docker-server="nvcr.io" \
+          --docker-username='$oauthtoken' \
+          --docker-password="${NGC_API_KEY}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Create HF token secret
+      if: inputs.hf_token != ''
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf_token }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create hf-token-secret"
+        kubectl create secret generic hf-token-secret \
+          --from-literal=HF_TOKEN="${HF_TOKEN}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Deploy MX server
+      shell: bash
+      env:
+        MX_SERVER_IMAGE: ${{ inputs.server_image }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Deploy MX server in ${NAMESPACE}"
+        envsubst < ci/k8s/server/mx-server.yaml | kubectl apply -n ${NAMESPACE} -f -
+        kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
+        echo "::endgroup::"
+
+    - name: Apply source manifest
+      if: inputs.source_extra_env != ''
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        NAMESPACE: ${{ inputs.namespace }}
+        WORKER_PORT: ${{ inputs.source_port }}
+        SOURCE_EXTRA_ENV: ${{ inputs.source_extra_env }}
+        MANIFEST: ${{ inputs.manifest }}
+      run: |
+        echo "::group::Apply source manifest (WORKER_PORT=${WORKER_PORT})"
+        while IFS= read -r line; do
+          [ -n "$line" ] && export "$line"
+        done <<< "${SOURCE_EXTRA_ENV}"
+        envsubst < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Wait for source to publish metadata
+      if: inputs.source_extra_env != ''
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
+      run: |
+        echo "::group::Wait for source to publish ModelMetadata CR"
+        deadline=$((SECONDS + TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          if kubectl get modelmetadata -n ${NAMESPACE} -o name 2>/dev/null | grep -q .; then
+            echo "Source published metadata."
+            break
+          fi
+          FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
+            | awk '$4 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
+          if [ -n "${FAILED}" ]; then
+            echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
+            exit 1
+          fi
+          echo "No ModelMetadata CR yet, retrying in 10s..."
+          sleep 10
+        done
+        # The loop exits without error when the deadline fires. Without this
+        # final check, the next step would apply the target manifest against
+        # a namespace that has no ModelMetadata CR and the test would fail
+        # downstream with a confusing "no source worker for rank N" error
+        # instead of the actual root cause.
+        if ! kubectl get modelmetadata -n ${NAMESPACE} -o name 2>/dev/null | grep -q .; then
+          echo "ERROR: source did not publish metadata within ${TIMEOUT}s"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Apply manifest
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        NAMESPACE: ${{ inputs.namespace }}
+        WORKER_PORT: ${{ inputs.worker_port }}
+        EXTRA_ENV: ${{ inputs.extra_env }}
+        MANIFEST: ${{ inputs.manifest }}
+      run: |
+        echo "::group::Apply ${MANIFEST} (WORKER_PORT=${WORKER_PORT})"
+        while IFS= read -r line; do
+          [ -n "$line" ] && export "$line"
+        done <<< "${EXTRA_ENV}"
+        envsubst < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Wait for test pods to start
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
+      run: |
+        echo "::group::Waiting for test pods to leave Pending"
+        deadline=$((SECONDS + TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          PENDING=$(kubectl get pods -n ${NAMESPACE} --no-headers 2>/dev/null \
+            | awk '$4 == "Pending"' | grep -v '^mx-server-' || true)
+          if [ -z "$PENDING" ]; then
+            echo "All test pods have left Pending."
+            break
+          fi
+          echo "Still pending: $PENDING"
+          sleep 10
+        done
+
+        FAILED=$(kubectl get pods -n ${NAMESPACE} --no-headers 2>/dev/null \
+          | awk '$4 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' \
+          | grep -v '^mx-server-' || true)
+        if [ -n "$FAILED" ]; then
+          echo "ERROR: the following test pods failed to start:"
+          echo "$FAILED"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install test dependencies
+      shell: bash
+      run: pip install pytest
+
+    - name: Run tests
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        SOURCE_PORT: ${{ inputs.source_port }}
+        WORKER_PORT: ${{ inputs.worker_port }}
+        TEST_SCRIPT: ${{ inputs.test_script }}
+        PYTEST_ARGS: ${{ inputs.pytest_args }}
+      run: |
+        pytest "${TEST_SCRIPT}" -v \
+          --namespace "${NAMESPACE}" \
+          --model "${MX_CI_MODEL}" \
+          --source-port "${SOURCE_PORT}" \
+          --worker-port "${WORKER_PORT}" \
+          ${PYTEST_ARGS}
+
+    - name: Dump pod logs on failure
+      if: failure()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        set +eo pipefail
+        echo "::group::Pod summary"
+        kubectl get pods -n ${NAMESPACE} -o wide 2>&1 || true
+        echo "::endgroup::"
+
+        for POD in $(kubectl get pods -n ${NAMESPACE} --no-headers 2>/dev/null \
+            | grep -v '^mx-server-' | awk '{print $1}'); do
+          echo "::group::logs ${POD} (all containers)"
+          kubectl logs -n ${NAMESPACE} "${POD}" --all-containers --tail=150 2>&1 || true
+          echo "::endgroup::"
+        done
+
+    - name: Cleanup test namespace
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Delete namespace ${NAMESPACE}"
+        # No `|| true` here on purpose: with per-run-id namespace names, an
+        # orphaned namespace from a failed cleanup would leak silently and
+        # accumulate over time (one new namespace per run, none ever GC'd).
+        # Surface the failure immediately so it can be investigated.
+        # 120s should be plenty for a normal delete; anything slower
+        # indicates a stuck finalizer.
+        kubectl delete namespace ${NAMESPACE} --ignore-not-found --timeout=120s
+        echo "::endgroup::"
