@@ -15,12 +15,12 @@ concurrency:
 
 jobs:
   test1:
-    runs-on: prod-modelexpress-default-small-v1
+    runs-on: prod-modelexpress-builder-amd-v1
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
       - name: Test
-        run: echo "Hello World"
+        run: docker info
 
   test2:
     runs-on: prod-modelexpress-tester-amd-gpu-v1
@@ -28,4 +28,4 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
       - name: Test
-        run: echo "Hello World"
+        run: docker info
