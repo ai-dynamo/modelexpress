@@ -61,7 +61,7 @@ spec:
             - --remote-instance-weight-loader-backend
             - modelexpress
             - --modelexpress-config
-            - '{"url":"modelexpress-server:8001","transport":"nixl"}'
+            - '{"url":"$(MODEL_EXPRESS_URL)","transport":"nixl"}'
             - --tp-size
             - "8"
             - --context-length

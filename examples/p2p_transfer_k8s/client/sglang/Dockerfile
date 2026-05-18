@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # TODO: Switch to an SGLang release image once the ModelExpress loader PR is released.
-ARG SGLANG_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20260517-229cadec
+ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:6553f8288e848fd833a4d473eca7aa2c8f141f98c52f63a5f4684631de50f9f2
 FROM ${SGLANG_IMAGE}
 
 # The SGLang base image owns the CUDA/NIXL/Torch stack. Install only the
