@@ -32,6 +32,7 @@ import torch.nn as nn
 from ... import configure_vllm_logging
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...nixl_transfer import NixlTransferManager
+from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import build_vllm_load_context
 
 from vllm.config import ModelConfig, VllmConfig
@@ -119,20 +120,23 @@ class MxModelLoader(BaseModelLoader):
 
         logger.info(f"[Worker {ctx.global_rank}] MxModelLoader starting (model={ctx.identity.model_name})")
 
-        with set_default_torch_dtype(model_config.dtype):
-            with ctx.target_device:
-                model = initialize_model(
-                    vllm_config=vllm_config, model_config=model_config
-                )
+        with maybe_enter_vmm_arena(ctx):
+            with set_default_torch_dtype(model_config.dtype):
+                with ctx.target_device:
+                    model = initialize_model(
+                        vllm_config=vllm_config, model_config=model_config
+                    )
 
-            model = LoadStrategyChain.run(model, ctx)
+                model = LoadStrategyChain.run(model, ctx)
 
-            # Update global registries
-            _tensor_registry[ctx.device_id] = ctx.tensors
-            if ctx.nixl_manager is not None:
-                _nixl_managers[ctx.device_id] = ctx.nixl_manager
-            else:
-                _nixl_managers.pop(ctx.device_id, None)
+                # Update global registries
+                _tensor_registry[ctx.device_id] = ctx.tensors
+                if ctx.nixl_manager is not None:
+                    _nixl_managers[ctx.device_id] = ctx.nixl_manager
+                else:
+                    _nixl_managers.pop(ctx.device_id, None)
+
+        log_arena_post_load(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
