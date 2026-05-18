@@ -109,14 +109,13 @@ jobs:
         include:
           - framework: vllm
             dockerfile: ci/k8s/client/vllm/Dockerfile
-          - framework: trt-llm
-            dockerfile: ci/k8s/client/trt-llm/Dockerfile
-          # SGLang — gated on upstream sgl-project/sglang#24723 (adds the
-          # --modelexpress-config flag). Uncomment once a tagged
-          # lmsysorg/sglang image carries that PR. See ci/k8s/client/sgl/Dockerfile
-          # and docs/SGLANG.md for background.
-          # - framework: sglang
-          #   dockerfile: ci/k8s/client/sgl/Dockerfile
+          # trt-llm — gated on the TRT-LLM ModelExpress adapter landing.
+          # Tracking: https://linear.app/nvidia/issue/MX-299/trt-llm-adapter
+          # Uncomment once the adapter is available in the base image.
+          # - framework: trt-llm
+          #   dockerfile: ci/k8s/client/trt-llm/Dockerfile
+          - framework: sglang
+            dockerfile: ci/k8s/client/sgl/Dockerfile
 
     steps:
       - name: Checkout
@@ -205,31 +204,28 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8001"
             worker_port: "8002"
-          - framework: trt-llm
-            namespace: mx-ci-trt-llm-${{ github.run_id }}
-            manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
-            test_script: ci/k8s/client/test_p2p_k8s.py
-            pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
-            source_extra_env: |
-              JOB_NAME=mx-source
-              MODEL_EXPRESS_SOURCE=1
-            extra_env: "JOB_NAME=mx-target"
-            source_port: "8003"
-            worker_port: "8004"
-          # SGLang — gated on upstream sgl-project/sglang#24723. SGLang's
-          # MxModelLoader handles source/target transparently (same command
-          # for both pods), so no MODEL_EXPRESS_SOURCE flag. Default
-          # --p2p-marker "RDMA transfer complete" applies — SGLang's loader
-          # delegates RDMA receive to the shared rdma_strategy.py which logs
-          # the same line as vLLM. Uncomment once the base image is ready.
-          # - framework: sglang
-          #   namespace: mx-ci-sglang-${{ github.run_id }}
-          #   manifest: ci/k8s/client/sgl/manifest-azure.yaml
+          # trt-llm — gated on the TRT-LLM ModelExpress adapter (MX-299:
+          # https://linear.app/nvidia/issue/MX-299/trt-llm-adapter).
+          # Uncomment once the adapter lands; see build matrix above.
+          # - framework: trt-llm
+          #   namespace: mx-ci-trt-llm-${{ github.run_id }}
+          #   manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
           #   test_script: ci/k8s/client/test_p2p_k8s.py
-          #   source_extra_env: "JOB_NAME=mx-source"
+          #   pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
+          #   source_extra_env: |
+          #     JOB_NAME=mx-source
+          #     MODEL_EXPRESS_SOURCE=1
           #   extra_env: "JOB_NAME=mx-target"
-          #   source_port: "8005"
-          #   worker_port: "8006"
+          #   source_port: "8003"
+          #   worker_port: "8004"
+          - framework: sglang
+            namespace: mx-ci-sglang-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8005"
+            worker_port: "8006"
 
     steps:
       - name: Checkout
