@@ -27,5 +27,8 @@ reviews:
       enabled: false
     unit_tests:
       enabled: false
+  tools:
+    golangci-lint:
+      enabled: false
 chat:
   auto_reply: true
