@@ -9,13 +9,13 @@ _loaders_registered = False
 
 
 def register_modelexpress_loaders() -> None:
-    """Register ModelExpress's vLLM loader when vLLM lacks native MX."""
+    """Register ModelExpress's vLLM loader for plugin-based vLLM integration."""
     global _loaders_registered
     if _loaders_registered:
         return
     from .registration import register_plugin_model_loader
 
-    # Needed for older vLLM versions before native `--load-format mx`
+    # Needed for older vLLM versions before native ModelExpress loader
     # registration is available.
     register_plugin_model_loader()
 

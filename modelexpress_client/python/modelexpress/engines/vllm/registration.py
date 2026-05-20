@@ -12,8 +12,11 @@ from vllm.model_executor.model_loader import register_model_loader
 logger = logging.getLogger(__name__)
 
 
+_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
+
+
 def _patch_vllm_s3_format_check() -> None:
-    """Allow 'mx' as a valid load format for object storage on older vLLM."""
+    """Allow ModelExpress load formats for object storage on older vLLM."""
     try:
         from vllm.config import VllmConfig
         from vllm.transformers_utils.runai_utils import is_runai_obj_uri
@@ -26,7 +29,7 @@ def _patch_vllm_s3_format_check() -> None:
 
     def patched(self: VllmConfig) -> None:
         if (
-            self.load_config.load_format == "mx"
+            self.load_config.load_format in _PLUGIN_LOAD_FORMATS
             and hasattr(self.model_config, "model_weights")
             and is_runai_obj_uri(self.model_config.model_weights)
         ):
@@ -42,20 +45,14 @@ def _patch_vllm_s3_format_check() -> None:
     patched.__modelexpress_patched__ = True
     VllmConfig.try_verify_and_update_config = patched
     logger.debug(
-        "Patched VllmConfig.try_verify_and_update_config to allow 'mx' "
+        "Patched VllmConfig.try_verify_and_update_config to allow ModelExpress "
         "for object storage URIs"
     )
 
 
 def register_plugin_model_loader() -> None:
-    """Register `mx` through vLLM's plugin registry when vLLM lacks native MX."""
+    """Register ModelExpress loaders through vLLM's plugin registry."""
     import vllm.model_executor.model_loader as model_loader
-
-    if "mx" in model_loader._LOAD_FORMAT_TO_MODEL_LOADER:
-        # Native vLLM integration owns `mx` in newer versions; the plugin path
-        # stays active only for older vLLM releases.
-        logger.debug("vLLM already provides native 'mx' loader registration")
-        return
 
     # Older vLLM still needs the plugin registration side effects that used to
     # happen when importing loader.py directly.
@@ -63,4 +60,10 @@ def register_plugin_model_loader() -> None:
 
     from .loader import MxModelLoader
 
-    register_model_loader("mx")(MxModelLoader)
+    for load_format in _PLUGIN_LOAD_FORMATS:
+        if load_format in model_loader._LOAD_FORMAT_TO_MODEL_LOADER:
+            logger.debug(
+                "vLLM already provides '%s' loader registration", load_format
+            )
+            continue
+        register_model_loader(load_format)(MxModelLoader)

@@ -18,7 +18,8 @@ Uses LoadStrategyChain to auto-detect the best loading strategy:
     4. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
-    --load-format mx  (auto-detect: RDMA -> ModelStreamer -> GDS -> default)
+    --load-format modelexpress
+    --load-format mx  (backward-compatible alias)
 """
 
 from __future__ import annotations
