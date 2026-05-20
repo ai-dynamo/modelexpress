@@ -15,6 +15,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=os.environ.get("P2P_MARKER", "RDMA transfer complete"),
         help="String that must appear in target pod logs to confirm P2P transfer ran.",
     )
+    parser.addoption(
+        "--tp-size",
+        default=int(os.environ.get("TP_SIZE", "1")),
+        type=int,
+        help="Tensor-parallel size — the per-rank transfer test expects this many distinct ranks.",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -42,3 +48,8 @@ def worker_port(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def p2p_marker(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--p2p-marker")
+
+
+@pytest.fixture(scope="session")
+def tp_size(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--tp-size")

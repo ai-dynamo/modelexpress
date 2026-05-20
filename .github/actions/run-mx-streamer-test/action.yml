@@ -1,0 +1,257 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Run ModelExpress Model Streamer Test'
+description: |
+  Standalone model-streamer CI test. Runs a single vLLM pod via Docker on a
+  GPU runner — no vCluster, no mx-server, no P2P. Exercises the
+  runai-model-streamer path by streaming safetensors directly from S3.
+
+  Pre-run setup (one-time): downloads the model safetensors from HuggingFace
+  and uploads to S3 if not already present. Subsequent runs skip the upload.
+  No cleanup — the S3 bucket acts as a persistent cache across runs.
+
+  Credentials: the runner is expected to have IRSA (IAM Roles for Service
+  Accounts) access to the S3 bucket via its EKS pod service account.
+  AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are forwarded from the pod
+  into the Docker container so boto3 can assume the role.
+
+inputs:
+  worker_image:
+    description: 'Fully-qualified vLLM worker image (built from ci/k8s/client/vllm/Dockerfile)'
+    required: true
+  model:
+    description: 'HuggingFace model id — used for architecture config and as the upload/download target'
+    required: false
+    default: 'Qwen/Qwen2.5-0.5B'
+  s3_bucket:
+    description: 'S3 bucket name for the model weight cache'
+    required: true
+  s3_region:
+    description: 'AWS region for the S3 bucket'
+    required: false
+    default: 'us-east-1'
+  port:
+    description: 'Port the vLLM server listens on inside the container'
+    required: false
+    default: '18888'
+  streamer_concurrency:
+    description: 'RUNAI_STREAMER_CONCURRENCY — number of parallel S3 read threads'
+    required: false
+    default: '16'
+  load_timeout_seconds:
+    description: 'Seconds to wait for "Model streamer weight loading complete" in container logs'
+    required: false
+    default: '300'
+  hf_token:
+    description: 'HuggingFace token — only required for gated models. Ignored when empty (public models work without it).'
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Populate S3 model cache (upload safetensors if missing)
+      shell: bash
+      env:
+        MODEL: ${{ inputs.model }}
+        S3_BUCKET: ${{ inputs.s3_bucket }}
+        S3_REGION: ${{ inputs.s3_region }}
+        # huggingface_hub reads HF_TOKEN automatically when present. Empty value
+        # is harmless — anonymous download still works for public models.
+        HF_TOKEN: ${{ inputs.hf_token }}
+      run: |
+        # Python is provided by the setup-python step above; works on
+        # self-hosted runners without assuming the runner image ships Python.
+        # boto3 is ~3 MB and installs in seconds; avoids assuming aws-cli
+        # or any other tool is present in the runner image.
+        pip install -q boto3 huggingface_hub
+
+        python3 - <<'EOF'
+        import boto3, os, pathlib, tempfile
+        from huggingface_hub import snapshot_download
+
+        bucket = os.environ["S3_BUCKET"]
+        region = os.environ["S3_REGION"]
+        model  = os.environ["MODEL"]
+        prefix = f"models/{model}/"
+
+        s3 = boto3.client("s3", region_name=region)
+
+        # Check if safetensors are already in S3.
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+        if any(obj["Key"].endswith(".safetensors") for obj in resp.get("Contents", [])):
+            print(f"Safetensors already in s3://{bucket}/{prefix} — skipping upload.")
+        else:
+            print(f"Downloading safetensors for {model} from HuggingFace...")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                snapshot_download(
+                    repo_id=model,
+                    local_dir=tmpdir,
+                    allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+                )
+                exts = (".safetensors", ".safetensors.index.json")
+                files = [f for f in pathlib.Path(tmpdir).rglob("*")
+                         if f.is_file() and any(f.name.endswith(e) for e in exts)]
+                print(f"Uploading {len(files)} file(s) to s3://{bucket}/{prefix}")
+
+                uploaded = []
+                try:
+                    for f in files:
+                        key = prefix + f.relative_to(tmpdir).as_posix()
+                        print(f"  {f.name} -> {key}")
+                        s3.upload_file(str(f), bucket, key)
+                        uploaded.append((key, f.stat().st_size))
+                except Exception as e:
+                    print(f"ERROR: upload failed mid-stream: {e}")
+                    print(f"Rolling back {len(uploaded)} partially-uploaded file(s) "
+                          f"to avoid poisoning the S3 cache for future runs...")
+                    for key, _ in uploaded:
+                        try:
+                            s3.delete_object(Bucket=bucket, Key=key)
+                            print(f"  rolled back: {key}")
+                        except Exception as rb:
+                            print(f"  WARN: failed to roll back {key}: {rb}")
+                    raise
+
+                # Verify each uploaded object is actually in S3 with matching size.
+                # Catches silent corruption (rare) and confirms the cache is usable.
+                for key, expected_size in uploaded:
+                    head = s3.head_object(Bucket=bucket, Key=key)
+                    actual_size = head["ContentLength"]
+                    if actual_size != expected_size:
+                        raise RuntimeError(
+                            f"Size mismatch for s3://{bucket}/{key}: "
+                            f"expected {expected_size}, got {actual_size}"
+                        )
+                print(f"Upload verified: {len(uploaded)} file(s).")
+        EOF
+
+    - name: Start vLLM container with model streamer
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MODEL: ${{ inputs.model }}
+        S3_BUCKET: ${{ inputs.s3_bucket }}
+        S3_REGION: ${{ inputs.s3_region }}
+        PORT: ${{ inputs.port }}
+        STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+      run: |
+        set -euo pipefail
+        MODEL_S3_URI="s3://${S3_BUCKET}/models/${MODEL}"
+
+        # IRSA credentials don't auto-propagate into child containers. The EKS
+        # runner pod gets AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE wired in,
+        # but a `docker run` child sees neither unless we forward them: pass
+        # the role ARN as -e and mount the OIDC token file in as a volume.
+        # boto3 inside the container then does its own sts:AssumeRoleWithWebIdentity.
+        IRSA_TOKEN="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/eks.amazonaws.com/serviceaccount/token}"
+
+        # `--entrypoint python3` overrides the image's ENTRYPOINT (which is
+        # the `vllm` multi-command CLI in vllm 0.17+). Without this override
+        # the args below get passed AS args to `vllm`, which doesn't recognize
+        # `-m vllm.entrypoints.openai.api_server` and errors out. The K8s
+        # manifests (e.g. ci/k8s/client/vllm/manifest-azure.yaml) get this
+        # for free because `command:` overrides ENTRYPOINT implicitly;
+        # `docker run` doesn't, so we have to be explicit.
+        CONTAINER_ID=$(docker run -d --gpus all --ipc=host \
+          --entrypoint python3 \
+          -e AWS_ROLE_ARN="${AWS_ROLE_ARN}" \
+          -e AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks-token" \
+          -v "${IRSA_TOKEN}:/var/run/secrets/eks-token:ro" \
+          -e AWS_DEFAULT_REGION="${S3_REGION}" \
+          -e MX_MODEL_URI="${MODEL_S3_URI}" \
+          -e RUNAI_STREAMER_CONCURRENCY="${STREAMER_CONCURRENCY}" \
+          -e VLLM_PLUGINS=modelexpress \
+          -p "${PORT}:${PORT}" \
+          "${WORKER_IMAGE}" \
+          -m vllm.entrypoints.openai.api_server \
+            --model "${MODEL}" \
+            --load-format mx \
+            --port "${PORT}")
+        echo "Container: ${CONTAINER_ID}"
+        # Persist CONTAINER_ID for subsequent steps in this composite action.
+        echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
+
+    - name: Wait for model streamer to complete
+      shell: bash
+      env:
+        LOAD_TIMEOUT: ${{ inputs.load_timeout_seconds }}
+      run: |
+        set -euo pipefail
+        deadline=$((SECONDS + LOAD_TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          if docker logs "${CONTAINER_ID}" 2>&1 | grep -q "Model streamer weight loading complete"; then
+            echo "Model streamer loading confirmed."
+            exit 0
+          fi
+          if [ "$(docker inspect "${CONTAINER_ID}" --format '{{.State.Running}}')" != "true" ]; then
+            echo "ERROR: container exited before model streamer completed."
+            docker logs "${CONTAINER_ID}" 2>&1 | tail -80
+            exit 1
+          fi
+          echo "Still loading... (${SECONDS}s elapsed)"
+          sleep 10
+        done
+
+        echo "ERROR: model streamer did not complete within ${LOAD_TIMEOUT}s."
+        docker logs "${CONTAINER_ID}" 2>&1 | tail -80
+        exit 1
+
+    - name: Wait for OpenAI server to be ready
+      shell: bash
+      env:
+        PORT: ${{ inputs.port }}
+      run: |
+        set -euo pipefail
+        timeout 60 bash -c \
+          "until curl -sf http://localhost:${PORT}/health > /dev/null; do sleep 2; done"
+        echo "Server ready on port ${PORT}."
+
+    - name: Verify inference
+      shell: bash
+      env:
+        MODEL: ${{ inputs.model }}
+        PORT: ${{ inputs.port }}
+      run: |
+        set -euo pipefail
+        RESPONSE=$(curl -sS --max-time 60 "http://localhost:${PORT}/v1/completions" \
+          -H "Content-Type: application/json" \
+          -d "{\"model\": \"${MODEL}\", \"prompt\": \"The capital of France is\", \"max_tokens\": 8}")
+        echo "Response: ${RESPONSE}"
+        echo "${RESPONSE}" | python3 -c "
+        import json, sys
+        body = json.load(sys.stdin)
+        choices = body.get('choices', [])
+        assert choices and choices[0].get('text'), f'No completion text in response: {body}'
+        print('Inference OK:', repr(choices[0]['text'][:60]))
+        "
+
+    - name: Cleanup container
+      if: always()
+      shell: bash
+      run: |
+        if [ -n "${CONTAINER_ID:-}" ]; then
+          echo "::group::Container logs (tail 200)"
+          docker logs "${CONTAINER_ID}" 2>&1 | tail -200 || true
+          echo "::endgroup::"
+          docker stop "${CONTAINER_ID}" 2>/dev/null || true
+          docker rm -f "${CONTAINER_ID}" 2>/dev/null || true
+        fi
+
+    - name: Cleanup local image
+      # `if: always()` so this also runs when the job is cancelled by
+      # cancel-in-progress concurrency. Without it, the vLLM worker image
+      # (~15GB with deps + ModelExpress layer) accumulates in the GPU
+      # runner's Docker daemon across runs and eventually exhausts disk.
+      if: always()
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+      run: |
+        docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true

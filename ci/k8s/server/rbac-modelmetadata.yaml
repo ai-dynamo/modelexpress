@@ -3,12 +3,21 @@
 #
 # CI version of examples/dynamo_p2p_transfer_k8s/vllm/rbac-modelmetadata.yaml.
 #
-# The upstream file hardcodes namespace: default in the RoleBinding subject, which
-# causes a 403 when the MX server runs in any other namespace.  This file uses
-# ${NAMESPACE} so envsubst substitutes the correct value before kubectl apply.
+# Grants the `modelexpress` ServiceAccount permissions on both CRDs the
+# mx-server uses with MX_METADATA_BACKEND=kubernetes:
+#   * modelmetadatas    — P2P worker discovery / heartbeats
+#   * modelcacheentries — model-download registry (LRU eviction state)
+# Missing either causes server startup to fail with a 403 against the
+# corresponding API group.
+#
+# The upstream file hardcodes namespace: default in the RoleBinding subject,
+# which causes a 403 when the MX server runs in any other namespace. This
+# file uses ${NAMESPACE} so envsubst substitutes the correct value before
+# kubectl apply.
 #
 # Apply with:
-#   NAMESPACE=<your-ns> envsubst < ci/k8s/rbac-modelmetadata.yaml | kubectl apply -n <your-ns> -f -
+#   NAMESPACE=<your-ns> envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
+#     kubectl apply -n <your-ns> -f -
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -40,6 +49,32 @@ rules:
       - modelexpress.nvidia.com
     resources:
       - modelmetadatas/status
+    verbs:
+      - get
+      - update
+      - patch
+  # ModelCacheEntry CRD — used by the mx-server registry backend (also
+  # selected via MX_METADATA_BACKEND=kubernetes). Without this rule, server
+  # startup fails with `Failed to connect to model registry backend:
+  # modelcacheentries.modelexpress.nvidia.com is forbidden`. The CRD itself
+  # is expected to already be installed cluster-wide (in our test vCluster
+  # the dynamo-platform install provides it).
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelcacheentries
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelcacheentries/status
     verbs:
       - get
       - update
