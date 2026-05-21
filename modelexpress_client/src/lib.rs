@@ -353,6 +353,7 @@ impl Client {
             model_name: model_name.to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             chunk_size,
+            file_selector: None,
         });
 
         let mut stream = self
