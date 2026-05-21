@@ -275,6 +275,100 @@ class TestAbstractMethodCompleteness:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
 
+    def test_loader_import_does_not_register_mx(self, monkeypatch):
+        import importlib
+        import vllm.model_executor.model_loader as model_loader
+
+        registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
+        registry.pop("mx", None)
+        monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
+
+        importlib.import_module("modelexpress.engines.vllm.loader")
+
+        assert "mx" not in model_loader._LOAD_FORMAT_TO_MODEL_LOADER
+
+    def test_plugin_registration_preserves_native_modelexpress(self, monkeypatch):
+        import importlib
+        import vllm.model_executor.model_loader as model_loader
+
+        sentinel = object()
+        registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
+        registry["modelexpress"] = sentinel
+        registry.pop("mx", None)
+        monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
+
+        registration = importlib.import_module(
+            "modelexpress.engines.vllm.registration"
+        )
+        patch_check = MagicMock()
+        registered = {}
+
+        def fake_register_model_loader(load_format):
+            def register(loader_cls):
+                registered[load_format] = loader_cls
+                return loader_cls
+
+            return register
+
+        monkeypatch.setattr(registration, "_patch_vllm_s3_format_check", patch_check)
+        monkeypatch.setattr(
+            registration,
+            "register_model_loader",
+            fake_register_model_loader,
+        )
+
+        registration.register_plugin_model_loader()
+
+        from modelexpress.engines.vllm.loader import MxModelLoader
+
+        patch_check.assert_called_once_with()
+        assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["modelexpress"] is sentinel
+        assert registered["mx"] is MxModelLoader
+        assert "modelexpress" not in registered
+
+    def test_plugin_registration_registers_load_formats_without_native_vllm(
+        self, monkeypatch
+    ):
+        import importlib
+        import vllm.model_executor.model_loader as model_loader
+
+        registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
+        registry.pop("mx", None)
+        registry.pop("modelexpress", None)
+        monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
+
+        registration = importlib.import_module(
+            "modelexpress.engines.vllm.registration"
+        )
+        patch_check = MagicMock()
+        registered = {}
+
+        def fake_register_model_loader(load_format):
+            def register(loader_cls):
+                registered[load_format] = loader_cls
+                return loader_cls
+
+            return register
+
+        monkeypatch.setattr(
+            registration,
+            "_patch_vllm_s3_format_check",
+            patch_check,
+        )
+        monkeypatch.setattr(
+            registration,
+            "register_model_loader",
+            fake_register_model_loader,
+        )
+
+        registration.register_plugin_model_loader()
+
+        from modelexpress.engines.vllm.loader import MxModelLoader
+
+        patch_check.assert_called_once_with()
+        assert registered["modelexpress"] is MxModelLoader
+        assert registered["mx"] is MxModelLoader
+
 
 # ---------------------------------------------------------------------------
 # register_tensors (load_strategy.base)

@@ -14,7 +14,7 @@ Quick Start (vLLM):
     from modelexpress import register_modelexpress_loaders
     register_modelexpress_loaders()
 
-    # vllm serve model --load-format mx
+    # vllm serve model --load-format modelexpress
     # Auto-detects: RDMA -> GDS -> disk
 """
 
@@ -54,7 +54,8 @@ def register_modelexpress_loaders():
     multiple times safely (idempotent).
 
     Enables:
-        --load-format mx  (auto-detect: RDMA -> GDS -> disk)
+        --load-format modelexpress  (auto-detect: RDMA -> GDS -> disk)
+        --load-format mx            (backward-compatible alias)
     """
     global _loaders_registered
     if _loaders_registered:
@@ -65,7 +66,7 @@ def register_modelexpress_loaders():
     register_vllm_loaders()
 
     _loaders_registered = True
-    _logger.debug("ModelExpress loader registered: mx")
+    _logger.debug("ModelExpress loaders registered")
 
 
 from .client import MxClient  # noqa: F401
