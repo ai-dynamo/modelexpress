@@ -32,10 +32,12 @@
 #
 # Status: scaffolded, gated. Blockers before this can run in CI:
 #
-#   1. ModelExpress device_id bug under Ray executor. Confirmed on
-#      vLLM 0.17.1: rank-1's NIXL registration fails with
-#      `CUDA error: invalid device ordinal` because the plugin reads
-#      `device_id` from `vllm_config.device_config.device.index` (see
+#   1. ModelExpress device_id bug observed under vLLM's Ray distributed
+#      executor (--distributed-executor-backend=ray) with one-GPU-per-pod
+#      isolation, exactly the topology this manifest uses. Confirmed on
+#      vLLM 0.17.1: rank-1's NIXL registration fails with `CUDA error:
+#      invalid device ordinal` because the plugin reads `device_id` from
+#      `vllm_config.device_config.device.index` (see
 #      modelexpress_client/python/modelexpress/engines/vllm/adapter.py
 #      `_get_vllm_device_id`), which carries the GLOBAL rank under Ray
 #      multi-node TP. Each pod only exposes its assigned GPU as local
@@ -44,10 +46,14 @@
 #      metadata publish"), only one ModelMetadata CR shows up server-
 #      side, and no P2P transfer is possible. Single-node TP=2 is
 #      unaffected because both devices (0 and 1) exist in the same pod.
+#      Whether other distributed setups (e.g. non-Ray multi-node) are
+#      affected is unverified — the failure mode is specific to how
+#      `device.index` maps to local CUDA visibility, so any executor that
+#      surfaces a local device index would dodge it; we haven't profiled.
 #      Likely fix in adapter.py: prefer `torch.cuda.current_device()`
 #      (reflects the worker process's actual visible CUDA context) over
-#      `target_device.index` whenever CUDA is available. Tracked as a
-#      separate bug — must land before this manifest is enabled.
+#      `target_device.index` whenever CUDA is available. Tracking ticket:
+#      TODO — file before re-enabling this manifest.
 #
 #   2. Cluster capacity. Requires ≥2 A100 + IB nodes (each with ≥2 GPUs)
 #      available concurrently in the Azure AKS test pool. The matchLabelKeys

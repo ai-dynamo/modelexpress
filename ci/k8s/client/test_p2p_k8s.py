@@ -160,10 +160,11 @@ def test_per_rank_source_agents(namespace: str, tp_size: int) -> None:
     """Target must connect to one distinct source NIXL agent per target rank.
 
     Each source rank publishes exactly one NIXL agent. The shared
-    nixl_transfer.py:386 logs `add_remote_agent: ... (agent=b'<name>')` for
-    every target→source connection in both engine paths (vLLM via
-    rdma_strategy.py and TRT-LLM via trtllm_live_transfer.py), though the
-    agent-name format differs per engine (see regex below). Failure modes:
+    NixlTransferManager.receive_from_source (in modelexpress.nixl_transfer)
+    logs `add_remote_agent: ... (agent=b'<name>')` for every target→source
+    connection in both engine paths (vLLM via rdma_strategy.py and TRT-LLM
+    via trtllm_live_transfer.py), though the agent-name format differs per
+    engine (see regex below). Failure modes:
 
       - TP collapse: fewer than `tp_size` add_remote_agent lines.
       - Source-rank collapse (e.g. all target ranks pulling from source rank 0
