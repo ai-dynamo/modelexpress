@@ -163,6 +163,27 @@ fn collect_model_files(
     files
 }
 
+fn ensure_selected_files_exist(
+    files: &[(PathBuf, u64)],
+    file_selector: Option<&ModelFileSelector>,
+) -> Result<(), String> {
+    let Some(selector) = file_selector else {
+        return Ok(());
+    };
+
+    if let Some(missing_path) = selector.paths.iter().find(|selector_path| {
+        !files
+            .iter()
+            .any(|(path, _)| Path::new(selector_path) == path.as_path())
+    }) {
+        Err(format!(
+            "Selected file not found in model directory: {missing_path}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl ModelService for ModelServiceImpl {
     type EnsureModelDownloadedStream = ReceiverStream<Result<ModelStatusUpdate, Status>>;
@@ -306,6 +327,8 @@ impl ModelService for ModelServiceImpl {
             &model_path,
             files_request.file_selector.as_ref(),
         );
+        ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
+            .map_err(Status::not_found)?;
 
         if files.is_empty() {
             return Err(Status::not_found("No files found in model directory"));
@@ -452,6 +475,8 @@ impl ModelService for ModelServiceImpl {
             &model_path,
             files_request.file_selector.as_ref(),
         );
+        ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
+            .map_err(Status::not_found)?;
 
         let file_infos: Vec<ModelFileInfo> = files
             .iter()
@@ -1233,7 +1258,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_stream_model_files_hf_returns_not_found_for_empty_selector_result() {
+    async fn test_stream_model_files_hf_returns_not_found_for_missing_selector_path() {
         let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let _cache_dir_guard = EnvVarGuard::set(
@@ -1254,14 +1279,17 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: Some(ModelFileSelector {
-                paths: vec!["missing.json".to_string()],
+                paths: vec!["config.json".to_string(), "missing.json".to_string()],
             }),
         });
 
         let result = service.stream_model_files(request).await;
         let status = result.expect_err("Expected not found");
         assert_eq!(status.code(), tonic::Code::NotFound);
-        assert_eq!(status.message(), "No files found in model directory");
+        assert_eq!(
+            status.message(),
+            "Selected file not found in model directory: missing.json"
+        );
     }
 
     #[tokio::test]
