@@ -52,7 +52,7 @@ runs:
   using: "composite"
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: "3.12"
 
@@ -143,6 +143,8 @@ runs:
         STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
       run: |
         set -euo pipefail
+        [[ "${PORT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: port must be a positive integer, got '${PORT}'"; exit 1; }
+        [[ "${STREAMER_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: streamer_concurrency must be a positive integer, got '${STREAMER_CONCURRENCY}'"; exit 1; }
         MODEL_S3_URI="s3://${S3_BUCKET}/models/${MODEL}"
 
         # IRSA credentials don't auto-propagate into child containers. The EKS
@@ -184,6 +186,7 @@ runs:
         LOAD_TIMEOUT: ${{ inputs.load_timeout_seconds }}
       run: |
         set -euo pipefail
+        [[ "${LOAD_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: load_timeout_seconds must be a positive integer, got '${LOAD_TIMEOUT}'"; exit 1; }
         deadline=$((SECONDS + LOAD_TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
           if docker logs "${CONTAINER_ID}" 2>&1 | grep -q "Model streamer weight loading complete"; then
@@ -209,6 +212,7 @@ runs:
         PORT: ${{ inputs.port }}
       run: |
         set -euo pipefail
+        [[ "${PORT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: port must be a positive integer, got '${PORT}'"; exit 1; }
         timeout 60 bash -c \
           "until curl -sf http://localhost:${PORT}/health > /dev/null; do sleep 2; done"
         echo "Server ready on port ${PORT}."

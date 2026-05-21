@@ -1,15 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import os
 import pytest
+
+
+def _positive_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {ivalue}")
+    return ivalue
+
+
+def _port(value: str) -> int:
+    ivalue = int(value)
+    if not 1 <= ivalue <= 65535:
+        raise argparse.ArgumentTypeError(f"must be a valid TCP port (1-65535), got {ivalue}")
+    return ivalue
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--namespace", default=os.environ.get("NAMESPACE", ""))
     parser.addoption("--model", default=os.environ.get("MX_CI_MODEL", "Qwen/Qwen2.5-0.5B"))
-    parser.addoption("--source-port", default=int(os.environ.get("SOURCE_PORT", "8001")), type=int)
-    parser.addoption("--worker-port", default=int(os.environ.get("WORKER_PORT", "8002")), type=int)
+    parser.addoption("--source-port", default=_port(os.environ.get("SOURCE_PORT", "8001")), type=_port)
+    parser.addoption("--worker-port", default=_port(os.environ.get("WORKER_PORT", "8002")), type=_port)
     parser.addoption(
         "--p2p-marker",
         default=os.environ.get("P2P_MARKER", "RDMA transfer complete"),
@@ -17,8 +32,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     parser.addoption(
         "--tp-size",
-        default=int(os.environ.get("TP_SIZE", "1")),
-        type=int,
+        default=_positive_int(os.environ.get("TP_SIZE", "1")),
+        type=_positive_int,
         help="Tensor-parallel size — the per-rank transfer test expects this many distinct ranks.",
     )
 

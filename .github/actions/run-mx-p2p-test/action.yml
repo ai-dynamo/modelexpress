@@ -191,6 +191,8 @@ runs:
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
         TP_SIZE: ${{ inputs.tp_size }}
       run: |
+        [[ "${TP_SIZE}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: tp_size must be a positive integer, got '${TP_SIZE}'"; exit 1; }
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         echo "::group::Wait for source to publish ${TP_SIZE} ModelMetadata CR(s)"
         # Wait for one CR per source rank. Under TP=N each rank publishes
         # its own ModelMetadata CR (worker_rank=0..N-1), and the target's
@@ -207,7 +209,7 @@ runs:
             break
           fi
           FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
-            | awk '$4 ~ /Error|CrashLoopBackOff|OOMKilled/' || true)
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
             exit 1
@@ -251,6 +253,7 @@ runs:
         WORKER_PORT: ${{ inputs.worker_port }}
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
       run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         echo "::group::Waiting for target /health to return 200"
         # Only wait on the target — source was already gated by the
         # `Wait for source to publish metadata` step (publishing requires
@@ -295,7 +298,7 @@ runs:
           # until timeout for a pod that's already broken.
           FAILED=$(kubectl get pods -n ${NAMESPACE} \
               -l job-name=mx-target --no-headers 2>/dev/null \
-            | awk '$4 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
             echo "ERROR: target pod entered failure state: ${FAILED}"
             exit 1
@@ -315,7 +318,7 @@ runs:
         echo "::endgroup::"
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: "3.12"
 

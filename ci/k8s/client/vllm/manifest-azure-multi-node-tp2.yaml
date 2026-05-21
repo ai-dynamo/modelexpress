@@ -64,14 +64,27 @@
 #        b. Replace ${POD_NAME##*-} with a sed/awk pre-process step before
 #           apply. Option (a) is cleaner and only touches one file.
 #
-#   4. StatefulSet pod selection. action.yml and test_p2p_k8s.py select
-#      pods by the auto-applied `job-name=` label (from K8s Jobs). The
-#      template below copies ${JOB_NAME} into a `job-name` label for compat,
-#      but `kubectl get pods -l job-name=mx-target -o ...items[0]...` does
-#      not guarantee ordinal order — it could return mx-target-1 (the Ray
-#      worker pod, no API server) before mx-target-0 (the head pod). Need
-#      to pin selection to ordinal 0 in both action.yml's port checks and
-#      pytest's _pod_name helper.
+#   4. StatefulSet pod selection AND Service routing. Two related issues
+#      to land together when enabling multi-node TP:
+#        a. action.yml and test_p2p_k8s.py select pods by the auto-applied
+#           `job-name=` label (from K8s Jobs). The template below copies
+#           ${JOB_NAME} into a `job-name` label for compat, but
+#           `kubectl get pods -l job-name=mx-target -o ...items[0]...`
+#           does not guarantee ordinal order — it could return mx-target-1
+#           (the Ray worker pod, no API server) before mx-target-0 (the
+#           head pod). Pin selection to ordinal 0 in both action.yml's
+#           port checks and pytest's _pod_name helper.
+#        b. The headless Service below uses selector `job-name=${JOB_NAME}`,
+#           which matches BOTH pods. Ray's own use of the Service is fine
+#           (it dials `${JOB_NAME}-0.${JOB_NAME}` via the per-pod DNS A
+#           record), but anything dialing the Service name directly (e.g.
+#           `${JOB_NAME}:${WORKER_PORT}` from a future caller) would
+#           round-robin and possibly hit pod-1 which has no HTTP endpoint.
+#           Fix by adding a separate head-only Service whose selector is
+#           `statefulset.kubernetes.io/pod-name: ${JOB_NAME}-0` and routing
+#           HTTP callers to that name. Current callers use `kubectl exec`
+#           into the resolved pod so don't hit this today, but the fix
+#           should land with (a) so future callers aren't surprised.
 #
 #   5. Workflow matrix entry. Once 1–4 land, uncomment the
 #      `framework: vllm / multinode tp_size: 2` block under the `test-tp`
