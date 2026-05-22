@@ -337,13 +337,15 @@ runs:
         TP_SIZE: ${{ inputs.tp_size }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
       run: |
-        # PYTEST_ARGS arrives as a single string that may contain quoted
-        # values with internal spaces (e.g. --p2p-marker 'TRT-LLM marker
-        # with spaces'). Unquoted ${PYTEST_ARGS} would word-split and turn
-        # the quoted value into 4 separate positional args. Parse into a
-        # bash array so quoting is honored, then expand as "${EXTRA[@]}".
-        declare -a EXTRA
-        eval "EXTRA=(${PYTEST_ARGS})"
+        # Parse PYTEST_ARGS via shlex so values with internal spaces
+        # (e.g. --p2p-marker 'TRT-LLM marker with spaces') are honored,
+        # without eval'ing the string (which would execute $(...) etc).
+        declare -a EXTRA=()
+        if [ -n "${PYTEST_ARGS}" ]; then
+          mapfile -d '' -t EXTRA < <(
+            python3 -c 'import shlex,sys; [sys.stdout.buffer.write(a.encode()+b"\0") for a in shlex.split(sys.argv[1])]' "${PYTEST_ARGS}"
+          )
+        fi
         pytest "${TEST_SCRIPT}" -v \
           --namespace "${NAMESPACE}" \
           --model "${MX_CI_MODEL}" \

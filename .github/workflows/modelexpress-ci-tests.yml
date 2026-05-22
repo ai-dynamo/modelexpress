@@ -67,7 +67,7 @@
 #
 # Required secrets:
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
-#   NGC_API_KEY                   — push/pull registry images + create in-cluster pull secret
+#   NGC_API_KEY                   — push/pull registry images
 #   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
 
 name: ModelExpress CI Tests
@@ -237,10 +237,7 @@ jobs:
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
       - name: Bootstrap vCluster (first run only)
-        # TEMPORARY: gate removed for one run to force a fresh bootstrap with
-        # the new sync.toHost.secrets.all=true flag. Re-add the gate once the
-        # baseline-health step confirms the synced pull secret is present.
-        # if: steps.vcluster-check.outputs.exists != 'true'
+        if: steps.vcluster-check.outputs.exists != 'true'
         uses: ./.github/actions/setup-mx-vcluster
         with:
           kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
@@ -295,29 +292,6 @@ jobs:
           # pod and any sibling resources.
           kubectl get events -n "${VCLUSTER_NAMESPACE}" \
             --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
-          echo "::endgroup::"
-
-          echo "::group::Dynamo operator pull-secret sync"
-
-          SYNCED_SECRET="nvcr-pull-x-dynamo-system-x-${VCLUSTER_NAME}"
-          SECRET_TYPE=$(kubectl get secret -n "${VCLUSTER_NAMESPACE}" \
-            "${SYNCED_SECRET}" -o jsonpath='{.type}' 2>/dev/null || true)
-          if [ -z "${SECRET_TYPE}" ]; then
-            echo "::warning::Host-side synced secret ${VCLUSTER_NAMESPACE}/${SYNCED_SECRET} not found. vCluster syncer may be lagging or broken — image pulls for dynamo-system pods will fail on node restart / eviction."
-          else
-            REGISTRIES=$(kubectl get secret -n "${VCLUSTER_NAMESPACE}" \
-              "${SYNCED_SECRET}" -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null \
-              | base64 -d 2>/dev/null \
-              | jq -r '.auths | keys | join(",")' 2>/dev/null \
-              || true)
-            echo "Secret type:       ${SECRET_TYPE}"
-            echo "Auth registries:   ${REGISTRIES:-<none>}"
-            if [ "${SECRET_TYPE}" != "kubernetes.io/dockerconfigjson" ]; then
-              echo "::warning::Synced secret type is '${SECRET_TYPE}' (expected kubernetes.io/dockerconfigjson). kubelet will not use it for image pulls."
-            elif [ -z "${REGISTRIES}" ]; then
-              echo "::warning::Synced secret has empty or unparseable .dockerconfigjson. Image pulls will fail."
-            fi
-          fi
           echo "::endgroup::"
 
       - name: Reap vCluster port-forward

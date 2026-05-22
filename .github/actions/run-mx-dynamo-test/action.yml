@@ -131,7 +131,7 @@ runs:
       run: |
         echo "::group::Create worker-registry pull secret"
         kubectl create secret docker-registry worker-registry \
-          --docker-server="nvcr.io" \
+          --docker-server="${REGISTRY}" \
           --docker-username='$oauthtoken' \
           --docker-password="${NGC_API_KEY}" \
           -n ${NAMESPACE} \
@@ -259,11 +259,19 @@ runs:
         DGD_NAME: ${{ inputs.dgd_name }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
       run: |
+        # Parse PYTEST_ARGS via shlex so values with internal spaces
+        # are honored, without eval'ing the string.
+        declare -a EXTRA=()
+        if [ -n "${PYTEST_ARGS}" ]; then
+          mapfile -d '' -t EXTRA < <(
+            python3 -c 'import shlex,sys; [sys.stdout.buffer.write(a.encode()+b"\0") for a in shlex.split(sys.argv[1])]' "${PYTEST_ARGS}"
+          )
+        fi
         pytest "${TEST_SCRIPT}" -v \
           --namespace "${NAMESPACE}" \
           --model "${MX_CI_MODEL}" \
           --dgd-name "${DGD_NAME}" \
-          ${PYTEST_ARGS}
+          "${EXTRA[@]}"
 
     - name: Dump pod logs
       # Runs on both success and failure. On failure it's the primary

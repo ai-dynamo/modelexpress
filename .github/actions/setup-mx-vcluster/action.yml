@@ -42,10 +42,7 @@ inputs:
     description: |
       Full Dynamo operator image repo (without tag). Defaults to the chart's
       own default (the public NVIDIA release at
-      nvcr.io/nvidia/ai-dynamo/kubernetes-operator). The dynamo team's
-      internal CI uses nvcr.io/nvidia/ai-dynamo/dynamo with tag
-      `main-operator` (or their dynamoci.azurecr.io mirror), which requires
-      team-scoped NGC entitlements we don't have here.
+      nvcr.io/nvidia/ai-dynamo/kubernetes-operator).
     required: false
     default: 'nvcr.io/nvidia/ai-dynamo/kubernetes-operator'
   dynamo_operator_tag:
@@ -58,13 +55,6 @@ inputs:
       when also bumping `dynamo_ref` to that release tag.
     required: false
     default: '1.0.2'
-  ngc_api_key:
-    description: |
-      NGC API key — used to create the nvcr.io image pull secret in
-      dynamo-system so the operator pod can pull its private image.
-      Required when dynamo_operator_image points at nvcr.io (default).
-    required: false
-    default: ''
 
 runs:
   using: "composite"
@@ -119,17 +109,6 @@ runs:
         echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
         # GPU workloads require syncing host nodes into the vCluster so the GPU
         # device plugin and resource limits are visible to the scheduler.
-        # sync.toHost.secrets.all=true: by default vCluster's optimization
-        # logic only syncs a Secret to the host once it observes a Pod
-        # mounting or referencing it (envFrom / volume mounts /
-        # imagePullSecrets). If a helm install creates a Pod and its
-        # referenced Secret in quick succession, the syncer can miss the
-        # reference and leave a dangling imagePullSecrets entry on the
-        # host-side Pod. The image is already cached so the operator
-        # appears healthy, but kubelet emits FailedToRetrieveImagePullSecret
-        # and any node restart / eviction breaks pulls. Forcing global
-        # secret sync removes the race at the cost of mirroring more
-        # secrets to the host — acceptable on a CI vCluster.
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -137,9 +116,7 @@ runs:
           --set controlPlane.distro.k8s.enabled=true \
           --set controlPlane.distro.k8s.version=${{ inputs.vcluster_k8s_version }} \
           --set sync.fromHost.nodes.enabled=true \
-          --set sync.fromHost.nodes.selector.all=true \
-          --set sync.toHost.secrets.enabled=true \
-          --set sync.toHost.secrets.all=true
+          --set sync.fromHost.nodes.selector.all=true
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready
@@ -195,7 +172,6 @@ runs:
         KUBECONFIG: ${{ github.workspace }}/.kubeconfig-vcluster
         OPERATOR_IMAGE: ${{ inputs.dynamo_operator_image }}
         OPERATOR_TAG: ${{ inputs.dynamo_operator_tag }}
-        NGC_API_KEY: ${{ inputs.ngc_api_key }}
       run: |
         echo "::group::Install Dynamo operator into dynamo-system"
         # `helm dep build` needs every HTTP repository the platform chart
@@ -215,22 +191,14 @@ runs:
         # scoped resources (ClusterRole, ClusterRoleBinding, CRDs) are
         # owned by this single release — avoids the ownership conflicts
         # that a per-run install would cause on the persistent vCluster.
+        # No imagePullSecret needed: the default operator image
+        # (nvcr.io/nvidia/ai-dynamo/kubernetes-operator) lives under the
+        # public `nvidia` NGC org and is pullable anonymously. The
+        # `worker-registry` secret used by test pods is created per-run by
+        # the test actions for our private nvcr.io/nvidian/dynamo-dev/*
+        # images, separately from this operator install.
         kubectl create namespace dynamo-system --dry-run=client -o yaml \
           | kubectl apply -f -
-
-        # Create nvcr.io pull secret in dynamo-system so the operator
-        # pod can pull its private nvcr.io/nvidia/ai-dynamo/dynamo image.
-        # The chart's own values key is `dynamo-operator.imagePullSecrets`
-        # (see deploy/helm/charts/platform/values.yaml) — we point the
-        # operator's pod spec at the secret via --set below.
-        if [ -n "${NGC_API_KEY}" ]; then
-          kubectl create secret docker-registry nvcr-pull \
-            --docker-server=nvcr.io \
-            --docker-username='$oauthtoken' \
-            --docker-password="${NGC_API_KEY}" \
-            -n dynamo-system \
-            --dry-run=client -o yaml | kubectl apply -f -
-        fi
 
         # Only override image.tag if explicitly provided; otherwise let
         # the chart fall through to its AppVersion default (which matches
@@ -244,7 +212,6 @@ runs:
           --namespace dynamo-system \
           --set dynamo-operator.controllerManager.manager.image.repository="${OPERATOR_IMAGE}" \
           "${TAG_OVERRIDE[@]}" \
-          --set 'dynamo-operator.imagePullSecrets[0].name=nvcr-pull' \
           --set dynamo-operator.gpuDiscovery.enabled=false \
           --set global.grove.install=true \
           --set global.kai-scheduler.install=false \

@@ -57,7 +57,17 @@ def main() -> None:
     # and trips an NVML probe in PyTorch's allocator that the MIG cgroup
     # blocks. Capping to 20% on 10GB slices avoids both. Set via env var so
     # the same launcher works on full-GPU nodes by raising/unsetting it.
-    kv_fraction = float(os.environ.get("TRTLLM_KV_CACHE_FRACTION", "0.85"))
+    kv_fraction_raw = os.environ.get("TRTLLM_KV_CACHE_FRACTION", "0.85")
+    try:
+        kv_fraction = float(kv_fraction_raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid TRTLLM_KV_CACHE_FRACTION={kv_fraction_raw!r}; expected float in (0, 1]."
+        ) from exc
+    if not (0.0 < kv_fraction <= 1.0):
+        raise ValueError(
+            f"Invalid TRTLLM_KV_CACHE_FRACTION={kv_fraction}; expected float in (0, 1]."
+        )
 
     from tensorrt_llm.llmapi import LLM, KvCacheConfig
     from tensorrt_llm.llmapi.llm_args import LoadFormat
