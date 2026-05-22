@@ -9,13 +9,14 @@ Inference engine instances with ModelExpress P2P weight transfer support.
 | **vLLM** | [`vllm/Dockerfile`](vllm/Dockerfile) |
 | **SGLang** | [`sglang/Dockerfile`](sglang/Dockerfile) |
 
+For ModelStreamer-only examples that load from Azure Blob Storage, S3, or a local PVC without an MX server, see [`../../model_streamer_k8s/`](../../model_streamer_k8s/).
+
 ## vLLM Deployments
 
 | Topology | Manifest | Model | Configuration |
 |----------|----------|-------|---------------|
 | **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | Llama-3.1-405B-Instruct | TP=8, 1 node (8 GPUs) |
 | **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | Llama-3.1-405B-Instruct | TP=4, PP=2, 2 nodes (8 GPUs) |
-| **ModelStreamer** | [`vllm/vllm-single-node-streamer-s3.yaml`](vllm/vllm-single-node-streamer-s3.yaml), [`vllm/vllm-single-node-streamer-azure.yaml`](vllm/vllm-single-node-streamer-azure.yaml), [`vllm/vllm-single-node-streamer-local.yaml`](vllm/vllm-single-node-streamer-local.yaml) | Storage URI or local path | Storage loading only by default; optional P2P after load |
 
 ## SGLang Deployments
 

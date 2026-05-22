@@ -215,13 +215,20 @@ ModelExpress/
 │   │       ├── vllm/
 │   │       │   ├── Dockerfile          # vLLM + ModelExpress client image
 │   │       │   ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
-│   │       │   ├── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
-│   │       │   └── vllm-single-node-streamer-*.yaml # ModelStreamer storage loading
+│   │       │   └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
 │   │       └── sglang/
 │   │           ├── Dockerfile          # SGLang + ModelExpress client image
 │   │           └── sglang-single-node-p2p.yaml
+│   ├── model_streamer_k8s/             # ModelStreamer startup examples
+│   │   ├── README.md
+│   │   └── client/
+│   │       └── vllm/
+│   │           ├── README.md
+│   │           ├── vllm-single-node-streamer-azure.yaml
+│   │           ├── vllm-single-node-streamer-s3.yaml
+│   │           └── vllm-single-node-streamer-local.yaml
 │   ├── crds.yaml                       # ModelMetadata + ModelCacheEntry CRDs (cluster-admin)
-│   ├── aggregated_k8s/                 # Dynamo aggregated serving example
+│   ├── dynamo_model_cache_k8s/         # Dynamo model-cache serving example
 │   │   ├── README.md
 │   │   └── agg.yaml
 │   └── dynamo_p2p_transfer_k8s/        # Dynamo DGD with P2P weight transfer

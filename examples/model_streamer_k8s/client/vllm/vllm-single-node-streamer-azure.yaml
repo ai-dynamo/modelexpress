@@ -19,7 +19,8 @@
 # serviceAccountName/annotations and keep AZURE_STORAGE_ACCOUNT_NAME available.
 #
 # For P2P RDMA serving after Azure Blob load, also set MX_SERVER_ADDRESS
-# and add RDMA resources (rdma/ib), UCX env vars — see vllm-single-node-p2p.yaml.
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/vllm/.
 apiVersion: v1
 kind: Service
 metadata:
