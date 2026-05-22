@@ -72,17 +72,18 @@ def resume_serving(
     ctx: LoadContext,
     model: nn.Module,
     *,
-    worker_id: str | None = None,
+    new_worker_id: bool = True,
 ) -> None:
     """Re-enter the P2P serving network after a weight-memory restore.
 
     Order: fresh MxClient (honors ``MX_METADATA_BACKEND``), new
-    ``worker_id`` unless the caller supplied one, NIXL re-registration
-    with ``reuse_discovered=True``, then republish metadata.
+    ``worker_id`` if requested, NIXL re-registration with
+    ``reuse_discovered=True``, then republish metadata.
 
-    ``worker_id=None`` mints a fresh id — the right default for
-    relocation failover (different pod). Pass an explicit ``worker_id``
-    to preserve identity for in-place wake.
+    ``new_worker_id=True`` (default) mints a fresh id — right for
+    relocation failover or CRIU restore on a different node. Set
+    ``False`` to preserve ``ctx.worker_id`` for in-place wake where
+    the MX server should treat this as the same worker resuming.
 
     ``model`` is only consulted by :func:`register_tensors`' defensive
     re-discovery path if ``ctx.tensors`` is unexpectedly empty;
@@ -90,7 +91,8 @@ def resume_serving(
     torch.compile / CUDA-graph artifacts attached post-warmup.
     """
     ctx.mx_client = create_metadata_client(worker_rank=ctx.worker_rank)
-    ctx.worker_id = worker_id if worker_id is not None else uuid.uuid4().hex[:8]
+    if new_worker_id:
+        ctx.worker_id = uuid.uuid4().hex[:8]
 
     register_tensors(model, ctx, reuse_discovered=True)
     publish_metadata(ctx)

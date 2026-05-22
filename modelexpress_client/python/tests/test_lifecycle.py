@@ -123,14 +123,14 @@ def test_resume_full_rebuild():
     mock_publish.assert_called_once_with(ctx)
 
 
-def test_resume_honors_explicit_worker_id():
-    """Caller-supplied worker_id wins over the default fresh-mint."""
+def test_resume_preserves_worker_id_when_new_worker_id_false():
+    """new_worker_id=False keeps ctx.worker_id (in-place wake)."""
     ctx = _make_load_context(worker_id="pre-pause-id")
     with patch("modelexpress.lifecycle.create_metadata_client"), patch(
         "modelexpress.lifecycle.register_tensors",
     ), patch("modelexpress.lifecycle.publish_metadata"):
-        resume_serving(ctx, MagicMock(), worker_id="caller-supplied")
-    assert ctx.worker_id == "caller-supplied"
+        resume_serving(ctx, MagicMock(), new_worker_id=False)
+    assert ctx.worker_id == "pre-pause-id"
 
 
 # ---------------------------------------------------------------------------
