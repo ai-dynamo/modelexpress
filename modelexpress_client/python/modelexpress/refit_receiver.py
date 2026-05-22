@@ -261,6 +261,11 @@ class MxRefitReceiver:
             )
 
         worker = meta_resp.worker
+        # Filter out V2 sidecar TensorDescriptors (name="__mx_v2_meta__",
+        # addr=0, size=0). The V2 publisher uses them to smuggle metadata
+        # past the MX server's field-dropping; they aren't real RDMA
+        # targets. Leaving them in the source_tensors list propagates a
+        # (0,0,0) descriptor into prep_xfer_dlist which UCX rejects.
         source_tensors = [
             TensorDescriptor(
                 name=t.name,
@@ -270,6 +275,7 @@ class MxRefitReceiver:
                 dtype=t.dtype,
             )
             for t in worker.tensors
+            if not t.name.startswith("__mx_") and t.size > 0
         ]
 
         transferred, skipped, elapsed = self._nixl.receive_from_source(
@@ -328,6 +334,11 @@ class MxRefitReceiver:
             )
 
         worker = meta_resp.worker
+        # Filter out V2 sidecar TensorDescriptors (name="__mx_v2_meta__",
+        # addr=0, size=0). The V2 publisher uses them to smuggle metadata
+        # past the MX server's field-dropping; they aren't real RDMA
+        # targets. Leaving them in the source_tensors list propagates a
+        # (0,0,0) descriptor into prep_xfer_dlist which UCX rejects.
         source_tensors = [
             TensorDescriptor(
                 name=t.name,
@@ -337,6 +348,7 @@ class MxRefitReceiver:
                 dtype=t.dtype,
             )
             for t in worker.tensors
+            if not t.name.startswith("__mx_") and t.size > 0
         ]
 
         scratch_tensors: dict[str, torch.Tensor] = {}
