@@ -1,4 +1,4 @@
-# Model Express with Aggregated Dynamo Inference on K8s
+# Model Express with Dynamo Model Cache on K8s
 
 
 ## Prerequisites

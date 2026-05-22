@@ -65,7 +65,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 | Runtime | Integration |
 |---------|-------------|
 | vLLM | `--load-format mx` for P2P weight transfer |
-| NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
+| NVIDIA Dynamo (vLLM) | `get_model_path` API; [Dynamo model cache K8s example](examples/dynamo_model_cache_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
 | SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
 
@@ -154,6 +154,10 @@ register_modelexpress_loaders()
 ```
 
 First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
+
+### ModelStreamer on Kubernetes
+
+Load model weights directly from Azure Blob Storage, S3, or a PVC-backed local path through ModelStreamer. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
 
 ### Docker
 

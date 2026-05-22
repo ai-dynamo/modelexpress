@@ -13,7 +13,8 @@
 #       --from-literal=AWS_SESSION_TOKEN=<token>
 #
 # For P2P RDMA serving after S3 load, also set MX_SERVER_ADDRESS
-# and add RDMA resources (rdma/ib), UCX env vars — see vllm-single-node-p2p.yaml.
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/vllm/.
 apiVersion: v1
 kind: Service
 metadata:

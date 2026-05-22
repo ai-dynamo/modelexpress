@@ -55,7 +55,7 @@ See [`client/`](client/) for engine deployment manifests:
 
 The ModelExpress loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from storage and becomes a source for future nodes.
 
-The vLLM ModelStreamer manifests under [`client/vllm/`](client/vllm/) are storage-loading examples. They do not require P2P by default; their comments show the extra environment variables and RDMA resources needed if you want those pods to publish as P2P sources after streaming from S3, Azure Blob Storage, or local disk.
+For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
 
 ## Environment Variables
 

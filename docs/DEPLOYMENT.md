@@ -112,7 +112,7 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | Single-replica MX, all pods on one node, RWO cache | RWO | Simplest option |
 | Multi-container sharing the cache (e.g. vLLM worker on a different node) | RWX | Operator choice; MX doesn't force it |
 | Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
-| S3 ModelStreamer on clients | none | Clients bypass MX cache entirely |
+| ModelStreamer object storage on clients | none | Clients stream from object storage directly |
 | P2P RDMA receivers | none on receiver (sender still needs disk) | Weights land in GPU HBM |
 
 For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
@@ -221,7 +221,7 @@ Deploy the server using one of the example manifests under `examples/`:
 
 - **With Redis backend**: `examples/p2p_transfer_k8s/server/redis_backend/modelexpress-server-redis.yaml`
 - **With Kubernetes CRD backend**: `examples/p2p_transfer_k8s/server/kubernetes_backend/modelexpress-server-kubernetes.yaml`
-- **Aggregated with Dynamo**: `examples/aggregated_k8s/agg.yaml`
+- **Dynamo model cache**: `examples/dynamo_model_cache_k8s/agg.yaml`
 
 ### HuggingFace Token
 
@@ -290,15 +290,15 @@ helm/deploy.sh --namespace my-ns --values helm/values-local-storage.yaml
 
 See [`../helm/README.md`](../helm/README.md) for the full parameter reference and installation guide.
 
-### Aggregated Deployment (with Dynamo)
+### Dynamo Model Cache Deployment
 
 For deploying ModelExpress alongside Dynamo with a vLLM worker:
 
 ```bash
-kubectl apply -f examples/aggregated_k8s/agg.yaml
+kubectl apply -f examples/dynamo_model_cache_k8s/agg.yaml
 ```
 
-See [`../examples/aggregated_k8s/README.md`](../examples/aggregated_k8s/README.md) for the full guide.
+See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_cache_k8s/README.md) for the full guide.
 
 ## P2P GPU Weight Transfers
 
@@ -441,7 +441,7 @@ Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in 
 
 ModelStreamer streams safetensors directly to GPU memory via `runai-model-streamer`. Supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. This is a storage-loading path and does not require P2P by itself. If the same deployment also enables ModelExpress P2P metadata and RDMA resources, later replicas can receive weights from an already-loaded source instead of streaming from storage again.
 
-All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. The strategy activates when `MX_MODEL_URI` is set.
+All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. The strategy activates when `MX_MODEL_URI` is set. See [`../examples/model_streamer_k8s/`](../examples/model_streamer_k8s/) for Kubernetes examples, including the Azure Blob recipe.
 
 **General configuration:**
 
@@ -474,10 +474,12 @@ Also supports GKE Workload Identity and Application Default Credentials (ADC) �
 
 | Variable | Description |
 |----------|-------------|
-| `AZURE_ACCOUNT_NAME` | Storage account name |
-| `AZURE_ACCOUNT_KEY` | Storage account access key |
+| `AZURE_STORAGE_ACCOUNT_NAME` | Storage account name |
+| `AZURE_CLIENT_ID` | Service principal or workload identity client ID |
+| `AZURE_CLIENT_SECRET` | Service principal client secret |
+| `AZURE_TENANT_ID` | Azure tenant ID |
 
-Or use service principal auth (`AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` + `AZURE_TENANT_ID`) or Azure Managed Identity (no env vars needed on AKS).
+Use service principal auth, Azure Managed Identity, or AKS workload identity through `DefaultAzureCredential`. The identity needs `Storage Blob Data Reader` on the storage account or container.
 
 Credentials are auto-detected by the underlying cloud SDKs. No credentials flow through the MX server or gRPC.
 
