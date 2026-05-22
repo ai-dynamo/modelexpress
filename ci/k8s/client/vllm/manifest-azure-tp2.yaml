@@ -1,29 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Azure GB200 single-job template for P2P RDMA weight-transfer CI tests.
+# Azure single-job template for P2P RDMA weight-transfer CI tests with
+# tensor parallelism = 2 (vLLM).
 #
-# Applied twice by the workflow — once for the source, once for the target —
-# with different env var substitutions each time:
+# Differences vs manifest-azure.yaml (TP=1):
+#   - nvidia.com/gpu / rdma/ib: 2 each (one IB device per GPU)
+#   - --tensor-parallel-size 2 in vLLM args
+#   - cpu/memory bumped to accommodate 2 GPUs of orchestration
 #
-#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
-#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
+# Source and target each schedule on different hosts (existing podAntiAffinity)
+# and each pod uses NVLink intra-node for TP comms, with NIXL/IB RDMA pulling
+# rank 0 + rank 1 worth of weights from the corresponding source pod's ranks.
 #
-# The workflow (via run-mx-test) gates target apply on the ModelMetadata CR
-# appearing in the namespace, replacing the need for an initContainer.
+# CLUSTER REQUIREMENT — MUST RUN ON NON-MIG GPU NODES.
+# When `nvidia.com/gpu: 2` is requested on a MIG node, K8s scheduler assigns
+# 2 MIG slices, NOT 2 full GPUs. NVIDIA hardware enforces:
+#   - NVML can't query topology across slices (PyTorch asserts on init)
+#   - NCCL peer-to-peer is blocked between slices
+#   - NVLink is blocked between slices
+# Net result: TP=2 fails during vLLM `compile_or_warm_up_model` with
+# `RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED`.
 #
-# Azure-specific differences vs manifest-gcp.yaml:
-#   - No GKE multi-network annotations (not supported on AKS)
-#   - rdma/ib resource limit exposes InfiniBand RDMA device (A100 SXM4 nodes)
-#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand (no GID index needed)
-#   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (workaround for ucx#11259)
-#   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools (amd64)
-#
-# Environment variables substituted by envsubst before each apply:
-#   JOB_NAME      — mx-source or mx-target
-#   WORKER_IMAGE  — image built from ci/k8s/client/vllm/Dockerfile
-#   WORKER_PORT   — port the vLLM server listens on
-#   MX_CI_MODEL   — HuggingFace model id
+# To unblock: ask ops for a non-MIG pool (`nvidia.com/mig.config=all-disabled`)
+# and add a nodeSelector targeting it below. Until then this manifest is
+# scaffolded but not run in CI (`test-tp` job in
+# .github/workflows/modelexpress-model-streamer-test.yml is `if: false`).
 
 ---
 apiVersion: batch/v1
@@ -51,8 +53,7 @@ spec:
         agentpool: a100a
       affinity:
         # podAntiAffinity on hostname: keep source and target on different
-        # physical hosts so RDMA still exercises true cross-host IB, not
-        # intra-node loopback.
+        # physical hosts so RDMA still exercises true cross-host IB.
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -61,12 +62,10 @@ spec:
               topologyKey: kubernetes.io/hostname
         # podAffinity on agentpool: keep source and target in the SAME node
         # pool. The Azure AKS test cluster splits GPU nodes across multiple
-        # InfiniBand partitions — `a100a` and `a100b` pools have different
-        # pkeys, and pods on different pkeys can't talk RDMA to each other
-        # (UCX error: "local pkey 0xXXXX differs from remote pkey 0xYYYY",
-        # NIXL_ERR_BACKEND on the receive). Combined with hostname anti-
-        # affinity, this forces source/target onto different hosts WITHIN
-        # the same IB partition.
+        # InfiniBand partitions (`a100a` and `a100b` pools have different
+        # pkeys), and pods on different pkeys can't talk RDMA to each other.
+        # Combined with hostname anti-affinity, forces source/target onto
+        # different hosts WITHIN the same IB partition.
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -88,8 +87,6 @@ spec:
       containers:
         - name: ${JOB_NAME}
           image: ${WORKER_IMAGE}
-          # Force re-pull on every pod creation so CI/dev iterations on the same
-          # tag pick up freshly pushed images instead of the node's cached copy.
           imagePullPolicy: Always
           command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
@@ -98,7 +95,7 @@ spec:
             - --load-format
             - mx
             - --tensor-parallel-size
-            - "1"
+            - "2"
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"
@@ -126,13 +123,13 @@ spec:
             - containerPort: ${WORKER_PORT}
           resources:
             requests:
-              cpu: "4"
-              memory: "16Gi"
-              nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
             limits:
-              nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
           volumeMounts:
             - name: shm
               mountPath: /dev/shm

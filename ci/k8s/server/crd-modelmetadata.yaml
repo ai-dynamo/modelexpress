@@ -1,9 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# ModelMetadata CRD for P2P worker coordination.
-# Copied from examples/crds.yaml — owned here so CI does not depend on
-# the examples directory layout.
+# ModelExpress CRDs needed by the mx-server in CI:
+#   * ModelMetadata    — P2P worker coordination (per-worker NIXL endpoints
+#                        + tensor descriptors)
+#   * ModelCacheEntry  — Model-download lifecycle registry (LRU eviction
+#                        state). Required by the registry backend even when
+#                        only P2P is exercised — mx-server lists this CRD at
+#                        startup regardless. Missing it causes server startup
+#                        to 404 against modelexpress.nvidia.com/modelcacheentries.
+#
+# Copied from examples/crds.yaml — owned here so CI does not depend on the
+# examples directory layout. Kept in a single file so one `kubectl apply -f`
+# covers both. The filename is preserved for compat with existing references;
+# rename to crds.yaml once any out-of-tree consumers (if any) are updated.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -137,3 +147,80 @@ spec:
     shortNames:
       - mxmeta
       - mm
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: modelcacheentries.modelexpress.nvidia.com
+  labels:
+    app.kubernetes.io/name: modelexpress
+    app.kubernetes.io/component: crd
+spec:
+  group: modelexpress.nvidia.com
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - modelName
+                - provider
+              properties:
+                modelName:
+                  type: string
+                  description: Full model name (e.g., meta-llama/Llama-3.1-70B)
+                provider:
+                  type: string
+                  description: Model provider identifier
+                  enum:
+                    - HuggingFace
+                    - Ngc
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Model download lifecycle phase
+                  enum:
+                    - ""
+                    - Downloading
+                    - Downloaded
+                    - Error
+                createdAt:
+                  type: string
+                  format: date-time
+                  description: RFC3339 timestamp of first write
+                lastUsedAt:
+                  type: string
+                  format: date-time
+                  description: RFC3339 timestamp of most recent status write or touch
+                message:
+                  type: string
+                  description: Optional human-readable progress or error message
+      additionalPrinterColumns:
+        - name: Model
+          type: string
+          jsonPath: .spec.modelName
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: LastUsed
+          type: date
+          jsonPath: .status.lastUsedAt
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+  scope: Namespaced
+  names:
+    plural: modelcacheentries
+    singular: modelcacheentry
+    kind: ModelCacheEntry
+    shortNames:
+      - mxcache

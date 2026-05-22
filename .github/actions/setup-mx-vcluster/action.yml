@@ -55,6 +55,22 @@ runs:
           --overwrite
         echo "::endgroup::"
 
+    - name: Delete existing vCluster (if any)
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Delete existing vCluster ${VCLUSTER_NAME} in ${NAMESPACE} (if present)"
+        # Idempotent: `vcluster delete` succeeds on a missing vCluster with
+        # `--ignore-not-found`.
+        vcluster delete "${VCLUSTER_NAME}" \
+          --namespace "${NAMESPACE}" \
+          --delete-namespace=false \
+          --ignore-not-found \
+          --wait || true
+        echo "::endgroup::"
+
     - name: Create vCluster
       shell: bash
       env:
