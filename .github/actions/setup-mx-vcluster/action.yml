@@ -119,6 +119,17 @@ runs:
         echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
         # GPU workloads require syncing host nodes into the vCluster so the GPU
         # device plugin and resource limits are visible to the scheduler.
+        # sync.toHost.secrets.all=true: by default vCluster's optimization
+        # logic only syncs a Secret to the host once it observes a Pod
+        # mounting or referencing it (envFrom / volume mounts /
+        # imagePullSecrets). If a helm install creates a Pod and its
+        # referenced Secret in quick succession, the syncer can miss the
+        # reference and leave a dangling imagePullSecrets entry on the
+        # host-side Pod. The image is already cached so the operator
+        # appears healthy, but kubelet emits FailedToRetrieveImagePullSecret
+        # and any node restart / eviction breaks pulls. Forcing global
+        # secret sync removes the race at the cost of mirroring more
+        # secrets to the host — acceptable on a CI vCluster.
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -126,7 +137,9 @@ runs:
           --set controlPlane.distro.k8s.enabled=true \
           --set controlPlane.distro.k8s.version=${{ inputs.vcluster_k8s_version }} \
           --set sync.fromHost.nodes.enabled=true \
-          --set sync.fromHost.nodes.selector.all=true
+          --set sync.fromHost.nodes.selector.all=true \
+          --set sync.toHost.secrets.enabled=true \
+          --set sync.toHost.secrets.all=true
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready

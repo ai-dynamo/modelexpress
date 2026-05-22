@@ -237,7 +237,10 @@ jobs:
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
       - name: Bootstrap vCluster (first run only)
-        if: steps.vcluster-check.outputs.exists != 'true'
+        # TEMPORARY: gate removed for one run to force a fresh bootstrap with
+        # the new sync.toHost.secrets.all=true flag. Re-add the gate once the
+        # baseline-health step confirms the synced pull secret is present.
+        # if: steps.vcluster-check.outputs.exists != 'true'
         uses: ./.github/actions/setup-mx-vcluster
         with:
           kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
