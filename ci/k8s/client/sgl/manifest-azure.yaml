@@ -40,13 +40,12 @@ spec:
       restartPolicy: Never
       imagePullSecrets:
         - name: worker-registry
-      # Pin to the a100a pool (4 nodes, 3 active after cordons) rather than
-      # leaving the agentpool open. a100b only has 1 active node — when
-      # source lands there, target's anti-affinity has nowhere to go and
-      # sits Pending forever. Pinning to a100a deterministically gives
-      # target a peer host. The agentpool podAffinity below becomes
-      # redundant (both pods already constrained to a100a) but is kept for
-      # self-documentation + as defense if this nodeSelector is removed.
+      # Pin to a specific GPU node pool rather than leaving the agentpool
+      # open. Other pools in the cluster may have too few active nodes for
+      # source + target anti-affinity to find a peer host, leaving target
+      # Pending forever. The agentpool podAffinity below becomes redundant
+      # (both pods already constrained here) but is kept for self-
+      # documentation + as defense if this nodeSelector is removed.
       nodeSelector:
         agentpool: a100a
       affinity:
@@ -58,14 +57,14 @@ spec:
                 matchLabels:
                   app: mx-p2p-worker
               topologyKey: kubernetes.io/hostname
-        # Pin source + target to the SAME node pool. The Azure AKS test
-        # cluster splits GPU nodes across multiple InfiniBand partitions
-        # (`a100a` and `a100b` pools have different pkeys), and pods on
-        # different pkeys can't talk RDMA to each other — UCX errors with
-        # "local pkey 0xXXXX differs from remote pkey 0xYYYY" and NIXL
-        # surfaces NIXL_ERR_BACKEND on the receive. Combined with the
-        # hostname anti-affinity above, this forces source/target onto
-        # different hosts WITHIN the same IB partition.
+        # Pin source + target to the SAME node pool. The test cluster splits
+        # GPU nodes across multiple InfiniBand partitions (different pools
+        # have different pkeys), and pods on different pkeys can't talk
+        # RDMA to each other — UCX errors with "local pkey 0xXXXX differs
+        # from remote pkey 0xYYYY" and NIXL surfaces NIXL_ERR_BACKEND on
+        # the receive. Combined with the hostname anti-affinity above,
+        # this forces source/target onto different hosts WITHIN the same
+        # IB partition.
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:

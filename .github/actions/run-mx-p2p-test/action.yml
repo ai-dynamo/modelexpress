@@ -337,13 +337,20 @@ runs:
         TP_SIZE: ${{ inputs.tp_size }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
       run: |
+        # PYTEST_ARGS arrives as a single string that may contain quoted
+        # values with internal spaces (e.g. --p2p-marker 'TRT-LLM marker
+        # with spaces'). Unquoted ${PYTEST_ARGS} would word-split and turn
+        # the quoted value into 4 separate positional args. Parse into a
+        # bash array so quoting is honored, then expand as "${EXTRA[@]}".
+        declare -a EXTRA
+        eval "EXTRA=(${PYTEST_ARGS})"
         pytest "${TEST_SCRIPT}" -v \
           --namespace "${NAMESPACE}" \
           --model "${MX_CI_MODEL}" \
           --source-port "${SOURCE_PORT}" \
           --worker-port "${WORKER_PORT}" \
           --tp-size "${TP_SIZE}" \
-          ${PYTEST_ARGS}
+          "${EXTRA[@]}"
 
     - name: Dump pod logs
       # Runs on both success and failure. On failure it's the primary
@@ -397,7 +404,29 @@ runs:
         #   - ModelMetadata + ModelCacheEntry CR finalizers (driven by the
         #     mx-server controller) — usually <30s but can stretch
         #   - K8s namespace finalizer clearance after all child resources
-        # 5 min covers the legitimate slow path. Anything slower really
-        # does indicate a stuck finalizer and is worth seeing fail loudly.
-        kubectl delete namespace ${NAMESPACE} --ignore-not-found --timeout=300s
+        # 5 min covers the legitimate slow path. Anything slower indicates a
+        # stuck finalizer — we fall back to force-finalize as a safeguard so
+        # the persistent vCluster doesn't accumulate orphaned namespaces
+        # across runs, but emit a ::warning:: so the unhealthy condition
+        # (stale conversion webhook, stuck controller finalizer, etc.) is
+        # surfaced in the GHA UI and gets investigated.
+        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=300s; then
+          echo "::warning::Namespace ${NAMESPACE} did not finalize within 300s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
+          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
+            | jq '.spec.finalizers = []' \
+            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
+          # Verify the namespace actually finalized. If it didn't, that means
+          # the API rejected our force-clear too — there's something deeper
+          # broken (e.g., dead admission webhook, unreachable conversion
+          # service). Fail loud so it gets investigated. If the namespace IS
+          # gone, the safeguard did its job — exit 0 and rely on the
+          # ::warning:: above for visibility.
+          sleep 5
+          if kubectl get ns "${NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
+            echo "::error::Namespace ${NAMESPACE} still present after force-finalize. Force-clear was rejected; deeper cluster issue."
+            kubectl get ns "${NAMESPACE}" -o yaml 2>&1 | tail -40
+            exit 1
+          fi
+          echo "Namespace ${NAMESPACE} is gone (safeguard cleared finalizers successfully)."
+        fi
         echo "::endgroup::"

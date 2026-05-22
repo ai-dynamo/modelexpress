@@ -36,6 +36,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type=_positive_int,
         help="Tensor-parallel size — the per-rank transfer test expects this many distinct ranks.",
     )
+    parser.addoption(
+        "--dgd-name",
+        default=os.environ.get("DGD_NAME", "mx-dynamo-vllm"),
+        help=(
+            "metadata.name of the DGD under test. Drives the Frontend Service name "
+            "(<dgd-name>-frontend) and the operator's auto-applied "
+            "nvidia.com/dynamo-graph-deployment-name label that the worker pod "
+            "selector uses. Must match what the action / manifest applied."
+        ),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -68,3 +78,8 @@ def p2p_marker(request: pytest.FixtureRequest) -> str:
 @pytest.fixture(scope="session")
 def tp_size(request: pytest.FixtureRequest) -> int:
     return request.config.getoption("--tp-size")
+
+
+@pytest.fixture(scope="session")
+def dgd_name(request: pytest.FixtureRequest) -> str:
+    return request.config.getoption("--dgd-name")

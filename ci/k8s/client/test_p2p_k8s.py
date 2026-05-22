@@ -178,14 +178,8 @@ def test_per_rank_source_agents(namespace: str, tp_size: int) -> None:
     """
     pod = _pod_name(namespace, "mx-target")
     result = _kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
-    # Two NIXL agent naming schemes are in use:
-    #   vLLM    (load_strategy/base.py:90)    — mx-{role}-worker{rank}-{uuid8}
-    #   TRT-LLM (trtllm_live_transfer.py:107) — trtllm-live-source-rank{rank}-{pid}
-    # Both encode source rank as the integer after `worker` / `rank`; one regex
-    # captures (full_agent_name, source_rank) for either format so the test
-    # stays engine-agnostic.
     matches = re.findall(
-        r"agent=b?'((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'",
+        r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
         result.stdout,
     )
 

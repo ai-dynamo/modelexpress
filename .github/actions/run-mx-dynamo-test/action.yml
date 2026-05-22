@@ -1,0 +1,346 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Run ModelExpress Dynamo Aggregated CI Test'
+description: |
+  CI lifecycle for the row-7 dynamo-integration P2P test. Wraps:
+
+    1. Apply ModelExpress CRDs + namespace RBAC + secrets in the test
+       namespace.
+    2. Apply the DynamoGraphDeployment with replicas=1. The cluster-wide
+       Dynamo operator (installed once in `dynamo-system` by
+       setup-mx-vcluster) reconciles it.
+    3. Wait until the first VllmWorker has loaded weights from HF and
+       published one ModelMetadata CR (so the second replica has a
+       discoverable source to pull from).
+    4. Patch the DGD to replicas=2.
+    5. Wait for the second worker to come up, discover the source, and
+       complete the P2P transfer (visible as "RDMA transfer complete" in
+       its container logs).
+    6. Run pytest against the deployed resources.
+    7. Delete the namespace on exit (pass or fail).
+
+  Pre-requisite: the Dynamo operator must already exist cluster-wide in
+  `dynamo-system`. setup-mx-vcluster handles that at bootstrap time. If
+  you're running this on a non-CI cluster, install the operator manually
+  once with the same helm-chart values setup-mx-vcluster uses.
+
+  This differs from run-mx-p2p-test.yml in that:
+    - The deployment unit is a DGD, not a Job; we use kubectl patch + watch
+      for status, not Job conditions.
+    - There are TWO wait gates (source published, target transferred), not
+      one — necessary because we deliberately serialize replica scaling so
+      the second replica always has a source.
+    - The Dynamo operator must be present before the DGD can reconcile, so
+      we install it inline rather than assuming a pre-installed operator.
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for the vCluster'
+    required: true
+  namespace:
+    description: 'Namespace inside the vCluster for this test run'
+    required: true
+  server_image:
+    description: 'Fully-qualified MX server image (ci/k8s/server/Dockerfile.server)'
+    required: true
+  worker_image:
+    description: 'Fully-qualified dynamo+modelexpress worker image (ci/k8s/client/vllm/dynamo/Dockerfile)'
+    required: true
+  model:
+    description: 'HuggingFace model id — exposed as MX_CI_MODEL for envsubst and pytest'
+    required: false
+    default: 'Qwen/Qwen2.5-0.5B'
+  hf_token:
+    description: 'HuggingFace token — written as hf-token-secret in the test namespace. Required: the DGD references it via envFromSecret.'
+    required: true
+  worker_registry:
+    description: 'Registry hostname for the worker / operator images (used to create worker-registry imagePullSecret)'
+    required: true
+  ngc_api_key:
+    description: 'NGC API key — used to create the worker-registry imagePullSecret'
+    required: true
+  manifest:
+    description: 'Repo-root-relative path to the DGD manifest. Envsubst is run on it before apply.'
+    required: false
+    default: 'ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml'
+  dgd_name:
+    description: |
+      `metadata.name` of the DGD created by the manifest above. Used by the
+      action to patch the DGD for replicas=2 scaling and to delete it on
+      cleanup. Must match the manifest's `metadata.name` exactly.
+    required: false
+    default: 'mx-dynamo-vllm'
+  test_script:
+    description: 'Repo-root-relative path to the pytest file to run after the test stack is up'
+    required: false
+    default: 'ci/k8s/client/test_dynamo_p2p.py'
+  pytest_args:
+    description: 'Extra arguments forwarded verbatim to pytest'
+    required: false
+    default: ''
+  source_load_timeout_seconds:
+    description: 'Seconds to wait for the first VllmWorker replica to publish ModelMetadata'
+    required: false
+    default: '900'
+  p2p_transfer_timeout_seconds:
+    description: 'Seconds to wait for the second VllmWorker replica to complete the RDMA transfer'
+    required: false
+    default: '600'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup vCluster kubeconfig
+      shell: bash
+      env:
+        KUBECONFIG_B64: ${{ inputs.kubeconfig_base64 }}
+      run: |
+        echo "${KUBECONFIG_B64}" | base64 -d > ${{ github.workspace }}/.kubeconfig-vcluster
+        chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
+        echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-vcluster" >> $GITHUB_ENV
+
+    - name: Setup test namespace
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
+        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+        # ModelExpress CRD (ModelMetadata). Cluster-scoped — idempotent,
+        # safe to re-apply on every run. Same file used by the row-1 P2P
+        # action — staying consistent with the rest of CI rather than
+        # pulling in examples/crds.yaml (which also includes ModelCacheEntry,
+        # not needed for the P2P transfer path).
+        kubectl apply -f ci/k8s/server/crd-modelmetadata.yaml
+
+        # RBAC scoped to this namespace. Same file used by the row-1 P2P test;
+        # creates the `modelexpress` ServiceAccount + Role + RoleBinding that
+        # the DGD's ModelExpress service references via serviceAccountName.
+        NAMESPACE=${NAMESPACE} envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
+          kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Create worker registry pull secret
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.worker_registry }}
+        NGC_API_KEY: ${{ inputs.ngc_api_key }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create worker-registry pull secret"
+        kubectl create secret docker-registry worker-registry \
+          --docker-server="nvcr.io" \
+          --docker-username='$oauthtoken' \
+          --docker-password="${NGC_API_KEY}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Create HF token secret
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf_token }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create hf-token-secret"
+        kubectl create secret generic hf-token-secret \
+          --from-literal=HF_TOKEN="${HF_TOKEN}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Apply DGD manifest (replicas=1)
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MX_SERVER_IMAGE: ${{ inputs.server_image }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        NAMESPACE: ${{ inputs.namespace }}
+        MANIFEST: ${{ inputs.manifest }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+      run: |
+        echo "::group::Apply DGD ${MANIFEST} (name=${DGD_NAME})"
+        envsubst < "${MANIFEST}" | kubectl apply -n "${NAMESPACE}" -f -
+        echo "::endgroup::"
+
+    - name: Wait for source worker to publish metadata
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TIMEOUT: ${{ inputs.source_load_timeout_seconds }}
+      run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: source_load_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        echo "::group::Wait for first VllmWorker to publish ModelMetadata"
+        deadline=$((SECONDS + TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${CR_COUNT}" -ge 1 ]; then
+            echo "Source published metadata (${CR_COUNT} CR)."
+            break
+          fi
+          # Fail fast on pod crashes.
+          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null \
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+          if [ -n "${FAILED}" ]; then
+            echo "ERROR: source worker failed before publishing metadata: ${FAILED}"
+            exit 1
+          fi
+          echo "No ModelMetadata CR yet, retrying in 15s..."
+          sleep 15
+        done
+        if ! kubectl get modelmetadata -n "${NAMESPACE}" -o name 2>/dev/null | grep -q .; then
+          echo "ERROR: source did not publish metadata within ${TIMEOUT}s"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Scale DGD to replicas=2
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+      run: |
+        echo "::group::Patch DGD ${DGD_NAME} to VllmWorker.replicas=2"
+        kubectl patch dgd "${DGD_NAME}" -n "${NAMESPACE}" --type merge \
+          -p '{"spec":{"services":{"VllmWorker":{"replicas":2}}}}'
+        echo "::endgroup::"
+
+    - name: Wait for second worker to complete P2P transfer
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TIMEOUT: ${{ inputs.p2p_transfer_timeout_seconds }}
+      run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: p2p_transfer_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        echo "::group::Wait for the second worker's RDMA transfer to complete"
+        deadline=$((SECONDS + TIMEOUT))
+        # Both target worker pods publish their own ModelMetadata CR, so a
+        # second CR is the most direct signal that the second replica reached
+        # the publish phase (which happens AFTER successful RDMA receive).
+        while [ $SECONDS -lt $deadline ]; do
+          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${CR_COUNT}" -ge 2 ]; then
+            echo "Both workers have published metadata (${CR_COUNT} CRs)."
+            break
+          fi
+          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null \
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+          if [ -n "${FAILED}" ]; then
+            echo "ERROR: a worker pod failed before completing P2P transfer: ${FAILED}"
+            exit 1
+          fi
+          echo "Have ${CR_COUNT}/2 ModelMetadata CRs, retrying in 15s..."
+          sleep 15
+        done
+        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${FINAL}" -lt 2 ]; then
+          echo "ERROR: only ${FINAL} ModelMetadata CRs after ${TIMEOUT}s (expected 2)"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Install test dependencies
+      shell: bash
+      run: pip install pytest
+
+    - name: Run tests
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        TEST_SCRIPT: ${{ inputs.test_script }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+        PYTEST_ARGS: ${{ inputs.pytest_args }}
+      run: |
+        pytest "${TEST_SCRIPT}" -v \
+          --namespace "${NAMESPACE}" \
+          --model "${MX_CI_MODEL}" \
+          --dgd-name "${DGD_NAME}" \
+          ${PYTEST_ARGS}
+
+    - name: Dump pod logs
+      # Runs on both success and failure. On failure it's the primary
+      # triage signal; on success it's still useful for timing analysis
+      # and confirming the RDMA / agent-pair behavior matches expectations.
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+      run: |
+        set +eo pipefail
+        echo "::group::DGD status"
+        kubectl get dgd "${DGD_NAME}" -n "${NAMESPACE}" -o yaml 2>&1 || true
+        echo "::endgroup::"
+
+        echo "::group::Pod summary"
+        kubectl get pods -n "${NAMESPACE}" -o wide 2>&1 || true
+        echo "::endgroup::"
+
+        # Namespace events surface scheduler decisions, image-pull errors,
+        # OOM kills, and probe failures — the highest-signal one-shot view
+        # for almost any deployment-time failure.
+        echo "::group::Namespace events (last 50, newest first)"
+        kubectl get events -n "${NAMESPACE}" --sort-by='.lastTimestamp' 2>&1 | tail -50 || true
+        echo "::endgroup::"
+
+        for POD in $(kubectl get pods -n "${NAMESPACE}" --no-headers 2>/dev/null | awk '{print $1}'); do
+          echo "::group::describe ${POD}"
+          kubectl describe pod -n "${NAMESPACE}" "${POD}" 2>&1 | tail -60 || true
+          echo "::endgroup::"
+          echo "::group::logs ${POD} (all containers, tail 200)"
+          kubectl logs -n "${NAMESPACE}" "${POD}" --all-containers --tail=200 2>&1 || true
+          echo "::endgroup::"
+        done
+
+    - name: Cleanup test namespace
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+      run: |
+        echo "::group::Delete namespace ${NAMESPACE}"
+        # Delete the DGD first so the operator finalizers run cleanly before
+        # the namespace delete reaps the operator deployment itself.
+        kubectl delete dgd "${DGD_NAME}" -n "${NAMESPACE}" --ignore-not-found --timeout=120s || true
+        # Timeout sized for our slowest realistic case:
+        #   - 3 component pods (Frontend, ModelExpress server, VllmWorker —
+        #     2 of those replicas after the scale-to-2 patch) each with a
+        #     30s graceful-shutdown grace period
+        #   - DGD-controlled PodClique + PodGang teardown
+        #   - ModelMetadata CR finalizers driven by the mx-server controller
+        #   - K8s namespace finalizer clearance after all child resources
+        # 5 min covers the legitimate slow path. Anything slower indicates a
+        # stuck finalizer — we fall back to force-finalize as a safeguard so
+        # the persistent vCluster doesn't accumulate orphaned namespaces
+        # across runs, but emit a ::warning:: so the unhealthy condition
+        # (stale conversion webhook, stuck controller finalizer, etc.) is
+        # surfaced in the GHA UI and gets investigated.
+        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=300s; then
+          echo "::warning::Namespace ${NAMESPACE} did not finalize within 300s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
+          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
+            | jq '.spec.finalizers = []' \
+            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
+          # Verify the namespace actually finalized. If it didn't, that means
+          # the API rejected our force-clear too — there's something deeper
+          # broken (e.g., dead admission webhook, unreachable conversion
+          # service). Fail loud so it gets investigated. If the namespace IS
+          # gone, the safeguard did its job — exit 0 and rely on the
+          # ::warning:: above for visibility.
+          sleep 5
+          if kubectl get ns "${NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
+            echo "::error::Namespace ${NAMESPACE} still present after force-finalize. Force-clear was rejected; deeper cluster issue."
+            kubectl get ns "${NAMESPACE}" -o yaml 2>&1 | tail -40
+            exit 1
+          fi
+          echo "Namespace ${NAMESPACE} is gone (safeguard cleared finalizers successfully)."
+        fi
+        echo "::endgroup::"

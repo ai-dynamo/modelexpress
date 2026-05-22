@@ -153,12 +153,10 @@ spec:
       restartPolicy: Always  # StatefulSet requires Always
       imagePullSecrets:
         - name: worker-registry
-      # Pin to the a100a pool (4 nodes, 3 active after cordons). Multi-node
-      # TP needs 4 pods (source-0/1 + target-0/1) on different hosts in the
-      # same IB partition — only a100a has enough hosts. The agentpool
-      # podAffinity below is redundant given this nodeSelector but kept as
-      # self-documentation. Note: this is moot today since the multi-node
-      # path is already gated on the MIG cluster blocker.
+      # Multi-node TP needs 4 pods (source-0/1 + target-0/1) on different
+      # hosts in the same IB partition — pin to a pool with enough hosts.
+      # The agentpool podAffinity below is redundant given this nodeSelector
+      # but kept as self-documentation.
       nodeSelector:
         agentpool: a100a
       affinity:
@@ -195,9 +193,9 @@ spec:
                 - apps.kubernetes.io/pod-index
               topologyKey: kubernetes.io/hostname
         # podAffinity on agentpool: keep ALL four P2P pods in the SAME node
-        # pool. The Azure AKS test cluster splits GPU nodes across multiple
-        # InfiniBand partitions (`a100a` and `a100b` pools have different
-        # pkeys), and pods on different pkeys can't talk RDMA to each other.
+        # pool. The test cluster splits GPU nodes across multiple InfiniBand
+        # partitions (different pools have different pkeys), and pods on
+        # different pkeys can't talk RDMA to each other.
         # The cross-pair layout above already pins source/target pairs to
         # the same host, but we also need TP collectives (source-0 ↔
         # source-1, target-0 ↔ target-1) to stay within one partition.
