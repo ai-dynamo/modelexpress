@@ -1,0 +1,306 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Multi-node vLLM TP=2 manifest for ModelExpress P2P CI tests.
+#
+# NOT YET WIRED INTO CI — see "Status" below.
+#
+# Topology vs ./manifest-azure-tp2.yaml (single-node TP=2):
+#   - StatefulSet (not Job): TP is split across 2 pods rather than 2 GPUs in
+#     one pod, so each pod owns one TP rank with 1 GPU + 1 IB device. Cross-
+#     pod TP comms go over IB RDMA (no intra-pod NVLink shortcut).
+#   - Headless Service: gives pod-0 a stable DNS name
+#     ${JOB_NAME}-0.${JOB_NAME} so pod-1 can reliably join the Ray cluster
+#     regardless of scheduling order.
+#   - Ray distributed executor: pod-0 is Ray head + vLLM API server, pod-1
+#     is a Ray worker. vLLM is launched only on pod-0 once Ray is up.
+#   - podAntiAffinity uses two rules: (a) spread pods within a StatefulSet
+#     across hosts so TP collectives go cross-host, and (b) `matchLabelKeys`
+#     on apps.kubernetes.io/pod-index so same-rank pods across source/target
+#     never co-locate. Lets the test run on a 2-node pool with the layout
+#     Node A: source-0 + target-1 / Node B: source-1 + target-0 — all four
+#     RDMA paths (source TP, target TP, MX P2P rank-0, MX P2P rank-1) are
+#     still cross-host. Needs K8s ≥ 1.29 for matchLabelKeys.
+#
+# Applied twice by the workflow with different envsubst values (same pattern
+# as manifest-azure.yaml / manifest-azure-tp2.yaml):
+#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
+#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
+#
+# Each apply creates one Service + one StatefulSet, each managing 2 pods
+# (rank 0 + rank 1).
+#
+# Status: scaffolded, gated. Blockers before this can run in CI:
+#
+#   1. ModelExpress device_id bug observed under vLLM's Ray distributed
+#      executor (--distributed-executor-backend=ray) with one-GPU-per-pod
+#      isolation, exactly the topology this manifest uses. Confirmed on
+#      vLLM 0.17.1: rank-1's NIXL registration fails with `CUDA error:
+#      invalid device ordinal` because the plugin reads `device_id` from
+#      `vllm_config.device_config.device.index` (see
+#      modelexpress_client/python/modelexpress/engines/vllm/adapter.py
+#      `_get_vllm_device_id`), which carries the GLOBAL rank under Ray
+#      multi-node TP. Each pod only exposes its assigned GPU as local
+#      device 0, so device_id=1 is invalid. Rank 1 then skips the NIXL
+#      register + publish step ("[Worker 1] No NIXL manager, skipping
+#      metadata publish"), only one ModelMetadata CR shows up server-
+#      side, and no P2P transfer is possible. Single-node TP=2 is
+#      unaffected because both devices (0 and 1) exist in the same pod.
+#      Whether other distributed setups (e.g. non-Ray multi-node) are
+#      affected is unverified — the failure mode is specific to how
+#      `device.index` maps to local CUDA visibility, so any executor that
+#      surfaces a local device index would dodge it; we haven't profiled.
+#      Likely fix in adapter.py: prefer `torch.cuda.current_device()`
+#      (reflects the worker process's actual visible CUDA context) over
+#      `target_device.index` whenever CUDA is available. Tracking ticket:
+#      TODO — file before re-enabling this manifest.
+#
+#   2. Cluster capacity. Requires ≥2 A100 + IB nodes (each with ≥2 GPUs)
+#      available concurrently in the Azure AKS test pool. The matchLabelKeys
+#      anti-affinity (see Topology above) cross-pairs ranks across the two
+#      hosts so source-0/target-1 share one node and source-1/target-0 share
+#      the other. K8s on the cluster must be ≥ 1.29 for matchLabelKeys.
+#
+#   3. action.yml envsubst. The action currently calls `envsubst` with no
+#      args, which substitutes ALL env vars present in the shell — including
+#      shell-only vars like ${HOSTNAME} and ${POD_NAME} that the Ray
+#      bootstrap script below relies on at runtime. Two fixes possible:
+#        a. Change action.yml to pass an explicit allowlist:
+#             envsubst '${JOB_NAME} ${WORKER_IMAGE} ${WORKER_PORT} ${MX_CI_MODEL}'
+#        b. Replace ${POD_NAME##*-} with a sed/awk pre-process step before
+#           apply. Option (a) is cleaner and only touches one file.
+#
+#   4. StatefulSet pod selection AND Service routing. Two related issues
+#      to land together when enabling multi-node TP:
+#        a. action.yml and test_p2p_k8s.py select pods by the auto-applied
+#           `job-name=` label (from K8s Jobs). The template below copies
+#           ${JOB_NAME} into a `job-name` label for compat, but
+#           `kubectl get pods -l job-name=mx-target -o ...items[0]...`
+#           does not guarantee ordinal order — it could return mx-target-1
+#           (the Ray worker pod, no API server) before mx-target-0 (the
+#           head pod). Pin selection to ordinal 0 in both action.yml's
+#           port checks and pytest's _pod_name helper.
+#        b. The headless Service below uses selector `job-name=${JOB_NAME}`,
+#           which matches BOTH pods. Ray's own use of the Service is fine
+#           (it dials `${JOB_NAME}-0.${JOB_NAME}` via the per-pod DNS A
+#           record), but anything dialing the Service name directly (e.g.
+#           `${JOB_NAME}:${WORKER_PORT}` from a future caller) would
+#           round-robin and possibly hit pod-1 which has no HTTP endpoint.
+#           Fix by adding a separate head-only Service whose selector is
+#           `statefulset.kubernetes.io/pod-name: ${JOB_NAME}-0` and routing
+#           HTTP callers to that name. Current callers use `kubectl exec`
+#           into the resolved pod so don't hit this today, but the fix
+#           should land with (a) so future callers aren't surprised.
+#
+#   5. Workflow matrix entry. Once 1–4 land, uncomment the
+#      `framework: vllm / multinode tp_size: 2` block under the `test-tp`
+#      job in .github/workflows/modelexpress-ci-tests.yml.
+#
+# Environment variables substituted by envsubst before each apply:
+#   JOB_NAME      — mx-source or mx-target (drives STS name, Service name,
+#                   and the `job-name` compat label)
+#   WORKER_IMAGE  — image built from ci/k8s/client/vllm/Dockerfile
+#   WORKER_PORT   — port the vLLM API server listens on (only meaningful on
+#                   pod-0; pod-1 is a Ray worker with no HTTP endpoint)
+#   MX_CI_MODEL   — HuggingFace model id
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JOB_NAME}
+  labels:
+    app: mx-p2p-worker
+    job-name: ${JOB_NAME}
+spec:
+  clusterIP: None  # headless: each pod gets a DNS A record
+  selector:
+    job-name: ${JOB_NAME}
+  ports:
+    - name: ray-gcs
+      port: 6379
+      targetPort: 6379
+    - name: http
+      port: ${WORKER_PORT}
+      targetPort: ${WORKER_PORT}
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${JOB_NAME}
+spec:
+  serviceName: ${JOB_NAME}
+  # Start pod-0 and pod-1 in parallel: pod-1's `ray start --block` will
+  # retry until pod-0's GCS is reachable, so we don't need strict ordering.
+  podManagementPolicy: Parallel
+  replicas: 2
+  selector:
+    matchLabels:
+      job-name: ${JOB_NAME}
+  template:
+    metadata:
+      labels:
+        # app=mx-p2p-worker is the cluster-wide P2P anti-affinity scope —
+        # source-0, source-1, target-0, target-1 all match and end up on
+        # four different hosts.
+        app: mx-p2p-worker
+        # job-name=${JOB_NAME} mirrors the auto-label K8s Jobs set, so
+        # existing CI tooling (action.yml, pytest helpers) that selects
+        # pods by job-name keeps working without changes.
+        job-name: ${JOB_NAME}
+    spec:
+      restartPolicy: Always  # StatefulSet requires Always
+      imagePullSecrets:
+        - name: worker-registry
+      # Pin to the a100a pool (4 nodes, 3 active after cordons). Multi-node
+      # TP needs 4 pods (source-0/1 + target-0/1) on different hosts in the
+      # same IB partition — only a100a has enough hosts. The agentpool
+      # podAffinity below is redundant given this nodeSelector but kept as
+      # self-documentation. Note: this is moot today since the multi-node
+      # path is already gated on the MIG cluster blocker.
+      nodeSelector:
+        agentpool: a100a
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            # Rule 1: spread pods within the same StatefulSet across hosts.
+            # Ensures source-0 / source-1 (and target-0 / target-1) never
+            # co-locate, so TP collective traffic always goes cross-host
+            # over IB rather than NVLink.
+            - labelSelector:
+                matchLabels:
+                  job-name: ${JOB_NAME}
+              topologyKey: kubernetes.io/hostname
+
+            # Rule 2: same-rank pods across StatefulSets land on different
+            # hosts. `matchLabelKeys` tells the scheduler "match pods that
+            # share my own value for these label keys" — here
+            # `apps.kubernetes.io/pod-index` is the StatefulSet auto-label
+            # carrying the ordinal (0 or 1). So source-0 (pod-index=0)
+            # avoids target-0 (also pod-index=0), and source-1 avoids
+            # target-1, but source-0 may share a host with target-1.
+            #
+            # Combined with Rule 1, this lets the test exercise full cross-
+            # host RDMA on a 2-node pool (Node A: source-0 + target-1,
+            # Node B: source-1 + target-0) instead of needing 4 nodes.
+            #
+            # Requires K8s ≥ 1.29 (matchLabelKeys is beta then, stable in
+            # 1.31) and ≥ 1.28 for the auto-applied
+            # apps.kubernetes.io/pod-index label.
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              matchLabelKeys:
+                - apps.kubernetes.io/pod-index
+              topologyKey: kubernetes.io/hostname
+        # podAffinity on agentpool: keep ALL four P2P pods in the SAME node
+        # pool. The Azure AKS test cluster splits GPU nodes across multiple
+        # InfiniBand partitions (`a100a` and `a100b` pools have different
+        # pkeys), and pods on different pkeys can't talk RDMA to each other.
+        # The cross-pair layout above already pins source/target pairs to
+        # the same host, but we also need TP collectives (source-0 ↔
+        # source-1, target-0 ↔ target-1) to stay within one partition.
+        # podAffinity with agentpool guarantees that.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: vllm
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          ports:
+            - containerPort: ${WORKER_PORT}
+              name: http
+            - containerPort: 6379
+              name: ray-gcs
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_TLS
+              value: "rc_x,rc,dc_x,dc,cuda_copy"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              # Pod ordinal (0 or 1) drives role assignment.
+              ORDINAL="${POD_NAME##*-}"
+              STS_NAME="${POD_NAME%-*}"
+              HEAD_ADDR="${STS_NAME}-0.${STS_NAME}:6379"
+
+              if [ "${ORDINAL}" = "0" ]; then
+                # Rank 0: Ray head + vLLM API server.
+                ray start --head --port=6379 --num-gpus=1
+                # Wait for Ray GCS to accept connections before launching vLLM.
+                until ray status --address=127.0.0.1:6379 >/dev/null 2>&1; do
+                  sleep 1
+                done
+                # Wait for pod-1 to register as a Ray worker so vLLM sees
+                # both nodes when it builds the TP group. `ray status`
+                # reports the cluster-total GPU line as "X.X/N.0 GPU" where
+                # N is the sum across nodes.
+                until ray status --address=127.0.0.1:6379 2>/dev/null \
+                    | grep -qE "/2\.0 GPU"; do
+                  sleep 2
+                done
+                RAY_ADDRESS=127.0.0.1:6379 exec python3 -m vllm.entrypoints.openai.api_server \
+                  --model "${MX_CI_MODEL}" \
+                  --load-format mx \
+                  --tensor-parallel-size 2 \
+                  --distributed-executor-backend ray \
+                  --trust-remote-code \
+                  --port "${WORKER_PORT}"
+              else
+                # Rank 1: Ray worker. Blocks until Ray head is reachable, then
+                # joins. No vLLM process here — pod-0 drives the TP group.
+                exec ray start --block --address="${HEAD_ADDR}" --num-gpus=1
+              fi
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
