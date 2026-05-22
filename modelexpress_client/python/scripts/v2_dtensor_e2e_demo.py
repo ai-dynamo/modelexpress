@@ -51,6 +51,20 @@ N_REFIT_CYCLES = int(os.environ.get("N_REFIT_CYCLES", "2"))
 HIDDEN = int(os.environ.get("HIDDEN", "1024"))
 INTER = int(os.environ.get("INTER", "2048"))
 
+# FORCE_RDMA=1 disables UCX's intra-node `cuda_ipc` fast path so the demo
+# exercises the same `rc_mlx5` (or `cuda_copy` over RDMA NIC) descriptor-list
+# validation path that real cross-node transfers do. Without this, intra-node
+# loopback runs through `cuda_ipc` which silently tolerates malformed
+# descriptor entries — e.g. the v2 `__mx_v2_meta__` sidecar (addr=0, size=0)
+# bug that MX PR #295 (commit 53c69ec) fixed. Set FORCE_RDMA=1 on every
+# pre-deploy run so cross-host descriptor-list bugs surface in loopback.
+if os.environ.get("FORCE_RDMA") == "1":
+    os.environ["UCX_TLS"] = os.environ.get("UCX_TLS", "self,sm,rc_mlx5,cuda_copy,tcp")
+    log.info(
+        "FORCE_RDMA=1: UCX_TLS=%s (cuda_ipc disabled to exercise descriptor validation)",
+        os.environ["UCX_TLS"],
+    )
+
 
 def _setup_dist(rank: int, world_size: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")

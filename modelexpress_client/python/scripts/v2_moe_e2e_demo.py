@@ -45,6 +45,23 @@ NUM_EXPERTS = int(os.environ.get("NUM_EXPERTS", "8"))   # 8 experts per "layer"
 HIDDEN = int(os.environ.get("HIDDEN", "256"))
 N_REFIT_CYCLES = int(os.environ.get("N_REFIT_CYCLES", "2"))
 
+# FORCE_RDMA=1 disables UCX's intra-node `cuda_ipc` fast path so the demo
+# exercises the same `rc_mlx5` (or `cuda_copy` over RDMA NIC) descriptor-list
+# validation path that real cross-node transfers do. Without this, intra-node
+# loopback runs through `cuda_ipc` which silently tolerates malformed
+# descriptor entries — e.g. the v2 `__mx_v2_meta__` sidecar (addr=0, size=0)
+# bug that MX PR #295 (commit 53c69ec) fixed. Set FORCE_RDMA=1 on every
+# pre-deploy run so cross-host descriptor-list bugs surface in loopback.
+if os.environ.get("FORCE_RDMA") == "1":
+    # rc_mlx5 = RDMA over RoCE/IB; cuda_copy = staged GPU↔NIC via host bounce.
+    # Both run UCX's strict prep_xfer_dlist validation. self+sm kept so the
+    # ZMQ/gRPC control plane still works.
+    os.environ["UCX_TLS"] = os.environ.get("UCX_TLS", "self,sm,rc_mlx5,cuda_copy,tcp")
+    log.info(
+        "FORCE_RDMA=1: UCX_TLS=%s (cuda_ipc disabled to exercise descriptor validation)",
+        os.environ["UCX_TLS"],
+    )
+
 
 def trainer_publish(rank: int, version: int, layout, mx_url: str):
     """Run as the trainer side: publish a moe-flavored shard for our rank."""
