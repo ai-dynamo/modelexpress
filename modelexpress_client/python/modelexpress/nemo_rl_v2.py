@@ -45,7 +45,7 @@ from typing import Iterator
 import torch
 
 from . import p2p_pb2
-from .heartbeat import HeartbeatThread
+from .metadata.heartbeat import HeartbeatThread
 from .refit_receiver import MxRefitReceiver, SourceRef
 from .shape_descriptors import (
     PLACEMENT_SHARD,
