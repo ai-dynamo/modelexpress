@@ -1,22 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: 'Run ModelExpress Dynamo Aggregated CI Test'
+name: 'Run ModelExpress Dynamo CI Test'
 description: |
-  CI lifecycle for the row-7 dynamo-integration P2P test. Wraps:
+  CI lifecycle for the dynamo-integration P2P tests (rows 7 + 8). Wraps:
 
     1. Apply ModelExpress CRDs + namespace RBAC + secrets in the test
        namespace.
-    2. Apply the DynamoGraphDeployment with replicas=1. The cluster-wide
-       Dynamo operator (installed once in `dynamo-system` by
-       setup-mx-vcluster) reconciles it.
-    3. Wait until the first VllmWorker has loaded weights from HF and
-       published one ModelMetadata CR (so the second replica has a
-       discoverable source to pull from).
-    4. Patch the DGD to replicas=2.
-    5. Wait for the second worker to come up, discover the source, and
-       complete the P2P transfer (visible as "RDMA transfer complete" in
-       its container logs).
+    2. Apply the DynamoGraphDeployment. The cluster-wide Dynamo operator
+       (installed once in `dynamo-system` by setup-mx-vcluster) reconciles it.
+    3. Wait until the initial worker(s) have loaded weights from HF and
+       published ModelMetadata CRs (aggregated: 1 CR from VllmWorker;
+       disaggregated: 2 CRs, one each from VllmPrefillWorker and
+       VllmDecodeWorker).
+    4. Patch the DGD to scale the relevant worker component to replicas=2
+       (aggregated: VllmWorker; disaggregated: VllmDecodeWorker).
+    5. Wait for the scaled-up replica to come up, discover the source, and
+       complete the P2P transfer (signal: the final ModelMetadata CR count
+       reaches the expected value — 2 for aggregated, 3 for disaggregated).
     6. Run pytest against the deployed resources.
     7. Delete the namespace on exit (pass or fail).
 
@@ -79,6 +80,15 @@ inputs:
     description: 'Extra arguments forwarded verbatim to pytest'
     required: false
     default: ''
+  mode:
+    description: |
+      Serving topology under test. Controls the wait gates and the DGD
+      patch path used to exercise P2P scaling:
+        aggregated    — initial 1 VllmWorker, scaled to 2 (final 2 CRs)
+        disaggregated — initial 1 VllmPrefillWorker + 1 VllmDecodeWorker,
+                        VllmDecodeWorker scaled to 2 (final 3 CRs)
+    required: false
+    default: 'aggregated'
   source_load_timeout_seconds:
     description: 'Seconds to wait for the first VllmWorker replica to publish ModelMetadata'
     required: false
@@ -165,33 +175,63 @@ runs:
         envsubst < "${MANIFEST}" | kubectl apply -n "${NAMESPACE}" -f -
         echo "::endgroup::"
 
-    - name: Wait for source worker to publish metadata
+    - name: Resolve mode-specific parameters
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        # Aggregated and disaggregated differ in three places:
+        #   INITIAL_CR_COUNT — CRs published before the scale patch
+        #   SCALE_COMPONENT  — DGD spec.services key to scale to replicas=2
+        #   FINAL_CR_COUNT   — CRs published after the scale patch
+        # Everything else (pod label selector, transfer assertion shape) is
+        # identical, so we just stash the three values in $GITHUB_ENV and
+        # let the downstream wait/scale steps read them.
+        case "${MODE}" in
+          aggregated)
+            echo "INITIAL_CR_COUNT=1" >> "$GITHUB_ENV"
+            echo "SCALE_COMPONENT=VllmWorker" >> "$GITHUB_ENV"
+            echo "FINAL_CR_COUNT=2" >> "$GITHUB_ENV"
+            ;;
+          disaggregated)
+            echo "INITIAL_CR_COUNT=2" >> "$GITHUB_ENV"
+            echo "SCALE_COMPONENT=VllmDecodeWorker" >> "$GITHUB_ENV"
+            echo "FINAL_CR_COUNT=3" >> "$GITHUB_ENV"
+            ;;
+          *)
+            echo "ERROR: unknown mode '${MODE}' (expected aggregated|disaggregated)"
+            exit 1
+            ;;
+        esac
+
+    - name: Wait for source worker(s) to publish metadata
       shell: bash
       env:
         NAMESPACE: ${{ inputs.namespace }}
         TIMEOUT: ${{ inputs.source_load_timeout_seconds }}
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: source_load_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
-        echo "::group::Wait for first VllmWorker to publish ModelMetadata"
+        echo "::group::Wait for initial workers to publish ${INITIAL_CR_COUNT} ModelMetadata CR(s)"
         deadline=$((SECONDS + TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
           CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${CR_COUNT}" -ge 1 ]; then
-            echo "Source published metadata (${CR_COUNT} CR)."
+          if [ "${CR_COUNT}" -ge "${INITIAL_CR_COUNT}" ]; then
+            echo "Initial workers published metadata (${CR_COUNT} CR(s))."
             break
           fi
           # Fail fast on pod crashes.
           FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
-            echo "ERROR: source worker failed before publishing metadata: ${FAILED}"
+            echo "ERROR: a worker failed before publishing metadata: ${FAILED}"
             exit 1
           fi
-          echo "No ModelMetadata CR yet, retrying in 15s..."
+          echo "Have ${CR_COUNT}/${INITIAL_CR_COUNT} ModelMetadata CR(s), retrying in 15s..."
           sleep 15
         done
-        if ! kubectl get modelmetadata -n "${NAMESPACE}" -o name 2>/dev/null | grep -q .; then
-          echo "ERROR: source did not publish metadata within ${TIMEOUT}s"
+        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${FINAL}" -lt "${INITIAL_CR_COUNT}" ]; then
+          echo "ERROR: only ${FINAL}/${INITIAL_CR_COUNT} ModelMetadata CRs after ${TIMEOUT}s"
           exit 1
         fi
         echo "::endgroup::"
@@ -202,27 +242,28 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
         DGD_NAME: ${{ inputs.dgd_name }}
       run: |
-        echo "::group::Patch DGD ${DGD_NAME} to VllmWorker.replicas=2"
+        echo "::group::Patch DGD ${DGD_NAME} to ${SCALE_COMPONENT}.replicas=2"
         kubectl patch dgd "${DGD_NAME}" -n "${NAMESPACE}" --type merge \
-          -p '{"spec":{"services":{"VllmWorker":{"replicas":2}}}}'
+          -p "{\"spec\":{\"services\":{\"${SCALE_COMPONENT}\":{\"replicas\":2}}}}"
         echo "::endgroup::"
 
-    - name: Wait for second worker to complete P2P transfer
+    - name: Wait for scaled-up worker to complete P2P transfer
       shell: bash
       env:
         NAMESPACE: ${{ inputs.namespace }}
         TIMEOUT: ${{ inputs.p2p_transfer_timeout_seconds }}
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: p2p_transfer_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
-        echo "::group::Wait for the second worker's RDMA transfer to complete"
+        echo "::group::Wait for ModelMetadata CR count to reach ${FINAL_CR_COUNT} (scaled-up replica's RDMA transfer complete)"
         deadline=$((SECONDS + TIMEOUT))
-        # Both target worker pods publish their own ModelMetadata CR, so a
-        # second CR is the most direct signal that the second replica reached
-        # the publish phase (which happens AFTER successful RDMA receive).
+        # The scaled-up worker publishes its own ModelMetadata CR, so the
+        # CR count reaching FINAL_CR_COUNT is the most direct signal that
+        # the new replica reached the publish phase (which happens AFTER
+        # successful RDMA receive).
         while [ $SECONDS -lt $deadline ]; do
           CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${CR_COUNT}" -ge 2 ]; then
-            echo "Both workers have published metadata (${CR_COUNT} CRs)."
+          if [ "${CR_COUNT}" -ge "${FINAL_CR_COUNT}" ]; then
+            echo "All workers have published metadata (${CR_COUNT} CRs)."
             break
           fi
           FAILED=$(kubectl get pods -n "${NAMESPACE}" -l nvidia.com/dynamo-component-type=worker --no-headers 2>/dev/null \
@@ -231,12 +272,12 @@ runs:
             echo "ERROR: a worker pod failed before completing P2P transfer: ${FAILED}"
             exit 1
           fi
-          echo "Have ${CR_COUNT}/2 ModelMetadata CRs, retrying in 15s..."
+          echo "Have ${CR_COUNT}/${FINAL_CR_COUNT} ModelMetadata CRs, retrying in 15s..."
           sleep 15
         done
         FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-        if [ "${FINAL}" -lt 2 ]; then
-          echo "ERROR: only ${FINAL} ModelMetadata CRs after ${TIMEOUT}s (expected 2)"
+        if [ "${FINAL}" -lt "${FINAL_CR_COUNT}" ]; then
+          echo "ERROR: only ${FINAL} ModelMetadata CRs after ${TIMEOUT}s (expected ${FINAL_CR_COUNT})"
           exit 1
         fi
         echo "::endgroup::"
@@ -271,6 +312,7 @@ runs:
           --namespace "${NAMESPACE}" \
           --model "${MX_CI_MODEL}" \
           --dgd-name "${DGD_NAME}" \
+          --expected-cr-count "${FINAL_CR_COUNT}" \
           "${EXTRA[@]}"
 
     - name: Dump pod logs

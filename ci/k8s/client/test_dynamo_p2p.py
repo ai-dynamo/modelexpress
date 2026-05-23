@@ -121,12 +121,17 @@ def _port_forward(namespace: str, target: str, local_port: int, remote_port: int
         proc.wait(timeout=5)
 
 
-def test_two_modelmetadata_crs_published(namespace: str) -> None:
-    """Both VllmWorker replicas must have published their own ModelMetadata CR.
+def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> None:
+    """Every worker replica must have published its own ModelMetadata CR.
 
-    The action.yml waits for this before invoking pytest, so a failure here
-    most likely means the cluster state regressed between the wait and the
-    test run (e.g. a worker pod crashed and the server reaper deleted its CR).
+    Aggregated: 2 (two VllmWorker replicas after scale-up).
+    Disaggregated: 3 (one VllmPrefillWorker + two VllmDecodeWorker after
+    scale-up).
+
+    The action.yml waits for `expected_cr_count` before invoking pytest, so a
+    failure here most likely means the cluster state regressed between the
+    wait and the test run (e.g. a worker pod crashed and the server reaper
+    deleted its CR).
     """
     result = _kubectl(
         "get", "modelmetadata",
@@ -137,8 +142,8 @@ def test_two_modelmetadata_crs_published(namespace: str) -> None:
     print(f"[modelmetadata] {len(rows)} CR(s):")
     for row in rows:
         print(f"  {row}")
-    assert len(rows) == 2, (
-        f"Expected 2 ModelMetadata CRs (one per VllmWorker replica), got {len(rows)}."
+    assert len(rows) == expected_cr_count, (
+        f"Expected {expected_cr_count} ModelMetadata CRs, got {len(rows)}."
     )
 
 

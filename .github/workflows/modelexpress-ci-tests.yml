@@ -73,14 +73,20 @@
 name: ModelExpress CI Tests
 
 on:
+  # TEMPORARY: push trigger disabled while modelexpress-trtllm-test.yml
+  # validates the disaggregated dynamo matrix entry end-to-end. Re-enable
+  # this once disaggregated has passed there and the matrix entry has
+  # been propagated here. workflow_dispatch stays available.
+  #
   # copy-pr-bot mediated trigger. Direct `pull_request:` events are forbidden
   # on self-hosted runners (PR-head code is untrusted); copy-pr-bot
   # copies a PR's content to `pull-request/<N>` in this repo AFTER a
   # maintainer approves (or all commits are GPG-signed by Nvidians), and
   # the push to that internal branch is what fires this workflow.
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  # push:
+  #   branches:
+  #     - "pull-request/[0-9]+"
+  workflow_dispatch:
 
 concurrency:
   # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so

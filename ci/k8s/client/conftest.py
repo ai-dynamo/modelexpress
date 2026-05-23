@@ -46,6 +46,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "selector uses. Must match what the action / manifest applied."
         ),
     )
+    parser.addoption(
+        "--expected-cr-count",
+        default=_positive_int(os.environ.get("EXPECTED_CR_COUNT", "2")),
+        type=_positive_int,
+        help=(
+            "Final ModelMetadata CR count expected at pytest time. "
+            "Aggregated: 2 (2 VllmWorker replicas after scale-up). "
+            "Disaggregated: 3 (1 prefill + 2 decode replicas after scale-up)."
+        ),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -83,3 +93,8 @@ def tp_size(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def dgd_name(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--dgd-name")
+
+
+@pytest.fixture(scope="session")
+def expected_cr_count(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--expected-cr-count")
