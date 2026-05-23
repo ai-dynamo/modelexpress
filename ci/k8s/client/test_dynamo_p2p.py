@@ -35,6 +35,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
 
@@ -148,12 +149,19 @@ def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> 
 
 
 def test_second_replica_used_rdma(namespace: str, dgd_name: str) -> None:
-    """Exactly one worker pod must have called `add_remote_agent` — the second
-    replica pulling from the first. The source replica never calls it.
+    """At least one worker pod must have called `add_remote_agent` — the
+    signal that P2P weight transfer engaged at all.
 
-    Catches the regression where the second replica falls back to HF disk
-    download instead of RDMA pull (e.g. mx-server connectivity issue, source
-    metadata not READY, NIXL agent registration failed).
+    Why `>= 1` and not `== 1`: in aggregated mode only the scaled-up replica
+    pulls (1 source + 1 puller = 1 distinct source agent), but disaggregated
+    has additional pullers — the prefill worker could also pull weights from
+    whichever decode replica downloaded from HF first, AND the scaled-up
+    decode replica picks a source independently. Depending on which sources
+    rdma_strategy returns, those two pulls may land on the same source (1
+    distinct agent) or different sources (2 distinct agents). Both outcomes
+    are healthy; the real failure mode this test guards against is the
+    scaled-up replica falling back to HF disk load entirely — that's the
+    `== 0` case.
     """
     logs = _worker_logs_combined(namespace, dgd_name)
     # Same regex shape as test_p2p_k8s.py's per-rank source agent check. Both
@@ -164,40 +172,82 @@ def test_second_replica_used_rdma(namespace: str, dgd_name: str) -> None:
     matches = re.findall(pattern, logs)
     distinct_agents = {name for name, _ in set(matches)}
     print(f"[workers] distinct source agents observed across all worker logs: {distinct_agents}")
-    assert len(distinct_agents) == 1, (
-        f"Expected exactly 1 source agent across worker logs (one replica pulling from one source), "
-        f"got {len(distinct_agents)}: {distinct_agents}. "
-        f"Zero usually means the second replica fell back to HF disk load — P2P didn't engage."
+    assert len(distinct_agents) >= 1, (
+        f"No add_remote_agent calls found across worker logs — every worker that "
+        f"needed weights fell back to HF disk load. P2P didn't engage at all."
     )
 
 
-def test_frontend_inference(namespace: str, model: str, dgd_name: str) -> None:
-    """Dynamo Frontend's /v1/completions returns a valid response.
+# Number of /v1/completions requests sent through the Frontend in the inference
+# test. Sized at >= 2x post-scale worker count (aggregated: 2 workers;
+# disaggregated: 2 decode workers serving + 1 prefill) so round-robin must
+# dispatch to every serving worker at least once with high probability —
+# catches the failure mode where the scaled-up replica's P2P-loaded weights
+# load fine but produce 5xx / empty text on inference.
+INFERENCE_REQUEST_COUNT = 6
 
-    Validates end-to-end: HTTP request → Frontend → round-robin to a worker
-    → inference using P2P-loaded weights → response back. The completion text
-    may be nonsensical (Qwen2.5-0.5B + non-zero temperature), but non-empty is
-    enough — we're testing the routing + serving path, not model correctness.
+
+def _send_completion(port: int, model: str, index: int) -> str:
+    """POST one /v1/completions request and return the completion text.
+
+    Asserts non-empty text inside the worker thread so the failure shows up
+    with the offending request index — `future.result()` re-raises in the
+    main test thread and pytest captures it normally.
     """
     payload = json.dumps({
         "model": model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
     }).encode()
+    req = urllib.request.Request(
+        f"http://localhost:{port}/v1/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Cold-start budget per request (vLLM CUDA-graph capture, model warmup);
+    # warm responses complete in seconds. Using the same timeout for every
+    # call keeps the code simple — the wall-clock cost is dominated by the
+    # cold start either way.
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        body = json.loads(resp.read())
+    choices = body.get("choices", [])
+    assert choices, f"Request {index}: no choices in response: {body}"
+    text = choices[0].get("text", "")
+    assert text, f"Request {index}: empty completion text: {body}"
+    return text
+
+
+def test_frontend_inference(namespace: str, model: str, dgd_name: str) -> None:
+    """Dynamo Frontend's /v1/completions returns valid responses across
+    multiple concurrent requests.
+
+    Validates end-to-end: HTTP request → Frontend → round-robin to a worker →
+    inference using P2P-loaded weights → response back. We can't address
+    individual workers directly (`python3 -m dynamo.vllm` doesn't expose
+    /v1/completions on the worker pod, only the Frontend does), so we fire N
+    requests concurrently and rely on round-robin to spread them across every
+    worker. As long as all N return non-empty text, the scaled-up replica's
+    P2P-loaded weights are intact enough to serve. Concurrent rather than
+    sequential because real serving sees concurrent load, and concurrency
+    forces the Frontend to actually distribute — sequential round-robin can
+    degenerate to "same worker handles all" if it always responds before the
+    next request arrives.
+
+    The completion text may be nonsensical (Qwen2.5-0.5B + non-zero
+    temperature), but every response must have non-empty text — we're
+    testing the routing + serving path, not model correctness.
+    """
     frontend_svc = f"{dgd_name}-frontend"
     with _port_forward(namespace, f"svc/{frontend_svc}", local_port=18000, remote_port=FRONTEND_PORT) as port:
-        req = urllib.request.Request(
-            f"http://localhost:{port}/v1/completions",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        # Cold-start budget: vLLM CUDA-graph capture etc.
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = json.loads(resp.read())
-    print(f"[frontend] response: {json.dumps(body, indent=2)}")
-    choices = body.get("choices", [])
-    assert choices, f"No choices in response from Frontend: {body}"
-    text = choices[0].get("text", "")
-    print(f"[frontend] completion text: {text!r}")
-    assert text, f"Empty completion text from Frontend: {body}"
+        with ThreadPoolExecutor(max_workers=INFERENCE_REQUEST_COUNT) as pool:
+            futures = {
+                pool.submit(_send_completion, port, model, i): i
+                for i in range(INFERENCE_REQUEST_COUNT)
+            }
+            for future in as_completed(futures):
+                i = futures[future]
+                # future.result() re-raises any AssertionError /
+                # urllib.error.URLError from inside the worker thread.
+                text = future.result()
+                print(f"[frontend req {i}] completion: {text!r}")

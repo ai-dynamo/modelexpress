@@ -56,6 +56,26 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Disaggregated: 3 (1 prefill + 2 decode replicas after scale-up)."
         ),
     )
+    parser.addoption(
+        "--heartbeat-timeout-secs",
+        default=_positive_int(os.environ.get("HEARTBEAT_TIMEOUT_SECS", "30")),
+        type=_positive_int,
+        help=(
+            "Server-side reaper heartbeat threshold (MX_HEARTBEAT_TIMEOUT_SECS). "
+            "Must match what the deployed mx-server is configured with — the "
+            "run-mx-stale-metadata-test action threads the same value to both "
+            "the manifest and pytest to keep them aligned."
+        ),
+    )
+    parser.addoption(
+        "--reaper-scan-interval-secs",
+        default=_positive_int(os.environ.get("REAPER_SCAN_INTERVAL_SECS", "10")),
+        type=_positive_int,
+        help=(
+            "Server-side reaper scan interval (MX_REAPER_SCAN_INTERVAL_SECS). "
+            "Same alignment requirement as --heartbeat-timeout-secs."
+        ),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -98,3 +118,13 @@ def dgd_name(request: pytest.FixtureRequest) -> str:
 @pytest.fixture(scope="session")
 def expected_cr_count(request: pytest.FixtureRequest) -> int:
     return request.config.getoption("--expected-cr-count")
+
+
+@pytest.fixture(scope="session")
+def heartbeat_timeout_secs(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--heartbeat-timeout-secs")
+
+
+@pytest.fixture(scope="session")
+def reaper_scan_interval_secs(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--reaper-scan-interval-secs")

@@ -282,6 +282,50 @@ runs:
         fi
         echo "::endgroup::"
 
+    - name: Wait for all worker pods /live to return 200
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+        TIMEOUT: ${{ inputs.p2p_transfer_timeout_seconds }}
+      run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: p2p_transfer_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        echo "::group::Wait for all worker pods' /live to return 200"
+        # CR publication happens during model load (before CUDA-graph capture
+        # finishes), so a pod with a published CR may still be 503'ing on
+        # /live. The dynamo runtime's /live on port 9090 returns 200 only
+        # when the worker is registered AND serving — gating pytest behind
+        # this ensures Frontend's round-robin doesn't route requests to a
+        # worker that's still warming up.
+        WORKER_SELECTOR="nvidia.com/dynamo-graph-deployment-name=${DGD_NAME},nvidia.com/dynamo-component-type=worker"
+        PODS=$(kubectl get pods -n "${NAMESPACE}" -l "${WORKER_SELECTOR}" \
+          -o jsonpath='{.items[*].metadata.name}')
+        if [ -z "${PODS}" ]; then
+          echo "ERROR: no worker pods found with selector ${WORKER_SELECTOR}"
+          exit 1
+        fi
+        for POD in ${PODS}; do
+          deadline=$((SECONDS + TIMEOUT))
+          while [ $SECONDS -lt $deadline ]; do
+            if kubectl exec -n "${NAMESPACE}" "${POD}" -- \
+                 curl -sf -m 5 http://localhost:9090/live >/dev/null 2>&1; then
+              echo "${POD} /live OK"
+              break
+            fi
+            echo "${POD} /live not ready yet, retrying in 10s..."
+            sleep 10
+          done
+          # Re-probe post-loop to distinguish "broke out on success" from
+          # "deadline elapsed" — without this, a pod that never becomes
+          # ready would silently fall through.
+          if ! kubectl exec -n "${NAMESPACE}" "${POD}" -- \
+               curl -sf -m 5 http://localhost:9090/live >/dev/null 2>&1; then
+            echo "ERROR: ${POD} /live did not return 200 within ${TIMEOUT}s"
+            exit 1
+          fi
+        done
+        echo "::endgroup::"
+
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
@@ -368,14 +412,14 @@ runs:
         #   - DGD-controlled PodClique + PodGang teardown
         #   - ModelMetadata CR finalizers driven by the mx-server controller
         #   - K8s namespace finalizer clearance after all child resources
-        # 5 min covers the legitimate slow path. Anything slower indicates a
-        # stuck finalizer — we fall back to force-finalize as a safeguard so
-        # the persistent vCluster doesn't accumulate orphaned namespaces
-        # across runs, but emit a ::warning:: so the unhealthy condition
-        # (stale conversion webhook, stuck controller finalizer, etc.) is
-        # surfaced in the GHA UI and gets investigated.
-        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=300s; then
-          echo "::warning::Namespace ${NAMESPACE} did not finalize within 300s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
+        # 3 min is enough buffer for the legitimate slow path; in practice the
+        # safeguard (force-finalize via kubectl replace --raw) is what
+        # consistently completes the delete because stuck finalizers from
+        # CR controllers / dynamo operator are the common case, not the
+        # exception. The ::warning:: still fires so unhealthy cleanup
+        # conditions are visible in the GHA UI.
+        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
+          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
           kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
             | jq '.spec.finalizers = []' \
             | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
