@@ -1,23 +1,36 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Kimi K2.5 decode source — DGD with multinode TP=8 (2 nodes × 4 GPUs)
-# Publishes weights via NIXL to modelexpress-server-decode
-# Phase 2: provides TP=8 weights for decode targets
-# Namespace: default
+# Aggregated Kimi K2.5 worker DGD designed for HPA-driven autoscaling.
+#
+# Each replica is a TP=8 group across 2 nodes × 4 GPUs.
+# `MXCheckpointLoader` auto-detects source vs target via _has_existing_sources():
+#   - First replica: no MX sources found → loads from disk → publishes via MX
+#   - Subsequent replicas: MX sources detected → RDMA receive (~5s vs ~22min)
+#
+# Same yaml works for replicas 1, 2, ..., N. Use the companion
+# kimi-agg-autoscale-hpa.yaml to drive replica count via HPA.
 #
 # Prerequisites:
-#   - modelexpress-server-decode + redis-decode running (mx-infra-decode.yaml)
-#   - shared-model-cache PVC with Kimi model
-#   - Dynamo platform (etcd + NATS)
-#   - DGD operator webhook running
+#   - modelexpress-server-decode + redis-decode running (../mx-infra-decode.yaml)
+#   - shared-model-cache PVC with Kimi model in HF cache layout
+#   - Dynamo platform (etcd + NATS) reachable via FQDN
+#   - DGD operator + DGDSA controller installed (part of Dynamo platform)
+#   - ComputeDomain large enough for maxReplicas × multinode.nodeCount nodes
+#
+# Update before applying:
+#   - Image tag: nvcr.io/nvidian/dynamo-dev/<user>:dynamo-trtllm-mx-<tag>
+#   - Node pool: cloud.google.com/gke-nodepool value (line ~74)
+#   - NATS_SERVER / ETCD_ENDPOINTS namespace FQDNs (lines ~117-119)
+#   - MODEL_EXPRESS_URL: where your modelexpress-server is reachable
+#   - resourceClaimTemplateName: your namespace's compute-domain-channel
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: kimi-source-decode-trtllm-config
+  name: kimi-agg-autoscale-config
 data:
-  source-decode.yaml: |
+  agg.yaml: |
     max_num_tokens: 8192
     enable_chunked_prefill: true
     disable_overlap_scheduler: true
@@ -47,7 +60,7 @@ data:
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
-  name: kimi-source-decode
+  name: kimi-agg-autoscale
 spec:
   services:
     source:
@@ -82,7 +95,7 @@ spec:
                 - key: app.kubernetes.io/part-of
                   operator: In
                   values:
-                  - kimi-source-decode
+                  - kimi-agg-autoscale
               topologyKey: nvidia.com/gpu.clique
         containers: null
         imagePullSecrets:
@@ -103,7 +116,7 @@ spec:
             - --served-model-name
             - baseten-admin/Kimi-2.5-text-nvfp4-v3
             - --extra-engine-args
-            - /config/source-decode.yaml
+            - /config/agg.yaml
             - --model-express-url
             - modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001
             - --tensor-parallel-size
@@ -219,4 +232,4 @@ spec:
               claimName: shared-model-cache
           - name: trtllm-config
             configMap:
-              name: kimi-source-decode-trtllm-config
+              name: kimi-agg-autoscale-config

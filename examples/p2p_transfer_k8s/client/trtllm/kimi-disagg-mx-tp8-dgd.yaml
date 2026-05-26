@@ -103,7 +103,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "<REGISTRY>/<NAME>:<TAG>"
           command:
             - python3
           args:
@@ -122,9 +122,9 @@ spec:
             - name: HF_HOME
               value: /model-cache
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.<NAMESPACE>.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.<NAMESPACE>.svc.cluster.local:2379"
           volumeMounts:
             - mountPath: /model-cache
               name: model-cache
@@ -210,7 +210,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "<REGISTRY>/<NAME>:<TAG>"
           workingDir: /workspace/
           securityContext:
             privileged: true
@@ -232,9 +232,7 @@ spec:
             - --disaggregation-mode
             - prefill
             - --model-express-url
-            - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - target
+            - modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001
             - --tensor-parallel-size
             - "8"
             - --publish-events-and-metrics
@@ -258,13 +256,15 @@ spec:
             - name: HF_MODULES_CACHE
               value: /tmp/hf_modules
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.default.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001"
+            - name: MODEL_EXPRESS_TARGET
+              value: "1"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.<NAMESPACE>.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.<NAMESPACE>.svc.cluster.local:2379"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -285,9 +285,6 @@ spec:
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
-            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
-            - name: MX_RDMA_NIC_PIN
-              value: "auto"
             - name: UCX_TLS
               value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
@@ -349,7 +346,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: my-compute-domain-channel
+            resourceClaimTemplateName: <NAMESPACE>-compute-domain-channel
         volumes:
           - name: shared-model-cache
             persistentVolumeClaim:
@@ -417,7 +414,7 @@ spec:
         imagePullSecrets:
           - name: nvcr-imagepullsecret
         mainContainer:
-          image: "<REGISTRY>/dynamo-trtllm-mx:<TAG>"
+          image: "<REGISTRY>/<NAME>:<TAG>"
           workingDir: /workspace/
           securityContext:
             privileged: true
@@ -439,9 +436,7 @@ spec:
             - --disaggregation-mode
             - decode
             - --model-express-url
-            - modelexpress-server-decode.default.svc.cluster.local:8001
-            - --model-express-role
-            - target
+            - modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001
             - --tensor-parallel-size
             - "8"
             - --publish-events-and-metrics
@@ -465,13 +460,15 @@ spec:
             - name: HF_MODULES_CACHE
               value: /tmp/hf_modules
             - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server-decode.default.svc.cluster.local:8001"
+              value: "modelexpress-server-decode.<NAMESPACE>.svc.cluster.local:8001"
+            - name: MODEL_EXPRESS_TARGET
+              value: "1"
             - name: MODEL_NAME
               value: "baseten-admin/Kimi-2.5-text-nvfp4-v3"
             - name: NATS_SERVER
-              value: "nats://dynamo-platform-nats.default.svc.cluster.local:4222"
+              value: "nats://dynamo-platform-nats.<NAMESPACE>.svc.cluster.local:4222"
             - name: ETCD_ENDPOINTS
-              value: "dynamo-platform-etcd.default.svc.cluster.local:2379"
+              value: "dynamo-platform-etcd.<NAMESPACE>.svc.cluster.local:2379"
             - name: NCCL_CUMEM_ENABLE
               value: "1"
             - name: NCCL_NVLS_ENABLE
@@ -492,9 +489,6 @@ spec:
               value: "eth0"
             - name: OMPI_MCA_oob_tcp_if_include
               value: "eth0"
-            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
-            - name: MX_RDMA_NIC_PIN
-              value: "auto"
             - name: UCX_TLS
               value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
@@ -558,7 +552,7 @@ spec:
             operator: Exists
         resourceClaims:
           - name: compute-domain-channel
-            resourceClaimTemplateName: my-compute-domain-channel
+            resourceClaimTemplateName: <NAMESPACE>-compute-domain-channel
         volumes:
           - name: shared-model-cache
             persistentVolumeClaim:
