@@ -32,11 +32,10 @@ Invoked by the workflow as:
 import json
 import re
 import subprocess
-import time
-import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+
+from kube_utils import kubectl, port_forward
 
 
 # Service + label conventions are set by the dynamo operator from the DGD spec:
@@ -56,18 +55,9 @@ def _worker_label_selector(dgd_name: str) -> str:
     )
 
 
-def _kubectl(*args: str, namespace: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["kubectl", "-n", namespace, *args],
-        capture_output=True,
-        text=True,
-        check=check,
-    )
-
-
 def _worker_pod_names(namespace: str, dgd_name: str) -> list[str]:
     selector = _worker_label_selector(dgd_name)
-    result = _kubectl(
+    result = kubectl(
         "get", "pods",
         "-l", selector,
         "-o", "jsonpath={.items[*].metadata.name}",
@@ -96,32 +86,6 @@ def _worker_logs_combined(namespace: str, dgd_name: str) -> str:
     return "\n".join(chunks)
 
 
-@contextmanager
-def _port_forward(namespace: str, target: str, local_port: int, remote_port: int):
-    """target is either `svc/<name>` or `pod/<name>` — kubectl port-forward
-    accepts either form."""
-    proc = subprocess.Popen(
-        ["kubectl", "-n", namespace, "port-forward", target, f"{local_port}:{remote_port}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        deadline = time.perf_counter() + 60
-        while time.perf_counter() < deadline:
-            try:
-                urllib.request.urlopen(f"http://localhost:{local_port}/health", timeout=2)
-                break
-            except urllib.error.HTTPError:
-                # Server responded — it's up even if /health returns an error code.
-                break
-            except (urllib.error.URLError, ConnectionRefusedError):
-                time.sleep(1)
-        yield local_port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
-
-
 def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> None:
     """Every worker replica must have published its own ModelMetadata CR.
 
@@ -134,7 +98,7 @@ def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> 
     wait and the test run (e.g. a worker pod crashed and the server reaper
     deleted its CR).
     """
-    result = _kubectl(
+    result = kubectl(
         "get", "modelmetadata",
         "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.spec.worker_rank}{\"\\n\"}{end}",
         namespace=namespace,
@@ -239,7 +203,7 @@ def test_frontend_inference(namespace: str, model: str, dgd_name: str) -> None:
     testing the routing + serving path, not model correctness.
     """
     frontend_svc = f"{dgd_name}-frontend"
-    with _port_forward(namespace, f"svc/{frontend_svc}", local_port=18000, remote_port=FRONTEND_PORT) as port:
+    with port_forward(namespace, f"svc/{frontend_svc}", local_port=18000, remote_port=FRONTEND_PORT) as port:
         with ThreadPoolExecutor(max_workers=INFERENCE_REQUEST_COUNT) as pool:
             futures = {
                 pool.submit(_send_completion, port, model, i): i

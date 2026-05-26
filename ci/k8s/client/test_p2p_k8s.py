@@ -58,24 +58,13 @@ ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml but not yet wired in):
 
 import json
 import re
-import subprocess
-import time
-import urllib.error
 import urllib.request
-from contextlib import contextmanager
 
-
-def _kubectl(*args: str, namespace: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["kubectl", "-n", namespace, *args],
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+from kube_utils import kubectl, port_forward
 
 
 def _pod_name(namespace: str, job_name: str) -> str:
-    result = _kubectl(
+    result = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
         "-o", "jsonpath={.items[0].metadata.name}",
@@ -84,29 +73,6 @@ def _pod_name(namespace: str, job_name: str) -> str:
     name = result.stdout.strip()
     assert name, f"{job_name} pod not found"
     return name
-
-
-@contextmanager
-def _port_forward(namespace: str, pod: str, local_port: int, remote_port: int):
-    proc = subprocess.Popen(
-        ["kubectl", "-n", namespace, "port-forward", pod, f"{local_port}:{remote_port}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        deadline = time.perf_counter() + 60
-        while time.perf_counter() < deadline:
-            try:
-                urllib.request.urlopen(f"http://localhost:{local_port}/health", timeout=2)
-                break
-            except urllib.error.HTTPError:
-                break  # server responded — it's up even if /health returns an error code
-            except (urllib.error.URLError, ConnectionRefusedError):
-                time.sleep(1)
-        yield local_port
-    finally:
-        proc.terminate()
-        proc.wait(timeout=5)
 
 
 def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
@@ -119,7 +85,7 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
         "prompt": "The capital of France is",
         "max_tokens": 8,
     }).encode()
-    with _port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
+    with port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
         req = urllib.request.Request(
             f"http://localhost:{port}/v1/completions",
             data=payload,
@@ -147,7 +113,7 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     """
     pod = _pod_name(namespace, "mx-target")
     print(f"\n[mx-target] pod={pod}")
-    result = _kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
+    result = kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
     marker_lines = [l for l in result.stdout.splitlines() if any(k in l for k in ("RDMA", "P2P", "transfer"))]
     print(f"[mx-target] transfer log lines:\n" + "\n".join(marker_lines))
     assert p2p_marker in result.stdout, (
@@ -177,7 +143,7 @@ def test_per_rank_source_agents(namespace: str, tp_size: int) -> None:
     plausible-but-garbage text — which the current non-empty assertion passes.
     """
     pod = _pod_name(namespace, "mx-target")
-    result = _kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
+    result = kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
     matches = re.findall(
         r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
         result.stdout,
