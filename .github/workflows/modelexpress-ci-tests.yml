@@ -3,15 +3,16 @@
 
 # ModelExpress K8s CI.
 #
-# Six jobs:
+# Seven jobs:
 #   build-server        — builds and pushes the MX coordination server image
 #                         from ci/k8s/server/Dockerfile.server. Runs on the
 #                         self-hosted builder runner
 #                         (prod-modelexpress-builder-amd-v1).
 #
-#   build-client        — matrix over inference engine frameworks; builds and
-#                         pushes one worker image per framework. Runs on the
-#                         self-hosted builder runner. Both build jobs run in
+#   build-client        — matrix over inference engine frameworks (vllm,
+#                         trt-llm, sglang, dynamo-vllm); builds and pushes
+#                         one worker image per framework. Runs on the
+#                         self-hosted builder runner. All build jobs run in
 #                         parallel.
 #
 #   ensure-vcluster     — bootstraps the persistent mx-ci-cluster vCluster on
@@ -27,9 +28,19 @@
 #                         parallel once each framework has been validated
 #                         independently.
 #
-#   test-tp             — TP > 1 variant of test-p2p. Currently disabled —
-#                         blocked on the AKS test cluster being all-MIG (see
-#                         the job's header comment for details).
+#   test-tp             — TP > 1 variant of test-p2p. Pinned to the agent
+#                         pool with non-MIG, full physical GPUs via the
+#                         tp2 manifest's nodeSelector. Single-node only
+#                         today; multi-node TP is still blocked on the
+#                         device_id bug (see TEST_PLAN row 5).
+#
+#   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment
+#                         (aggregated serving). Different shape than test-p2p
+#                         (DGD CR + grove-managed pods, not a raw K8s Job), so
+#                         it's its own top-level job rather than a test-p2p
+#                         matrix entry. Relies on the cluster-wide Dynamo
+#                         operator installed in dynamo-system by
+#                         setup-mx-vcluster.
 #
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
@@ -50,10 +61,13 @@
 #   4. If the engine's S3 streamer path works end-to-end, add the framework to
 #      the model-streamer matrix and generalize the run-mx-streamer-test
 #      composite action to dispatch on framework.
+#   5. If the engine also runs under a Dynamo DGD (`dynamo-<engine>`), add it
+#      to the build-client matrix with the dynamo-specific Dockerfile and
+#      consider extending test-with-dynamo to a matrix.
 #
 # Required secrets:
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
-#   NGC_API_KEY                   — push/pull registry images + create in-cluster pull secret
+#   NGC_API_KEY                   — push/pull registry images
 #   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
 
 name: ModelExpress CI Tests
@@ -150,13 +164,12 @@ jobs:
         include:
           - framework: vllm
             dockerfile: ci/k8s/client/vllm/Dockerfile
-          # trt-llm — gated on the TRT-LLM ModelExpress adapter landing.
-          # Tracking: https://linear.app/nvidia/issue/MX-299/trt-llm-adapter
-          # Uncomment once the adapter is available in the base image.
-          # - framework: trt-llm
-          #   dockerfile: ci/k8s/client/trt-llm/Dockerfile
+          - framework: trt-llm
+            dockerfile: ci/k8s/client/trt-llm/Dockerfile
           - framework: sglang
             dockerfile: ci/k8s/client/sgl/Dockerfile
+          - framework: dynamo-vllm
+            dockerfile: ci/k8s/client/vllm/dynamo/Dockerfile
 
     steps:
       - name: Checkout
@@ -240,6 +253,47 @@ jobs:
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
+      - name: vCluster baseline health
+        # Snapshot vCluster control-plane state before any test job runs. When
+        # downstream jobs fail with "connection refused" mid-run, this baseline
+        # tells us whether the vCluster was already showing signs of strain
+        # (restarts, OOMs, evictions, low headroom) or was healthy at the start
+        # — pointing the investigation at either cluster-health or test-load.
+        # Uses the host kubeconfig (set by connect-vcluster) since the vCluster
+        # pod itself is a host-cluster resource.
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          SELECTOR="app=vcluster,release=${VCLUSTER_NAME}"
+
+          echo "::group::vCluster pod summary"
+          kubectl get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+            -o wide 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::vCluster container restart count + last termination"
+          # Restart count > 0 or any non-empty lastState.terminated is a smoking
+          # gun for a recent crash — most likely OOM or a control-plane bug.
+          kubectl get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.containerStatuses[*]}  {.name}: restartCount={.restartCount}, lastState={.lastState}{"\n"}{end}{end}' 2>&1 || true
+          echo
+          echo "::endgroup::"
+
+          echo "::group::vCluster pod resource usage (kubectl top)"
+          # Requires metrics-server in the host cluster. Failure here is fine —
+          # the diagnostic is best-effort and shouldn't gate the job.
+          kubectl top pod -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" 2>&1 || \
+            echo "(kubectl top unavailable — metrics-server not installed or not ready)"
+          echo "::endgroup::"
+
+          echo "::group::Recent events in ${VCLUSTER_NAMESPACE} (last 30)"
+          # Catches scheduler/eviction/probe-failure events for the vCluster
+          # pod and any sibling resources.
+          kubectl get events -n "${VCLUSTER_NAMESPACE}" \
+            --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
+          echo "::endgroup::"
+
       - name: Reap vCluster port-forward
         # connect-vcluster backgrounds a `kubectl port-forward` and exports
         # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
@@ -268,7 +322,7 @@ jobs:
       # per node). Per-namespace podAntiAffinity lets matrix entries
       # co-locate on the same hosts, so node count is not the binding
       # constraint; IB device count per node is.
-      max-parallel: 2
+      max-parallel: 3
       matrix:
         include:
           - framework: vllm
@@ -279,20 +333,17 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8001"
             worker_port: "8002"
-          # trt-llm — gated on the TRT-LLM ModelExpress adapter (MX-299:
-          # https://linear.app/nvidia/issue/MX-299/trt-llm-adapter).
-          # Uncomment once the adapter lands; see build matrix above.
-          # - framework: trt-llm
-          #   namespace: mx-ci-trt-llm-${{ github.run_id }}
-          #   manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
-          #   test_script: ci/k8s/client/test_p2p_k8s.py
-          #   pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
-          #   source_extra_env: |
-          #     JOB_NAME=mx-source
-          #     MODEL_EXPRESS_SOURCE=1
-          #   extra_env: "JOB_NAME=mx-target"
-          #   source_port: "8003"
-          #   worker_port: "8004"
+          - framework: trt-llm
+            namespace: mx-ci-trt-llm-${{ github.run_id }}
+            manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
+            source_extra_env: |
+              JOB_NAME=mx-source
+              MODEL_EXPRESS_SOURCE=1
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8003"
+            worker_port: "8004"
           - framework: sglang
             namespace: mx-ci-sglang-${{ github.run_id }}
             manifest: ci/k8s/client/sgl/manifest-azure.yaml
@@ -353,20 +404,12 @@ jobs:
   # Multi-node TP coverage is a follow-up — would slot in here as additional
   # matrix entries once the cluster + manifests support it.
   #
-  # CURRENTLY DISABLED — the AKS test cluster has all A100 nodes in MIG mode.
-  # Requesting `nvidia.com/gpu: 2` returns 2 MIG slices, not 2 full GPUs;
-  # NVIDIA hardware blocks NVML topology queries, NCCL peer-to-peer, and
-  # NVLink across slices. Net result: vLLM crashes during
-  # `compile_or_warm_up_model` with
-  # `RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED`.
-  # Re-enable by removing the `if: false` once ops provisions a non-MIG
-  # pool (`nvidia.com/mig.config=all-disabled`) and the manifest's
-  # nodeSelector is updated to target it. See ci/k8s/client/vllm/manifest-azure-tp2.yaml
-  # for the full requirements header.
+  # Pinned to the right agentpool (2 nodes, full physical GPUs,
+  # `mig.config=all-disabled`) via the nodeSelector in
+  # manifest-azure-tp2.yaml.
   # ---------------------------------------------------------------------------
   test-tp:
-    if: false
-    name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }}) [disabled — MIG blocker]
+    name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -451,6 +494,57 @@ jobs:
         # connect-vcluster backgrounds a `kubectl port-forward` and exports
         # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
         # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Dynamo aggregated-serving P2P test — DGD lifecycle (apply / scale / wait)
+  # against the cluster-wide Dynamo operator installed in dynamo-system by
+  # setup-mx-vcluster. Different shape than test-p2p (DGD CR + grove-managed
+  # pods, not a raw Job), so it lives as its own top-level job rather than a
+  # matrix entry of test-p2p.
+  # ---------------------------------------------------------------------------
+  test-with-dynamo:
+    name: P2P test with Dynamo (aggregated)
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run Dynamo P2P test
+        uses: ./.github/actions/run-mx-dynamo-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: mx-ci-dynamo-${{ github.run_id }}
+          # DGD name shared with the action input AND the manifest's envsubst
+          # placeholder, so all three (kubectl patch/delete, manifest
+          # metadata.name, derived service refs) stay in sync.
+          dgd_name: mx-dynamo-${{ github.run_id }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-dynamo-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+
+      - name: Reap vCluster port-forward
         if: always()
         run: |
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then

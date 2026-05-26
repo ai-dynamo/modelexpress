@@ -21,11 +21,6 @@
 #   - NVLink is blocked between slices
 # Net result: TP=2 fails during vLLM `compile_or_warm_up_model` with
 # `RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED`.
-#
-# To unblock: ask ops for a non-MIG pool (`nvidia.com/mig.config=all-disabled`)
-# and add a nodeSelector targeting it below. Until then this manifest is
-# scaffolded but not run in CI (`test-tp` job in
-# .github/workflows/modelexpress-model-streamer-test.yml is `if: false`).
 
 ---
 apiVersion: batch/v1
@@ -42,15 +37,14 @@ spec:
       restartPolicy: Never
       imagePullSecrets:
         - name: worker-registry
-      # Pin to the a100a pool (4 nodes, 3 active after cordons) rather than
-      # leaving the agentpool open. a100b only has 1 active node — when
-      # source lands there, target's anti-affinity has nowhere to go and
-      # sits Pending forever. Pinning to a100a deterministically gives
-      # target a peer host. The agentpool podAffinity below becomes
-      # redundant (both pods already constrained to a100a) but is kept for
-      # self-documentation + as defense if this nodeSelector is removed.
+      # Pin to a non-MIG GPU pool (mig.config=all-disabled, full physical
+      # GPUs per node), required for TP=2 NCCL / NVLink / NVML to work —
+      # MIG-sliced nodes expose slices, not GPUs, and hardware blocks
+      # NCCL/NVLink/NVML across slices. The agentpool podAffinity below
+      # becomes redundant under this nodeSelector but is kept for self-
+      # documentation + as defense if this nodeSelector is removed.
       nodeSelector:
-        agentpool: a100a
+        agentpool: a100b
       affinity:
         # podAntiAffinity on hostname: keep source and target on different
         # physical hosts so RDMA still exercises true cross-host IB.
@@ -62,10 +56,9 @@ spec:
               topologyKey: kubernetes.io/hostname
         # podAffinity on agentpool: keep source and target in the SAME node
         # pool. The Azure AKS test cluster splits GPU nodes across multiple
-        # InfiniBand partitions (`a100a` and `a100b` pools have different
-        # pkeys), and pods on different pkeys can't talk RDMA to each other.
-        # Combined with hostname anti-affinity, forces source/target onto
-        # different hosts WITHIN the same IB partition.
+        # InfiniBand partitions, and pods on different pkeys can't talk RDMA
+        # to each other. Combined with hostname anti-affinity, forces
+        # source/target onto different hosts WITHIN the same IB partition.
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:

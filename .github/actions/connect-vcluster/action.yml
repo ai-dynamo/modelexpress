@@ -79,6 +79,10 @@ runs:
           --namespace ${NAMESPACE} \
           --server=https://127.0.0.1:${LOCAL_PORT} \
           --print > ${{ github.workspace }}/.kubeconfig-vcluster
+        # kubectl warns on world/group-readable kubeconfigs. The file
+        # already had restrictive content (server URL + cert + token) so
+        # tighten the mode to match.
+        chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
 
         echo "Verifying vCluster connectivity..."
         kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-vcluster get ns
