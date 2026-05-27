@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+import uuid
+
+import pytest
+
+from modelexpress import p2p_pb2
+from modelexpress.rl_benchmark import (
+    RlTransferBenchmarkConfig,
+    run_mx_rl_transfer_benchmark,
+)
+
+_LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get(_LIVE_SERVER_ENV),
+    reason=f"{_LIVE_SERVER_ENV} is not set",
+)
+
+
+def test_live_rl_benchmark_reports_transfer_lease_summary():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("nixl._api")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("live RL benchmark lease summary needs at least 2 CUDA devices")
+
+    result = run_mx_rl_transfer_benchmark(
+        RlTransferBenchmarkConfig(
+            server_url=os.environ[_LIVE_SERVER_ENV],
+            model_name=f"mx-live-rl-benchmark-{uuid.uuid4().hex[:8]}",
+            tensor_count=2,
+            tensor_shape=(256, 256),
+            iterations=1,
+            warmup_iterations=0,
+            source_device_id=0,
+            target_device_id=1,
+        )
+    )
+
+    output = result.to_dict()
+    summary = output["summary"]
+    if not summary["lease_discovery_supported"]:
+        pytest.skip("server does not expose transfer lease discovery")
+
+    assert summary["iterations"] == 1
+    assert summary["total_attempts"] == 1
+    assert summary["successful_attempts"] == 1
+    assert summary["failed_attempts"] == 0
+    assert summary["attempts_with_lease_ids"] == 1
+    assert summary["iterations_with_missing_lease_ids"] == 0
+    assert summary["non_completed_matching_leases"] == 0
+
+    iteration = output["iterations"][0]
+    assert iteration["transfer_lease_discovery_supported"] is True
+    assert iteration["attempt_lease_ids"]
+    assert iteration["report_lease_ids"] == iteration["attempt_lease_ids"]
+    assert iteration["missing_lease_ids"] == []
+    assert iteration["matching_lease_statuses"] == [
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+    ]
+    assert iteration["non_completed_lease_statuses"] == []
+    assert iteration["attempts"][0]["lease_id"] == iteration["attempt_lease_ids"][0]
