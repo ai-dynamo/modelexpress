@@ -74,14 +74,28 @@ from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.heartbeat import HeartbeatThread  # noqa: F401
 from .rl_metadata import RlSourceMetadata, RlSourceRole  # noqa: F401
+from .rl_reshard import (  # noqa: F401
+    MissingTensor,
+    TensorReceiveSpec,
+    TensorShardSpec,
+    TransferPlan,
+    TransferPlanEntry,
+    plan_exact_transfers,
+)
 
 __all__ = [
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
+    "MissingTensor",
     "RlSourceMetadata",
     "RlSourceRole",
+    "TensorReceiveSpec",
+    "TensorShardSpec",
+    "TransferPlan",
+    "TransferPlanEntry",
     "configure_vllm_logging",
+    "plan_exact_transfers",
     "register_modelexpress_loaders",
 ]
