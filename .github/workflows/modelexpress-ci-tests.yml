@@ -3,7 +3,7 @@
 
 # ModelExpress K8s CI.
 #
-# Seven jobs:
+# Eight jobs:
 #   build-server        — builds and pushes the MX coordination server image
 #                         from ci/k8s/server/Dockerfile.server. Runs on the
 #                         self-hosted builder runner
@@ -34,13 +34,22 @@
 #                         today; multi-node TP is still blocked on the
 #                         device_id bug (see TEST_PLAN row 5).
 #
-#   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment
-#                         (aggregated serving). Different shape than test-p2p
-#                         (DGD CR + grove-managed pods, not a raw K8s Job), so
-#                         it's its own top-level job rather than a test-p2p
-#                         matrix entry. Relies on the cluster-wide Dynamo
-#                         operator installed in dynamo-system by
-#                         setup-mx-vcluster.
+#   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
+#                         Matrix over serving topology (aggregated /
+#                         disaggregated). Different shape than test-p2p (DGD CR
+#                         + grove-managed pods, not a raw K8s Job), so it's
+#                         its own top-level job rather than a test-p2p matrix
+#                         entry. Relies on the cluster-wide Dynamo operator
+#                         installed in dynamo-system by setup-mx-vcluster.
+#
+#   test-stale-metadata — Reaper-correctness check. mx-server runs with the
+#                         Redis backend (sidecar) and compressed reaper knobs
+#                         (heartbeat=30s, scan=10s); a single source pod
+#                         publishes, the action force-kills it, and pytest
+#                         asserts ListSources(status_filter=READY) returns 0
+#                         after the heartbeat window. Matrix over framework
+#                         (vllm / sglang). No target pod — the assertion runs
+#                         against mx-server directly via gRPC.
 #
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
@@ -508,11 +517,23 @@ jobs:
   # matrix entry of test-p2p.
   # ---------------------------------------------------------------------------
   test-with-dynamo:
-    name: P2P test with Dynamo (aggregated)
+    name: P2P test with Dynamo (${{ matrix.mode }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: aggregated
+            manifest: ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml
+            namespace: mx-ci-dynamo-agg-${{ github.run_id }}
+            dgd_name: mx-dynamo-agg-${{ github.run_id }}
+          - mode: disaggregated
+            manifest: ci/k8s/client/vllm/dynamo/manifest-azure-disaggregated.yaml
+            namespace: mx-ci-dynamo-disagg-${{ github.run_id }}
+            dgd_name: mx-dynamo-disagg-${{ github.run_id }}
 
     steps:
       - name: Checkout
@@ -532,17 +553,80 @@ jobs:
         uses: ./.github/actions/run-mx-dynamo-test
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
-          namespace: mx-ci-dynamo-${{ github.run_id }}
           # DGD name shared with the action input AND the manifest's envsubst
           # placeholder, so all three (kubectl patch/delete, manifest
           # metadata.name, derived service refs) stay in sync.
-          dgd_name: mx-dynamo-${{ github.run_id }}
+          namespace: ${{ matrix.namespace }}
+          dgd_name: ${{ matrix.dgd_name }}
+          manifest: ${{ matrix.manifest }}
+          mode: ${{ matrix.mode }}
           server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
           worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-dynamo-vllm:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stale-metadata test (row 18) — single source pod, no target, mx-server
+  # deployed with the Redis backend + compressed reaper knobs. After the
+  # source publishes, we force-kill it and assert that the server stops
+  # returning it as READY within ~60s. Matrix over framework so we catch
+  # framework-specific publish-path regressions in the reaper flow.
+  # ---------------------------------------------------------------------------
+  test-stale-metadata:
+    name: Stale metadata test (${{ matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            namespace: mx-ci-stale-vllm-${{ github.run_id }}
+            source_port: "8011"
+          - framework: sglang
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            namespace: mx-ci-stale-sgl-${{ github.run_id }}
+            source_port: "8012"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run stale-metadata test
+        uses: ./.github/actions/run-mx-stale-metadata-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          source_port: ${{ matrix.source_port }}
 
       - name: Reap vCluster port-forward
         if: always()

@@ -406,14 +406,14 @@ runs:
         #   - ModelMetadata + ModelCacheEntry CR finalizers (driven by the
         #     mx-server controller) — usually <30s but can stretch
         #   - K8s namespace finalizer clearance after all child resources
-        # 5 min covers the legitimate slow path. Anything slower indicates a
-        # stuck finalizer — we fall back to force-finalize as a safeguard so
-        # the persistent vCluster doesn't accumulate orphaned namespaces
-        # across runs, but emit a ::warning:: so the unhealthy condition
-        # (stale conversion webhook, stuck controller finalizer, etc.) is
-        # surfaced in the GHA UI and gets investigated.
-        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=300s; then
-          echo "::warning::Namespace ${NAMESPACE} did not finalize within 300s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
+        # 3 min is enough buffer for the legitimate slow path; in practice the
+        # safeguard (force-finalize via kubectl replace --raw) is what
+        # consistently completes the delete because stuck finalizers from
+        # CR controllers / dynamo operator are the common case, not the
+        # exception. The ::warning:: still fires so unhealthy cleanup
+        # conditions are visible in the GHA UI.
+        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
+          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers as a safeguard. Investigate the underlying stuck resource."
           kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
             | jq '.spec.finalizers = []' \
             | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true

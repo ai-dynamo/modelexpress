@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress gRPC server with the Redis metadata backend.
+#
+# Differs from mx-server.yaml (the default K8s CRD backend) in:
+#   - Native sidecar (init container with restartPolicy: Always) running Redis
+#     in-process. Redis listens on localhost:6379; mx-server points at it via
+#     REDIS_URL. Keeps metadata storage in a single deployment unit.
+#   - MX_METADATA_BACKEND=redis (no ModelMetadata CRD usage).
+#   - Compressed reaper knobs (MX_HEARTBEAT_TIMEOUT_SECS=30,
+#     MX_REAPER_SCAN_INTERVAL_SECS=10) so the stale-metadata test can verify
+#     READY → STALE transition in ~45s instead of the production ~120s. Same
+#     code path is exercised — just on a shorter timeline.
+#
+# Accessed by test pods at: mx-server:8000 (same Service name as the default
+# backend, so client manifests don't need backend-specific tweaks).
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-server
+  labels:
+    app: mx-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-server
+  template:
+    metadata:
+      labels:
+        app: mx-server
+    spec:
+      imagePullSecrets:
+        - name: worker-registry
+      # Native sidecar: Redis starts first via init container with
+      # restartPolicy: Always, so it stays running for the main container's
+      # lifetime. Avoids the ordering races a regular sidecar container has.
+      initContainers:
+        - name: redis
+          image: redis:7-alpine
+          restartPolicy: Always
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          startupProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            periodSeconds: 10
+      containers:
+        - name: mx-server
+          image: ${MX_SERVER_IMAGE}
+          imagePullPolicy: Always
+          command: ["/app/modelexpress-server"]
+          args: ["--port", "8000"]
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            - name: REDIS_URL
+              value: "redis://localhost:6379"
+            # Compressed reaper timing for CI — keeps the stale-metadata
+            # test's wait window short while exercising the same code path.
+            # The values are sourced from the run-mx-stale-metadata-test
+            # action's inputs so a single override propagates to both the
+            # server's reaper and the test's wait calculation. Do not
+            # hardcode here.
+            - name: MX_HEARTBEAT_TIMEOUT_SECS
+              value: "${MX_HEARTBEAT_TIMEOUT_SECS}"
+            - name: MX_REAPER_SCAN_INTERVAL_SECS
+              value: "${MX_REAPER_SCAN_INTERVAL_SECS}"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              memory: "8Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-server
+spec:
+  selector:
+    app: mx-server
+  ports:
+    - port: 8000
+      targetPort: 8000

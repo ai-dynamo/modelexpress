@@ -1,0 +1,257 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Disaggregated-serving Dynamo + ModelExpress P2P CI manifest for row 8.
+#
+# Sibling of manifest-azure-aggregated.yaml. Same DGD shell (ModelExpress +
+# Frontend), but the single VllmWorker is split into two components:
+#   VllmPrefillWorker — computes KV cache, ships it to decode via NIXL
+#   VllmDecodeWorker  — generates tokens after receiving KV from prefill
+#
+# Modeled on examples/dynamo_p2p_transfer_k8s/vllm/vllm-single-node-disaggregated.yaml
+# but scaled to CI sizes (Qwen2.5-0.5B, TP=1, 1 GPU/IB device per worker).
+#
+# Initial topology: 1 prefill + 1 decode (2 ModelMetadata CRs).
+# Test scales VllmDecodeWorker to replicas=2 (3 CRs total). This exercises
+# BOTH the disagg KV transfer path (prefill ↔ decode) AND the P2P weight
+# transfer path (the second decode replica pulls weights via NIXL from an
+# existing source — either prefill or the first decode).
+#
+# Cross-host enforcement: a single anti-affinity rule on hostname selecting
+# any worker pod in this DGD forces all worker replicas onto distinct hosts.
+# That gives us cross-host KV transfer (prefill ↔ decode-1) AND cross-host
+# P2P weight transfer (decode-1 ↔ decode-2). Requires 3 distinct schedulable
+# nodes in the pinned pool. The reference example allows prefill/decode
+# co-location for resource utilization on 8-GPU nodes; we require separation
+# because the test is the point of the deployment.
+#
+# Source bootstrap is HuggingFace (same as our other P2P tests).
+#
+# Environment variables substituted by envsubst before apply: see
+# manifest-azure-aggregated.yaml for the full list — the same variables apply
+# here (DGD_NAME, MX_CI_MODEL, WORKER_IMAGE, MX_SERVER_IMAGE).
+
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${DGD_NAME}
+spec:
+  backendFramework: vllm
+  services:
+    # ---- ModelExpress P2P metadata server -------------------------------
+    # Shared by both prefill and decode workers — single pool of sources.
+    ModelExpress:
+      componentType: frontend
+      replicas: 1
+      livenessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      readinessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      extraPodSpec:
+        serviceAccountName: modelexpress
+        imagePullSecrets:
+          - name: worker-registry
+        mainContainer:
+          image: ${MX_SERVER_IMAGE}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - exec /app/modelexpress-server --port 8000
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+    # ---- Dynamo Frontend (HTTP entry point) -----------------------------
+    # Routes to decode workers; decode internally coordinates with prefill
+    # via NIXL KV transfer. See aggregated manifest for the image-size
+    # rationale behind using `dynamo-frontend` instead of the worker image.
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      extraPodSpec:
+        imagePullSecrets:
+          - name: worker-registry
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.1.1
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --http-port
+            - "8000"
+
+    # ---- vLLM prefill workers -------------------------------------------
+    # Compute KV cache, ship to decode via NIXL. kv-transfer-config selects
+    # NixlConnector with kv_role=kv_both (prefill always produces KV;
+    # `kv_both` lets dynamo's service discovery handle the peering without
+    # per-replica engine_id templating).
+    VllmPrefillWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      subComponentType: prefill
+      replicas: 1
+      sharedMemory:
+        size: 64Gi
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+          gpu: "1"
+          custom:
+            rdma/ib: "1"
+        limits:
+          gpu: "1"
+          custom:
+            rdma/ib: "1"
+      envs:
+        - name: VLLM_PLUGINS
+          value: "modelexpress"
+        - name: MX_SERVER_ADDRESS
+          value: "${DGD_NAME}-modelexpress:8000"
+        - name: MX_RDMA_NIC_PIN
+          value: "auto"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      extraPodSpec:
+        imagePullSecrets:
+          - name: worker-registry
+        nodeSelector:
+          agentpool: a100a
+        # Anti-affinity selects ANY worker pod in this DGD (prefill or
+        # decode), so prefill lands on a different host from both decode-0
+        # and decode-1. This forces cross-host KV transfer.
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                    nvidia.com/dynamo-component-type: worker
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: agentpool
+                labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                    nvidia.com/dynamo-component-type: worker
+        mainContainer:
+          image: ${WORKER_IMAGE}
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --trust-remote-code
+            - --disaggregation-mode
+            - prefill
+            - --kv-transfer-config
+            - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+
+    # ---- vLLM decode workers --------------------------------------------
+    # Initial replicas=1. The test patches to replicas=2 after the first
+    # decode replica has published metadata — the second decode replica
+    # discovers a source via mx-server and pulls weights via NIXL RDMA
+    # (from either the prefill worker or the first decode worker, whichever
+    # rdma_strategy picks first).
+    VllmDecodeWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      subComponentType: decode
+      replicas: 1
+      sharedMemory:
+        size: 64Gi
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+          gpu: "1"
+          custom:
+            rdma/ib: "1"
+        limits:
+          gpu: "1"
+          custom:
+            rdma/ib: "1"
+      envs:
+        - name: VLLM_PLUGINS
+          value: "modelexpress"
+        - name: MX_SERVER_ADDRESS
+          value: "${DGD_NAME}-modelexpress:8000"
+        - name: MX_RDMA_NIC_PIN
+          value: "auto"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      extraPodSpec:
+        imagePullSecrets:
+          - name: worker-registry
+        nodeSelector:
+          agentpool: a100a
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                    nvidia.com/dynamo-component-type: worker
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: agentpool
+                labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                    nvidia.com/dynamo-component-type: worker
+        mainContainer:
+          image: ${WORKER_IMAGE}
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --trust-remote-code
+            - --disaggregation-mode
+            - decode
