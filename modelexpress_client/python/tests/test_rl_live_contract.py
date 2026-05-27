@@ -27,6 +27,7 @@ from modelexpress.rl_transfer_lease import (
 )
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
+_LIVE_TRANSFER_LEASE_GC_ENV = "MX_LIVE_TRANSFER_LEASE_GC_EXPECTED"
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get(_LIVE_SERVER_ENV),
@@ -174,6 +175,60 @@ def test_live_server_transfer_lease_expires_abandoned_attempts():
 
         with pytest.raises(RuntimeError, match="is not active"):
             client.renew_transfer_lease(lease_id, ttl_millis=5_000)
+    finally:
+        client.close()
+
+
+def test_live_server_reaper_garbage_collects_terminal_transfer_leases():
+    if not os.environ.get(_LIVE_TRANSFER_LEASE_GC_ENV):
+        pytest.skip(
+            f"{_LIVE_TRANSFER_LEASE_GC_ENV} is not set; "
+            "requires a server started with a short MX_TRANSFER_LEASE_GC_TIMEOUT_SECS"
+        )
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    lease_id = f"lease-terminal-gc-{uuid.uuid4().hex}"
+    mx_source_id = f"live-lease-gc-source-{uuid.uuid4().hex[:8]}"
+    target_worker_id = f"target-gc-{uuid.uuid4().hex[:8]}"
+
+    try:
+        lease = _begin_transfer_lease_or_skip(
+            client,
+            lease_id=lease_id,
+            mx_source_id=mx_source_id,
+            source_worker_id="source-worker",
+            target_worker_id=target_worker_id,
+            target_worker_rank=3,
+            model_version=29,
+            ttl_millis=5_000,
+            metadata={"contract": "terminal-gc"},
+        )
+        assert lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
+
+        completed = client.complete_transfer_lease(
+            lease_id,
+            status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+        )
+        assert completed.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            listed = client.list_transfer_leases(
+                mx_source_id=mx_source_id,
+                target_worker_id=target_worker_id,
+                status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+            )
+            if listed.leases == []:
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "terminal transfer lease was not garbage-collected "
+                    "within the live contract deadline"
+                )
+            time.sleep(0.1)
+
+        fetched = client.get_transfer_lease(lease_id)
+        assert not fetched.found
     finally:
         client.close()
 
