@@ -741,11 +741,7 @@ class RlNixlWeightTransfer:
         target_tensors: dict[str, torch.Tensor] | None,
         target_specs: Sequence[TensorReceiveSpec] | None,
     ) -> DenseFanInReceiveResult:
-        if target_tensors is None:
-            raise RuntimeError(
-                "ModelExpress dense fan-in requires caller-owned target tensors"
-            )
-
+        device_id = self.resolve_device_id(target_tensors.values() if target_tensors is not None else None)
         fanin_plan = prepare_dense_fanin_receive(
             mx_client=self.mx_client,
             candidates=candidates,
@@ -753,8 +749,8 @@ class RlNixlWeightTransfer:
             target_specs=target_specs,
             receiver_rank=receiver_rank,
             same_rank_only=same_rank_only,
+            target_device=f"cuda:{device_id}",
         )
-        device_id = self.resolve_device_id(target_tensors.values())
         self._shutdown_target_nixl_manager()
         manager = NixlTransferManager(
             agent_name=f"mx-rl-target-{uuid.uuid4().hex[:12]}",

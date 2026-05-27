@@ -16,11 +16,13 @@ from modelexpress.client import MxClientBase
 from modelexpress.rl_metadata import RlSourceCandidate, RlSourceRole
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
+    TensorShardSpec,
     plan_dense_reshard_transfers,
     plan_exact_transfers,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
 )
+from modelexpress.rl_shape_registry import torch_dtype_from_string
 from modelexpress.rl_slice_transfer import (
     GroupedSliceTransferManifest,
     build_grouped_slice_transfer_manifest,
@@ -81,18 +83,17 @@ def prepare_dense_fanin_receive(
     *,
     mx_client: MxClientBase,
     candidates: Sequence[RlSourceCandidate],
-    target_tensors: dict[str, torch.Tensor],
+    target_tensors: dict[str, torch.Tensor] | None,
     target_specs: Sequence[TensorReceiveSpec] | None,
     receiver_rank: int,
     same_rank_only: bool,
+    target_device: torch.device | str | None = None,
 ) -> DenseFanInPlan:
     """Resolve source metadata and build a complete dense fan-in plan."""
     unique_candidates = _require_unique_rank_candidates(candidates)
     if len(unique_candidates) < 2:
         raise RuntimeError("ModelExpress dense fan-in requires at least two source ranks")
     model_version = _validate_candidate_group(unique_candidates)
-    if not target_tensors:
-        raise RuntimeError("ModelExpress dense fan-in requires caller-owned target tensors")
 
     source_specs = []
     source_descriptors_by_rank = {}
@@ -128,11 +129,21 @@ def prepare_dense_fanin_receive(
             )
         )
 
-    effective_target_specs = tuple(
-        target_specs
-        if target_specs is not None
-        else receive_specs_from_tensors(target_tensors, receiver_rank=receiver_rank)
+    effective_target_specs = _resolve_dense_fanin_target_specs(
+        unique_candidates,
+        target_tensors=target_tensors,
+        target_specs=target_specs,
+        receiver_rank=receiver_rank,
     )
+    if target_tensors is None:
+        if target_device is None:
+            raise RuntimeError("ModelExpress dense fan-in allocation requires a target device")
+        target_tensors = allocate_tensors_from_receive_specs(
+            effective_target_specs,
+            device=target_device,
+        )
+    if not target_tensors:
+        raise RuntimeError("ModelExpress dense fan-in requires target tensors")
     transfer_plan = plan_dense_reshard_transfers(
         source_specs,
         effective_target_specs,
@@ -213,13 +224,48 @@ def preferred_dense_fanin_groups(
     same_rank_only: bool,
 ) -> tuple[tuple[RlSourceCandidate, ...], ...]:
     """Return complete fan-in groups when no single source can satisfy the receive."""
-    if target_tensors is None:
-        return ()
-    effective_target_specs = tuple(
-        target_specs
-        if target_specs is not None
-        else receive_specs_from_tensors(target_tensors, receiver_rank=receiver_rank)
-    )
+    fanin_groups = candidate_fanin_groups(candidates)
+    if target_tensors is not None or target_specs is not None:
+        effective_target_specs = _resolve_dense_fanin_target_specs(
+            candidates,
+            target_tensors=target_tensors,
+            target_specs=target_specs,
+            receiver_rank=receiver_rank,
+        )
+        return _preferred_dense_fanin_groups_for_specs(
+            candidates,
+            fanin_groups,
+            effective_target_specs=effective_target_specs,
+            same_rank_only=same_rank_only,
+        )
+
+    preferred_groups = []
+    for group in fanin_groups:
+        try:
+            effective_target_specs = infer_dense_fanin_receive_specs(
+                group,
+                receiver_rank=receiver_rank,
+            )
+        except (RuntimeError, ValueError):
+            continue
+        preferred_groups.extend(
+            _preferred_dense_fanin_groups_for_specs(
+                candidates,
+                (group,),
+                effective_target_specs=effective_target_specs,
+                same_rank_only=same_rank_only,
+            )
+        )
+    return tuple(preferred_groups)
+
+
+def _preferred_dense_fanin_groups_for_specs(
+    candidates: Sequence[RlSourceCandidate],
+    fanin_groups: Sequence[Sequence[RlSourceCandidate]],
+    *,
+    effective_target_specs: Sequence[TensorReceiveSpec],
+    same_rank_only: bool,
+) -> tuple[tuple[RlSourceCandidate, ...], ...]:
     if any(
         _single_source_plan_complete(
             candidate,
@@ -230,14 +276,61 @@ def preferred_dense_fanin_groups(
     ):
         return ()
     return tuple(
-        group
-        for group in candidate_fanin_groups(candidates)
+        tuple(group)
+        for group in fanin_groups
         if _dense_fanin_plan_complete(
             group,
             effective_target_specs=effective_target_specs,
             same_rank_only=same_rank_only,
         )
     )
+
+
+def infer_dense_fanin_receive_specs(
+    candidates: Sequence[RlSourceCandidate],
+    *,
+    receiver_rank: int,
+) -> tuple[TensorReceiveSpec, ...]:
+    """Infer full dense receive specs from a compatible multi-rank source group."""
+    unique_candidates = _require_unique_rank_candidates(candidates)
+    _validate_candidate_group(unique_candidates)
+    source_specs = [
+        spec
+        for candidate in unique_candidates
+        for spec in source_specs_from_shape_registry(
+            candidate.metadata.shape_registry,
+            worker_rank=candidate.worker_rank,
+        )
+    ]
+    if not source_specs:
+        raise RuntimeError("ModelExpress dense fan-in sources have no shape registry entries")
+    specs_by_name: dict[str, list[TensorShardSpec]] = {}
+    for spec in source_specs:
+        specs_by_name.setdefault(spec.name, []).append(spec)
+    return tuple(
+        _infer_dense_fanin_tensor_receive_spec(
+            name,
+            specs,
+            receiver_rank=receiver_rank,
+        )
+        for name, specs in sorted(specs_by_name.items())
+    )
+
+
+def allocate_tensors_from_receive_specs(
+    specs: Sequence[TensorReceiveSpec],
+    *,
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Allocate receive tensors from explicit dense receive specs."""
+    return {
+        spec.name: torch.empty(
+            spec.shape,
+            dtype=torch_dtype_from_string(spec.dtype),
+            device=device,
+        )
+        for spec in specs
+    }
 
 
 def candidate_group_label(candidates: Sequence[RlSourceCandidate]) -> str:
@@ -287,6 +380,78 @@ def _validate_candidate_group(candidates: Sequence[RlSourceCandidate]) -> int:
         if candidate.metadata.model_version != model_version or candidate.metadata.role != role:
             raise RuntimeError("ModelExpress dense fan-in group mixes source versions or roles")
     return model_version
+
+
+def _resolve_dense_fanin_target_specs(
+    candidates: Sequence[RlSourceCandidate],
+    *,
+    target_tensors: dict[str, torch.Tensor] | None,
+    target_specs: Sequence[TensorReceiveSpec] | None,
+    receiver_rank: int,
+) -> tuple[TensorReceiveSpec, ...]:
+    if target_specs is not None:
+        return tuple(target_specs)
+    if target_tensors is not None:
+        return tuple(receive_specs_from_tensors(target_tensors, receiver_rank=receiver_rank))
+    return infer_dense_fanin_receive_specs(candidates, receiver_rank=receiver_rank)
+
+
+def _infer_dense_fanin_tensor_receive_spec(
+    name: str,
+    source_specs: Sequence[TensorShardSpec],
+    *,
+    receiver_rank: int,
+) -> TensorReceiveSpec:
+    first = source_specs[0]
+    _validate_consistent_dense_fanin_sources(name, source_specs)
+    expert_order, expert_axis = _infer_dense_fanin_expert_layout(source_specs)
+    return TensorReceiveSpec(
+        name=name,
+        receiver_rank=receiver_rank,
+        shape=first.global_shape,
+        dtype=first.dtype,
+        global_shape=first.global_shape,
+        shard_offsets=tuple(0 for _dim in first.global_shape),
+        pipeline_parallel_rank=first.pipeline_parallel_rank,
+        expert_ids=frozenset(expert_order),
+        expert_order=expert_order,
+        expert_axis=expert_axis,
+    )
+
+
+def _validate_consistent_dense_fanin_sources(
+    name: str,
+    source_specs: Sequence[TensorShardSpec],
+) -> None:
+    first = source_specs[0]
+    for spec in source_specs[1:]:
+        if (
+            spec.dtype != first.dtype
+            or spec.global_shape != first.global_shape
+            or spec.pipeline_parallel_rank != first.pipeline_parallel_rank
+        ):
+            raise RuntimeError(f"ModelExpress dense fan-in sources for {name!r} have inconsistent layout")
+
+
+def _infer_dense_fanin_expert_layout(
+    source_specs: Sequence[TensorShardSpec],
+) -> tuple[tuple[int, ...], int | None]:
+    expert_orders = [spec.expert_order for spec in source_specs if spec.expert_order]
+    if not expert_orders:
+        return (), None
+    if len(expert_orders) != len(source_specs):
+        raise RuntimeError("ModelExpress dense fan-in sources mix expert and non-expert layouts")
+    expert_axis = source_specs[0].expert_axis
+    if any(spec.expert_axis != expert_axis for spec in source_specs):
+        raise RuntimeError("ModelExpress dense fan-in sources have inconsistent expert axes")
+    expert_order = tuple(
+        dict.fromkeys(
+            expert
+            for spec in sorted(source_specs, key=lambda item: (item.shard_offsets, item.worker_rank))
+            for expert in spec.expert_order
+        )
+    )
+    return expert_order, expert_axis
 
 
 def _single_source_plan_complete(

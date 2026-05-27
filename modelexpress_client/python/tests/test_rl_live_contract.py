@@ -417,6 +417,20 @@ def test_live_server_transfers_multi_source_dense_fanin_cuda_version():
             (attempt.worker_rank, attempt.bytes_transferred, attempt.tensor_count)
             for attempt in receiver.last_receive_report.attempts
         ] == [(0, 8, 1), (1, 8, 1)]
+
+        allocated_tensors = asyncio.run(
+            receiver.receive_tensors(
+                model_version=11,
+                receiver_rank=0,
+            )
+        )
+        torch.cuda.synchronize(2)
+
+        assert allocated_tensors[0][0] == "w"
+        assert allocated_tensors[0][1].device.index == 2
+        assert allocated_tensors[0][1].detach().cpu().tolist() == [1.0, 2.0, 3.0, 4.0]
+        assert receiver.last_receive_report is not None
+        assert receiver.last_receive_report.retry_count == 0
     finally:
         receiver.finalize()
         publisher_r1.finalize()
