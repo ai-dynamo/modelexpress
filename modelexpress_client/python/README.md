@@ -76,6 +76,26 @@ register_modelexpress_loaders()
 # Now vLLM recognizes --load-format mx-source and mx-target
 ```
 
+## RL Transfer Benchmark
+
+The Python client includes a synthetic live RL transfer benchmark that emits
+JSON fields suitable for Checkpoint Engine / MX comparisons: bytes transferred,
+publish time, receive time, effective bandwidth, source role, retries, and
+per-attempt details.
+
+```bash
+MX_LIVE_SERVER_URL=localhost:8001 \
+python -m modelexpress.rl_benchmark \
+  --tensor-count 8 \
+  --tensor-shape 1024,1024 \
+  --iterations 5 \
+  --warmup-iterations 1 \
+  --output-json mx-rl-benchmark.json
+```
+
+Use `--output-json` when transport libraries also write logs to the console.
+The benchmark requires CUDA, NIXL, and a running ModelExpress server.
+
 ## Environment Variables
 
 | Variable | Default | Description |
