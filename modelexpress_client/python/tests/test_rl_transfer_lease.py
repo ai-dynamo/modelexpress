@@ -40,8 +40,11 @@ class _LeaseClient:
         mx_source_id="",
         target_worker_id="",
         status_filter=None,
+        model_version_filter=None,
     ):
-        self.lists.append((mx_source_id, target_worker_id, status_filter))
+        self.lists.append(
+            (mx_source_id, target_worker_id, status_filter, model_version_filter)
+        )
         return p2p_pb2.ListTransferLeasesResponse(
             leases=self.leases_by_status.get(status_filter, ())
         )
@@ -308,6 +311,7 @@ def test_transfer_lease_coordinator_lists_target_attempts_by_status():
             p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
             p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
         ),
+        model_version=8,
     )
 
     assert inventory.discovery_supported
@@ -320,11 +324,13 @@ def test_transfer_lease_coordinator_lists_target_attempts_by_status():
             "source",
             "target-worker",
             p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
+            8,
         ),
         (
             "source",
             "target-worker",
             p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
+            8,
         ),
     ]
 
@@ -350,7 +356,7 @@ def test_transfer_lease_coordinator_lists_all_target_attempts_once():
     inventory = coordinator.list_target_leases(mx_source_id="source")
 
     assert [lease.lease_id for lease in inventory.leases] == ["lease-completed"]
-    assert client.lists == [("source", "target-worker", None)]
+    assert client.lists == [("source", "target-worker", None, None)]
 
 
 def test_transfer_lease_inventory_reports_unsupported_old_server():

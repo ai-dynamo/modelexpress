@@ -403,6 +403,7 @@ message ListTransferLeasesRequest {
   string mx_source_id = 1;
   string target_worker_id = 2;
   optional TransferLeaseStatus status_filter = 3;
+  optional uint64 model_version_filter = 4;
 }
 
 message TransferLeaseResponse {

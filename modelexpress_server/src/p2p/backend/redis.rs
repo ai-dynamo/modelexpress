@@ -646,6 +646,7 @@ impl MetadataBackend for RedisBackend {
         mx_source_id: Option<String>,
         target_worker_id: Option<String>,
         status_filter: Option<TransferLeaseStatus>,
+        model_version_filter: Option<u64>,
     ) -> MetadataResult<Vec<TransferLeaseRecord>> {
         let mut conn = self.get_conn().await?;
         let keys = scan_keys(&mut conn, keys::TRANSFER_LEASE_SCAN_PATTERN).await?;
@@ -669,6 +670,9 @@ impl MetadataBackend for RedisBackend {
                 continue;
             }
             if status_filter.is_some_and(|status| lease.status != status as i32) {
+                continue;
+            }
+            if model_version_filter.is_some_and(|version| lease.model_version != version) {
                 continue;
             }
             leases.push(lease);

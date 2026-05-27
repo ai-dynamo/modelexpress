@@ -12,6 +12,7 @@ pub mod k8s_types;
 pub mod lease;
 pub mod reaper;
 pub mod service;
+mod service_transfer_lease;
 pub mod source_identity;
 pub mod state;
 mod state_transfer_lease;

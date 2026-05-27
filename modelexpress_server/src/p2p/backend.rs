@@ -273,12 +273,13 @@ pub trait MetadataBackend: Send + Sync {
         lease_id: &str,
     ) -> MetadataResult<Option<TransferLeaseRecord>>;
 
-    /// List durable transfer leases, optionally filtered by source/target/status.
+    /// List durable transfer leases, optionally filtered by source/target/status/version.
     async fn list_transfer_leases(
         &self,
         mx_source_id: Option<String>,
         target_worker_id: Option<String>,
         status_filter: Option<modelexpress_common::grpc::p2p::TransferLeaseStatus>,
+        model_version_filter: Option<u64>,
     ) -> MetadataResult<Vec<TransferLeaseRecord>>;
 
     /// Renew an active transfer lease with a fresh expiry.

@@ -123,6 +123,7 @@ class MxClientBase(ABC):
         mx_source_id: str = "",
         target_worker_id: str = "",
         status_filter: "p2p_pb2.TransferLeaseStatus | None" = None,
+        model_version_filter: int | None = None,
     ) -> "p2p_pb2.ListTransferLeasesResponse":
         """List durable transfer leases, when supported."""
         raise NotImplementedError
@@ -352,11 +353,13 @@ class MxClient(MxClientBase):
         mx_source_id: str = "",
         target_worker_id: str = "",
         status_filter: "p2p_pb2.TransferLeaseStatus | None" = None,
+        model_version_filter: int | None = None,
     ) -> "p2p_pb2.ListTransferLeasesResponse":
-        """List durable transfer leases with optional source/target/status filters."""
+        """List durable transfer leases with optional source/target/status/version filters."""
         request = p2p_pb2.ListTransferLeasesRequest(
             mx_source_id=mx_source_id,
             target_worker_id=target_worker_id,
             status_filter=status_filter,
+            model_version_filter=model_version_filter,
         )
         return self.stub.ListTransferLeases(request, timeout=30)

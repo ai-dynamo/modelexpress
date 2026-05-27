@@ -384,10 +384,12 @@ class _ModelExpressCheckpointEngineMixin:
         *,
         mx_source_id: str = "",
         statuses: Iterable[int] | None = None,
+        model_version: int | None = None,
     ) -> RlTransferLeaseReportSummary:
         inventory = self._transfer.list_target_transfer_leases(
             mx_source_id=mx_source_id,
             statuses=statuses,
+            model_version=model_version,
         )
         return summarize_report_leases(self._transfer.last_receive_report, inventory)
 

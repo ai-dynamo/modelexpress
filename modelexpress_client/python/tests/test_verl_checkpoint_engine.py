@@ -358,12 +358,14 @@ def test_transfer_lease_summary_uses_receive_report_and_inventory():
     summary = engine.transfer_lease_summary(
         mx_source_id="source-a",
         statuses=(p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
+        model_version=7,
     )
 
     assert engine.last_receive_report is report
     assert fake_transfer.list_kwargs == {
         "mx_source_id": "source-a",
         "statuses": (p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
+        "model_version": 7,
     }
     assert summary.report is report
     assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
