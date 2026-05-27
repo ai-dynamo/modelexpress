@@ -325,6 +325,102 @@ def test_live_server_transfers_moe_expert_axis_slice_cuda_version():
         client.close()
 
 
+def test_live_server_transfers_multi_source_dense_fanin_cuda_version():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if torch.cuda.device_count() < 3:
+        pytest.skip("dense fan-in live contract needs at least 3 CUDA devices")
+    pytest.importorskip("nixl._api")
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-fanin-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    publisher_r0 = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-r0-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    publisher_r1 = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-r1-{uuid.uuid4().hex[:8]}",
+        device_id=1,
+        timeout_seconds=20.0,
+    )
+    receiver = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"receiver-{uuid.uuid4().hex[:8]}",
+        device_id=2,
+        timeout_seconds=20.0,
+    )
+
+    try:
+        publisher_r0.publish_tensors(
+            {"w": torch.tensor([1.0, 2.0], dtype=torch.float32, device="cuda:0")},
+            model_version=11,
+            worker_rank=0,
+            source_world_size=2,
+            tensor_metadata={
+                "w": {
+                    "global_shape": [4],
+                    "shard_offsets": [0],
+                }
+            },
+        )
+        publisher_r1.publish_tensors(
+            {"w": torch.tensor([3.0, 4.0], dtype=torch.float32, device="cuda:1")},
+            model_version=11,
+            worker_rank=1,
+            source_world_size=2,
+            tensor_metadata={
+                "w": {
+                    "global_shape": [4],
+                    "shard_offsets": [2],
+                }
+            },
+        )
+
+        received = torch.zeros((4,), dtype=torch.float32, device="cuda:2")
+        tensors = asyncio.run(
+            receiver.receive_into_tensors(
+                {"w": received},
+                model_version=None,
+                receiver_rank=0,
+                target_specs=[
+                    TensorReceiveSpec(
+                        name="w",
+                        receiver_rank=0,
+                        shape=(4,),
+                        dtype="torch.float32",
+                        global_shape=(4,),
+                        shard_offsets=(0,),
+                    )
+                ],
+            )
+        )
+        torch.cuda.synchronize(0)
+        torch.cuda.synchronize(1)
+        torch.cuda.synchronize(2)
+
+        assert tensors == [("w", received)]
+        assert received.detach().cpu().tolist() == [1.0, 2.0, 3.0, 4.0]
+        assert receiver.last_receive_report is not None
+        assert receiver.last_receive_report.resolved_model_version == 11
+        assert receiver.last_receive_report.retry_count == 0
+        assert [
+            (attempt.worker_rank, attempt.bytes_transferred, attempt.tensor_count)
+            for attempt in receiver.last_receive_report.attempts
+        ] == [(0, 8, 1), (1, 8, 1)]
+    finally:
+        receiver.finalize()
+        publisher_r1.finalize()
+        publisher_r0.finalize()
+        client.close()
+
+
 def test_live_server_recovers_from_republished_inference_replica():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
