@@ -22,6 +22,26 @@ async def _collect_weights(weights):
     return [item async for item in weights]
 
 
+class _FakeCudaTensor:
+    is_cuda = True
+
+    def detach(self):
+        return self
+
+    def is_contiguous(self):
+        return True
+
+
+class _FakePublishingTransfer:
+    def __init__(self):
+        self.tensors = None
+        self.kwargs = None
+
+    def publish_tensors(self, tensors, **kwargs):
+        self.tensors = tensors
+        self.kwargs = kwargs
+
+
 def test_model_version_prefers_global_steps_and_falls_back_to_counter():
     assert _model_version_from_global_steps(42, current_version=7) == 42
     assert _model_version_from_global_steps(None, current_version=7) == 8
@@ -590,24 +610,6 @@ def test_tree_fanout_first_wave_receives_from_trainer_root():
 
 
 def test_send_weights_passes_tensor_metadata_to_transfer():
-    class _FakeCudaTensor:
-        is_cuda = True
-
-        def detach(self):
-            return self
-
-        def is_contiguous(self):
-            return True
-
-    class _FakeTransfer:
-        def __init__(self):
-            self.tensors = None
-            self.kwargs = None
-
-        def publish_tensors(self, tensors, **kwargs):
-            self.tensors = tensors
-            self.kwargs = kwargs
-
     tensor_metadata = {
         "experts.w": {
             "expert_ids": [0, 1],
@@ -620,7 +622,7 @@ def test_send_weights_passes_tensor_metadata_to_transfer():
         tensor_metadata=tensor_metadata,
         mx_client=object(),
     )
-    fake_transfer = _FakeTransfer()
+    fake_transfer = _FakePublishingTransfer()
     engine._transfer = fake_transfer
     engine.init_process_group(rank=0, world_size=1, is_trainer=True)
 
@@ -634,3 +636,89 @@ def test_send_weights_passes_tensor_metadata_to_transfer():
         "source_world_size": 1,
         "tensor_metadata": tensor_metadata,
     }
+
+
+def test_send_weights_accepts_inline_tensor_metadata():
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakePublishingTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(rank=0, world_size=1, is_trainer=True)
+
+    asyncio.run(
+        engine.send_weights(
+            [
+                (
+                    "experts.w",
+                    _FakeCudaTensor(),
+                    {"expert_ids": [0, 1]},
+                )
+            ],
+            global_steps=9,
+        )
+    )
+
+    assert fake_transfer.kwargs["tensor_metadata"] == {
+        "experts.w": {"expert_ids": [0, 1]}
+    }
+
+
+def test_send_weights_merges_configured_and_inline_tensor_metadata():
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        tensor_metadata={
+            "experts.w": {
+                "global_shape": [4, 2],
+                "shard_offsets": [0, 0],
+            }
+        },
+        mx_client=object(),
+    )
+    fake_transfer = _FakePublishingTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(rank=0, world_size=1, is_trainer=True)
+
+    asyncio.run(
+        engine.send_weights(
+            [
+                (
+                    "experts.w",
+                    _FakeCudaTensor(),
+                    {"expert_ids": [0, 1]},
+                )
+            ],
+            global_steps=9,
+        )
+    )
+
+    assert fake_transfer.kwargs["tensor_metadata"] == {
+        "experts.w": {
+            "global_shape": [4, 2],
+            "shard_offsets": [0, 0],
+            "expert_ids": [0, 1],
+        }
+    }
+
+
+def test_send_weights_rejects_invalid_inline_tensor_metadata():
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakePublishingTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(rank=0, world_size=1, is_trainer=True)
+
+    with pytest.raises(ValueError, match="per-tensor metadata"):
+        asyncio.run(
+            engine.send_weights(
+                [("experts.w", object(), "bad")],
+                global_steps=9,
+            )
+        )
+    assert fake_transfer.kwargs is None

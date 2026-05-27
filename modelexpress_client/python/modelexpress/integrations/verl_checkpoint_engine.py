@@ -48,14 +48,49 @@ _SOURCE_ROLE_POLICIES = {
 }
 
 
-async def _iter_weights(weights: Any) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+async def _iter_weights(
+    weights: Any,
+) -> AsyncGenerator[tuple[str, torch.Tensor, Mapping[str, Any]], None]:
     if isinstance(weights, AsyncIterable):
-        async for name, tensor in weights:
-            yield name, tensor
+        async for item in weights:
+            yield _normalize_weight_item(item)
         return
-    for name, tensor in weights:
-        yield name, tensor
+    for item in weights:
+        yield _normalize_weight_item(item)
         await asyncio.sleep(0)
+
+
+def _normalize_weight_item(
+    item: Any,
+) -> tuple[str, torch.Tensor, Mapping[str, Any]]:
+    try:
+        values = tuple(item)
+    except TypeError as exc:
+        raise ValueError(
+            "ModelExpress veRL weights must yield (name, tensor) or "
+            "(name, tensor, metadata)"
+        ) from exc
+    if len(values) == 2:
+        name, tensor = values
+        metadata: Mapping[str, Any] = {}
+    elif len(values) == 3:
+        name, tensor, raw_metadata = values
+        if raw_metadata is None:
+            metadata = {}
+        elif isinstance(raw_metadata, Mapping):
+            metadata = dict(raw_metadata)
+        else:
+            raise ValueError(
+                "ModelExpress veRL per-tensor metadata must be an object"
+            )
+    else:
+        raise ValueError(
+            "ModelExpress veRL weights must yield (name, tensor) or "
+            "(name, tensor, metadata)"
+        )
+    if not isinstance(name, str):
+        raise ValueError("ModelExpress veRL weight name must be a string")
+    return name, tensor, metadata
 
 
 def _model_version_from_global_steps(
@@ -134,6 +169,29 @@ def _normalize_source_role_policy(value: str | None) -> tuple[RlSourceRole, ...]
             f"unsupported ModelExpress veRL source role policy {normalized!r}; "
             f"expected one of {sorted(_SOURCE_ROLE_POLICIES)}"
         ) from exc
+
+
+def _merge_tensor_metadata(
+    configured_metadata: Mapping[str, Mapping[str, Any]] | None,
+    inline_metadata: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Mapping[str, Any]] | None:
+    if not inline_metadata:
+        return configured_metadata
+    if not configured_metadata:
+        return inline_metadata
+    merged = {}
+    for name, metadata in configured_metadata.items():
+        if not isinstance(metadata, Mapping):
+            raise ValueError(
+                f"ModelExpress tensor metadata for {name!r} must be an object"
+            )
+        merged[name] = dict(metadata)
+    for name, metadata in inline_metadata.items():
+        # Inline metadata comes from the emitted tensor and can refine static config.
+        entry = dict(merged.get(name, {}))
+        entry.update(metadata)
+        merged[name] = entry
+    return merged
 
 
 class _ModelExpressCheckpointEngineMixin:
@@ -335,7 +393,7 @@ class _ModelExpressCheckpointEngineMixin:
 
     async def send_weights(
         self,
-        weights: Iterable[tuple[str, torch.Tensor]] | AsyncIterable[tuple[str, torch.Tensor]],
+        weights: Iterable[Any] | AsyncIterable[Any],
         global_steps: int | None = None,
     ) -> None:
         if self.rank is None:
@@ -343,18 +401,22 @@ class _ModelExpressCheckpointEngineMixin:
         if self._is_trainer is False:
             raise RuntimeError("rollout rank cannot publish ModelExpress weights")
         if self.rank < 0:
-            async for _name, _tensor in _iter_weights(weights):
+            async for _name, _tensor, _metadata in _iter_weights(weights):
                 pass
             return
 
         model_version = self._resolve_send_model_version(global_steps)
-        tensors = await self._materialize_source_tensors(weights)
+        tensors, inline_tensor_metadata = await self._materialize_source_tensors(weights)
+        tensor_metadata = _merge_tensor_metadata(
+            self._tensor_metadata,
+            inline_tensor_metadata,
+        )
         self._transfer.publish_tensors(
             tensors,
             model_version=model_version,
             worker_rank=max(self.rank, 0),
             source_world_size=self._source_world_size,
-            tensor_metadata=self._tensor_metadata,
+            tensor_metadata=tensor_metadata,
         )
 
     async def receive_weights(
@@ -445,17 +507,20 @@ class _ModelExpressCheckpointEngineMixin:
 
     async def _materialize_source_tensors(
         self,
-        weights: Iterable[tuple[str, torch.Tensor]] | AsyncIterable[tuple[str, torch.Tensor]],
-    ) -> dict[str, torch.Tensor]:
+        weights: Iterable[Any] | AsyncIterable[Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Mapping[str, Any]]]:
         tensors = {}
-        async for name, tensor in _iter_weights(weights):
+        tensor_metadata = {}
+        async for name, tensor, metadata in _iter_weights(weights):
             value = tensor.detach()
             if not value.is_cuda:
                 raise RuntimeError(f"ModelExpress requires CUDA tensor for {name!r}")
             if not value.is_contiguous():
                 value = value.contiguous()
             tensors[name] = value
-        return tensors
+            if metadata:
+                tensor_metadata[name] = metadata
+        return tensors, tensor_metadata
 
 
 def register_verl_checkpoint_engine():
