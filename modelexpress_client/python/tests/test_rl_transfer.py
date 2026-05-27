@@ -62,12 +62,19 @@ def _transfer(mx_client):
     )
 
 
-def _source_ref(mx_source_id: str, worker_id: str):
+def _source_ref(
+    mx_source_id: str,
+    worker_id: str,
+    *,
+    model_version: int = 5,
+    role: RlSourceRole = RlSourceRole.TRAINER,
+    worker_rank: int = 0,
+):
     identity = with_rl_source_metadata(
         _base_identity(),
         RlSourceMetadata(
-            model_version=5,
-            role=RlSourceRole.TRAINER,
+            model_version=model_version,
+            role=role,
             world_size=1,
             shape_registry={"w": {"shape": [1], "dtype": "torch.float32"}},
         ),
@@ -76,7 +83,7 @@ def _source_ref(mx_source_id: str, worker_id: str):
         mx_source_id=mx_source_id,
         worker_id=worker_id,
         model_name="test-model",
-        worker_rank=0,
+        worker_rank=worker_rank,
         identity=identity,
     )
 
@@ -174,6 +181,50 @@ def test_select_sources_returns_ordered_candidates_for_retry():
     ]
 
 
+def test_select_source_uses_latest_visible_version_when_unspecified():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref("source-v5", "worker-v5", model_version=5),
+            _source_ref("source-v8", "worker-v8", model_version=8),
+        ]
+    )
+
+    candidate = _transfer(_FakeMxClient(response)).select_source(
+        model_version=None,
+        receiver_rank=0,
+    )
+
+    assert candidate.mx_source_id == "source-v8"
+    assert candidate.metadata.model_version == 8
+
+
+def test_select_source_prefers_inference_replica_for_same_latest_version():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "trainer-v8",
+                "trainer-worker",
+                model_version=8,
+                role=RlSourceRole.TRAINER,
+            ),
+            _source_ref(
+                "replica-v8",
+                "replica-worker",
+                model_version=8,
+                role=RlSourceRole.INFERENCE_REPLICA,
+            ),
+        ]
+    )
+
+    candidate = _transfer(_FakeMxClient(response)).select_source(
+        model_version=None,
+        receiver_rank=0,
+    )
+
+    assert candidate.mx_source_id == "replica-v8"
+    assert candidate.metadata.role == RlSourceRole.INFERENCE_REPLICA
+
+
 def test_publish_tensors_rejects_empty_tensor_set():
     with pytest.raises(RuntimeError, match="no tensors to publish"):
         _transfer(_FakeMxClient(p2p_pb2.ListSourcesResponse())).publish_tensors(
@@ -257,19 +308,20 @@ def test_receive_tensors_retries_next_candidate_after_failure():
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.attempted_sources = []
+            self.model_versions = []
 
         def _receive_from_candidate(self, candidate, model_version, target_tensors=None):
-            del model_version
             del target_tensors
             self.attempted_sources.append(candidate.mx_source_id)
+            self.model_versions.append(model_version)
             if candidate.mx_source_id == "source-a":
                 raise RuntimeError("boom")
             return [("w", torch.zeros(1))]
 
     response = p2p_pb2.ListSourcesResponse(
         instances=[
-            _source_ref("source-a", "worker-a"),
-            _source_ref("source-b", "worker-b"),
+            _source_ref("source-a", "worker-a", model_version=7),
+            _source_ref("source-b", "worker-b", model_version=7),
         ]
     )
     transfer = _RetryTransfer(
@@ -279,10 +331,11 @@ def test_receive_tensors_retries_next_candidate_after_failure():
     )
 
     tensors = asyncio.run(
-        transfer.receive_tensors(model_version=5, receiver_rank=0)
+        transfer.receive_tensors(model_version=None, receiver_rank=0)
     )
 
     assert transfer.attempted_sources == ["source-a", "source-b"]
+    assert transfer.model_versions == [7, 7]
     assert tensors[0][0] == "w"
 
 

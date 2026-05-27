@@ -29,6 +29,8 @@ from modelexpress.types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.rl_transfer")
 
+_DEFAULT_RECEIVE_ROLES = (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER)
+
 _BACKEND_FRAMEWORKS = {
     "vllm": p2p_pb2.BACKEND_FRAMEWORK_VLLM,
     "sglang": p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
@@ -276,12 +278,12 @@ class RlNixlWeightTransfer:
     async def receive_tensors(
         self,
         *,
-        model_version: int,
+        model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Discover, allocate, and pull one model version from a source."""
+        """Discover, allocate, and pull a requested or latest model version."""
         candidates = await self.wait_for_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
@@ -291,7 +293,10 @@ class RlNixlWeightTransfer:
         errors = []
         for candidate in candidates:
             try:
-                return self._receive_from_candidate(candidate, model_version)
+                return self._receive_from_candidate(
+                    candidate,
+                    candidate.metadata.model_version,
+                )
             except Exception as exc:
                 errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
                 logger.warning(
@@ -303,7 +308,7 @@ class RlNixlWeightTransfer:
                 )
         raise RuntimeError(
             "No ModelExpress RL source transfer succeeded for "
-            f"model={self.base_identity.model_name!r} version={model_version}; "
+            f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
             f"errors={errors}"
         )
 
@@ -311,12 +316,12 @@ class RlNixlWeightTransfer:
         self,
         target_tensors: dict[str, torch.Tensor],
         *,
-        model_version: int,
+        model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
     ) -> list[tuple[str, torch.Tensor]]:
-        """Discover and pull one model version into caller-owned tensors."""
+        """Discover and pull a requested or latest version into caller tensors."""
         if not target_tensors:
             raise RuntimeError("ModelExpress RL transfer got no target tensors")
         candidates = await self.wait_for_sources(
@@ -330,7 +335,7 @@ class RlNixlWeightTransfer:
             try:
                 return self._receive_from_candidate(
                     candidate,
-                    model_version,
+                    candidate.metadata.model_version,
                     target_tensors=target_tensors,
                 )
             except Exception as exc:
@@ -344,7 +349,7 @@ class RlNixlWeightTransfer:
                 )
         raise RuntimeError(
             "No ModelExpress RL source transfer succeeded for "
-            f"model={self.base_identity.model_name!r} version={model_version}; "
+            f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
             f"errors={errors}"
         )
 
@@ -365,12 +370,14 @@ class RlNixlWeightTransfer:
                 f"ModelExpress source {candidate.mx_source_id} has no RL shape registry"
             )
 
-        device_id = self.resolve_device_id()
         if target_tensors is None:
+            device_id = self.resolve_device_id()
             target_tensors = allocate_tensors_from_shape_registry(
                 dict(candidate.metadata.shape_registry),
                 device=f"cuda:{device_id}",
             )
+        else:
+            device_id = self.resolve_device_id(target_tensors.values())
         self.shutdown_nixl_manager()
         manager = NixlTransferManager(
             agent_name=f"mx-rl-target-{uuid.uuid4().hex[:12]}",
@@ -402,9 +409,9 @@ class RlNixlWeightTransfer:
     async def wait_for_source(
         self,
         *,
-        model_version: int,
+        model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
     ) -> RlSourceCandidate:
         """Poll MX metadata until the best matching source is visible."""
@@ -420,12 +427,12 @@ class RlNixlWeightTransfer:
     async def wait_for_sources(
         self,
         *,
-        model_version: int,
+        model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
     ) -> list[RlSourceCandidate]:
-        """Poll MX metadata until a matching source is visible or timed out."""
+        """Poll MX metadata until matching requested/latest sources are visible."""
         deadline = time.monotonic() + self.timeout_seconds
         last_error: RuntimeError | None = None
         while True:
@@ -445,9 +452,9 @@ class RlNixlWeightTransfer:
     def select_source(
         self,
         *,
-        model_version: int,
+        model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
     ) -> RlSourceCandidate:
         """Select the best source for a receiver from MX metadata."""
@@ -461,12 +468,12 @@ class RlNixlWeightTransfer:
     def select_sources(
         self,
         *,
-        model_version: int,
+        model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
     ) -> list[RlSourceCandidate]:
-        """Select the best source for a receiver from MX metadata."""
+        """Select source candidates for a requested or latest model version."""
         response = self.mx_client.list_sources(
             identity=None,
             status_filter=p2p_pb2.SOURCE_STATUS_READY,
@@ -487,7 +494,7 @@ class RlNixlWeightTransfer:
         if not selected:
             raise RuntimeError(
                 f"No ModelExpress RL source found for model={self.base_identity.model_name!r} "
-                f"version={model_version}"
+                f"version={_version_label(model_version)}"
             )
         return selected
 
@@ -527,3 +534,7 @@ class RlNixlWeightTransfer:
             return
         self._nixl_manager.shutdown()
         self._nixl_manager = None
+
+
+def _version_label(model_version: int | None) -> str:
+    return "latest" if model_version is None else str(model_version)
