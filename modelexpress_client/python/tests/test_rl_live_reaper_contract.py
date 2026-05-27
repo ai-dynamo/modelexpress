@@ -15,6 +15,7 @@ from modelexpress.rl_transfer import build_rl_base_identity
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
 _LIVE_TRANSFER_LEASE_GC_ENV = "MX_LIVE_TRANSFER_LEASE_GC_EXPECTED"
 _LIVE_WORKER_REAPER_GC_ENV = "MX_LIVE_WORKER_REAPER_GC_EXPECTED"
+_LIVE_WORKER_REAPER_STALE_ENV = "MX_LIVE_WORKER_REAPER_STALE_EXPECTED"
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get(_LIVE_SERVER_ENV),
@@ -150,5 +151,69 @@ def test_live_server_reaper_garbage_collects_stale_workers():
             status_filter=p2p_pb2.SOURCE_STATUS_STALE,
         )
         assert all(ref.worker_id != worker_id for ref in stale.instances)
+    finally:
+        client.close()
+
+
+def test_live_server_reaper_marks_workers_stale_after_heartbeat_timeout():
+    if not os.environ.get(_LIVE_WORKER_REAPER_STALE_ENV):
+        pytest.skip(
+            f"{_LIVE_WORKER_REAPER_STALE_ENV} is not set; "
+            "requires a server started with a short MX_HEARTBEAT_TIMEOUT_SECS"
+        )
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-worker-stale-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    worker_id = f"ready-worker-{uuid.uuid4().hex[:8]}"
+    old_updated_at = int(time.time() * 1000) - 120_000
+
+    try:
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=0,
+            nixl_metadata=b"worker-stale-contract",
+            tensors=[],
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            updated_at=old_updated_at,
+        )
+        source_id = client.publish_metadata(base_identity, worker, worker_id)
+
+        fetched = client.get_metadata(source_id, worker_id)
+        assert fetched.found
+        assert fetched.worker.status == p2p_pb2.SOURCE_STATUS_READY
+        assert fetched.worker.updated_at == old_updated_at
+
+        ready = client.list_sources(
+            identity=base_identity,
+            status_filter=p2p_pb2.SOURCE_STATUS_READY,
+        )
+        assert any(ref.worker_id == worker_id for ref in ready.instances)
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            fetched = client.get_metadata(source_id, worker_id)
+            assert fetched.found
+            if fetched.worker.status == p2p_pb2.SOURCE_STATUS_STALE:
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "ready worker metadata was not marked stale "
+                    "within the live contract deadline"
+                )
+            time.sleep(0.1)
+
+        assert fetched.worker.updated_at > old_updated_at
+
+        stale = client.list_sources(
+            identity=base_identity,
+            status_filter=p2p_pb2.SOURCE_STATUS_STALE,
+        )
+        assert any(ref.worker_id == worker_id for ref in stale.instances)
+
+        ready = client.list_sources(
+            identity=base_identity,
+            status_filter=p2p_pb2.SOURCE_STATUS_READY,
+        )
+        assert all(ref.worker_id != worker_id for ref in ready.instances)
     finally:
         client.close()
