@@ -12,9 +12,11 @@ from modelexpress.rl_metadata import (
     build_rl_query_identities,
     candidates_from_response,
     complete_model_versions,
+    complete_source_groups,
     get_rl_source_metadata,
     latest_complete_model_version,
     latest_model_version,
+    retained_model_versions,
     select_rl_source_candidates,
     try_get_rl_source_metadata,
     with_rl_source_metadata,
@@ -46,6 +48,29 @@ def _ref(
         worker_id=worker_id,
         model_name="test-model",
         worker_rank=rank,
+    )
+
+
+def _candidate(
+    source_id: str,
+    *,
+    version: int,
+    role: RlSourceRole = RlSourceRole.TRAINER,
+    rank: int = 0,
+    world_size: int = 1,
+    retain_latest_k: int = 1,
+) -> RlSourceCandidate:
+    return RlSourceCandidate(
+        source_id,
+        f"{source_id}-worker-r{rank}",
+        "test-model",
+        rank,
+        RlSourceMetadata(
+            version,
+            role,
+            world_size=world_size,
+            retain_latest_k=retain_latest_k,
+        ),
     )
 
 
@@ -232,6 +257,16 @@ def test_select_candidates_uses_latest_version_and_prefers_replica_role():
     assert latest_model_version(candidates) == 8
 
 
+def test_retained_model_versions_uses_latest_version_window():
+    candidates = [
+        _candidate("trainer-v7", version=7, retain_latest_k=5),
+        _candidate("trainer-v8", version=8, retain_latest_k=5),
+        _candidate("trainer-v9", version=9, retain_latest_k=2),
+    ]
+
+    assert retained_model_versions(candidates) == {8, 9}
+
+
 def test_complete_model_versions_require_distinct_ranks_per_role():
     candidates = [
         RlSourceCandidate(
@@ -258,7 +293,33 @@ def test_complete_model_versions_require_distinct_ranks_per_role():
     ]
 
     assert complete_model_versions(candidates) == {7}
+    assert complete_source_groups(candidates) == {(7, RlSourceRole.TRAINER)}
     assert latest_complete_model_version(candidates) == 7
+
+
+def test_select_candidates_skips_incomplete_preferred_role_group():
+    candidates = [
+        _candidate("trainer-v8-r0", version=8, rank=0, world_size=2),
+        _candidate("trainer-v8-r1", version=8, rank=1, world_size=2),
+        _candidate(
+            "replica-v8-r0",
+            version=8,
+            role=RlSourceRole.INFERENCE_REPLICA,
+            rank=0,
+            world_size=2,
+        ),
+    ]
+
+    selected = select_rl_source_candidates(
+        candidates,
+        receiver_rank=0,
+        same_rank_only=False,
+    )
+
+    assert [candidate.mx_source_id for candidate in selected] == [
+        "trainer-v8-r0",
+        "trainer-v8-r1",
+    ]
 
 
 def test_select_candidates_falls_back_to_latest_complete_version():
@@ -298,22 +359,31 @@ def test_select_candidates_falls_back_to_latest_complete_version():
     ]
 
 
+def test_select_candidates_retention_ignores_incomplete_newer_version():
+    candidates = [
+        _candidate("trainer-v8", version=8),
+        _candidate("trainer-v9", version=9, retain_latest_k=2),
+        _candidate("trainer-v10", version=10, world_size=2),
+    ]
+
+    selected = select_rl_source_candidates(
+        candidates,
+        receiver_rank=0,
+        model_version=8,
+    )
+
+    assert [candidate.mx_source_id for candidate in selected] == ["trainer-v8"]
+
+
 def test_select_candidates_can_request_specific_version():
     candidates = [
-        RlSourceCandidate(
+        _candidate(
             "replica-v8",
-            "replica-r0",
-            "test-model",
-            0,
-            RlSourceMetadata(8, RlSourceRole.INFERENCE_REPLICA, world_size=1),
+            version=8,
+            role=RlSourceRole.INFERENCE_REPLICA,
+            retain_latest_k=2,
         ),
-        RlSourceCandidate(
-            "trainer-v7",
-            "trainer-r0",
-            "test-model",
-            0,
-            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=1),
-        ),
+        _candidate("trainer-v7", version=7),
     ]
 
     selected = select_rl_source_candidates(
@@ -323,6 +393,27 @@ def test_select_candidates_can_request_specific_version():
     )
 
     assert [candidate.mx_source_id for candidate in selected] == ["trainer-v7"]
+
+
+def test_select_candidates_rejects_exact_version_outside_retention_window():
+    candidates = [
+        _candidate("trainer-v7", version=7, retain_latest_k=3),
+        _candidate("trainer-v8", version=8, retain_latest_k=2),
+        _candidate("trainer-v9", version=9, retain_latest_k=2),
+    ]
+
+    assert (
+        select_rl_source_candidates(candidates, receiver_rank=0, model_version=7)
+        == []
+    )
+    assert [
+        candidate.mx_source_id
+        for candidate in select_rl_source_candidates(
+            candidates,
+            receiver_rank=0,
+            model_version=8,
+        )
+    ] == ["trainer-v8"]
 
 
 def test_select_candidates_enforces_same_rank_by_default():

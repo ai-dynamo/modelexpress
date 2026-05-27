@@ -225,13 +225,37 @@ def latest_model_version(candidates: Iterable[RlSourceCandidate]) -> int | None:
     return latest
 
 
-def complete_model_versions(candidates: Iterable[RlSourceCandidate]) -> set[int]:
-    """Return model versions whose role group has all advertised ranks READY.
+def retained_model_versions(candidates: Iterable[RlSourceCandidate]) -> set[int]:
+    """Return model versions inside the latest advertised retention window.
+
+    The latest visible version is the best source of the current retention
+    policy. If multiple source groups advertise that version, keep the widest
+    window so one role cannot accidentally hide another role's retained source.
+    """
+    candidate_list = list(candidates)
+    latest = latest_model_version(candidate_list)
+    if latest is None:
+        return set()
+
+    retain_latest_k = max(
+        candidate.metadata.retain_latest_k
+        for candidate in candidate_list
+        if candidate.metadata.model_version == latest
+    )
+    oldest_retained = max(0, latest - retain_latest_k + 1)
+    return {
+        candidate.metadata.model_version
+        for candidate in candidate_list
+        if oldest_retained <= candidate.metadata.model_version <= latest
+    }
+
+
+def complete_source_groups(
+    candidates: Iterable[RlSourceCandidate],
+) -> set[tuple[int, RlSourceRole]]:
+    """Return version/role groups with all advertised ranks READY.
 
     The caller should pass candidates already filtered to one base identity.
-    Completeness is role-specific: a version is complete when either its
-    trainer group or inference-replica group has at least ``world_size``
-    distinct worker ranks.
     """
     groups: dict[tuple[int, RlSourceRole], tuple[set[int], int]] = {}
     for candidate in candidates:
@@ -245,9 +269,17 @@ def complete_model_versions(candidates: Iterable[RlSourceCandidate]) -> set[int]
             groups[key] = (ranks, candidate.metadata.world_size)
 
     return {
-        version
-        for (version, _role), (ranks, required_world_size) in groups.items()
+        group
+        for group, (ranks, required_world_size) in groups.items()
         if len(ranks) >= required_world_size
+    }
+
+
+def complete_model_versions(candidates: Iterable[RlSourceCandidate]) -> set[int]:
+    """Return model versions where at least one role group is complete."""
+    return {
+        version
+        for version, _role in complete_source_groups(candidates)
     }
 
 
@@ -273,8 +305,9 @@ def select_rl_source_candidates(
 
     The default policy matches the first CE-parity milestone: prefer
     complete source groups, prefer same-rank sources, prefer inference
-    replicas over trainer sources, and use the latest visible model version
-    when a specific version is not requested.
+    replicas over trainer sources, honor the advertised retention window, and
+    use the latest visible model version when a specific version is not
+    requested.
     """
     role_priority = {role: index for index, role in enumerate(roles)}
     role_filtered = [
@@ -285,16 +318,25 @@ def select_rl_source_candidates(
     if not role_filtered:
         return []
 
-    complete_versions = (
-        complete_model_versions(role_filtered)
+    complete_groups = (
+        complete_source_groups(role_filtered)
         if require_complete_version
         else None
     )
     version_pool = [
         candidate
         for candidate in role_filtered
-        if complete_versions is None
-        or candidate.metadata.model_version in complete_versions
+        if complete_groups is None
+        or (candidate.metadata.model_version, candidate.metadata.role) in complete_groups
+    ]
+    if not version_pool:
+        return []
+
+    retained_versions = retained_model_versions(version_pool)
+    version_pool = [
+        candidate
+        for candidate in version_pool
+        if candidate.metadata.model_version in retained_versions
     ]
     if not version_pool:
         return []
@@ -309,9 +351,8 @@ def select_rl_source_candidates(
 
     filtered = [
         candidate
-        for candidate in role_filtered
+        for candidate in version_pool
         if candidate.metadata.model_version == target_version
-        and (complete_versions is None or target_version in complete_versions)
         and (not same_rank_only or candidate.worker_rank == receiver_rank)
     ]
 
