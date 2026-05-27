@@ -166,3 +166,72 @@ def test_live_server_transfers_latest_retained_cuda_version():
         receiver.finalize()
         publisher.finalize()
         client.close()
+
+
+def test_live_server_recovers_from_republished_inference_replica():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    pytest.importorskip("nixl._api")
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-replica-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    publisher = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    replica = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"replica-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    restarted_receiver = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"restart-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+
+    try:
+        source_tensor = torch.tensor([4.0, 5.0, 6.0], device="cuda:0")
+        publisher.publish_tensors({"w": source_tensor}, model_version=4)
+
+        replica_tensor = torch.zeros_like(source_tensor)
+        first_receive = asyncio.run(
+            replica.receive_and_publish_replica(
+                {"w": replica_tensor},
+                model_version=None,
+                receiver_rank=0,
+                replica_world_size=1,
+            )
+        )
+        torch.cuda.synchronize(0)
+        assert first_receive == [("w", replica_tensor)]
+        assert replica_tensor.detach().cpu().tolist() == [4.0, 5.0, 6.0]
+
+        publisher.finalize()
+
+        recovered = asyncio.run(
+            restarted_receiver.receive_tensors(model_version=None, receiver_rank=0)
+        )
+        torch.cuda.synchronize(0)
+
+        assert recovered[0][0] == "w"
+        assert recovered[0][1].detach().cpu().tolist() == [4.0, 5.0, 6.0]
+        assert restarted_receiver.last_receive_report is not None
+        assert restarted_receiver.last_receive_report.resolved_model_version == 4
+        assert (
+            restarted_receiver.last_receive_report.attempts[0].role
+            == RlSourceRole.INFERENCE_REPLICA
+        )
+    finally:
+        restarted_receiver.finalize()
+        replica.finalize()
+        publisher.finalize()
+        client.close()
