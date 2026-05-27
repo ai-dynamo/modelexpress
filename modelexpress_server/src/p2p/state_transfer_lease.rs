@@ -69,11 +69,18 @@ impl P2pStateManager {
         target_worker_id: Option<String>,
         status_filter: Option<TransferLeaseStatus>,
         model_version_filter: Option<u64>,
+        source_worker_id: Option<String>,
     ) -> MetadataResult<Vec<TransferLeaseRecord>> {
         let leases = self
             .get_backend()
             .await?
-            .list_transfer_leases(mx_source_id, target_worker_id, None, model_version_filter)
+            .list_transfer_leases(
+                mx_source_id,
+                target_worker_id,
+                None,
+                model_version_filter,
+                source_worker_id,
+            )
             .await?;
         let mut observed = Vec::with_capacity(leases.len());
         for lease in leases {
@@ -90,7 +97,7 @@ impl P2pStateManager {
         let leases = self
             .get_backend()
             .await?
-            .list_transfer_leases(None, None, Some(TransferLeaseStatus::Active), None)
+            .list_transfer_leases(None, None, Some(TransferLeaseStatus::Active), None, None)
             .await?;
         let mut expired_count = 0u32;
         for lease in leases {
@@ -109,7 +116,9 @@ impl P2pStateManager {
     ) -> MetadataResult<u32> {
         let now = chrono::Utc::now().timestamp_millis();
         let backend = self.get_backend().await?;
-        let leases = backend.list_transfer_leases(None, None, None, None).await?;
+        let leases = backend
+            .list_transfer_leases(None, None, None, None, None)
+            .await?;
         let mut removed_count = 0u32;
         for lease in leases {
             let age_millis = now.saturating_sub(lease.updated_at).max(0) as u64;
@@ -321,9 +330,10 @@ mod tests {
                 eq(Some("target-worker".to_string())),
                 eq(None),
                 eq(Some(9)),
+                eq(Some("source-worker".to_string())),
             )
             .once()
-            .returning(move |_, _, _, _| Ok(vec![active.clone(), completed.clone()]));
+            .returning(move |_, _, _, _, _| Ok(vec![active.clone(), completed.clone()]));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         let leases = manager
@@ -332,6 +342,7 @@ mod tests {
                 Some("target-worker".to_string()),
                 Some(TransferLeaseStatus::Completed),
                 Some(9),
+                Some("source-worker".to_string()),
             )
             .await
             .expect("list_transfer_leases failed");
@@ -355,9 +366,10 @@ mod tests {
                 eq(None),
                 eq(Some(TransferLeaseStatus::Active)),
                 eq(None),
+                eq(None),
             )
             .once()
-            .returning(move |_, _, _, _| Ok(vec![expired.clone(), active.clone()]));
+            .returning(move |_, _, _, _, _| Ok(vec![expired.clone(), active.clone()]));
         mock.expect_finish_transfer_lease()
             .withf(|lease_id, status, _updated_at, error_message| {
                 lease_id == "lease-expired"
@@ -389,9 +401,9 @@ mod tests {
         let active_old = active_lease_record("lease-active-old");
 
         mock.expect_list_transfer_leases()
-            .with(eq(None), eq(None), eq(None), eq(None))
+            .with(eq(None), eq(None), eq(None), eq(None), eq(None))
             .once()
-            .returning(move |_, _, _, _| {
+            .returning(move |_, _, _, _, _| {
                 Ok(vec![
                     completed_old.clone(),
                     failed_recent.clone(),

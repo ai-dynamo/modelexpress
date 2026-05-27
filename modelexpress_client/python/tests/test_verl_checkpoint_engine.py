@@ -359,6 +359,7 @@ def test_transfer_lease_summary_uses_receive_report_and_inventory():
         mx_source_id="source-a",
         statuses=(p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
         model_version=7,
+        source_worker_id="worker-a",
     )
 
     assert engine.last_receive_report is report
@@ -366,6 +367,7 @@ def test_transfer_lease_summary_uses_receive_report_and_inventory():
         "mx_source_id": "source-a",
         "statuses": (p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
         "model_version": 7,
+        "source_worker_id": "worker-a",
     }
     assert summary.report is report
     assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
@@ -412,6 +414,7 @@ def test_transfer_lease_summary_defaults_to_report_model_version():
         "mx_source_id": "",
         "statuses": None,
         "model_version": 7,
+        "source_worker_id": "",
     }
 
 
@@ -446,6 +449,7 @@ def test_transfer_lease_summary_can_skip_report_model_version_scope():
         "mx_source_id": "",
         "statuses": None,
         "model_version": None,
+        "source_worker_id": "",
     }
 
 

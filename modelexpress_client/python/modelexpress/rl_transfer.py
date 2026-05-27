@@ -143,11 +143,13 @@ class RlNixlWeightTransfer:
         mx_source_id: str = "",
         statuses: Iterable[int] | None = None,
         model_version: int | None = None,
+        source_worker_id: str = "",
     ) -> RlTransferLeaseInventory:
         return self._lease_coordinator.list_target_leases(
             mx_source_id=mx_source_id,
             statuses=statuses,
             model_version=model_version,
+            source_worker_id=source_worker_id,
         )
 
     def publish_tensors(

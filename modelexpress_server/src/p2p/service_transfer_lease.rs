@@ -184,6 +184,11 @@ pub(super) async fn list_transfer_leases(
     } else {
         Some(req.target_worker_id)
     };
+    let source_worker_id = if req.source_worker_id.is_empty() {
+        None
+    } else {
+        Some(req.source_worker_id)
+    };
     let model_version_filter = req.model_version_filter;
 
     match state
@@ -192,6 +197,7 @@ pub(super) async fn list_transfer_leases(
             target_worker_id,
             status_filter,
             model_version_filter,
+            source_worker_id,
         )
         .await
     {

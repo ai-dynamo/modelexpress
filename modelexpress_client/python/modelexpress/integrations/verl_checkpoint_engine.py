@@ -385,6 +385,7 @@ class _ModelExpressCheckpointEngineMixin:
         mx_source_id: str = "",
         statuses: Iterable[int] | None = None,
         model_version: int | None = None,
+        source_worker_id: str = "",
         scope_to_report_model_version: bool = True,
     ) -> RlTransferLeaseReportSummary:
         """Join the last receive report to server leases for the relevant version."""
@@ -395,6 +396,7 @@ class _ModelExpressCheckpointEngineMixin:
             mx_source_id=mx_source_id,
             statuses=statuses,
             model_version=model_version,
+            source_worker_id=source_worker_id,
         )
         return summarize_report_leases(report, inventory)
 

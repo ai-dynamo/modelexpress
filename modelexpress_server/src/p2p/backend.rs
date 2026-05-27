@@ -280,6 +280,7 @@ pub trait MetadataBackend: Send + Sync {
         target_worker_id: Option<String>,
         status_filter: Option<modelexpress_common::grpc::p2p::TransferLeaseStatus>,
         model_version_filter: Option<u64>,
+        source_worker_id: Option<String>,
     ) -> MetadataResult<Vec<TransferLeaseRecord>>;
 
     /// Renew an active transfer lease with a fresh expiry.

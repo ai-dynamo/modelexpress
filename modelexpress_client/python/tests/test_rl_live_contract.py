@@ -61,6 +61,7 @@ def test_live_server_transfer_lease_contract():
     client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
     lease_id = f"lease-{uuid.uuid4().hex}"
     other_lease_id = f"lease-{uuid.uuid4().hex}"
+    other_source_lease_id = f"lease-{uuid.uuid4().hex}"
     mx_source_id = f"live-lease-source-{uuid.uuid4().hex[:8]}"
     target_worker_id = f"target-worker-{uuid.uuid4().hex[:8]}"
 
@@ -113,6 +114,24 @@ def test_live_server_transfer_lease_contract():
             status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
         )
 
+        other_source_lease = _begin_transfer_lease_or_skip(
+            client,
+            lease_id=other_source_lease_id,
+            mx_source_id=mx_source_id,
+            source_worker_id="source-worker-other",
+            target_worker_id=target_worker_id,
+            target_worker_rank=1,
+            model_version=17,
+            ttl_millis=5_000,
+            metadata={"contract": "live-other-source"},
+        )
+        assert other_source_lease.source_worker_id == "source-worker-other"
+        assert other_source_lease.model_version == 17
+        client.complete_transfer_lease(
+            other_source_lease_id,
+            status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+        )
+
         fetched = client.get_transfer_lease(lease_id)
         assert fetched.found
         assert fetched.lease.lease_id == lease_id
@@ -126,6 +145,7 @@ def test_live_server_transfer_lease_contract():
         assert [lease.lease_id for lease in listed.leases] == [
             lease_id,
             other_lease_id,
+            other_source_lease_id,
         ]
         listed_v17 = client.list_transfer_leases(
             mx_source_id=mx_source_id,
@@ -133,7 +153,18 @@ def test_live_server_transfer_lease_contract():
             status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
             model_version_filter=17,
         )
-        assert [lease.lease_id for lease in listed_v17.leases] == [lease_id]
+        assert [lease.lease_id for lease in listed_v17.leases] == [
+            lease_id,
+            other_source_lease_id,
+        ]
+        listed_source_worker = client.list_transfer_leases(
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
+            status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+            model_version_filter=17,
+            source_worker_id="source-worker",
+        )
+        assert [lease.lease_id for lease in listed_source_worker.leases] == [lease_id]
 
         inventory = RlTransferLeaseCoordinator(
             mx_client=client,
@@ -143,6 +174,7 @@ def test_live_server_transfer_lease_contract():
             mx_source_id=mx_source_id,
             statuses=(p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
             model_version=17,
+            source_worker_id="source-worker",
         )
         assert inventory.discovery_supported
         assert [lease.lease_id for lease in inventory.leases] == [lease_id]

@@ -234,6 +234,7 @@ class RlTransferLeaseCoordinator:
         mx_source_id: str = "",
         statuses: Iterable[int] | None = None,
         model_version: int | None = None,
+        source_worker_id: str = "",
     ) -> RlTransferLeaseInventory:
         """List persisted transfer attempts for this target worker.
 
@@ -254,6 +255,7 @@ class RlTransferLeaseCoordinator:
                 target_worker_id=self._target_worker_id,
                 statuses=statuses,
                 model_version=model_version,
+                source_worker_id=source_worker_id,
             )
         except (NotImplementedError, grpc.RpcError) as exc:
             if isinstance(exc, NotImplementedError) or _is_unimplemented_rpc(exc):
@@ -373,12 +375,14 @@ def _list_leases_by_status(
     target_worker_id: str,
     statuses: Iterable[int] | None,
     model_version: int | None,
+    source_worker_id: str,
 ) -> tuple["p2p_pb2.TransferLease", ...]:
     if statuses is None:
         response = list_leases(
             mx_source_id=mx_source_id,
             target_worker_id=target_worker_id,
             model_version_filter=model_version,
+            source_worker_id=source_worker_id,
         )
         return tuple(response.leases)
 
@@ -389,6 +393,7 @@ def _list_leases_by_status(
             target_worker_id=target_worker_id,
             status_filter=int(status),
             model_version_filter=model_version,
+            source_worker_id=source_worker_id,
         )
         for lease in response.leases:
             leases_by_id.setdefault(lease.lease_id, lease)

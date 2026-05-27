@@ -145,26 +145,32 @@ mod tests {
 
     fn expect_no_active_transfer_leases(mock: &mut MockMetadataBackend) {
         mock.expect_list_transfer_leases()
-            .withf(|source_id, worker_id, status, model_version| {
-                source_id.is_none()
-                    && worker_id.is_none()
-                    && *status == Some(TransferLeaseStatus::Active)
-                    && model_version.is_none()
-            })
+            .withf(
+                |source_id, worker_id, status, model_version, source_worker_id| {
+                    source_id.is_none()
+                        && worker_id.is_none()
+                        && *status == Some(TransferLeaseStatus::Active)
+                        && model_version.is_none()
+                        && source_worker_id.is_none()
+                },
+            )
             .once()
-            .returning(|_, _, _, _| Ok(vec![]));
+            .returning(|_, _, _, _, _| Ok(vec![]));
     }
 
     fn expect_no_terminal_transfer_leases(mock: &mut MockMetadataBackend) {
         mock.expect_list_transfer_leases()
-            .withf(|source_id, worker_id, status, model_version| {
-                source_id.is_none()
-                    && worker_id.is_none()
-                    && status.is_none()
-                    && model_version.is_none()
-            })
+            .withf(
+                |source_id, worker_id, status, model_version, source_worker_id| {
+                    source_id.is_none()
+                        && worker_id.is_none()
+                        && status.is_none()
+                        && model_version.is_none()
+                        && source_worker_id.is_none()
+                },
+            )
             .once()
-            .returning(|_, _, _, _| Ok(vec![]));
+            .returning(|_, _, _, _, _| Ok(vec![]));
     }
 
     fn active_lease_record(lease_id: &str, expires_at: i64) -> TransferLeaseRecord {
@@ -283,14 +289,17 @@ mod tests {
             .once()
             .returning(|_, _| Ok(vec![]));
         mock.expect_list_transfer_leases()
-            .withf(|source_id, worker_id, status, model_version| {
-                source_id.is_none()
-                    && worker_id.is_none()
-                    && *status == Some(TransferLeaseStatus::Active)
-                    && model_version.is_none()
-            })
+            .withf(
+                |source_id, worker_id, status, model_version, source_worker_id| {
+                    source_id.is_none()
+                        && worker_id.is_none()
+                        && *status == Some(TransferLeaseStatus::Active)
+                        && model_version.is_none()
+                        && source_worker_id.is_none()
+                },
+            )
             .once()
-            .returning(move |_, _, _, _| Ok(vec![expired.clone()]));
+            .returning(move |_, _, _, _, _| Ok(vec![expired.clone()]));
         mock.expect_finish_transfer_lease()
             .withf(|lease_id, status, _updated_at, error_message| {
                 lease_id == "lease-expired"
@@ -320,14 +329,17 @@ mod tests {
             .returning(|_, _| Ok(vec![]));
         expect_no_active_transfer_leases(&mut mock);
         mock.expect_list_transfer_leases()
-            .withf(|source_id, worker_id, status, model_version| {
-                source_id.is_none()
-                    && worker_id.is_none()
-                    && status.is_none()
-                    && model_version.is_none()
-            })
+            .withf(
+                |source_id, worker_id, status, model_version, source_worker_id| {
+                    source_id.is_none()
+                        && worker_id.is_none()
+                        && status.is_none()
+                        && model_version.is_none()
+                        && source_worker_id.is_none()
+                },
+            )
             .once()
-            .returning(move |_, _, _, _| Ok(vec![completed.clone()]));
+            .returning(move |_, _, _, _, _| Ok(vec![completed.clone()]));
         mock.expect_remove_transfer_lease()
             .withf(|lease_id| lease_id == "lease-complete")
             .once()

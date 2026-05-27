@@ -404,6 +404,7 @@ message ListTransferLeasesRequest {
   string target_worker_id = 2;
   optional TransferLeaseStatus status_filter = 3;
   optional uint64 model_version_filter = 4;
+  string source_worker_id = 5;
 }
 
 message TransferLeaseResponse {

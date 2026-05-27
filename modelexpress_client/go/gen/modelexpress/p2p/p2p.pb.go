@@ -1728,6 +1728,7 @@ type ListTransferLeasesRequest struct {
 	TargetWorkerId     string               `protobuf:"bytes,2,opt,name=target_worker_id,json=targetWorkerId,proto3" json:"target_worker_id,omitempty"`
 	StatusFilter       *TransferLeaseStatus `protobuf:"varint,3,opt,name=status_filter,json=statusFilter,proto3,enum=model_express.p2p.TransferLeaseStatus,oneof" json:"status_filter,omitempty"`
 	ModelVersionFilter *uint64              `protobuf:"varint,4,opt,name=model_version_filter,json=modelVersionFilter,proto3,oneof" json:"model_version_filter,omitempty"`
+	SourceWorkerId     string               `protobuf:"bytes,5,opt,name=source_worker_id,json=sourceWorkerId,proto3" json:"source_worker_id,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -1788,6 +1789,13 @@ func (x *ListTransferLeasesRequest) GetModelVersionFilter() uint64 {
 		return *x.ModelVersionFilter
 	}
 	return 0
+}
+
+func (x *ListTransferLeasesRequest) GetSourceWorkerId() string {
+	if x != nil {
+		return x.SourceWorkerId
+	}
+	return ""
 }
 
 type TransferLeaseResponse struct {
@@ -2094,13 +2102,14 @@ const file_p2p_proto_rawDesc = "" +
 	"\x06status\x18\x02 \x01(\x0e2&.model_express.p2p.TransferLeaseStatusR\x06status\x12#\n" +
 	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\"4\n" +
 	"\x17GetTransferLeaseRequest\x12\x19\n" +
-	"\blease_id\x18\x01 \x01(\tR\aleaseId\"\x9b\x02\n" +
+	"\blease_id\x18\x01 \x01(\tR\aleaseId\"\xc5\x02\n" +
 	"\x19ListTransferLeasesRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12(\n" +
 	"\x10target_worker_id\x18\x02 \x01(\tR\x0etargetWorkerId\x12P\n" +
 	"\rstatus_filter\x18\x03 \x01(\x0e2&.model_express.p2p.TransferLeaseStatusH\x00R\fstatusFilter\x88\x01\x01\x125\n" +
-	"\x14model_version_filter\x18\x04 \x01(\x04H\x01R\x12modelVersionFilter\x88\x01\x01B\x10\n" +
+	"\x14model_version_filter\x18\x04 \x01(\x04H\x01R\x12modelVersionFilter\x88\x01\x01\x12(\n" +
+	"\x10source_worker_id\x18\x05 \x01(\tR\x0esourceWorkerIdB\x10\n" +
 	"\x0e_status_filterB\x17\n" +
 	"\x15_model_version_filter\"\x83\x01\n" +
 	"\x15TransferLeaseResponse\x12\x18\n" +

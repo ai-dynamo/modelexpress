@@ -813,6 +813,7 @@ impl MetadataBackend for KubernetesBackend {
         target_worker_id: Option<String>,
         status_filter: Option<TransferLeaseStatus>,
         model_version_filter: Option<u64>,
+        source_worker_id: Option<String>,
     ) -> MetadataResult<Vec<TransferLeaseRecord>> {
         let api = self.configmap_api();
         let list_params =
@@ -840,6 +841,12 @@ impl MetadataBackend for KubernetesBackend {
                 continue;
             }
             if model_version_filter.is_some_and(|version| lease.model_version != version) {
+                continue;
+            }
+            if source_worker_id
+                .as_ref()
+                .is_some_and(|worker_id| lease.source_worker_id != *worker_id)
+            {
                 continue;
             }
             leases.push(lease);

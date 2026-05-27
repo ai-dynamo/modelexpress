@@ -116,6 +116,7 @@ def test_renew_complete_get_and_list_transfer_lease():
         target_worker_id="target-worker",
         status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
         model_version_filter=17,
+        source_worker_id="source-worker",
     )
 
     assert renewed.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
@@ -125,6 +126,7 @@ def test_renew_complete_get_and_list_transfer_lease():
     assert listed.leases[0].mx_source_id == "source"
     assert listed.leases[0].target_worker_id == "target-worker"
     assert stub.requests[-1][1].model_version_filter == 17
+    assert stub.requests[-1][1].source_worker_id == "source-worker"
     assert [method for method, _request, _timeout in stub.requests] == [
         "renew",
         "complete",
