@@ -263,6 +263,90 @@ def test_plan_exact_transfers_requires_matching_expert_metadata():
     assert "expert ownership differs" in plan.missing[0].reason
 
 
+def test_plan_dense_reshard_transfers_filters_moe_expert_axis():
+    plan = plan_dense_reshard_transfers(
+        [
+            _source(
+                "experts.w",
+                rank=0,
+                shape=(4, 2),
+                global_shape=(4, 2),
+                shard_offsets=(0, 0),
+                expert_ids=(0, 1, 2, 3),
+                expert_axis=0,
+            )
+        ],
+        [
+            _target(
+                "experts.w",
+                rank=0,
+                shape=(2, 2),
+                global_shape=(4, 2),
+                shard_offsets=(0, 0),
+                expert_ids=(1, 3),
+                expert_axis=0,
+            )
+        ],
+    )
+
+    assert plan.complete
+    assert [entry.source_slice for entry in plan.entries] == [
+        TensorSlice((1, 0), (1, 2)),
+        TensorSlice((3, 0), (1, 2)),
+    ]
+    assert [entry.target_slice for entry in plan.entries] == [
+        TensorSlice((0, 0), (1, 2)),
+        TensorSlice((1, 0), (1, 2)),
+    ]
+
+
+def test_plan_dense_reshard_transfers_filters_moe_experts_across_sources():
+    plan = plan_dense_reshard_transfers(
+        [
+            _source(
+                "experts.w",
+                rank=0,
+                shape=(2, 2),
+                global_shape=(4, 2),
+                shard_offsets=(0, 0),
+                expert_ids=(0, 1),
+                expert_axis=0,
+            ),
+            _source(
+                "experts.w",
+                rank=1,
+                shape=(2, 2),
+                global_shape=(4, 2),
+                shard_offsets=(2, 0),
+                expert_ids=(2, 3),
+                expert_axis=0,
+            ),
+        ],
+        [
+            _target(
+                "experts.w",
+                rank=0,
+                shape=(2, 2),
+                global_shape=(4, 2),
+                shard_offsets=(0, 0),
+                expert_ids=(1, 3),
+                expert_axis=0,
+            )
+        ],
+    )
+
+    assert plan.complete
+    assert [entry.source_worker_rank for entry in plan.entries] == [0, 1]
+    assert [entry.source_slice for entry in plan.entries] == [
+        TensorSlice((1, 0), (1, 2)),
+        TensorSlice((1, 0), (1, 2)),
+    ]
+    assert [entry.target_slice for entry in plan.entries] == [
+        TensorSlice((0, 0), (1, 2)),
+        TensorSlice((1, 0), (1, 2)),
+    ]
+
+
 def test_reshard_planner_types_are_exported_from_package():
     assert modelexpress.TensorShardSpec is TensorShardSpec
     assert modelexpress.TensorReceiveSpec is TensorReceiveSpec
@@ -285,6 +369,7 @@ def test_source_specs_from_shape_registry_preserves_layout_metadata():
                 "global_shape": [4, 4],
                 "shard_offsets": [2, 0],
                 "expert_ids": [3, 7],
+                "expert_axis": 0,
             }
         },
         worker_rank=5,
@@ -301,8 +386,26 @@ def test_source_specs_from_shape_registry_preserves_layout_metadata():
             tensor_parallel_rank=1,
             pipeline_parallel_rank=2,
             expert_ids=frozenset({3, 7}),
+            expert_order=(3, 7),
+            expert_axis=0,
         ),
     )
+
+
+def test_shape_registry_spec_conversion_requires_explicit_expert_axis():
+    specs = source_specs_from_shape_registry(
+        {
+            "w": {
+                "shape": [2, 4],
+                "dtype": "torch.float32",
+                "expert_ids": [3, 7],
+            }
+        },
+        worker_rank=0,
+    )
+
+    assert specs[0].expert_order == (3, 7)
+    assert specs[0].expert_axis is None
 
 
 def test_receive_specs_from_shape_registry_sets_receiver_rank():
@@ -341,5 +444,31 @@ def test_shape_registry_spec_conversion_rejects_invalid_expert_metadata():
     with pytest.raises(ValueError, match="expert_ids must be a list"):
         source_specs_from_shape_registry(
             {"w": {"shape": [1], "dtype": "torch.float32", "expert_ids": "bad"}},
+            worker_rank=0,
+        )
+
+    with pytest.raises(ValueError, match="expert_axis dimension"):
+        source_specs_from_shape_registry(
+            {
+                "w": {
+                    "shape": [1, 4],
+                    "dtype": "torch.float32",
+                    "expert_ids": [0, 1],
+                    "expert_axis": 0,
+                }
+            },
+            worker_rank=0,
+        )
+
+    with pytest.raises(ValueError, match="duplicate expert IDs"):
+        source_specs_from_shape_registry(
+            {
+                "w": {
+                    "shape": [2, 4],
+                    "dtype": "torch.float32",
+                    "expert_ids": [0, 0],
+                    "expert_axis": 0,
+                }
+            },
             worker_rank=0,
         )

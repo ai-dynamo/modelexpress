@@ -180,6 +180,41 @@ def test_slice_transfer_manifest_fragments_noncontiguous_source_slice():
     assert all(tensor.is_contiguous() for tensor in manifest.target_tensors.values())
 
 
+def test_slice_transfer_manifest_allows_same_source_moe_expert_slices():
+    source = _source_spec(
+        name="experts.w",
+        shape=(4, 2),
+        global_shape=(4, 2),
+        shard_offsets=(0, 0),
+        expert_ids=(0, 1, 2, 3),
+        expert_axis=0,
+    )
+    target = _target_spec(
+        name="experts.w",
+        shape=(2, 2),
+        global_shape=(4, 2),
+        shard_offsets=(0, 0),
+        expert_ids=(1, 3),
+        expert_axis=0,
+    )
+    plan = plan_dense_reshard_transfers([source], [target])
+
+    manifest = build_slice_transfer_manifest(
+        plan,
+        source_descriptors=[TensorDescriptor("experts.w", 100, 32, 0, "torch.float32")],
+        target_tensors={"experts.w": torch.zeros((2, 2), dtype=torch.float32)},
+    )
+
+    assert list(manifest.target_tensors) == [
+        "experts.w.__mx_slice_0",
+        "experts.w.__mx_slice_1",
+    ]
+    assert manifest.source_descriptors == [
+        TensorDescriptor("experts.w.__mx_slice_0", 108, 8, 0, "torch.float32"),
+        TensorDescriptor("experts.w.__mx_slice_1", 124, 8, 0, "torch.float32"),
+    ]
+
+
 def test_slice_transfer_manifest_stages_noncontiguous_target_view():
     source = _source_spec(shape=(4, 2), global_shape=(4, 4), shard_offsets=(0, 1))
     target = _target_spec(shape=(4, 2), global_shape=(4, 4), shard_offsets=(0, 1))

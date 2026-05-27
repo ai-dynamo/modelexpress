@@ -75,15 +75,12 @@ def build_slice_transfer_manifest(
     post_transfer_copies: list[StagedTensorCopy] = []
     output_names = []
     entry_counts = _entry_counts(plan)
-    duplicated_names = sorted(
-        tensor_name
-        for tensor_name, count in entry_counts.items()
-        if count > 1
-    )
-    if duplicated_names:
+    multi_source_names = _multi_source_tensor_names(plan)
+    if multi_source_names:
         raise RuntimeError(
             "ModelExpress dense slice transfer currently materializes one source "
-            f"descriptor per tensor; multi-source tensors are not supported: {duplicated_names}"
+            f"descriptor group per tensor; multi-source tensors are not supported: "
+            f"{multi_source_names}"
         )
 
     entry_offsets: dict[str, int] = {}
@@ -206,6 +203,19 @@ def _entry_counts(plan: TransferPlan) -> dict[str, int]:
     for entry in plan.entries:
         entry_counts[entry.tensor_name] = entry_counts.get(entry.tensor_name, 0) + 1
     return entry_counts
+
+
+def _multi_source_tensor_names(plan: TransferPlan) -> list[str]:
+    source_ranks_by_name: dict[str, set[int]] = {}
+    for entry in plan.entries:
+        source_ranks_by_name.setdefault(entry.tensor_name, set()).add(
+            entry.source_worker_rank
+        )
+    return sorted(
+        tensor_name
+        for tensor_name, source_ranks in source_ranks_by_name.items()
+        if len(source_ranks) > 1
+    )
 
 
 def _transfer_name(tensor_name: str, index: int, entry_count: int) -> str:
