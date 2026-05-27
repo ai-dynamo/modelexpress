@@ -20,7 +20,6 @@
 # Azure-specific differences vs GCP manifest:
 #   - No GKE multi-network annotations
 #   - rdma/ib resource limit exposes InfiniBand RDMA device (A100 SXM4 nodes)
-#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand (no GID index needed)
 #   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (workaround for ucx#11259)
 #   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools (amd64)
 #
@@ -120,8 +119,6 @@ spec:
               value: "0.20"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH

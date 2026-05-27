@@ -178,7 +178,6 @@ docker-compose up --build
 | `MX_METADATA_BACKEND` | (required) | `redis` \| `kubernetes` |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (`redis` backend only) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server (P2P) |
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | InfiniBand transports |
 
 ```bash
 cargo run --bin config_gen -- --output model-express.yaml

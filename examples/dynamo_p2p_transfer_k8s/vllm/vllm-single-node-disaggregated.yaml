@@ -106,8 +106,6 @@ spec:
           value: "INFO"
         - name: UCX_LOG_LEVEL
           value: "INFO"
-        - name: UCX_TLS
-          value: "rc_x,rc,dc_x,dc,cuda_copy"
         # Optional: pin UCX to specific compute-fabric HCAs if your cluster
         # exposes multiple IB fabrics. Device list is cluster-specific.
         # - name: UCX_NET_DEVICES
@@ -180,9 +178,7 @@ spec:
           value: "INFO"
         - name: UCX_LOG_LEVEL
           value: "INFO"
-        - name: UCX_TLS
-          value: "rc_x,rc,dc_x,dc,cuda_copy"
-        # Optional UCX_NET_DEVICES — see decode block.
+        # Optional UCX_NET_DEVICES - see decode block.
         - name: UCX_RNDV_SCHEME
           value: "get_zcopy"
         - name: UCX_RNDV_THRESH

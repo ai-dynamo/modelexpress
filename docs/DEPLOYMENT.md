@@ -487,7 +487,6 @@ Credentials are auto-detected by the underlying cloud SDKs. No credentials flow 
 
 | Variable | Recommended | Description |
 |----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand |
 | `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
 | `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
 | `NIXL_LOG_LEVEL` | `INFO` | NIXL logging (DEBUG for troubleshooting) |

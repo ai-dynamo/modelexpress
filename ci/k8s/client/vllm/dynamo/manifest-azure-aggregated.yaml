@@ -160,8 +160,6 @@ spec:
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN
           value: "auto"
-        - name: UCX_TLS
-          value: "rc_x,rc,dc_x,dc,cuda_copy"
         - name: UCX_RNDV_SCHEME
           value: "get_zcopy"
         - name: UCX_RNDV_THRESH
