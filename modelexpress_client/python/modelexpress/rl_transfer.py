@@ -298,35 +298,13 @@ class RlNixlWeightTransfer:
         same_rank_only: bool = False,
     ) -> list[tuple[str, torch.Tensor]]:
         """Discover, allocate, and pull a requested or latest model version."""
-        candidates = await self.wait_for_sources(
+        _version, tensors = await self._receive_from_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
         )
-        errors = []
-        for candidate in candidates:
-            try:
-                return self._receive_from_candidate(
-                    candidate,
-                    candidate.metadata.model_version,
-                    receiver_rank=receiver_rank,
-                    same_rank_only=same_rank_only,
-                )
-            except Exception as exc:
-                errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
-                logger.warning(
-                    "ModelExpress RL source transfer failed; trying next candidate: "
-                    "source_id=%s worker_id=%s",
-                    candidate.mx_source_id,
-                    candidate.worker_id,
-                    exc_info=True,
-                )
-        raise RuntimeError(
-            "No ModelExpress RL source transfer succeeded for "
-            f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
-            f"errors={errors}"
-        )
+        return tensors
 
     async def receive_into_tensors(
         self,
@@ -341,6 +319,57 @@ class RlNixlWeightTransfer:
         """Discover and pull a requested or latest version into caller tensors."""
         if not target_tensors:
             raise RuntimeError("ModelExpress RL transfer got no target tensors")
+        _version, tensors = await self._receive_from_sources(
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+            target_tensors=target_tensors,
+            target_specs=target_specs,
+        )
+        return tensors
+
+    async def receive_and_publish_replica(
+        self,
+        target_tensors: dict[str, torch.Tensor],
+        *,
+        model_version: int | None,
+        receiver_rank: int,
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        same_rank_only: bool = False,
+        target_specs: Sequence[TensorReceiveSpec] | None = None,
+        replica_world_size: int = 1,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Receive into caller tensors, then publish them as an inference replica."""
+        if not target_tensors:
+            raise RuntimeError("ModelExpress RL transfer got no target tensors")
+        received_version, tensors = await self._receive_from_sources(
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+            target_tensors=target_tensors,
+            target_specs=target_specs,
+        )
+        self.publish_tensors(
+            dict(tensors),
+            model_version=received_version,
+            role=RlSourceRole.INFERENCE_REPLICA,
+            worker_rank=receiver_rank,
+            source_world_size=replica_world_size,
+        )
+        return tensors
+
+    async def _receive_from_sources(
+        self,
+        *,
+        model_version: int | None,
+        receiver_rank: int,
+        roles: Sequence[RlSourceRole],
+        same_rank_only: bool,
+        target_tensors: dict[str, torch.Tensor] | None = None,
+        target_specs: Sequence[TensorReceiveSpec] | None = None,
+    ) -> tuple[int, list[tuple[str, torch.Tensor]]]:
         candidates = await self.wait_for_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
@@ -350,7 +379,7 @@ class RlNixlWeightTransfer:
         errors = []
         for candidate in candidates:
             try:
-                return self._receive_from_candidate(
+                tensors = self._receive_from_candidate(
                     candidate,
                     candidate.metadata.model_version,
                     receiver_rank=receiver_rank,
@@ -358,11 +387,12 @@ class RlNixlWeightTransfer:
                     target_tensors=target_tensors,
                     target_specs=target_specs,
                 )
+                return candidate.metadata.model_version, tensors
             except Exception as exc:
                 errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
                 logger.warning(
-                    "ModelExpress RL source transfer into caller tensors failed; "
-                    "trying next candidate: source_id=%s worker_id=%s",
+                    "ModelExpress RL source transfer failed; trying next candidate: "
+                    "source_id=%s worker_id=%s",
                     candidate.mx_source_id,
                     candidate.worker_id,
                     exc_info=True,

@@ -683,6 +683,68 @@ def test_receive_into_tensors_passes_caller_owned_targets():
     assert tensors[0][1] is target_tensors["w"]
 
 
+def test_receive_and_publish_replica_uses_received_version_and_receiver_rank():
+    class _ReplicaTransfer(RlNixlWeightTransfer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.publish_calls = []
+
+        def _receive_from_candidate(self, candidate, model_version, **kwargs):
+            del candidate
+            del model_version
+            return list(kwargs["target_tensors"].items())
+
+        def publish_tensors(
+            self,
+            tensors,
+            *,
+            model_version,
+            role=RlSourceRole.TRAINER,
+            worker_rank=0,
+            source_world_size=1,
+        ):
+            self.publish_calls.append(
+                {
+                    "tensors": tensors,
+                    "model_version": model_version,
+                    "role": role,
+                    "worker_rank": worker_rank,
+                    "source_world_size": source_world_size,
+                }
+            )
+            return "replica-source"
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[_source_ref("source-v9", "worker-v9", model_version=9)]
+    )
+    transfer = _ReplicaTransfer(
+        mx_client=_FakeMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+    target_tensors = {"w": torch.zeros(1)}
+
+    tensors = asyncio.run(
+        transfer.receive_and_publish_replica(
+            target_tensors,
+            model_version=None,
+            receiver_rank=3,
+            replica_world_size=4,
+        )
+    )
+
+    assert tensors == list(target_tensors.items())
+    assert transfer.publish_calls == [
+        {
+            "tensors": target_tensors,
+            "model_version": 9,
+            "role": RlSourceRole.INFERENCE_REPLICA,
+            "worker_rank": 3,
+            "source_world_size": 4,
+        }
+    ]
+
+
 def test_receive_into_tensors_rejects_empty_target_set():
     with pytest.raises(RuntimeError, match="no target tensors"):
         asyncio.run(
