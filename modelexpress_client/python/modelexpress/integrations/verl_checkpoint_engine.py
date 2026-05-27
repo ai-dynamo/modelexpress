@@ -253,7 +253,7 @@ class _ModelExpressCheckpointEngineMixin:
                 pass
             return
 
-        model_version = self._resolve_model_version(global_steps)
+        model_version = self._resolve_send_model_version(global_steps)
         tensors = await self._materialize_source_tensors(weights)
         self._transfer.publish_tensors(
             tensors,
@@ -272,7 +272,7 @@ class _ModelExpressCheckpointEngineMixin:
         if self._is_trainer:
             raise RuntimeError("trainer rank cannot receive ModelExpress weights")
 
-        model_version = self._resolve_model_version(global_steps)
+        model_version = self._resolve_receive_model_version(global_steps)
         receiver_rank = self._resolved_receiver_rank()
         if self.republish_received:
             tensors = await self._transfer.receive_tensors_and_publish_replica(
@@ -306,11 +306,17 @@ class _ModelExpressCheckpointEngineMixin:
             return self.world_size
         return max(self.world_size - self._source_world_size, 1)
 
-    def _resolve_model_version(self, global_steps: int | None) -> int:
+    def _resolve_send_model_version(self, global_steps: int | None) -> int:
         self._local_model_version = _model_version_from_global_steps(
             global_steps,
             self._local_model_version,
         )
+        return self._local_model_version
+
+    def _resolve_receive_model_version(self, global_steps: int | None) -> int | None:
+        if global_steps is None:
+            return None
+        self._local_model_version = int(global_steps)
         return self._local_model_version
 
     async def _materialize_source_tensors(

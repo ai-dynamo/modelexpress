@@ -152,7 +152,7 @@ def test_init_rejects_unknown_topology():
         )
 
 
-def test_receive_weights_can_republish_received_replica():
+def test_receive_weights_without_global_steps_requests_latest_and_republishes():
     class _FakeTransfer:
         def __init__(self):
             self.republish_kwargs = None
@@ -184,7 +184,7 @@ def test_receive_weights_can_republish_received_replica():
 
     assert weights[0][0] == "w"
     assert fake_transfer.republish_kwargs == {
-        "model_version": 0,
+        "model_version": None,
         "receiver_rank": 1,
         "same_rank_only": False,
         "replica_world_size": 3,
