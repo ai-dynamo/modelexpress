@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::cache::CacheConfig;
-use crate::config::{ConnectionConfig, LogFormat, LogLevel, load_layered_config};
+use crate::config::{
+    ConnectionConfig, LogFormat, LogLevel, load_layered_config, normalize_grpc_endpoint,
+};
 use anyhow::Result;
 use clap::Parser;
 use config::ConfigError;
@@ -128,7 +130,7 @@ impl ClientConfig {
 
         // Connection settings
         if let Some(endpoint) = args.endpoint {
-            config.connection.endpoint = endpoint;
+            config.connection.endpoint = normalize_grpc_endpoint(endpoint);
         }
 
         if let Some(timeout) = args.timeout {
@@ -170,6 +172,11 @@ impl ClientConfig {
         }
 
         // ==================== END CLI ARGUMENT OVERRIDES ====================
+
+        config.connection.endpoint =
+            normalize_grpc_endpoint(std::mem::take(&mut config.connection.endpoint));
+        config.cache.server_endpoint =
+            normalize_grpc_endpoint(std::mem::take(&mut config.cache.server_endpoint));
 
         // Validate configuration
         config.validate()?;
@@ -243,6 +250,7 @@ impl ClientConfig {
 
     /// Set the server endpoint for both connection and cache
     pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        let endpoint = normalize_grpc_endpoint(endpoint);
         self.connection.endpoint = endpoint.clone();
         self.cache.server_endpoint = endpoint;
         self
@@ -273,6 +281,17 @@ mod tests {
     fn test_client_config_with_endpoint() {
         let config =
             ClientConfig::default().with_endpoint("http://custom.example.com:5678".to_string());
+
+        assert_eq!(config.connection.endpoint, "http://custom.example.com:5678");
+        assert_eq!(
+            config.cache.server_endpoint,
+            "http://custom.example.com:5678"
+        );
+    }
+
+    #[test]
+    fn test_client_config_with_endpoint_accepts_bare_host_port() {
+        let config = ClientConfig::default().with_endpoint("custom.example.com:5678".to_string());
 
         assert_eq!(config.connection.endpoint, "http://custom.example.com:5678");
         assert_eq!(
@@ -379,7 +398,7 @@ mod tests {
         // Test that ClientConfig::load() properly applies CLI arguments
         let args = ClientArgs {
             config: None,
-            endpoint: Some("http://cli-override:7777".to_string()),
+            endpoint: Some("cli-override:7777".to_string()),
             timeout: Some(120),
             cache_path: None,
             log_level: None,
