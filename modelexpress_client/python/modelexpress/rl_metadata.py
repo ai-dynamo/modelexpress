@@ -225,6 +225,38 @@ def latest_model_version(candidates: Iterable[RlSourceCandidate]) -> int | None:
     return latest
 
 
+def complete_model_versions(candidates: Iterable[RlSourceCandidate]) -> set[int]:
+    """Return model versions whose role group has all advertised ranks READY.
+
+    The caller should pass candidates already filtered to one base identity.
+    Completeness is role-specific: a version is complete when either its
+    trainer group or inference-replica group has at least ``world_size``
+    distinct worker ranks.
+    """
+    groups: dict[tuple[int, RlSourceRole], tuple[set[int], int]] = {}
+    for candidate in candidates:
+        key = (candidate.metadata.model_version, candidate.metadata.role)
+        ranks, required_world_size = groups.setdefault(
+            key,
+            (set(), candidate.metadata.world_size),
+        )
+        ranks.add(candidate.worker_rank)
+        if candidate.metadata.world_size > required_world_size:
+            groups[key] = (ranks, candidate.metadata.world_size)
+
+    return {
+        version
+        for (version, _role), (ranks, required_world_size) in groups.items()
+        if len(ranks) >= required_world_size
+    }
+
+
+def latest_complete_model_version(candidates: Iterable[RlSourceCandidate]) -> int | None:
+    """Return the latest complete model version among candidates."""
+    versions = complete_model_versions(candidates)
+    return max(versions) if versions else None
+
+
 def select_rl_source_candidates(
     candidates: Iterable[RlSourceCandidate],
     *,
@@ -235,36 +267,52 @@ def select_rl_source_candidates(
         RlSourceRole.TRAINER,
     ),
     same_rank_only: bool = True,
+    require_complete_version: bool = True,
 ) -> list[RlSourceCandidate]:
     """Filter and order RL source candidates for a receiver rank.
 
     The default policy matches the first CE-parity milestone: prefer
-    same-rank sources, prefer inference replicas over trainer sources,
-    and use the latest visible model version when a specific version is
-    not requested.
+    complete source groups, prefer same-rank sources, prefer inference
+    replicas over trainer sources, and use the latest visible model version
+    when a specific version is not requested.
     """
     role_priority = {role: index for index, role in enumerate(roles)}
-    filtered = [
+    role_filtered = [
         candidate
         for candidate in candidates
         if candidate.metadata.role in role_priority
-        and (not same_rank_only or candidate.worker_rank == receiver_rank)
     ]
-    if not filtered:
+    if not role_filtered:
+        return []
+
+    complete_versions = (
+        complete_model_versions(role_filtered)
+        if require_complete_version
+        else None
+    )
+    version_pool = [
+        candidate
+        for candidate in role_filtered
+        if complete_versions is None
+        or candidate.metadata.model_version in complete_versions
+    ]
+    if not version_pool:
         return []
 
     target_version = (
         model_version
         if model_version is not None
-        else latest_model_version(filtered)
+        else latest_model_version(version_pool)
     )
     if target_version is None:
         return []
 
     filtered = [
         candidate
-        for candidate in filtered
+        for candidate in role_filtered
         if candidate.metadata.model_version == target_version
+        and (complete_versions is None or target_version in complete_versions)
+        and (not same_rank_only or candidate.worker_rank == receiver_rank)
     ]
 
     return sorted(

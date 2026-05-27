@@ -11,7 +11,9 @@ from modelexpress.rl_metadata import (
     RlSourceRole,
     build_rl_query_identities,
     candidates_from_response,
+    complete_model_versions,
     get_rl_source_metadata,
+    latest_complete_model_version,
     latest_model_version,
     select_rl_source_candidates,
     try_get_rl_source_metadata,
@@ -203,21 +205,21 @@ def test_select_candidates_uses_latest_version_and_prefers_replica_role():
             "trainer-r0",
             "test-model",
             0,
-            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=2),
+            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=1),
         ),
         RlSourceCandidate(
             "replica-v8",
             "replica-r0",
             "test-model",
             0,
-            RlSourceMetadata(8, RlSourceRole.INFERENCE_REPLICA, world_size=2),
+            RlSourceMetadata(8, RlSourceRole.INFERENCE_REPLICA, world_size=1),
         ),
         RlSourceCandidate(
             "trainer-v8",
             "trainer-r0",
             "test-model",
             0,
-            RlSourceMetadata(8, RlSourceRole.TRAINER, world_size=2),
+            RlSourceMetadata(8, RlSourceRole.TRAINER, world_size=1),
         ),
     ]
 
@@ -228,6 +230,72 @@ def test_select_candidates_uses_latest_version_and_prefers_replica_role():
         "trainer-v8",
     ]
     assert latest_model_version(candidates) == 8
+
+
+def test_complete_model_versions_require_distinct_ranks_per_role():
+    candidates = [
+        RlSourceCandidate(
+            "trainer-v7",
+            "trainer-r0",
+            "test-model",
+            0,
+            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=2),
+        ),
+        RlSourceCandidate(
+            "trainer-v7",
+            "trainer-r1",
+            "test-model",
+            1,
+            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=2),
+        ),
+        RlSourceCandidate(
+            "replica-v8",
+            "replica-r0",
+            "test-model",
+            0,
+            RlSourceMetadata(8, RlSourceRole.INFERENCE_REPLICA, world_size=2),
+        ),
+    ]
+
+    assert complete_model_versions(candidates) == {7}
+    assert latest_complete_model_version(candidates) == 7
+
+
+def test_select_candidates_falls_back_to_latest_complete_version():
+    candidates = [
+        RlSourceCandidate(
+            "trainer-v7",
+            "trainer-r0",
+            "test-model",
+            0,
+            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=2),
+        ),
+        RlSourceCandidate(
+            "trainer-v7",
+            "trainer-r1",
+            "test-model",
+            1,
+            RlSourceMetadata(7, RlSourceRole.TRAINER, world_size=2),
+        ),
+        RlSourceCandidate(
+            "trainer-v8",
+            "trainer-r0",
+            "test-model",
+            0,
+            RlSourceMetadata(8, RlSourceRole.TRAINER, world_size=2),
+        ),
+    ]
+
+    selected = select_rl_source_candidates(
+        candidates,
+        receiver_rank=1,
+        same_rank_only=False,
+    )
+
+    assert [candidate.worker_id for candidate in selected] == [
+        "trainer-r1",
+        "trainer-r0",
+    ]
 
 
 def test_select_candidates_can_request_specific_version():

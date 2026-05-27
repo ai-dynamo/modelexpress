@@ -71,6 +71,7 @@ def _source_ref(
     model_version: int = 5,
     role: RlSourceRole = RlSourceRole.TRAINER,
     worker_rank: int = 0,
+    source_world_size: int = 1,
     shape_registry=None,
 ):
     if shape_registry is None:
@@ -80,7 +81,7 @@ def _source_ref(
         RlSourceMetadata(
             model_version=model_version,
             role=role,
-            world_size=1,
+            world_size=source_world_size,
             shape_registry=shape_registry,
         ),
     )
@@ -201,6 +202,42 @@ def test_select_source_uses_latest_visible_version_when_unspecified():
 
     assert candidate.mx_source_id == "source-v8"
     assert candidate.metadata.model_version == 8
+
+
+def test_select_source_uses_latest_complete_version_when_unspecified():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "source-v7",
+                "worker-v7-r0",
+                model_version=7,
+                worker_rank=0,
+                source_world_size=2,
+            ),
+            _source_ref(
+                "source-v7",
+                "worker-v7-r1",
+                model_version=7,
+                worker_rank=1,
+                source_world_size=2,
+            ),
+            _source_ref(
+                "source-v8",
+                "worker-v8-r0",
+                model_version=8,
+                worker_rank=0,
+                source_world_size=2,
+            ),
+        ]
+    )
+
+    candidate = _transfer(_FakeMxClient(response)).select_source(
+        model_version=None,
+        receiver_rank=1,
+    )
+
+    assert candidate.mx_source_id == "source-v7"
+    assert candidate.metadata.model_version == 7
 
 
 def test_select_source_prefers_inference_replica_for_same_latest_version():
