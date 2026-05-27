@@ -19,6 +19,14 @@ class VerlRuntimeSmokeResult:
     update_seconds: float
     check_seconds: float
     total_seconds: float
+    failed: bool = False
+    error_message: str = ""
+    report_lease_ids: tuple[str, ...] = ()
+    matching_lease_statuses: tuple[int, ...] = ()
+    missing_lease_ids: tuple[str, ...] = ()
+    non_completed_lease_statuses: tuple[int, ...] = ()
+    transfer_lease_discovery_supported: bool = False
+    replica_events: tuple[str, ...] = ()
 
 
 def run_verl_checkpoint_manager_update(
@@ -29,6 +37,8 @@ def run_verl_checkpoint_manager_update(
     mx_python_path: Path,
     server_url: str | None = None,
     global_steps: int = 17,
+    fail_refit_after_tensors: int | None = None,
+    expect_update_failure: bool = False,
 ) -> VerlRuntimeSmokeResult:
     torch = pytest.importorskip("torch")
     ray = pytest.importorskip("ray")
@@ -159,9 +169,16 @@ def run_verl_checkpoint_manager_update(
             raise NotImplementedError
 
         async def update_weights(self, weights, **kwargs):
+            received_count = 0
             async for name, weight in weights:
+                received_count += 1
                 if self.check_allclose:
                     self.received_weights[name] = weight.clone()
+                if (
+                    fail_refit_after_tensors is not None
+                    and received_count >= fail_refit_after_tensors
+                ):
+                    raise RuntimeError("synthetic veRL refit failure after MX receive")
 
         def check_weights(self):
             if not self.check_allclose:
@@ -182,10 +199,26 @@ def run_verl_checkpoint_manager_update(
             self.received_weights.clear()
 
     class MockReplica(RolloutReplica):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.events: list[str] = []
+
         async def init_hybrid(self, worker_group: RayWorkerGroup):
             start = self.world_size * self.replica_rank
             stop = self.world_size * (self.replica_rank + 1)
             self.workers = worker_group.workers[start:stop]
+
+        async def abort_all_requests(self):
+            self.events.append("abort_all_requests")
+
+        async def release_kv_cache(self):
+            self.events.append("release_kv_cache")
+
+        async def resume_kv_cache(self):
+            self.events.append("resume_kv_cache")
+
+        async def resume_generation(self):
+            self.events.append("resume_generation")
 
         def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
             raise NotImplementedError
@@ -212,6 +245,22 @@ def run_verl_checkpoint_manager_update(
         @register(dispatch_mode=Dispatch.ONE_TO_ALL)
         def check_weights(self):
             self.server_adapter.check_weights()
+
+        @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+        def transfer_lease_snapshot(self):
+            summary = self.checkpoint_engine.transfer_lease_summary()
+            return {
+                "report_lease_ids": tuple(summary.report_lease_ids),
+                "matching_lease_statuses": tuple(
+                    int(lease.status) for lease in summary.matching_leases
+                ),
+                "missing_lease_ids": tuple(summary.missing_lease_ids),
+                "non_completed_lease_statuses": tuple(
+                    int(lease.status)
+                    for lease in summary.non_completed_matching_leases
+                ),
+                "discovery_supported": summary.inventory.discovery_supported,
+            }
 
     async def create_rollout_worker_group(
         resource_pool: RayResourcePool,
@@ -296,18 +345,49 @@ def run_verl_checkpoint_manager_update(
 
         total_started = time.perf_counter()
         update_started = time.perf_counter()
-        await manager.update_weights(global_steps=global_steps)
+        failed = False
+        error_message = ""
+        try:
+            await manager.update_weights(global_steps=global_steps)
+        except Exception as exc:
+            failed = True
+            error_message = str(exc)
+            if not expect_update_failure:
+                raise
+        else:
+            if expect_update_failure:
+                raise AssertionError("expected veRL checkpoint update to fail")
         update_seconds = time.perf_counter() - update_started
 
-        check_started = time.perf_counter()
-        rollout.check_weights()
-        check_seconds = time.perf_counter() - check_started
+        if failed:
+            check_seconds = 0.0
+        else:
+            check_started = time.perf_counter()
+            rollout.check_weights()
+            check_seconds = time.perf_counter() - check_started
+        lease_snapshot = _lease_snapshot(rollout) if backend == "modelexpress" else {}
         return VerlRuntimeSmokeResult(
             backend=backend,
             model_name=model_name,
             update_seconds=update_seconds,
             check_seconds=check_seconds,
             total_seconds=time.perf_counter() - total_started,
+            failed=failed,
+            error_message=error_message,
+            report_lease_ids=tuple(lease_snapshot.get("report_lease_ids", ())),
+            matching_lease_statuses=tuple(
+                lease_snapshot.get("matching_lease_statuses", ())
+            ),
+            missing_lease_ids=tuple(lease_snapshot.get("missing_lease_ids", ())),
+            non_completed_lease_statuses=tuple(
+                lease_snapshot.get("non_completed_lease_statuses", ())
+            ),
+            transfer_lease_discovery_supported=bool(
+                lease_snapshot.get("discovery_supported", False)
+            ),
+            replica_events=tuple(
+                event for replica in replicas for event in replica.events
+            ),
         )
 
     try:
@@ -357,6 +437,13 @@ def _checkpoint_engine_config(
         update_weights_bucket_megabytes=16,
         engine_kwargs={"nccl": {"rebuild_group": False}},
     )
+
+
+def _lease_snapshot(rollout):
+    snapshots = rollout.transfer_lease_snapshot()
+    if isinstance(snapshots, list):
+        return snapshots[0] if snapshots else {}
+    return snapshots
 
 
 def _create_tiny_qwen2_checkpoint(path: Path) -> Path:

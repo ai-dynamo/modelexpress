@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from modelexpress import p2p_pb2
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
 _VERL_REPO_ENV = "MX_VERL_REPO_PATH"
@@ -60,6 +61,36 @@ def test_live_verl_checkpoint_manager_compares_nccl_and_modelexpress(tmp_path):
         "veRL tiny-Qwen2 update timings: "
         f"nccl={nccl_result.update_seconds:.6f}s, "
         f"modelexpress={mx_result.update_seconds:.6f}s"
+    )
+
+
+def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
+    """Surface MX transfer lease state after a veRL-side refit failure."""
+    run_verl_checkpoint_manager_update = _load_harness().run_verl_checkpoint_manager_update
+    result = run_verl_checkpoint_manager_update(
+        backend="modelexpress",
+        tmp_path=tmp_path,
+        verl_repo=Path(os.environ[_VERL_REPO_ENV]).resolve(),
+        mx_python_path=Path(__file__).resolve().parents[1],
+        server_url=os.environ[_LIVE_SERVER_ENV],
+        fail_refit_after_tensors=1,
+        expect_update_failure=True,
+    )
+
+    assert result.failed
+    assert "synthetic veRL refit failure" in result.error_message
+    assert result.report_lease_ids
+    assert result.transfer_lease_discovery_supported
+    assert result.matching_lease_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
+    assert result.missing_lease_ids == ()
+    assert result.non_completed_lease_statuses == ()
+    assert result.replica_events == (
+        "abort_all_requests",
+        "release_kv_cache",
+        "resume_kv_cache",
+        "resume_generation",
     )
 
 
