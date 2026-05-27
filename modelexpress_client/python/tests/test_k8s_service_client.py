@@ -131,6 +131,7 @@ def test_list_sources_returns_single_synthetic_ref_at_caller_rank():
     assert inst.worker_rank == 2
     assert inst.mx_source_id == compute_mx_source_id(identity)
     assert inst.model_name == identity.model_name
+    assert inst.identity == identity
 
 
 def test_list_sources_requires_identity():

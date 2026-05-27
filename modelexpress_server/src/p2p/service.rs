@@ -159,6 +159,7 @@ impl P2pService for P2pServiceImpl {
                 worker_id: info.worker_id,
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
+                identity: info.identity,
             })
             .collect();
 
@@ -603,6 +604,7 @@ mod tests {
                     source_id: "abc123def456abcd".to_string(),
                     worker_id: "w1".to_string(),
                     model_name: "my-model".to_string(),
+                    identity: Some(test_identity()),
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
@@ -611,6 +613,7 @@ mod tests {
                     source_id: "abc123def456abcd".to_string(),
                     worker_id: "w2".to_string(),
                     model_name: "my-model".to_string(),
+                    identity: Some(test_identity()),
                     worker_rank: 1,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
@@ -630,6 +633,13 @@ mod tests {
         assert_eq!(resp.instances.len(), 2);
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(
+            resp.instances[0]
+                .identity
+                .as_ref()
+                .map(|id| id.model_name.as_str()),
+            Some("my-model")
+        );
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
     }

@@ -194,10 +194,26 @@ def build_rl_query_identities(
 
 def candidates_from_response(
     response: "p2p_pb2.ListSourcesResponse",
-    metadata: RlSourceMetadata,
+    metadata: RlSourceMetadata | None = None,
 ) -> list[RlSourceCandidate]:
-    """Annotate ListSources refs with the metadata used for that query."""
-    return [RlSourceCandidate.from_ref(ref, metadata) for ref in response.instances]
+    """Annotate ListSources refs with RL metadata.
+
+    Older servers do not include SourceIdentity in SourceInstanceRef, so
+    callers can pass the metadata used for an exact identity query. Newer
+    servers include ref.identity, allowing callers to list broadly and
+    discover version/role metadata from the response itself.
+    """
+    candidates = []
+    for ref in response.instances:
+        candidate_metadata = metadata
+        if candidate_metadata is None:
+            if not ref.HasField("identity"):
+                continue
+            candidate_metadata = try_get_rl_source_metadata(ref.identity)
+            if candidate_metadata is None:
+                continue
+        candidates.append(RlSourceCandidate.from_ref(ref, candidate_metadata))
+    return candidates
 
 
 def latest_model_version(candidates: Iterable[RlSourceCandidate]) -> int | None:

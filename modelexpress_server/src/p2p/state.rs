@@ -490,6 +490,7 @@ mod tests {
                     source_id: "abc123def456abcd".to_string(),
                     worker_id: "w1".to_string(),
                     model_name: "my-model".to_string(),
+                    identity: None,
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,

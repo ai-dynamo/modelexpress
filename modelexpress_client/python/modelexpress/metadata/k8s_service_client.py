@@ -163,6 +163,7 @@ class MxK8sServiceClient(MxClientBase):
             worker_id="",
             model_name=identity.model_name,
             worker_rank=self._worker_rank,
+            identity=identity,
         )
         return p2p_pb2.ListSourcesResponse(instances=[ref])
 

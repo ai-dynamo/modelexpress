@@ -6,7 +6,9 @@
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
 use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
-use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use crate::p2p::k8s_types::{
+    ModelMetadata, ModelMetadataSpec, SourceIdentityJson, TensorDescriptorJson, WorkerStatus,
+};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -219,6 +221,7 @@ impl MetadataBackend for KubernetesBackend {
                 },
                 spec: ModelMetadataSpec {
                     model_name: model_name.to_string(),
+                    source_identity: Some(SourceIdentityJson::from(identity)),
                 },
                 status: None,
             };
@@ -236,6 +239,19 @@ impl MetadataBackend for KubernetesBackend {
                 Err(e) => return Err(e.into()),
             }
         }
+
+        let spec_patch = json!({
+            "spec": {
+                "modelName": model_name,
+                "sourceIdentity": SourceIdentityJson::from(identity),
+            }
+        });
+        api.patch(
+            &cr_name,
+            &PatchParams::default(),
+            &Patch::Merge(&spec_patch),
+        )
+        .await?;
 
         // Get CR UID for ownerReferences on ConfigMaps
         let cr = api.get(&cr_name).await?;
@@ -522,7 +538,11 @@ impl MetadataBackend for KubernetesBackend {
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
-                model_name: cr.spec.model_name,
+                model_name: cr.spec.model_name.clone(),
+                identity: cr
+                    .spec
+                    .source_identity
+                    .map(|identity| identity.to_source_identity()),
                 worker_rank,
                 status,
                 updated_at,

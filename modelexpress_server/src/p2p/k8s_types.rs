@@ -7,8 +7,10 @@
 //! alternative to Redis for storing P2P metadata.
 
 use kube::CustomResource;
+use modelexpress_common::grpc::p2p::SourceIdentity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// ModelMetadata spec - the desired state
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -25,6 +27,73 @@ pub struct ModelMetadataSpec {
     /// Full model name (e.g., deepseek-ai/DeepSeek-V3)
     #[serde(rename = "modelName")]
     pub model_name: String,
+
+    /// Full source identity used to compute the mx_source_id.
+    #[serde(rename = "sourceIdentity", default)]
+    pub source_identity: Option<SourceIdentityJson>,
+}
+
+/// JSON-serializable SourceIdentity stored in the CRD spec.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct SourceIdentityJson {
+    #[serde(rename = "mxVersion", default)]
+    pub mx_version: String,
+    #[serde(rename = "mxSourceType", default)]
+    pub mx_source_type: i32,
+    #[serde(rename = "modelName", default)]
+    pub model_name: String,
+    #[serde(rename = "backendFramework", default)]
+    pub backend_framework: i32,
+    #[serde(rename = "tensorParallelSize", default)]
+    pub tensor_parallel_size: u32,
+    #[serde(rename = "pipelineParallelSize", default)]
+    pub pipeline_parallel_size: u32,
+    #[serde(rename = "expertParallelSize", default)]
+    pub expert_parallel_size: u32,
+    #[serde(default)]
+    pub dtype: String,
+    #[serde(default)]
+    pub quantization: String,
+    #[serde(rename = "extraParameters", default)]
+    pub extra_parameters: BTreeMap<String, String>,
+    #[serde(default)]
+    pub revision: String,
+}
+
+impl From<&SourceIdentity> for SourceIdentityJson {
+    fn from(identity: &SourceIdentity) -> Self {
+        Self {
+            mx_version: identity.mx_version.clone(),
+            mx_source_type: identity.mx_source_type,
+            model_name: identity.model_name.clone(),
+            backend_framework: identity.backend_framework,
+            tensor_parallel_size: identity.tensor_parallel_size,
+            pipeline_parallel_size: identity.pipeline_parallel_size,
+            expert_parallel_size: identity.expert_parallel_size,
+            dtype: identity.dtype.clone(),
+            quantization: identity.quantization.clone(),
+            extra_parameters: identity.extra_parameters.clone().into_iter().collect(),
+            revision: identity.revision.clone(),
+        }
+    }
+}
+
+impl SourceIdentityJson {
+    pub fn to_source_identity(&self) -> SourceIdentity {
+        SourceIdentity {
+            mx_version: self.mx_version.clone(),
+            mx_source_type: self.mx_source_type,
+            model_name: self.model_name.clone(),
+            backend_framework: self.backend_framework,
+            tensor_parallel_size: self.tensor_parallel_size,
+            pipeline_parallel_size: self.pipeline_parallel_size,
+            expert_parallel_size: self.expert_parallel_size,
+            dtype: self.dtype.clone(),
+            quantization: self.quantization.clone(),
+            extra_parameters: self.extra_parameters.clone().into_iter().collect(),
+            revision: self.revision.clone(),
+        }
+    }
 }
 
 /// ModelMetadata status - the observed state
@@ -326,6 +395,32 @@ mod tests {
 
         let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
         assert_eq!(addr, u64::MAX);
+    }
+
+    #[test]
+    fn test_source_identity_json_roundtrip_preserves_extra_parameters() {
+        let mut identity = SourceIdentity {
+            mx_version: "0.3.0".to_string(),
+            mx_source_type: 0,
+            model_name: "deepseek-ai/DeepSeek-V3".to_string(),
+            backend_framework: 1,
+            tensor_parallel_size: 8,
+            pipeline_parallel_size: 1,
+            expert_parallel_size: 0,
+            dtype: "bfloat16".to_string(),
+            quantization: String::new(),
+            extra_parameters: Default::default(),
+            revision: "abc123".to_string(),
+        };
+        identity
+            .extra_parameters
+            .insert("mx_rl_model_version".to_string(), "9".to_string());
+
+        let json_identity = SourceIdentityJson::from(&identity);
+        let payload = serde_json::to_string(&json_identity).expect("serialize");
+        let parsed: SourceIdentityJson = serde_json::from_str(&payload).expect("deserialize");
+
+        assert_eq!(parsed.to_source_identity(), identity);
     }
 
     #[test]

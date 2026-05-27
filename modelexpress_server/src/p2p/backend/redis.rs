@@ -21,6 +21,7 @@ use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -54,6 +55,10 @@ struct SourceAttributesJson {
     pub dtype: String,
     #[serde(default)]
     pub quantization: String,
+    #[serde(default)]
+    pub extra_parameters: HashMap<String, String>,
+    #[serde(default)]
+    pub revision: String,
 }
 
 impl From<&SourceIdentity> for SourceAttributesJson {
@@ -68,6 +73,26 @@ impl From<&SourceIdentity> for SourceAttributesJson {
             expert_parallel_size: id.expert_parallel_size,
             dtype: id.dtype.clone(),
             quantization: id.quantization.clone(),
+            extra_parameters: id.extra_parameters.clone(),
+            revision: id.revision.clone(),
+        }
+    }
+}
+
+impl SourceAttributesJson {
+    fn to_source_identity(&self) -> SourceIdentity {
+        SourceIdentity {
+            mx_version: self.mx_version.clone(),
+            mx_source_type: self.mx_source_type,
+            model_name: self.model_name.clone(),
+            backend_framework: self.backend_framework,
+            tensor_parallel_size: self.tensor_parallel_size,
+            pipeline_parallel_size: self.pipeline_parallel_size,
+            expert_parallel_size: self.expert_parallel_size,
+            dtype: self.dtype.clone(),
+            quantization: self.quantization.clone(),
+            extra_parameters: self.extra_parameters.clone(),
+            revision: self.revision.clone(),
         }
     }
 }
@@ -438,11 +463,14 @@ impl MetadataBackend for RedisBackend {
             let instance_map: std::collections::HashMap<String, String> =
                 conn.hgetall(&source_key).await?;
 
-            let model_name = instance_map
+            let attributes = instance_map
                 .get(keys::ATTRIBUTES_FIELD)
-                .and_then(|v| serde_json::from_str::<SourceAttributesJson>(v).ok())
-                .map(|a| a.model_name)
+                .and_then(|v| serde_json::from_str::<SourceAttributesJson>(v).ok());
+            let model_name = attributes
+                .as_ref()
+                .map(|attrs| attrs.model_name.clone())
                 .unwrap_or_default();
+            let identity = attributes.map(|attrs| attrs.to_source_identity());
 
             for (iid, rank_str) in instance_map
                 .iter()
@@ -477,6 +505,7 @@ impl MetadataBackend for RedisBackend {
                     source_id: sid.clone(),
                     worker_id: iid.to_string(),
                     model_name: model_name.clone(),
+                    identity: identity.clone(),
                     worker_rank,
                     status,
                     updated_at,
@@ -681,6 +710,8 @@ mod tests {
     // ── SourceAttributesJson ────────────────────────────────────────────────
 
     fn test_identity() -> modelexpress_common::grpc::p2p::SourceIdentity {
+        let mut extra_parameters = std::collections::HashMap::new();
+        extra_parameters.insert("mx_rl_model_version".to_string(), "7".to_string());
         modelexpress_common::grpc::p2p::SourceIdentity {
             mx_version: "0.3.0".to_string(),
             mx_source_type: 0,
@@ -691,8 +722,8 @@ mod tests {
             expert_parallel_size: 4,
             dtype: "bfloat16".to_string(),
             quantization: "fp8".to_string(),
-            extra_parameters: Default::default(),
-            revision: String::new(),
+            extra_parameters,
+            revision: "abc123".to_string(),
         }
     }
 
@@ -709,6 +740,14 @@ mod tests {
         assert_eq!(attr.dtype, "bfloat16");
         assert_eq!(attr.quantization, "fp8");
         assert_eq!(attr.backend_framework, 1);
+        assert_eq!(
+            attr.extra_parameters
+                .get("mx_rl_model_version")
+                .map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(attr.revision, "abc123");
+        assert_eq!(attr.to_source_identity(), id);
     }
 
     #[test]
@@ -724,6 +763,8 @@ mod tests {
         assert_eq!(back.expert_parallel_size, attr.expert_parallel_size);
         assert_eq!(back.dtype, attr.dtype);
         assert_eq!(back.quantization, attr.quantization);
+        assert_eq!(back.extra_parameters, attr.extra_parameters);
+        assert_eq!(back.revision, attr.revision);
     }
 
     #[test]
@@ -738,5 +779,7 @@ mod tests {
         assert_eq!(attr.expert_parallel_size, 0);
         assert_eq!(attr.dtype, "");
         assert_eq!(attr.quantization, "");
+        assert!(attr.extra_parameters.is_empty());
+        assert_eq!(attr.revision, "");
     }
 }

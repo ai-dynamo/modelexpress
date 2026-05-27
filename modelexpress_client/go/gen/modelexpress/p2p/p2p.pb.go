@@ -826,7 +826,11 @@ type SourceInstanceRef struct {
 	ModelName string `protobuf:"bytes,3,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// Global rank of this worker within the instance.
 	// Clients filter on this field to find a peer with a matching rank.
-	WorkerRank    uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	WorkerRank uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// Full source identity for this source group. This keeps ListSources
+	// lightweight relative to GetMetadata while letting clients inspect
+	// version/role/revision extra parameters without fetching tensor metadata.
+	Identity      *SourceIdentity `protobuf:"bytes,5,opt,name=identity,proto3" json:"identity,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -887,6 +891,13 @@ func (x *SourceInstanceRef) GetWorkerRank() uint32 {
 		return x.WorkerRank
 	}
 	return 0
+}
+
+func (x *SourceInstanceRef) GetIdentity() *SourceIdentity {
+	if x != nil {
+		return x.Identity
+	}
+	return nil
 }
 
 type ListSourcesRequest struct {
@@ -1303,7 +1314,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\x92\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xd1\x01\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -1311,7 +1322,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
-	"workerRank\"\xb0\x01\n" +
+	"workerRank\x12=\n" +
+	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xb0\x01\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
@@ -1404,26 +1416,27 @@ var file_p2p_proto_depIdxs = []int32{
 	4,  // 5: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
 	3,  // 6: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
 	5,  // 7: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 8: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	2,  // 9: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
-	10, // 10: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
-	5,  // 11: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	2,  // 12: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	8,  // 13: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	11, // 14: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	13, // 15: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	15, // 16: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	6,  // 17: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	9,  // 18: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	12, // 19: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	14, // 20: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	16, // 21: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	7,  // 22: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	18, // [18:23] is the sub-list for method output_type
-	13, // [13:18] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	3,  // 8: model_express.p2p.SourceInstanceRef.identity:type_name -> model_express.p2p.SourceIdentity
+	3,  // 9: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 10: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
+	10, // 11: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
+	5,  // 12: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
+	2,  // 13: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
+	8,  // 14: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	11, // 15: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	13, // 16: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	15, // 17: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	6,  // 18: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	9,  // 19: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	12, // 20: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	14, // 21: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	16, // 22: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	7,  // 23: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	19, // [19:24] is the sub-list for method output_type
+	14, // [14:19] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }

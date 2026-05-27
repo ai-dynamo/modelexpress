@@ -39,6 +39,9 @@ pub struct SourceInstanceInfo {
     pub source_id: String,
     pub worker_id: String,
     pub model_name: String,
+    /// Full source identity for this source group, when the backend can
+    /// reconstruct it from persisted source attributes.
+    pub identity: Option<SourceIdentity>,
     /// Global rank of this worker.
     pub worker_rank: u32,
     /// Worker lifecycle status (maps to `SourceStatus` proto enum).

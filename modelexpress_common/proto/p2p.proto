@@ -238,6 +238,11 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Full source identity for this source group. This keeps ListSources
+  // lightweight relative to GetMetadata while letting clients inspect
+  // version/role/revision extra parameters without fetching tensor metadata.
+  SourceIdentity identity = 5;
 }
 
 message ListSourcesRequest {

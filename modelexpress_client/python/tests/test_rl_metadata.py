@@ -161,6 +161,41 @@ def test_candidates_from_response_annotates_list_sources_refs():
     ]
 
 
+def test_candidates_from_response_can_parse_rl_metadata_from_ref_identity():
+    metadata = RlSourceMetadata(
+        model_version=9,
+        role=RlSourceRole.INFERENCE_REPLICA,
+        world_size=2,
+    )
+    identity = with_rl_source_metadata(_base_identity(), metadata)
+    plain_identity = _base_identity()
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            p2p_pb2.SourceInstanceRef(
+                mx_source_id="source-a",
+                worker_id="worker-a",
+                model_name="test-model",
+                worker_rank=0,
+                identity=identity,
+            ),
+            p2p_pb2.SourceInstanceRef(
+                mx_source_id="source-b",
+                worker_id="worker-b",
+                model_name="test-model",
+                worker_rank=1,
+                identity=plain_identity,
+            ),
+            _ref(source_id="legacy-source", worker_id="legacy-worker", rank=0),
+        ],
+    )
+
+    candidates = candidates_from_response(response)
+
+    assert candidates == [
+        RlSourceCandidate("source-a", "worker-a", "test-model", 0, metadata),
+    ]
+
+
 def test_select_candidates_uses_latest_version_and_prefers_replica_role():
     candidates = [
         RlSourceCandidate(
