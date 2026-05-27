@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
 import logging
 import threading
 from types import TracebackType
@@ -18,6 +20,91 @@ logger = logging.getLogger("modelexpress.rl_transfer_lease")
 
 _DEFAULT_TTL_SECONDS = 30.0
 _MIN_RENEW_INTERVAL_SECONDS = 1.0
+_NON_COMPLETED_LEASE_STATUSES = frozenset(
+    {
+        p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+        p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
+    }
+)
+
+
+@dataclass(frozen=True)
+class RlTransferLeaseInventory:
+    """Discovered transfer leases for one target worker."""
+
+    target_worker_id: str
+    leases: tuple["p2p_pb2.TransferLease", ...] = ()
+    discovery_supported: bool = True
+
+    @property
+    def active_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return self.with_statuses((p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,))
+
+    @property
+    def completed_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return self.with_statuses((p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,))
+
+    @property
+    def failed_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return self.with_statuses((p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,))
+
+    @property
+    def expired_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return self.with_statuses((p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,))
+
+    @property
+    def non_completed_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return self.with_statuses(_NON_COMPLETED_LEASE_STATUSES)
+
+    @property
+    def latest_non_completed_attempts(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return self.latest_attempts(statuses=_NON_COMPLETED_LEASE_STATUSES)
+
+    def with_statuses(
+        self,
+        statuses: Iterable[int],
+    ) -> tuple["p2p_pb2.TransferLease", ...]:
+        status_set = {int(status) for status in statuses}
+        return tuple(lease for lease in self.leases if lease.status in status_set)
+
+    def latest_model_version(self, *, statuses: Iterable[int] | None = None) -> int | None:
+        leases = self._filtered(statuses)
+        if not leases:
+            return None
+        return max(int(lease.model_version) for lease in leases)
+
+    def latest_attempts(
+        self,
+        *,
+        statuses: Iterable[int] | None = None,
+    ) -> tuple["p2p_pb2.TransferLease", ...]:
+        latest = self.latest_model_version(statuses=statuses)
+        if latest is None:
+            return ()
+        leases = [
+            lease
+            for lease in self._filtered(statuses)
+            if int(lease.model_version) == latest
+        ]
+        return tuple(
+            sorted(
+                leases,
+                key=lambda lease: (
+                    int(lease.updated_at),
+                    int(lease.created_at),
+                    lease.lease_id,
+                ),
+            )
+        )
+
+    def _filtered(
+        self,
+        statuses: Iterable[int] | None,
+    ) -> tuple["p2p_pb2.TransferLease", ...]:
+        if statuses is None:
+            return self.leases
+        return self.with_statuses(statuses)
 
 
 class RlTransferLeaseCoordinator:
@@ -65,6 +152,45 @@ class RlTransferLeaseCoordinator:
             mx_client=self._mx_client,
             lease_id=lease.lease_id,
             ttl_millis=self._ttl_millis,
+        )
+
+    def list_target_leases(
+        self,
+        *,
+        mx_source_id: str = "",
+        statuses: Iterable[int] | None = None,
+    ) -> RlTransferLeaseInventory:
+        """List persisted transfer attempts for this target worker.
+
+        Older servers that do not expose lease discovery return an unsupported,
+        empty inventory so framework adapters can preserve compatibility.
+        """
+        list_leases = getattr(self._mx_client, "list_transfer_leases", None)
+        if list_leases is None:
+            return RlTransferLeaseInventory(
+                target_worker_id=self._target_worker_id,
+                discovery_supported=False,
+            )
+
+        try:
+            leases = _list_leases_by_status(
+                list_leases,
+                mx_source_id=mx_source_id,
+                target_worker_id=self._target_worker_id,
+                statuses=statuses,
+            )
+        except (NotImplementedError, grpc.RpcError) as exc:
+            if isinstance(exc, NotImplementedError) or _is_unimplemented_rpc(exc):
+                return RlTransferLeaseInventory(
+                    target_worker_id=self._target_worker_id,
+                    discovery_supported=False,
+                )
+            raise
+
+        return RlTransferLeaseInventory(
+            target_worker_id=self._target_worker_id,
+            leases=leases,
+            discovery_supported=True,
         )
 
     @property
@@ -158,3 +284,29 @@ def _is_unimplemented_rpc(exc: grpc.RpcError) -> bool:
         return exc.code() == grpc.StatusCode.UNIMPLEMENTED
     except Exception:
         return False
+
+
+def _list_leases_by_status(
+    list_leases,
+    *,
+    mx_source_id: str,
+    target_worker_id: str,
+    statuses: Iterable[int] | None,
+) -> tuple["p2p_pb2.TransferLease", ...]:
+    if statuses is None:
+        response = list_leases(
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
+        )
+        return tuple(response.leases)
+
+    leases_by_id: dict[str, "p2p_pb2.TransferLease"] = {}
+    for status in statuses:
+        response = list_leases(
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
+            status_filter=int(status),
+        )
+        for lease in response.leases:
+            leases_by_id.setdefault(lease.lease_id, lease)
+    return tuple(leases_by_id.values())

@@ -20,6 +20,7 @@ from modelexpress.rl_metadata import (
 )
 from modelexpress.rl_reshard import TensorReceiveSpec
 from modelexpress.rl_transfer import RlNixlWeightTransfer, build_rl_base_identity
+from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
 
@@ -96,6 +97,19 @@ def test_live_server_transfer_lease_contract():
             status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
         )
         assert [lease.lease_id for lease in listed.leases] == [lease_id]
+
+        inventory = RlTransferLeaseCoordinator(
+            mx_client=client,
+            target_worker_id=target_worker_id,
+            ttl_seconds=5,
+        ).list_target_leases(
+            mx_source_id=mx_source_id,
+            statuses=(p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
+        )
+        assert inventory.discovery_supported
+        assert [lease.lease_id for lease in inventory.leases] == [lease_id]
+        assert inventory.latest_model_version() == 17
+        assert [lease.lease_id for lease in inventory.latest_attempts()] == [lease_id]
     finally:
         client.close()
 
