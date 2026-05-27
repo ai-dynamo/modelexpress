@@ -26,6 +26,7 @@ from modelexpress.rl_fanin_transfer import (
     candidate_group_label,
     execute_dense_fanin_receive,
     prepare_dense_fanin_receive,
+    preferred_dense_fanin_groups,
     source_descriptors_from_worker,
 )
 from modelexpress.rl_metadata import (
@@ -61,80 +62,23 @@ from modelexpress.rl_transfer_identity import (
     candidates_for_base_identity,
     identity_matches_base,
 )
-from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator, RlTransferLeaseInventory
+from modelexpress.rl_transfer_lease import (
+    LeasedTransferError,
+    RlTransferLeaseCoordinator,
+    RlTransferLeaseInventory,
+    transfer_lease_key,
+)
 from modelexpress.rl_transfer_report import (
+    failed_attempt_from_candidate,
     RlTransferAttempt,
     RlTransferReport,
+    successful_attempt_from_candidate,
     _ReceiveCandidateResult,
 )
 
 logger = logging.getLogger("modelexpress.rl_transfer")
 
 _DEFAULT_RECEIVE_ROLES = (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER)
-
-def _successful_attempt_from_candidate(
-    candidate: RlSourceCandidate,
-    *,
-    bytes_transferred: int,
-    tensor_count: int,
-    duration_seconds: float,
-    lease_id: str = "",
-) -> RlTransferAttempt:
-    return RlTransferAttempt(
-        mx_source_id=candidate.mx_source_id,
-        worker_id=candidate.worker_id,
-        worker_rank=candidate.worker_rank,
-        role=candidate.metadata.role,
-        model_version=candidate.metadata.model_version,
-        success=True,
-        lease_id=lease_id,
-        bytes_transferred=bytes_transferred,
-        tensor_count=tensor_count,
-        duration_seconds=duration_seconds,
-    )
-
-
-def _failed_attempt_from_candidate(
-    candidate: RlSourceCandidate,
-    exc: Exception,
-) -> RlTransferAttempt:
-    return RlTransferAttempt(
-        mx_source_id=candidate.mx_source_id,
-        worker_id=candidate.worker_id,
-        worker_rank=candidate.worker_rank,
-        role=candidate.metadata.role,
-        model_version=candidate.metadata.model_version,
-        success=False,
-        error=str(exc),
-        lease_id=_lease_id_for_exception(exc, candidate),
-    )
-
-
-def _candidate_lease_key(candidate: RlSourceCandidate) -> tuple[str, str, int]:
-    return (candidate.mx_source_id, candidate.worker_id, candidate.worker_rank)
-
-
-class _LeasedTransferError(RuntimeError):
-    def __init__(
-        self,
-        exc: Exception,
-        lease_ids_by_candidate: Mapping[tuple[str, str, int], str],
-    ) -> None:
-        super().__init__(str(exc))
-        self.lease_ids_by_candidate = dict(lease_ids_by_candidate)
-
-    def lease_id_for(self, candidate: RlSourceCandidate) -> str:
-        return self.lease_ids_by_candidate.get(_candidate_lease_key(candidate), "")
-
-
-def _lease_id_for_exception(exc: Exception, candidate: RlSourceCandidate) -> str:
-    lease_id_for = getattr(exc, "lease_id_for", None)
-    if lease_id_for is None:
-        return ""
-    try:
-        return str(lease_id_for(candidate))
-    except Exception:
-        return ""
 
 
 class RlNixlWeightTransfer:
@@ -437,6 +381,30 @@ class RlNixlWeightTransfer:
         )
         errors = []
         attempts: list[RlTransferAttempt] = []
+        fanin_groups = candidate_fanin_groups(candidates)
+        preferred_fanin_groups = preferred_dense_fanin_groups(
+            candidates,
+            target_tensors=target_tensors,
+            target_specs=target_specs,
+            receiver_rank=receiver_rank,
+            same_rank_only=same_rank_only,
+        )
+        if preferred_fanin_groups:
+            received = self._receive_from_candidate_groups(
+                preferred_fanin_groups,
+                attempts=attempts,
+                errors=errors,
+                model_version=model_version,
+                receiver_rank=receiver_rank,
+                same_rank_only=same_rank_only,
+                target_tensors=target_tensors,
+                target_specs=target_specs,
+            )
+            if received is not None:
+                return received
+            fanin_groups = tuple(
+                group for group in fanin_groups if group not in preferred_fanin_groups
+            )
         for candidate in candidates:
             try:
                 result = self._receive_from_candidate(
@@ -448,7 +416,7 @@ class RlNixlWeightTransfer:
                     target_specs=target_specs,
                 )
                 attempts.append(
-                    _successful_attempt_from_candidate(
+                    successful_attempt_from_candidate(
                         candidate,
                         bytes_transferred=result.bytes_transferred,
                         tensor_count=result.tensor_count,
@@ -465,7 +433,7 @@ class RlNixlWeightTransfer:
                 return candidate.metadata.model_version, result.tensors
             except Exception as exc:
                 errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
-                attempts.append(_failed_attempt_from_candidate(candidate, exc))
+                attempts.append(failed_attempt_from_candidate(candidate, exc))
                 logger.warning(
                     "ModelExpress RL source transfer failed; trying next candidate: "
                     "source_id=%s worker_id=%s",
@@ -473,7 +441,43 @@ class RlNixlWeightTransfer:
                     candidate.worker_id,
                     exc_info=True,
                 )
-        for candidate_group in candidate_fanin_groups(candidates):
+        received = self._receive_from_candidate_groups(
+            fanin_groups,
+            attempts=attempts,
+            errors=errors,
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            same_rank_only=same_rank_only,
+            target_tensors=target_tensors,
+            target_specs=target_specs,
+        )
+        if received is not None:
+            return received
+        self.last_receive_report = RlTransferReport(
+            requested_model_version=model_version,
+            resolved_model_version=None,
+            receiver_rank=receiver_rank,
+            attempts=tuple(attempts),
+        )
+        raise RuntimeError(
+            "No ModelExpress RL source transfer succeeded for "
+            f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
+            f"errors={errors}"
+        )
+
+    def _receive_from_candidate_groups(
+        self,
+        candidate_groups: Sequence[Sequence[RlSourceCandidate]],
+        *,
+        attempts: list[RlTransferAttempt],
+        errors: list[str],
+        model_version: int | None,
+        receiver_rank: int,
+        same_rank_only: bool,
+        target_tensors: dict[str, torch.Tensor] | None,
+        target_specs: Sequence[TensorReceiveSpec] | None,
+    ) -> tuple[int, list[tuple[str, torch.Tensor]]] | None:
+        for candidate_group in candidate_groups:
             try:
                 result = self._receive_from_candidate_group(
                     candidate_group,
@@ -483,7 +487,7 @@ class RlNixlWeightTransfer:
                     target_specs=target_specs,
                 )
                 attempts.extend(
-                    _successful_attempt_from_candidate(
+                    successful_attempt_from_candidate(
                         source_result.candidate,
                         bytes_transferred=source_result.bytes_transferred,
                         tensor_count=source_result.tensor_count,
@@ -502,7 +506,7 @@ class RlNixlWeightTransfer:
             except Exception as exc:
                 errors.append(f"{candidate_group_label(candidate_group)}: {exc}")
                 attempts.extend(
-                    _failed_attempt_from_candidate(candidate, exc)
+                    failed_attempt_from_candidate(candidate, exc)
                     for candidate in candidate_group
                 )
                 logger.warning(
@@ -511,17 +515,7 @@ class RlNixlWeightTransfer:
                     candidate_group_label(candidate_group),
                     exc_info=True,
                 )
-        self.last_receive_report = RlTransferReport(
-            requested_model_version=model_version,
-            resolved_model_version=None,
-            receiver_rank=receiver_rank,
-            attempts=tuple(attempts),
-        )
-        raise RuntimeError(
-            "No ModelExpress RL source transfer succeeded for "
-            f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
-            f"errors={errors}"
-        )
+        return None
 
     def _publish_replica_tensors(
         self,
@@ -567,9 +561,9 @@ class RlNixlWeightTransfer:
                 )
         except Exception as exc:
             if lease.lease_id:
-                raise _LeasedTransferError(
+                raise LeasedTransferError(
                     exc,
-                    {_candidate_lease_key(candidate): lease.lease_id},
+                    {transfer_lease_key(candidate): lease.lease_id},
                 ) from exc
             raise
         return replace(result, lease_id=lease.lease_id)
@@ -711,7 +705,7 @@ class RlNixlWeightTransfer:
                     )
                     stack.enter_context(lease)
                     if lease.lease_id:
-                        lease_ids_by_candidate[_candidate_lease_key(candidate)] = (
+                        lease_ids_by_candidate[transfer_lease_key(candidate)] = (
                             lease.lease_id
                         )
                 result = self._receive_from_candidate_group_unleased(
@@ -723,14 +717,14 @@ class RlNixlWeightTransfer:
                 )
         except Exception as exc:
             if lease_ids_by_candidate:
-                raise _LeasedTransferError(exc, lease_ids_by_candidate) from exc
+                raise LeasedTransferError(exc, lease_ids_by_candidate) from exc
             raise
 
         source_results = tuple(
             replace(
                 source_result,
                 lease_id=lease_ids_by_candidate.get(
-                    _candidate_lease_key(source_result.candidate),
+                    transfer_lease_key(source_result.candidate),
                     "",
                 ),
             )

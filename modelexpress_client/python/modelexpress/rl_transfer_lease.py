@@ -164,6 +164,23 @@ def summarize_report_leases(
     )
 
 
+def transfer_lease_key(candidate: RlSourceCandidate) -> tuple[str, str, int]:
+    return (candidate.mx_source_id, candidate.worker_id, candidate.worker_rank)
+
+
+class LeasedTransferError(RuntimeError):
+    def __init__(
+        self,
+        exc: Exception,
+        lease_ids_by_candidate: dict[tuple[str, str, int], str],
+    ) -> None:
+        super().__init__(str(exc))
+        self.lease_ids_by_candidate = dict(lease_ids_by_candidate)
+
+    def lease_id_for(self, candidate: RlSourceCandidate) -> str:
+        return self.lease_ids_by_candidate.get(transfer_lease_key(candidate), "")
+
+
 class RlTransferLeaseCoordinator:
     """Begin/renew/complete MX transfer leases when the client supports them."""
 

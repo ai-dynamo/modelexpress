@@ -17,6 +17,7 @@ from modelexpress.rl_metadata import RlSourceCandidate, RlSourceRole
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
     plan_dense_reshard_transfers,
+    plan_exact_transfers,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
 )
@@ -203,6 +204,42 @@ def candidate_fanin_groups(
     )
 
 
+def preferred_dense_fanin_groups(
+    candidates: Sequence[RlSourceCandidate],
+    *,
+    target_tensors: dict[str, torch.Tensor] | None,
+    target_specs: Sequence[TensorReceiveSpec] | None,
+    receiver_rank: int,
+    same_rank_only: bool,
+) -> tuple[tuple[RlSourceCandidate, ...], ...]:
+    """Return complete fan-in groups when no single source can satisfy the receive."""
+    if target_tensors is None:
+        return ()
+    effective_target_specs = tuple(
+        target_specs
+        if target_specs is not None
+        else receive_specs_from_tensors(target_tensors, receiver_rank=receiver_rank)
+    )
+    if any(
+        _single_source_plan_complete(
+            candidate,
+            effective_target_specs=effective_target_specs,
+            same_rank_only=same_rank_only,
+        )
+        for candidate in candidates
+    ):
+        return ()
+    return tuple(
+        group
+        for group in candidate_fanin_groups(candidates)
+        if _dense_fanin_plan_complete(
+            group,
+            effective_target_specs=effective_target_specs,
+            same_rank_only=same_rank_only,
+        )
+    )
+
+
 def candidate_group_label(candidates: Sequence[RlSourceCandidate]) -> str:
     first = candidates[0]
     ranks = ",".join(str(candidate.worker_rank) for candidate in candidates)
@@ -250,3 +287,52 @@ def _validate_candidate_group(candidates: Sequence[RlSourceCandidate]) -> int:
         if candidate.metadata.model_version != model_version or candidate.metadata.role != role:
             raise RuntimeError("ModelExpress dense fan-in group mixes source versions or roles")
     return model_version
+
+
+def _single_source_plan_complete(
+    candidate: RlSourceCandidate,
+    *,
+    effective_target_specs: Sequence[TensorReceiveSpec],
+    same_rank_only: bool,
+) -> bool:
+    source_specs = source_specs_from_shape_registry(
+        candidate.metadata.shape_registry,
+        worker_rank=candidate.worker_rank,
+    )
+    exact_plan = plan_exact_transfers(
+        source_specs,
+        effective_target_specs,
+        same_rank_only=same_rank_only,
+    )
+    if exact_plan.complete:
+        return True
+    return plan_dense_reshard_transfers(
+        source_specs,
+        effective_target_specs,
+        same_rank_only=same_rank_only,
+    ).complete
+
+
+def _dense_fanin_plan_complete(
+    candidates: Sequence[RlSourceCandidate],
+    *,
+    effective_target_specs: Sequence[TensorReceiveSpec],
+    same_rank_only: bool,
+) -> bool:
+    try:
+        unique_candidates = _require_unique_rank_candidates(candidates)
+    except RuntimeError:
+        return False
+    source_specs = [
+        spec
+        for candidate in unique_candidates
+        for spec in source_specs_from_shape_registry(
+            candidate.metadata.shape_registry,
+            worker_rank=candidate.worker_rank,
+        )
+    ]
+    return plan_dense_reshard_transfers(
+        source_specs,
+        effective_target_specs,
+        same_rank_only=same_rank_only,
+    ).complete

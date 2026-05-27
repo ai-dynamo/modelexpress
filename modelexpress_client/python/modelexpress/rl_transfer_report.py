@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 
-from modelexpress.rl_metadata import RlSourceRole
+from modelexpress.rl_metadata import RlSourceCandidate, RlSourceRole
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,44 @@ class RlTransferAttempt:
     bytes_transferred: int = 0
     tensor_count: int = 0
     duration_seconds: float = 0.0
+
+
+def successful_attempt_from_candidate(
+    candidate: RlSourceCandidate,
+    *,
+    bytes_transferred: int,
+    tensor_count: int,
+    duration_seconds: float,
+    lease_id: str = "",
+) -> RlTransferAttempt:
+    return RlTransferAttempt(
+        mx_source_id=candidate.mx_source_id,
+        worker_id=candidate.worker_id,
+        worker_rank=candidate.worker_rank,
+        role=candidate.metadata.role,
+        model_version=candidate.metadata.model_version,
+        success=True,
+        lease_id=lease_id,
+        bytes_transferred=bytes_transferred,
+        tensor_count=tensor_count,
+        duration_seconds=duration_seconds,
+    )
+
+
+def failed_attempt_from_candidate(
+    candidate: RlSourceCandidate,
+    exc: Exception,
+) -> RlTransferAttempt:
+    return RlTransferAttempt(
+        mx_source_id=candidate.mx_source_id,
+        worker_id=candidate.worker_id,
+        worker_rank=candidate.worker_rank,
+        role=candidate.metadata.role,
+        model_version=candidate.metadata.model_version,
+        success=False,
+        error=str(exc),
+        lease_id=_lease_id_for_exception(exc, candidate),
+    )
 
 
 @dataclass(frozen=True)
@@ -68,3 +106,13 @@ class _ReceiveCandidateResult:
     tensor_count: int
     duration_seconds: float
     lease_id: str = ""
+
+
+def _lease_id_for_exception(exc: Exception, candidate: RlSourceCandidate) -> str:
+    lease_id_for = getattr(exc, "lease_id_for", None)
+    if lease_id_for is None:
+        return ""
+    try:
+        return str(lease_id_for(candidate))
+    except Exception:
+        return ""

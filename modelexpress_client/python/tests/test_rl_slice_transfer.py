@@ -8,7 +8,13 @@ import torch
 
 import modelexpress.rl_transfer as rl_transfer_module
 from modelexpress import p2p_pb2
-from modelexpress.rl_metadata import RlSourceMetadata, RlSourceRole, with_rl_source_metadata
+from modelexpress.rl_fanin_transfer import preferred_dense_fanin_groups
+from modelexpress.rl_metadata import (
+    RlSourceMetadata,
+    RlSourceRole,
+    candidates_from_response,
+    with_rl_source_metadata,
+)
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
     TensorShardSpec,
@@ -530,6 +536,9 @@ def test_receive_into_tensors_applies_multi_source_dense_fanin(monkeypatch):
             pass
 
     class _MxClient:
+        def __init__(self):
+            self.metadata_calls = []
+
         def list_sources(self, identity=None, status_filter=None):
             del identity
             del status_filter
@@ -567,7 +576,7 @@ def test_receive_into_tensors_applies_multi_source_dense_fanin(monkeypatch):
             )
 
         def get_metadata(self, mx_source_id, worker_id):
-            del mx_source_id
+            self.metadata_calls.append((mx_source_id, worker_id))
             rank_by_worker = {"worker-r0": 0, "worker-r1": 1}
             addr_by_worker = {"worker-r0": 100, "worker-r1": 200}
             rank = rank_by_worker[worker_id]
@@ -589,8 +598,9 @@ def test_receive_into_tensors_applies_multi_source_dense_fanin(monkeypatch):
             )
 
     monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _FakeNixlManager)
+    mx_client = _MxClient()
     transfer = RlNixlWeightTransfer(
-        mx_client=_MxClient(),
+        mx_client=mx_client,
         base_identity=_base_identity(),
         worker_id="worker-local",
     )
@@ -631,13 +641,95 @@ def test_receive_into_tensors_applies_multi_source_dense_fanin(monkeypatch):
     ]
     assert transfer.last_receive_report is not None
     assert [attempt.success for attempt in transfer.last_receive_report.attempts] == [
-        False,
-        False,
         True,
         True,
     ]
-    assert transfer.last_receive_report.retry_count == 2
+    assert transfer.last_receive_report.retry_count == 0
     assert transfer.last_receive_report.source_worker_id == "worker-r0"
+    assert mx_client.metadata_calls == [
+        ("source-r0", "worker-r0"),
+        ("source-r1", "worker-r1"),
+    ]
+
+
+def test_dense_fanin_preflight_preserves_complete_single_source_preference():
+    target = {"w": torch.zeros((4,), dtype=torch.float32)}
+    target_specs = [
+        TensorReceiveSpec(
+            name="w",
+            receiver_rank=0,
+            shape=(4,),
+            global_shape=(4,),
+            shard_offsets=(0,),
+            dtype="torch.float32",
+        )
+    ]
+    partial_refs = [
+        _source_ref(
+            {
+                "w": {
+                    "shape": [2],
+                    "global_shape": [4],
+                    "shard_offsets": [0],
+                    "dtype": "torch.float32",
+                }
+            },
+            mx_source_id="source-r0",
+            worker_id="worker-r0",
+            worker_rank=0,
+            source_world_size=2,
+        ),
+        _source_ref(
+            {
+                "w": {
+                    "shape": [2],
+                    "global_shape": [4],
+                    "shard_offsets": [2],
+                    "dtype": "torch.float32",
+                }
+            },
+            mx_source_id="source-r1",
+            worker_id="worker-r1",
+            worker_rank=1,
+            source_world_size=2,
+        ),
+    ]
+
+    partial_candidates = candidates_from_response(
+        p2p_pb2.ListSourcesResponse(instances=partial_refs)
+    )
+    preferred_groups = preferred_dense_fanin_groups(
+        partial_candidates,
+        target_tensors=target,
+        target_specs=target_specs,
+        receiver_rank=0,
+        same_rank_only=False,
+    )
+
+    assert [[candidate.worker_id for candidate in group] for group in preferred_groups] == [
+        ["worker-r0", "worker-r1"]
+    ]
+
+    full_candidates = candidates_from_response(
+        p2p_pb2.ListSourcesResponse(
+            instances=[
+                _source_ref(
+                    {"w": {"shape": [4], "dtype": "torch.float32"}},
+                    mx_source_id="source-full",
+                    worker_id="worker-full",
+                ),
+                *partial_refs,
+            ]
+        )
+    )
+
+    assert preferred_dense_fanin_groups(
+        full_candidates,
+        target_tensors=target,
+        target_specs=target_specs,
+        receiver_rank=0,
+        same_rank_only=False,
+    ) == ()
 
 
 def test_receive_into_tensors_scatters_into_noncontiguous_target_view(monkeypatch):
