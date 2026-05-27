@@ -58,14 +58,27 @@ def port_forward(namespace: str, target: str, local_port: int, remote_port: int)
     )
     try:
         deadline = time.perf_counter() + 60
+        ready = False
         while time.perf_counter() < deadline:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(2)
                 try:
                     sock.connect(("localhost", local_port))
+                    ready = True
                     break
                 except (ConnectionRefusedError, socket.timeout, OSError):
                     time.sleep(1)
+        if not ready:
+            # Without this raise, the with-block proceeds with a port that
+            # nothing's listening on, and the caller's first operation
+            # surfaces an opaque "connection refused" several frames removed
+            # from the real cause. Failing loudly here keeps the blame on
+            # the port-forward setup rather than on the test logic.
+            raise TimeoutError(
+                f"kubectl port-forward in namespace {namespace} to {target} "
+                f"(local:{local_port} -> remote:{remote_port}) "
+                f"not ready after 60s"
+            )
         yield local_port
     finally:
         proc.terminate()
