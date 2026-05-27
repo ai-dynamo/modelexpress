@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import time
 import uuid
 
 import grpc
@@ -47,6 +48,15 @@ def _base_identity(model_name: str):
     )
 
 
+def _begin_transfer_lease_or_skip(client: MxClient, **kwargs):
+    try:
+        return client.begin_transfer_lease(**kwargs)
+    except grpc.RpcError as exc:
+        if exc.code() == grpc.StatusCode.UNIMPLEMENTED:
+            pytest.skip("server does not expose transfer lease RPCs")
+        raise
+
+
 def test_live_server_transfer_lease_contract():
     client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
     lease_id = f"lease-{uuid.uuid4().hex}"
@@ -54,21 +64,17 @@ def test_live_server_transfer_lease_contract():
     target_worker_id = f"target-worker-{uuid.uuid4().hex[:8]}"
 
     try:
-        try:
-            lease = client.begin_transfer_lease(
-                lease_id=lease_id,
-                mx_source_id=mx_source_id,
-                source_worker_id="source-worker",
-                target_worker_id=target_worker_id,
-                target_worker_rank=1,
-                model_version=17,
-                ttl_millis=5_000,
-                metadata={"contract": "live"},
-            )
-        except grpc.RpcError as exc:
-            if exc.code() == grpc.StatusCode.UNIMPLEMENTED:
-                pytest.skip("server does not expose transfer lease RPCs")
-            raise
+        lease = _begin_transfer_lease_or_skip(
+            client,
+            lease_id=lease_id,
+            mx_source_id=mx_source_id,
+            source_worker_id="source-worker",
+            target_worker_id=target_worker_id,
+            target_worker_rank=1,
+            model_version=17,
+            ttl_millis=5_000,
+            metadata={"contract": "live"},
+        )
 
         assert lease.lease_id == lease_id
         assert lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
@@ -113,6 +119,61 @@ def test_live_server_transfer_lease_contract():
         assert [lease.lease_id for lease in inventory.leases] == [lease_id]
         assert inventory.latest_model_version() == 17
         assert [lease.lease_id for lease in inventory.latest_attempts()] == [lease_id]
+    finally:
+        client.close()
+
+
+def test_live_server_transfer_lease_expires_abandoned_attempts():
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    lease_id = f"lease-expire-{uuid.uuid4().hex}"
+    mx_source_id = f"live-lease-expire-source-{uuid.uuid4().hex[:8]}"
+    target_worker_id = f"target-expire-{uuid.uuid4().hex[:8]}"
+
+    try:
+        lease = _begin_transfer_lease_or_skip(
+            client,
+            lease_id=lease_id,
+            mx_source_id=mx_source_id,
+            source_worker_id="source-worker",
+            target_worker_id=target_worker_id,
+            target_worker_rank=2,
+            model_version=23,
+            ttl_millis=1,
+            metadata={"contract": "expire"},
+        )
+
+        assert lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
+
+        deadline = time.monotonic() + 3.0
+        while True:
+            fetched = client.get_transfer_lease(lease_id)
+            assert fetched.found
+            if fetched.lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED:
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail("transfer lease did not expire within the live contract deadline")
+            time.sleep(0.1)
+
+        assert fetched.lease.error_message == "transfer lease expired"
+        assert fetched.lease.target_worker_id == target_worker_id
+        assert fetched.lease.model_version == 23
+
+        expired = client.list_transfer_leases(
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
+            status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
+        )
+        assert [lease.lease_id for lease in expired.leases] == [lease_id]
+
+        active = client.list_transfer_leases(
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
+            status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
+        )
+        assert active.leases == []
+
+        with pytest.raises(RuntimeError, match="is not active"):
+            client.renew_transfer_lease(lease_id, ttl_millis=5_000)
     finally:
         client.close()
 
