@@ -5,6 +5,7 @@
 
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -26,20 +27,43 @@ def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
     )
 
 
-def test_worker_rank_uses_vllm_model_parallel_rank():
-    # vLLM rank layout is DP x PP x TP. Modulo TP*PP keeps PP/TP shard
-    # identity and drops the DP component.
-    config = _vllm_config(rank=6, tp_size=4, pp_size=2)
+def test_worker_rank_uses_torch_distributed_global_rank():
+    config = _vllm_config(rank=2, tp_size=4, pp_size=2)
+    device = torch.device("cuda", 0)
 
-    assert _get_vllm_worker_rank(config) == 6
+    with patch("torch.distributed.is_initialized", return_value=True), patch(
+        "torch.distributed.get_rank", return_value=6,
+    ):
+        assert _get_vllm_worker_rank(config, device) == 6
 
 
-def test_worker_rank_ignores_dp_component():
-    dp0 = _vllm_config(rank=5, tp_size=4, pp_size=2)
-    dp1 = _vllm_config(rank=13, tp_size=4, pp_size=2)
+def test_worker_rank_distinguishes_dp_replicas():
+    config = _vllm_config(rank=0, tp_size=4, pp_size=2)
+    device = torch.device("cuda", 0)
 
-    assert _get_vllm_worker_rank(dp0) == 5
-    assert _get_vllm_worker_rank(dp1) == 5
+    with patch("torch.distributed.is_initialized", return_value=True), patch(
+        "torch.distributed.get_rank", return_value=5,
+    ):
+        dp0_rank = _get_vllm_worker_rank(config, device)
+
+    with patch("torch.distributed.is_initialized", return_value=True), patch(
+        "torch.distributed.get_rank", return_value=13,
+    ):
+        dp1_rank = _get_vllm_worker_rank(config, device)
+
+    assert dp0_rank == 5
+    assert dp1_rank == 13
+
+
+def test_worker_rank_falls_back_to_parallel_config_rank_pre_init():
+    # Pre-init / bare-cuda path: torch.distributed not initialised AND device
+    # has no index. Falls back to parallel_config.rank so workers in the same
+    # DP still get distinct keys.
+    config = _vllm_config(rank=3, tp_size=4, pp_size=2)
+    bare_device = torch.device("cuda")
+
+    with patch("torch.distributed.is_initialized", return_value=False):
+        assert _get_vllm_worker_rank(config, bare_device) == 3
 
 
 def test_vllm_device_id_uses_current_platform_device(monkeypatch):
