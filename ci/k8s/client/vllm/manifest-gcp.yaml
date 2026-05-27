@@ -15,7 +15,7 @@
 # GCP-specific additions vs the generic manifest:
 #   - GKE multi-network RDMA annotations attach rdma0-rdma3 interfaces
 #   - networking.gke.io.networks/rdma-* resource limits expose RDMA devices
-#   - UCX_TLS=cuda_ipc,cuda_copy,rc + UCX_IB_GID_INDEX=3 for GKE RoCE
+#   - UCX_IB_GID_INDEX=3 for GKE RoCE
 #   - 64Gi /dev/shm emptyDir for vLLM inter-process shared memory
 #
 # Environment variables substituted by envsubst before each apply:
@@ -89,8 +89,6 @@ spec:
               value: "mx-server:8000"
             - name: MX_CONTIGUOUS_REG
               value: "0"
-            - name: UCX_TLS
-              value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
               value: "3"
             - name: UCX_RNDV_SCHEME

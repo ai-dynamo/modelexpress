@@ -15,7 +15,6 @@
 #
 # Azure A100-specific differences vs GCP/upstream:
 #   - rdma/ib resource limit exposes the InfiniBand RDMA device
-#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand
 #   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (ucx#11259)
 #   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools
 #
@@ -112,8 +111,6 @@ spec:
               value: "mx-server:8000"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH

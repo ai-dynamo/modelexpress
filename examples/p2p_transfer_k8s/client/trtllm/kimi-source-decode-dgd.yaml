@@ -144,8 +144,6 @@ spec:
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            - name: UCX_TLS
-              value: "self,sm,rc,cuda_copy,gdr_copy,tcp"
             - name: UCX_IB_GID_INDEX
               value: "3"
             - name: OMPI_MCA_pml
