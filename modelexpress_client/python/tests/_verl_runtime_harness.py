@@ -25,6 +25,8 @@ class VerlRuntimeSmokeResult:
     requested_model_version: int | None = None
     resolved_model_version: int | None = None
     source_roles: tuple[str, ...] = ()
+    attempt_roles: tuple[str, ...] = ()
+    attempt_successes: tuple[bool, ...] = ()
     retry_count: int = 0
     bytes_transferred: int = 0
     tensor_count: int = 0
@@ -40,6 +42,8 @@ class VerlRuntimeSmokeResult:
     recovery_requested_model_version: int | None = None
     recovery_resolved_model_version: int | None = None
     recovery_source_roles: tuple[str, ...] = ()
+    recovery_attempt_roles: tuple[str, ...] = ()
+    recovery_attempt_successes: tuple[bool, ...] = ()
     recovery_retry_count: int = 0
     recovery_bytes_transferred: int = 0
     recovery_tensor_count: int = 0
@@ -57,6 +61,7 @@ def run_verl_checkpoint_manager_update(
     global_steps: int = 17,
     republish_received: bool = False,
     recover_latest_from_replica: bool = False,
+    fail_trainer_transfer_before_recovery: bool = False,
     fail_refit_after_tensors: int | None = None,
     expect_update_failure: bool = False,
 ) -> VerlRuntimeSmokeResult:
@@ -140,6 +145,13 @@ def run_verl_checkpoint_manager_update(
         @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
         def execute_checkpoint_engine(self, method: str, *args, **kwargs):
             return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+        @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+        def drop_published_nixl_managers_without_stale(self):
+            transfer = getattr(self.checkpoint_engine, "_transfer", None)
+            if transfer is None:
+                raise RuntimeError("ModelExpress transfer state is unavailable")
+            transfer.shutdown_nixl_manager()
 
     def create_trainer_worker_group(
         resource_pool: RayResourcePool,
@@ -295,6 +307,12 @@ def run_verl_checkpoint_manager_update(
                 "source_roles": tuple(
                     attempt.role.value for attempt in report.attempts if attempt.success
                 ),
+                "attempt_roles": tuple(
+                    attempt.role.value for attempt in report.attempts
+                ),
+                "attempt_successes": tuple(
+                    attempt.success for attempt in report.attempts
+                ),
                 "bytes_transferred": sum(
                     attempt.bytes_transferred
                     for attempt in report.attempts
@@ -423,11 +441,14 @@ def run_verl_checkpoint_manager_update(
                 raise ValueError("latest replica recovery is only supported for ModelExpress")
             if failed:
                 raise AssertionError("cannot recover latest after a failed initial update")
-            ray.get(
-                trainer.execute_checkpoint_engine(
-                    ["mark_current_source_stale"] * trainer.world_size
+            if fail_trainer_transfer_before_recovery:
+                ray.get(trainer.drop_published_nixl_managers_without_stale())
+            else:
+                ray.get(
+                    trainer.execute_checkpoint_engine(
+                        ["mark_current_source_stale"] * trainer.world_size
+                    )
                 )
-            )
             recovery_rollout, recovery_replicas = await create_rollout_worker_group(
                 rollout_pool,
                 model_config,
@@ -463,6 +484,8 @@ def run_verl_checkpoint_manager_update(
             requested_model_version=receive_report.get("requested_model_version"),
             resolved_model_version=receive_report.get("resolved_model_version"),
             source_roles=tuple(receive_report.get("source_roles", ())),
+            attempt_roles=tuple(receive_report.get("attempt_roles", ())),
+            attempt_successes=tuple(receive_report.get("attempt_successes", ())),
             retry_count=int(receive_report.get("retry_count", 0)),
             bytes_transferred=int(receive_report.get("bytes_transferred", 0)),
             tensor_count=int(receive_report.get("tensor_count", 0)),
@@ -490,6 +513,10 @@ def run_verl_checkpoint_manager_update(
                 "resolved_model_version"
             ),
             recovery_source_roles=tuple(recovery_report.get("source_roles", ())),
+            recovery_attempt_roles=tuple(recovery_report.get("attempt_roles", ())),
+            recovery_attempt_successes=tuple(
+                recovery_report.get("attempt_successes", ())
+            ),
             recovery_retry_count=int(recovery_report.get("retry_count", 0)),
             recovery_bytes_transferred=int(
                 recovery_report.get("bytes_transferred", 0)
