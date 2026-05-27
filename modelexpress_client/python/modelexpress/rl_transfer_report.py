@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+from modelexpress import p2p_pb2
 from modelexpress.rl_metadata import RlSourceCandidate, RlSourceRole
 
 
@@ -26,6 +27,8 @@ class RlTransferAttempt:
     success: bool
     error: str | None = None
     lease_id: str = ""
+    source_status: int = p2p_pb2.SOURCE_STATUS_UNKNOWN
+    source_updated_at: int = 0
     bytes_transferred: int = 0
     tensor_count: int = 0
     duration_seconds: float = 0.0
@@ -47,6 +50,8 @@ def successful_attempt_from_candidate(
         model_version=candidate.metadata.model_version,
         success=True,
         lease_id=lease_id,
+        source_status=candidate.status,
+        source_updated_at=candidate.updated_at,
         bytes_transferred=bytes_transferred,
         tensor_count=tensor_count,
         duration_seconds=duration_seconds,
@@ -66,6 +71,8 @@ def failed_attempt_from_candidate(
         success=False,
         error=str(exc),
         lease_id=_lease_id_for_exception(exc, candidate),
+        source_status=candidate.status,
+        source_updated_at=candidate.updated_at,
     )
 
 

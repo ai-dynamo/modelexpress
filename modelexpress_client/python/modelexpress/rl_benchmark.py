@@ -304,6 +304,8 @@ def _attempt_to_dict(attempt: RlTransferAttempt) -> dict[str, Any]:
         "model_version": attempt.model_version,
         "success": attempt.success,
         "error": attempt.error,
+        "source_status": attempt.source_status,
+        "source_updated_at": attempt.source_updated_at,
         "bytes_transferred": attempt.bytes_transferred,
         "tensor_count": attempt.tensor_count,
         "duration_seconds": attempt.duration_seconds,

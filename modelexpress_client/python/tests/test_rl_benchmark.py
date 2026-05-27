@@ -5,6 +5,7 @@ import argparse
 
 import pytest
 
+from modelexpress import p2p_pb2
 from modelexpress.rl_benchmark import (
     RlTransferBenchmarkConfig,
     RlTransferBenchmarkResult,
@@ -75,6 +76,8 @@ def test_benchmark_iteration_serializes_report_attempts():
                 role=RlSourceRole.INFERENCE_REPLICA,
                 model_version=7,
                 success=True,
+                source_status=p2p_pb2.SOURCE_STATUS_READY,
+                source_updated_at=1234567890000,
                 bytes_transferred=1024,
                 tensor_count=2,
                 duration_seconds=0.01,
@@ -99,6 +102,10 @@ def test_benchmark_iteration_serializes_report_attempts():
     assert item.tensor_count == 2
     assert item.effective_bandwidth_gbps == pytest.approx(0.000016384)
     assert item.to_dict()["attempts"][0]["error"] == "first failed"
+    assert item.to_dict()["attempts"][1]["source_status"] == (
+        p2p_pb2.SOURCE_STATUS_READY
+    )
+    assert item.to_dict()["attempts"][1]["source_updated_at"] == 1234567890000
 
 
 def test_benchmark_result_summary_ignores_warmups():
