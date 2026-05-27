@@ -34,11 +34,13 @@ from modelexpress.rl_publication import (
 )
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
+    plan_dense_reshard_transfers,
     plan_exact_transfers,
     receive_specs_from_shape_registry,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
 )
+from modelexpress.rl_slice_transfer import build_slice_transfer_manifest
 from modelexpress.types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.rl_transfer")
@@ -636,14 +638,23 @@ class RlNixlWeightTransfer:
                 else receive_specs_from_tensors(target_tensors, receiver_rank=receiver_rank)
             )
 
+        source_specs = source_specs_from_shape_registry(
+            shape_registry,
+            worker_rank=candidate.worker_rank,
+        )
         plan = plan_exact_transfers(
-            source_specs_from_shape_registry(
-                shape_registry,
-                worker_rank=candidate.worker_rank,
-            ),
+            source_specs,
             effective_target_specs,
             same_rank_only=same_rank_only,
         )
+        if not plan.complete:
+            dense_plan = plan_dense_reshard_transfers(
+                source_specs,
+                effective_target_specs,
+                same_rank_only=same_rank_only,
+            )
+            if dense_plan.complete:
+                plan = dense_plan
         plan.raise_if_incomplete()
 
         planned_names = {entry.tensor_name for entry in plan.entries}
@@ -669,6 +680,11 @@ class RlNixlWeightTransfer:
             raise RuntimeError(
                 f"ModelExpress source descriptors missing planned entries {missing_names}"
             )
+        transfer_manifest = build_slice_transfer_manifest(
+            plan,
+            source_descriptors=descriptors,
+            target_tensors=target_tensors,
+        )
 
         self._shutdown_target_nixl_manager()
         manager = NixlTransferManager(
@@ -676,13 +692,13 @@ class RlNixlWeightTransfer:
             device_id=device_id,
         )
         manager.initialize()
-        manager.register_tensors(target_tensors)
+        manager.register_tensors(transfer_manifest.target_tensors)
         self._target_nixl_manager = manager
         self._nixl_manager = manager
 
         bytes_transferred, tensor_count, _duration = manager.receive_from_source(
             source_metadata=metadata_resp.worker.nixl_metadata,
-            source_tensors=descriptors,
+            source_tensors=transfer_manifest.source_descriptors,
             timeout_seconds=self.timeout_seconds,
         )
         logger.info(
@@ -692,13 +708,8 @@ class RlNixlWeightTransfer:
             tensor_count,
             bytes_transferred,
         )
-        tensors = [
-            (descriptor.name, tensor)
-            for descriptor in descriptors
-            if (tensor := target_tensors.get(descriptor.name)) is not None
-        ]
         return _ReceiveCandidateResult(
-            tensors=tensors,
+            tensors=transfer_manifest.output_tensors,
             bytes_transferred=bytes_transferred,
             tensor_count=tensor_count,
             duration_seconds=_duration,
