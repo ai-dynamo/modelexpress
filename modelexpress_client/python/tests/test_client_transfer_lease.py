@@ -49,6 +49,19 @@ class _FakeStub:
             lease=p2p_pb2.TransferLease(lease_id=request.lease_id),
         )
 
+    def ListTransferLeases(self, request, timeout=None):
+        self.requests.append(("list", request, timeout))
+        return p2p_pb2.ListTransferLeasesResponse(
+            leases=[
+                p2p_pb2.TransferLease(
+                    lease_id="lease-1",
+                    mx_source_id=request.mx_source_id,
+                    target_worker_id=request.target_worker_id,
+                    status=request.status_filter,
+                )
+            ]
+        )
+
 
 class _FakeClient(MxClient):
     def __init__(self, stub):
@@ -88,7 +101,7 @@ def test_begin_transfer_lease_sends_request_fields():
     assert request.metadata["role"] == "trainer"
 
 
-def test_renew_complete_and_get_transfer_lease():
+def test_renew_complete_get_and_list_transfer_lease():
     stub = _FakeStub()
     client = _FakeClient(stub)
 
@@ -98,14 +111,23 @@ def test_renew_complete_and_get_transfer_lease():
         status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     )
     fetched = client.get_transfer_lease("lease-1")
+    listed = client.list_transfer_leases(
+        mx_source_id="source",
+        target_worker_id="target-worker",
+        status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
 
     assert renewed.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
     assert completed.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
     assert fetched.found
+    assert len(listed.leases) == 1
+    assert listed.leases[0].mx_source_id == "source"
+    assert listed.leases[0].target_worker_id == "target-worker"
     assert [method for method, _request, _timeout in stub.requests] == [
         "renew",
         "complete",
         "get",
+        "list",
     ]
 
 

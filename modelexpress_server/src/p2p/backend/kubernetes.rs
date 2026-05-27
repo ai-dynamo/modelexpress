@@ -807,6 +807,47 @@ impl MetadataBackend for KubernetesBackend {
         Ok(Some(serde_json::from_str(&json)?))
     }
 
+    async fn list_transfer_leases(
+        &self,
+        mx_source_id: Option<String>,
+        target_worker_id: Option<String>,
+        status_filter: Option<TransferLeaseStatus>,
+    ) -> MetadataResult<Vec<TransferLeaseRecord>> {
+        let api = self.configmap_api();
+        let list_params =
+            ListParams::default().labels("modelexpress.nvidia.com/transfer-lease=true");
+        let cms = api.list(&list_params).await?;
+        let mut leases = Vec::new();
+        for cm in cms.items {
+            let Some(json) = cm.data.and_then(|data| data.get("lease.json").cloned()) else {
+                continue;
+            };
+            let lease: TransferLeaseRecord = serde_json::from_str(&json)?;
+            if mx_source_id
+                .as_ref()
+                .is_some_and(|source_id| lease.mx_source_id != *source_id)
+            {
+                continue;
+            }
+            if target_worker_id
+                .as_ref()
+                .is_some_and(|worker_id| lease.target_worker_id != *worker_id)
+            {
+                continue;
+            }
+            if status_filter.is_some_and(|status| lease.status != status as i32) {
+                continue;
+            }
+            leases.push(lease);
+        }
+        leases.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.lease_id.cmp(&b.lease_id))
+        });
+        Ok(leases)
+    }
+
     async fn renew_transfer_lease(
         &self,
         lease_id: &str,

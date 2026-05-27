@@ -33,6 +33,7 @@ mod keys {
     pub const TRANSFER_LEASE_PREFIX: &str = "mx:transfer_lease:";
     /// SCAN pattern matching source index keys: `mx:source:{16-char-id}`
     pub const SOURCE_SCAN_PATTERN: &str = "mx:source:????????????????";
+    pub const TRANSFER_LEASE_SCAN_PATTERN: &str = "mx:transfer_lease:*";
     /// Reserved hash field in the source index key that stores SourceAttributesJson.
     pub const ATTRIBUTES_FIELD: &str = "__attributes__";
 }
@@ -638,6 +639,46 @@ impl MetadataBackend for RedisBackend {
         value
             .map(|json| serde_json::from_str::<TransferLeaseRecord>(&json).map_err(Into::into))
             .transpose()
+    }
+
+    async fn list_transfer_leases(
+        &self,
+        mx_source_id: Option<String>,
+        target_worker_id: Option<String>,
+        status_filter: Option<TransferLeaseStatus>,
+    ) -> MetadataResult<Vec<TransferLeaseRecord>> {
+        let mut conn = self.get_conn().await?;
+        let keys = scan_keys(&mut conn, keys::TRANSFER_LEASE_SCAN_PATTERN).await?;
+        let mut leases = Vec::new();
+        for key in keys {
+            let value: Option<String> = conn.get(&key).await?;
+            let Some(json) = value else {
+                continue;
+            };
+            let lease: TransferLeaseRecord = serde_json::from_str(&json)?;
+            if mx_source_id
+                .as_ref()
+                .is_some_and(|source_id| lease.mx_source_id != *source_id)
+            {
+                continue;
+            }
+            if target_worker_id
+                .as_ref()
+                .is_some_and(|worker_id| lease.target_worker_id != *worker_id)
+            {
+                continue;
+            }
+            if status_filter.is_some_and(|status| lease.status != status as i32) {
+                continue;
+            }
+            leases.push(lease);
+        }
+        leases.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.lease_id.cmp(&b.lease_id))
+        });
+        Ok(leases)
     }
 
     async fn renew_transfer_lease(

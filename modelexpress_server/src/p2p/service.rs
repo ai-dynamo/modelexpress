@@ -12,10 +12,10 @@ use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
     BeginTransferLeaseRequest, CompleteTransferLeaseRequest, GetMetadataRequest,
     GetMetadataResponse, GetTransferLeaseRequest, GetTransferLeaseResponse, ListSourcesRequest,
-    ListSourcesResponse, PublishMetadataRequest, PublishMetadataResponse,
-    RenewTransferLeaseRequest, SourceInstanceRef, SourceStatus, TransferLeaseResponse,
-    TransferLeaseStatus, UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata,
-    p2p_service_server::P2pService,
+    ListSourcesResponse, ListTransferLeasesRequest, ListTransferLeasesResponse,
+    PublishMetadataRequest, PublishMetadataResponse, RenewTransferLeaseRequest, SourceInstanceRef,
+    SourceStatus, TransferLeaseResponse, TransferLeaseStatus, UpdateStatusRequest,
+    UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -439,6 +439,42 @@ impl P2pService for P2pServiceImpl {
                 Ok(Response::new(GetTransferLeaseResponse {
                     found: false,
                     lease: None,
+                }))
+            }
+        }
+    }
+
+    async fn list_transfer_leases(
+        &self,
+        request: Request<ListTransferLeasesRequest>,
+    ) -> Result<Response<ListTransferLeasesResponse>, Status> {
+        let req = request.into_inner();
+        let status_filter = req
+            .status_filter
+            .and_then(|status| TransferLeaseStatus::try_from(status).ok());
+        let mx_source_id = if req.mx_source_id.is_empty() {
+            None
+        } else {
+            Some(req.mx_source_id)
+        };
+        let target_worker_id = if req.target_worker_id.is_empty() {
+            None
+        } else {
+            Some(req.target_worker_id)
+        };
+
+        match self
+            .state
+            .list_transfer_leases(mx_source_id, target_worker_id, status_filter)
+            .await
+        {
+            Ok(leases) => Ok(Response::new(ListTransferLeasesResponse {
+                leases: leases.into_iter().map(Into::into).collect(),
+            })),
+            Err(e) => {
+                error!("Failed to list transfer leases: {}", e);
+                Ok(Response::new(ListTransferLeasesResponse {
+                    leases: Vec::new(),
                 }))
             }
         }

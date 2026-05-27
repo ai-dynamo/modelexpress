@@ -86,6 +86,13 @@ def test_live_server_transfer_lease_contract():
         assert fetched.found
         assert fetched.lease.lease_id == lease_id
         assert fetched.lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+
+        listed = client.list_transfer_leases(
+            mx_source_id="live-lease-source",
+            target_worker_id="target-worker",
+            status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+        )
+        assert [lease.lease_id for lease in listed.leases] == [lease_id]
     finally:
         client.close()
 

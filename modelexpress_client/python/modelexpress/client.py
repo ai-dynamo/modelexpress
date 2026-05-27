@@ -117,6 +117,16 @@ class MxClientBase(ABC):
         """Fetch a durable transfer lease, when supported."""
         raise NotImplementedError
 
+    def list_transfer_leases(
+        self,
+        *,
+        mx_source_id: str = "",
+        target_worker_id: str = "",
+        status_filter: "p2p_pb2.TransferLeaseStatus | None" = None,
+    ) -> "p2p_pb2.ListTransferLeasesResponse":
+        """List durable transfer leases, when supported."""
+        raise NotImplementedError
+
     @abstractmethod
     def close(self) -> None:
         """Release any resources held by the client."""
@@ -335,3 +345,18 @@ class MxClient(MxClientBase):
         """Fetch a durable transfer lease by ID."""
         request = p2p_pb2.GetTransferLeaseRequest(lease_id=lease_id)
         return self.stub.GetTransferLease(request, timeout=30)
+
+    def list_transfer_leases(
+        self,
+        *,
+        mx_source_id: str = "",
+        target_worker_id: str = "",
+        status_filter: "p2p_pb2.TransferLeaseStatus | None" = None,
+    ) -> "p2p_pb2.ListTransferLeasesResponse":
+        """List durable transfer leases with optional source/target/status filters."""
+        request = p2p_pb2.ListTransferLeasesRequest(
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
+            status_filter=status_filter,
+        )
+        return self.stub.ListTransferLeases(request, timeout=30)

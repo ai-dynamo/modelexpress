@@ -249,6 +249,28 @@ impl P2pStateManager {
         self.observe_transfer_lease(record).await.map(Some)
     }
 
+    /// List transfer leases and persist EXPIRED for active records whose TTL elapsed.
+    pub async fn list_transfer_leases(
+        &self,
+        mx_source_id: Option<String>,
+        target_worker_id: Option<String>,
+        status_filter: Option<TransferLeaseStatus>,
+    ) -> MetadataResult<Vec<TransferLeaseRecord>> {
+        let leases = self
+            .get_backend()
+            .await?
+            .list_transfer_leases(mx_source_id, target_worker_id, None)
+            .await?;
+        let mut observed = Vec::with_capacity(leases.len());
+        for lease in leases {
+            observed.push(self.observe_transfer_lease(lease).await?);
+        }
+        if let Some(status) = status_filter {
+            observed.retain(|lease| lease.status == status as i32);
+        }
+        Ok(observed)
+    }
+
     /// Extend an active transfer lease with a fresh expiry.
     pub async fn renew_transfer_lease(
         &self,
@@ -820,5 +842,34 @@ mod tests {
             .expect("complete_transfer_lease failed");
 
         assert_eq!(lease.lease_id, "lease-1");
+    }
+
+    #[tokio::test]
+    async fn test_list_transfer_leases_filters_after_observing() {
+        let mut mock = MockMetadataBackend::new();
+        let active = active_lease_record("lease-active");
+        let mut completed = active_lease_record("lease-complete");
+        completed.status = TransferLeaseStatus::Completed as i32;
+        mock.expect_list_transfer_leases()
+            .with(
+                eq(Some("abc123def456abcd".to_string())),
+                eq(Some("target-worker".to_string())),
+                eq(None),
+            )
+            .once()
+            .returning(move |_, _, _| Ok(vec![active.clone(), completed.clone()]));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let leases = manager
+            .list_transfer_leases(
+                Some("abc123def456abcd".to_string()),
+                Some("target-worker".to_string()),
+                Some(TransferLeaseStatus::Completed),
+            )
+            .await
+            .expect("list_transfer_leases failed");
+
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].lease_id, "lease-complete");
     }
 }

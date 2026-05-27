@@ -35,6 +35,9 @@ service P2pService {
 
   // Fetch a transfer lease by ID for recovery/debugging.
   rpc GetTransferLease(GetTransferLeaseRequest) returns (GetTransferLeaseResponse);
+
+  // List transfer leases for recovery/debugging.
+  rpc ListTransferLeases(ListTransferLeasesRequest) returns (ListTransferLeasesResponse);
 }
 
 // ============================================================================
@@ -387,6 +390,13 @@ message GetTransferLeaseRequest {
   string lease_id = 1;
 }
 
+message ListTransferLeasesRequest {
+  // Optional filters. Empty string / unset means no filter.
+  string mx_source_id = 1;
+  string target_worker_id = 2;
+  optional TransferLeaseStatus status_filter = 3;
+}
+
 message TransferLeaseResponse {
   bool success = 1;
   string message = 2;
@@ -396,4 +406,8 @@ message TransferLeaseResponse {
 message GetTransferLeaseResponse {
   bool found = 1;
   TransferLease lease = 2;
+}
+
+message ListTransferLeasesResponse {
+  repeated TransferLease leases = 1;
 }
