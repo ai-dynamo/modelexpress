@@ -19,6 +19,14 @@ from modelexpress import p2p_pb2
 from modelexpress.client import MxClientBase
 from modelexpress.metadata.heartbeat import HeartbeatThread
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.rl_fanin_transfer import (
+    DenseFanInReceiveResult,
+    candidate_fanin_groups,
+    candidate_group_label,
+    execute_dense_fanin_receive,
+    prepare_dense_fanin_receive,
+    source_descriptors_from_worker,
+)
 from modelexpress.rl_metadata import (
     RlSourceCandidate,
     RlSourceMetadata,
@@ -41,7 +49,6 @@ from modelexpress.rl_reshard import (
     source_specs_from_shape_registry,
 )
 from modelexpress.rl_slice_transfer import build_slice_transfer_manifest
-from modelexpress.types import TensorDescriptor
 
 logger = logging.getLogger("modelexpress.rl_transfer")
 
@@ -215,20 +222,6 @@ def allocate_tensors_from_shape_registry(
             device=device,
         )
     return tensors
-
-
-def source_descriptors(worker: "p2p_pb2.WorkerMetadata") -> list[TensorDescriptor]:
-    """Convert protobuf descriptors into the Python transfer descriptor type."""
-    return [
-        TensorDescriptor(
-            name=tensor.name,
-            addr=tensor.addr,
-            size=tensor.size,
-            device_id=tensor.device_id,
-            dtype=tensor.dtype,
-        )
-        for tensor in worker.tensors
-    ]
 
 
 def candidates_for_base_identity(
@@ -570,6 +563,43 @@ class RlNixlWeightTransfer:
                     candidate.worker_id,
                     exc_info=True,
                 )
+        for candidate_group in candidate_fanin_groups(candidates):
+            try:
+                result = self._receive_from_candidate_group(
+                    candidate_group,
+                    receiver_rank=receiver_rank,
+                    same_rank_only=same_rank_only,
+                    target_tensors=target_tensors,
+                    target_specs=target_specs,
+                )
+                attempts.extend(
+                    _successful_attempt_from_candidate(
+                        source_result.candidate,
+                        bytes_transferred=source_result.bytes_transferred,
+                        tensor_count=source_result.tensor_count,
+                        duration_seconds=source_result.duration_seconds,
+                    )
+                    for source_result in result.source_results
+                )
+                self.last_receive_report = RlTransferReport(
+                    requested_model_version=model_version,
+                    resolved_model_version=candidate_group[0].metadata.model_version,
+                    receiver_rank=receiver_rank,
+                    attempts=tuple(attempts),
+                )
+                return candidate_group[0].metadata.model_version, result.tensors
+            except Exception as exc:
+                errors.append(f"{candidate_group_label(candidate_group)}: {exc}")
+                attempts.extend(
+                    _failed_attempt_from_candidate(candidate, exc)
+                    for candidate in candidate_group
+                )
+                logger.warning(
+                    "ModelExpress RL dense fan-in transfer failed; trying next group: "
+                    "group=%s",
+                    candidate_group_label(candidate_group),
+                    exc_info=True,
+                )
         self.last_receive_report = RlTransferReport(
             requested_model_version=model_version,
             resolved_model_version=None,
@@ -671,7 +701,7 @@ class RlNixlWeightTransfer:
 
         descriptors = [
             descriptor
-            for descriptor in source_descriptors(metadata_resp.worker)
+            for descriptor in source_descriptors_from_worker(metadata_resp.worker)
             if descriptor.name in planned_names
         ]
         descriptor_names = {descriptor.name for descriptor in descriptors}
@@ -714,6 +744,53 @@ class RlNixlWeightTransfer:
             tensor_count=tensor_count,
             duration_seconds=_duration,
         )
+
+    def _receive_from_candidate_group(
+        self,
+        candidates: Sequence[RlSourceCandidate],
+        *,
+        receiver_rank: int,
+        same_rank_only: bool,
+        target_tensors: dict[str, torch.Tensor] | None,
+        target_specs: Sequence[TensorReceiveSpec] | None,
+    ) -> DenseFanInReceiveResult:
+        if target_tensors is None:
+            raise RuntimeError(
+                "ModelExpress dense fan-in requires caller-owned target tensors"
+            )
+
+        fanin_plan = prepare_dense_fanin_receive(
+            mx_client=self.mx_client,
+            candidates=candidates,
+            target_tensors=target_tensors,
+            target_specs=target_specs,
+            receiver_rank=receiver_rank,
+            same_rank_only=same_rank_only,
+        )
+        device_id = self.resolve_device_id(target_tensors.values())
+        self._shutdown_target_nixl_manager()
+        manager = NixlTransferManager(
+            agent_name=f"mx-rl-target-{uuid.uuid4().hex[:12]}",
+            device_id=device_id,
+        )
+        manager.initialize()
+        self._target_nixl_manager = manager
+        self._nixl_manager = manager
+        result = execute_dense_fanin_receive(
+            fanin_plan,
+            manager=manager,
+            timeout_seconds=self.timeout_seconds,
+        )
+        logger.info(
+            "Received ModelExpress RL dense fan-in weights: model=%s version=%d "
+            "sources=%d tensors=%d bytes=%d",
+            self.base_identity.model_name,
+            fanin_plan.model_version,
+            len(result.source_results),
+            result.tensor_count,
+            result.bytes_transferred,
+        )
+        return result
 
     async def wait_for_source(
         self,
