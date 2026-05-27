@@ -143,6 +143,13 @@ def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
     assert result.recovery_tensor_count == 15
     assert result.recovery_bytes_transferred > 0
     assert result.recovery_attempt_lease_ids
+    assert result.recovery_attempt_lease_ids == result.recovery_report_lease_ids
+    assert result.recovery_transfer_lease_discovery_supported
+    assert result.recovery_matching_lease_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
+    assert result.recovery_missing_lease_ids == ()
+    assert result.recovery_non_completed_lease_statuses == ()
 
 
 def test_live_verl_modelexpress_trainer_failure_falls_back_to_replica(
@@ -174,6 +181,16 @@ def test_live_verl_modelexpress_trainer_failure_falls_back_to_replica(
     assert result.recovery_tensor_count == 15
     assert result.recovery_bytes_transferred > 0
     assert len(result.recovery_attempt_lease_ids) == 2
+    assert result.recovery_attempt_lease_ids == result.recovery_report_lease_ids
+    assert result.recovery_transfer_lease_discovery_supported
+    assert result.recovery_matching_lease_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
+    assert result.recovery_missing_lease_ids == ()
+    assert result.recovery_non_completed_lease_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+    )
 
 
 def _load_harness():

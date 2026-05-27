@@ -48,6 +48,11 @@ class VerlRuntimeSmokeResult:
     recovery_bytes_transferred: int = 0
     recovery_tensor_count: int = 0
     recovery_attempt_lease_ids: tuple[str, ...] = ()
+    recovery_report_lease_ids: tuple[str, ...] = ()
+    recovery_matching_lease_statuses: tuple[int, ...] = ()
+    recovery_missing_lease_ids: tuple[str, ...] = ()
+    recovery_non_completed_lease_statuses: tuple[int, ...] = ()
+    recovery_transfer_lease_discovery_supported: bool = False
     recovery_success: bool = False
 
 
@@ -436,6 +441,7 @@ def run_verl_checkpoint_manager_update(
         recovery_update_seconds = 0.0
         recovery_check_seconds = 0.0
         recovery_report = {}
+        recovery_lease_snapshot = {}
         if recover_latest_from_replica:
             if backend != "modelexpress":
                 raise ValueError("latest replica recovery is only supported for ModelExpress")
@@ -471,6 +477,7 @@ def run_verl_checkpoint_manager_update(
             recovery_rollout.check_weights()
             recovery_check_seconds = time.perf_counter() - recovery_check_started
             recovery_report = _receive_report_snapshot(recovery_rollout)
+            recovery_lease_snapshot = _lease_snapshot(recovery_rollout)
         lease_snapshot = _lease_snapshot(rollout) if backend == "modelexpress" else {}
         return VerlRuntimeSmokeResult(
             backend=backend,
@@ -524,6 +531,21 @@ def run_verl_checkpoint_manager_update(
             recovery_tensor_count=int(recovery_report.get("tensor_count", 0)),
             recovery_attempt_lease_ids=tuple(
                 recovery_report.get("attempt_lease_ids", ())
+            ),
+            recovery_report_lease_ids=tuple(
+                recovery_lease_snapshot.get("report_lease_ids", ())
+            ),
+            recovery_matching_lease_statuses=tuple(
+                recovery_lease_snapshot.get("matching_lease_statuses", ())
+            ),
+            recovery_missing_lease_ids=tuple(
+                recovery_lease_snapshot.get("missing_lease_ids", ())
+            ),
+            recovery_non_completed_lease_statuses=tuple(
+                recovery_lease_snapshot.get("non_completed_lease_statuses", ())
+            ),
+            recovery_transfer_lease_discovery_supported=bool(
+                recovery_lease_snapshot.get("discovery_supported", False)
             ),
             recovery_success=bool(recovery_report.get("success", False)),
         )
