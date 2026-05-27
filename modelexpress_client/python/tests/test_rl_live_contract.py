@@ -20,7 +20,10 @@ from modelexpress.rl_metadata import (
 )
 from modelexpress.rl_reshard import TensorReceiveSpec
 from modelexpress.rl_transfer import RlNixlWeightTransfer, build_rl_base_identity
-from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator
+from modelexpress.rl_transfer_lease import (
+    RlTransferLeaseCoordinator,
+    summarize_report_leases,
+)
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
 
@@ -418,6 +421,80 @@ def test_live_server_transfers_multi_source_dense_fanin_cuda_version():
         receiver.finalize()
         publisher_r1.finalize()
         publisher_r0.finalize()
+        client.close()
+
+
+def test_live_server_summarizes_failed_transfer_lease_cuda_version():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    pytest.importorskip("nixl._api")
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-failed-lease-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    publisher = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    receiver = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"receiver-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+
+    try:
+        publisher.publish_tensors(
+            {"w": torch.tensor([1.0], dtype=torch.float32, device="cuda:0")},
+            model_version=13,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="No ModelExpress RL source transfer succeeded",
+        ):
+            asyncio.run(
+                receiver.receive_into_tensors(
+                    {"missing": torch.zeros((1,), dtype=torch.float32, device="cuda:0")},
+                    model_version=None,
+                    receiver_rank=0,
+                    target_specs=[
+                        TensorReceiveSpec(
+                            name="missing",
+                            receiver_rank=0,
+                            shape=(1,),
+                            dtype="torch.float32",
+                        )
+                    ],
+                )
+            )
+
+        assert receiver.last_receive_report is not None
+        attempt = receiver.last_receive_report.attempts[0]
+        assert not attempt.success
+        if not attempt.lease_id:
+            pytest.skip("server does not expose transfer lease RPCs")
+
+        inventory = receiver.list_target_transfer_leases(
+            statuses=(p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,),
+        )
+        summary = summarize_report_leases(receiver.last_receive_report, inventory)
+
+        assert summary.report_lease_ids == (attempt.lease_id,)
+        assert summary.missing_lease_ids == ()
+        assert [lease.lease_id for lease in summary.matching_leases] == [
+            attempt.lease_id
+        ]
+        assert [
+            lease.status for lease in summary.non_completed_matching_leases
+        ] == [p2p_pb2.TRANSFER_LEASE_STATUS_FAILED]
+    finally:
+        receiver.finalize()
+        publisher.finalize()
         client.close()
 
 
