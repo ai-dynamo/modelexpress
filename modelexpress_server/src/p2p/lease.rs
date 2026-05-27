@@ -40,6 +40,15 @@ impl TransferLeaseRecord {
         self.status == Self::active_status()
     }
 
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            TransferLeaseStatus::try_from(self.status),
+            Ok(TransferLeaseStatus::Completed
+                | TransferLeaseStatus::Failed
+                | TransferLeaseStatus::Expired)
+        )
+    }
+
     pub fn is_expired_at(&self, now_millis: i64) -> bool {
         self.is_active() && self.expires_at <= now_millis
     }
@@ -85,6 +94,23 @@ pub fn bounded_lease_ttl_millis(ttl_millis: u64) -> i64 {
 mod tests {
     use super::*;
 
+    fn record_with_status(status: i32) -> TransferLeaseRecord {
+        TransferLeaseRecord {
+            lease_id: "lease".to_string(),
+            mx_source_id: "source".to_string(),
+            source_worker_id: "source-worker".to_string(),
+            target_worker_id: "target-worker".to_string(),
+            target_worker_rank: 0,
+            model_version: 7,
+            status,
+            created_at: 100,
+            updated_at: 100,
+            expires_at: 200,
+            error_message: String::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
     #[test]
     fn test_bounded_lease_ttl_uses_default_for_zero() {
         assert_eq!(
@@ -103,21 +129,17 @@ mod tests {
     }
 
     #[test]
+    fn test_is_terminal_matches_completed_failed_and_expired() {
+        assert!(!record_with_status(TransferLeaseStatus::Active as i32).is_terminal());
+        assert!(record_with_status(TransferLeaseStatus::Completed as i32).is_terminal());
+        assert!(record_with_status(TransferLeaseStatus::Failed as i32).is_terminal());
+        assert!(record_with_status(TransferLeaseStatus::Expired as i32).is_terminal());
+        assert!(!record_with_status(i32::MAX).is_terminal());
+    }
+
+    #[test]
     fn test_observed_at_marks_active_lease_expired() {
-        let record = TransferLeaseRecord {
-            lease_id: "lease".to_string(),
-            mx_source_id: "source".to_string(),
-            source_worker_id: "source-worker".to_string(),
-            target_worker_id: "target-worker".to_string(),
-            target_worker_rank: 0,
-            model_version: 7,
-            status: TransferLeaseStatus::Active as i32,
-            created_at: 100,
-            updated_at: 100,
-            expires_at: 200,
-            error_message: String::new(),
-            metadata: HashMap::new(),
-        };
+        let record = record_with_status(TransferLeaseStatus::Active as i32);
 
         let observed = record.observed_at(201);
 

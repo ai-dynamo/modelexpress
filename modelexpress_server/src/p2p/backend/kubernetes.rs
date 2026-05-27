@@ -882,4 +882,20 @@ impl MetadataBackend for KubernetesBackend {
         lease.error_message = error_message.to_string();
         self.patch_transfer_lease(&lease).await
     }
+
+    async fn remove_transfer_lease(&self, lease_id: &str) -> MetadataResult<()> {
+        let api = self.configmap_api();
+        let name = transfer_lease_configmap_name(lease_id);
+        match api.delete(&name, &kube::api::DeleteParams::default()).await {
+            Ok(_) => {
+                debug!("Deleted transfer lease ConfigMap '{}'", name);
+                Ok(())
+            }
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                debug!("Transfer lease ConfigMap '{}' already gone", name);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }

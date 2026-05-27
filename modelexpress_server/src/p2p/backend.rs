@@ -297,6 +297,10 @@ pub trait MetadataBackend: Send + Sync {
         updated_at: i64,
         error_message: &str,
     ) -> MetadataResult<()>;
+
+    /// Remove a transfer lease by ID.
+    /// State-layer cleanup checks terminal eligibility before deleting records.
+    async fn remove_transfer_lease(&self, lease_id: &str) -> MetadataResult<()>;
 }
 
 pub use crate::backend_config::BackendConfig;

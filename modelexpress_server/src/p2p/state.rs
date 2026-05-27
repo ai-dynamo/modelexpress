@@ -295,6 +295,25 @@ impl P2pStateManager {
         Ok(expired_count)
     }
 
+    /// Remove terminal transfer leases whose last update is older than `max_age_millis`.
+    pub async fn cleanup_terminal_transfer_leases(
+        &self,
+        max_age_millis: u64,
+    ) -> MetadataResult<u32> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let backend = self.get_backend().await?;
+        let leases = backend.list_transfer_leases(None, None, None).await?;
+        let mut removed_count = 0u32;
+        for lease in leases {
+            let age_millis = now.saturating_sub(lease.updated_at).max(0) as u64;
+            if lease.is_terminal() && age_millis > max_age_millis {
+                backend.remove_transfer_lease(&lease.lease_id).await?;
+                removed_count = removed_count.saturating_add(1);
+            }
+        }
+        Ok(removed_count)
+    }
+
     /// Extend an active transfer lease with a fresh expiry.
     pub async fn renew_transfer_lease(
         &self,
@@ -926,5 +945,41 @@ mod tests {
             .expect("expire_transfer_leases failed");
 
         assert_eq!(expired_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_terminal_transfer_leases_removes_old_terminal_records() {
+        let mut mock = MockMetadataBackend::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut completed_old = active_lease_record("lease-completed-old");
+        completed_old.status = TransferLeaseStatus::Completed as i32;
+        completed_old.updated_at = now - 7_200_000;
+        let mut failed_recent = active_lease_record("lease-failed-recent");
+        failed_recent.status = TransferLeaseStatus::Failed as i32;
+        failed_recent.updated_at = now - 10_000;
+        let active_old = active_lease_record("lease-active-old");
+
+        mock.expect_list_transfer_leases()
+            .with(eq(None), eq(None), eq(None))
+            .once()
+            .returning(move |_, _, _| {
+                Ok(vec![
+                    completed_old.clone(),
+                    failed_recent.clone(),
+                    active_old.clone(),
+                ])
+            });
+        mock.expect_remove_transfer_lease()
+            .with(eq("lease-completed-old"))
+            .once()
+            .returning(|_| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let removed_count = manager
+            .cleanup_terminal_transfer_leases(3_600_000)
+            .await
+            .expect("cleanup_terminal_transfer_leases failed");
+
+        assert_eq!(removed_count, 1);
     }
 }

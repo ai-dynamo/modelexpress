@@ -727,6 +727,14 @@ impl MetadataBackend for RedisBackend {
         debug!("Finished transfer lease '{}' as {:?}", lease_id, status);
         Ok(())
     }
+
+    async fn remove_transfer_lease(&self, lease_id: &str) -> MetadataResult<()> {
+        let mut conn = self.get_conn().await?;
+        let key = transfer_lease_key(lease_id);
+        conn.del::<_, ()>(&key).await?;
+        debug!("Removed transfer lease '{}'", lease_id);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Server-side reaper for stale source detection, lease expiry, and garbage collection.
+//! Server-side reaper for stale source detection, lease maintenance, and garbage collection.
 //!
 //! Periodically scans all workers in the metadata backend:
 //! 1. **Stale detection**: READY workers whose `updated_at` exceeds the heartbeat
@@ -9,6 +9,8 @@
 //! 2. **Garbage collection**: STALE workers older than the GC timeout are deleted.
 //! 3. **Lease expiry**: ACTIVE transfer leases whose `expires_at` has elapsed are
 //!    marked EXPIRED.
+//! 4. **Lease garbage collection**: terminal transfer leases older than the lease
+//!    GC timeout are deleted.
 //!
 //! Safe to run on every server replica — all operations are idempotent.
 
@@ -31,12 +33,15 @@ pub async fn run_reaper(state: Arc<P2pStateManager>, shutdown: oneshot::Receiver
     let scan_interval_secs = env_u64("MX_REAPER_SCAN_INTERVAL_SECS", 30);
     let heartbeat_timeout_secs = env_u64("MX_HEARTBEAT_TIMEOUT_SECS", 90);
     let gc_timeout_secs = env_u64("MX_GC_TIMEOUT_SECS", 3600);
+    let transfer_lease_gc_timeout_secs =
+        env_u64("MX_TRANSFER_LEASE_GC_TIMEOUT_SECS", gc_timeout_secs);
     let heartbeat_timeout_ms = heartbeat_timeout_secs.saturating_mul(1000);
     let gc_timeout_ms = gc_timeout_secs.saturating_mul(1000);
+    let transfer_lease_gc_timeout_ms = transfer_lease_gc_timeout_secs.saturating_mul(1000);
 
     info!(
-        "Reaper started (scan_interval={}s, heartbeat_timeout={}s, gc_timeout={}s)",
-        scan_interval_secs, heartbeat_timeout_secs, gc_timeout_secs,
+        "Reaper started (scan_interval={}s, heartbeat_timeout={}s, gc_timeout={}s, transfer_lease_gc_timeout={}s)",
+        scan_interval_secs, heartbeat_timeout_secs, gc_timeout_secs, transfer_lease_gc_timeout_secs,
     );
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(scan_interval_secs));
@@ -45,7 +50,12 @@ pub async fn run_reaper(state: Arc<P2pStateManager>, shutdown: oneshot::Receiver
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = reap_once(&state, heartbeat_timeout_ms, gc_timeout_ms).await {
+                if let Err(e) = reap_once(
+                    &state,
+                    heartbeat_timeout_ms,
+                    gc_timeout_ms,
+                    transfer_lease_gc_timeout_ms,
+                ).await {
                     warn!("Reaper scan failed: {}", e);
                 }
             }
@@ -62,6 +72,7 @@ async fn reap_once(
     state: &P2pStateManager,
     heartbeat_timeout_ms: u64,
     gc_timeout_ms: u64,
+    transfer_lease_gc_timeout_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().timestamp_millis();
     let workers = state.list_workers(None, None).await?;
@@ -105,15 +116,18 @@ async fn reap_once(
     }
 
     let lease_expire_count = state.expire_transfer_leases().await?;
+    let lease_gc_count = state
+        .cleanup_terminal_transfer_leases(transfer_lease_gc_timeout_ms)
+        .await?;
 
-    if stale_count > 0 || gc_count > 0 || lease_expire_count > 0 {
+    if stale_count > 0 || gc_count > 0 || lease_expire_count > 0 || lease_gc_count > 0 {
         info!(
-            "Reaper: marked {} stale, expired {} transfer leases, garbage-collected {}",
-            stale_count, lease_expire_count, gc_count
+            "Reaper: marked {} stale, expired {} transfer leases, garbage-collected {} workers, garbage-collected {} transfer leases",
+            stale_count, lease_expire_count, gc_count, lease_gc_count,
         );
     } else {
         debug!(
-            "Reaper: no action needed ({} workers scanned, no expired transfer leases)",
+            "Reaper: no action needed ({} workers scanned, no expired or garbage-collectable transfer leases)",
             workers.len(),
         );
     }
@@ -135,6 +149,15 @@ mod tests {
                 source_id.is_none()
                     && worker_id.is_none()
                     && *status == Some(TransferLeaseStatus::Active)
+            })
+            .once()
+            .returning(|_, _, _| Ok(vec![]));
+    }
+
+    fn expect_no_terminal_transfer_leases(mock: &mut MockMetadataBackend) {
+        mock.expect_list_transfer_leases()
+            .withf(|source_id, worker_id, status| {
+                source_id.is_none() && worker_id.is_none() && status.is_none()
             })
             .once()
             .returning(|_, _, _| Ok(vec![]));
@@ -181,9 +204,10 @@ mod tests {
             .once()
             .returning(|_, _, _, _, _| Ok(()));
         expect_no_active_transfer_leases(&mut mock);
+        expect_no_terminal_transfer_leases(&mut mock);
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
-        reap_once(&state, 90_000, 3_600_000)
+        reap_once(&state, 90_000, 3_600_000, 3_600_000)
             .await
             .expect("reap_once failed");
     }
@@ -210,9 +234,10 @@ mod tests {
             .once()
             .returning(|_, _| Ok(()));
         expect_no_active_transfer_leases(&mut mock);
+        expect_no_terminal_transfer_leases(&mut mock);
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
-        reap_once(&state, 90_000, 3_600_000)
+        reap_once(&state, 90_000, 3_600_000, 3_600_000)
             .await
             .expect("reap_once failed");
     }
@@ -236,9 +261,10 @@ mod tests {
         });
         // No update_status or remove_worker calls expected
         expect_no_active_transfer_leases(&mut mock);
+        expect_no_terminal_transfer_leases(&mut mock);
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
-        reap_once(&state, 90_000, 3_600_000)
+        reap_once(&state, 90_000, 3_600_000, 3_600_000)
             .await
             .expect("reap_once failed");
     }
@@ -268,9 +294,39 @@ mod tests {
             })
             .once()
             .returning(|_, _, _, _| Ok(()));
+        expect_no_terminal_transfer_leases(&mut mock);
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
-        reap_once(&state, 90_000, 3_600_000)
+        reap_once(&state, 90_000, 3_600_000, 3_600_000)
+            .await
+            .expect("reap_once failed");
+    }
+
+    #[tokio::test]
+    async fn test_reap_garbage_collects_terminal_transfer_leases() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut completed = active_lease_record("lease-complete", now - 7_200_000);
+        completed.status = TransferLeaseStatus::Completed as i32;
+        completed.updated_at = now - 7_200_000;
+
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Ok(vec![]));
+        expect_no_active_transfer_leases(&mut mock);
+        mock.expect_list_transfer_leases()
+            .withf(|source_id, worker_id, status| {
+                source_id.is_none() && worker_id.is_none() && status.is_none()
+            })
+            .once()
+            .returning(move |_, _, _| Ok(vec![completed.clone()]));
+        mock.expect_remove_transfer_lease()
+            .withf(|lease_id| lease_id == "lease-complete")
+            .once()
+            .returning(|_| Ok(()));
+
+        let state = P2pStateManager::with_backend(Arc::new(mock));
+        reap_once(&state, 90_000, 3_600_000, 3_600_000)
             .await
             .expect("reap_once failed");
     }
