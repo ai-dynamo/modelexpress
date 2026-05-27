@@ -73,6 +73,7 @@ from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.heartbeat import HeartbeatThread  # noqa: F401
+from .rl_fanout import RlTreeFanoutPolicy  # noqa: F401
 from .rl_metadata import RlSourceMetadata, RlSourceRole  # noqa: F401
 from .rl_reshard import (  # noqa: F401
     MissingTensor,
@@ -98,6 +99,7 @@ __all__ = [
     "MissingTensor",
     "RlSourceMetadata",
     "RlSourceRole",
+    "RlTreeFanoutPolicy",
     "RlWeightUpdateLifecycleHooks",
     "TensorReceiveSpec",
     "TensorShardSpec",

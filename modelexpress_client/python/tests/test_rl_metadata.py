@@ -375,6 +375,44 @@ def test_select_candidates_retention_ignores_incomplete_newer_version():
     assert [candidate.mx_source_id for candidate in selected] == ["trainer-v8"]
 
 
+def test_select_candidates_can_filter_source_rank_without_complete_group():
+    candidates = [
+        _candidate(
+            "replica-r0",
+            version=8,
+            role=RlSourceRole.INFERENCE_REPLICA,
+            rank=0,
+            world_size=3,
+        ),
+        _candidate(
+            "replica-r1",
+            version=8,
+            role=RlSourceRole.INFERENCE_REPLICA,
+            rank=1,
+            world_size=3,
+        ),
+    ]
+
+    assert select_rl_source_candidates(
+        candidates,
+        receiver_rank=2,
+        roles=(RlSourceRole.INFERENCE_REPLICA,),
+        same_rank_only=False,
+        source_ranks_by_role={RlSourceRole.INFERENCE_REPLICA: (0,)},
+    ) == []
+
+    selected = select_rl_source_candidates(
+        candidates,
+        receiver_rank=2,
+        roles=(RlSourceRole.INFERENCE_REPLICA,),
+        same_rank_only=False,
+        require_complete_version=False,
+        source_ranks_by_role={RlSourceRole.INFERENCE_REPLICA: (0,)},
+    )
+
+    assert [candidate.mx_source_id for candidate in selected] == ["replica-r0"]
+
+
 def test_select_candidates_can_request_specific_version():
     candidates = [
         _candidate(

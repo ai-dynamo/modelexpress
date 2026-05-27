@@ -300,6 +300,7 @@ def select_rl_source_candidates(
     ),
     same_rank_only: bool = True,
     require_complete_version: bool = True,
+    source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
 ) -> list[RlSourceCandidate]:
     """Filter and order RL source candidates for a receiver rank.
 
@@ -310,10 +311,23 @@ def select_rl_source_candidates(
     requested.
     """
     role_priority = {role: index for index, role in enumerate(roles)}
+    source_rank_filter = None
+    if source_ranks_by_role is not None:
+        source_rank_filter = {
+            (role if isinstance(role, RlSourceRole) else RlSourceRole(str(role))): {
+                int(rank) for rank in ranks
+            }
+            for role, ranks in source_ranks_by_role.items()
+        }
+
     role_filtered = [
         candidate
         for candidate in candidates
         if candidate.metadata.role in role_priority
+        and (
+            source_rank_filter is None
+            or candidate.worker_rank in source_rank_filter.get(candidate.metadata.role, set())
+        )
     ]
     if not role_filtered:
         return []

@@ -12,6 +12,7 @@ from modelexpress.integrations.verl_checkpoint_engine import (
     _model_version_from_global_steps,
     _topology_from_metadata,
 )
+from modelexpress.rl_metadata import RlSourceRole
 
 
 async def _collect_weights(weights):
@@ -82,6 +83,12 @@ def test_topology_metadata_defaults_to_broadcast():
     assert _topology_from_metadata([]) == "broadcast"
 
 
+def test_topology_metadata_accepts_tree_fanout():
+    assert _topology_from_metadata([{"modelexpress_topology": "tree_fanout"}]) == (
+        "tree_fanout"
+    )
+
+
 def test_topology_metadata_rejects_conflicting_values():
     with pytest.raises(ValueError, match="conflicting ModelExpress veRL topologies"):
         _topology_from_metadata(
@@ -149,6 +156,31 @@ def test_init_rejects_unknown_topology():
             bucket_size=1,
             model_name="test-model",
             topology="unknown",
+        )
+
+
+def test_tree_fanout_defaults_to_republish_received():
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        topology="tree_fanout",
+        tree_fanout=3,
+        mx_client=object(),
+    )
+
+    assert engine.republish_received is True
+    assert engine.same_rank_only is False
+    assert engine.prepare() == {"modelexpress_topology": "tree_fanout"}
+
+
+def test_tree_fanout_requires_republish_received():
+    with pytest.raises(ValueError, match="requires republish_received"):
+        _ModelExpressCheckpointEngineMixin(
+            bucket_size=1,
+            model_name="test-model",
+            topology="tree_fanout",
+            republish_received=False,
+            mx_client=object(),
         )
 
 
@@ -281,6 +313,84 @@ def test_receive_weights_uses_explicit_replica_world_size():
 
     assert fake_transfer.republish_kwargs["replica_world_size"] == 4
     assert fake_transfer.republish_kwargs["model_version"] == 8
+
+
+def test_tree_fanout_receive_uses_parent_replica_policy():
+    class _FakeTransfer:
+        def __init__(self):
+            self.republish_kwargs = None
+
+        async def receive_tensors_and_publish_replica(self, **kwargs):
+            self.republish_kwargs = kwargs
+            return [("w", torch.zeros(1))]
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        topology="tree_fanout",
+        tree_fanout=2,
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(
+        rank=3,
+        world_size=5,
+        is_trainer=False,
+        receiver_rank=2,
+        source_world_size=1,
+    )
+
+    asyncio.run(_collect_weights(engine.receive_weights(global_steps=None)))
+
+    assert fake_transfer.republish_kwargs == {
+        "model_version": None,
+        "receiver_rank": 2,
+        "same_rank_only": False,
+        "roles": (RlSourceRole.INFERENCE_REPLICA,),
+        "source_ranks_by_role": {RlSourceRole.INFERENCE_REPLICA: (0,)},
+        "require_complete_version": False,
+        "replica_world_size": 4,
+    }
+
+
+def test_tree_fanout_first_wave_receives_from_trainer_root():
+    class _FakeTransfer:
+        def __init__(self):
+            self.republish_kwargs = None
+
+        async def receive_tensors_and_publish_replica(self, **kwargs):
+            self.republish_kwargs = kwargs
+            return [("w", torch.zeros(1))]
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        topology="tree_fanout",
+        tree_fanout=2,
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(
+        rank=1,
+        world_size=5,
+        is_trainer=False,
+        receiver_rank=0,
+        source_world_size=1,
+    )
+
+    asyncio.run(_collect_weights(engine.receive_weights(global_steps=8)))
+
+    assert fake_transfer.republish_kwargs == {
+        "model_version": 8,
+        "receiver_rank": 0,
+        "same_rank_only": False,
+        "roles": (RlSourceRole.TRAINER,),
+        "source_ranks_by_role": {RlSourceRole.TRAINER: (0,)},
+        "require_complete_version": True,
+        "replica_world_size": 4,
+    }
 
 
 def test_send_weights_passes_tensor_metadata_to_transfer():

@@ -31,7 +31,6 @@ from modelexpress.rl_metadata import (
     RlSourceCandidate,
     RlSourceMetadata,
     RlSourceRole,
-    candidates_from_response,
     select_rl_source_candidates,
     with_rl_source_metadata,
 )
@@ -55,6 +54,12 @@ from modelexpress.rl_shape_registry import (
     torch_dtype_from_string,
 )
 from modelexpress.rl_slice_transfer import build_slice_transfer_manifest
+from modelexpress.rl_transfer_identity import (
+    backend_framework_value,
+    build_rl_base_identity,
+    candidates_for_base_identity,
+    identity_matches_base,
+)
 from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator
 from modelexpress.rl_transfer_report import (
     RlTransferAttempt,
@@ -65,91 +70,6 @@ from modelexpress.rl_transfer_report import (
 logger = logging.getLogger("modelexpress.rl_transfer")
 
 _DEFAULT_RECEIVE_ROLES = (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER)
-
-_BACKEND_FRAMEWORKS = {
-    "vllm": p2p_pb2.BACKEND_FRAMEWORK_VLLM,
-    "sglang": p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
-    "trtllm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
-    "trt_llm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
-    "trt-llm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
-}
-
-
-def backend_framework_value(value: str | int) -> int:
-    """Return the SourceIdentity enum value for a framework name."""
-    if isinstance(value, int):
-        return value
-    normalized = value.strip().lower()
-    if normalized not in _BACKEND_FRAMEWORKS:
-        raise ValueError(
-            f"unsupported backend_framework {value!r}; expected one of "
-            f"{sorted(_BACKEND_FRAMEWORKS)}"
-        )
-    return _BACKEND_FRAMEWORKS[normalized]
-
-
-def build_rl_base_identity(
-    *,
-    model_name: str,
-    mx_version: str,
-    backend_framework: str | int,
-    tensor_parallel_size: int,
-    pipeline_parallel_size: int,
-    expert_parallel_size: int,
-    dtype: str,
-    quantization: str,
-    revision: str,
-) -> "p2p_pb2.SourceIdentity":
-    """Build the stable, non-versioned SourceIdentity shared by RL sources."""
-    if not model_name:
-        raise ValueError("ModelExpress RL transfer requires model_name")
-    return p2p_pb2.SourceIdentity(
-        mx_version=mx_version,
-        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
-        model_name=model_name,
-        backend_framework=backend_framework_value(backend_framework),
-        tensor_parallel_size=int(tensor_parallel_size),
-        pipeline_parallel_size=int(pipeline_parallel_size),
-        expert_parallel_size=int(expert_parallel_size),
-        dtype=dtype,
-        quantization=quantization,
-        revision=revision,
-    )
-
-
-def identity_matches_base(
-    identity: "p2p_pb2.SourceIdentity",
-    base_identity: "p2p_pb2.SourceIdentity",
-) -> bool:
-    """Return true when an RL source identity matches the non-versioned base."""
-    return (
-        identity.mx_version == base_identity.mx_version
-        and identity.mx_source_type == base_identity.mx_source_type
-        and identity.model_name == base_identity.model_name
-        and identity.backend_framework == base_identity.backend_framework
-        and identity.tensor_parallel_size == base_identity.tensor_parallel_size
-        and identity.pipeline_parallel_size == base_identity.pipeline_parallel_size
-        and identity.expert_parallel_size == base_identity.expert_parallel_size
-        and identity.dtype == base_identity.dtype
-        and identity.quantization == base_identity.quantization
-        and identity.revision == base_identity.revision
-    )
-
-
-def candidates_for_base_identity(
-    response: "p2p_pb2.ListSourcesResponse",
-    base_identity: "p2p_pb2.SourceIdentity",
-) -> list[RlSourceCandidate]:
-    """Parse RL candidates from a broad ListSources response."""
-    filtered_response = p2p_pb2.ListSourcesResponse()
-    for ref in response.instances:
-        if not ref.HasField("identity"):
-            continue
-        if not identity_matches_base(ref.identity, base_identity):
-            continue
-        filtered_response.instances.append(ref)
-    return candidates_from_response(filtered_response)
-
 
 def _successful_attempt_from_candidate(
     candidate: RlSourceCandidate,
@@ -343,6 +263,8 @@ class RlNixlWeightTransfer:
         receiver_rank: int,
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> list[tuple[str, torch.Tensor]]:
         """Discover, allocate, and pull a requested or latest model version."""
         _version, tensors = await self._receive_from_sources(
@@ -350,6 +272,8 @@ class RlNixlWeightTransfer:
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )
         return tensors
 
@@ -362,6 +286,8 @@ class RlNixlWeightTransfer:
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> list[tuple[str, torch.Tensor]]:
         """Discover and pull a requested or latest version into caller tensors."""
         if not target_tensors:
@@ -373,6 +299,8 @@ class RlNixlWeightTransfer:
             same_rank_only=same_rank_only,
             target_tensors=target_tensors,
             target_specs=target_specs,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )
         return tensors
 
@@ -386,6 +314,8 @@ class RlNixlWeightTransfer:
         same_rank_only: bool = False,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
         replica_world_size: int = 1,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> list[tuple[str, torch.Tensor]]:
         """Receive into caller tensors, then publish them as an inference replica."""
         if not target_tensors:
@@ -398,6 +328,8 @@ class RlNixlWeightTransfer:
             same_rank_only=same_rank_only,
             target_tensors=target_tensors,
             target_specs=effective_target_specs,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )
         self._publish_replica_tensors(
             tensors,
@@ -420,6 +352,8 @@ class RlNixlWeightTransfer:
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         replica_world_size: int = 1,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> list[tuple[str, torch.Tensor]]:
         """Receive allocated tensors, then publish them as an inference replica."""
         received_version, tensors = await self._receive_from_sources(
@@ -427,6 +361,8 @@ class RlNixlWeightTransfer:
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )
         self._publish_replica_tensors(
             tensors,
@@ -445,6 +381,8 @@ class RlNixlWeightTransfer:
         same_rank_only: bool,
         target_tensors: dict[str, torch.Tensor] | None = None,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> tuple[int, list[tuple[str, torch.Tensor]]]:
         self.last_receive_report = None
         candidates = await self.wait_for_sources(
@@ -452,6 +390,8 @@ class RlNixlWeightTransfer:
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )
         errors = []
         attempts: list[RlTransferAttempt] = []
@@ -776,6 +716,8 @@ class RlNixlWeightTransfer:
         receiver_rank: int,
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> RlSourceCandidate:
         """Poll MX metadata until the best matching source is visible."""
         return (
@@ -784,6 +726,8 @@ class RlNixlWeightTransfer:
                 receiver_rank=receiver_rank,
                 roles=roles,
                 same_rank_only=same_rank_only,
+                source_ranks_by_role=source_ranks_by_role,
+                require_complete_version=require_complete_version,
             )
         )[0]
 
@@ -794,6 +738,8 @@ class RlNixlWeightTransfer:
         receiver_rank: int,
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> list[RlSourceCandidate]:
         """Poll MX metadata until matching requested/latest sources are visible."""
         deadline = time.monotonic() + self.timeout_seconds
@@ -805,6 +751,8 @@ class RlNixlWeightTransfer:
                     receiver_rank=receiver_rank,
                     roles=roles,
                     same_rank_only=same_rank_only,
+                    source_ranks_by_role=source_ranks_by_role,
+                    require_complete_version=require_complete_version,
                 )
             except RuntimeError as exc:
                 last_error = exc
@@ -819,6 +767,8 @@ class RlNixlWeightTransfer:
         receiver_rank: int,
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> RlSourceCandidate:
         """Select the best source for a receiver from MX metadata."""
         return self.select_sources(
@@ -826,6 +776,8 @@ class RlNixlWeightTransfer:
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )[0]
 
     def select_sources(
@@ -835,6 +787,8 @@ class RlNixlWeightTransfer:
         receiver_rank: int,
         roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
+        source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
+        require_complete_version: bool = True,
     ) -> list[RlSourceCandidate]:
         """Select source candidates for a requested or latest model version."""
         response = self.mx_client.list_sources(
@@ -854,6 +808,8 @@ class RlNixlWeightTransfer:
             model_version=model_version,
             roles=roles,
             same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
         )
         if not selected:
             raise RuntimeError(

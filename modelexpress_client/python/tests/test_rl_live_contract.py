@@ -11,6 +11,7 @@ import torch
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
+from modelexpress.rl_fanout import RlTreeFanoutPolicy
 from modelexpress.rl_metadata import (
     RlSourceMetadata,
     RlSourceRole,
@@ -45,14 +46,16 @@ def _base_identity(model_name: str):
 def test_live_server_transfer_lease_contract():
     client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
     lease_id = f"lease-{uuid.uuid4().hex}"
+    mx_source_id = f"live-lease-source-{uuid.uuid4().hex[:8]}"
+    target_worker_id = f"target-worker-{uuid.uuid4().hex[:8]}"
 
     try:
         try:
             lease = client.begin_transfer_lease(
                 lease_id=lease_id,
-                mx_source_id="live-lease-source",
+                mx_source_id=mx_source_id,
                 source_worker_id="source-worker",
-                target_worker_id="target-worker",
+                target_worker_id=target_worker_id,
                 target_worker_rank=1,
                 model_version=17,
                 ttl_millis=5_000,
@@ -65,9 +68,9 @@ def test_live_server_transfer_lease_contract():
 
         assert lease.lease_id == lease_id
         assert lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
-        assert lease.mx_source_id == "live-lease-source"
+        assert lease.mx_source_id == mx_source_id
         assert lease.source_worker_id == "source-worker"
-        assert lease.target_worker_id == "target-worker"
+        assert lease.target_worker_id == target_worker_id
         assert lease.target_worker_rank == 1
         assert lease.model_version == 17
         assert lease.metadata["contract"] == "live"
@@ -88,8 +91,8 @@ def test_live_server_transfer_lease_contract():
         assert fetched.lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
 
         listed = client.list_transfer_leases(
-            mx_source_id="live-lease-source",
-            target_worker_id="target-worker",
+            mx_source_id=mx_source_id,
+            target_worker_id=target_worker_id,
             status_filter=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
         )
         assert [lease.lease_id for lease in listed.leases] == [lease_id]
@@ -366,5 +369,92 @@ def test_live_server_recovers_from_republished_inference_replica():
     finally:
         restarted_receiver.finalize()
         replica.finalize()
+        publisher.finalize()
+        client.close()
+
+
+def test_live_server_tree_fanout_uses_parent_replica_source():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    pytest.importorskip("nixl._api")
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-tree-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    publisher = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    parent = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"parent-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    child = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"child-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+
+    try:
+        source_tensor = torch.tensor([7.0, 8.0, 9.0], device="cuda:0")
+        publisher.publish_tensors({"w": source_tensor}, model_version=9)
+
+        root_policy = RlTreeFanoutPolicy(
+            receiver_rank=0,
+            replica_world_size=3,
+            fanout=2,
+        )
+        parent_tensor = torch.zeros_like(source_tensor)
+        asyncio.run(
+            parent.receive_and_publish_replica(
+                {"w": parent_tensor},
+                model_version=None,
+                receiver_rank=0,
+                roles=root_policy.roles,
+                same_rank_only=False,
+                source_ranks_by_role=root_policy.source_ranks_by_role,
+                require_complete_version=root_policy.parent_replica_rank is None,
+                replica_world_size=3,
+            )
+        )
+        torch.cuda.synchronize(0)
+        assert parent_tensor.detach().cpu().tolist() == [7.0, 8.0, 9.0]
+
+        child_policy = RlTreeFanoutPolicy(
+            receiver_rank=2,
+            replica_world_size=3,
+            fanout=2,
+        )
+        child_tensor = torch.zeros_like(source_tensor)
+        received = asyncio.run(
+            child.receive_into_tensors(
+                {"w": child_tensor},
+                model_version=None,
+                receiver_rank=2,
+                roles=child_policy.roles,
+                same_rank_only=False,
+                source_ranks_by_role=child_policy.source_ranks_by_role,
+                require_complete_version=child_policy.parent_replica_rank is None,
+            )
+        )
+        torch.cuda.synchronize(0)
+
+        assert received == [("w", child_tensor)]
+        assert child_tensor.detach().cpu().tolist() == [7.0, 8.0, 9.0]
+        assert child.last_receive_report is not None
+        attempt = child.last_receive_report.attempts[0]
+        assert attempt.role == RlSourceRole.INFERENCE_REPLICA
+        assert attempt.worker_rank == 0
+    finally:
+        child.finalize()
+        parent.finalize()
         publisher.finalize()
         client.close()

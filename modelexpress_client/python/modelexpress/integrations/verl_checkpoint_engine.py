@@ -20,6 +20,7 @@ from typing import Any
 import torch
 
 from modelexpress.client import MxClient, MxClientBase
+from modelexpress.rl_fanout import RlTreeFanoutPolicy
 from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
     build_rl_base_identity,
@@ -31,7 +32,8 @@ from modelexpress.rl_update_lifecycle import (
 
 _TOPOLOGY_BROADCAST = "broadcast"
 _TOPOLOGY_RANK_LOCAL = "rank_local"
-_TOPOLOGIES = {_TOPOLOGY_BROADCAST, _TOPOLOGY_RANK_LOCAL}
+_TOPOLOGY_TREE_FANOUT = "tree_fanout"
+_TOPOLOGIES = {_TOPOLOGY_BROADCAST, _TOPOLOGY_RANK_LOCAL, _TOPOLOGY_TREE_FANOUT}
 
 
 async def _iter_weights(weights: Any) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
@@ -99,6 +101,15 @@ def _normalize_bool(value: bool | str | None, *, default: bool = False) -> bool:
     raise ValueError(f"unsupported boolean value {value!r}")
 
 
+def _normalize_positive_int(value: int | str | None, *, default: int) -> int:
+    if value is None:
+        return default
+    result = int(value)
+    if result <= 0:
+        raise ValueError("value must be positive")
+    return result
+
+
 class _ModelExpressCheckpointEngineMixin:
     def __init__(
         self,
@@ -120,6 +131,7 @@ class _ModelExpressCheckpointEngineMixin:
         topology: str | None = None,
         same_rank_only: bool | None = None,
         republish_received: bool | str | None = None,
+        tree_fanout: int | str | None = None,
         tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
         lifecycle_hooks: RlWeightUpdateLifecycleHooks | None = None,
         pause_generation: Any | None = None,
@@ -142,12 +154,21 @@ class _ModelExpressCheckpointEngineMixin:
             if same_rank_only is None
             else same_rank_only
         )
-        self.republish_received = _normalize_bool(
+        self.tree_fanout = _normalize_positive_int(
+            tree_fanout if tree_fanout is not None else os.environ.get("MX_RL_TREE_FANOUT"),
+            default=2,
+        )
+        republish_value = (
             republish_received
             if republish_received is not None
-            else os.environ.get("MX_RL_REPUBLISH_RECEIVED"),
-            default=False,
+            else os.environ.get("MX_RL_REPUBLISH_RECEIVED")
         )
+        self.republish_received = _normalize_bool(
+            republish_value,
+            default=self.topology == _TOPOLOGY_TREE_FANOUT,
+        )
+        if self.topology == _TOPOLOGY_TREE_FANOUT and not self.republish_received:
+            raise ValueError("ModelExpress tree_fanout topology requires republish_received")
         self.base_identity = build_rl_base_identity(
             model_name=self.model_name,
             mx_version=mx_version,
@@ -296,19 +317,19 @@ class _ModelExpressCheckpointEngineMixin:
 
         model_version = self._resolve_receive_model_version(global_steps)
         receiver_rank = self._resolved_receiver_rank()
+        receive_kwargs = {
+            "model_version": model_version,
+            "receiver_rank": receiver_rank,
+            "same_rank_only": self.same_rank_only,
+            **self._receive_source_policy_kwargs(receiver_rank),
+        }
         if self.republish_received:
             tensors = await self._transfer.receive_tensors_and_publish_replica(
-                model_version=model_version,
-                receiver_rank=receiver_rank,
-                same_rank_only=self.same_rank_only,
+                **receive_kwargs,
                 replica_world_size=self._replica_world_size_for_publish(),
             )
         else:
-            tensors = await self._transfer.receive_tensors(
-                model_version=model_version,
-                receiver_rank=receiver_rank,
-                same_rank_only=self.same_rank_only,
-            )
+            tensors = await self._transfer.receive_tensors(**receive_kwargs)
         for name, tensor in tensors:
             yield name, tensor
 
@@ -333,6 +354,21 @@ class _ModelExpressCheckpointEngineMixin:
         if self.topology == _TOPOLOGY_RANK_LOCAL:
             return self.world_size
         return max(self.world_size - self._source_world_size, 1)
+
+    def _receive_source_policy_kwargs(self, receiver_rank: int) -> dict[str, Any]:
+        if self.topology != _TOPOLOGY_TREE_FANOUT:
+            return {}
+        policy = RlTreeFanoutPolicy(
+            receiver_rank=receiver_rank,
+            replica_world_size=self._replica_world_size_for_publish(),
+            fanout=self.tree_fanout,
+        )
+        return {
+            "roles": policy.roles,
+            "same_rank_only": False,
+            "source_ranks_by_role": policy.source_ranks_by_role,
+            "require_complete_version": policy.parent_replica_rank is None,
+        }
 
     def _resolve_send_model_version(self, global_steps: int | None) -> int:
         self._local_model_version = _model_version_from_global_steps(

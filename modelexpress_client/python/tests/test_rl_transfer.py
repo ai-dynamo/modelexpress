@@ -199,6 +199,47 @@ def test_select_sources_excludes_current_worker_after_replica_publish():
     ]
 
 
+def test_select_sources_can_target_incomplete_replica_parent_rank():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "replica-r0",
+                "worker-r0",
+                model_version=5,
+                role=RlSourceRole.INFERENCE_REPLICA,
+                worker_rank=0,
+                source_world_size=3,
+            ),
+            _source_ref(
+                "replica-r1",
+                "worker-r1",
+                model_version=5,
+                role=RlSourceRole.INFERENCE_REPLICA,
+                worker_rank=1,
+                source_world_size=3,
+            ),
+            _source_ref(
+                "trainer-r0",
+                "worker-trainer",
+                model_version=5,
+                role=RlSourceRole.TRAINER,
+                worker_rank=0,
+            ),
+        ]
+    )
+
+    candidates = _transfer(_FakeMxClient(response)).select_sources(
+        model_version=5,
+        receiver_rank=2,
+        roles=(RlSourceRole.INFERENCE_REPLICA,),
+        same_rank_only=False,
+        require_complete_version=False,
+        source_ranks_by_role={RlSourceRole.INFERENCE_REPLICA: (0,)},
+    )
+
+    assert [candidate.mx_source_id for candidate in candidates] == ["replica-r0"]
+
+
 def test_select_sources_reports_missing_when_only_current_worker_matches():
     response = p2p_pb2.ListSourcesResponse(
         instances=[
