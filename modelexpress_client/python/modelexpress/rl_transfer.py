@@ -307,10 +307,52 @@ class RlNixlWeightTransfer:
             f"errors={errors}"
         )
 
+    async def receive_into_tensors(
+        self,
+        target_tensors: dict[str, torch.Tensor],
+        *,
+        model_version: int,
+        receiver_rank: int,
+        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        same_rank_only: bool = False,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Discover and pull one model version into caller-owned tensors."""
+        if not target_tensors:
+            raise RuntimeError("ModelExpress RL transfer got no target tensors")
+        candidates = await self.wait_for_sources(
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+        )
+        errors = []
+        for candidate in candidates:
+            try:
+                return self._receive_from_candidate(
+                    candidate,
+                    model_version,
+                    target_tensors=target_tensors,
+                )
+            except Exception as exc:
+                errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
+                logger.warning(
+                    "ModelExpress RL source transfer into caller tensors failed; "
+                    "trying next candidate: source_id=%s worker_id=%s",
+                    candidate.mx_source_id,
+                    candidate.worker_id,
+                    exc_info=True,
+                )
+        raise RuntimeError(
+            "No ModelExpress RL source transfer succeeded for "
+            f"model={self.base_identity.model_name!r} version={model_version}; "
+            f"errors={errors}"
+        )
+
     def _receive_from_candidate(
         self,
         candidate: RlSourceCandidate,
         model_version: int,
+        target_tensors: dict[str, torch.Tensor] | None = None,
     ) -> list[tuple[str, torch.Tensor]]:
         metadata_resp = self.mx_client.get_metadata(candidate.mx_source_id, candidate.worker_id)
         if not metadata_resp.found:
@@ -318,16 +360,17 @@ class RlNixlWeightTransfer:
                 f"ModelExpress source metadata not found for {candidate.mx_source_id}/"
                 f"{candidate.worker_id}"
             )
-        if not candidate.metadata.shape_registry:
+        if target_tensors is None and not candidate.metadata.shape_registry:
             raise RuntimeError(
                 f"ModelExpress source {candidate.mx_source_id} has no RL shape registry"
             )
 
         device_id = self.resolve_device_id()
-        target_tensors = allocate_tensors_from_shape_registry(
-            dict(candidate.metadata.shape_registry),
-            device=f"cuda:{device_id}",
-        )
+        if target_tensors is None:
+            target_tensors = allocate_tensors_from_shape_registry(
+                dict(candidate.metadata.shape_registry),
+                device=f"cuda:{device_id}",
+            )
         self.shutdown_nixl_manager()
         manager = NixlTransferManager(
             agent_name=f"mx-rl-target-{uuid.uuid4().hex[:12]}",

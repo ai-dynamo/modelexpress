@@ -258,8 +258,9 @@ def test_receive_tensors_retries_next_candidate_after_failure():
             super().__init__(**kwargs)
             self.attempted_sources = []
 
-        def _receive_from_candidate(self, candidate, model_version):
+        def _receive_from_candidate(self, candidate, model_version, target_tensors=None):
             del model_version
+            del target_tensors
             self.attempted_sources.append(candidate.mx_source_id)
             if candidate.mx_source_id == "source-a":
                 raise RuntimeError("boom")
@@ -283,6 +284,52 @@ def test_receive_tensors_retries_next_candidate_after_failure():
 
     assert transfer.attempted_sources == ["source-a", "source-b"]
     assert tensors[0][0] == "w"
+
+
+def test_receive_into_tensors_passes_caller_owned_targets():
+    class _IntoTransfer(RlNixlWeightTransfer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.target_tensors = None
+
+        def _receive_from_candidate(self, candidate, model_version, target_tensors=None):
+            del candidate
+            del model_version
+            self.target_tensors = target_tensors
+            return list(target_tensors.items())
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[_source_ref("source-a", "worker-a")]
+    )
+    transfer = _IntoTransfer(
+        mx_client=_FakeMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+    target_tensors = {"w": torch.zeros(1)}
+
+    tensors = asyncio.run(
+        transfer.receive_into_tensors(
+            target_tensors,
+            model_version=5,
+            receiver_rank=0,
+        )
+    )
+
+    assert transfer.target_tensors is target_tensors
+    assert tensors[0][0] == "w"
+    assert tensors[0][1] is target_tensors["w"]
+
+
+def test_receive_into_tensors_rejects_empty_target_set():
+    with pytest.raises(RuntimeError, match="no target tensors"):
+        asyncio.run(
+            _transfer(_FakeMxClient(p2p_pb2.ListSourcesResponse())).receive_into_tensors(
+                {},
+                model_version=5,
+                receiver_rank=0,
+            )
+        )
 
 
 def test_finalize_marks_published_source_stale():
