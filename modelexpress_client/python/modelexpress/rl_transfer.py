@@ -27,6 +27,11 @@ from modelexpress.rl_metadata import (
     select_rl_source_candidates,
     with_rl_source_metadata,
 )
+from modelexpress.rl_publication import (
+    RlPublicationStore,
+    RlPublishedSource,
+    snapshot_tensors_for_retention,
+)
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
     plan_exact_transfers,
@@ -287,6 +292,8 @@ class RlNixlWeightTransfer:
         device_id: int | None = None,
         timeout_seconds: float = 300.0,
     ) -> None:
+        if retain_latest_k <= 0:
+            raise ValueError("retain_latest_k must be positive")
         self.mx_client = mx_client
         self.base_identity = base_identity
         self.worker_id = worker_id
@@ -294,6 +301,13 @@ class RlNixlWeightTransfer:
         self.device_id = device_id
         self.timeout_seconds = timeout_seconds
         self._nixl_manager: NixlTransferManager | None = None
+        self._target_nixl_manager: NixlTransferManager | None = None
+        self._publication_store = RlPublicationStore(
+            mx_client=mx_client,
+            worker_id=worker_id,
+            retain_latest_k=retain_latest_k,
+        )
+        self._published_sources = self._publication_store.sources
         self._published_tensors: dict[str, torch.Tensor] = {}
         self._mx_source_id: str | None = None
         self._worker_rank = 0
@@ -302,10 +316,12 @@ class RlNixlWeightTransfer:
 
     def finalize(self) -> None:
         """Tear down transient transfer state and stop advertising this source."""
-        self.mark_current_source_stale()
-        self.shutdown_nixl_manager()
-        self._published_tensors = {}
-        self._mx_source_id = None
+        if self._published_sources:
+            self._publication_store.close_all(mark_stale=True)
+            self._refresh_current_publication()
+        else:
+            self.mark_current_source_stale()
+        self._shutdown_target_nixl_manager()
 
     def publish_tensors(
         self,
@@ -320,26 +336,35 @@ class RlNixlWeightTransfer:
         if not tensors:
             raise RuntimeError("ModelExpress RL transfer got no tensors to publish")
 
-        device_id = self.resolve_device_id(tensors.values())
-        self.mark_current_source_stale()
-        self.shutdown_nixl_manager()
+        self._publication_store.close_duplicate(
+            role=role,
+            model_version=model_version,
+            worker_rank=worker_rank,
+        )
+        self._refresh_current_publication()
+        if self.retain_latest_k == 1:
+            self._publication_store.close_all(mark_stale=True)
+            self._refresh_current_publication()
+        publish_tensors = (
+            snapshot_tensors_for_retention(tensors)
+            if self.retain_latest_k > 1
+            else tensors
+        )
+
+        device_id = self.resolve_device_id(publish_tensors.values())
         manager = NixlTransferManager(
             agent_name=f"mx-rl-source-{uuid.uuid4().hex[:12]}",
             device_id=device_id,
         )
         manager.initialize()
-        manager.register_tensors(tensors)
-
-        self._nixl_manager = manager
-        self._published_tensors = tensors
-        self._worker_rank = worker_rank
+        manager.register_tensors(publish_tensors)
 
         metadata = RlSourceMetadata(
             model_version=model_version,
             role=role,
             world_size=source_world_size,
             retain_latest_k=self.retain_latest_k,
-            shape_registry=shape_registry_from_tensors(tensors),
+            shape_registry=shape_registry_from_tensors(publish_tensors),
         )
         identity = with_rl_source_metadata(self.base_identity, metadata)
         worker = p2p_pb2.WorkerMetadata(
@@ -357,30 +382,43 @@ class RlNixlWeightTransfer:
             ],
             status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
         )
-        self._mx_source_id = self.mx_client.publish_metadata(
+        mx_source_id = self.mx_client.publish_metadata(
             identity,
             worker,
             self.worker_id,
         )
         self.mx_client.update_status(
-            self._mx_source_id,
+            mx_source_id,
             self.worker_id,
             worker_rank,
             p2p_pb2.SOURCE_STATUS_READY,
         )
-        self._start_heartbeat(
-            mx_source_id=self._mx_source_id,
+        heartbeat = self._start_heartbeat(
+            mx_source_id=mx_source_id,
             worker_rank=worker_rank,
             nixl_manager=manager,
         )
+        published_source = RlPublishedSource(
+            mx_source_id=mx_source_id,
+            model_version=model_version,
+            role=role,
+            worker_rank=worker_rank,
+            tensors=publish_tensors,
+            manager=manager,
+            heartbeat=heartbeat,
+        )
+        self._publication_store.add(published_source)
+        self._refresh_current_publication()
+        self._publication_store.prune()
+        self._refresh_current_publication()
         logger.info(
             "Published ModelExpress RL weights: model=%s version=%d tensors=%d source_id=%s",
             self.base_identity.model_name,
             model_version,
-            len(tensors),
-            self._mx_source_id,
+            len(publish_tensors),
+            mx_source_id,
         )
-        return self._mx_source_id
+        return mx_source_id
 
     async def receive_tensors(
         self,
@@ -632,13 +670,14 @@ class RlNixlWeightTransfer:
                 f"ModelExpress source descriptors missing planned entries {missing_names}"
             )
 
-        self.shutdown_nixl_manager()
+        self._shutdown_target_nixl_manager()
         manager = NixlTransferManager(
             agent_name=f"mx-rl-target-{uuid.uuid4().hex[:12]}",
             device_id=device_id,
         )
         manager.initialize()
         manager.register_tensors(target_tensors)
+        self._target_nixl_manager = manager
         self._nixl_manager = manager
 
         bytes_transferred, tensor_count, _duration = manager.receive_from_source(
@@ -772,6 +811,10 @@ class RlNixlWeightTransfer:
 
     def mark_current_source_stale(self) -> None:
         """Best-effort STALE transition for a previously published source."""
+        if self._published_sources:
+            self._publication_store.close_current(mark_stale=True)
+            self._refresh_current_publication()
+            return
         if not self._mx_source_id:
             return
         self._stop_heartbeat(mark_stale=False)
@@ -788,6 +831,26 @@ class RlNixlWeightTransfer:
                 self._mx_source_id,
                 exc_info=True,
             )
+        self._published_tensors = {}
+        self._mx_source_id = None
+        self._worker_rank = 0
+
+    def _refresh_current_publication(self) -> None:
+        current = self._publication_store.current
+        if current is None:
+            self._published_tensors = {}
+            self._mx_source_id = None
+            self._worker_rank = 0
+            self._heartbeat = None
+            if self._target_nixl_manager is None:
+                self._nixl_manager = None
+            return
+
+        self._published_tensors = current.tensors
+        self._mx_source_id = current.mx_source_id
+        self._worker_rank = current.worker_rank
+        self._heartbeat = current.heartbeat
+        self._nixl_manager = current.manager
 
     def _start_heartbeat(
         self,
@@ -795,10 +858,9 @@ class RlNixlWeightTransfer:
         mx_source_id: str,
         worker_rank: int,
         nixl_manager: NixlTransferManager,
-    ) -> None:
+    ) -> HeartbeatThread:
         """Start periodic READY heartbeats for the published RL source."""
-        self._stop_heartbeat(mark_stale=False)
-        self._heartbeat = HeartbeatThread(
+        heartbeat = HeartbeatThread(
             mx_client=self.mx_client,
             mx_source_id=mx_source_id,
             worker_id=self.worker_id,
@@ -806,7 +868,8 @@ class RlNixlWeightTransfer:
             nixl_manager=nixl_manager,
             initially_ready=True,
         )
-        self._heartbeat.start()
+        heartbeat.start()
+        return heartbeat
 
     def _stop_heartbeat(self, *, mark_stale: bool) -> None:
         """Stop the RL source heartbeat if one is active."""
@@ -816,12 +879,18 @@ class RlNixlWeightTransfer:
         self._heartbeat = None
         heartbeat.stop(mark_stale=mark_stale)
 
-    def shutdown_nixl_manager(self) -> None:
-        """Release the current NIXL manager, if any."""
-        if self._nixl_manager is None:
+    def _shutdown_target_nixl_manager(self) -> None:
+        if self._target_nixl_manager is None:
             return
-        self._nixl_manager.shutdown()
-        self._nixl_manager = None
+        self._target_nixl_manager.shutdown()
+        self._target_nixl_manager = None
+        self._refresh_current_publication()
+
+    def shutdown_nixl_manager(self) -> None:
+        """Release active NIXL managers without changing metadata status."""
+        self._shutdown_target_nixl_manager()
+        self._publication_store.shutdown_all()
+        self._refresh_current_publication()
 
 
 def _version_label(model_version: int | None) -> str:
