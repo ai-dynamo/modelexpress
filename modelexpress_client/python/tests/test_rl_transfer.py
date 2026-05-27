@@ -1170,6 +1170,128 @@ def test_receive_tensors_and_publish_replica_uses_allocated_receive():
     ]
 
 
+def test_receive_tensors_and_publish_replica_preserves_allocated_metadata(monkeypatch):
+    class _FakeNixlManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def initialize(self):
+            pass
+
+        def register_tensors(self, tensors):
+            self.tensors = tensors
+
+        def receive_from_source(self, source_metadata, source_tensors, timeout_seconds):
+            del source_metadata
+            del timeout_seconds
+            return 8, len(source_tensors), 0.0
+
+    class _MetadataMxClient(_FakeMxClient):
+        def get_metadata(self, mx_source_id, worker_id):
+            del mx_source_id
+            del worker_id
+            return p2p_pb2.GetMetadataResponse(
+                found=True,
+                worker=p2p_pb2.WorkerMetadata(
+                    worker_rank=0,
+                    nixl_metadata=b"source",
+                    tensors=[
+                        p2p_pb2.TensorDescriptor(
+                            name="experts.w",
+                            addr=1,
+                            size=8,
+                            device_id=0,
+                            dtype="torch.float32",
+                        )
+                    ],
+                ),
+            )
+
+    class _ReplicaTransfer(RlNixlWeightTransfer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.publish_calls = []
+
+        def publish_tensors(
+            self,
+            tensors,
+            *,
+            model_version,
+            role=RlSourceRole.TRAINER,
+            worker_rank=0,
+            source_world_size=1,
+            tensor_metadata=None,
+        ):
+            self.publish_calls.append(
+                {
+                    "tensors": tensors,
+                    "model_version": model_version,
+                    "role": role,
+                    "worker_rank": worker_rank,
+                    "source_world_size": source_world_size,
+                    "tensor_metadata": tensor_metadata,
+                }
+            )
+            return "replica-source"
+
+    shape_registry = {
+        "experts.w": {
+            "shape": [1, 2],
+            "dtype": "torch.float32",
+            "global_shape": [4, 2],
+            "shard_offsets": [1, 0],
+            "tensor_parallel_rank": 2,
+            "pipeline_parallel_rank": 3,
+            "expert_ids": [1],
+            "expert_axis": 0,
+        }
+    }
+    monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _FakeNixlManager)
+    monkeypatch.setattr(
+        rl_transfer_module,
+        "allocate_tensors_from_shape_registry",
+        lambda _shape_registry, *, device: {
+            "experts.w": torch.zeros((1, 2), dtype=torch.float32)
+        },
+    )
+    transfer = _ReplicaTransfer(
+        mx_client=_MetadataMxClient(
+            p2p_pb2.ListSourcesResponse(
+                instances=[
+                    _source_ref(
+                        "source-v12",
+                        "worker-v12",
+                        model_version=12,
+                        shape_registry=shape_registry,
+                    )
+                ]
+            )
+        ),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    tensors = asyncio.run(
+        transfer.receive_tensors_and_publish_replica(
+            model_version=None,
+            receiver_rank=2,
+            replica_world_size=3,
+        )
+    )
+
+    assert tensors[0][0] == "experts.w"
+    assert transfer.publish_calls[0]["tensor_metadata"] == {
+        "experts.w": {
+            "global_shape": [4, 2],
+            "shard_offsets": [1, 0],
+            "tensor_parallel_rank": 2,
+            "pipeline_parallel_rank": 3,
+            "expert_ids": [1],
+            "expert_axis": 0,
+        }
+    }
+
+
 def test_receive_into_tensors_rejects_empty_target_set():
     with pytest.raises(RuntimeError, match="no target tensors"):
         asyncio.run(

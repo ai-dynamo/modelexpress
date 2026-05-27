@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -106,6 +108,14 @@ class _ReceiveCandidateResult:
     tensor_count: int
     duration_seconds: float
     lease_id: str = ""
+    tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None
+
+
+@dataclass(frozen=True)
+class _ReceiveSourcesResult:
+    model_version: int
+    tensors: list[tuple[str, torch.Tensor]]
+    tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None
 
 
 def _lease_id_for_exception(exc: Exception, candidate: RlSourceCandidate) -> str:

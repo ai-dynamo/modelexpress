@@ -74,6 +74,7 @@ from modelexpress.rl_transfer_report import (
     RlTransferReport,
     successful_attempt_from_candidate,
     _ReceiveCandidateResult,
+    _ReceiveSourcesResult,
 )
 
 logger = logging.getLogger("modelexpress.rl_transfer")
@@ -257,7 +258,7 @@ class RlNixlWeightTransfer:
         require_complete_version: bool = True,
     ) -> list[tuple[str, torch.Tensor]]:
         """Discover, allocate, and pull a requested or latest model version."""
-        _version, tensors = await self._receive_from_sources(
+        result = await self._receive_from_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
@@ -265,7 +266,7 @@ class RlNixlWeightTransfer:
             source_ranks_by_role=source_ranks_by_role,
             require_complete_version=require_complete_version,
         )
-        return tensors
+        return result.tensors
 
     async def receive_into_tensors(
         self,
@@ -282,7 +283,7 @@ class RlNixlWeightTransfer:
         """Discover and pull a requested or latest version into caller tensors."""
         if not target_tensors:
             raise RuntimeError("ModelExpress RL transfer got no target tensors")
-        _version, tensors = await self._receive_from_sources(
+        result = await self._receive_from_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
@@ -292,7 +293,7 @@ class RlNixlWeightTransfer:
             source_ranks_by_role=source_ranks_by_role,
             require_complete_version=require_complete_version,
         )
-        return tensors
+        return result.tensors
 
     async def receive_and_publish_replica(
         self,
@@ -311,7 +312,7 @@ class RlNixlWeightTransfer:
         if not target_tensors:
             raise RuntimeError("ModelExpress RL transfer got no target tensors")
         effective_target_specs = tuple(target_specs) if target_specs is not None else None
-        received_version, tensors = await self._receive_from_sources(
+        result = await self._receive_from_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
@@ -322,8 +323,8 @@ class RlNixlWeightTransfer:
             require_complete_version=require_complete_version,
         )
         self._publish_replica_tensors(
-            tensors,
-            model_version=received_version,
+            result.tensors,
+            model_version=result.model_version,
             receiver_rank=receiver_rank,
             replica_world_size=replica_world_size,
             tensor_metadata=(
@@ -332,7 +333,7 @@ class RlNixlWeightTransfer:
                 else None
             ),
         )
-        return tensors
+        return result.tensors
 
     async def receive_tensors_and_publish_replica(
         self,
@@ -346,7 +347,7 @@ class RlNixlWeightTransfer:
         require_complete_version: bool = True,
     ) -> list[tuple[str, torch.Tensor]]:
         """Receive allocated tensors, then publish them as an inference replica."""
-        received_version, tensors = await self._receive_from_sources(
+        result = await self._receive_from_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
@@ -355,12 +356,13 @@ class RlNixlWeightTransfer:
             require_complete_version=require_complete_version,
         )
         self._publish_replica_tensors(
-            tensors,
-            model_version=received_version,
+            result.tensors,
+            model_version=result.model_version,
             receiver_rank=receiver_rank,
             replica_world_size=replica_world_size,
+            tensor_metadata=result.tensor_metadata,
         )
-        return tensors
+        return result.tensors
 
     async def _receive_from_sources(
         self,
@@ -373,7 +375,7 @@ class RlNixlWeightTransfer:
         target_specs: Sequence[TensorReceiveSpec] | None = None,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
         require_complete_version: bool = True,
-    ) -> tuple[int, list[tuple[str, torch.Tensor]]]:
+    ) -> _ReceiveSourcesResult:
         self.last_receive_report = None
         candidates = await self.wait_for_sources(
             model_version=model_version,
@@ -434,7 +436,11 @@ class RlNixlWeightTransfer:
                     receiver_rank=receiver_rank,
                     attempts=tuple(attempts),
                 )
-                return candidate.metadata.model_version, result.tensors
+                return _ReceiveSourcesResult(
+                    model_version=candidate.metadata.model_version,
+                    tensors=result.tensors,
+                    tensor_metadata=result.tensor_metadata,
+                )
             except Exception as exc:
                 errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
                 attempts.append(failed_attempt_from_candidate(candidate, exc))
@@ -480,7 +486,7 @@ class RlNixlWeightTransfer:
         same_rank_only: bool,
         target_tensors: dict[str, torch.Tensor] | None,
         target_specs: Sequence[TensorReceiveSpec] | None,
-    ) -> tuple[int, list[tuple[str, torch.Tensor]]] | None:
+    ) -> _ReceiveSourcesResult | None:
         for candidate_group in candidate_groups:
             try:
                 result = self._receive_from_candidate_group(
@@ -506,7 +512,11 @@ class RlNixlWeightTransfer:
                     receiver_rank=receiver_rank,
                     attempts=tuple(attempts),
                 )
-                return candidate_group[0].metadata.model_version, result.tensors
+                return _ReceiveSourcesResult(
+                    model_version=candidate_group[0].metadata.model_version,
+                    tensors=result.tensors,
+                    tensor_metadata=result.tensor_metadata,
+                )
             except Exception as exc:
                 errors.append(f"{candidate_group_label(candidate_group)}: {exc}")
                 attempts.extend(
@@ -688,6 +698,7 @@ class RlNixlWeightTransfer:
             bytes_transferred=bytes_transferred,
             tensor_count=tensor_count,
             duration_seconds=_duration,
+            tensor_metadata=tensor_metadata_from_receive_specs(effective_target_specs),
         )
 
     def _receive_from_candidate_group(

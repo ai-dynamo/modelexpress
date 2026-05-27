@@ -21,6 +21,7 @@ from modelexpress.rl_reshard import (
     plan_exact_transfers,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
+    tensor_metadata_from_receive_specs,
 )
 from modelexpress.rl_shape_registry import torch_dtype_from_string
 from modelexpress.rl_slice_transfer import (
@@ -46,6 +47,7 @@ class DenseFanInPlan:
     model_version: int
     manifest: GroupedSliceTransferManifest
     source_transfers: tuple[DenseFanInSourceTransfer, ...]
+    target_specs: tuple[TensorReceiveSpec, ...]
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,7 @@ class DenseFanInReceiveResult:
 
     tensors: list[tuple[str, torch.Tensor]]
     source_results: tuple[DenseFanInSourceResult, ...]
+    tensor_metadata: dict[str, dict[str, Any]] | None = None
 
     @property
     def bytes_transferred(self) -> int:
@@ -167,6 +170,7 @@ def prepare_dense_fanin_receive(
         model_version=model_version,
         manifest=manifest,
         source_transfers=source_transfers,
+        target_specs=effective_target_specs,
     )
 
 
@@ -197,6 +201,7 @@ def execute_dense_fanin_receive(
     return DenseFanInReceiveResult(
         tensors=plan.manifest.output_tensors,
         source_results=tuple(source_results),
+        tensor_metadata=tensor_metadata_from_receive_specs(plan.target_specs),
     )
 
 
