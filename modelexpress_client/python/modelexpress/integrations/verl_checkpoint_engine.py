@@ -25,6 +25,10 @@ from modelexpress.rl_transfer import (
     build_rl_base_identity,
 )
 
+_TOPOLOGY_BROADCAST = "broadcast"
+_TOPOLOGY_RANK_LOCAL = "rank_local"
+_TOPOLOGIES = {_TOPOLOGY_BROADCAST, _TOPOLOGY_RANK_LOCAL}
+
 
 async def _iter_weights(weights: Any) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
     if isinstance(weights, AsyncIterable):
@@ -49,6 +53,35 @@ def _worker_id(prefix: str) -> str:
     return f"{prefix}-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
 
 
+def _topology_from_metadata(metadata: list[dict]) -> str:
+    values = set()
+    for item in metadata:
+        if isinstance(item, dict) and item.get("modelexpress_topology"):
+            values.add(str(item["modelexpress_topology"]).strip().lower())
+    if not values:
+        return _TOPOLOGY_BROADCAST
+    if len(values) > 1:
+        raise ValueError(f"conflicting ModelExpress veRL topologies: {sorted(values)}")
+    topology = values.pop()
+    if topology not in _TOPOLOGIES:
+        raise ValueError(
+            f"unsupported ModelExpress veRL topology {topology!r}; "
+            f"expected one of {sorted(_TOPOLOGIES)}"
+        )
+    return topology
+
+
+def _normalize_topology(topology: str | None) -> str:
+    value = (topology or os.environ.get("MX_RL_TOPOLOGY", _TOPOLOGY_BROADCAST))
+    value = value.strip().lower()
+    if value not in _TOPOLOGIES:
+        raise ValueError(
+            f"unsupported ModelExpress veRL topology {value!r}; "
+            f"expected one of {sorted(_TOPOLOGIES)}"
+        )
+    return value
+
+
 class _ModelExpressCheckpointEngineMixin:
     def __init__(
         self,
@@ -67,6 +100,8 @@ class _ModelExpressCheckpointEngineMixin:
         retain_latest_k: int = 1,
         device_id: int | None = None,
         timeout_seconds: float = 300.0,
+        topology: str | None = None,
+        same_rank_only: bool | None = None,
         mx_client: MxClientBase | None = None,
         **_: Any,
     ) -> None:
@@ -78,6 +113,12 @@ class _ModelExpressCheckpointEngineMixin:
                 "actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.modelexpress.model_name "
                 "or MX_RL_MODEL_NAME."
             )
+        self.topology = _normalize_topology(topology)
+        self.same_rank_only = (
+            self.topology == _TOPOLOGY_RANK_LOCAL
+            if same_rank_only is None
+            else same_rank_only
+        )
         self.base_identity = build_rl_base_identity(
             model_name=self.model_name,
             mx_version=mx_version,
@@ -92,6 +133,9 @@ class _ModelExpressCheckpointEngineMixin:
         self.mx_client = mx_client or MxClient(server_url=server_url)
         self.rank: int | None = None
         self.world_size: int | None = None
+        self._is_trainer: bool | None = None
+        self._receiver_rank: int | None = None
+        self._source_world_size = 1
         self._local_model_version = -1
         self._worker_id = _worker_id("verl-mx")
         self._transfer = RlNixlWeightTransfer(
@@ -104,7 +148,7 @@ class _ModelExpressCheckpointEngineMixin:
         )
 
     def prepare(self) -> dict[str, Any]:
-        return {}
+        return {"modelexpress_topology": self.topology}
 
     @classmethod
     def build_topology(
@@ -113,20 +157,59 @@ class _ModelExpressCheckpointEngineMixin:
         rollout_world_size: int,
         metadata: list[dict],
     ) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
-        del metadata
+        topology = _topology_from_metadata(metadata)
+        if topology == _TOPOLOGY_RANK_LOCAL:
+            if trainer_world_size != rollout_world_size:
+                raise ValueError(
+                    "ModelExpress rank_local topology requires equal trainer and rollout world sizes"
+                )
+            trainer_ranks = list(range(trainer_world_size))
+            rollout_ranks = list(range(rollout_world_size))
+            trainer_kwargs = {
+                "rank": trainer_ranks,
+                "world_size": [trainer_world_size] * trainer_world_size,
+                "is_trainer": [True] * trainer_world_size,
+                "receiver_rank": [None] * trainer_world_size,
+                "source_world_size": [trainer_world_size] * trainer_world_size,
+            }
+            rollout_kwargs = {
+                "rank": rollout_ranks,
+                "world_size": [trainer_world_size] * rollout_world_size,
+                "is_trainer": [False] * rollout_world_size,
+                "receiver_rank": rollout_ranks,
+                "source_world_size": [trainer_world_size] * rollout_world_size,
+            }
+            return trainer_kwargs, rollout_kwargs
+
         trainer_kwargs = {
             "rank": [0] + [-1] * (trainer_world_size - 1),
             "world_size": [rollout_world_size + 1] * trainer_world_size,
+            "is_trainer": [True] * trainer_world_size,
+            "receiver_rank": [None] * trainer_world_size,
+            "source_world_size": [1] * trainer_world_size,
         }
         rollout_kwargs = {
             "rank": list(range(1, rollout_world_size + 1)),
             "world_size": [rollout_world_size + 1] * rollout_world_size,
+            "is_trainer": [False] * rollout_world_size,
+            "receiver_rank": list(range(rollout_world_size)),
+            "source_world_size": [1] * rollout_world_size,
         }
         return trainer_kwargs, rollout_kwargs
 
-    def init_process_group(self, rank: int, world_size: int) -> None:
+    def init_process_group(
+        self,
+        rank: int,
+        world_size: int,
+        is_trainer: bool | None = None,
+        receiver_rank: int | None = None,
+        source_world_size: int = 1,
+    ) -> None:
         self.rank = rank
         self.world_size = world_size
+        self._is_trainer = rank <= 0 if is_trainer is None else is_trainer
+        self._receiver_rank = receiver_rank
+        self._source_world_size = source_world_size
 
     def finalize(self) -> None:
         self._transfer.finalize()
@@ -138,6 +221,8 @@ class _ModelExpressCheckpointEngineMixin:
     ) -> None:
         if self.rank is None:
             raise RuntimeError("init_process_group must run before send_weights")
+        if self._is_trainer is False:
+            raise RuntimeError("rollout rank cannot publish ModelExpress weights")
         if self.rank < 0:
             async for _name, _tensor in _iter_weights(weights):
                 pass
@@ -145,7 +230,12 @@ class _ModelExpressCheckpointEngineMixin:
 
         model_version = self._resolve_model_version(global_steps)
         tensors = await self._materialize_source_tensors(weights)
-        self._transfer.publish_tensors(tensors, model_version=model_version)
+        self._transfer.publish_tensors(
+            tensors,
+            model_version=model_version,
+            worker_rank=max(self.rank, 0),
+            source_world_size=self._source_world_size,
+        )
 
     async def receive_weights(
         self,
@@ -153,13 +243,18 @@ class _ModelExpressCheckpointEngineMixin:
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         if self.rank is None:
             raise RuntimeError("init_process_group must run before receive_weights")
-        if self.rank <= 0:
+        if self._is_trainer:
             raise RuntimeError("trainer rank cannot receive ModelExpress weights")
 
         model_version = self._resolve_model_version(global_steps)
         tensors = await self._transfer.receive_tensors(
             model_version=model_version,
-            receiver_rank=max(self.rank - 1, 0),
+            receiver_rank=(
+                self._receiver_rank
+                if self._receiver_rank is not None
+                else max(self.rank - 1, 0)
+            ),
+            same_rank_only=self.same_rank_only,
         )
         for name, tensor in tensors:
             yield name, tensor
