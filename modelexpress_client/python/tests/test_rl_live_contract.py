@@ -16,6 +16,7 @@ from modelexpress.rl_metadata import (
     get_rl_source_metadata,
     with_rl_source_metadata,
 )
+from modelexpress.rl_reshard import TensorReceiveSpec
 from modelexpress.rl_transfer import RlNixlWeightTransfer, build_rl_base_identity
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
@@ -162,6 +163,82 @@ def test_live_server_transfers_latest_retained_cuda_version():
         assert receiver.last_receive_report is not None
         assert receiver.last_receive_report.resolved_model_version == 2
         assert receiver.last_receive_report.attempts[0].bytes_transferred == 12
+    finally:
+        receiver.finalize()
+        publisher.finalize()
+        client.close()
+
+
+def test_live_server_transfers_moe_expert_axis_slice_cuda_version():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    pytest.importorskip("nixl._api")
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-moe-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    publisher = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    receiver = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"receiver-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+
+    try:
+        source_tensor = torch.arange(
+            8,
+            dtype=torch.float32,
+            device="cuda:0",
+        ).reshape(4, 2)
+        publisher.publish_tensors(
+            {"experts.w": source_tensor},
+            model_version=7,
+            tensor_metadata={
+                "experts.w": {
+                    "global_shape": [4, 2],
+                    "shard_offsets": [0, 0],
+                    "expert_ids": [0, 1, 2, 3],
+                    "expert_axis": 0,
+                }
+            },
+        )
+
+        received = torch.zeros((2, 2), dtype=torch.float32, device="cuda:0")
+        tensors = asyncio.run(
+            receiver.receive_into_tensors(
+                {"experts.w": received},
+                model_version=None,
+                receiver_rank=0,
+                target_specs=[
+                    TensorReceiveSpec(
+                        name="experts.w",
+                        receiver_rank=0,
+                        shape=(2, 2),
+                        dtype="torch.float32",
+                        global_shape=(4, 2),
+                        shard_offsets=(0, 0),
+                        expert_ids=(1, 3),
+                        expert_axis=0,
+                    )
+                ],
+            )
+        )
+        torch.cuda.synchronize(0)
+
+        assert tensors == [("experts.w", received)]
+        assert received.detach().cpu().tolist() == [[2.0, 3.0], [6.0, 7.0]]
+        assert receiver.last_receive_report is not None
+        assert receiver.last_receive_report.resolved_model_version == 7
+        assert receiver.last_receive_report.attempts[0].bytes_transferred == 16
+        assert receiver.last_receive_report.attempts[0].tensor_count == 2
     finally:
         receiver.finalize()
         publisher.finalize()
