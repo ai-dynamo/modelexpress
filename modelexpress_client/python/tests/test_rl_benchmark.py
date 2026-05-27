@@ -68,6 +68,7 @@ def test_benchmark_iteration_serializes_report_attempts():
                 model_version=7,
                 success=False,
                 error="first failed",
+                lease_id="lease-source-a",
             ),
             RlTransferAttempt(
                 mx_source_id="source-b",
@@ -76,6 +77,7 @@ def test_benchmark_iteration_serializes_report_attempts():
                 role=RlSourceRole.INFERENCE_REPLICA,
                 model_version=7,
                 success=True,
+                lease_id="lease-source-b",
                 source_status=p2p_pb2.SOURCE_STATUS_READY,
                 source_updated_at=1234567890000,
                 bytes_transferred=1024,
@@ -100,12 +102,18 @@ def test_benchmark_iteration_serializes_report_attempts():
     assert item.source_worker_id == "worker-b"
     assert item.transferred_bytes == 1024
     assert item.tensor_count == 2
+    assert item.attempt_lease_ids == ("lease-source-a", "lease-source-b")
     assert item.effective_bandwidth_gbps == pytest.approx(0.000016384)
     assert item.to_dict()["attempts"][0]["error"] == "first failed"
+    assert item.to_dict()["attempts"][0]["lease_id"] == "lease-source-a"
     assert item.to_dict()["attempts"][1]["source_status"] == (
         p2p_pb2.SOURCE_STATUS_READY
     )
     assert item.to_dict()["attempts"][1]["source_updated_at"] == 1234567890000
+    assert item.to_dict()["attempt_lease_ids"] == [
+        "lease-source-a",
+        "lease-source-b",
+    ]
 
 
 def test_benchmark_result_summary_ignores_warmups():
@@ -121,6 +129,7 @@ def test_benchmark_result_summary_ignores_warmups():
                 role=RlSourceRole.TRAINER,
                 model_version=1,
                 success=True,
+                lease_id="lease-source-a",
                 bytes_transferred=100,
                 tensor_count=1,
                 duration_seconds=0.01,
@@ -159,6 +168,10 @@ def test_benchmark_result_summary_ignores_warmups():
     assert summary["iterations"] == 1
     assert summary["total_transferred_bytes"] == 100
     assert summary["mean_receive_seconds"] == 1.0
+    assert summary["total_attempts"] == 1
+    assert summary["successful_attempts"] == 1
+    assert summary["failed_attempts"] == 0
+    assert summary["attempts_with_lease_ids"] == 1
 
 
 def test_parse_tensor_shape_accepts_comma_or_x_separators():

@@ -106,6 +106,7 @@ class RlTransferBenchmarkIteration:
     transfer_duration_seconds: float
     effective_bandwidth_gbps: float
     retry_count: int
+    attempt_lease_ids: tuple[str, ...]
     source_role: str | None
     source_worker_id: str | None
     attempts: tuple[dict[str, Any], ...]
@@ -123,6 +124,7 @@ class RlTransferBenchmarkIteration:
             "transfer_duration_seconds": self.transfer_duration_seconds,
             "effective_bandwidth_gbps": self.effective_bandwidth_gbps,
             "retry_count": self.retry_count,
+            "attempt_lease_ids": list(self.attempt_lease_ids),
             "source_role": self.source_role,
             "source_worker_id": self.source_worker_id,
             "attempts": list(self.attempts),
@@ -145,6 +147,11 @@ class RlTransferBenchmarkResult:
         measured = self.measured_iterations
         receive_seconds = [item.receive_seconds for item in measured]
         bandwidth = [item.effective_bandwidth_gbps for item in measured]
+        attempts = [
+            attempt
+            for item in measured
+            for attempt in item.attempts
+        ]
         return {
             "iterations": len(measured),
             "total_transferred_bytes": sum(item.transferred_bytes for item in measured),
@@ -156,6 +163,12 @@ class RlTransferBenchmarkResult:
             "median_effective_bandwidth_gbps": statistics.median(bandwidth),
             "max_effective_bandwidth_gbps": max(bandwidth),
             "total_retries": sum(item.retry_count for item in measured),
+            "total_attempts": len(attempts),
+            "successful_attempts": sum(1 for attempt in attempts if attempt["success"]),
+            "failed_attempts": sum(1 for attempt in attempts if not attempt["success"]),
+            "attempts_with_lease_ids": sum(
+                1 for attempt in attempts if attempt["lease_id"]
+            ),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -289,6 +302,9 @@ def _benchmark_iteration_from_report(
         transfer_duration_seconds=transfer_duration_seconds,
         effective_bandwidth_gbps=_bandwidth_gbps(transferred_bytes, receive_seconds),
         retry_count=report.retry_count,
+        attempt_lease_ids=tuple(
+            attempt.lease_id for attempt in report.attempts if attempt.lease_id
+        ),
         source_role=_role_value(report.source_role),
         source_worker_id=report.source_worker_id,
         attempts=tuple(_attempt_to_dict(attempt) for attempt in report.attempts),
@@ -304,6 +320,7 @@ def _attempt_to_dict(attempt: RlTransferAttempt) -> dict[str, Any]:
         "model_version": attempt.model_version,
         "success": attempt.success,
         "error": attempt.error,
+        "lease_id": attempt.lease_id,
         "source_status": attempt.source_status,
         "source_updated_at": attempt.source_updated_at,
         "bytes_transferred": attempt.bytes_transferred,
