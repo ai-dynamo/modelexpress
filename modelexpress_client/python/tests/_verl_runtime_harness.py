@@ -38,6 +38,7 @@ class VerlRuntimeSmokeResult:
     missing_lease_ids: tuple[str, ...] = ()
     non_completed_lease_statuses: tuple[int, ...] = ()
     transfer_lease_discovery_supported: bool = False
+    manager_cleanup_supported: bool = False
     replica_events: tuple[str, ...] = ()
     recovery_update_seconds: float = 0.0
     recovery_check_seconds: float = 0.0
@@ -120,6 +121,11 @@ def run_verl_checkpoint_manager_update(
     )
     from verl.workers.engine_workers import TrainingWorker
     from verl.workers.rollout import BaseRollout, RolloutReplica
+
+    manager_cleanup_supported = hasattr(
+        CheckpointEngineManager,
+        "finalize_process_group",
+    )
 
     class TrainingWorkerSmoke(TrainingWorker):
         def __init__(
@@ -481,7 +487,11 @@ def run_verl_checkpoint_manager_update(
             try:
                 ray.get(recovery_rollout.update_weights(global_steps=None))
             finally:
-                recovery_manager.finalize_process_group(recovery_rollout)
+                _finalize_process_group_compat(
+                    recovery_manager,
+                    trainer,
+                    recovery_rollout,
+                )
             recovery_update_seconds = time.perf_counter() - recovery_started
             recovery_check_started = time.perf_counter()
             recovery_rollout.check_weights()
@@ -524,6 +534,7 @@ def run_verl_checkpoint_manager_update(
             transfer_lease_discovery_supported=bool(
                 lease_snapshot.get("discovery_supported", False)
             ),
+            manager_cleanup_supported=manager_cleanup_supported,
             replica_events=tuple(
                 event for replica in replicas for event in replica.events
             ),
@@ -576,6 +587,19 @@ def run_verl_checkpoint_manager_update(
         return asyncio.run(run_update())
     finally:
         ray.shutdown()
+
+
+def _finalize_process_group_compat(manager, trainer, rollout):
+    import ray
+
+    finalize_process_group = getattr(manager, "finalize_process_group", None)
+    if finalize_process_group is not None:
+        finalize_process_group(rollout)
+        return
+    ray.get(
+        trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
+        + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+    )
 
 
 def _ray_env(python_path: str) -> dict[str, str]:

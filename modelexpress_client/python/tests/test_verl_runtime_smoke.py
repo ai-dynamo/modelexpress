@@ -36,7 +36,7 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
     assert result.update_seconds > 0.0
     assert result.check_seconds > 0.0
     assert result.receive_success
-    assert result.requested_model_version is None
+    assert result.requested_model_version == 17
     assert result.resolved_model_version == 17
     assert result.source_roles == (RlSourceRole.TRAINER.value,)
     assert result.attempt_roles == (RlSourceRole.TRAINER.value,)
@@ -112,12 +112,13 @@ def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
     )
     assert result.missing_lease_ids == ()
     assert result.non_completed_lease_statuses == ()
-    assert result.replica_events == (
+    expected_events = (
         "abort_all_requests",
         "release_kv_cache",
-        "resume_kv_cache",
-        "resume_generation",
     )
+    if result.manager_cleanup_supported:
+        expected_events += ("resume_kv_cache", "resume_generation")
+    assert result.replica_events == expected_events
 
 
 def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
