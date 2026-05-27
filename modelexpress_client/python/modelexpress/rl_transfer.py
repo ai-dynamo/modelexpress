@@ -61,7 +61,7 @@ from modelexpress.rl_transfer_identity import (
     candidates_for_base_identity,
     identity_matches_base,
 )
-from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator
+from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator, RlTransferLeaseInventory
 from modelexpress.rl_transfer_report import (
     RlTransferAttempt,
     RlTransferReport,
@@ -185,6 +185,17 @@ class RlNixlWeightTransfer:
         else:
             self.mark_current_source_stale()
         self._shutdown_target_nixl_manager()
+
+    def list_target_transfer_leases(
+        self,
+        *,
+        mx_source_id: str = "",
+        statuses: Iterable[int] | None = None,
+    ) -> RlTransferLeaseInventory:
+        return self._lease_coordinator.list_target_leases(
+            mx_source_id=mx_source_id,
+            statuses=statuses,
+        )
 
     def publish_tensors(
         self,

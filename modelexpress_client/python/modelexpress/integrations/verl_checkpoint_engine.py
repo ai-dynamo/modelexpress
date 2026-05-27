@@ -25,6 +25,11 @@ from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
     build_rl_base_identity,
 )
+from modelexpress.rl_transfer_lease import (
+    RlTransferLeaseReportSummary,
+    summarize_report_leases,
+)
+from modelexpress.rl_transfer_report import RlTransferReport
 from modelexpress.rl_update_lifecycle import (
     RlWeightUpdateLifecycleHooks,
     iter_weight_update_lifecycle,
@@ -272,6 +277,22 @@ class _ModelExpressCheckpointEngineMixin:
 
     def finalize(self) -> None:
         self._transfer.finalize()
+
+    @property
+    def last_receive_report(self) -> RlTransferReport | None:
+        return self._transfer.last_receive_report
+
+    def transfer_lease_summary(
+        self,
+        *,
+        mx_source_id: str = "",
+        statuses: Iterable[int] | None = None,
+    ) -> RlTransferLeaseReportSummary:
+        inventory = self._transfer.list_target_transfer_leases(
+            mx_source_id=mx_source_id,
+            statuses=statuses,
+        )
+        return summarize_report_leases(self._transfer.last_receive_report, inventory)
 
     async def send_weights(
         self,

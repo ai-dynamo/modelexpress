@@ -13,6 +13,8 @@ from modelexpress.integrations.verl_checkpoint_engine import (
     _topology_from_metadata,
 )
 from modelexpress.rl_metadata import RlSourceRole
+from modelexpress.rl_transfer_lease import RlTransferLeaseInventory
+from modelexpress.rl_transfer_report import RlTransferAttempt, RlTransferReport
 
 
 async def _collect_weights(weights):
@@ -264,6 +266,63 @@ def test_receive_weights_runs_lifecycle_hooks_around_verl_refit():
         "flush",
         "resume",
     ]
+
+
+def test_transfer_lease_summary_uses_receive_report_and_inventory():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=1,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source-a",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=True,
+                lease_id="lease-a",
+            ),
+        ),
+    )
+
+    class _FakeTransfer:
+        def __init__(self):
+            self.last_receive_report = report
+            self.list_kwargs = None
+
+        def list_target_transfer_leases(self, **kwargs):
+            self.list_kwargs = kwargs
+            return RlTransferLeaseInventory(
+                target_worker_id="verl-worker",
+                leases=(
+                    p2p_pb2.TransferLease(
+                        lease_id="lease-a",
+                        status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+                    ),
+                ),
+            )
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+
+    summary = engine.transfer_lease_summary(
+        mx_source_id="source-a",
+        statuses=(p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
+    )
+
+    assert engine.last_receive_report is report
+    assert fake_transfer.list_kwargs == {
+        "mx_source_id": "source-a",
+        "statuses": (p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,),
+    }
+    assert summary.report is report
+    assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
 
 
 def test_receive_weights_validates_before_pause_hook():

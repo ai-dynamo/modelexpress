@@ -9,7 +9,9 @@ from modelexpress.rl_metadata import RlSourceCandidate, RlSourceMetadata, RlSour
 from modelexpress.rl_transfer_lease import (
     RlTransferLeaseCoordinator,
     RlTransferLeaseInventory,
+    summarize_report_leases,
 )
+from modelexpress.rl_transfer_report import RlTransferAttempt, RlTransferReport
 
 
 class _LeaseClient:
@@ -176,6 +178,102 @@ def test_transfer_lease_inventory_summarizes_latest_target_attempts():
         "lease-v7-active",
         "lease-v7-failed",
     ]
+
+
+def test_transfer_lease_summary_correlates_report_attempts_with_inventory():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=0,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=False,
+                lease_id="lease-v7-failed",
+            ),
+            RlTransferAttempt(
+                mx_source_id="source",
+                worker_id="worker-b",
+                worker_rank=1,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=True,
+                lease_id="lease-v7-completed",
+            ),
+            RlTransferAttempt(
+                mx_source_id="source",
+                worker_id="worker-b",
+                worker_rank=1,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=True,
+                lease_id="lease-v7-completed",
+            ),
+            RlTransferAttempt(
+                mx_source_id="source",
+                worker_id="worker-c",
+                worker_rank=2,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=False,
+                lease_id="lease-v7-missing",
+            ),
+        ),
+    )
+    inventory = RlTransferLeaseInventory(
+        target_worker_id="target-worker",
+        leases=(
+            _lease(
+                "lease-v7-completed",
+                version=7,
+                status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+                updated_at=20,
+            ),
+            _lease(
+                "lease-v7-failed",
+                version=7,
+                status=p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+                updated_at=10,
+            ),
+        ),
+    )
+
+    summary = summarize_report_leases(report, inventory)
+
+    assert summary.report is report
+    assert summary.inventory is inventory
+    assert summary.report_lease_ids == (
+        "lease-v7-failed",
+        "lease-v7-completed",
+        "lease-v7-missing",
+    )
+    assert [lease.lease_id for lease in summary.matching_leases] == [
+        "lease-v7-failed",
+        "lease-v7-completed",
+    ]
+    assert summary.missing_lease_ids == ("lease-v7-missing",)
+    assert summary.has_missing_leases
+    assert [
+        lease.lease_id for lease in summary.non_completed_matching_leases
+    ] == ["lease-v7-failed"]
+
+
+def test_transfer_lease_summary_handles_absent_report():
+    inventory = RlTransferLeaseInventory(
+        target_worker_id="target-worker",
+        discovery_supported=False,
+    )
+
+    summary = summarize_report_leases(None, inventory)
+
+    assert summary.report_lease_ids == ()
+    assert summary.matching_leases == ()
+    assert summary.missing_lease_ids == ()
+    assert not summary.has_missing_leases
 
 
 def test_transfer_lease_coordinator_lists_target_attempts_by_status():

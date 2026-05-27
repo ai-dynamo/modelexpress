@@ -15,6 +15,7 @@ import grpc
 
 from modelexpress import p2p_pb2
 from modelexpress.rl_metadata import RlSourceCandidate
+from modelexpress.rl_transfer_report import RlTransferReport
 
 logger = logging.getLogger("modelexpress.rl_transfer_lease")
 
@@ -105,6 +106,62 @@ class RlTransferLeaseInventory:
         if statuses is None:
             return self.leases
         return self.with_statuses(statuses)
+
+
+@dataclass(frozen=True)
+class RlTransferLeaseReportSummary:
+    """Join a local receive report with durable server-side lease records."""
+
+    report: RlTransferReport | None
+    inventory: RlTransferLeaseInventory
+    report_lease_ids: tuple[str, ...]
+    matching_leases: tuple["p2p_pb2.TransferLease", ...]
+    missing_lease_ids: tuple[str, ...]
+
+    @property
+    def has_missing_leases(self) -> bool:
+        return bool(self.missing_lease_ids)
+
+    @property
+    def non_completed_matching_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
+        return tuple(
+            lease
+            for lease in self.matching_leases
+            if lease.status != p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+        )
+
+
+def summarize_report_leases(
+    report: RlTransferReport | None,
+    inventory: RlTransferLeaseInventory,
+) -> RlTransferLeaseReportSummary:
+    """Correlate receive-report lease IDs with server-discovered lease state."""
+    if report is None:
+        report_lease_ids = ()
+    else:
+        report_lease_ids = tuple(
+            dict.fromkeys(
+                attempt.lease_id
+                for attempt in report.attempts
+                if attempt.lease_id
+            )
+        )
+    leases_by_id = {lease.lease_id: lease for lease in inventory.leases}
+    matching_leases = tuple(
+        leases_by_id[lease_id]
+        for lease_id in report_lease_ids
+        if lease_id in leases_by_id
+    )
+    missing_lease_ids = tuple(
+        lease_id for lease_id in report_lease_ids if lease_id not in leases_by_id
+    )
+    return RlTransferLeaseReportSummary(
+        report=report,
+        inventory=inventory,
+        report_lease_ids=report_lease_ids,
+        matching_leases=matching_leases,
+        missing_lease_ids=missing_lease_ids,
+    )
 
 
 class RlTransferLeaseCoordinator:

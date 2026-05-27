@@ -89,7 +89,11 @@ from .rl_reshard import (  # noqa: F401
     source_specs_from_shape_registry,
     tensor_metadata_from_receive_specs,
 )
-from .rl_transfer_lease import RlTransferLeaseInventory  # noqa: F401
+from .rl_transfer_lease import (  # noqa: F401
+    RlTransferLeaseInventory,
+    RlTransferLeaseReportSummary,
+    summarize_report_leases,
+)
 from .rl_update_lifecycle import RlWeightUpdateLifecycleHooks  # noqa: F401
 
 __all__ = [
@@ -102,6 +106,7 @@ __all__ = [
     "RlSourceRole",
     "RlTreeFanoutPolicy",
     "RlTransferLeaseInventory",
+    "RlTransferLeaseReportSummary",
     "RlWeightUpdateLifecycleHooks",
     "TensorReceiveSpec",
     "TensorShardSpec",
@@ -115,5 +120,6 @@ __all__ = [
     "receive_specs_from_tensors",
     "register_modelexpress_loaders",
     "source_specs_from_shape_registry",
+    "summarize_report_leases",
     "tensor_metadata_from_receive_specs",
 ]
