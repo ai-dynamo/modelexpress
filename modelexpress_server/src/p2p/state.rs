@@ -271,6 +271,23 @@ impl P2pStateManager {
         Ok(observed)
     }
 
+    /// Observe active transfer leases and persist EXPIRED for abandoned attempts.
+    pub async fn expire_transfer_leases(&self) -> MetadataResult<u32> {
+        let leases = self
+            .get_backend()
+            .await?
+            .list_transfer_leases(None, None, Some(TransferLeaseStatus::Active))
+            .await?;
+        let mut expired_count = 0u32;
+        for lease in leases {
+            let observed = self.observe_transfer_lease(lease).await?;
+            if observed.status == TransferLeaseStatus::Expired as i32 {
+                expired_count = expired_count.saturating_add(1);
+            }
+        }
+        Ok(expired_count)
+    }
+
     /// Extend an active transfer lease with a fresh expiry.
     pub async fn renew_transfer_lease(
         &self,
@@ -871,5 +888,36 @@ mod tests {
 
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].lease_id, "lease-complete");
+    }
+
+    #[tokio::test]
+    async fn test_expire_transfer_leases_marks_only_expired_active_records() {
+        let mut mock = MockMetadataBackend::new();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut expired = active_lease_record("lease-expired");
+        expired.expires_at = now - 1_000;
+        let mut active = active_lease_record("lease-active");
+        active.expires_at = now + 60_000;
+
+        mock.expect_list_transfer_leases()
+            .with(eq(None), eq(None), eq(Some(TransferLeaseStatus::Active)))
+            .once()
+            .returning(move |_, _, _| Ok(vec![expired.clone(), active.clone()]));
+        mock.expect_finish_transfer_lease()
+            .withf(|lease_id, status, _updated_at, error_message| {
+                lease_id == "lease-expired"
+                    && *status == TransferLeaseStatus::Expired
+                    && error_message == "transfer lease expired"
+            })
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let expired_count = manager
+            .expire_transfer_leases()
+            .await
+            .expect("expire_transfer_leases failed");
+
+        assert_eq!(expired_count, 1);
     }
 }
