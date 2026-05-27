@@ -15,6 +15,18 @@ from modelexpress.rl_benchmark import (
 )
 from modelexpress.rl_metadata import RlSourceRole
 from modelexpress.rl_transfer import RlTransferAttempt, RlTransferReport
+from modelexpress.rl_transfer_lease import (
+    RlTransferLeaseInventory,
+    summarize_report_leases,
+)
+
+
+def _lease(lease_id: str, *, status: int):
+    return p2p_pb2.TransferLease(
+        lease_id=lease_id,
+        status=status,
+        model_version=7,
+    )
 
 
 def test_benchmark_config_normalizes_dtype_and_counts_bytes():
@@ -86,6 +98,22 @@ def test_benchmark_iteration_serializes_report_attempts():
             ),
         ),
     )
+    lease_summary = summarize_report_leases(
+        report,
+        RlTransferLeaseInventory(
+            target_worker_id="target-worker",
+            leases=(
+                _lease(
+                    "lease-source-a",
+                    status=p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+                ),
+                _lease(
+                    "lease-source-b",
+                    status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+                ),
+            ),
+        ),
+    )
 
     item = _benchmark_iteration_from_report(
         index=0,
@@ -95,6 +123,7 @@ def test_benchmark_iteration_serializes_report_attempts():
         publish_seconds=0.2,
         receive_seconds=0.5,
         report=report,
+        lease_summary=lease_summary,
     )
 
     assert item.retry_count == 1
@@ -103,9 +132,23 @@ def test_benchmark_iteration_serializes_report_attempts():
     assert item.transferred_bytes == 1024
     assert item.tensor_count == 2
     assert item.attempt_lease_ids == ("lease-source-a", "lease-source-b")
+    assert item.transfer_lease_discovery_supported
+    assert item.report_lease_ids == ("lease-source-a", "lease-source-b")
+    assert item.matching_lease_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
+    assert item.missing_lease_ids == ()
+    assert item.non_completed_lease_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+    )
     assert item.effective_bandwidth_gbps == pytest.approx(0.000016384)
     assert item.to_dict()["attempts"][0]["error"] == "first failed"
     assert item.to_dict()["attempts"][0]["lease_id"] == "lease-source-a"
+    assert item.to_dict()["matching_lease_statuses"] == [
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    ]
     assert item.to_dict()["attempts"][1]["source_status"] == (
         p2p_pb2.SOURCE_STATUS_READY
     )
@@ -172,6 +215,9 @@ def test_benchmark_result_summary_ignores_warmups():
     assert summary["successful_attempts"] == 1
     assert summary["failed_attempts"] == 0
     assert summary["attempts_with_lease_ids"] == 1
+    assert not summary["lease_discovery_supported"]
+    assert summary["iterations_with_missing_lease_ids"] == 0
+    assert summary["non_completed_matching_leases"] == 0
 
 
 def test_parse_tensor_shape_accepts_comma_or_x_separators():

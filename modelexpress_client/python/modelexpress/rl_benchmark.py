@@ -27,6 +27,11 @@ from modelexpress.rl_transfer import (
     RlTransferReport,
     build_rl_base_identity,
 )
+from modelexpress.rl_transfer_lease import (
+    RlTransferLeaseInventory,
+    RlTransferLeaseReportSummary,
+    summarize_report_leases,
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,11 @@ class RlTransferBenchmarkIteration:
     effective_bandwidth_gbps: float
     retry_count: int
     attempt_lease_ids: tuple[str, ...]
+    transfer_lease_discovery_supported: bool
+    report_lease_ids: tuple[str, ...]
+    matching_lease_statuses: tuple[int, ...]
+    missing_lease_ids: tuple[str, ...]
+    non_completed_lease_statuses: tuple[int, ...]
     source_role: str | None
     source_worker_id: str | None
     attempts: tuple[dict[str, Any], ...]
@@ -125,6 +135,13 @@ class RlTransferBenchmarkIteration:
             "effective_bandwidth_gbps": self.effective_bandwidth_gbps,
             "retry_count": self.retry_count,
             "attempt_lease_ids": list(self.attempt_lease_ids),
+            "transfer_lease_discovery_supported": (
+                self.transfer_lease_discovery_supported
+            ),
+            "report_lease_ids": list(self.report_lease_ids),
+            "matching_lease_statuses": list(self.matching_lease_statuses),
+            "missing_lease_ids": list(self.missing_lease_ids),
+            "non_completed_lease_statuses": list(self.non_completed_lease_statuses),
             "source_role": self.source_role,
             "source_worker_id": self.source_worker_id,
             "attempts": list(self.attempts),
@@ -168,6 +185,15 @@ class RlTransferBenchmarkResult:
             "failed_attempts": sum(1 for attempt in attempts if not attempt["success"]),
             "attempts_with_lease_ids": sum(
                 1 for attempt in attempts if attempt["lease_id"]
+            ),
+            "lease_discovery_supported": all(
+                item.transfer_lease_discovery_supported for item in measured
+            ),
+            "iterations_with_missing_lease_ids": sum(
+                1 for item in measured if item.missing_lease_ids
+            ),
+            "non_completed_matching_leases": sum(
+                len(item.non_completed_lease_statuses) for item in measured
             ),
         }
 
@@ -251,6 +277,10 @@ def run_mx_rl_transfer_benchmark(
                 raise RuntimeError("ModelExpress RL benchmark receive did not succeed")
             if config.verify:
                 _verify_received(source_tensors, dict(received))
+            lease_summary = summarize_report_leases(
+                report,
+                receiver.list_target_transfer_leases(),
+            )
             iterations.append(
                 _benchmark_iteration_from_report(
                     index=index,
@@ -260,6 +290,7 @@ def run_mx_rl_transfer_benchmark(
                     publish_seconds=publish_seconds,
                     receive_seconds=receive_seconds,
                     report=report,
+                    lease_summary=lease_summary,
                 )
             )
     finally:
@@ -283,12 +314,25 @@ def _benchmark_iteration_from_report(
     publish_seconds: float,
     receive_seconds: float,
     report: RlTransferReport,
+    lease_summary: RlTransferLeaseReportSummary | None = None,
 ) -> RlTransferBenchmarkIteration:
     successful_attempts = [attempt for attempt in report.attempts if attempt.success]
     transferred_bytes = sum(attempt.bytes_transferred for attempt in successful_attempts)
     tensor_count = sum(attempt.tensor_count for attempt in successful_attempts)
     transfer_duration_seconds = sum(
         attempt.duration_seconds for attempt in successful_attempts
+    )
+    if lease_summary is None:
+        lease_summary = summarize_report_leases(
+            report,
+            RlTransferLeaseInventory(
+                target_worker_id="",
+                discovery_supported=False,
+            ),
+        )
+    lease_discovery_supported = lease_summary.inventory.discovery_supported
+    missing_lease_ids = (
+        lease_summary.missing_lease_ids if lease_discovery_supported else ()
     )
     return RlTransferBenchmarkIteration(
         index=index,
@@ -304,6 +348,15 @@ def _benchmark_iteration_from_report(
         retry_count=report.retry_count,
         attempt_lease_ids=tuple(
             attempt.lease_id for attempt in report.attempts if attempt.lease_id
+        ),
+        transfer_lease_discovery_supported=lease_discovery_supported,
+        report_lease_ids=lease_summary.report_lease_ids,
+        matching_lease_statuses=tuple(
+            int(lease.status) for lease in lease_summary.matching_leases
+        ),
+        missing_lease_ids=missing_lease_ids,
+        non_completed_lease_statuses=tuple(
+            int(lease.status) for lease in lease_summary.non_completed_matching_leases
         ),
         source_role=_role_value(report.source_role),
         source_worker_id=report.source_worker_id,
