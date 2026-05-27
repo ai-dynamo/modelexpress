@@ -126,6 +126,45 @@ class TestHeartbeatStop:
         ]
         assert len(stale_calls) == 0
 
+    def test_stop_honors_initial_ready_state(self, mx_client, nixl_manager):
+        with patch.dict("os.environ", {"MX_HEARTBEAT_INTERVAL_SECS": "1"}):
+            heartbeat = HeartbeatThread(
+                mx_client=mx_client,
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                nixl_manager=nixl_manager,
+                initially_ready=True,
+            )
+
+        heartbeat.stop()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=3,
+            )
+        ]
+
+    def test_stop_can_skip_stale_mark(self, heartbeat, mx_client):
+        heartbeat.start()
+        time.sleep(1.5)
+        heartbeat.stop(mark_stale=False)
+        heartbeat._on_exit()
+
+        stale_calls = [
+            c for c in mx_client.update_status.call_args_list
+            if c == call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=3,
+            )
+        ]
+        assert len(stale_calls) == 0
+
     def test_stop_is_idempotent(self, heartbeat, mx_client):
         heartbeat.start()
         time.sleep(1.5)

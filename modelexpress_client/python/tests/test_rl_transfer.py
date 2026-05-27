@@ -238,6 +238,93 @@ def test_publish_tensors_rejects_empty_tensor_set():
         )
 
 
+def test_publish_tensors_starts_heartbeat_and_finalize_stops_it(monkeypatch):
+    class _FakeNixlManager:
+        def __init__(self, *args, **kwargs):
+            self.nixl_metadata = b"nixl"
+            self.tensor_descriptors = []
+            self.shutdown_called = False
+
+        def initialize(self):
+            pass
+
+        def register_tensors(self, tensors):
+            self.tensor_descriptors = [
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=1,
+                    size=tensor.numel() * tensor.element_size(),
+                    device_id=0,
+                    dtype=str(tensor.dtype),
+                )
+                for name, tensor in tensors.items()
+            ]
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    class _FakeHeartbeat:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = False
+            self.stop_calls = []
+            type(self).instances.append(self)
+
+        def start(self):
+            self.started = True
+
+        def stop(self, *, mark_stale=True):
+            self.stop_calls.append(mark_stale)
+
+    class _PublishMxClient(_FakeMxClient):
+        def __init__(self):
+            super().__init__(p2p_pb2.ListSourcesResponse())
+            self.published = []
+
+        def publish_metadata(self, identity, worker, worker_id):
+            self.published.append((identity, worker, worker_id))
+            return "source-v5"
+
+    monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _FakeNixlManager)
+    monkeypatch.setattr(rl_transfer_module, "HeartbeatThread", _FakeHeartbeat)
+    fake_client = _PublishMxClient()
+    transfer = RlNixlWeightTransfer(
+        mx_client=fake_client,
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    source_id = transfer.publish_tensors(
+        {"w": torch.zeros(1, dtype=torch.float32)},
+        model_version=5,
+        worker_rank=2,
+    )
+
+    assert source_id == "source-v5"
+    assert fake_client.status_updates == [
+        ("source-v5", "worker-local", 2, p2p_pb2.SOURCE_STATUS_READY)
+    ]
+    assert len(_FakeHeartbeat.instances) == 1
+    heartbeat = _FakeHeartbeat.instances[0]
+    assert heartbeat.started
+    assert heartbeat.kwargs["mx_source_id"] == "source-v5"
+    assert heartbeat.kwargs["worker_rank"] == 2
+    assert heartbeat.kwargs["initially_ready"] is True
+
+    transfer.finalize()
+
+    assert heartbeat.stop_calls == [False]
+    assert fake_client.status_updates[-1] == (
+        "source-v5",
+        "worker-local",
+        2,
+        p2p_pb2.SOURCE_STATUS_STALE,
+    )
+    assert transfer._heartbeat is None
+
+
 def test_select_source_ignores_different_base_identity():
     base_identity = _base_identity()
     wrong_identity = with_rl_source_metadata(

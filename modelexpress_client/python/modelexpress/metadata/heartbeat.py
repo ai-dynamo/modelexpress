@@ -42,6 +42,8 @@ class HeartbeatThread:
         worker_rank: Model-shard rank used for metadata/status keying.
         nixl_manager: Optional NIXL transfer manager for agent health checks.
             Non-NIXL transports pass None and heartbeat unconditionally.
+        initially_ready: Set when the caller already sent UpdateStatus(READY)
+            before starting the heartbeat thread.
     """
 
     def __init__(
@@ -51,6 +53,7 @@ class HeartbeatThread:
         worker_id: str,
         worker_rank: int,
         nixl_manager: NixlTransferManager | None,
+        initially_ready: bool = False,
     ):
         self._mx_client = mx_client
         self._mx_source_id = mx_source_id
@@ -62,7 +65,7 @@ class HeartbeatThread:
             os.environ.get("MX_HEARTBEAT_INTERVAL_SECS", "30")
         )
         self._stop_event = threading.Event()
-        self._started = False
+        self._started = initially_ready
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -79,12 +82,15 @@ class HeartbeatThread:
             f"(interval={self._interval}s)"
         )
 
-    def stop(self) -> None:
-        """Signal the heartbeat thread to stop and mark STALE."""
+    def stop(self, *, mark_stale: bool = True) -> None:
+        """Signal the heartbeat thread to stop and optionally mark STALE."""
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self._interval + 5)
-        self._mark_stale()
+        if mark_stale:
+            self._mark_stale()
+        else:
+            self._started = False
         logger.info(f"[Worker {self._worker_rank}] Heartbeat stopped")
 
     def _on_exit(self) -> None:

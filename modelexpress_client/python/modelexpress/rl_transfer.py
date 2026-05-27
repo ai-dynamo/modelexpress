@@ -16,6 +16,7 @@ import torch
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClientBase
+from modelexpress.metadata.heartbeat import HeartbeatThread
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.rl_metadata import (
     RlSourceCandidate,
@@ -204,6 +205,7 @@ class RlNixlWeightTransfer:
         self._published_tensors: dict[str, torch.Tensor] = {}
         self._mx_source_id: str | None = None
         self._worker_rank = 0
+        self._heartbeat: HeartbeatThread | None = None
 
     def finalize(self) -> None:
         """Tear down transient transfer state and stop advertising this source."""
@@ -272,6 +274,11 @@ class RlNixlWeightTransfer:
             self.worker_id,
             worker_rank,
             p2p_pb2.SOURCE_STATUS_READY,
+        )
+        self._start_heartbeat(
+            mx_source_id=self._mx_source_id,
+            worker_rank=worker_rank,
+            nixl_manager=manager,
         )
         logger.info(
             "Published ModelExpress RL weights: model=%s version=%d tensors=%d source_id=%s",
@@ -575,6 +582,7 @@ class RlNixlWeightTransfer:
         """Best-effort STALE transition for a previously published source."""
         if not self._mx_source_id:
             return
+        self._stop_heartbeat(mark_stale=False)
         try:
             self.mx_client.update_status(
                 self._mx_source_id,
@@ -588,6 +596,33 @@ class RlNixlWeightTransfer:
                 self._mx_source_id,
                 exc_info=True,
             )
+
+    def _start_heartbeat(
+        self,
+        *,
+        mx_source_id: str,
+        worker_rank: int,
+        nixl_manager: NixlTransferManager,
+    ) -> None:
+        """Start periodic READY heartbeats for the published RL source."""
+        self._stop_heartbeat(mark_stale=False)
+        self._heartbeat = HeartbeatThread(
+            mx_client=self.mx_client,
+            mx_source_id=mx_source_id,
+            worker_id=self.worker_id,
+            worker_rank=worker_rank,
+            nixl_manager=nixl_manager,
+            initially_ready=True,
+        )
+        self._heartbeat.start()
+
+    def _stop_heartbeat(self, *, mark_stale: bool) -> None:
+        """Stop the RL source heartbeat if one is active."""
+        if self._heartbeat is None:
+            return
+        heartbeat = self._heartbeat
+        self._heartbeat = None
+        heartbeat.stop(mark_stale=mark_stale)
 
     def shutdown_nixl_manager(self) -> None:
         """Release the current NIXL manager, if any."""
