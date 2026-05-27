@@ -6,8 +6,10 @@ import asyncio
 import pytest
 import torch
 
+import modelexpress.rl_transfer as rl_transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.rl_metadata import RlSourceMetadata, RlSourceRole, with_rl_source_metadata
+from modelexpress.rl_reshard import TensorReceiveSpec
 from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
     allocate_tensors_from_shape_registry,
@@ -69,14 +71,17 @@ def _source_ref(
     model_version: int = 5,
     role: RlSourceRole = RlSourceRole.TRAINER,
     worker_rank: int = 0,
+    shape_registry=None,
 ):
+    if shape_registry is None:
+        shape_registry = {"w": {"shape": [1], "dtype": "torch.float32"}}
     identity = with_rl_source_metadata(
         _base_identity(),
         RlSourceMetadata(
             model_version=model_version,
             role=role,
             world_size=1,
-            shape_registry={"w": {"shape": [1], "dtype": "torch.float32"}},
+            shape_registry=shape_registry,
         ),
     )
     return p2p_pb2.SourceInstanceRef(
@@ -310,8 +315,8 @@ def test_receive_tensors_retries_next_candidate_after_failure():
             self.attempted_sources = []
             self.model_versions = []
 
-        def _receive_from_candidate(self, candidate, model_version, target_tensors=None):
-            del target_tensors
+        def _receive_from_candidate(self, candidate, model_version, **kwargs):
+            del kwargs
             self.attempted_sources.append(candidate.mx_source_id)
             self.model_versions.append(model_version)
             if candidate.mx_source_id == "source-a":
@@ -339,15 +344,195 @@ def test_receive_tensors_retries_next_candidate_after_failure():
     assert tensors[0][0] == "w"
 
 
+def test_receive_into_tensors_applies_exact_plan_before_nixl(monkeypatch):
+    class _FakeNixlManager:
+        received_tensor_names = None
+        registered_tensor_names = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @property
+        def nixl_metadata(self):
+            return b""
+
+        @property
+        def tensor_descriptors(self):
+            return []
+
+        def initialize(self):
+            pass
+
+        def register_tensors(self, tensors):
+            type(self).registered_tensor_names = sorted(tensors)
+
+        def receive_from_source(self, source_metadata, source_tensors, timeout_seconds):
+            del source_metadata
+            del timeout_seconds
+            type(self).received_tensor_names = [tensor.name for tensor in source_tensors]
+            return 4, len(source_tensors), 0.0
+
+    class _MetadataMxClient(_FakeMxClient):
+        def get_metadata(self, mx_source_id, worker_id):
+            del mx_source_id
+            del worker_id
+            return p2p_pb2.GetMetadataResponse(
+                found=True,
+                worker=p2p_pb2.WorkerMetadata(
+                    worker_rank=0,
+                    nixl_metadata=b"source",
+                    tensors=[
+                        p2p_pb2.TensorDescriptor(
+                            name="w",
+                            addr=1,
+                            size=4,
+                            device_id=0,
+                            dtype="torch.float32",
+                        ),
+                        p2p_pb2.TensorDescriptor(
+                            name="unused",
+                            addr=2,
+                            size=4,
+                            device_id=0,
+                            dtype="torch.float32",
+                        ),
+                    ],
+                ),
+            )
+
+    monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _FakeNixlManager)
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[_source_ref("source-a", "worker-a")]
+    )
+    transfer = RlNixlWeightTransfer(
+        mx_client=_MetadataMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    tensors = asyncio.run(
+        transfer.receive_into_tensors(
+            {"w": torch.zeros(1, dtype=torch.float32)},
+            model_version=5,
+            receiver_rank=0,
+        )
+    )
+
+    assert tensors[0][0] == "w"
+    assert _FakeNixlManager.registered_tensor_names == ["w"]
+    assert _FakeNixlManager.received_tensor_names == ["w"]
+
+
+def test_receive_into_tensors_rejects_incomplete_exact_plan():
+    class _MetadataMxClient(_FakeMxClient):
+        def get_metadata(self, mx_source_id, worker_id):
+            del mx_source_id
+            del worker_id
+            return p2p_pb2.GetMetadataResponse(
+                found=True,
+                worker=p2p_pb2.WorkerMetadata(
+                    worker_rank=0,
+                    nixl_metadata=b"source",
+                    tensors=[
+                        p2p_pb2.TensorDescriptor(
+                            name="experts.w",
+                            addr=1,
+                            size=4,
+                            device_id=0,
+                            dtype="torch.float32",
+                        )
+                    ],
+                ),
+            )
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "source-a",
+                "worker-a",
+                shape_registry={
+                    "experts.w": {
+                        "shape": [1],
+                        "dtype": "torch.float32",
+                        "expert_ids": [0],
+                    }
+                },
+            )
+        ]
+    )
+    transfer = RlNixlWeightTransfer(
+        mx_client=_MetadataMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete RL reshard plan"):
+        asyncio.run(
+            transfer.receive_into_tensors(
+                {"experts.w": torch.zeros(1, dtype=torch.float32)},
+                model_version=5,
+                receiver_rank=0,
+                target_specs=[
+                    TensorReceiveSpec(
+                        name="experts.w",
+                        receiver_rank=0,
+                        shape=(1,),
+                        dtype="torch.float32",
+                        expert_ids=frozenset({1}),
+                    )
+                ],
+            )
+        )
+
+
+def test_receive_into_tensors_validates_descriptors_before_nixl(monkeypatch):
+    class _UnexpectedNixlManager:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("NIXL should not initialize before descriptor validation")
+
+    class _MetadataMxClient(_FakeMxClient):
+        def get_metadata(self, mx_source_id, worker_id):
+            del mx_source_id
+            del worker_id
+            return p2p_pb2.GetMetadataResponse(
+                found=True,
+                worker=p2p_pb2.WorkerMetadata(
+                    worker_rank=0,
+                    nixl_metadata=b"source",
+                    tensors=[],
+                ),
+            )
+
+    monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _UnexpectedNixlManager)
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[_source_ref("source-a", "worker-a")]
+    )
+    transfer = RlNixlWeightTransfer(
+        mx_client=_MetadataMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    with pytest.raises(RuntimeError, match="source descriptors missing planned entries"):
+        asyncio.run(
+            transfer.receive_into_tensors(
+                {"w": torch.zeros(1, dtype=torch.float32)},
+                model_version=5,
+                receiver_rank=0,
+            )
+        )
+
+
 def test_receive_into_tensors_passes_caller_owned_targets():
     class _IntoTransfer(RlNixlWeightTransfer):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
             self.target_tensors = None
 
-        def _receive_from_candidate(self, candidate, model_version, target_tensors=None):
+        def _receive_from_candidate(self, candidate, model_version, **kwargs):
             del candidate
             del model_version
+            target_tensors = kwargs["target_tensors"]
             self.target_tensors = target_tensors
             return list(target_tensors.items())
 

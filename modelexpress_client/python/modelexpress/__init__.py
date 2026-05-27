@@ -81,6 +81,9 @@ from .rl_reshard import (  # noqa: F401
     TransferPlan,
     TransferPlanEntry,
     plan_exact_transfers,
+    receive_specs_from_shape_registry,
+    receive_specs_from_tensors,
+    source_specs_from_shape_registry,
 )
 
 __all__ = [
@@ -97,5 +100,8 @@ __all__ = [
     "TransferPlanEntry",
     "configure_vllm_logging",
     "plan_exact_transfers",
+    "receive_specs_from_shape_registry",
+    "receive_specs_from_tensors",
     "register_modelexpress_loaders",
+    "source_specs_from_shape_registry",
 ]

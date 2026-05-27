@@ -10,8 +10,11 @@ framework adapters can provide tensor handles without embedding layout policy.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import Any
+
+import torch
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,63 @@ def plan_exact_transfers(
     return TransferPlan(tuple(entries), tuple(missing))
 
 
+def source_specs_from_shape_registry(
+    shape_registry: Mapping[str, Any],
+    *,
+    worker_rank: int,
+) -> tuple[TensorShardSpec, ...]:
+    """Build source specs from RL shape-registry metadata."""
+    return tuple(
+        TensorShardSpec(
+            name=name,
+            worker_rank=worker_rank,
+            shape=_shape_from_registry_entry(name, entry),
+            dtype=_dtype_from_registry_entry(name, entry),
+            tensor_parallel_rank=_int_from_registry_entry(entry, "tensor_parallel_rank"),
+            pipeline_parallel_rank=_int_from_registry_entry(entry, "pipeline_parallel_rank"),
+            expert_ids=_expert_ids_from_registry_entry(entry),
+        )
+        for name, entry in shape_registry.items()
+    )
+
+
+def receive_specs_from_shape_registry(
+    shape_registry: Mapping[str, Any],
+    *,
+    receiver_rank: int,
+) -> tuple[TensorReceiveSpec, ...]:
+    """Build receiver specs from RL shape-registry metadata."""
+    return tuple(
+        TensorReceiveSpec(
+            name=name,
+            receiver_rank=receiver_rank,
+            shape=_shape_from_registry_entry(name, entry),
+            dtype=_dtype_from_registry_entry(name, entry),
+            tensor_parallel_rank=_int_from_registry_entry(entry, "tensor_parallel_rank"),
+            pipeline_parallel_rank=_int_from_registry_entry(entry, "pipeline_parallel_rank"),
+            expert_ids=_expert_ids_from_registry_entry(entry),
+        )
+        for name, entry in shape_registry.items()
+    )
+
+
+def receive_specs_from_tensors(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    receiver_rank: int,
+) -> tuple[TensorReceiveSpec, ...]:
+    """Build default dense receiver specs from caller-owned tensors."""
+    return tuple(
+        TensorReceiveSpec(
+            name=name,
+            receiver_rank=receiver_rank,
+            shape=tuple(tensor.shape),
+            dtype=str(tensor.dtype),
+        )
+        for name, tensor in tensors.items()
+    )
+
+
 def _is_compatible_source(source: TensorShardSpec, target: TensorReceiveSpec) -> bool:
     return (
         source.name == target.name
@@ -171,3 +231,38 @@ def _missing_reason(
     if any(source.name == target.name for source in sources):
         return "tensor exists but shape, dtype, layout, or expert ownership differs"
     return "tensor not found"
+
+
+def _shape_from_registry_entry(name: str, entry: Any) -> tuple[int, ...]:
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"shape registry entry for {name!r} must be an object")
+    shape = entry.get("shape")
+    if not isinstance(shape, list):
+        raise ValueError(f"shape registry entry for {name!r} must include shape")
+    return tuple(int(dim) for dim in shape)
+
+
+def _dtype_from_registry_entry(name: str, entry: Any) -> str:
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"shape registry entry for {name!r} must be an object")
+    dtype = entry.get("dtype")
+    if dtype is None:
+        raise ValueError(f"shape registry entry for {name!r} must include dtype")
+    return str(dtype)
+
+
+def _int_from_registry_entry(entry: Any, key: str) -> int:
+    if not isinstance(entry, Mapping):
+        return 0
+    return int(entry.get(key, 0))
+
+
+def _expert_ids_from_registry_entry(entry: Any) -> frozenset[int]:
+    if not isinstance(entry, Mapping):
+        return frozenset()
+    expert_ids = entry.get("expert_ids", [])
+    if expert_ids is None:
+        return frozenset()
+    if not isinstance(expert_ids, list):
+        raise ValueError("shape registry expert_ids must be a list")
+    return frozenset(int(expert) for expert in expert_ids)

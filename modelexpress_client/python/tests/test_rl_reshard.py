@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import torch
 
 import modelexpress
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
     TensorShardSpec,
     plan_exact_transfers,
+    receive_specs_from_shape_registry,
+    receive_specs_from_tensors,
+    source_specs_from_shape_registry,
 )
 
 
@@ -136,3 +140,73 @@ def test_reshard_planner_types_are_exported_from_package():
     assert modelexpress.TensorShardSpec is TensorShardSpec
     assert modelexpress.TensorReceiveSpec is TensorReceiveSpec
     assert modelexpress.plan_exact_transfers is plan_exact_transfers
+    assert modelexpress.source_specs_from_shape_registry is source_specs_from_shape_registry
+    assert modelexpress.receive_specs_from_shape_registry is receive_specs_from_shape_registry
+    assert modelexpress.receive_specs_from_tensors is receive_specs_from_tensors
+
+
+def test_source_specs_from_shape_registry_preserves_layout_metadata():
+    specs = source_specs_from_shape_registry(
+        {
+            "experts.w": {
+                "shape": [2, 4],
+                "dtype": "torch.bfloat16",
+                "tensor_parallel_rank": 1,
+                "pipeline_parallel_rank": 2,
+                "expert_ids": [3, 7],
+            }
+        },
+        worker_rank=5,
+    )
+
+    assert specs == (
+        TensorShardSpec(
+            name="experts.w",
+            worker_rank=5,
+            shape=(2, 4),
+            dtype="torch.bfloat16",
+            tensor_parallel_rank=1,
+            pipeline_parallel_rank=2,
+            expert_ids=frozenset({3, 7}),
+        ),
+    )
+
+
+def test_receive_specs_from_shape_registry_sets_receiver_rank():
+    specs = receive_specs_from_shape_registry(
+        {"w": {"shape": [2, 4], "dtype": "torch.float16"}},
+        receiver_rank=2,
+    )
+
+    assert specs == (
+        TensorReceiveSpec(
+            name="w",
+            receiver_rank=2,
+            shape=(2, 4),
+            dtype="torch.float16",
+        ),
+    )
+
+
+def test_receive_specs_from_tensors_builds_default_dense_specs():
+    specs = receive_specs_from_tensors(
+        {"w": torch.zeros((2, 4), dtype=torch.float32)},
+        receiver_rank=1,
+    )
+
+    assert specs == (
+        TensorReceiveSpec(
+            name="w",
+            receiver_rank=1,
+            shape=(2, 4),
+            dtype="torch.float32",
+        ),
+    )
+
+
+def test_shape_registry_spec_conversion_rejects_invalid_expert_metadata():
+    with pytest.raises(ValueError, match="expert_ids must be a list"):
+        source_specs_from_shape_registry(
+            {"w": {"shape": [1], "dtype": "torch.float32", "expert_ids": "bad"}},
+            worker_rank=0,
+        )
