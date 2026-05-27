@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -46,6 +47,62 @@ _BACKEND_FRAMEWORKS = {
     "trt_llm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
     "trt-llm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
 }
+
+
+@dataclass(frozen=True)
+class RlTransferAttempt:
+    """One attempted RL receive source."""
+
+    mx_source_id: str
+    worker_id: str
+    worker_rank: int
+    role: RlSourceRole
+    model_version: int
+    success: bool
+    error: str | None = None
+    bytes_transferred: int = 0
+    tensor_count: int = 0
+    duration_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class RlTransferReport:
+    """Summary of the latest RL receive attempt sequence."""
+
+    requested_model_version: int | None
+    resolved_model_version: int | None
+    receiver_rank: int
+    attempts: tuple[RlTransferAttempt, ...]
+
+    @property
+    def success(self) -> bool:
+        return any(attempt.success for attempt in self.attempts)
+
+    @property
+    def retry_count(self) -> int:
+        return sum(1 for attempt in self.attempts if not attempt.success)
+
+    @property
+    def source_role(self) -> RlSourceRole | None:
+        for attempt in self.attempts:
+            if attempt.success:
+                return attempt.role
+        return None
+
+    @property
+    def source_worker_id(self) -> str | None:
+        for attempt in self.attempts:
+            if attempt.success:
+                return attempt.worker_id
+        return None
+
+
+@dataclass(frozen=True)
+class _ReceiveCandidateResult:
+    tensors: list[tuple[str, torch.Tensor]]
+    bytes_transferred: int
+    tensor_count: int
+    duration_seconds: float
 
 
 def backend_framework_value(value: str | int) -> int:
@@ -182,6 +239,41 @@ def candidates_for_base_identity(
     return candidates_from_response(filtered_response)
 
 
+def _successful_attempt_from_candidate(
+    candidate: RlSourceCandidate,
+    *,
+    bytes_transferred: int,
+    tensor_count: int,
+    duration_seconds: float,
+) -> RlTransferAttempt:
+    return RlTransferAttempt(
+        mx_source_id=candidate.mx_source_id,
+        worker_id=candidate.worker_id,
+        worker_rank=candidate.worker_rank,
+        role=candidate.metadata.role,
+        model_version=candidate.metadata.model_version,
+        success=True,
+        bytes_transferred=bytes_transferred,
+        tensor_count=tensor_count,
+        duration_seconds=duration_seconds,
+    )
+
+
+def _failed_attempt_from_candidate(
+    candidate: RlSourceCandidate,
+    exc: Exception,
+) -> RlTransferAttempt:
+    return RlTransferAttempt(
+        mx_source_id=candidate.mx_source_id,
+        worker_id=candidate.worker_id,
+        worker_rank=candidate.worker_rank,
+        role=candidate.metadata.role,
+        model_version=candidate.metadata.model_version,
+        success=False,
+        error=str(exc),
+    )
+
+
 class RlNixlWeightTransfer:
     """Publish and receive versioned RL weights through MX metadata and NIXL."""
 
@@ -206,6 +298,7 @@ class RlNixlWeightTransfer:
         self._mx_source_id: str | None = None
         self._worker_rank = 0
         self._heartbeat: HeartbeatThread | None = None
+        self.last_receive_report: RlTransferReport | None = None
 
     def finalize(self) -> None:
         """Tear down transient transfer state and stop advertising this source."""
@@ -393,6 +486,7 @@ class RlNixlWeightTransfer:
         target_tensors: dict[str, torch.Tensor] | None = None,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
     ) -> tuple[int, list[tuple[str, torch.Tensor]]]:
+        self.last_receive_report = None
         candidates = await self.wait_for_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
@@ -400,9 +494,10 @@ class RlNixlWeightTransfer:
             same_rank_only=same_rank_only,
         )
         errors = []
+        attempts: list[RlTransferAttempt] = []
         for candidate in candidates:
             try:
-                tensors = self._receive_from_candidate(
+                result = self._receive_from_candidate(
                     candidate,
                     candidate.metadata.model_version,
                     receiver_rank=receiver_rank,
@@ -410,9 +505,24 @@ class RlNixlWeightTransfer:
                     target_tensors=target_tensors,
                     target_specs=target_specs,
                 )
-                return candidate.metadata.model_version, tensors
+                attempts.append(
+                    _successful_attempt_from_candidate(
+                        candidate,
+                        bytes_transferred=result.bytes_transferred,
+                        tensor_count=result.tensor_count,
+                        duration_seconds=result.duration_seconds,
+                    )
+                )
+                self.last_receive_report = RlTransferReport(
+                    requested_model_version=model_version,
+                    resolved_model_version=candidate.metadata.model_version,
+                    receiver_rank=receiver_rank,
+                    attempts=tuple(attempts),
+                )
+                return candidate.metadata.model_version, result.tensors
             except Exception as exc:
                 errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
+                attempts.append(_failed_attempt_from_candidate(candidate, exc))
                 logger.warning(
                     "ModelExpress RL source transfer failed; trying next candidate: "
                     "source_id=%s worker_id=%s",
@@ -420,6 +530,12 @@ class RlNixlWeightTransfer:
                     candidate.worker_id,
                     exc_info=True,
                 )
+        self.last_receive_report = RlTransferReport(
+            requested_model_version=model_version,
+            resolved_model_version=None,
+            receiver_rank=receiver_rank,
+            attempts=tuple(attempts),
+        )
         raise RuntimeError(
             "No ModelExpress RL source transfer succeeded for "
             f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
@@ -451,7 +567,7 @@ class RlNixlWeightTransfer:
         same_rank_only: bool,
         target_tensors: dict[str, torch.Tensor] | None = None,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
-    ) -> list[tuple[str, torch.Tensor]]:
+    ) -> _ReceiveCandidateResult:
         metadata_resp = self.mx_client.get_metadata(candidate.mx_source_id, candidate.worker_id)
         if not metadata_resp.found:
             raise RuntimeError(
@@ -537,11 +653,17 @@ class RlNixlWeightTransfer:
             tensor_count,
             bytes_transferred,
         )
-        return [
+        tensors = [
             (descriptor.name, tensor)
             for descriptor in descriptors
             if (tensor := target_tensors.get(descriptor.name)) is not None
         ]
+        return _ReceiveCandidateResult(
+            tensors=tensors,
+            bytes_transferred=bytes_transferred,
+            tensor_count=tensor_count,
+            duration_seconds=_duration,
+        )
 
     async def wait_for_source(
         self,

@@ -12,6 +12,7 @@ from modelexpress.rl_metadata import RlSourceMetadata, RlSourceRole, with_rl_sou
 from modelexpress.rl_reshard import TensorReceiveSpec
 from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
+    _ReceiveCandidateResult,
     allocate_tensors_from_shape_registry,
     backend_framework_value,
     build_rl_base_identity,
@@ -499,7 +500,12 @@ def test_receive_tensors_retries_next_candidate_after_failure():
             self.model_versions.append(model_version)
             if candidate.mx_source_id == "source-a":
                 raise RuntimeError("boom")
-            return [("w", torch.zeros(1))]
+            return _ReceiveCandidateResult(
+                tensors=[("w", torch.zeros(1))],
+                bytes_transferred=4,
+                tensor_count=1,
+                duration_seconds=0.01,
+            )
 
     response = p2p_pb2.ListSourcesResponse(
         instances=[
@@ -520,6 +526,58 @@ def test_receive_tensors_retries_next_candidate_after_failure():
     assert transfer.attempted_sources == ["source-a", "source-b"]
     assert transfer.model_versions == [7, 7]
     assert tensors[0][0] == "w"
+    assert transfer.last_receive_report is not None
+    assert transfer.last_receive_report.success
+    assert transfer.last_receive_report.retry_count == 1
+    assert transfer.last_receive_report.resolved_model_version == 7
+    assert transfer.last_receive_report.source_worker_id == "worker-b"
+    assert [attempt.success for attempt in transfer.last_receive_report.attempts] == [
+        False,
+        True,
+    ]
+    assert transfer.last_receive_report.attempts[1].bytes_transferred == 4
+
+
+def test_receive_tensors_records_failed_transfer_report():
+    class _FailTransfer(RlNixlWeightTransfer):
+        def _receive_from_candidate(self, candidate, model_version, **kwargs):
+            del candidate
+            del model_version
+            del kwargs
+            raise RuntimeError("transfer failed")
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[_source_ref("source-a", "worker-a", model_version=7)]
+    )
+    transfer = _FailTransfer(
+        mx_client=_FakeMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    with pytest.raises(RuntimeError, match="No ModelExpress RL source transfer succeeded"):
+        asyncio.run(transfer.receive_tensors(model_version=None, receiver_rank=0))
+
+    assert transfer.last_receive_report is not None
+    assert not transfer.last_receive_report.success
+    assert transfer.last_receive_report.resolved_model_version is None
+    assert transfer.last_receive_report.retry_count == 1
+    assert transfer.last_receive_report.attempts[0].error == "transfer failed"
+
+
+def test_receive_tensors_clears_stale_report_when_discovery_fails():
+    transfer = RlNixlWeightTransfer(
+        mx_client=_FakeMxClient(p2p_pb2.ListSourcesResponse()),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+        timeout_seconds=0.0,
+    )
+    transfer.last_receive_report = object()
+
+    with pytest.raises(RuntimeError, match="No ModelExpress RL source found"):
+        asyncio.run(transfer.receive_tensors(model_version=5, receiver_rank=0))
+
+    assert transfer.last_receive_report is None
 
 
 def test_receive_into_tensors_applies_exact_plan_before_nixl(monkeypatch):
@@ -712,7 +770,12 @@ def test_receive_into_tensors_passes_caller_owned_targets():
             del model_version
             target_tensors = kwargs["target_tensors"]
             self.target_tensors = target_tensors
-            return list(target_tensors.items())
+            return _ReceiveCandidateResult(
+                tensors=list(target_tensors.items()),
+                bytes_transferred=4,
+                tensor_count=len(target_tensors),
+                duration_seconds=0.01,
+            )
 
     response = p2p_pb2.ListSourcesResponse(
         instances=[_source_ref("source-a", "worker-a")]
@@ -746,7 +809,13 @@ def test_receive_and_publish_replica_uses_received_version_and_receiver_rank():
         def _receive_from_candidate(self, candidate, model_version, **kwargs):
             del candidate
             del model_version
-            return list(kwargs["target_tensors"].items())
+            tensors = list(kwargs["target_tensors"].items())
+            return _ReceiveCandidateResult(
+                tensors=tensors,
+                bytes_transferred=4,
+                tensor_count=len(tensors),
+                duration_seconds=0.01,
+            )
 
         def publish_tensors(
             self,
@@ -809,7 +878,12 @@ def test_receive_tensors_and_publish_replica_uses_allocated_receive():
             del candidate
             del model_version
             del kwargs
-            return [("w", torch.zeros(1))]
+            return _ReceiveCandidateResult(
+                tensors=[("w", torch.zeros(1))],
+                bytes_transferred=4,
+                tensor_count=1,
+                duration_seconds=0.01,
+            )
 
         def publish_tensors(
             self,
