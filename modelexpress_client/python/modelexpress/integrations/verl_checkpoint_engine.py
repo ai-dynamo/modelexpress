@@ -136,6 +136,7 @@ class _ModelExpressCheckpointEngineMixin:
         topology: str | None = None,
         same_rank_only: bool | None = None,
         republish_received: bool | str | None = None,
+        retain_sources_on_finalize: bool | str | None = None,
         tree_fanout: int | str | None = None,
         tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
         lifecycle_hooks: RlWeightUpdateLifecycleHooks | None = None,
@@ -174,6 +175,15 @@ class _ModelExpressCheckpointEngineMixin:
         )
         if self.topology == _TOPOLOGY_TREE_FANOUT and not self.republish_received:
             raise ValueError("ModelExpress tree_fanout topology requires republish_received")
+        retain_sources_value = (
+            retain_sources_on_finalize
+            if retain_sources_on_finalize is not None
+            else os.environ.get("MX_RL_RETAIN_SOURCES_ON_FINALIZE")
+        )
+        self.retain_sources_on_finalize = _normalize_bool(
+            retain_sources_value,
+            default=True,
+        )
         self.base_identity = build_rl_base_identity(
             model_name=self.model_name,
             mx_version=mx_version,
@@ -276,7 +286,13 @@ class _ModelExpressCheckpointEngineMixin:
         self._replica_world_size = replica_world_size
 
     def finalize(self) -> None:
-        self._transfer.finalize()
+        if self.retain_sources_on_finalize:
+            self._transfer.finalize_receive_state()
+        else:
+            self._transfer.finalize()
+
+    def mark_current_source_stale(self) -> None:
+        self._transfer.mark_current_source_stale()
 
     @property
     def last_receive_report(self) -> RlTransferReport | None:

@@ -27,6 +27,12 @@ class VerlRuntimeSmokeResult:
     non_completed_lease_statuses: tuple[int, ...] = ()
     transfer_lease_discovery_supported: bool = False
     replica_events: tuple[str, ...] = ()
+    recovery_update_seconds: float = 0.0
+    recovery_check_seconds: float = 0.0
+    recovery_requested_model_version: int | None = None
+    recovery_resolved_model_version: int | None = None
+    recovery_source_roles: tuple[str, ...] = ()
+    recovery_success: bool = False
 
 
 def run_verl_checkpoint_manager_update(
@@ -37,6 +43,8 @@ def run_verl_checkpoint_manager_update(
     mx_python_path: Path,
     server_url: str | None = None,
     global_steps: int = 17,
+    republish_received: bool = False,
+    recover_latest_from_replica: bool = False,
     fail_refit_after_tensors: int | None = None,
     expect_update_failure: bool = False,
 ) -> VerlRuntimeSmokeResult:
@@ -262,6 +270,20 @@ def run_verl_checkpoint_manager_update(
                 "discovery_supported": summary.inventory.discovery_supported,
             }
 
+        @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+        def receive_report_snapshot(self):
+            report = self.checkpoint_engine.last_receive_report
+            if report is None:
+                return {}
+            return {
+                "requested_model_version": report.requested_model_version,
+                "resolved_model_version": report.resolved_model_version,
+                "success": report.success,
+                "source_roles": tuple(
+                    attempt.role.value for attempt in report.attempts if attempt.success
+                ),
+            }
+
     async def create_rollout_worker_group(
         resource_pool: RayResourcePool,
         model_config: HFModelConfig,
@@ -309,6 +331,7 @@ def run_verl_checkpoint_manager_update(
             backend=backend,
             model_name=model_name,
             server_url=server_url,
+            republish_received=republish_received,
         )
         model_config = HFModelConfig(
             path=str(model_path),
@@ -365,6 +388,41 @@ def run_verl_checkpoint_manager_update(
             check_started = time.perf_counter()
             rollout.check_weights()
             check_seconds = time.perf_counter() - check_started
+        recovery_update_seconds = 0.0
+        recovery_check_seconds = 0.0
+        recovery_report = {}
+        if recover_latest_from_replica:
+            if backend != "modelexpress":
+                raise ValueError("latest replica recovery is only supported for ModelExpress")
+            if failed:
+                raise AssertionError("cannot recover latest after a failed initial update")
+            ray.get(
+                trainer.execute_checkpoint_engine(
+                    ["mark_current_source_stale"] * trainer.world_size
+                )
+            )
+            recovery_rollout, recovery_replicas = await create_rollout_worker_group(
+                rollout_pool,
+                model_config,
+                rollout_config,
+                check_allclose=True,
+            )
+            recovery_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                trainer=trainer,
+                replicas=recovery_replicas,
+            )
+            recovery_manager.build_process_group(recovery_rollout)
+            recovery_started = time.perf_counter()
+            try:
+                ray.get(recovery_rollout.update_weights(global_steps=None))
+            finally:
+                recovery_manager.finalize_process_group(recovery_rollout)
+            recovery_update_seconds = time.perf_counter() - recovery_started
+            recovery_check_started = time.perf_counter()
+            recovery_rollout.check_weights()
+            recovery_check_seconds = time.perf_counter() - recovery_check_started
+            recovery_report = _receive_report_snapshot(recovery_rollout)
         lease_snapshot = _lease_snapshot(rollout) if backend == "modelexpress" else {}
         return VerlRuntimeSmokeResult(
             backend=backend,
@@ -388,6 +446,16 @@ def run_verl_checkpoint_manager_update(
             replica_events=tuple(
                 event for replica in replicas for event in replica.events
             ),
+            recovery_update_seconds=recovery_update_seconds,
+            recovery_check_seconds=recovery_check_seconds,
+            recovery_requested_model_version=recovery_report.get(
+                "requested_model_version"
+            ),
+            recovery_resolved_model_version=recovery_report.get(
+                "resolved_model_version"
+            ),
+            recovery_source_roles=tuple(recovery_report.get("source_roles", ())),
+            recovery_success=bool(recovery_report.get("success", False)),
         )
 
     try:
@@ -412,6 +480,7 @@ def _checkpoint_engine_config(
     backend: Literal["modelexpress", "nccl"],
     model_name: str,
     server_url: str | None,
+    republish_received: bool = False,
 ):
     from verl.workers.config import CheckpointEngineConfig
 
@@ -429,6 +498,8 @@ def _checkpoint_engine_config(
                     "dtype": "bfloat16",
                     "retain_latest_k": 1,
                     "timeout_seconds": 60.0,
+                    "republish_received": republish_received,
+                    "retain_sources_on_finalize": True,
                 }
             },
         )
@@ -441,6 +512,13 @@ def _checkpoint_engine_config(
 
 def _lease_snapshot(rollout):
     snapshots = rollout.transfer_lease_snapshot()
+    if isinstance(snapshots, list):
+        return snapshots[0] if snapshots else {}
+    return snapshots
+
+
+def _receive_report_snapshot(rollout):
+    snapshots = rollout.receive_report_snapshot()
     if isinstance(snapshots, list):
         return snapshots[0] if snapshots else {}
     return snapshots

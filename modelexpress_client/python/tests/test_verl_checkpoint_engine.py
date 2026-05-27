@@ -325,6 +325,80 @@ def test_transfer_lease_summary_uses_receive_report_and_inventory():
     assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
 
 
+def test_finalize_retains_sources_by_default_for_verl_manager_finalize():
+    class _FakeTransfer:
+        def __init__(self):
+            self.finalize_called = False
+            self.finalize_receive_state_called = False
+
+        def finalize(self):
+            self.finalize_called = True
+
+        def finalize_receive_state(self):
+            self.finalize_receive_state_called = True
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+
+    engine.finalize()
+
+    assert fake_transfer.finalize_receive_state_called
+    assert not fake_transfer.finalize_called
+
+
+def test_finalize_can_stale_sources_when_configured():
+    class _FakeTransfer:
+        def __init__(self):
+            self.finalize_called = False
+            self.finalize_receive_state_called = False
+
+        def finalize(self):
+            self.finalize_called = True
+
+        def finalize_receive_state(self):
+            self.finalize_receive_state_called = True
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        retain_sources_on_finalize=False,
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+
+    engine.finalize()
+
+    assert fake_transfer.finalize_called
+    assert not fake_transfer.finalize_receive_state_called
+
+
+def test_mark_current_source_stale_delegates_to_transfer():
+    class _FakeTransfer:
+        def __init__(self):
+            self.marked_stale = False
+
+        def mark_current_source_stale(self):
+            self.marked_stale = True
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+
+    engine.mark_current_source_stale()
+
+    assert fake_transfer.marked_stale
+
+
 def test_receive_weights_validates_before_pause_hook():
     events = []
     engine = _ModelExpressCheckpointEngineMixin(

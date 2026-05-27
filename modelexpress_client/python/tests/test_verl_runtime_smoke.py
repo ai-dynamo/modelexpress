@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from modelexpress import p2p_pb2
+from modelexpress.rl_metadata import RlSourceRole
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
 _VERL_REPO_ENV = "MX_VERL_REPO_PATH"
@@ -92,6 +93,29 @@ def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
         "resume_kv_cache",
         "resume_generation",
     )
+
+
+def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
+    tmp_path,
+):
+    """Recover a fresh veRL rollout worker from an MX inference replica source."""
+    run_verl_checkpoint_manager_update = _load_harness().run_verl_checkpoint_manager_update
+    result = run_verl_checkpoint_manager_update(
+        backend="modelexpress",
+        tmp_path=tmp_path,
+        verl_repo=Path(os.environ[_VERL_REPO_ENV]).resolve(),
+        mx_python_path=Path(__file__).resolve().parents[1],
+        server_url=os.environ[_LIVE_SERVER_ENV],
+        republish_received=True,
+        recover_latest_from_replica=True,
+    )
+
+    assert result.recovery_success
+    assert result.recovery_update_seconds > 0.0
+    assert result.recovery_check_seconds > 0.0
+    assert result.recovery_requested_model_version is None
+    assert result.recovery_resolved_model_version == 17
+    assert result.recovery_source_roles == (RlSourceRole.INFERENCE_REPLICA.value,)
 
 
 def _load_harness():

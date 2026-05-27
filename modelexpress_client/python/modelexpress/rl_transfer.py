@@ -130,6 +130,10 @@ class RlNixlWeightTransfer:
             self.mark_current_source_stale()
         self._shutdown_target_nixl_manager()
 
+    def finalize_receive_state(self) -> None:
+        """Tear down receiver-side transfer state while keeping publications live."""
+        self._shutdown_target_nixl_manager()
+
     def list_target_transfer_leases(
         self,
         *,
