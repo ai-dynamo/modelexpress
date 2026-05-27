@@ -10,6 +10,7 @@ from modelexpress import p2p_pb2
 from modelexpress.integrations.verl_checkpoint_engine import (
     _ModelExpressCheckpointEngineMixin,
     _model_version_from_global_steps,
+    _normalize_source_role_policy,
     _topology_from_metadata,
 )
 from modelexpress.rl_metadata import RlSourceRole
@@ -186,6 +187,27 @@ def test_tree_fanout_requires_republish_received():
         )
 
 
+def test_source_role_policy_defaults_to_trainer_with_replica_fallback(monkeypatch):
+    monkeypatch.delenv("MX_RL_SOURCE_ROLE_POLICY", raising=False)
+
+    assert _normalize_source_role_policy(None) == (
+        RlSourceRole.TRAINER,
+        RlSourceRole.INFERENCE_REPLICA,
+    )
+
+
+def test_source_role_policy_accepts_replica_first():
+    assert _normalize_source_role_policy("replica_first") == (
+        RlSourceRole.INFERENCE_REPLICA,
+        RlSourceRole.TRAINER,
+    )
+
+
+def test_source_role_policy_rejects_unknown_values():
+    with pytest.raises(ValueError, match="unsupported ModelExpress veRL source role policy"):
+        _normalize_source_role_policy("unknown")
+
+
 def test_receive_weights_without_global_steps_requests_latest_and_republishes():
     class _FakeTransfer:
         def __init__(self):
@@ -221,6 +243,7 @@ def test_receive_weights_without_global_steps_requests_latest_and_republishes():
         "model_version": None,
         "receiver_rank": 1,
         "same_rank_only": False,
+        "roles": (RlSourceRole.TRAINER, RlSourceRole.INFERENCE_REPLICA),
         "replica_world_size": 3,
     }
 
@@ -261,6 +284,7 @@ def test_receive_weights_runs_lifecycle_hooks_around_verl_refit():
                 "model_version": None,
                 "receiver_rank": 1,
                 "same_rank_only": False,
+                "roles": (RlSourceRole.TRAINER, RlSourceRole.INFERENCE_REPLICA),
             },
         ),
         "flush",
@@ -446,6 +470,45 @@ def test_receive_weights_uses_explicit_replica_world_size():
 
     assert fake_transfer.republish_kwargs["replica_world_size"] == 4
     assert fake_transfer.republish_kwargs["model_version"] == 8
+    assert fake_transfer.republish_kwargs["roles"] == (
+        RlSourceRole.TRAINER,
+        RlSourceRole.INFERENCE_REPLICA,
+    )
+
+
+def test_receive_weights_can_prefer_replica_sources():
+    class _FakeTransfer:
+        def __init__(self):
+            self.receive_kwargs = None
+
+        async def receive_tensors(self, **kwargs):
+            self.receive_kwargs = kwargs
+            return [("w", torch.zeros(1))]
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        source_role_policy="replica_first",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(
+        rank=2,
+        world_size=4,
+        is_trainer=False,
+        receiver_rank=1,
+        source_world_size=1,
+    )
+
+    asyncio.run(_collect_weights(engine.receive_weights(global_steps=8)))
+
+    assert fake_transfer.receive_kwargs == {
+        "model_version": 8,
+        "receiver_rank": 1,
+        "same_rank_only": False,
+        "roles": (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER),
+    }
 
 
 def test_tree_fanout_receive_uses_parent_replica_policy():

@@ -21,6 +21,7 @@ import torch
 
 from modelexpress.client import MxClient, MxClientBase
 from modelexpress.rl_fanout import RlTreeFanoutPolicy
+from modelexpress.rl_metadata import RlSourceRole
 from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
     build_rl_base_identity,
@@ -39,6 +40,12 @@ _TOPOLOGY_BROADCAST = "broadcast"
 _TOPOLOGY_RANK_LOCAL = "rank_local"
 _TOPOLOGY_TREE_FANOUT = "tree_fanout"
 _TOPOLOGIES = {_TOPOLOGY_BROADCAST, _TOPOLOGY_RANK_LOCAL, _TOPOLOGY_TREE_FANOUT}
+_SOURCE_ROLE_POLICIES = {
+    "trainer_first": (RlSourceRole.TRAINER, RlSourceRole.INFERENCE_REPLICA),
+    "replica_first": (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER),
+    "trainer_only": (RlSourceRole.TRAINER,),
+    "replica_only": (RlSourceRole.INFERENCE_REPLICA,),
+}
 
 
 async def _iter_weights(weights: Any) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
@@ -115,6 +122,20 @@ def _normalize_positive_int(value: int | str | None, *, default: int) -> int:
     return result
 
 
+def _normalize_source_role_policy(value: str | None) -> tuple[RlSourceRole, ...]:
+    normalized = (
+        value or os.environ.get("MX_RL_SOURCE_ROLE_POLICY", "trainer_first")
+    )
+    normalized = normalized.strip().lower()
+    try:
+        return _SOURCE_ROLE_POLICIES[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported ModelExpress veRL source role policy {normalized!r}; "
+            f"expected one of {sorted(_SOURCE_ROLE_POLICIES)}"
+        ) from exc
+
+
 class _ModelExpressCheckpointEngineMixin:
     def __init__(
         self,
@@ -137,6 +158,7 @@ class _ModelExpressCheckpointEngineMixin:
         same_rank_only: bool | None = None,
         republish_received: bool | str | None = None,
         retain_sources_on_finalize: bool | str | None = None,
+        source_role_policy: str | None = None,
         tree_fanout: int | str | None = None,
         tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
         lifecycle_hooks: RlWeightUpdateLifecycleHooks | None = None,
@@ -184,6 +206,7 @@ class _ModelExpressCheckpointEngineMixin:
             retain_sources_value,
             default=True,
         )
+        self.source_roles = _normalize_source_role_policy(source_role_policy)
         self.base_identity = build_rl_base_identity(
             model_name=self.model_name,
             mx_version=mx_version,
@@ -394,7 +417,7 @@ class _ModelExpressCheckpointEngineMixin:
 
     def _receive_source_policy_kwargs(self, receiver_rank: int) -> dict[str, Any]:
         if self.topology != _TOPOLOGY_TREE_FANOUT:
-            return {}
+            return {"roles": self.source_roles}
         policy = RlTreeFanoutPolicy(
             receiver_rank=receiver_rank,
             replica_world_size=self._replica_world_size_for_publish(),
