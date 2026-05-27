@@ -180,6 +180,7 @@ def execute_dense_fanin_receive(
                 duration_seconds=duration_seconds,
             )
         )
+    plan.manifest.finalize()
     return DenseFanInReceiveResult(
         tensors=plan.manifest.output_tensors,
         source_results=tuple(source_results),

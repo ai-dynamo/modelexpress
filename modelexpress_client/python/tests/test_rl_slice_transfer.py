@@ -127,7 +127,7 @@ def test_slice_transfer_manifest_offsets_remote_descriptor_for_partial_target():
     assert manifest.output_tensors == [("w", target_tensor)]
 
 
-def test_slice_transfer_manifest_rejects_noncontiguous_target_slice():
+def test_slice_transfer_manifest_rejects_noncontiguous_source_slice():
     source = TensorShardSpec(
         name="w",
         worker_rank=0,
@@ -164,6 +164,51 @@ def test_slice_transfer_manifest_rejects_noncontiguous_target_slice():
             plan,
             source_descriptors=[TensorDescriptor("w", 100, 64, 0, "torch.float32")],
             target_tensors={"w": torch.zeros((4, 2), dtype=torch.float32)},
+        )
+
+
+def test_slice_transfer_manifest_stages_noncontiguous_target_view():
+    source = _source_spec(shape=(4, 2), global_shape=(4, 4), shard_offsets=(0, 1))
+    target = _target_spec(shape=(4, 2), global_shape=(4, 4), shard_offsets=(0, 1))
+    plan = plan_dense_reshard_transfers([source], [target])
+    backing_tensor = torch.zeros((4, 4), dtype=torch.float32)
+    target_view = backing_tensor[:, 1:3]
+
+    manifest = build_slice_transfer_manifest(
+        plan,
+        source_descriptors=[TensorDescriptor("w", 100, 32, 0, "torch.float32")],
+        target_tensors={"w": target_view},
+    )
+    transfer_target = manifest.target_tensors["w"]
+    transfer_target.copy_(
+        torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    )
+    manifest.finalize()
+
+    assert transfer_target.is_contiguous()
+    assert transfer_target.data_ptr() != target_view.data_ptr()
+    assert manifest.source_descriptors == [
+        TensorDescriptor("w", 100, 32, 0, "torch.float32"),
+    ]
+    assert manifest.output_tensors == [("w", target_view)]
+    assert torch.equal(
+        backing_tensor[:, 1:3],
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    )
+    assert torch.equal(backing_tensor[:, 0], torch.zeros(4))
+    assert torch.equal(backing_tensor[:, 3], torch.zeros(4))
+
+
+def test_slice_transfer_manifest_rejects_target_tensor_out_of_bounds():
+    source = _source_spec(shape=(4, 2), global_shape=(4, 2), shard_offsets=(0, 0))
+    target = _target_spec(shape=(4, 2), global_shape=(4, 2), shard_offsets=(0, 0))
+    plan = plan_dense_reshard_transfers([source], [target])
+
+    with pytest.raises(RuntimeError, match="target slice.*exceeds target tensor bounds"):
+        build_slice_transfer_manifest(
+            plan,
+            source_descriptors=[TensorDescriptor("w", 100, 32, 0, "torch.float32")],
+            target_tensors={"w": torch.zeros((4, 1), dtype=torch.float32)},
         )
 
 
@@ -206,6 +251,45 @@ def test_grouped_slice_transfer_manifest_materializes_multi_source_tensor_plan()
         TensorDescriptor("w.__mx_slice_1", 200, 8, 0, "torch.float32"),
     ]
     assert manifest.output_tensors == [("w", target_tensor)]
+
+
+def test_grouped_slice_transfer_manifest_stages_noncontiguous_target_slices():
+    source_a = _source_spec(
+        shape=(4, 2),
+        global_shape=(4, 4),
+        shard_offsets=(0, 0),
+    )
+    source_b = _source_spec(
+        worker_rank=1,
+        shape=(4, 2),
+        global_shape=(4, 4),
+        shard_offsets=(0, 2),
+    )
+    target = _target_spec(shape=(4, 4), global_shape=(4, 4), shard_offsets=(0, 0))
+    plan = plan_dense_reshard_transfers([source_a, source_b], [target])
+    target_tensor = torch.zeros((4, 4), dtype=torch.float32)
+
+    manifest = build_grouped_slice_transfer_manifest(
+        plan,
+        source_descriptors_by_rank={
+            0: [TensorDescriptor("w", 100, 32, 0, "torch.float32")],
+            1: [TensorDescriptor("w", 200, 32, 0, "torch.float32")],
+        },
+        target_tensors={"w": target_tensor},
+    )
+    manifest.target_tensors["w.__mx_slice_0"].fill_(1.0)
+    manifest.target_tensors["w.__mx_slice_1"].fill_(2.0)
+    manifest.finalize()
+
+    assert all(tensor.is_contiguous() for tensor in manifest.target_tensors.values())
+    assert manifest.source_transfers[0].source_descriptors == [
+        TensorDescriptor("w.__mx_slice_0", 100, 32, 0, "torch.float32"),
+    ]
+    assert manifest.source_transfers[1].source_descriptors == [
+        TensorDescriptor("w.__mx_slice_1", 200, 32, 0, "torch.float32"),
+    ]
+    assert torch.equal(target_tensor[:, :2], torch.ones((4, 2), dtype=torch.float32))
+    assert torch.equal(target_tensor[:, 2:], torch.full((4, 2), 2.0))
 
 
 def test_receive_into_tensors_applies_dense_slice_plan(monkeypatch):
@@ -431,3 +515,109 @@ def test_receive_into_tensors_applies_multi_source_dense_fanin(monkeypatch):
     ]
     assert transfer.last_receive_report.retry_count == 2
     assert transfer.last_receive_report.source_worker_id == "worker-r0"
+
+
+def test_receive_into_tensors_scatters_into_noncontiguous_target_view(monkeypatch):
+    class _FakeNixlManager:
+        registered_tensors = {}
+        received_descriptors = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def initialize(self):
+            pass
+
+        def register_tensors(self, tensors):
+            type(self).registered_tensors = dict(tensors)
+
+        def receive_from_source(self, source_metadata, source_tensors, timeout_seconds):
+            del source_metadata
+            del timeout_seconds
+            type(self).received_descriptors = source_tensors
+            type(self).registered_tensors["w"].copy_(
+                torch.arange(8, dtype=torch.float32).reshape(4, 2)
+            )
+            return sum(descriptor.size for descriptor in source_tensors), len(source_tensors), 0.0
+
+        def shutdown(self):
+            pass
+
+    class _MxClient:
+        def list_sources(self, identity=None, status_filter=None):
+            del identity
+            del status_filter
+            return p2p_pb2.ListSourcesResponse(
+                instances=[
+                    _source_ref(
+                        {
+                            "w": {
+                                "shape": [4, 2],
+                                "global_shape": [4, 4],
+                                "shard_offsets": [0, 1],
+                                "dtype": "torch.float32",
+                            }
+                        }
+                    )
+                ],
+            )
+
+        def get_metadata(self, mx_source_id, worker_id):
+            del mx_source_id
+            del worker_id
+            return p2p_pb2.GetMetadataResponse(
+                found=True,
+                worker=p2p_pb2.WorkerMetadata(
+                    worker_rank=0,
+                    nixl_metadata=b"source",
+                    tensors=[
+                        p2p_pb2.TensorDescriptor(
+                            name="w",
+                            addr=100,
+                            size=32,
+                            device_id=0,
+                            dtype="torch.float32",
+                        )
+                    ],
+                ),
+            )
+
+    monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _FakeNixlManager)
+    transfer = RlNixlWeightTransfer(
+        mx_client=_MxClient(),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+    backing_tensor = torch.zeros((4, 4), dtype=torch.float32)
+    target_view = backing_tensor[:, 1:3]
+
+    tensors = asyncio.run(
+        transfer.receive_into_tensors(
+            {"w": target_view},
+            model_version=5,
+            receiver_rank=0,
+            target_specs=[
+                TensorReceiveSpec(
+                    name="w",
+                    receiver_rank=0,
+                    shape=(4, 2),
+                    global_shape=(4, 4),
+                    shard_offsets=(0, 1),
+                    dtype="torch.float32",
+                )
+            ],
+        )
+    )
+
+    assert tensors == [("w", target_view)]
+    assert _FakeNixlManager.registered_tensors["w"].is_contiguous()
+    assert _FakeNixlManager.registered_tensors["w"].data_ptr() != target_view.data_ptr()
+    assert _FakeNixlManager.received_descriptors == [
+        TensorDescriptor("w", 100, 32, 0, "torch.float32"),
+    ]
+    assert torch.equal(
+        backing_tensor[:, 1:3],
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    )
+    assert torch.equal(backing_tensor[:, 0], torch.zeros(4))
+    assert torch.equal(backing_tensor[:, 3], torch.zeros(4))

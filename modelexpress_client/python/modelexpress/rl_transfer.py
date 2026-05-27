@@ -731,6 +731,7 @@ class RlNixlWeightTransfer:
             source_tensors=transfer_manifest.source_descriptors,
             timeout_seconds=self.timeout_seconds,
         )
+        transfer_manifest.finalize()
         logger.info(
             "Received ModelExpress RL weights: model=%s version=%d tensors=%d bytes=%d",
             self.base_identity.model_name,

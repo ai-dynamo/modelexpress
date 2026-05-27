@@ -21,6 +21,11 @@ class SliceTransferManifest:
     target_tensors: dict[str, torch.Tensor]
     source_descriptors: list[TensorDescriptor]
     output_tensors: list[tuple[str, torch.Tensor]]
+    post_transfer_copies: tuple["StagedTensorCopy", ...] = ()
+
+    def finalize(self) -> None:
+        """Apply any staged target copies after transfer completion."""
+        _apply_post_transfer_copies(self.post_transfer_copies)
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,19 @@ class GroupedSliceTransferManifest:
     target_tensors: dict[str, torch.Tensor]
     source_transfers: list[SourceSliceTransferManifest]
     output_tensors: list[tuple[str, torch.Tensor]]
+    post_transfer_copies: tuple["StagedTensorCopy", ...] = ()
+
+    def finalize(self) -> None:
+        """Apply any staged target copies after transfer completion."""
+        _apply_post_transfer_copies(self.post_transfer_copies)
+
+
+@dataclass(frozen=True)
+class StagedTensorCopy:
+    """Copy from a contiguous receive buffer into a caller-owned tensor view."""
+
+    source: torch.Tensor
+    target: torch.Tensor
 
 
 def build_slice_transfer_manifest(
@@ -53,6 +71,7 @@ def build_slice_transfer_manifest(
     source_by_name = {descriptor.name: descriptor for descriptor in source_descriptors}
     transfer_targets = {}
     transfer_sources = []
+    post_transfer_copies: list[StagedTensorCopy] = []
     output_names = []
     entry_counts = _entry_counts(plan)
     duplicated_names = sorted(
@@ -80,14 +99,16 @@ def build_slice_transfer_manifest(
             entry_index,
             entry_counts[entry.tensor_name],
         )
-        target_view, transfer_source = _materialize_entry(
+        materialized = _materialize_entry(
             entry,
             transfer_name=transfer_name,
             source_descriptor=source_descriptor,
             target_tensors=target_tensors,
         )
-        transfer_targets[transfer_name] = target_view
-        transfer_sources.append(transfer_source)
+        transfer_targets[transfer_name] = materialized.target_tensor
+        transfer_sources.append(materialized.source_descriptor)
+        if materialized.post_transfer_copy is not None:
+            post_transfer_copies.append(materialized.post_transfer_copy)
         if entry.target.name not in output_names:
             output_names.append(entry.target.name)
 
@@ -98,6 +119,7 @@ def build_slice_transfer_manifest(
             (name, target_tensors[name])
             for name in output_names
         ],
+        post_transfer_copies=tuple(post_transfer_copies),
     )
 
 
@@ -118,6 +140,7 @@ def build_grouped_slice_transfer_manifest(
     entry_counts = _entry_counts(plan)
     transfer_targets = {}
     transfer_sources_by_rank: dict[int, list[TensorDescriptor]] = {}
+    post_transfer_copies: list[StagedTensorCopy] = []
     output_names = []
 
     entry_offsets: dict[str, int] = {}
@@ -140,14 +163,18 @@ def build_grouped_slice_transfer_manifest(
             entry_index,
             entry_counts[entry.tensor_name],
         )
-        target_view, transfer_source = _materialize_entry(
+        materialized = _materialize_entry(
             entry,
             transfer_name=transfer_name,
             source_descriptor=source_descriptor,
             target_tensors=target_tensors,
         )
-        transfer_targets[transfer_name] = target_view
-        transfer_sources_by_rank.setdefault(entry.source_worker_rank, []).append(transfer_source)
+        transfer_targets[transfer_name] = materialized.target_tensor
+        transfer_sources_by_rank.setdefault(entry.source_worker_rank, []).append(
+            materialized.source_descriptor
+        )
+        if materialized.post_transfer_copy is not None:
+            post_transfer_copies.append(materialized.post_transfer_copy)
         if entry.target.name not in output_names:
             output_names.append(entry.target.name)
 
@@ -161,6 +188,7 @@ def build_grouped_slice_transfer_manifest(
             (name, target_tensors[name])
             for name in output_names
         ],
+        post_transfer_copies=tuple(post_transfer_copies),
     )
 
 
@@ -183,13 +211,20 @@ def _transfer_name(tensor_name: str, index: int, entry_count: int) -> str:
     return f"{tensor_name}.__mx_slice_{index}"
 
 
+@dataclass(frozen=True)
+class _MaterializedEntry:
+    target_tensor: torch.Tensor
+    source_descriptor: TensorDescriptor
+    post_transfer_copy: StagedTensorCopy | None
+
+
 def _materialize_entry(
     entry: TransferPlanEntry,
     *,
     transfer_name: str,
     source_descriptor: TensorDescriptor,
     target_tensors: dict[str, torch.Tensor],
-) -> tuple[torch.Tensor, TensorDescriptor]:
+) -> _MaterializedEntry:
     target_tensor = target_tensors.get(entry.target.name)
     if target_tensor is None:
         raise RuntimeError(
@@ -203,25 +238,41 @@ def _materialize_entry(
         tensor_name=entry.source.name,
         side="source",
     )
-    _contiguous_slice_span(
+    _validate_slice_bounds(
         entry.target.shape,
         target_slice,
         tensor_name=entry.target.name,
         side="target",
     )
     target_view = _slice_view(target_tensor, target_slice)
-    if not target_view.is_contiguous():
+    if tuple(target_view.shape) != target_slice.shape:
         raise RuntimeError(
-            f"ModelExpress target slice for {entry.target.name!r} is not contiguous"
+            f"ModelExpress target slice for {entry.target.name!r} exceeds target tensor bounds"
+        )
+    transfer_target = target_view
+    post_transfer_copy = None
+    if not target_view.is_contiguous():
+        transfer_target = torch.empty(
+            tuple(target_view.shape),
+            dtype=target_view.dtype,
+            device=target_view.device,
+        )
+        post_transfer_copy = StagedTensorCopy(
+            source=transfer_target,
+            target=target_view,
         )
 
     source_element_size = _source_element_size(source_descriptor, entry.source.shape)
-    return target_view, TensorDescriptor(
-        name=transfer_name,
-        addr=source_descriptor.addr + source_offset * source_element_size,
-        size=source_elements * source_element_size,
-        device_id=source_descriptor.device_id,
-        dtype=source_descriptor.dtype,
+    return _MaterializedEntry(
+        target_tensor=transfer_target,
+        source_descriptor=TensorDescriptor(
+            name=transfer_name,
+            addr=source_descriptor.addr + source_offset * source_element_size,
+            size=source_elements * source_element_size,
+            device_id=source_descriptor.device_id,
+            dtype=source_descriptor.dtype,
+        ),
+        post_transfer_copy=post_transfer_copy,
     )
 
 
@@ -240,10 +291,12 @@ def _contiguous_slice_span(
     tensor_name: str,
     side: str,
 ) -> tuple[int, int]:
-    if len(tensor_shape) != len(tensor_slice.shape):
-        raise RuntimeError(
-            f"ModelExpress {side} slice rank mismatch for {tensor_name!r}"
-        )
+    _validate_slice_bounds(
+        tensor_shape,
+        tensor_slice,
+        tensor_name=tensor_name,
+        side=side,
+    )
     strides = _contiguous_strides(tensor_shape)
     start = sum(
         offset * stride
@@ -264,6 +317,34 @@ def _contiguous_slice_span(
             f"ModelExpress {side} slice for {tensor_name!r} is not contiguous"
         )
     return start, elements
+
+
+def _validate_slice_bounds(
+    tensor_shape: tuple[int, ...],
+    tensor_slice: TensorSlice,
+    *,
+    tensor_name: str,
+    side: str,
+) -> None:
+    if len(tensor_shape) != len(tensor_slice.shape):
+        raise RuntimeError(
+            f"ModelExpress {side} slice rank mismatch for {tensor_name!r}"
+        )
+    for offset, dim, tensor_dim in zip(
+        tensor_slice.offsets,
+        tensor_slice.shape,
+        tensor_shape,
+        strict=True,
+    ):
+        if offset + dim > tensor_dim:
+            raise RuntimeError(
+                f"ModelExpress {side} slice for {tensor_name!r} exceeds tensor bounds"
+            )
+
+
+def _apply_post_transfer_copies(copies: tuple[StagedTensorCopy, ...]) -> None:
+    for copy in copies:
+        copy.target.copy_(copy.source)
 
 
 def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
