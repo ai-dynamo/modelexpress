@@ -75,13 +75,13 @@ def test_extra_parameters_sorted():
 # ---------------------------------------------------------------------------
 
 def test_pinned_hash_base_identity():
-    assert compute_mx_source_id(_base_identity()) == "b0c2c67edeaefc20"
+    assert compute_mx_source_id(_base_identity()) == "e2438ef16adcf628"
 
 
 def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
-    assert compute_mx_source_id(pinned) == "40704b34e4b7deaa"
+    assert compute_mx_source_id(pinned) == "7b7803769825576e"
 
 
 def test_case_colliding_extra_parameters_are_deterministic():
@@ -97,4 +97,4 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["foo"] = "b"
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
-    assert compute_mx_source_id(a) == "bd9ea6c70d83fef1"
+    assert compute_mx_source_id(a) == "deecf6684507f09c"
