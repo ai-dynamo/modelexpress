@@ -23,6 +23,18 @@ service P2pService {
 
   // Update source status - called by source after NIXL registration and warmup
   rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
+
+  // Begin a durable transfer lease before pulling tensors from a source.
+  rpc BeginTransferLease(BeginTransferLeaseRequest) returns (TransferLeaseResponse);
+
+  // Extend an active transfer lease while a long transfer is still running.
+  rpc RenewTransferLease(RenewTransferLeaseRequest) returns (TransferLeaseResponse);
+
+  // Mark a transfer lease as completed, failed, or expired.
+  rpc CompleteTransferLease(CompleteTransferLeaseRequest) returns (TransferLeaseResponse);
+
+  // Fetch a transfer lease by ID for recovery/debugging.
+  rpc GetTransferLease(GetTransferLeaseRequest) returns (GetTransferLeaseResponse);
 }
 
 // ============================================================================
@@ -305,4 +317,83 @@ message UpdateStatusRequest {
 message UpdateStatusResponse {
   bool success = 1;
   string message = 2;
+}
+
+// ============================================================================
+// Transfer Leases
+// ============================================================================
+
+// Durable transfer lifecycle state. ACTIVE leases expire when expires_at passes
+// unless the target renews them; terminal states remain queryable.
+enum TransferLeaseStatus {
+  TRANSFER_LEASE_STATUS_UNKNOWN = 0;
+  TRANSFER_LEASE_STATUS_ACTIVE = 1;
+  TRANSFER_LEASE_STATUS_COMPLETED = 2;
+  TRANSFER_LEASE_STATUS_FAILED = 3;
+  TRANSFER_LEASE_STATUS_EXPIRED = 4;
+}
+
+message TransferLease {
+  // Server-generated UUID unless BeginTransferLeaseRequest.lease_id is set.
+  string lease_id = 1;
+
+  // Source worker being pulled from.
+  string mx_source_id = 2;
+  string source_worker_id = 3;
+
+  // Target worker performing the pull.
+  string target_worker_id = 4;
+  uint32 target_worker_rank = 5;
+
+  // RL/model update version associated with this transfer.
+  uint64 model_version = 6;
+
+  TransferLeaseStatus status = 7;
+  int64 created_at = 8;  // unix millis
+  int64 updated_at = 9;  // unix millis
+  int64 expires_at = 10; // unix millis
+
+  // Optional terminal error when status is FAILED or EXPIRED.
+  string error_message = 11;
+
+  // Framework-agnostic extension point for roles, tensor layout IDs, etc.
+  map<string, string> metadata = 12;
+}
+
+message BeginTransferLeaseRequest {
+  // Optional caller-supplied idempotency key. Empty means server-generated UUID.
+  string lease_id = 1;
+  string mx_source_id = 2;
+  string source_worker_id = 3;
+  string target_worker_id = 4;
+  uint32 target_worker_rank = 5;
+  uint64 model_version = 6;
+  uint64 ttl_millis = 7;
+  map<string, string> metadata = 8;
+}
+
+message RenewTransferLeaseRequest {
+  string lease_id = 1;
+  uint64 ttl_millis = 2;
+}
+
+message CompleteTransferLeaseRequest {
+  string lease_id = 1;
+  TransferLeaseStatus status = 2;
+  string error_message = 3;
+}
+
+message GetTransferLeaseRequest {
+  string lease_id = 1;
+}
+
+message TransferLeaseResponse {
+  bool success = 1;
+  string message = 2;
+  TransferLease lease = 3;
+}
+
+message GetTransferLeaseResponse {
+  bool found = 1;
+  TransferLease lease = 2;
 }

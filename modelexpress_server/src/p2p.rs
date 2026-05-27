@@ -9,6 +9,7 @@
 
 pub mod backend;
 pub mod k8s_types;
+pub mod lease;
 pub mod reaper;
 pub mod service;
 pub mod source_identity;

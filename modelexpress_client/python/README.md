@@ -96,6 +96,17 @@ python -m modelexpress.rl_benchmark \
 Use `--output-json` when transport libraries also write logs to the console.
 The benchmark requires CUDA, NIXL, and a running ModelExpress server.
 
+## RL Transfer Leases
+
+RL receives automatically begin a server-backed transfer lease when the
+connected MX server supports the lease RPCs. Active leases renew while the NIXL
+pull is running, then finish as completed or failed. This gives production RL
+runtimes a durable place to inspect in-flight or abandoned weight updates
+without coupling the mechanism to veRL, NeMo-RL, Slime, or another framework.
+
+Clients talking to older MX servers that do not expose the lease RPCs continue
+without leases.
+
 ## Environment Variables
 
 | Variable | Default | Description |

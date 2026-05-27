@@ -60,6 +60,26 @@ class P2pServiceStub(object):
                 request_serializer=p2p__pb2.UpdateStatusRequest.SerializeToString,
                 response_deserializer=p2p__pb2.UpdateStatusResponse.FromString,
                 _registered_method=True)
+        self.BeginTransferLease = channel.unary_unary(
+                '/model_express.p2p.P2pService/BeginTransferLease',
+                request_serializer=p2p__pb2.BeginTransferLeaseRequest.SerializeToString,
+                response_deserializer=p2p__pb2.TransferLeaseResponse.FromString,
+                _registered_method=True)
+        self.RenewTransferLease = channel.unary_unary(
+                '/model_express.p2p.P2pService/RenewTransferLease',
+                request_serializer=p2p__pb2.RenewTransferLeaseRequest.SerializeToString,
+                response_deserializer=p2p__pb2.TransferLeaseResponse.FromString,
+                _registered_method=True)
+        self.CompleteTransferLease = channel.unary_unary(
+                '/model_express.p2p.P2pService/CompleteTransferLease',
+                request_serializer=p2p__pb2.CompleteTransferLeaseRequest.SerializeToString,
+                response_deserializer=p2p__pb2.TransferLeaseResponse.FromString,
+                _registered_method=True)
+        self.GetTransferLease = channel.unary_unary(
+                '/model_express.p2p.P2pService/GetTransferLease',
+                request_serializer=p2p__pb2.GetTransferLeaseRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetTransferLeaseResponse.FromString,
+                _registered_method=True)
 
 
 class P2pServiceServicer(object):
@@ -99,6 +119,34 @@ class P2pServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def BeginTransferLease(self, request, context):
+        """Begin a durable transfer lease before pulling tensors from a source.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RenewTransferLease(self, request, context):
+        """Extend an active transfer lease while a long transfer is still running.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CompleteTransferLease(self, request, context):
+        """Mark a transfer lease as completed, failed, or expired.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetTransferLease(self, request, context):
+        """Fetch a transfer lease by ID for recovery/debugging.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_P2pServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -121,6 +169,26 @@ def add_P2pServiceServicer_to_server(servicer, server):
                     servicer.UpdateStatus,
                     request_deserializer=p2p__pb2.UpdateStatusRequest.FromString,
                     response_serializer=p2p__pb2.UpdateStatusResponse.SerializeToString,
+            ),
+            'BeginTransferLease': grpc.unary_unary_rpc_method_handler(
+                    servicer.BeginTransferLease,
+                    request_deserializer=p2p__pb2.BeginTransferLeaseRequest.FromString,
+                    response_serializer=p2p__pb2.TransferLeaseResponse.SerializeToString,
+            ),
+            'RenewTransferLease': grpc.unary_unary_rpc_method_handler(
+                    servicer.RenewTransferLease,
+                    request_deserializer=p2p__pb2.RenewTransferLeaseRequest.FromString,
+                    response_serializer=p2p__pb2.TransferLeaseResponse.SerializeToString,
+            ),
+            'CompleteTransferLease': grpc.unary_unary_rpc_method_handler(
+                    servicer.CompleteTransferLease,
+                    request_deserializer=p2p__pb2.CompleteTransferLeaseRequest.FromString,
+                    response_serializer=p2p__pb2.TransferLeaseResponse.SerializeToString,
+            ),
+            'GetTransferLease': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetTransferLease,
+                    request_deserializer=p2p__pb2.GetTransferLeaseRequest.FromString,
+                    response_serializer=p2p__pb2.GetTransferLeaseResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -234,6 +302,114 @@ class P2pService(object):
             '/model_express.p2p.P2pService/UpdateStatus',
             p2p__pb2.UpdateStatusRequest.SerializeToString,
             p2p__pb2.UpdateStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BeginTransferLease(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/BeginTransferLease',
+            p2p__pb2.BeginTransferLeaseRequest.SerializeToString,
+            p2p__pb2.TransferLeaseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RenewTransferLease(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/RenewTransferLease',
+            p2p__pb2.RenewTransferLeaseRequest.SerializeToString,
+            p2p__pb2.TransferLeaseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CompleteTransferLease(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/CompleteTransferLease',
+            p2p__pb2.CompleteTransferLeaseRequest.SerializeToString,
+            p2p__pb2.TransferLeaseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetTransferLease(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.P2pService/GetTransferLease',
+            p2p__pb2.GetTransferLeaseRequest.SerializeToString,
+            p2p__pb2.GetTransferLeaseResponse.FromString,
             options,
             channel_credentials,
             insecure,

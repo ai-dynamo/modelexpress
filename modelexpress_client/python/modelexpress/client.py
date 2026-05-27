@@ -15,6 +15,7 @@ registered by the owning process for GPUDirect RDMA.
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 
 import grpc
 
@@ -74,6 +75,47 @@ class MxClientBase(ABC):
         status: "p2p_pb2.SourceStatus",
     ) -> bool:
         """Update a source worker's lifecycle status."""
+
+    def begin_transfer_lease(
+        self,
+        *,
+        mx_source_id: str,
+        source_worker_id: str,
+        target_worker_id: str,
+        target_worker_rank: int,
+        model_version: int,
+        ttl_millis: int = 0,
+        metadata: Mapping[str, str] | None = None,
+        lease_id: str = "",
+    ) -> "p2p_pb2.TransferLease":
+        """Begin a durable transfer lease, when supported by the backend."""
+        raise NotImplementedError
+
+    def renew_transfer_lease(
+        self,
+        lease_id: str,
+        *,
+        ttl_millis: int = 0,
+    ) -> "p2p_pb2.TransferLease":
+        """Renew an active durable transfer lease, when supported."""
+        raise NotImplementedError
+
+    def complete_transfer_lease(
+        self,
+        lease_id: str,
+        *,
+        status: "p2p_pb2.TransferLeaseStatus",
+        error_message: str = "",
+    ) -> "p2p_pb2.TransferLease":
+        """Mark a durable transfer lease terminal, when supported."""
+        raise NotImplementedError
+
+    def get_transfer_lease(
+        self,
+        lease_id: str,
+    ) -> "p2p_pb2.GetTransferLeaseResponse":
+        """Fetch a durable transfer lease, when supported."""
+        raise NotImplementedError
 
     @abstractmethod
     def close(self) -> None:
@@ -223,3 +265,73 @@ class MxClient(MxClientBase):
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)
         return response.success
+
+    def begin_transfer_lease(
+        self,
+        *,
+        mx_source_id: str,
+        source_worker_id: str,
+        target_worker_id: str,
+        target_worker_rank: int,
+        model_version: int,
+        ttl_millis: int = 0,
+        metadata: Mapping[str, str] | None = None,
+        lease_id: str = "",
+    ) -> "p2p_pb2.TransferLease":
+        """Begin a durable transfer lease and return the lease record."""
+        request = p2p_pb2.BeginTransferLeaseRequest(
+            lease_id=lease_id,
+            mx_source_id=mx_source_id,
+            source_worker_id=source_worker_id,
+            target_worker_id=target_worker_id,
+            target_worker_rank=target_worker_rank,
+            model_version=model_version,
+            ttl_millis=ttl_millis,
+            metadata=dict(metadata or {}),
+        )
+        response = self.stub.BeginTransferLease(request, timeout=30)
+        if not response.success:
+            raise RuntimeError(f"BeginTransferLease failed: {response.message}")
+        return response.lease
+
+    def renew_transfer_lease(
+        self,
+        lease_id: str,
+        *,
+        ttl_millis: int = 0,
+    ) -> "p2p_pb2.TransferLease":
+        """Renew a durable transfer lease and return the updated record."""
+        request = p2p_pb2.RenewTransferLeaseRequest(
+            lease_id=lease_id,
+            ttl_millis=ttl_millis,
+        )
+        response = self.stub.RenewTransferLease(request, timeout=30)
+        if not response.success:
+            raise RuntimeError(f"RenewTransferLease failed: {response.message}")
+        return response.lease
+
+    def complete_transfer_lease(
+        self,
+        lease_id: str,
+        *,
+        status: "p2p_pb2.TransferLeaseStatus",
+        error_message: str = "",
+    ) -> "p2p_pb2.TransferLease":
+        """Complete a durable transfer lease and return the updated record."""
+        request = p2p_pb2.CompleteTransferLeaseRequest(
+            lease_id=lease_id,
+            status=status,
+            error_message=error_message,
+        )
+        response = self.stub.CompleteTransferLease(request, timeout=30)
+        if not response.success:
+            raise RuntimeError(f"CompleteTransferLease failed: {response.message}")
+        return response.lease
+
+    def get_transfer_lease(
+        self,
+        lease_id: str,
+    ) -> "p2p_pb2.GetTransferLeaseResponse":
+        """Fetch a durable transfer lease by ID."""
+        request = p2p_pb2.GetTransferLeaseRequest(lease_id=lease_id)
+        return self.stub.GetTransferLease(request, timeout=30)

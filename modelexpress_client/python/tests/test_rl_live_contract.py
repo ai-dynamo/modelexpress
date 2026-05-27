@@ -5,6 +5,7 @@ import asyncio
 import os
 import uuid
 
+import grpc
 import pytest
 import torch
 
@@ -39,6 +40,54 @@ def _base_identity(model_name: str):
         quantization="",
         revision="",
     )
+
+
+def test_live_server_transfer_lease_contract():
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    lease_id = f"lease-{uuid.uuid4().hex}"
+
+    try:
+        try:
+            lease = client.begin_transfer_lease(
+                lease_id=lease_id,
+                mx_source_id="live-lease-source",
+                source_worker_id="source-worker",
+                target_worker_id="target-worker",
+                target_worker_rank=1,
+                model_version=17,
+                ttl_millis=5_000,
+                metadata={"contract": "live"},
+            )
+        except grpc.RpcError as exc:
+            if exc.code() == grpc.StatusCode.UNIMPLEMENTED:
+                pytest.skip("server does not expose transfer lease RPCs")
+            raise
+
+        assert lease.lease_id == lease_id
+        assert lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
+        assert lease.mx_source_id == "live-lease-source"
+        assert lease.source_worker_id == "source-worker"
+        assert lease.target_worker_id == "target-worker"
+        assert lease.target_worker_rank == 1
+        assert lease.model_version == 17
+        assert lease.metadata["contract"] == "live"
+
+        renewed = client.renew_transfer_lease(lease_id, ttl_millis=5_000)
+        assert renewed.status == p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE
+        assert renewed.expires_at >= lease.expires_at
+
+        completed = client.complete_transfer_lease(
+            lease_id,
+            status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+        )
+        assert completed.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+
+        fetched = client.get_transfer_lease(lease_id)
+        assert fetched.found
+        assert fetched.lease.lease_id == lease_id
+        assert fetched.lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+    finally:
+        client.close()
 
 
 def test_live_server_lists_rl_identity_and_selects_latest_retained_version():

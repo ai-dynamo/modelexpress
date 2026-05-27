@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
+import grpc
+
+from modelexpress import p2p_pb2
+from modelexpress.rl_metadata import RlSourceCandidate, RlSourceMetadata, RlSourceRole
+from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator
+
+
+class _LeaseClient:
+    def __init__(self):
+        self.begins = []
+        self.renews = []
+        self.completes = []
+
+    def begin_transfer_lease(self, **kwargs):
+        self.begins.append(kwargs)
+        return p2p_pb2.TransferLease(lease_id="lease-1")
+
+    def renew_transfer_lease(self, lease_id, *, ttl_millis=0):
+        self.renews.append((lease_id, ttl_millis))
+        return p2p_pb2.TransferLease(lease_id=lease_id)
+
+    def complete_transfer_lease(self, lease_id, *, status, error_message=""):
+        self.completes.append((lease_id, status, error_message))
+        return p2p_pb2.TransferLease(lease_id=lease_id, status=status)
+
+
+def _candidate():
+    return RlSourceCandidate(
+        mx_source_id="source",
+        worker_id="source-worker",
+        model_name="test-model",
+        worker_rank=0,
+        metadata=RlSourceMetadata(
+            model_version=7,
+            role=RlSourceRole.TRAINER,
+            world_size=1,
+        ),
+    )
+
+
+def test_transfer_lease_completes_successful_context():
+    client = _LeaseClient()
+    coordinator = RlTransferLeaseCoordinator(
+        mx_client=client,
+        target_worker_id="target-worker",
+        ttl_seconds=5,
+    )
+
+    with coordinator.lease_candidate(_candidate(), receiver_rank=3):
+        pass
+
+    assert client.begins == [
+        {
+            "mx_source_id": "source",
+            "source_worker_id": "source-worker",
+            "target_worker_id": "target-worker",
+            "target_worker_rank": 3,
+            "model_version": 7,
+            "ttl_millis": 5000,
+            "metadata": {"mx_rl_role": "trainer"},
+        }
+    ]
+    assert client.completes == [
+        ("lease-1", p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED, "")
+    ]
+
+
+def test_transfer_lease_marks_failed_context():
+    client = _LeaseClient()
+    coordinator = RlTransferLeaseCoordinator(
+        mx_client=client,
+        target_worker_id="target-worker",
+        ttl_seconds=5,
+    )
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        with coordinator.lease_candidate(_candidate(), receiver_rank=0):
+            raise RuntimeError("transfer failed")
+
+    assert client.completes == [
+        ("lease-1", p2p_pb2.TRANSFER_LEASE_STATUS_FAILED, "transfer failed")
+    ]
+
+
+def test_transfer_lease_noops_when_client_does_not_support_leases():
+    coordinator = RlTransferLeaseCoordinator(
+        mx_client=object(),
+        target_worker_id="target-worker",
+        ttl_seconds=5,
+    )
+
+    with coordinator.lease_candidate(_candidate(), receiver_rank=0):
+        pass
+
+
+def test_transfer_lease_noops_for_old_server_unimplemented_rpc():
+    class _Unimplemented(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.UNIMPLEMENTED
+
+    class _OldServerClient:
+        def begin_transfer_lease(self, **kwargs):
+            raise _Unimplemented()
+
+    coordinator = RlTransferLeaseCoordinator(
+        mx_client=_OldServerClient(),
+        target_worker_id="target-worker",
+        ttl_seconds=5,
+    )
+
+    with coordinator.lease_candidate(_candidate(), receiver_rank=0):
+        pass

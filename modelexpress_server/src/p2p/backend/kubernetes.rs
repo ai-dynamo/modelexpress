@@ -9,6 +9,7 @@ use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, 
 use crate::p2p::k8s_types::{
     ModelMetadata, ModelMetadataSpec, SourceIdentityJson, TensorDescriptorJson, WorkerStatus,
 };
+use crate::p2p::lease::TransferLeaseRecord;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -16,10 +17,22 @@ use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
 };
-use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
+use modelexpress_common::grpc::p2p::{
+    SourceIdentity, SourceStatus, TransferLeaseStatus, WorkerMetadata,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use tracing::{debug, info, warn};
+
+fn transfer_lease_configmap_name(lease_id: &str) -> String {
+    let digest = Sha256::digest(lease_id.as_bytes());
+    let prefix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("mx-transfer-lease-{prefix}")
+}
 
 /// Kubernetes backend for metadata storage
 pub struct KubernetesBackend {
@@ -166,6 +179,21 @@ impl KubernetesBackend {
             .collect::<MetadataResult<Vec<_>>>()?;
 
         Ok(tensors)
+    }
+
+    async fn patch_transfer_lease(&self, lease: &TransferLeaseRecord) -> MetadataResult<()> {
+        let api = self.configmap_api();
+        let name = transfer_lease_configmap_name(&lease.lease_id);
+        let lease_json = serde_json::to_string(lease)?;
+        let patch = json!({
+            "data": {
+                "lease.json": lease_json,
+            }
+        });
+        api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+        debug!("Patched transfer lease ConfigMap '{}'", name);
+        Ok(())
     }
 }
 
@@ -723,5 +751,94 @@ impl MetadataBackend for KubernetesBackend {
             source_id, worker_id, worker_rank, max_retries
         )
         .into())
+    }
+
+    async fn create_transfer_lease(&self, lease: TransferLeaseRecord) -> MetadataResult<()> {
+        let api = self.configmap_api();
+        let name = transfer_lease_configmap_name(&lease.lease_id);
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "modelexpress.nvidia.com/transfer-lease".to_string(),
+            "true".to_string(),
+        );
+        labels.insert(
+            "modelexpress.nvidia.com/mx-source-id".to_string(),
+            lease.mx_source_id.clone(),
+        );
+
+        let mut data = BTreeMap::new();
+        data.insert("lease.json".to_string(), serde_json::to_string(&lease)?);
+
+        let cm = ConfigMap {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(self.namespace.clone()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        };
+
+        match api.create(&PostParams::default(), &cm).await {
+            Ok(_) => {
+                debug!("Created transfer lease ConfigMap '{}'", name);
+                Ok(())
+            }
+            Err(kube::Error::Api(err)) if err.code == 409 => {
+                Err(format!("transfer lease '{}' already exists", lease.lease_id).into())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn get_transfer_lease(
+        &self,
+        lease_id: &str,
+    ) -> MetadataResult<Option<TransferLeaseRecord>> {
+        let api = self.configmap_api();
+        let name = transfer_lease_configmap_name(lease_id);
+        let Some(cm) = api.get_opt(&name).await? else {
+            return Ok(None);
+        };
+        let Some(json) = cm.data.and_then(|data| data.get("lease.json").cloned()) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_str(&json)?))
+    }
+
+    async fn renew_transfer_lease(
+        &self,
+        lease_id: &str,
+        updated_at: i64,
+        expires_at: i64,
+    ) -> MetadataResult<()> {
+        let mut lease = self
+            .get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found", lease_id))?;
+        if lease.status != TransferLeaseStatus::Active as i32 {
+            return Err(format!("transfer lease '{}' is not active", lease_id).into());
+        }
+        lease.updated_at = updated_at;
+        lease.expires_at = expires_at;
+        self.patch_transfer_lease(&lease).await
+    }
+
+    async fn finish_transfer_lease(
+        &self,
+        lease_id: &str,
+        status: TransferLeaseStatus,
+        updated_at: i64,
+        error_message: &str,
+    ) -> MetadataResult<()> {
+        let mut lease = self
+            .get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found", lease_id))?;
+        lease.status = status as i32;
+        lease.updated_at = updated_at;
+        lease.error_message = error_message.to_string();
+        self.patch_transfer_lease(&lease).await
     }
 }

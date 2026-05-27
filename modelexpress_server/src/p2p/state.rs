@@ -8,10 +8,13 @@
 //! making the server stateless and horizontally scalable.
 
 use crate::p2p::backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
-use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
+use crate::p2p::lease::{TransferLeaseRecord, bounded_lease_ttl_millis};
+use modelexpress_common::grpc::p2p::{SourceIdentity, TransferLeaseStatus, WorkerMetadata};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 // Re-export types for backwards compatibility
 pub use crate::p2p::backend::{
@@ -185,6 +188,138 @@ impl P2pStateManager {
         );
         Ok(())
     }
+
+    // ========================================================================
+    // Transfer Leases
+    // ========================================================================
+
+    /// Create a durable ACTIVE transfer lease.
+    pub async fn begin_transfer_lease(
+        &self,
+        lease_id: Option<String>,
+        mx_source_id: &str,
+        source_worker_id: &str,
+        target_worker_id: &str,
+        target_worker_rank: u32,
+        model_version: u64,
+        ttl_millis: u64,
+        metadata: HashMap<String, String>,
+    ) -> MetadataResult<TransferLeaseRecord> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let ttl = bounded_lease_ttl_millis(ttl_millis);
+        let record = TransferLeaseRecord {
+            lease_id: lease_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            mx_source_id: mx_source_id.to_string(),
+            source_worker_id: source_worker_id.to_string(),
+            target_worker_id: target_worker_id.to_string(),
+            target_worker_rank,
+            model_version,
+            status: TransferLeaseStatus::Active as i32,
+            created_at: now,
+            updated_at: now,
+            expires_at: now + ttl,
+            error_message: String::new(),
+            metadata,
+        };
+
+        self.get_backend()
+            .await?
+            .create_transfer_lease(record.clone())
+            .await?;
+        debug!(
+            "Began transfer lease '{}' for source '{}' worker '{}'",
+            record.lease_id, record.mx_source_id, record.source_worker_id
+        );
+        Ok(record)
+    }
+
+    /// Fetch a transfer lease and persist EXPIRED if its active TTL elapsed.
+    pub async fn get_transfer_lease(
+        &self,
+        lease_id: &str,
+    ) -> MetadataResult<Option<TransferLeaseRecord>> {
+        let Some(record) = self
+            .get_backend()
+            .await?
+            .get_transfer_lease(lease_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.observe_transfer_lease(record).await.map(Some)
+    }
+
+    /// Extend an active transfer lease with a fresh expiry.
+    pub async fn renew_transfer_lease(
+        &self,
+        lease_id: &str,
+        ttl_millis: u64,
+    ) -> MetadataResult<TransferLeaseRecord> {
+        let record = self
+            .get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found", lease_id))?;
+        if !record.is_active() {
+            return Err(format!("transfer lease '{}' is not active", lease_id).into());
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let expires_at = now + bounded_lease_ttl_millis(ttl_millis);
+        self.get_backend()
+            .await?
+            .renew_transfer_lease(lease_id, now, expires_at)
+            .await?;
+
+        self.get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found after renew", lease_id).into())
+    }
+
+    /// Mark an active transfer lease terminal.
+    pub async fn complete_transfer_lease(
+        &self,
+        lease_id: &str,
+        status: TransferLeaseStatus,
+        error_message: &str,
+    ) -> MetadataResult<TransferLeaseRecord> {
+        let record = self
+            .get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found", lease_id))?;
+        if !record.is_active() && status != TransferLeaseStatus::Expired {
+            return Err(format!("transfer lease '{}' is not active", lease_id).into());
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        self.get_backend()
+            .await?
+            .finish_transfer_lease(lease_id, status, now, error_message)
+            .await?;
+
+        self.get_transfer_lease(lease_id).await?.ok_or_else(|| {
+            format!("transfer lease '{}' not found after completion", lease_id).into()
+        })
+    }
+
+    async fn observe_transfer_lease(
+        &self,
+        record: TransferLeaseRecord,
+    ) -> MetadataResult<TransferLeaseRecord> {
+        let now = chrono::Utc::now().timestamp_millis();
+        if !record.is_expired_at(now) {
+            return Ok(record);
+        }
+        self.get_backend()
+            .await?
+            .finish_transfer_lease(
+                &record.lease_id,
+                TransferLeaseStatus::Expired,
+                now,
+                "transfer lease expired",
+            )
+            .await?;
+        Ok(record.observed_at(now))
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +345,23 @@ mod tests {
             quantization: String::new(),
             extra_parameters: Default::default(),
             revision: String::new(),
+        }
+    }
+
+    fn active_lease_record(lease_id: &str) -> TransferLeaseRecord {
+        TransferLeaseRecord {
+            lease_id: lease_id.to_string(),
+            mx_source_id: "abc123def456abcd".to_string(),
+            source_worker_id: "source-worker".to_string(),
+            target_worker_id: "target-worker".to_string(),
+            target_worker_rank: 2,
+            model_version: 9,
+            status: TransferLeaseStatus::Active as i32,
+            created_at: 1_000,
+            updated_at: 1_000,
+            expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
+            error_message: String::new(),
+            metadata: std::collections::HashMap::new(),
         }
     }
 
@@ -578,5 +730,95 @@ mod tests {
             .update_worker_status("abc123def456abcd", "test-instance", 7, SourceStatus::Ready)
             .await
             .expect("update_worker_status failed");
+    }
+
+    #[tokio::test]
+    async fn test_begin_transfer_lease_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_create_transfer_lease()
+            .withf(|lease| {
+                lease.lease_id == "lease-1"
+                    && lease.mx_source_id == "abc123def456abcd"
+                    && lease.source_worker_id == "source-worker"
+                    && lease.target_worker_id == "target-worker"
+                    && lease.target_worker_rank == 3
+                    && lease.model_version == 11
+                    && lease.status == TransferLeaseStatus::Active as i32
+                    && lease.expires_at > lease.created_at
+                    && lease.metadata.get("role").map(String::as_str) == Some("trainer")
+            })
+            .once()
+            .returning(|_| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("role".to_string(), "trainer".to_string());
+
+        let lease = manager
+            .begin_transfer_lease(
+                Some("lease-1".to_string()),
+                "abc123def456abcd",
+                "source-worker",
+                "target-worker",
+                3,
+                11,
+                5_000,
+                metadata,
+            )
+            .await
+            .expect("begin_transfer_lease failed");
+
+        assert_eq!(lease.lease_id, "lease-1");
+        assert_eq!(lease.status, TransferLeaseStatus::Active as i32);
+    }
+
+    #[tokio::test]
+    async fn test_renew_transfer_lease_calls_backend_for_active_lease() {
+        let mut mock = MockMetadataBackend::new();
+        let record = active_lease_record("lease-1");
+        mock.expect_get_transfer_lease()
+            .with(eq("lease-1"))
+            .times(2)
+            .returning(move |_| Ok(Some(record.clone())));
+        mock.expect_renew_transfer_lease()
+            .withf(|lease_id, updated_at, expires_at| {
+                lease_id == "lease-1" && *expires_at > *updated_at
+            })
+            .once()
+            .returning(|_, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let lease = manager
+            .renew_transfer_lease("lease-1", 5_000)
+            .await
+            .expect("renew_transfer_lease failed");
+
+        assert_eq!(lease.lease_id, "lease-1");
+    }
+
+    #[tokio::test]
+    async fn test_complete_transfer_lease_calls_backend() {
+        let mut mock = MockMetadataBackend::new();
+        let record = active_lease_record("lease-1");
+        mock.expect_get_transfer_lease()
+            .with(eq("lease-1"))
+            .times(2)
+            .returning(move |_| Ok(Some(record.clone())));
+        mock.expect_finish_transfer_lease()
+            .withf(|lease_id, status, _updated_at, error_message| {
+                lease_id == "lease-1"
+                    && *status == TransferLeaseStatus::Completed
+                    && error_message.is_empty()
+            })
+            .once()
+            .returning(|_, _, _, _| Ok(()));
+
+        let manager = P2pStateManager::with_backend(Arc::new(mock));
+        let lease = manager
+            .complete_transfer_lease("lease-1", TransferLeaseStatus::Completed, "")
+            .await
+            .expect("complete_transfer_lease failed");
+
+        assert_eq!(lease.lease_id, "lease-1");
     }
 }

@@ -6,11 +6,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -55,6 +55,12 @@ from modelexpress.rl_shape_registry import (
     torch_dtype_from_string,
 )
 from modelexpress.rl_slice_transfer import build_slice_transfer_manifest
+from modelexpress.rl_transfer_lease import RlTransferLeaseCoordinator
+from modelexpress.rl_transfer_report import (
+    RlTransferAttempt,
+    RlTransferReport,
+    _ReceiveCandidateResult,
+)
 
 logger = logging.getLogger("modelexpress.rl_transfer")
 
@@ -67,62 +73,6 @@ _BACKEND_FRAMEWORKS = {
     "trt_llm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
     "trt-llm": p2p_pb2.BACKEND_FRAMEWORK_TRT_LLM,
 }
-
-
-@dataclass(frozen=True)
-class RlTransferAttempt:
-    """One attempted RL receive source."""
-
-    mx_source_id: str
-    worker_id: str
-    worker_rank: int
-    role: RlSourceRole
-    model_version: int
-    success: bool
-    error: str | None = None
-    bytes_transferred: int = 0
-    tensor_count: int = 0
-    duration_seconds: float = 0.0
-
-
-@dataclass(frozen=True)
-class RlTransferReport:
-    """Summary of the latest RL receive attempt sequence."""
-
-    requested_model_version: int | None
-    resolved_model_version: int | None
-    receiver_rank: int
-    attempts: tuple[RlTransferAttempt, ...]
-
-    @property
-    def success(self) -> bool:
-        return any(attempt.success for attempt in self.attempts)
-
-    @property
-    def retry_count(self) -> int:
-        return sum(1 for attempt in self.attempts if not attempt.success)
-
-    @property
-    def source_role(self) -> RlSourceRole | None:
-        for attempt in self.attempts:
-            if attempt.success:
-                return attempt.role
-        return None
-
-    @property
-    def source_worker_id(self) -> str | None:
-        for attempt in self.attempts:
-            if attempt.success:
-                return attempt.worker_id
-        return None
-
-
-@dataclass(frozen=True)
-class _ReceiveCandidateResult:
-    tensors: list[tuple[str, torch.Tensor]]
-    bytes_transferred: int
-    tensor_count: int
-    duration_seconds: float
 
 
 def backend_framework_value(value: str | int) -> int:
@@ -270,6 +220,11 @@ class RlNixlWeightTransfer:
         self._worker_rank = 0
         self._heartbeat: HeartbeatThread | None = None
         self.last_receive_report: RlTransferReport | None = None
+        self._lease_coordinator = RlTransferLeaseCoordinator(
+            mx_client=mx_client,
+            target_worker_id=worker_id,
+            ttl_seconds=min(max(timeout_seconds, 5.0), 30.0),
+        )
 
     def finalize(self) -> None:
         """Tear down transient transfer state and stop advertising this source."""
@@ -612,6 +567,29 @@ class RlNixlWeightTransfer:
         target_tensors: dict[str, torch.Tensor] | None = None,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
     ) -> _ReceiveCandidateResult:
+        with self._lease_coordinator.lease_candidate(
+            candidate,
+            receiver_rank=receiver_rank,
+        ):
+            return self._receive_from_candidate_unleased(
+                candidate,
+                model_version,
+                receiver_rank=receiver_rank,
+                same_rank_only=same_rank_only,
+                target_tensors=target_tensors,
+                target_specs=target_specs,
+            )
+
+    def _receive_from_candidate_unleased(
+        self,
+        candidate: RlSourceCandidate,
+        model_version: int,
+        *,
+        receiver_rank: int,
+        same_rank_only: bool,
+        target_tensors: dict[str, torch.Tensor] | None = None,
+        target_specs: Sequence[TensorReceiveSpec] | None = None,
+    ) -> _ReceiveCandidateResult:
         metadata_resp = self.mx_client.get_metadata(candidate.mx_source_id, candidate.worker_id)
         if not metadata_resp.found:
             raise RuntimeError(
@@ -721,6 +699,30 @@ class RlNixlWeightTransfer:
         )
 
     def _receive_from_candidate_group(
+        self,
+        candidates: Sequence[RlSourceCandidate],
+        *,
+        receiver_rank: int,
+        same_rank_only: bool,
+        target_tensors: dict[str, torch.Tensor] | None,
+        target_specs: Sequence[TensorReceiveSpec] | None,
+    ) -> DenseFanInReceiveResult:
+        leases = [
+            self._lease_coordinator.lease_candidate(candidate, receiver_rank=receiver_rank)
+            for candidate in candidates
+        ]
+        with contextlib.ExitStack() as stack:
+            for lease in leases:
+                stack.enter_context(lease)
+            return self._receive_from_candidate_group_unleased(
+                candidates,
+                receiver_rank=receiver_rank,
+                same_rank_only=same_rank_only,
+                target_tensors=target_tensors,
+                target_specs=target_specs,
+            )
+
+    def _receive_from_candidate_group_unleased(
         self,
         candidates: Sequence[RlSourceCandidate],
         *,

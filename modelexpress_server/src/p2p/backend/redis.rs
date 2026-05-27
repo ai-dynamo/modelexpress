@@ -15,9 +15,10 @@
 //! to enumerate source index keys without a separate secondary index.
 
 use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use crate::p2p::lease::TransferLeaseRecord;
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
-use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
+use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, TransferLeaseStatus};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -29,10 +30,15 @@ use tracing::{debug, info};
 /// Redis key prefixes and reserved field names
 mod keys {
     pub const SOURCE_PREFIX: &str = "mx:source:";
+    pub const TRANSFER_LEASE_PREFIX: &str = "mx:transfer_lease:";
     /// SCAN pattern matching source index keys: `mx:source:{16-char-id}`
     pub const SOURCE_SCAN_PATTERN: &str = "mx:source:????????????????";
     /// Reserved hash field in the source index key that stores SourceAttributesJson.
     pub const ATTRIBUTES_FIELD: &str = "__attributes__";
+}
+
+fn transfer_lease_key(lease_id: &str) -> String {
+    format!("{}{}", keys::TRANSFER_LEASE_PREFIX, lease_id)
 }
 
 /// All fields of a SourceIdentity stored once per source in the index hash.
@@ -604,6 +610,80 @@ impl MetadataBackend for RedisBackend {
             "Updated status for source '{}' worker '{}' rank {} -> {}",
             source_id, worker_id, worker_rank, status as i32
         );
+        Ok(())
+    }
+
+    async fn create_transfer_lease(&self, lease: TransferLeaseRecord) -> MetadataResult<()> {
+        let mut conn = self.get_conn().await?;
+        let key = transfer_lease_key(&lease.lease_id);
+        let value = serde_json::to_string(&lease)?;
+        let created: bool = conn.set_nx(&key, &value).await?;
+        if !created {
+            return Err(format!("transfer lease '{}' already exists", lease.lease_id).into());
+        }
+        debug!(
+            "Created transfer lease '{}' for source '{}' worker '{}'",
+            lease.lease_id, lease.mx_source_id, lease.source_worker_id
+        );
+        Ok(())
+    }
+
+    async fn get_transfer_lease(
+        &self,
+        lease_id: &str,
+    ) -> MetadataResult<Option<TransferLeaseRecord>> {
+        let mut conn = self.get_conn().await?;
+        let key = transfer_lease_key(lease_id);
+        let value: Option<String> = conn.get(&key).await?;
+        value
+            .map(|json| serde_json::from_str::<TransferLeaseRecord>(&json).map_err(Into::into))
+            .transpose()
+    }
+
+    async fn renew_transfer_lease(
+        &self,
+        lease_id: &str,
+        updated_at: i64,
+        expires_at: i64,
+    ) -> MetadataResult<()> {
+        let mut lease = self
+            .get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found", lease_id))?;
+        if lease.status != TransferLeaseStatus::Active as i32 {
+            return Err(format!("transfer lease '{}' is not active", lease_id).into());
+        }
+        lease.updated_at = updated_at;
+        lease.expires_at = expires_at;
+
+        let mut conn = self.get_conn().await?;
+        let key = transfer_lease_key(lease_id);
+        let value = serde_json::to_string(&lease)?;
+        conn.set::<_, _, ()>(&key, &value).await?;
+        debug!("Renewed transfer lease '{}'", lease_id);
+        Ok(())
+    }
+
+    async fn finish_transfer_lease(
+        &self,
+        lease_id: &str,
+        status: TransferLeaseStatus,
+        updated_at: i64,
+        error_message: &str,
+    ) -> MetadataResult<()> {
+        let mut lease = self
+            .get_transfer_lease(lease_id)
+            .await?
+            .ok_or_else(|| format!("transfer lease '{}' not found", lease_id))?;
+        lease.status = status as i32;
+        lease.updated_at = updated_at;
+        lease.error_message = error_message.to_string();
+
+        let mut conn = self.get_conn().await?;
+        let key = transfer_lease_key(lease_id);
+        let value = serde_json::to_string(&lease)?;
+        conn.set::<_, _, ()>(&key, &value).await?;
+        debug!("Finished transfer lease '{}' as {:?}", lease_id, status);
         Ok(())
     }
 }

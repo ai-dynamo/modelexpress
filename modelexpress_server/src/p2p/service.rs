@@ -10,9 +10,12 @@ use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
-    GetMetadataRequest, GetMetadataResponse, ListSourcesRequest, ListSourcesResponse,
-    PublishMetadataRequest, PublishMetadataResponse, SourceInstanceRef, SourceStatus,
-    UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
+    BeginTransferLeaseRequest, CompleteTransferLeaseRequest, GetMetadataRequest,
+    GetMetadataResponse, GetTransferLeaseRequest, GetTransferLeaseResponse, ListSourcesRequest,
+    ListSourcesResponse, PublishMetadataRequest, PublishMetadataResponse,
+    RenewTransferLeaseRequest, SourceInstanceRef, SourceStatus, TransferLeaseResponse,
+    TransferLeaseStatus, UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata,
+    p2p_service_server::P2pService,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -277,6 +280,165 @@ impl P2pService for P2pServiceImpl {
                 Ok(Response::new(UpdateStatusResponse {
                     success: false,
                     message: format!("Failed to update status: {e}"),
+                }))
+            }
+        }
+    }
+
+    async fn begin_transfer_lease(
+        &self,
+        request: Request<BeginTransferLeaseRequest>,
+    ) -> Result<Response<TransferLeaseResponse>, Status> {
+        let req = request.into_inner();
+        if req.mx_source_id.is_empty()
+            || req.source_worker_id.is_empty()
+            || req.target_worker_id.is_empty()
+        {
+            return Ok(Response::new(TransferLeaseResponse {
+                success: false,
+                message: "mx_source_id, source_worker_id, and target_worker_id are required"
+                    .to_string(),
+                lease: None,
+            }));
+        }
+
+        let requested_lease_id = if req.lease_id.is_empty() {
+            None
+        } else {
+            Some(req.lease_id)
+        };
+        match self
+            .state
+            .begin_transfer_lease(
+                requested_lease_id,
+                &req.mx_source_id,
+                &req.source_worker_id,
+                &req.target_worker_id,
+                req.target_worker_rank,
+                req.model_version,
+                req.ttl_millis,
+                req.metadata,
+            )
+            .await
+        {
+            Ok(lease) => Ok(Response::new(TransferLeaseResponse {
+                success: true,
+                message: "transfer lease started".to_string(),
+                lease: Some(lease.into()),
+            })),
+            Err(e) => {
+                error!("Failed to begin transfer lease: {}", e);
+                Ok(Response::new(TransferLeaseResponse {
+                    success: false,
+                    message: format!("Failed to begin transfer lease: {e}"),
+                    lease: None,
+                }))
+            }
+        }
+    }
+
+    async fn renew_transfer_lease(
+        &self,
+        request: Request<RenewTransferLeaseRequest>,
+    ) -> Result<Response<TransferLeaseResponse>, Status> {
+        let req = request.into_inner();
+        if req.lease_id.is_empty() {
+            return Ok(Response::new(TransferLeaseResponse {
+                success: false,
+                message: "lease_id is required".to_string(),
+                lease: None,
+            }));
+        }
+
+        match self
+            .state
+            .renew_transfer_lease(&req.lease_id, req.ttl_millis)
+            .await
+        {
+            Ok(lease) => Ok(Response::new(TransferLeaseResponse {
+                success: true,
+                message: "transfer lease renewed".to_string(),
+                lease: Some(lease.into()),
+            })),
+            Err(e) => Ok(Response::new(TransferLeaseResponse {
+                success: false,
+                message: format!("Failed to renew transfer lease: {e}"),
+                lease: None,
+            })),
+        }
+    }
+
+    async fn complete_transfer_lease(
+        &self,
+        request: Request<CompleteTransferLeaseRequest>,
+    ) -> Result<Response<TransferLeaseResponse>, Status> {
+        let req = request.into_inner();
+        if req.lease_id.is_empty() {
+            return Ok(Response::new(TransferLeaseResponse {
+                success: false,
+                message: "lease_id is required".to_string(),
+                lease: None,
+            }));
+        }
+        let status = match TransferLeaseStatus::try_from(req.status) {
+            Ok(
+                status @ (TransferLeaseStatus::Completed
+                | TransferLeaseStatus::Failed
+                | TransferLeaseStatus::Expired),
+            ) => status,
+            _ => {
+                return Ok(Response::new(TransferLeaseResponse {
+                    success: false,
+                    message: "status must be COMPLETED, FAILED, or EXPIRED".to_string(),
+                    lease: None,
+                }));
+            }
+        };
+
+        match self
+            .state
+            .complete_transfer_lease(&req.lease_id, status, &req.error_message)
+            .await
+        {
+            Ok(lease) => Ok(Response::new(TransferLeaseResponse {
+                success: true,
+                message: "transfer lease completed".to_string(),
+                lease: Some(lease.into()),
+            })),
+            Err(e) => Ok(Response::new(TransferLeaseResponse {
+                success: false,
+                message: format!("Failed to complete transfer lease: {e}"),
+                lease: None,
+            })),
+        }
+    }
+
+    async fn get_transfer_lease(
+        &self,
+        request: Request<GetTransferLeaseRequest>,
+    ) -> Result<Response<GetTransferLeaseResponse>, Status> {
+        let req = request.into_inner();
+        if req.lease_id.is_empty() {
+            return Ok(Response::new(GetTransferLeaseResponse {
+                found: false,
+                lease: None,
+            }));
+        }
+
+        match self.state.get_transfer_lease(&req.lease_id).await {
+            Ok(Some(lease)) => Ok(Response::new(GetTransferLeaseResponse {
+                found: true,
+                lease: Some(lease.into()),
+            })),
+            Ok(None) => Ok(Response::new(GetTransferLeaseResponse {
+                found: false,
+                lease: None,
+            })),
+            Err(e) => {
+                error!("Failed to get transfer lease: {}", e);
+                Ok(Response::new(GetTransferLeaseResponse {
+                    found: false,
+                    lease: None,
                 }))
             }
         }

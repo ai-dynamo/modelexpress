@@ -16,6 +16,8 @@ use std::sync::Arc;
 pub mod kubernetes;
 pub mod redis;
 
+use crate::p2p::lease::TransferLeaseRecord;
+
 /// Result type for metadata operations
 pub type MetadataResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -260,6 +262,32 @@ pub trait MetadataBackend: Send + Sync {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+    ) -> MetadataResult<()>;
+
+    /// Create a durable transfer lease. Returns an error if the lease ID exists.
+    async fn create_transfer_lease(&self, lease: TransferLeaseRecord) -> MetadataResult<()>;
+
+    /// Fetch a durable transfer lease by ID.
+    async fn get_transfer_lease(
+        &self,
+        lease_id: &str,
+    ) -> MetadataResult<Option<TransferLeaseRecord>>;
+
+    /// Renew an active transfer lease with a fresh expiry.
+    async fn renew_transfer_lease(
+        &self,
+        lease_id: &str,
+        updated_at: i64,
+        expires_at: i64,
+    ) -> MetadataResult<()>;
+
+    /// Mark a transfer lease as terminal.
+    async fn finish_transfer_lease(
+        &self,
+        lease_id: &str,
+        status: modelexpress_common::grpc::p2p::TransferLeaseStatus,
+        updated_at: i64,
+        error_message: &str,
     ) -> MetadataResult<()>;
 }
 
