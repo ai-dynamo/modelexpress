@@ -21,6 +21,14 @@ class VerlRuntimeSmokeResult:
     total_seconds: float
     failed: bool = False
     error_message: str = ""
+    receive_success: bool = False
+    requested_model_version: int | None = None
+    resolved_model_version: int | None = None
+    source_roles: tuple[str, ...] = ()
+    retry_count: int = 0
+    bytes_transferred: int = 0
+    tensor_count: int = 0
+    attempt_lease_ids: tuple[str, ...] = ()
     report_lease_ids: tuple[str, ...] = ()
     matching_lease_statuses: tuple[int, ...] = ()
     missing_lease_ids: tuple[str, ...] = ()
@@ -32,6 +40,10 @@ class VerlRuntimeSmokeResult:
     recovery_requested_model_version: int | None = None
     recovery_resolved_model_version: int | None = None
     recovery_source_roles: tuple[str, ...] = ()
+    recovery_retry_count: int = 0
+    recovery_bytes_transferred: int = 0
+    recovery_tensor_count: int = 0
+    recovery_attempt_lease_ids: tuple[str, ...] = ()
     recovery_success: bool = False
 
 
@@ -279,8 +291,20 @@ def run_verl_checkpoint_manager_update(
                 "requested_model_version": report.requested_model_version,
                 "resolved_model_version": report.resolved_model_version,
                 "success": report.success,
+                "retry_count": report.retry_count,
                 "source_roles": tuple(
                     attempt.role.value for attempt in report.attempts if attempt.success
+                ),
+                "bytes_transferred": sum(
+                    attempt.bytes_transferred
+                    for attempt in report.attempts
+                    if attempt.success
+                ),
+                "tensor_count": sum(
+                    attempt.tensor_count for attempt in report.attempts if attempt.success
+                ),
+                "attempt_lease_ids": tuple(
+                    attempt.lease_id for attempt in report.attempts if attempt.lease_id
                 ),
             }
 
@@ -388,6 +412,9 @@ def run_verl_checkpoint_manager_update(
             check_started = time.perf_counter()
             rollout.check_weights()
             check_seconds = time.perf_counter() - check_started
+        receive_report = (
+            _receive_report_snapshot(rollout) if backend == "modelexpress" else {}
+        )
         recovery_update_seconds = 0.0
         recovery_check_seconds = 0.0
         recovery_report = {}
@@ -432,6 +459,14 @@ def run_verl_checkpoint_manager_update(
             total_seconds=time.perf_counter() - total_started,
             failed=failed,
             error_message=error_message,
+            receive_success=bool(receive_report.get("success", False)),
+            requested_model_version=receive_report.get("requested_model_version"),
+            resolved_model_version=receive_report.get("resolved_model_version"),
+            source_roles=tuple(receive_report.get("source_roles", ())),
+            retry_count=int(receive_report.get("retry_count", 0)),
+            bytes_transferred=int(receive_report.get("bytes_transferred", 0)),
+            tensor_count=int(receive_report.get("tensor_count", 0)),
+            attempt_lease_ids=tuple(receive_report.get("attempt_lease_ids", ())),
             report_lease_ids=tuple(lease_snapshot.get("report_lease_ids", ())),
             matching_lease_statuses=tuple(
                 lease_snapshot.get("matching_lease_statuses", ())
@@ -455,6 +490,14 @@ def run_verl_checkpoint_manager_update(
                 "resolved_model_version"
             ),
             recovery_source_roles=tuple(recovery_report.get("source_roles", ())),
+            recovery_retry_count=int(recovery_report.get("retry_count", 0)),
+            recovery_bytes_transferred=int(
+                recovery_report.get("bytes_transferred", 0)
+            ),
+            recovery_tensor_count=int(recovery_report.get("tensor_count", 0)),
+            recovery_attempt_lease_ids=tuple(
+                recovery_report.get("attempt_lease_ids", ())
+            ),
             recovery_success=bool(recovery_report.get("success", False)),
         )
 
