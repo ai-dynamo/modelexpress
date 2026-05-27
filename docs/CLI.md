@@ -161,8 +161,8 @@ For GCS downloads, configure Google Application Default Credentials on the proce
 - `init`: Initialize model storage configuration
 - `list`: List downloaded models (use `--detailed` for more info)
 - `status`: Show model storage status and usage
-- `clear`: Clear specific model from storage
-- `clear-all`: Clear all models from storage (use `--yes` to skip confirmation)
+- `clear`: Clear specific model from local P2P client cache (disabled in shared storage mode)
+- `clear-all`: Clear all models from local P2P client cache (disabled in shared storage mode, use `--yes` to skip confirmation)
 - `validate`: Validate model integrity
 - `stats`: Show model storage statistics (use `--detailed` for more info)
 

@@ -104,7 +104,7 @@ pub enum ModelCommands {
     /// Show model storage status and usage
     Status,
 
-    /// Clear specific model from storage
+    /// Clear specific model from local P2P client cache (not available in shared storage mode)
     Clear {
         /// Model provider
         #[arg(long, short = 'p', value_enum, default_value_t = ModelProvider::HuggingFace)]
@@ -114,7 +114,7 @@ pub enum ModelCommands {
         model_name: String,
     },
 
-    /// Clear all models from storage
+    /// Clear all models from local P2P client cache (not available in shared storage mode)
     ClearAll {
         /// Confirm without prompting
         #[arg(long)]
