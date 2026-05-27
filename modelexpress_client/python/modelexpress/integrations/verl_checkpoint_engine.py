@@ -385,13 +385,18 @@ class _ModelExpressCheckpointEngineMixin:
         mx_source_id: str = "",
         statuses: Iterable[int] | None = None,
         model_version: int | None = None,
+        scope_to_report_model_version: bool = True,
     ) -> RlTransferLeaseReportSummary:
+        """Join the last receive report to server leases for the relevant version."""
+        report = self._transfer.last_receive_report
+        if model_version is None and scope_to_report_model_version and report is not None:
+            model_version = report.resolved_model_version
         inventory = self._transfer.list_target_transfer_leases(
             mx_source_id=mx_source_id,
             statuses=statuses,
             model_version=model_version,
         )
-        return summarize_report_leases(self._transfer.last_receive_report, inventory)
+        return summarize_report_leases(report, inventory)
 
     async def send_weights(
         self,

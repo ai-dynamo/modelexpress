@@ -5,10 +5,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
-import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
@@ -33,7 +31,6 @@ from modelexpress.rl_metadata import (
     RlSourceCandidate,
     RlSourceMetadata,
     RlSourceRole,
-    select_rl_source_candidates,
     with_rl_source_metadata,
 )
 from modelexpress.rl_publication import (
@@ -56,10 +53,17 @@ from modelexpress.rl_shape_registry import (
     torch_dtype_from_string,
 )
 from modelexpress.rl_slice_transfer import build_slice_transfer_manifest
+from modelexpress.rl_source_discovery import (
+    DEFAULT_RECEIVE_ROLES,
+    select_source as select_rl_source,
+    select_sources as select_rl_sources,
+    version_label,
+    wait_for_source as wait_for_rl_source,
+    wait_for_sources as wait_for_rl_sources,
+)
 from modelexpress.rl_transfer_identity import (
     backend_framework_value,
     build_rl_base_identity,
-    candidates_for_base_identity,
     identity_matches_base,
 )
 from modelexpress.rl_transfer_lease import (
@@ -78,8 +82,6 @@ from modelexpress.rl_transfer_report import (
 )
 
 logger = logging.getLogger("modelexpress.rl_transfer")
-
-_DEFAULT_RECEIVE_ROLES = (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER)
 
 
 class RlNixlWeightTransfer:
@@ -254,7 +256,7 @@ class RlNixlWeightTransfer:
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
         require_complete_version: bool = True,
@@ -276,7 +278,7 @@ class RlNixlWeightTransfer:
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
@@ -303,7 +305,7 @@ class RlNixlWeightTransfer:
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
         replica_world_size: int = 1,
@@ -342,7 +344,7 @@ class RlNixlWeightTransfer:
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         replica_world_size: int = 1,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
@@ -473,7 +475,7 @@ class RlNixlWeightTransfer:
         )
         raise RuntimeError(
             "No ModelExpress RL source transfer succeeded for "
-            f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
+            f"model={self.base_identity.model_name!r} version={version_label(model_version)}; "
             f"errors={errors}"
         )
 
@@ -797,109 +799,94 @@ class RlNixlWeightTransfer:
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
         require_complete_version: bool = True,
     ) -> RlSourceCandidate:
         """Poll MX metadata until the best matching source is visible."""
-        return (
-            await self.wait_for_sources(
-                model_version=model_version,
-                receiver_rank=receiver_rank,
-                roles=roles,
-                same_rank_only=same_rank_only,
-                source_ranks_by_role=source_ranks_by_role,
-                require_complete_version=require_complete_version,
-            )
-        )[0]
+        return await wait_for_rl_source(
+            mx_client=self.mx_client,
+            base_identity=self.base_identity,
+            worker_id=self.worker_id,
+            timeout_seconds=self.timeout_seconds,
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
+        )
 
     async def wait_for_sources(
         self,
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
         require_complete_version: bool = True,
     ) -> list[RlSourceCandidate]:
         """Poll MX metadata until matching requested/latest sources are visible."""
-        deadline = time.monotonic() + self.timeout_seconds
-        last_error: RuntimeError | None = None
-        while True:
-            try:
-                return self.select_sources(
-                    model_version=model_version,
-                    receiver_rank=receiver_rank,
-                    roles=roles,
-                    same_rank_only=same_rank_only,
-                    source_ranks_by_role=source_ranks_by_role,
-                    require_complete_version=require_complete_version,
-                )
-            except RuntimeError as exc:
-                last_error = exc
-                if time.monotonic() >= deadline:
-                    raise last_error
-                await asyncio.sleep(0.25)
+        return await wait_for_rl_sources(
+            mx_client=self.mx_client,
+            base_identity=self.base_identity,
+            worker_id=self.worker_id,
+            timeout_seconds=self.timeout_seconds,
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+            source_ranks_by_role=source_ranks_by_role,
+            require_complete_version=require_complete_version,
+        )
 
     def select_source(
         self,
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
         require_complete_version: bool = True,
     ) -> RlSourceCandidate:
         """Select the best source for a receiver from MX metadata."""
-        return self.select_sources(
+        return select_rl_source(
+            mx_client=self.mx_client,
+            base_identity=self.base_identity,
+            worker_id=self.worker_id,
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
             source_ranks_by_role=source_ranks_by_role,
             require_complete_version=require_complete_version,
-        )[0]
+        )
 
     def select_sources(
         self,
         *,
         model_version: int | None,
         receiver_rank: int,
-        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        roles: Sequence[RlSourceRole] = DEFAULT_RECEIVE_ROLES,
         same_rank_only: bool = False,
         source_ranks_by_role: Mapping[RlSourceRole, Sequence[int]] | None = None,
         require_complete_version: bool = True,
     ) -> list[RlSourceCandidate]:
         """Select source candidates for a requested or latest model version."""
-        response = self.mx_client.list_sources(
-            identity=None,
-            status_filter=p2p_pb2.SOURCE_STATUS_READY,
-        )
-        candidates = candidates_for_base_identity(response, self.base_identity)
-        candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.model_name == self.base_identity.model_name
-            and candidate.worker_id != self.worker_id
-        ]
-        selected = select_rl_source_candidates(
-            candidates,
-            receiver_rank=receiver_rank,
+        return select_rl_sources(
+            mx_client=self.mx_client,
+            base_identity=self.base_identity,
+            worker_id=self.worker_id,
             model_version=model_version,
+            receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
             source_ranks_by_role=source_ranks_by_role,
             require_complete_version=require_complete_version,
         )
-        if not selected:
-            raise RuntimeError(
-                f"No ModelExpress RL source found for model={self.base_identity.model_name!r} "
-                f"version={_version_label(model_version)}"
-            )
-        return selected
 
     def resolve_device_id(
         self,
@@ -995,7 +982,3 @@ class RlNixlWeightTransfer:
         self._shutdown_target_nixl_manager()
         self._publication_store.shutdown_all()
         self._refresh_current_publication()
-
-
-def _version_label(model_version: int | None) -> str:
-    return "latest" if model_version is None else str(model_version)

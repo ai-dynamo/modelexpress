@@ -11,6 +11,7 @@ from modelexpress.rl_benchmark import (
     RlTransferBenchmarkResult,
     _build_parser,
     _benchmark_iteration_from_report,
+    _lease_summary_for_report,
     _parse_tensor_shape,
 )
 from modelexpress.rl_metadata import RlSourceRole
@@ -157,6 +158,47 @@ def test_benchmark_iteration_serializes_report_attempts():
         "lease-source-a",
         "lease-source-b",
     ]
+
+
+def test_benchmark_lease_summary_scopes_to_report_model_version():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=0,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source-a",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=True,
+                lease_id="lease-a",
+            ),
+        ),
+    )
+
+    class _Receiver:
+        def __init__(self):
+            self.kwargs = None
+
+        def list_target_transfer_leases(self, **kwargs):
+            self.kwargs = kwargs
+            return RlTransferLeaseInventory(
+                target_worker_id="target-worker",
+                leases=(
+                    _lease(
+                        "lease-a",
+                        status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+                    ),
+                ),
+            )
+
+    receiver = _Receiver()
+    summary = _lease_summary_for_report(receiver, report)
+
+    assert receiver.kwargs == {"model_version": 7}
+    assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
 
 
 def test_benchmark_result_summary_ignores_warmups():

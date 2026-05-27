@@ -277,10 +277,7 @@ def run_mx_rl_transfer_benchmark(
                 raise RuntimeError("ModelExpress RL benchmark receive did not succeed")
             if config.verify:
                 _verify_received(source_tensors, dict(received))
-            lease_summary = summarize_report_leases(
-                report,
-                receiver.list_target_transfer_leases(),
-            )
+            lease_summary = _lease_summary_for_report(receiver, report)
             iterations.append(
                 _benchmark_iteration_from_report(
                     index=index,
@@ -302,6 +299,18 @@ def run_mx_rl_transfer_benchmark(
         backend="modelexpress",
         config=config,
         iterations=tuple(iterations),
+    )
+
+
+def _lease_summary_for_report(
+    receiver: RlNixlWeightTransfer,
+    report: RlTransferReport,
+) -> RlTransferLeaseReportSummary:
+    return summarize_report_leases(
+        report,
+        receiver.list_target_transfer_leases(
+            model_version=report.resolved_model_version,
+        ),
     )
 
 
