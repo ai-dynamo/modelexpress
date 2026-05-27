@@ -8,6 +8,8 @@ import modelexpress
 from modelexpress.rl_reshard import (
     TensorReceiveSpec,
     TensorShardSpec,
+    TensorSlice,
+    plan_dense_reshard_transfers,
     plan_exact_transfers,
     receive_specs_from_shape_registry,
     receive_specs_from_tensors,
@@ -113,6 +115,131 @@ def test_plan_exact_transfers_filters_by_tp_and_pp_coordinates():
     assert plan.entries[0].source.pipeline_parallel_rank == 1
 
 
+def test_plan_exact_transfers_rejects_matching_local_shape_at_different_offsets():
+    plan = plan_exact_transfers(
+        [
+            _source(
+                "w",
+                rank=0,
+                shape=(2, 4),
+                global_shape=(4, 4),
+                shard_offsets=(0, 0),
+            )
+        ],
+        [
+            _target(
+                "w",
+                rank=0,
+                shape=(2, 4),
+                global_shape=(4, 4),
+                shard_offsets=(2, 0),
+            )
+        ],
+    )
+
+    assert not plan.complete
+    assert "layout" in plan.missing[0].reason
+
+
+def test_plan_dense_reshard_transfers_splits_full_target_across_source_shards():
+    plan = plan_dense_reshard_transfers(
+        [
+            _source(
+                "w",
+                rank=0,
+                shape=(2, 4),
+                global_shape=(4, 4),
+                shard_offsets=(0, 0),
+            ),
+            _source(
+                "w",
+                rank=1,
+                shape=(2, 4),
+                global_shape=(4, 4),
+                shard_offsets=(2, 0),
+            ),
+        ],
+        [
+            _target(
+                "w",
+                rank=0,
+                shape=(4, 4),
+                global_shape=(4, 4),
+                shard_offsets=(0, 0),
+            )
+        ],
+    )
+
+    assert plan.complete
+    assert [entry.source_worker_rank for entry in plan.entries] == [0, 1]
+    assert [entry.source_slice for entry in plan.entries] == [
+        TensorSlice((0, 0), (2, 4)),
+        TensorSlice((0, 0), (2, 4)),
+    ]
+    assert [entry.target_slice for entry in plan.entries] == [
+        TensorSlice((0, 0), (2, 4)),
+        TensorSlice((2, 0), (2, 4)),
+    ]
+
+
+def test_plan_dense_reshard_transfers_targets_partial_shard_from_full_source():
+    plan = plan_dense_reshard_transfers(
+        [
+            _source(
+                "w",
+                rank=0,
+                shape=(8,),
+                global_shape=(8,),
+                shard_offsets=(0,),
+            )
+        ],
+        [
+            _target(
+                "w",
+                rank=2,
+                shape=(2,),
+                global_shape=(8,),
+                shard_offsets=(4,),
+            )
+        ],
+    )
+
+    assert plan.complete
+    assert plan.entries[0].source_slice == TensorSlice((4,), (2,))
+    assert plan.entries[0].target_slice == TensorSlice((0,), (2,))
+
+
+def test_plan_dense_reshard_transfers_reports_incomplete_coverage():
+    plan = plan_dense_reshard_transfers(
+        [
+            _source(
+                "w",
+                rank=0,
+                shape=(2,),
+                global_shape=(8,),
+                shard_offsets=(0,),
+            )
+        ],
+        [_target("w", rank=0, shape=(4,), global_shape=(8,), shard_offsets=(0,))],
+    )
+
+    assert not plan.complete
+    assert plan.missing[0].reason == "source coverage is incomplete or overlapping"
+
+
+def test_plan_dense_reshard_transfers_rejects_overlapping_coverage():
+    plan = plan_dense_reshard_transfers(
+        [
+            _source("w", rank=0, shape=(2,), global_shape=(4,), shard_offsets=(0,)),
+            _source("w", rank=1, shape=(2,), global_shape=(4,), shard_offsets=(0,)),
+        ],
+        [_target("w", rank=0, shape=(4,), global_shape=(4,), shard_offsets=(0,))],
+    )
+
+    assert not plan.complete
+    assert plan.missing[0].reason == "source coverage is incomplete or overlapping"
+
+
 def test_plan_exact_transfers_filters_by_moe_expert_ownership():
     plan = plan_exact_transfers(
         [
@@ -139,7 +266,9 @@ def test_plan_exact_transfers_requires_matching_expert_metadata():
 def test_reshard_planner_types_are_exported_from_package():
     assert modelexpress.TensorShardSpec is TensorShardSpec
     assert modelexpress.TensorReceiveSpec is TensorReceiveSpec
+    assert modelexpress.TensorSlice is TensorSlice
     assert modelexpress.plan_exact_transfers is plan_exact_transfers
+    assert modelexpress.plan_dense_reshard_transfers is plan_dense_reshard_transfers
     assert modelexpress.source_specs_from_shape_registry is source_specs_from_shape_registry
     assert modelexpress.receive_specs_from_shape_registry is receive_specs_from_shape_registry
     assert modelexpress.receive_specs_from_tensors is receive_specs_from_tensors
@@ -153,6 +282,8 @@ def test_source_specs_from_shape_registry_preserves_layout_metadata():
                 "dtype": "torch.bfloat16",
                 "tensor_parallel_rank": 1,
                 "pipeline_parallel_rank": 2,
+                "global_shape": [4, 4],
+                "shard_offsets": [2, 0],
                 "expert_ids": [3, 7],
             }
         },
@@ -165,6 +296,8 @@ def test_source_specs_from_shape_registry_preserves_layout_metadata():
             worker_rank=5,
             shape=(2, 4),
             dtype="torch.bfloat16",
+            global_shape=(4, 4),
+            shard_offsets=(2, 0),
             tensor_parallel_rank=1,
             pipeline_parallel_rank=2,
             expert_ids=frozenset({3, 7}),

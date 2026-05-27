@@ -25,12 +25,28 @@ class TensorShardSpec:
     worker_rank: int
     shape: tuple[int, ...]
     dtype: str
+    global_shape: tuple[int, ...] = ()
+    shard_offsets: tuple[int, ...] = ()
     tensor_parallel_rank: int = 0
     pipeline_parallel_rank: int = 0
     expert_ids: frozenset[int] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "shape", tuple(int(dim) for dim in self.shape))
+        shape = tuple(int(dim) for dim in self.shape)
+        global_shape = (
+            tuple(int(dim) for dim in self.global_shape)
+            if self.global_shape
+            else shape
+        )
+        shard_offsets = (
+            tuple(int(offset) for offset in self.shard_offsets)
+            if self.shard_offsets
+            else tuple(0 for _dim in shape)
+        )
+        _validate_shard_geometry(self.name, shape, global_shape, shard_offsets)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "global_shape", global_shape)
+        object.__setattr__(self, "shard_offsets", shard_offsets)
         object.__setattr__(self, "dtype", str(self.dtype))
         object.__setattr__(self, "expert_ids", frozenset(int(expert) for expert in self.expert_ids))
 
@@ -43,25 +59,77 @@ class TensorReceiveSpec:
     receiver_rank: int
     shape: tuple[int, ...]
     dtype: str
+    global_shape: tuple[int, ...] = ()
+    shard_offsets: tuple[int, ...] = ()
     tensor_parallel_rank: int = 0
     pipeline_parallel_rank: int = 0
     expert_ids: frozenset[int] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "shape", tuple(int(dim) for dim in self.shape))
+        shape = tuple(int(dim) for dim in self.shape)
+        global_shape = (
+            tuple(int(dim) for dim in self.global_shape)
+            if self.global_shape
+            else shape
+        )
+        shard_offsets = (
+            tuple(int(offset) for offset in self.shard_offsets)
+            if self.shard_offsets
+            else tuple(0 for _dim in shape)
+        )
+        _validate_shard_geometry(self.name, shape, global_shape, shard_offsets)
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "global_shape", global_shape)
+        object.__setattr__(self, "shard_offsets", shard_offsets)
         object.__setattr__(self, "dtype", str(self.dtype))
         object.__setattr__(self, "expert_ids", frozenset(int(expert) for expert in self.expert_ids))
 
 
 @dataclass(frozen=True)
+class TensorSlice:
+    """A local tensor slice described by offsets and shape."""
+
+    offsets: tuple[int, ...]
+    shape: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        offsets = tuple(int(offset) for offset in self.offsets)
+        shape = tuple(int(dim) for dim in self.shape)
+        if len(offsets) != len(shape):
+            raise ValueError("tensor slice offsets and shape must have the same rank")
+        if any(offset < 0 for offset in offsets):
+            raise ValueError("tensor slice offsets must be non-negative")
+        if any(dim <= 0 for dim in shape):
+            raise ValueError("tensor slice shape dimensions must be positive")
+        object.__setattr__(self, "offsets", offsets)
+        object.__setattr__(self, "shape", shape)
+
+
+@dataclass(frozen=True)
 class TransferPlanEntry:
-    """A single exact-shard transfer from a source worker to a receiver."""
+    """A single planned tensor segment transfer."""
 
     tensor_name: str
     source_worker_rank: int
     receiver_rank: int
     source: TensorShardSpec
     target: TensorReceiveSpec
+    source_slice: TensorSlice | None = None
+    target_slice: TensorSlice | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_slice is None:
+            object.__setattr__(
+                self,
+                "source_slice",
+                TensorSlice(tuple(0 for _dim in self.source.shape), self.source.shape),
+            )
+        if self.target_slice is None:
+            object.__setattr__(
+                self,
+                "target_slice",
+                TensorSlice(tuple(0 for _dim in self.target.shape), self.target.shape),
+            )
 
 
 @dataclass(frozen=True)
@@ -74,7 +142,7 @@ class MissingTensor:
 
 @dataclass(frozen=True)
 class TransferPlan:
-    """Result of planning exact shard transfers for one receiver/update."""
+    """Result of planning tensor transfers for one receiver/update."""
 
     entries: tuple[TransferPlanEntry, ...]
     missing: tuple[MissingTensor, ...]
@@ -103,8 +171,7 @@ def plan_exact_transfers(
 
     Exact means source and target have the same tensor name, shape, dtype,
     tensor-parallel rank, pipeline-parallel rank, and compatible expert
-    ownership. This is the no-allgather baseline that rank-local RL transfer
-    needs before cross-rank reshard planning is added.
+    ownership. This is the no-allgather baseline for rank-local RL transfer.
     """
     source_specs = tuple(sources)
     entries = []
@@ -118,7 +185,12 @@ def plan_exact_transfers(
             and (not same_rank_only or source.worker_rank == target.receiver_rank)
         ]
         if not candidates:
-            missing.append(MissingTensor(target, _missing_reason(source_specs, target, same_rank_only)))
+            missing.append(
+                MissingTensor(
+                    target,
+                    _missing_reason(source_specs, target, same_rank_only),
+                )
+            )
             continue
 
         source = min(
@@ -142,6 +214,67 @@ def plan_exact_transfers(
     return TransferPlan(tuple(entries), tuple(missing))
 
 
+def plan_dense_reshard_transfers(
+    sources: Iterable[TensorShardSpec],
+    targets: Iterable[TensorReceiveSpec],
+    *,
+    same_rank_only: bool = False,
+) -> TransferPlan:
+    """Plan dense rectangular shard intersections from sources to targets.
+
+    This is a pure planning primitive for tensor-parallel layout changes. It
+    can produce multiple entries for one target when the target shard spans
+    more than one source shard. Execution still belongs to the transfer layer.
+    """
+    source_specs = tuple(sources)
+    entries = []
+    missing = []
+
+    for target in targets:
+        candidates = [
+            source
+            for source in source_specs
+            if _is_dense_reshard_candidate(source, target)
+            and (not same_rank_only or source.worker_rank == target.receiver_rank)
+        ]
+        target_entries = []
+        for source in sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.worker_rank != target.receiver_rank,
+                candidate.worker_rank,
+                candidate.shard_offsets,
+            ),
+        ):
+            slices = _intersect_local_slices(source, target)
+            if slices is None:
+                continue
+            source_slice, target_slice = slices
+            target_entries.append(
+                TransferPlanEntry(
+                    tensor_name=target.name,
+                    source_worker_rank=source.worker_rank,
+                    receiver_rank=target.receiver_rank,
+                    source=source,
+                    target=target,
+                    source_slice=source_slice,
+                    target_slice=target_slice,
+                )
+            )
+
+        if not _target_coverage_complete(target_entries, target.shape):
+            missing.append(
+                MissingTensor(
+                    target,
+                    _dense_missing_reason(source_specs, target, same_rank_only),
+                )
+            )
+            continue
+        entries.extend(target_entries)
+
+    return TransferPlan(tuple(entries), tuple(missing))
+
+
 def source_specs_from_shape_registry(
     shape_registry: Mapping[str, Any],
     *,
@@ -154,6 +287,8 @@ def source_specs_from_shape_registry(
             worker_rank=worker_rank,
             shape=_shape_from_registry_entry(name, entry),
             dtype=_dtype_from_registry_entry(name, entry),
+            global_shape=_tuple_from_registry_entry(entry, "global_shape"),
+            shard_offsets=_tuple_from_registry_entry(entry, "shard_offsets"),
             tensor_parallel_rank=_int_from_registry_entry(entry, "tensor_parallel_rank"),
             pipeline_parallel_rank=_int_from_registry_entry(entry, "pipeline_parallel_rank"),
             expert_ids=_expert_ids_from_registry_entry(entry),
@@ -174,6 +309,8 @@ def receive_specs_from_shape_registry(
             receiver_rank=receiver_rank,
             shape=_shape_from_registry_entry(name, entry),
             dtype=_dtype_from_registry_entry(name, entry),
+            global_shape=_tuple_from_registry_entry(entry, "global_shape"),
+            shard_offsets=_tuple_from_registry_entry(entry, "shard_offsets"),
             tensor_parallel_rank=_int_from_registry_entry(entry, "tensor_parallel_rank"),
             pipeline_parallel_rank=_int_from_registry_entry(entry, "pipeline_parallel_rank"),
             expert_ids=_expert_ids_from_registry_entry(entry),
@@ -203,8 +340,20 @@ def _is_compatible_source(source: TensorShardSpec, target: TensorReceiveSpec) ->
     return (
         source.name == target.name
         and source.shape == target.shape
+        and source.global_shape == target.global_shape
+        and source.shard_offsets == target.shard_offsets
         and source.dtype == target.dtype
         and source.tensor_parallel_rank == target.tensor_parallel_rank
+        and source.pipeline_parallel_rank == target.pipeline_parallel_rank
+        and _expert_ownership_matches(source.expert_ids, target.expert_ids)
+    )
+
+
+def _is_dense_reshard_candidate(source: TensorShardSpec, target: TensorReceiveSpec) -> bool:
+    return (
+        source.name == target.name
+        and source.dtype == target.dtype
+        and source.global_shape == target.global_shape
         and source.pipeline_parallel_rank == target.pipeline_parallel_rank
         and _expert_ownership_matches(source.expert_ids, target.expert_ids)
     )
@@ -233,6 +382,127 @@ def _missing_reason(
     return "tensor not found"
 
 
+def _dense_missing_reason(
+    sources: tuple[TensorShardSpec, ...],
+    target: TensorReceiveSpec,
+    same_rank_only: bool,
+) -> str:
+    candidates = [
+        source
+        for source in sources
+        if _is_dense_reshard_candidate(source, target)
+    ]
+    if same_rank_only and any(_intersect_local_slices(source, target) for source in candidates):
+        return "compatible source coverage exists on a different rank"
+    if candidates:
+        return "source coverage is incomplete or overlapping"
+    if any(source.name == target.name for source in sources):
+        return "tensor exists but dtype, global shape, pipeline rank, or expert ownership differs"
+    return "tensor not found"
+
+
+def _intersect_local_slices(
+    source: TensorShardSpec,
+    target: TensorReceiveSpec,
+) -> tuple[TensorSlice, TensorSlice] | None:
+    starts = []
+    shape = []
+    for source_offset, source_dim, target_offset, target_dim in zip(
+        source.shard_offsets,
+        source.shape,
+        target.shard_offsets,
+        target.shape,
+        strict=True,
+    ):
+        start = max(source_offset, target_offset)
+        end = min(source_offset + source_dim, target_offset + target_dim)
+        if start >= end:
+            return None
+        starts.append(start)
+        shape.append(end - start)
+
+    source_offsets = tuple(
+        start - offset
+        for start, offset in zip(starts, source.shard_offsets, strict=True)
+    )
+    target_offsets = tuple(
+        start - offset
+        for start, offset in zip(starts, target.shard_offsets, strict=True)
+    )
+    return TensorSlice(source_offsets, tuple(shape)), TensorSlice(target_offsets, tuple(shape))
+
+
+def _target_coverage_complete(
+    entries: list[TransferPlanEntry],
+    target_shape: tuple[int, ...],
+) -> bool:
+    return _covered_numel(entries) == _numel(target_shape) and not _target_slices_overlap(entries)
+
+
+def _target_slices_overlap(entries: list[TransferPlanEntry]) -> bool:
+    slices = [
+        entry.target_slice
+        for entry in entries
+        if entry.target_slice is not None
+    ]
+    for index, left in enumerate(slices):
+        for right in slices[index + 1:]:
+            if _slices_overlap(left, right):
+                return True
+    return False
+
+
+def _slices_overlap(left: TensorSlice, right: TensorSlice) -> bool:
+    for left_offset, left_dim, right_offset, right_dim in zip(
+        left.offsets,
+        left.shape,
+        right.offsets,
+        right.shape,
+        strict=True,
+    ):
+        if left_offset >= right_offset + right_dim:
+            return False
+        if right_offset >= left_offset + left_dim:
+            return False
+    return True
+
+
+def _covered_numel(entries: list[TransferPlanEntry]) -> int:
+    return sum(
+        _numel(entry.target_slice.shape)
+        for entry in entries
+        if entry.target_slice is not None
+    )
+
+
+def _numel(shape: tuple[int, ...]) -> int:
+    total = 1
+    for dim in shape:
+        total *= dim
+    return total
+
+
+def _validate_shard_geometry(
+    name: str,
+    shape: tuple[int, ...],
+    global_shape: tuple[int, ...],
+    shard_offsets: tuple[int, ...],
+) -> None:
+    if len(shape) != len(global_shape) or len(shape) != len(shard_offsets):
+        raise ValueError(
+            f"tensor {name!r} shape, global_shape, and shard_offsets must have the same rank"
+        )
+    if any(dim <= 0 for dim in shape):
+        raise ValueError(f"tensor {name!r} shape dimensions must be positive")
+    if any(dim <= 0 for dim in global_shape):
+        raise ValueError(f"tensor {name!r} global_shape dimensions must be positive")
+    if any(offset < 0 for offset in shard_offsets):
+        raise ValueError(f"tensor {name!r} shard_offsets must be non-negative")
+    for offset, dim, global_dim in zip(shard_offsets, shape, global_shape, strict=True):
+        if offset + dim > global_dim:
+            raise ValueError(f"tensor {name!r} shard extends beyond global_shape")
+
+
 def _shape_from_registry_entry(name: str, entry: Any) -> tuple[int, ...]:
     if not isinstance(entry, Mapping):
         raise ValueError(f"shape registry entry for {name!r} must be an object")
@@ -255,6 +525,17 @@ def _int_from_registry_entry(entry: Any, key: str) -> int:
     if not isinstance(entry, Mapping):
         return 0
     return int(entry.get(key, 0))
+
+
+def _tuple_from_registry_entry(entry: Any, key: str) -> tuple[int, ...]:
+    if not isinstance(entry, Mapping):
+        return ()
+    value = entry.get(key, [])
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"shape registry {key} must be a list")
+    return tuple(int(item) for item in value)
 
 
 def _expert_ids_from_registry_entry(entry: Any) -> frozenset[int]:
