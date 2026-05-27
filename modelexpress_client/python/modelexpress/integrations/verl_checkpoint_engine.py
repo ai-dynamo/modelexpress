@@ -14,7 +14,7 @@ import asyncio
 import os
 import socket
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterable, Iterable, Mapping
 from typing import Any
 
 import torch
@@ -116,6 +116,7 @@ class _ModelExpressCheckpointEngineMixin:
         topology: str | None = None,
         same_rank_only: bool | None = None,
         republish_received: bool | str | None = None,
+        tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
         mx_client: MxClientBase | None = None,
         **_: Any,
     ) -> None:
@@ -157,6 +158,7 @@ class _ModelExpressCheckpointEngineMixin:
         self._receiver_rank: int | None = None
         self._source_world_size = 1
         self._replica_world_size: int | None = None
+        self._tensor_metadata = tensor_metadata
         self._local_model_version = -1
         self._worker_id = _worker_id("verl-mx")
         self._transfer = RlNixlWeightTransfer(
@@ -258,6 +260,7 @@ class _ModelExpressCheckpointEngineMixin:
             model_version=model_version,
             worker_rank=max(self.rank, 0),
             source_world_size=self._source_world_size,
+            tensor_metadata=self._tensor_metadata,
         )
 
     async def receive_weights(

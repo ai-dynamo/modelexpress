@@ -86,6 +86,7 @@ from .rl_reshard import (  # noqa: F401
     receive_specs_from_shape_registry,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
+    tensor_metadata_from_receive_specs,
 )
 
 __all__ = [
@@ -108,4 +109,5 @@ __all__ = [
     "receive_specs_from_tensors",
     "register_modelexpress_loaders",
     "source_specs_from_shape_registry",
+    "tensor_metadata_from_receive_specs",
 ]

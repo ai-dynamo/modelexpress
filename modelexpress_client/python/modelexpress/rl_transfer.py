@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +47,12 @@ from modelexpress.rl_reshard import (
     receive_specs_from_shape_registry,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
+    tensor_metadata_from_receive_specs,
+)
+from modelexpress.rl_shape_registry import (
+    allocate_tensors_from_shape_registry,
+    shape_registry_from_tensors,
+    torch_dtype_from_string,
 )
 from modelexpress.rl_slice_transfer import build_slice_transfer_manifest
 
@@ -180,50 +186,6 @@ def identity_matches_base(
     )
 
 
-def shape_registry_from_tensors(
-    tensors: dict[str, torch.Tensor],
-) -> dict[str, dict[str, Any]]:
-    """Build shape/dtype metadata needed to allocate receive buffers."""
-    return {
-        name: {
-            "shape": list(tensor.shape),
-            "dtype": str(tensor.dtype),
-        }
-        for name, tensor in tensors.items()
-    }
-
-
-def torch_dtype_from_string(dtype: str) -> torch.dtype:
-    """Parse dtype strings emitted by ``str(torch.dtype)``."""
-    name = dtype.removeprefix("torch.")
-    value = getattr(torch, name, None)
-    if not isinstance(value, torch.dtype):
-        raise ValueError(f"unsupported tensor dtype {dtype!r}")
-    return value
-
-
-def allocate_tensors_from_shape_registry(
-    shape_registry: dict[str, Any],
-    *,
-    device: torch.device | str,
-) -> dict[str, torch.Tensor]:
-    """Allocate empty tensors from shape registry metadata."""
-    tensors = {}
-    for name, entry in shape_registry.items():
-        if not isinstance(entry, dict):
-            raise ValueError(f"shape registry entry for {name!r} must be an object")
-        shape = entry.get("shape")
-        dtype = entry.get("dtype")
-        if not isinstance(shape, list) or dtype is None:
-            raise ValueError(f"shape registry entry for {name!r} must include shape and dtype")
-        tensors[name] = torch.empty(
-            tuple(int(dim) for dim in shape),
-            dtype=torch_dtype_from_string(str(dtype)),
-            device=device,
-        )
-    return tensors
-
-
 def candidates_for_base_identity(
     response: "p2p_pb2.ListSourcesResponse",
     base_identity: "p2p_pb2.SourceIdentity",
@@ -326,6 +288,7 @@ class RlNixlWeightTransfer:
         role: RlSourceRole = RlSourceRole.TRAINER,
         worker_rank: int = 0,
         source_world_size: int = 1,
+        tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> str:
         """Publish CUDA tensors as a READY MX source for one model version."""
         if not tensors:
@@ -359,7 +322,10 @@ class RlNixlWeightTransfer:
             role=role,
             world_size=source_world_size,
             retain_latest_k=self.retain_latest_k,
-            shape_registry=shape_registry_from_tensors(publish_tensors),
+            shape_registry=shape_registry_from_tensors(
+                publish_tensors,
+                tensor_metadata=tensor_metadata,
+            ),
         )
         identity = with_rl_source_metadata(self.base_identity, metadata)
         worker = p2p_pb2.WorkerMetadata(
@@ -469,19 +435,25 @@ class RlNixlWeightTransfer:
         """Receive into caller tensors, then publish them as an inference replica."""
         if not target_tensors:
             raise RuntimeError("ModelExpress RL transfer got no target tensors")
+        effective_target_specs = tuple(target_specs) if target_specs is not None else None
         received_version, tensors = await self._receive_from_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
             target_tensors=target_tensors,
-            target_specs=target_specs,
+            target_specs=effective_target_specs,
         )
         self._publish_replica_tensors(
             tensors,
             model_version=received_version,
             receiver_rank=receiver_rank,
             replica_world_size=replica_world_size,
+            tensor_metadata=(
+                tensor_metadata_from_receive_specs(effective_target_specs)
+                if effective_target_specs is not None
+                else None
+            ),
         )
         return tensors
 
@@ -619,6 +591,7 @@ class RlNixlWeightTransfer:
         model_version: int,
         receiver_rank: int,
         replica_world_size: int,
+        tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         self.publish_tensors(
             dict(tensors),
@@ -626,6 +599,7 @@ class RlNixlWeightTransfer:
             role=RlSourceRole.INFERENCE_REPLICA,
             worker_rank=receiver_rank,
             source_world_size=replica_world_size,
+            tensor_metadata=tensor_metadata,
         )
 
     def _receive_from_candidate(

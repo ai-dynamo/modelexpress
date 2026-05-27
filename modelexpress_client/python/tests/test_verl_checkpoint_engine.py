@@ -222,3 +222,50 @@ def test_receive_weights_uses_explicit_replica_world_size():
 
     assert fake_transfer.republish_kwargs["replica_world_size"] == 4
     assert fake_transfer.republish_kwargs["model_version"] == 8
+
+
+def test_send_weights_passes_tensor_metadata_to_transfer():
+    class _FakeCudaTensor:
+        is_cuda = True
+
+        def detach(self):
+            return self
+
+        def is_contiguous(self):
+            return True
+
+    class _FakeTransfer:
+        def __init__(self):
+            self.tensors = None
+            self.kwargs = None
+
+        def publish_tensors(self, tensors, **kwargs):
+            self.tensors = tensors
+            self.kwargs = kwargs
+
+    tensor_metadata = {
+        "experts.w": {
+            "expert_ids": [0, 1],
+            "expert_axis": 0,
+        }
+    }
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        tensor_metadata=tensor_metadata,
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(rank=0, world_size=1, is_trainer=True)
+
+    asyncio.run(engine.send_weights([("experts.w", _FakeCudaTensor())], global_steps=9))
+
+    assert fake_transfer.tensors is not None
+    assert list(fake_transfer.tensors) == ["experts.w"]
+    assert fake_transfer.kwargs == {
+        "model_version": 9,
+        "worker_rank": 0,
+        "source_world_size": 1,
+        "tensor_metadata": tensor_metadata,
+    }

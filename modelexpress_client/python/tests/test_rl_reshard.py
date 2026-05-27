@@ -14,6 +14,7 @@ from modelexpress.rl_reshard import (
     receive_specs_from_shape_registry,
     receive_specs_from_tensors,
     source_specs_from_shape_registry,
+    tensor_metadata_from_receive_specs,
 )
 
 
@@ -356,6 +357,7 @@ def test_reshard_planner_types_are_exported_from_package():
     assert modelexpress.source_specs_from_shape_registry is source_specs_from_shape_registry
     assert modelexpress.receive_specs_from_shape_registry is receive_specs_from_shape_registry
     assert modelexpress.receive_specs_from_tensors is receive_specs_from_tensors
+    assert modelexpress.tensor_metadata_from_receive_specs is tensor_metadata_from_receive_specs
 
 
 def test_source_specs_from_shape_registry_preserves_layout_metadata():
@@ -438,6 +440,36 @@ def test_receive_specs_from_tensors_builds_default_dense_specs():
             dtype="torch.float32",
         ),
     )
+
+
+def test_tensor_metadata_from_receive_specs_preserves_layout_metadata():
+    metadata = tensor_metadata_from_receive_specs(
+        [
+            TensorReceiveSpec(
+                name="experts.w",
+                receiver_rank=3,
+                shape=(2, 4),
+                dtype="torch.float16",
+                global_shape=(8, 4),
+                shard_offsets=(4, 0),
+                tensor_parallel_rank=1,
+                pipeline_parallel_rank=2,
+                expert_ids=(4, 7),
+                expert_axis=0,
+            )
+        ]
+    )
+
+    assert metadata == {
+        "experts.w": {
+            "global_shape": [8, 4],
+            "shard_offsets": [4, 0],
+            "tensor_parallel_rank": 1,
+            "pipeline_parallel_rank": 2,
+            "expert_ids": [4, 7],
+            "expert_axis": 0,
+        }
+    }
 
 
 def test_shape_registry_spec_conversion_rejects_invalid_expert_metadata():

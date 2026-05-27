@@ -8,17 +8,19 @@ import torch
 
 import modelexpress.rl_transfer as rl_transfer_module
 from modelexpress import p2p_pb2
-from modelexpress.rl_metadata import RlSourceMetadata, RlSourceRole, with_rl_source_metadata
+from modelexpress.rl_metadata import (
+    RlSourceMetadata,
+    RlSourceRole,
+    get_rl_source_metadata,
+    with_rl_source_metadata,
+)
 from modelexpress.rl_reshard import TensorReceiveSpec
 from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
     _ReceiveCandidateResult,
-    allocate_tensors_from_shape_registry,
     backend_framework_value,
     build_rl_base_identity,
     identity_matches_base,
-    shape_registry_from_tensors,
-    torch_dtype_from_string,
 )
 
 
@@ -93,32 +95,6 @@ def _source_ref(
         worker_rank=worker_rank,
         identity=identity,
     )
-
-
-def test_shape_registry_round_trip_allocates_tensors_on_requested_device():
-    tensors = {
-        "w1": torch.zeros((2, 3), dtype=torch.bfloat16),
-        "w2": torch.ones((1,), dtype=torch.float32),
-    }
-
-    registry = shape_registry_from_tensors(tensors)
-    allocated = allocate_tensors_from_shape_registry(registry, device="cpu")
-
-    assert allocated["w1"].shape == (2, 3)
-    assert allocated["w1"].dtype == torch.bfloat16
-    assert allocated["w1"].device.type == "cpu"
-    assert allocated["w2"].shape == (1,)
-    assert allocated["w2"].dtype == torch.float32
-
-
-def test_torch_dtype_from_string_accepts_torch_prefix():
-    assert torch_dtype_from_string("torch.bfloat16") is torch.bfloat16
-    assert torch_dtype_from_string("float16") is torch.float16
-
-
-def test_torch_dtype_from_string_rejects_unknown_dtype():
-    with pytest.raises(ValueError, match="unsupported tensor dtype"):
-        torch_dtype_from_string("not_a_dtype")
 
 
 def test_build_base_identity_uses_expected_backend_framework():
@@ -392,9 +368,18 @@ def test_publish_tensors_starts_heartbeat_and_finalize_stops_it(monkeypatch):
         {"w": torch.zeros(1, dtype=torch.float32)},
         model_version=5,
         worker_rank=2,
+        tensor_metadata={"w": {"expert_ids": [0], "expert_axis": 0}},
     )
 
     assert source_id == "source-v5"
+    assert get_rl_source_metadata(fake_client.published[0][0]).shape_registry == {
+        "w": {
+            "shape": [1],
+            "dtype": "torch.float32",
+            "expert_ids": [0],
+            "expert_axis": 0,
+        }
+    }
     assert fake_client.status_updates == [
         ("source-v5", "worker-local", 2, p2p_pb2.SOURCE_STATUS_READY)
     ]
@@ -825,6 +810,7 @@ def test_receive_and_publish_replica_uses_received_version_and_receiver_rank():
             role=RlSourceRole.TRAINER,
             worker_rank=0,
             source_world_size=1,
+            tensor_metadata=None,
         ):
             self.publish_calls.append(
                 {
@@ -833,6 +819,7 @@ def test_receive_and_publish_replica_uses_received_version_and_receiver_rank():
                     "role": role,
                     "worker_rank": worker_rank,
                     "source_world_size": source_world_size,
+                    "tensor_metadata": tensor_metadata,
                 }
             )
             return "replica-source"
@@ -852,6 +839,18 @@ def test_receive_and_publish_replica_uses_received_version_and_receiver_rank():
             target_tensors,
             model_version=None,
             receiver_rank=3,
+            target_specs=[
+                TensorReceiveSpec(
+                    name="w",
+                    receiver_rank=3,
+                    shape=(1,),
+                    dtype="torch.float32",
+                    global_shape=(2,),
+                    shard_offsets=(1,),
+                    expert_ids=(1,),
+                    expert_axis=0,
+                )
+            ],
             replica_world_size=4,
         )
     )
@@ -864,6 +863,16 @@ def test_receive_and_publish_replica_uses_received_version_and_receiver_rank():
             "role": RlSourceRole.INFERENCE_REPLICA,
             "worker_rank": 3,
             "source_world_size": 4,
+            "tensor_metadata": {
+                "w": {
+                    "global_shape": [2],
+                    "shard_offsets": [1],
+                    "tensor_parallel_rank": 0,
+                    "pipeline_parallel_rank": 0,
+                    "expert_ids": [1],
+                    "expert_axis": 0,
+                }
+            },
         }
     ]
 
@@ -893,6 +902,7 @@ def test_receive_tensors_and_publish_replica_uses_allocated_receive():
             role=RlSourceRole.TRAINER,
             worker_rank=0,
             source_world_size=1,
+            tensor_metadata=None,
         ):
             self.publish_calls.append(
                 {
@@ -901,6 +911,7 @@ def test_receive_tensors_and_publish_replica_uses_allocated_receive():
                     "role": role,
                     "worker_rank": worker_rank,
                     "source_world_size": source_world_size,
+                    "tensor_metadata": tensor_metadata,
                 }
             )
             return "replica-source"
@@ -930,6 +941,7 @@ def test_receive_tensors_and_publish_replica_uses_allocated_receive():
             "role": RlSourceRole.INFERENCE_REPLICA,
             "worker_rank": 2,
             "source_world_size": 3,
+            "tensor_metadata": None,
         }
     ]
 

@@ -362,6 +362,26 @@ def receive_specs_from_tensors(
     )
 
 
+def tensor_metadata_from_receive_specs(
+    specs: Iterable[TensorReceiveSpec],
+) -> dict[str, dict[str, Any]]:
+    """Build shape-registry layout metadata from receive specs."""
+    metadata = {}
+    for spec in specs:
+        entry: dict[str, Any] = {
+            "global_shape": list(spec.global_shape),
+            "shard_offsets": list(spec.shard_offsets),
+            "tensor_parallel_rank": spec.tensor_parallel_rank,
+            "pipeline_parallel_rank": spec.pipeline_parallel_rank,
+        }
+        if spec.expert_order:
+            entry["expert_ids"] = list(spec.expert_order)
+        if spec.expert_axis is not None:
+            entry["expert_axis"] = spec.expert_axis
+        metadata[spec.name] = entry
+    return metadata
+
+
 def _is_compatible_source(source: TensorShardSpec, target: TensorReceiveSpec) -> bool:
     return (
         source.name == target.name
