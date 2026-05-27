@@ -107,6 +107,19 @@ class RlTransferReport:
                 return attempt.worker_id
         return None
 
+    @property
+    def single_lease_source_worker_id(self) -> str | None:
+        worker_ids = tuple(
+            dict.fromkeys(
+                attempt.worker_id
+                for attempt in self.attempts
+                if attempt.lease_id
+            )
+        )
+        if len(worker_ids) == 1:
+            return worker_ids[0]
+        return None
+
 
 @dataclass(frozen=True)
 class _ReceiveCandidateResult:

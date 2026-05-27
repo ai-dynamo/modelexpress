@@ -387,11 +387,18 @@ class _ModelExpressCheckpointEngineMixin:
         model_version: int | None = None,
         source_worker_id: str = "",
         scope_to_report_model_version: bool = True,
+        scope_to_report_source_worker_id: bool = True,
     ) -> RlTransferLeaseReportSummary:
         """Join the last receive report to server leases for the relevant version."""
         report = self._transfer.last_receive_report
         if model_version is None and scope_to_report_model_version and report is not None:
             model_version = report.resolved_model_version
+        if (
+            not source_worker_id
+            and scope_to_report_source_worker_id
+            and report is not None
+        ):
+            source_worker_id = report.single_lease_source_worker_id or ""
         inventory = self._transfer.list_target_transfer_leases(
             mx_source_id=mx_source_id,
             statuses=statuses,

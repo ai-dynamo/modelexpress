@@ -160,7 +160,7 @@ def test_benchmark_iteration_serializes_report_attempts():
     ]
 
 
-def test_benchmark_lease_summary_scopes_to_report_model_version():
+def test_benchmark_lease_summary_scopes_to_report_version_and_source_worker():
     report = RlTransferReport(
         requested_model_version=None,
         resolved_model_version=7,
@@ -197,8 +197,71 @@ def test_benchmark_lease_summary_scopes_to_report_model_version():
     receiver = _Receiver()
     summary = _lease_summary_for_report(receiver, report)
 
-    assert receiver.kwargs == {"model_version": 7}
+    assert receiver.kwargs == {
+        "model_version": 7,
+        "source_worker_id": "worker-a",
+    }
     assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
+
+
+def test_benchmark_lease_summary_keeps_multi_source_reports_unscoped():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=0,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source-a",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=False,
+                lease_id="lease-a",
+            ),
+            RlTransferAttempt(
+                mx_source_id="source-b",
+                worker_id="worker-b",
+                worker_rank=0,
+                role=RlSourceRole.INFERENCE_REPLICA,
+                model_version=7,
+                success=True,
+                lease_id="lease-b",
+            ),
+        ),
+    )
+
+    class _Receiver:
+        def __init__(self):
+            self.kwargs = None
+
+        def list_target_transfer_leases(self, **kwargs):
+            self.kwargs = kwargs
+            return RlTransferLeaseInventory(
+                target_worker_id="target-worker",
+                leases=(
+                    _lease(
+                        "lease-a",
+                        status=p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+                    ),
+                    _lease(
+                        "lease-b",
+                        status=p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+                    ),
+                ),
+            )
+
+    receiver = _Receiver()
+    summary = _lease_summary_for_report(receiver, report)
+
+    assert receiver.kwargs == {
+        "model_version": 7,
+        "source_worker_id": "",
+    }
+    assert [lease.lease_id for lease in summary.matching_leases] == [
+        "lease-a",
+        "lease-b",
+    ]
 
 
 def test_benchmark_result_summary_ignores_warmups():

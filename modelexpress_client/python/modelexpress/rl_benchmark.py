@@ -310,6 +310,7 @@ def _lease_summary_for_report(
         report,
         receiver.list_target_transfer_leases(
             model_version=report.resolved_model_version,
+            source_worker_id=report.single_lease_source_worker_id or "",
         ),
     )
 

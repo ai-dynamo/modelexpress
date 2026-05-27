@@ -414,6 +414,105 @@ def test_transfer_lease_summary_defaults_to_report_model_version():
         "mx_source_id": "",
         "statuses": None,
         "model_version": 7,
+        "source_worker_id": "worker-a",
+    }
+
+
+def test_transfer_lease_summary_keeps_multi_source_reports_unscoped():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=1,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source-a",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=False,
+                lease_id="lease-a",
+            ),
+            RlTransferAttempt(
+                mx_source_id="source-b",
+                worker_id="worker-b",
+                worker_rank=0,
+                role=RlSourceRole.INFERENCE_REPLICA,
+                model_version=7,
+                success=True,
+                lease_id="lease-b",
+            ),
+        ),
+    )
+
+    class _FakeTransfer:
+        def __init__(self):
+            self.last_receive_report = report
+            self.list_kwargs = None
+
+        def list_target_transfer_leases(self, **kwargs):
+            self.list_kwargs = kwargs
+            return RlTransferLeaseInventory(target_worker_id="verl-worker")
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+
+    engine.transfer_lease_summary()
+
+    assert fake_transfer.list_kwargs == {
+        "mx_source_id": "",
+        "statuses": None,
+        "model_version": 7,
+        "source_worker_id": "",
+    }
+
+
+def test_transfer_lease_summary_can_skip_report_source_worker_scope():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=1,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source-a",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=True,
+                lease_id="lease-a",
+            ),
+        ),
+    )
+
+    class _FakeTransfer:
+        def __init__(self):
+            self.last_receive_report = report
+            self.list_kwargs = None
+
+        def list_target_transfer_leases(self, **kwargs):
+            self.list_kwargs = kwargs
+            return RlTransferLeaseInventory(target_worker_id="verl-worker")
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+
+    engine.transfer_lease_summary(scope_to_report_source_worker_id=False)
+
+    assert fake_transfer.list_kwargs == {
+        "mx_source_id": "",
+        "statuses": None,
+        "model_version": 7,
         "source_worker_id": "",
     }
 
