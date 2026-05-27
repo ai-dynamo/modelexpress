@@ -62,6 +62,25 @@ def _transfer(mx_client):
     )
 
 
+def _source_ref(mx_source_id: str, worker_id: str):
+    identity = with_rl_source_metadata(
+        _base_identity(),
+        RlSourceMetadata(
+            model_version=5,
+            role=RlSourceRole.TRAINER,
+            world_size=1,
+            shape_registry={"w": {"shape": [1], "dtype": "torch.float32"}},
+        ),
+    )
+    return p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id,
+        worker_id=worker_id,
+        model_name="test-model",
+        worker_rank=0,
+        identity=identity,
+    )
+
+
 def test_shape_registry_round_trip_allocates_tensors_on_requested_device():
     tensors = {
         "w1": torch.zeros((2, 3), dtype=torch.bfloat16),
@@ -120,25 +139,8 @@ def test_backend_framework_value_rejects_unknown_framework():
 
 
 def test_select_source_uses_broad_list_sources_and_requested_version():
-    identity = with_rl_source_metadata(
-        _base_identity(),
-        RlSourceMetadata(
-            model_version=5,
-            role=RlSourceRole.TRAINER,
-            world_size=1,
-            shape_registry={"w": {"shape": [1], "dtype": "torch.float32"}},
-        ),
-    )
     response = p2p_pb2.ListSourcesResponse(
-        instances=[
-            p2p_pb2.SourceInstanceRef(
-                mx_source_id="source-v5",
-                worker_id="worker-v5",
-                model_name="test-model",
-                worker_rank=0,
-                identity=identity,
-            )
-        ]
+        instances=[_source_ref("source-v5", "worker-v5")]
     )
     fake_client = _FakeMxClient(response)
 
@@ -151,6 +153,25 @@ def test_select_source_uses_broad_list_sources_and_requested_version():
     assert candidate.worker_id == "worker-v5"
     assert fake_client.identity is None
     assert fake_client.status_filter == p2p_pb2.SOURCE_STATUS_READY
+
+
+def test_select_sources_returns_ordered_candidates_for_retry():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref("source-b", "worker-b"),
+            _source_ref("source-a", "worker-a"),
+        ]
+    )
+
+    candidates = _transfer(_FakeMxClient(response)).select_sources(
+        model_version=5,
+        receiver_rank=0,
+    )
+
+    assert [candidate.mx_source_id for candidate in candidates] == [
+        "source-a",
+        "source-b",
+    ]
 
 
 def test_publish_tensors_rejects_empty_tensor_set():
@@ -211,26 +232,9 @@ def test_select_source_ignores_different_base_identity():
 
 
 def test_wait_for_source_retries_until_source_is_published():
-    identity = with_rl_source_metadata(
-        _base_identity(),
-        RlSourceMetadata(
-            model_version=5,
-            role=RlSourceRole.TRAINER,
-            world_size=1,
-            shape_registry={"w": {"shape": [1], "dtype": "torch.float32"}},
-        ),
-    )
     empty = p2p_pb2.ListSourcesResponse()
     ready = p2p_pb2.ListSourcesResponse(
-        instances=[
-            p2p_pb2.SourceInstanceRef(
-                mx_source_id="source-v5",
-                worker_id="worker-v5",
-                model_name="test-model",
-                worker_rank=0,
-                identity=identity,
-            )
-        ]
+        instances=[_source_ref("source-v5", "worker-v5")]
     )
     fake_client = _FakeMxClient([empty, ready])
     transfer = RlNixlWeightTransfer(
@@ -246,6 +250,39 @@ def test_wait_for_source_retries_until_source_is_published():
 
     assert candidate.mx_source_id == "source-v5"
     assert fake_client.list_call_count == 2
+
+
+def test_receive_tensors_retries_next_candidate_after_failure():
+    class _RetryTransfer(RlNixlWeightTransfer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.attempted_sources = []
+
+        def _receive_from_candidate(self, candidate, model_version):
+            del model_version
+            self.attempted_sources.append(candidate.mx_source_id)
+            if candidate.mx_source_id == "source-a":
+                raise RuntimeError("boom")
+            return [("w", torch.zeros(1))]
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref("source-a", "worker-a"),
+            _source_ref("source-b", "worker-b"),
+        ]
+    )
+    transfer = _RetryTransfer(
+        mx_client=_FakeMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    tensors = asyncio.run(
+        transfer.receive_tensors(model_version=5, receiver_rank=0)
+    )
+
+    assert transfer.attempted_sources == ["source-a", "source-b"]
+    assert tensors[0][0] == "w"
 
 
 def test_finalize_marks_published_source_stale():

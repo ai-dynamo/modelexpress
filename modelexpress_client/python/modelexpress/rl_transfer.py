@@ -282,12 +282,36 @@ class RlNixlWeightTransfer:
         same_rank_only: bool = False,
     ) -> list[tuple[str, torch.Tensor]]:
         """Discover, allocate, and pull one model version from a source."""
-        candidate = await self.wait_for_source(
+        candidates = await self.wait_for_sources(
             model_version=model_version,
             receiver_rank=receiver_rank,
             roles=roles,
             same_rank_only=same_rank_only,
         )
+        errors = []
+        for candidate in candidates:
+            try:
+                return self._receive_from_candidate(candidate, model_version)
+            except Exception as exc:
+                errors.append(f"{candidate.mx_source_id}/{candidate.worker_id}: {exc}")
+                logger.warning(
+                    "ModelExpress RL source transfer failed; trying next candidate: "
+                    "source_id=%s worker_id=%s",
+                    candidate.mx_source_id,
+                    candidate.worker_id,
+                    exc_info=True,
+                )
+        raise RuntimeError(
+            "No ModelExpress RL source transfer succeeded for "
+            f"model={self.base_identity.model_name!r} version={model_version}; "
+            f"errors={errors}"
+        )
+
+    def _receive_from_candidate(
+        self,
+        candidate: RlSourceCandidate,
+        model_version: int,
+    ) -> list[tuple[str, torch.Tensor]]:
         metadata_resp = self.mx_client.get_metadata(candidate.mx_source_id, candidate.worker_id)
         if not metadata_resp.found:
             raise RuntimeError(
@@ -340,12 +364,30 @@ class RlNixlWeightTransfer:
         roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
         same_rank_only: bool = False,
     ) -> RlSourceCandidate:
+        """Poll MX metadata until the best matching source is visible."""
+        return (
+            await self.wait_for_sources(
+                model_version=model_version,
+                receiver_rank=receiver_rank,
+                roles=roles,
+                same_rank_only=same_rank_only,
+            )
+        )[0]
+
+    async def wait_for_sources(
+        self,
+        *,
+        model_version: int,
+        receiver_rank: int,
+        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        same_rank_only: bool = False,
+    ) -> list[RlSourceCandidate]:
         """Poll MX metadata until a matching source is visible or timed out."""
         deadline = time.monotonic() + self.timeout_seconds
         last_error: RuntimeError | None = None
         while True:
             try:
-                return self.select_source(
+                return self.select_sources(
                     model_version=model_version,
                     receiver_rank=receiver_rank,
                     roles=roles,
@@ -365,6 +407,22 @@ class RlNixlWeightTransfer:
         roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
         same_rank_only: bool = False,
     ) -> RlSourceCandidate:
+        """Select the best source for a receiver from MX metadata."""
+        return self.select_sources(
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+        )[0]
+
+    def select_sources(
+        self,
+        *,
+        model_version: int,
+        receiver_rank: int,
+        roles: Sequence[RlSourceRole] = (RlSourceRole.TRAINER,),
+        same_rank_only: bool = False,
+    ) -> list[RlSourceCandidate]:
         """Select the best source for a receiver from MX metadata."""
         response = self.mx_client.list_sources(
             identity=None,
@@ -388,7 +446,7 @@ class RlNixlWeightTransfer:
                 f"No ModelExpress RL source found for model={self.base_identity.model_name!r} "
                 f"version={model_version}"
             )
-        return selected[0]
+        return selected
 
     def resolve_device_id(
         self,
