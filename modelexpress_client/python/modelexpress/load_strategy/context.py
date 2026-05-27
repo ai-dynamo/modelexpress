@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
@@ -16,6 +17,10 @@ from ..client import MxClientBase
 
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter
+    from ..engines.trtllm.adapter import (
+        TrtllmLoadConfig,
+        TrtllmModelConfig,
+    )
     from ..nixl_transfer import NixlTransferManager
     from ..vmm import VmmArena
     from sglang.srt.configs.load_config import LoadConfig as SglangLoadConfig
@@ -23,8 +28,12 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig as VllmModelConfig
     from vllm.config.load import LoadConfig as VllmLoadConfig
 
-    EngineModelConfig: TypeAlias = VllmModelConfig | SglangModelConfig
-    EngineLoadConfig: TypeAlias = VllmLoadConfig | SglangLoadConfig
+    # vLLM and SGLang expose native config objects. TRT-LLM does not expose the
+    # same load-strategy shape here, so its adapter provides a small shim.
+    EngineModelConfig: TypeAlias = (
+        VllmModelConfig | SglangModelConfig | TrtllmModelConfig
+    )
+    EngineLoadConfig: TypeAlias = VllmLoadConfig | SglangLoadConfig | TrtllmLoadConfig
 else:
     EngineModelConfig = object
     EngineLoadConfig = object
@@ -60,7 +69,11 @@ class LoadContext:
     identity: p2p_pb2.SourceIdentity
     mx_client: MxClientBase
     worker_id: str
+    metadata_server_url: str | None = None
+    metadata_port: int = 5555
+    model_streamer_uri: str | None = None
     adapter: EngineAdapter | None = None
+    selected_strategy: str | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the
@@ -69,3 +82,16 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+
+
+def resolve_model_streamer_uri(model_config: EngineModelConfig) -> str | None:
+    """Resolve ModelStreamer URI while preserving MX_MODEL_URI gate semantics."""
+    if not os.environ.get("MX_MODEL_URI"):
+        return None
+    model_weights = getattr(model_config, "model_weights", None)
+    if model_weights:
+        return str(model_weights)
+    model = getattr(model_config, "model", None)
+    if model:
+        return str(model)
+    return None

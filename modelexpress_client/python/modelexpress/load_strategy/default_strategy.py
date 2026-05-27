@@ -34,5 +34,6 @@ class DefaultStrategy(LoadStrategy):
         except Exception as e:
             raise StrategyFailed(str(e), mutated=True) from e
 
-        register_tensors(result, ctx)
+        if result.model_for_publish is not None:
+            register_tensors(result, ctx)
         return result

@@ -253,18 +253,17 @@ def test_sglang_adapter_enables_distributed_model_streamer(monkeypatch):
     load_format = SimpleNamespace(RUNAI_STREAMER="runai_streamer")
     _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format)
 
-    adapter = SglangAdapter(
-        _load_config(model_loader_extra_config={"concurrency": 4}),
-        _model_config(),
-        _device_config(device="cuda:0", gpu_id=0),
-    )
+    with patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "1"}):
+        adapter = SglangAdapter(
+            _load_config(model_loader_extra_config={"concurrency": 4}),
+            _model_config(),
+            _device_config(device="cuda:0", gpu_id=0),
+        )
 
     with patch(
         "modelexpress.engines.sglang.adapter._get_parallel_size",
         return_value=8,
-    ), patch.object(adapter, "is_cuda_alike", return_value=True), patch.dict(
-        "os.environ", {"MX_MS_DISTRIBUTED": "1"}
-    ):
+    ), patch.object(adapter, "is_cuda_alike", return_value=True):
         list(
             adapter.build_model_streamer_weight_iter(
                 "s3://bucket/deepseek-ai/DeepSeek-V3",

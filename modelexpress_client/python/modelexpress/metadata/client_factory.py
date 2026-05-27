@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 
-from ..client import MxClient, MxClientBase
+from ..client import MxClient, MxClientBase, _parse_server_address
 from .k8s_service_client import MxK8sServiceClient
 
 logger = logging.getLogger("modelexpress.metadata.client_factory")
@@ -32,6 +32,25 @@ _CENTRAL_BACKEND_ALIASES = frozenset({
     "", "server", "redis", "kubernetes", "k8s", "crd",
 })
 _K8S_SERVICE_ALIASES = frozenset({"k8s-service", "service"})
+
+
+def resolve_metadata_server_url(server_url: str | None = None) -> str | None:
+    """Return the explicitly configured central metadata server, if any.
+
+    Unlike MxClient's connection resolver, this intentionally does not fall
+    back to localhost. Strategies use this value as a configuration signal for
+    whether central metadata was requested at all.
+    """
+    if server_url:
+        return _parse_server_address(server_url)
+    url = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+    if not url:
+        return None
+    return _parse_server_address(url)
+
+
+def resolve_metadata_port() -> int:
+    return int(os.environ.get("MX_METADATA_PORT", "5555"))
 
 
 def create_metadata_client(

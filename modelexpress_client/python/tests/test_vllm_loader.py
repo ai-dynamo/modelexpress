@@ -410,19 +410,17 @@ class TestRegisterTensorsErrorHandling:
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=False)
     def test_skips_when_nixl_unavailable(self, _mock):
         from modelexpress.load_strategy.base import register_tensors
-        ctx = _make_load_context()
+        ctx = _make_load_context(metadata_server_url="localhost:8001")
         model = MagicMock()
-        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
-            register_tensors(model, ctx)
+        register_tensors(model, ctx)
         assert ctx.nixl_manager is None
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
     def test_requires_adapter_when_nixl_available(self, _mock):
         from modelexpress.load_strategy.base import register_tensors
-        ctx = _make_load_context(adapter=None)
-        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
-            with pytest.raises(RuntimeError, match="engine adapter"):
-                register_tensors(MagicMock(), ctx)
+        ctx = _make_load_context(adapter=None, metadata_server_url="localhost:8001")
+        with pytest.raises(RuntimeError, match="engine adapter"):
+            register_tensors(MagicMock(), ctx)
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
     @patch(
@@ -431,10 +429,9 @@ class TestRegisterTensorsErrorHandling:
     )
     def test_nixl_init_failure_does_not_raise(self, _init, _avail):
         from modelexpress.load_strategy.base import register_tensors
-        ctx = _make_load_context()
+        ctx = _make_load_context(metadata_server_url="localhost:8001")
         model = MagicMock()
-        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
-            register_tensors(model, ctx)
+        register_tensors(model, ctx)
         assert ctx.nixl_manager is None
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
@@ -445,11 +442,10 @@ class TestRegisterTensorsErrorHandling:
         mock_mgr.tensor_descriptors = []
         mock_mgr.register_tensors.side_effect = RuntimeError("memory registration failed")
         mock_init.return_value = mock_mgr
-        ctx = _make_load_context()
+        ctx = _make_load_context(metadata_server_url="localhost:8001")
         ctx.adapter.discover_tensors = MagicMock(return_value={"t": MagicMock()})
         model = MagicMock()
-        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
-            register_tensors(model, ctx)
+        register_tensors(model, ctx)
 
 
 class TestRegisterTensorsReuseDiscovered:
@@ -601,10 +597,9 @@ class TestPublishMetadataErrorHandling:
     @patch("modelexpress.load_strategy.base.publish_metadata_and_ready", side_effect=RuntimeError("gRPC fail"))
     def test_publish_failure_does_not_raise(self, _mock):
         from modelexpress.load_strategy.base import publish_metadata
-        ctx = _make_load_context()
+        ctx = _make_load_context(metadata_server_url="localhost:8001")
         ctx.nixl_manager = MagicMock()
-        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
-            publish_metadata(ctx)
+        publish_metadata(ctx)
 
     def test_unpublish_uses_worker_rank_for_heartbeat_lifecycle(self):
         from modelexpress.load_strategy.base import unpublish_metadata
@@ -853,22 +848,14 @@ class TestRdmaStrategyAvailability:
     def test_unavailable_when_no_server_address(self, _mock):
         strategy = self._make_strategy()
         ctx = _make_load_context()
-        with patch.dict("os.environ", {}, clear=True):
-            assert strategy.is_available(ctx) is False
+        assert strategy.is_available(ctx) is False
 
     @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
-    def test_available_when_mx_server_address_set(self, _mock):
+    def test_available_when_context_metadata_server_url_set(self, _mock):
         strategy = self._make_strategy()
         ctx = _make_load_context()
-        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
-            assert strategy.is_available(ctx) is True
-
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
-    def test_available_when_model_express_url_set(self, _mock):
-        strategy = self._make_strategy()
-        ctx = _make_load_context()
-        with patch.dict("os.environ", {"MODEL_EXPRESS_URL": "server:8001"}):
-            assert strategy.is_available(ctx) is True
+        ctx.metadata_server_url = "server:8001"
+        assert strategy.is_available(ctx) is True
 
     @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=False)
     def test_unavailable_when_nixl_not_available(self, _mock):
@@ -886,8 +873,7 @@ class TestRdmaStrategyAvailability:
         strategy = self._make_strategy()
         ctx = _make_load_context()
         ctx.mx_client.REQUIRES_P2P_METADATA = True
-        with patch.dict("os.environ", {}, clear=True):
-            assert strategy.is_available(ctx) is True
+        assert strategy.is_available(ctx) is True
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +898,21 @@ class TestFindSourceInstances:
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[])
         result = strategy._find_source_instances(ctx)
         assert result == []
+
+    def test_source_query_timeout_polls_until_matching_instance(self):
+        strategy = self._make_strategy()
+        ctx = _make_load_context()
+        ctx.load_config.source_query_timeout_s = 1
+        inst = _make_instance_ref(worker_rank=ctx.worker_rank)
+        ctx.mx_client.list_sources.side_effect = [
+            p2p_pb2.ListSourcesResponse(instances=[]),
+            p2p_pb2.ListSourcesResponse(instances=[inst]),
+        ]
+        with patch("modelexpress.load_strategy.rdma_strategy.time.sleep"), \
+             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+            result = strategy._find_source_instances(ctx)
+        assert result == [inst]
+        assert ctx.mx_client.list_sources.call_count == 2
 
     def test_returns_empty_when_list_sources_raises(self):
         strategy = self._make_strategy()

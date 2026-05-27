@@ -16,8 +16,16 @@ import torch
 
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
-from ...load_strategy.context import LoadContext, LoadResult
-from ...metadata.client_factory import create_metadata_client
+from ...load_strategy.context import (
+    LoadContext,
+    LoadResult,
+    resolve_model_streamer_uri,
+)
+from ...metadata.client_factory import (
+    create_metadata_client,
+    resolve_metadata_port,
+    resolve_metadata_server_url,
+)
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -40,6 +48,9 @@ class SglangAdapter(EngineAdapter):
         self.model_config = model_config
         self.device_config = device_config
         self.target_device = torch.device(device_config.device)
+        self.model_streamer_distributed = (
+            os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+        )
 
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
@@ -187,7 +198,7 @@ class SglangAdapter(EngineAdapter):
         return (
             tp_size > 1
             and self.is_cuda_alike()
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and self.model_streamer_distributed
         )
 
 
@@ -326,7 +337,9 @@ def build_sglang_load_context(
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
-    server_url = getattr(load_config, "modelexpress_url", None)
+    server_url = resolve_metadata_server_url(
+        getattr(load_config, "modelexpress_url", None),
+    )
     return LoadContext(
         model_config=model_config,
         load_config=load_config,
@@ -340,5 +353,8 @@ def build_sglang_load_context(
             server_url=server_url,
         ),
         worker_id=uuid.uuid4().hex[:8],
+        metadata_server_url=server_url,
+        metadata_port=resolve_metadata_port(),
+        model_streamer_uri=resolve_model_streamer_uri(model_config),
         adapter=adapter,
     )

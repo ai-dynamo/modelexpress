@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import random
 import time
 
@@ -29,6 +28,16 @@ from .. import p2p_pb2
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+SOURCE_QUERY_POLL_INTERVAL_S = 5.0
+
+
+def _source_query_timeout_s(ctx: LoadContext) -> float | None:
+    timeout_s = getattr(ctx.load_config, "source_query_timeout_s", None)
+    if timeout_s is None:
+        return None
+    if not isinstance(timeout_s, (int, float)):
+        return None
+    return float(timeout_s)
 
 
 class RdmaStrategy(LoadStrategy):
@@ -63,9 +72,8 @@ class RdmaStrategy(LoadStrategy):
         # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't
         # masquerade as the flag in tests.
-        server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
         requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
-        if not server_addr and not requires_p2p:
+        if not ctx.metadata_server_url and not requires_p2p:
             logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
             return False
 
@@ -137,6 +145,27 @@ class RdmaStrategy(LoadStrategy):
         self, ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         """Return all READY source instances (shuffled for load balancing)."""
+        timeout_s = _source_query_timeout_s(ctx)
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+
+        while True:
+            candidates = self._list_source_instances(ctx)
+            if candidates or deadline is None:
+                return candidates
+
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                logger.info(
+                    f"[Worker {ctx.global_rank}] No RDMA source found within "
+                    f"{timeout_s}s, falling through"
+                )
+                return []
+
+            time.sleep(min(SOURCE_QUERY_POLL_INTERVAL_S, remaining_s))
+
+    def _list_source_instances(
+        self, ctx: LoadContext,
+    ) -> list[p2p_pb2.SourceInstanceRef]:
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,

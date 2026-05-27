@@ -25,6 +25,7 @@ from .base import (
     publish_source_if_supported,
     register_tensors,
     publish_metadata,
+    publish_loaded_model,
     unpublish_metadata,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "SourceTransferError",
     "register_tensors",
     "publish_metadata",
+    "publish_loaded_model",
     "unpublish_metadata",
 ]
 
@@ -85,6 +87,7 @@ class LoadStrategyChain:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
                 try:
                     result = strategy.load(result, ctx)
+                    ctx.selected_strategy = strategy.name
                     publish_source_if_supported(result, ctx)
                     span.set_attribute("weight_loading_strategy", strategy.name)
                     return result.value

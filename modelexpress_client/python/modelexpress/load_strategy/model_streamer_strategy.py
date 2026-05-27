@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import os
 from typing import Iterator
 
 import torch
@@ -27,11 +26,9 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 class ModelStreamerStrategy(LoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
-    Activated by setting MX_MODEL_URI (gate only). The actual URI used to
-    stream weights is taken from `model_config.model_weights` if set
-    (object-storage URIs: s3://, gs://, az://) and falls back to
-    `model_config.model` otherwise (local paths, HF-resolved snapshots).
-    Engine adapters provide the concrete ModelStreamer iterator.
+    Activated by LoadContext.model_streamer_uri. Context builders preserve the
+    legacy MX_MODEL_URI gate behavior and freeze the resolved model path before
+    the strategy chain runs.
     """
 
     name = "model_streamer"
@@ -49,17 +46,18 @@ class ModelStreamerStrategy(LoadStrategy):
             )
             return False
 
-        model_uri = os.environ.get("MX_MODEL_URI", "")
-        if not model_uri:
+        if not ctx.model_streamer_uri:
             logger.info(
-                f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
+                f"[Worker {ctx.global_rank}] ModelStreamer URI not configured, skipping"
             )
             return False
         return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
-        model_uri = getattr(ctx.model_config, "model_weights", None) or ctx.model_config.model
+        model_uri = ctx.model_streamer_uri
+        if not model_uri:
+            raise StrategyFailed("ModelStreamer URI not configured", mutated=False)
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:
