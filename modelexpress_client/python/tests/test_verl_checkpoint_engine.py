@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+
 import pytest
+import torch
 
 from modelexpress import p2p_pb2
 from modelexpress.integrations.verl_checkpoint_engine import (
@@ -9,6 +12,10 @@ from modelexpress.integrations.verl_checkpoint_engine import (
     _model_version_from_global_steps,
     _topology_from_metadata,
 )
+
+
+async def _collect_weights(weights):
+    return [item async for item in weights]
 
 
 def test_model_version_prefers_global_steps_and_falls_back_to_counter():
@@ -133,6 +140,7 @@ def test_init_process_group_records_rank_local_roles():
     assert engine._receiver_rank == 1
     assert engine._source_world_size == 2
     assert engine.same_rank_only is True
+    assert engine._replica_world_size_for_publish() == 2
 
 
 def test_init_rejects_unknown_topology():
@@ -142,3 +150,75 @@ def test_init_rejects_unknown_topology():
             model_name="test-model",
             topology="unknown",
         )
+
+
+def test_receive_weights_can_republish_received_replica():
+    class _FakeTransfer:
+        def __init__(self):
+            self.republish_kwargs = None
+
+        async def receive_tensors_and_publish_replica(self, **kwargs):
+            self.republish_kwargs = kwargs
+            return [("w", torch.zeros(1))]
+
+        async def receive_tensors(self, **kwargs):
+            raise AssertionError("receive_tensors should not run when republish is enabled")
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        republish_received=True,
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(
+        rank=2,
+        world_size=4,
+        is_trainer=False,
+        receiver_rank=1,
+        source_world_size=1,
+    )
+
+    weights = asyncio.run(_collect_weights(engine.receive_weights(global_steps=None)))
+
+    assert weights[0][0] == "w"
+    assert fake_transfer.republish_kwargs == {
+        "model_version": 0,
+        "receiver_rank": 1,
+        "same_rank_only": False,
+        "replica_world_size": 3,
+    }
+
+
+def test_receive_weights_uses_explicit_replica_world_size():
+    class _FakeTransfer:
+        def __init__(self):
+            self.republish_kwargs = None
+
+        async def receive_tensors_and_publish_replica(self, **kwargs):
+            self.republish_kwargs = kwargs
+            return [("w", torch.zeros(1))]
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        republish_received="true",
+        topology="rank_local",
+        mx_client=object(),
+    )
+    fake_transfer = _FakeTransfer()
+    engine._transfer = fake_transfer
+    engine.init_process_group(
+        rank=1,
+        world_size=2,
+        is_trainer=False,
+        receiver_rank=1,
+        source_world_size=2,
+        replica_world_size=4,
+    )
+
+    asyncio.run(_collect_weights(engine.receive_weights(global_steps=8)))
+
+    assert fake_transfer.republish_kwargs["replica_world_size"] == 4
+    assert fake_transfer.republish_kwargs["model_version"] == 8

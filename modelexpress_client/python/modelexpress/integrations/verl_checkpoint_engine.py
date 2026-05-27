@@ -82,6 +82,19 @@ def _normalize_topology(topology: str | None) -> str:
     return value
 
 
+def _normalize_bool(value: bool | str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"unsupported boolean value {value!r}")
+
+
 class _ModelExpressCheckpointEngineMixin:
     def __init__(
         self,
@@ -102,6 +115,7 @@ class _ModelExpressCheckpointEngineMixin:
         timeout_seconds: float = 300.0,
         topology: str | None = None,
         same_rank_only: bool | None = None,
+        republish_received: bool | str | None = None,
         mx_client: MxClientBase | None = None,
         **_: Any,
     ) -> None:
@@ -118,6 +132,12 @@ class _ModelExpressCheckpointEngineMixin:
             self.topology == _TOPOLOGY_RANK_LOCAL
             if same_rank_only is None
             else same_rank_only
+        )
+        self.republish_received = _normalize_bool(
+            republish_received
+            if republish_received is not None
+            else os.environ.get("MX_RL_REPUBLISH_RECEIVED"),
+            default=False,
         )
         self.base_identity = build_rl_base_identity(
             model_name=self.model_name,
@@ -136,6 +156,7 @@ class _ModelExpressCheckpointEngineMixin:
         self._is_trainer: bool | None = None
         self._receiver_rank: int | None = None
         self._source_world_size = 1
+        self._replica_world_size: int | None = None
         self._local_model_version = -1
         self._worker_id = _worker_id("verl-mx")
         self._transfer = RlNixlWeightTransfer(
@@ -204,12 +225,14 @@ class _ModelExpressCheckpointEngineMixin:
         is_trainer: bool | None = None,
         receiver_rank: int | None = None,
         source_world_size: int = 1,
+        replica_world_size: int | None = None,
     ) -> None:
         self.rank = rank
         self.world_size = world_size
         self._is_trainer = rank <= 0 if is_trainer is None else is_trainer
         self._receiver_rank = receiver_rank
         self._source_world_size = source_world_size
+        self._replica_world_size = replica_world_size
 
     def finalize(self) -> None:
         self._transfer.finalize()
@@ -247,17 +270,38 @@ class _ModelExpressCheckpointEngineMixin:
             raise RuntimeError("trainer rank cannot receive ModelExpress weights")
 
         model_version = self._resolve_model_version(global_steps)
-        tensors = await self._transfer.receive_tensors(
-            model_version=model_version,
-            receiver_rank=(
-                self._receiver_rank
-                if self._receiver_rank is not None
-                else max(self.rank - 1, 0)
-            ),
-            same_rank_only=self.same_rank_only,
-        )
+        receiver_rank = self._resolved_receiver_rank()
+        if self.republish_received:
+            tensors = await self._transfer.receive_tensors_and_publish_replica(
+                model_version=model_version,
+                receiver_rank=receiver_rank,
+                same_rank_only=self.same_rank_only,
+                replica_world_size=self._replica_world_size_for_publish(),
+            )
+        else:
+            tensors = await self._transfer.receive_tensors(
+                model_version=model_version,
+                receiver_rank=receiver_rank,
+                same_rank_only=self.same_rank_only,
+            )
         for name, tensor in tensors:
             yield name, tensor
+
+    def _resolved_receiver_rank(self) -> int:
+        if self.rank is None:
+            raise RuntimeError("init_process_group must run before receive_weights")
+        if self._receiver_rank is not None:
+            return self._receiver_rank
+        return max(self.rank - 1, 0)
+
+    def _replica_world_size_for_publish(self) -> int:
+        if self._replica_world_size is not None:
+            return self._replica_world_size
+        if self.world_size is None:
+            return 1
+        if self.topology == _TOPOLOGY_RANK_LOCAL:
+            return self.world_size
+        return max(self.world_size - self._source_world_size, 1)
 
     def _resolve_model_version(self, global_steps: int | None) -> int:
         self._local_model_version = _model_version_from_global_steps(

@@ -351,12 +351,35 @@ class RlNixlWeightTransfer:
             target_tensors=target_tensors,
             target_specs=target_specs,
         )
-        self.publish_tensors(
-            dict(tensors),
+        self._publish_replica_tensors(
+            tensors,
             model_version=received_version,
-            role=RlSourceRole.INFERENCE_REPLICA,
-            worker_rank=receiver_rank,
-            source_world_size=replica_world_size,
+            receiver_rank=receiver_rank,
+            replica_world_size=replica_world_size,
+        )
+        return tensors
+
+    async def receive_tensors_and_publish_replica(
+        self,
+        *,
+        model_version: int | None,
+        receiver_rank: int,
+        roles: Sequence[RlSourceRole] = _DEFAULT_RECEIVE_ROLES,
+        same_rank_only: bool = False,
+        replica_world_size: int = 1,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Receive allocated tensors, then publish them as an inference replica."""
+        received_version, tensors = await self._receive_from_sources(
+            model_version=model_version,
+            receiver_rank=receiver_rank,
+            roles=roles,
+            same_rank_only=same_rank_only,
+        )
+        self._publish_replica_tensors(
+            tensors,
+            model_version=received_version,
+            receiver_rank=receiver_rank,
+            replica_world_size=replica_world_size,
         )
         return tensors
 
@@ -401,6 +424,22 @@ class RlNixlWeightTransfer:
             "No ModelExpress RL source transfer succeeded for "
             f"model={self.base_identity.model_name!r} version={_version_label(model_version)}; "
             f"errors={errors}"
+        )
+
+    def _publish_replica_tensors(
+        self,
+        tensors: Sequence[tuple[str, torch.Tensor]],
+        *,
+        model_version: int,
+        receiver_rank: int,
+        replica_world_size: int,
+    ) -> None:
+        self.publish_tensors(
+            dict(tensors),
+            model_version=model_version,
+            role=RlSourceRole.INFERENCE_REPLICA,
+            worker_rank=receiver_rank,
+            source_world_size=replica_world_size,
         )
 
     def _receive_from_candidate(
