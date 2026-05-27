@@ -191,6 +191,65 @@ def test_receive_weights_without_global_steps_requests_latest_and_republishes():
     }
 
 
+def test_receive_weights_runs_lifecycle_hooks_around_verl_refit():
+    events = []
+
+    class _FakeTransfer:
+        async def receive_tensors(self, **kwargs):
+            events.append(("receive", kwargs))
+            return [("w", torch.zeros(1))]
+
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        pause_generation=lambda: events.append("pause"),
+        flush_cache=lambda: events.append("flush"),
+        resume_generation=lambda: events.append("resume"),
+        mx_client=object(),
+    )
+    engine._transfer = _FakeTransfer()
+    engine.init_process_group(
+        rank=2,
+        world_size=4,
+        is_trainer=False,
+        receiver_rank=1,
+        source_world_size=1,
+    )
+
+    weights = asyncio.run(_collect_weights(engine.receive_weights(global_steps=None)))
+
+    assert weights[0][0] == "w"
+    assert events == [
+        "pause",
+        (
+            "receive",
+            {
+                "model_version": None,
+                "receiver_rank": 1,
+                "same_rank_only": False,
+            },
+        ),
+        "flush",
+        "resume",
+    ]
+
+
+def test_receive_weights_validates_before_pause_hook():
+    events = []
+    engine = _ModelExpressCheckpointEngineMixin(
+        bucket_size=1,
+        model_name="test-model",
+        pause_generation=lambda: events.append("pause"),
+        resume_generation=lambda: events.append("resume"),
+        mx_client=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="init_process_group"):
+        asyncio.run(_collect_weights(engine.receive_weights(global_steps=None)))
+
+    assert events == []
+
+
 def test_receive_weights_uses_explicit_replica_world_size():
     class _FakeTransfer:
         def __init__(self):

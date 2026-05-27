@@ -88,6 +88,7 @@ from .rl_reshard import (  # noqa: F401
     source_specs_from_shape_registry,
     tensor_metadata_from_receive_specs,
 )
+from .rl_update_lifecycle import RlWeightUpdateLifecycleHooks  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
@@ -97,6 +98,7 @@ __all__ = [
     "MissingTensor",
     "RlSourceMetadata",
     "RlSourceRole",
+    "RlWeightUpdateLifecycleHooks",
     "TensorReceiveSpec",
     "TensorShardSpec",
     "TensorSlice",

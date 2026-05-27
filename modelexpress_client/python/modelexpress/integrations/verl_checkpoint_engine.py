@@ -24,6 +24,10 @@ from modelexpress.rl_transfer import (
     RlNixlWeightTransfer,
     build_rl_base_identity,
 )
+from modelexpress.rl_update_lifecycle import (
+    RlWeightUpdateLifecycleHooks,
+    iter_weight_update_lifecycle,
+)
 
 _TOPOLOGY_BROADCAST = "broadcast"
 _TOPOLOGY_RANK_LOCAL = "rank_local"
@@ -117,6 +121,10 @@ class _ModelExpressCheckpointEngineMixin:
         same_rank_only: bool | None = None,
         republish_received: bool | str | None = None,
         tensor_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+        lifecycle_hooks: RlWeightUpdateLifecycleHooks | None = None,
+        pause_generation: Any | None = None,
+        flush_cache: Any | None = None,
+        resume_generation: Any | None = None,
         mx_client: MxClientBase | None = None,
         **_: Any,
     ) -> None:
@@ -159,6 +167,11 @@ class _ModelExpressCheckpointEngineMixin:
         self._source_world_size = 1
         self._replica_world_size: int | None = None
         self._tensor_metadata = tensor_metadata
+        self._lifecycle_hooks = lifecycle_hooks or RlWeightUpdateLifecycleHooks(
+            pause_generation=pause_generation,
+            flush_cache=flush_cache,
+            resume_generation=resume_generation,
+        )
         self._local_model_version = -1
         self._worker_id = _worker_id("verl-mx")
         self._transfer = RlNixlWeightTransfer(
@@ -267,10 +280,19 @@ class _ModelExpressCheckpointEngineMixin:
         self,
         global_steps: int | None = None,
     ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
-        if self.rank is None:
-            raise RuntimeError("init_process_group must run before receive_weights")
-        if self._is_trainer:
-            raise RuntimeError("trainer rank cannot receive ModelExpress weights")
+        self._raise_if_receive_unready()
+        async for name, tensor in iter_weight_update_lifecycle(
+            self._receive_weight_items(global_steps=global_steps),
+            hooks=self._lifecycle_hooks,
+        ):
+            yield name, tensor
+
+    async def _receive_weight_items(
+        self,
+        *,
+        global_steps: int | None = None,
+    ) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        self._raise_if_receive_unready()
 
         model_version = self._resolve_receive_model_version(global_steps)
         receiver_rank = self._resolved_receiver_rank()
@@ -289,6 +311,12 @@ class _ModelExpressCheckpointEngineMixin:
             )
         for name, tensor in tensors:
             yield name, tensor
+
+    def _raise_if_receive_unready(self) -> None:
+        if self.rank is None:
+            raise RuntimeError("init_process_group must run before receive_weights")
+        if self._is_trainer:
+            raise RuntimeError("trainer rank cannot receive ModelExpress weights")
 
     def _resolved_receiver_rank(self) -> int:
         if self.rank is None:
