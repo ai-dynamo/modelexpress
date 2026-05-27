@@ -42,12 +42,16 @@ def _ref(
     source_id: str,
     worker_id: str,
     rank: int,
+    status: int = p2p_pb2.SOURCE_STATUS_UNKNOWN,
+    updated_at: int = 0,
 ) -> p2p_pb2.SourceInstanceRef:
     return p2p_pb2.SourceInstanceRef(
         mx_source_id=source_id,
         worker_id=worker_id,
         model_name="test-model",
         worker_rank=rank,
+        status=status,
+        updated_at=updated_at,
     )
 
 
@@ -59,6 +63,8 @@ def _candidate(
     rank: int = 0,
     world_size: int = 1,
     retain_latest_k: int = 1,
+    status: int = p2p_pb2.SOURCE_STATUS_UNKNOWN,
+    updated_at: int = 0,
 ) -> RlSourceCandidate:
     return RlSourceCandidate(
         source_id,
@@ -71,6 +77,8 @@ def _candidate(
             world_size=world_size,
             retain_latest_k=retain_latest_k,
         ),
+        status=status,
+        updated_at=updated_at,
     )
 
 
@@ -223,6 +231,31 @@ def test_candidates_from_response_can_parse_rl_metadata_from_ref_identity():
     ]
 
 
+def test_candidates_from_response_annotates_discovery_health():
+    metadata = RlSourceMetadata(
+        model_version=5,
+        role=RlSourceRole.TRAINER,
+        world_size=1,
+    )
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _ref(
+                source_id="source-a",
+                worker_id="worker-a",
+                rank=0,
+                status=p2p_pb2.SOURCE_STATUS_READY,
+                updated_at=1234567890000,
+            ),
+        ],
+    )
+
+    candidates = candidates_from_response(response, metadata)
+
+    assert len(candidates) == 1
+    assert candidates[0].status == p2p_pb2.SOURCE_STATUS_READY
+    assert candidates[0].updated_at == 1234567890000
+
+
 def test_select_candidates_uses_latest_version_and_prefers_replica_role():
     candidates = [
         RlSourceCandidate(
@@ -297,6 +330,28 @@ def test_complete_model_versions_require_distinct_ranks_per_role():
     assert latest_complete_model_version(candidates) == 7
 
 
+def test_complete_model_versions_ignore_stale_discovery_refs():
+    candidates = [
+        _candidate(
+            "trainer-v7-r0",
+            version=7,
+            rank=0,
+            world_size=2,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        ),
+        _candidate(
+            "trainer-v7-r1",
+            version=7,
+            rank=1,
+            world_size=2,
+            status=p2p_pb2.SOURCE_STATUS_STALE,
+        ),
+    ]
+
+    assert complete_model_versions(candidates) == set()
+    assert complete_source_groups(candidates) == set()
+
+
 def test_select_candidates_skips_incomplete_preferred_role_group():
     candidates = [
         _candidate("trainer-v8-r0", version=8, rank=0, world_size=2),
@@ -357,6 +412,26 @@ def test_select_candidates_falls_back_to_latest_complete_version():
         "trainer-r1",
         "trainer-r0",
     ]
+
+
+def test_select_candidates_ignore_stale_refs_but_keep_legacy_unknown_health():
+    candidates = [
+        _candidate(
+            "stale-v8",
+            version=8,
+            status=p2p_pb2.SOURCE_STATUS_STALE,
+        ),
+        _candidate(
+            "ready-v8",
+            version=8,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        ),
+        _candidate("legacy-v7", version=7),
+    ]
+
+    selected = select_rl_source_candidates(candidates, receiver_rank=0)
+
+    assert [candidate.mx_source_id for candidate in selected] == ["ready-v8"]
 
 
 def test_select_candidates_retention_ignores_incomplete_newer_version():

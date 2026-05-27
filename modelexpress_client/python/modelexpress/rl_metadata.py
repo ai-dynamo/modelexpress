@@ -33,6 +33,9 @@ _RL_EXTRA_PARAMETER_KEYS = {
     RL_RETAIN_LATEST_K_KEY,
     RL_SHAPE_REGISTRY_KEY,
 }
+_READY_OR_LEGACY_SOURCE_STATUSES = frozenset(
+    (p2p_pb2.SOURCE_STATUS_UNKNOWN, p2p_pb2.SOURCE_STATUS_READY)
+)
 
 
 class RlSourceRole(str, Enum):
@@ -119,6 +122,8 @@ class RlSourceCandidate:
     model_name: str
     worker_rank: int
     metadata: RlSourceMetadata
+    status: int = p2p_pb2.SOURCE_STATUS_UNKNOWN
+    updated_at: int = 0
 
     @classmethod
     def from_ref(
@@ -132,6 +137,8 @@ class RlSourceCandidate:
             model_name=ref.model_name,
             worker_rank=ref.worker_rank,
             metadata=metadata,
+            status=int(ref.status),
+            updated_at=int(ref.updated_at),
         )
 
 
@@ -216,6 +223,11 @@ def candidates_from_response(
     return candidates
 
 
+def source_candidate_is_ready(candidate: RlSourceCandidate) -> bool:
+    """Return true for READY refs and legacy refs without discovery status."""
+    return int(candidate.status) in _READY_OR_LEGACY_SOURCE_STATUSES
+
+
 def latest_model_version(candidates: Iterable[RlSourceCandidate]) -> int | None:
     """Return the latest model version among candidates, or None if empty."""
     latest: int | None = None
@@ -256,9 +268,13 @@ def complete_source_groups(
     """Return version/role groups with all advertised ranks READY.
 
     The caller should pass candidates already filtered to one base identity.
+    Legacy refs without discovery status are treated as READY because older
+    servers only applied status through the ListSources filter.
     """
     groups: dict[tuple[int, RlSourceRole], tuple[set[int], int]] = {}
     for candidate in candidates:
+        if not source_candidate_is_ready(candidate):
+            continue
         key = (candidate.metadata.model_version, candidate.metadata.role)
         ranks, required_world_size = groups.setdefault(
             key,
@@ -323,7 +339,8 @@ def select_rl_source_candidates(
     role_filtered = [
         candidate
         for candidate in candidates
-        if candidate.metadata.role in role_priority
+        if source_candidate_is_ready(candidate)
+        and candidate.metadata.role in role_priority
         and (
             source_rank_filter is None
             or candidate.worker_rank in source_rank_filter.get(candidate.metadata.role, set())
