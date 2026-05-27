@@ -620,6 +620,7 @@ class RlNixlWeightTransfer:
             candidate
             for candidate in candidates
             if candidate.model_name == self.base_identity.model_name
+            and candidate.worker_id != self.worker_id
         ]
         selected = select_rl_source_candidates(
             candidates,

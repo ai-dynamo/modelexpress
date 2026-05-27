@@ -187,6 +187,60 @@ def test_select_sources_returns_ordered_candidates_for_retry():
     ]
 
 
+def test_select_sources_excludes_current_worker_after_replica_publish():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "self-replica",
+                "worker-local",
+                model_version=5,
+                role=RlSourceRole.INFERENCE_REPLICA,
+            ),
+            _source_ref(
+                "peer-replica",
+                "worker-peer",
+                model_version=5,
+                role=RlSourceRole.INFERENCE_REPLICA,
+            ),
+            _source_ref(
+                "trainer-source",
+                "worker-trainer",
+                model_version=5,
+                role=RlSourceRole.TRAINER,
+            ),
+        ]
+    )
+
+    candidates = _transfer(_FakeMxClient(response)).select_sources(
+        model_version=5,
+        receiver_rank=0,
+    )
+
+    assert [candidate.worker_id for candidate in candidates] == [
+        "worker-peer",
+        "worker-trainer",
+    ]
+
+
+def test_select_sources_reports_missing_when_only_current_worker_matches():
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "self-replica",
+                "worker-local",
+                model_version=5,
+                role=RlSourceRole.INFERENCE_REPLICA,
+            )
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="No ModelExpress RL source found"):
+        _transfer(_FakeMxClient(response)).select_sources(
+            model_version=5,
+            receiver_rank=0,
+        )
+
+
 def test_select_source_uses_latest_visible_version_when_unspecified():
     response = p2p_pb2.ListSourcesResponse(
         instances=[
