@@ -127,7 +127,7 @@ def test_slice_transfer_manifest_offsets_remote_descriptor_for_partial_target():
     assert manifest.output_tensors == [("w", target_tensor)]
 
 
-def test_slice_transfer_manifest_rejects_noncontiguous_source_slice():
+def test_slice_transfer_manifest_fragments_noncontiguous_source_slice():
     source = TensorShardSpec(
         name="w",
         worker_rank=0,
@@ -159,12 +159,25 @@ def test_slice_transfer_manifest_rejects_noncontiguous_source_slice():
         (),
     )
 
-    with pytest.raises(RuntimeError, match="source slice.*not contiguous"):
-        build_slice_transfer_manifest(
-            plan,
-            source_descriptors=[TensorDescriptor("w", 100, 64, 0, "torch.float32")],
-            target_tensors={"w": torch.zeros((4, 2), dtype=torch.float32)},
-        )
+    manifest = build_slice_transfer_manifest(
+        plan,
+        source_descriptors=[TensorDescriptor("w", 100, 64, 0, "torch.float32")],
+        target_tensors={"w": torch.zeros((4, 2), dtype=torch.float32)},
+    )
+
+    assert list(manifest.target_tensors) == [
+        "w.__mx_fragment_0",
+        "w.__mx_fragment_1",
+        "w.__mx_fragment_2",
+        "w.__mx_fragment_3",
+    ]
+    assert manifest.source_descriptors == [
+        TensorDescriptor("w.__mx_fragment_0", 104, 8, 0, "torch.float32"),
+        TensorDescriptor("w.__mx_fragment_1", 120, 8, 0, "torch.float32"),
+        TensorDescriptor("w.__mx_fragment_2", 136, 8, 0, "torch.float32"),
+        TensorDescriptor("w.__mx_fragment_3", 152, 8, 0, "torch.float32"),
+    ]
+    assert all(tensor.is_contiguous() for tensor in manifest.target_tensors.values())
 
 
 def test_slice_transfer_manifest_stages_noncontiguous_target_view():
@@ -290,6 +303,81 @@ def test_grouped_slice_transfer_manifest_stages_noncontiguous_target_slices():
     ]
     assert torch.equal(target_tensor[:, :2], torch.ones((4, 2), dtype=torch.float32))
     assert torch.equal(target_tensor[:, 2:], torch.full((4, 2), 2.0))
+
+
+def test_grouped_slice_transfer_manifest_fragments_noncontiguous_source_slices():
+    source_a = _source_spec(
+        shape=(4, 4),
+        global_shape=(4, 4),
+        shard_offsets=(0, 0),
+    )
+    source_b = _source_spec(
+        worker_rank=1,
+        shape=(4, 4),
+        global_shape=(4, 4),
+        shard_offsets=(0, 0),
+    )
+    target_a = _target_spec(
+        name="w.left",
+        shape=(4, 2),
+        global_shape=(4, 4),
+        shard_offsets=(0, 0),
+    )
+    target_b = _target_spec(
+        name="w.right",
+        shape=(4, 2),
+        global_shape=(4, 4),
+        shard_offsets=(0, 2),
+    )
+    plan = TransferPlan(
+        (
+            TransferPlanEntry(
+                tensor_name="w.left",
+                source_worker_rank=0,
+                receiver_rank=0,
+                source=source_a,
+                target=target_a,
+                source_slice=TensorSlice((0, 0), (4, 2)),
+                target_slice=TensorSlice((0, 0), (4, 2)),
+            ),
+            TransferPlanEntry(
+                tensor_name="w.right",
+                source_worker_rank=1,
+                receiver_rank=0,
+                source=source_b,
+                target=target_b,
+                source_slice=TensorSlice((0, 2), (4, 2)),
+                target_slice=TensorSlice((0, 0), (4, 2)),
+            ),
+        ),
+        (),
+    )
+
+    manifest = build_grouped_slice_transfer_manifest(
+        plan,
+        source_descriptors_by_rank={
+            0: [TensorDescriptor("w", 100, 64, 0, "torch.float32")],
+            1: [TensorDescriptor("w", 200, 64, 0, "torch.float32")],
+        },
+        target_tensors={
+            "w.left": torch.zeros((4, 2), dtype=torch.float32),
+            "w.right": torch.zeros((4, 2), dtype=torch.float32),
+        },
+    )
+
+    assert [transfer.source_worker_rank for transfer in manifest.source_transfers] == [0, 1]
+    assert manifest.source_transfers[0].source_descriptors == [
+        TensorDescriptor("w.left.__mx_fragment_0", 100, 8, 0, "torch.float32"),
+        TensorDescriptor("w.left.__mx_fragment_1", 116, 8, 0, "torch.float32"),
+        TensorDescriptor("w.left.__mx_fragment_2", 132, 8, 0, "torch.float32"),
+        TensorDescriptor("w.left.__mx_fragment_3", 148, 8, 0, "torch.float32"),
+    ]
+    assert manifest.source_transfers[1].source_descriptors == [
+        TensorDescriptor("w.right.__mx_fragment_0", 208, 8, 0, "torch.float32"),
+        TensorDescriptor("w.right.__mx_fragment_1", 224, 8, 0, "torch.float32"),
+        TensorDescriptor("w.right.__mx_fragment_2", 240, 8, 0, "torch.float32"),
+        TensorDescriptor("w.right.__mx_fragment_3", 256, 8, 0, "torch.float32"),
+    ]
 
 
 def test_receive_into_tensors_applies_dense_slice_plan(monkeypatch):
@@ -621,3 +709,114 @@ def test_receive_into_tensors_scatters_into_noncontiguous_target_view(monkeypatc
     )
     assert torch.equal(backing_tensor[:, 0], torch.zeros(4))
     assert torch.equal(backing_tensor[:, 3], torch.zeros(4))
+
+
+def test_receive_into_tensors_gathers_noncontiguous_source_fragments(monkeypatch):
+    class _FakeNixlManager:
+        registered_tensors = {}
+        received_descriptors = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def initialize(self):
+            pass
+
+        def register_tensors(self, tensors):
+            type(self).registered_tensors = dict(tensors)
+
+        def receive_from_source(self, source_metadata, source_tensors, timeout_seconds):
+            del source_metadata
+            del timeout_seconds
+            type(self).received_descriptors = list(source_tensors)
+            for row, descriptor in enumerate(source_tensors):
+                type(self).registered_tensors[descriptor.name].fill_(float(row + 1))
+            return sum(descriptor.size for descriptor in source_tensors), len(source_tensors), 0.0
+
+        def shutdown(self):
+            pass
+
+    class _MxClient:
+        def list_sources(self, identity=None, status_filter=None):
+            del identity
+            del status_filter
+            return p2p_pb2.ListSourcesResponse(
+                instances=[
+                    _source_ref(
+                        {
+                            "w": {
+                                "shape": [4, 4],
+                                "global_shape": [4, 4],
+                                "shard_offsets": [0, 0],
+                                "dtype": "torch.float32",
+                            }
+                        }
+                    )
+                ],
+            )
+
+        def get_metadata(self, mx_source_id, worker_id):
+            del mx_source_id
+            del worker_id
+            return p2p_pb2.GetMetadataResponse(
+                found=True,
+                worker=p2p_pb2.WorkerMetadata(
+                    worker_rank=0,
+                    nixl_metadata=b"source",
+                    tensors=[
+                        p2p_pb2.TensorDescriptor(
+                            name="w",
+                            addr=100,
+                            size=64,
+                            device_id=0,
+                            dtype="torch.float32",
+                        )
+                    ],
+                ),
+            )
+
+    monkeypatch.setattr(rl_transfer_module, "NixlTransferManager", _FakeNixlManager)
+    transfer = RlNixlWeightTransfer(
+        mx_client=_MxClient(),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+    target = torch.zeros((4, 2), dtype=torch.float32)
+
+    tensors = asyncio.run(
+        transfer.receive_into_tensors(
+            {"w": target},
+            model_version=5,
+            receiver_rank=0,
+            target_specs=[
+                TensorReceiveSpec(
+                    name="w",
+                    receiver_rank=0,
+                    shape=(4, 2),
+                    global_shape=(4, 4),
+                    shard_offsets=(0, 1),
+                    dtype="torch.float32",
+                )
+            ],
+        )
+    )
+
+    assert tensors == [("w", target)]
+    assert _FakeNixlManager.received_descriptors == [
+        TensorDescriptor("w.__mx_fragment_0", 104, 8, 0, "torch.float32"),
+        TensorDescriptor("w.__mx_fragment_1", 120, 8, 0, "torch.float32"),
+        TensorDescriptor("w.__mx_fragment_2", 136, 8, 0, "torch.float32"),
+        TensorDescriptor("w.__mx_fragment_3", 152, 8, 0, "torch.float32"),
+    ]
+    assert torch.equal(
+        target,
+        torch.tensor(
+            [
+                [1.0, 1.0],
+                [2.0, 2.0],
+                [3.0, 3.0],
+                [4.0, 4.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import product
 
 import torch
 
@@ -99,16 +100,17 @@ def build_slice_transfer_manifest(
             entry_index,
             entry_counts[entry.tensor_name],
         )
-        materialized = _materialize_entry(
+        materialized_entries = _materialize_entry(
             entry,
             transfer_name=transfer_name,
             source_descriptor=source_descriptor,
             target_tensors=target_tensors,
         )
-        transfer_targets[transfer_name] = materialized.target_tensor
-        transfer_sources.append(materialized.source_descriptor)
-        if materialized.post_transfer_copy is not None:
-            post_transfer_copies.append(materialized.post_transfer_copy)
+        for materialized in materialized_entries:
+            transfer_targets[materialized.source_descriptor.name] = materialized.target_tensor
+            transfer_sources.append(materialized.source_descriptor)
+            if materialized.post_transfer_copy is not None:
+                post_transfer_copies.append(materialized.post_transfer_copy)
         if entry.target.name not in output_names:
             output_names.append(entry.target.name)
 
@@ -163,18 +165,19 @@ def build_grouped_slice_transfer_manifest(
             entry_index,
             entry_counts[entry.tensor_name],
         )
-        materialized = _materialize_entry(
+        materialized_entries = _materialize_entry(
             entry,
             transfer_name=transfer_name,
             source_descriptor=source_descriptor,
             target_tensors=target_tensors,
         )
-        transfer_targets[transfer_name] = materialized.target_tensor
-        transfer_sources_by_rank.setdefault(entry.source_worker_rank, []).append(
-            materialized.source_descriptor
-        )
-        if materialized.post_transfer_copy is not None:
-            post_transfer_copies.append(materialized.post_transfer_copy)
+        for materialized in materialized_entries:
+            transfer_targets[materialized.source_descriptor.name] = materialized.target_tensor
+            transfer_sources_by_rank.setdefault(entry.source_worker_rank, []).append(
+                materialized.source_descriptor
+            )
+            if materialized.post_transfer_copy is not None:
+                post_transfer_copies.append(materialized.post_transfer_copy)
         if entry.target.name not in output_names:
             output_names.append(entry.target.name)
 
@@ -211,6 +214,12 @@ def _transfer_name(tensor_name: str, index: int, entry_count: int) -> str:
     return f"{tensor_name}.__mx_slice_{index}"
 
 
+def _fragment_transfer_name(transfer_name: str, index: int, fragment_count: int) -> str:
+    if fragment_count == 1:
+        return transfer_name
+    return f"{transfer_name}.__mx_fragment_{index}"
+
+
 @dataclass(frozen=True)
 class _MaterializedEntry:
     target_tensor: torch.Tensor
@@ -224,7 +233,7 @@ def _materialize_entry(
     transfer_name: str,
     source_descriptor: TensorDescriptor,
     target_tensors: dict[str, torch.Tensor],
-) -> _MaterializedEntry:
+) -> tuple[_MaterializedEntry, ...]:
     target_tensor = target_tensors.get(entry.target.name)
     if target_tensor is None:
         raise RuntimeError(
@@ -232,12 +241,100 @@ def _materialize_entry(
         )
     source_slice = _require_slice(entry.source_slice)
     target_slice = _require_slice(entry.target_slice)
-    source_offset, source_elements = _contiguous_slice_span(
-        entry.source.shape,
-        source_slice,
+    fragments = _source_fragments(
+        source_shape=entry.source.shape,
+        source_slice=source_slice,
+        target_slice=target_slice,
         tensor_name=entry.source.name,
-        side="source",
     )
+    source_element_size = _source_element_size(source_descriptor, entry.source.shape)
+    materialized_entries = []
+    for fragment_index, fragment in enumerate(fragments):
+        source_offset, source_elements = _contiguous_slice_span(
+            entry.source.shape,
+            fragment.source_slice,
+            tensor_name=entry.source.name,
+            side="source",
+        )
+        fragment_name = _fragment_transfer_name(
+            transfer_name,
+            fragment_index,
+            len(fragments),
+        )
+        target_tensor_view, post_transfer_copy = _materialize_target_view(
+            entry=entry,
+            target_tensor=target_tensor,
+            target_slice=fragment.target_slice,
+        )
+        materialized_entries.append(
+            _MaterializedEntry(
+                target_tensor=target_tensor_view,
+                source_descriptor=TensorDescriptor(
+                    name=fragment_name,
+                    addr=source_descriptor.addr + source_offset * source_element_size,
+                    size=source_elements * source_element_size,
+                    device_id=source_descriptor.device_id,
+                    dtype=source_descriptor.dtype,
+                ),
+                post_transfer_copy=post_transfer_copy,
+            )
+        )
+    return tuple(materialized_entries)
+
+
+@dataclass(frozen=True)
+class _TransferFragment:
+    source_slice: TensorSlice
+    target_slice: TensorSlice
+
+
+def _source_fragments(
+    *,
+    source_shape: tuple[int, ...],
+    source_slice: TensorSlice,
+    target_slice: TensorSlice,
+    tensor_name: str,
+) -> tuple[_TransferFragment, ...]:
+    if source_slice.shape != target_slice.shape:
+        raise RuntimeError(
+            f"ModelExpress source and target slice shape mismatch for {tensor_name!r}"
+        )
+    if _slice_is_contiguous(source_shape, source_slice, tensor_name=tensor_name):
+        return (_TransferFragment(source_slice, target_slice),)
+
+    suffix_start = len(source_slice.shape) - 1
+    while suffix_start > 0 and _slice_covers_full_dim(
+        source_shape,
+        source_slice,
+        suffix_start,
+    ):
+        suffix_start -= 1
+
+    prefix_shape = source_slice.shape[:suffix_start]
+    fragments = []
+    for prefix_offsets in product(*(range(dim) for dim in prefix_shape)):
+        source_offsets = list(source_slice.offsets)
+        target_offsets = list(target_slice.offsets)
+        fragment_shape = list(source_slice.shape)
+        for dim, relative_offset in enumerate(prefix_offsets):
+            source_offsets[dim] += relative_offset
+            target_offsets[dim] += relative_offset
+            fragment_shape[dim] = 1
+        fragments.append(
+            _TransferFragment(
+                source_slice=TensorSlice(tuple(source_offsets), tuple(fragment_shape)),
+                target_slice=TensorSlice(tuple(target_offsets), tuple(fragment_shape)),
+            )
+        )
+    return tuple(fragments)
+
+
+def _materialize_target_view(
+    *,
+    entry: TransferPlanEntry,
+    target_tensor: torch.Tensor,
+    target_slice: TensorSlice,
+) -> tuple[torch.Tensor, StagedTensorCopy | None]:
     _validate_slice_bounds(
         entry.target.shape,
         target_slice,
@@ -249,30 +346,16 @@ def _materialize_entry(
         raise RuntimeError(
             f"ModelExpress target slice for {entry.target.name!r} exceeds target tensor bounds"
         )
-    transfer_target = target_view
-    post_transfer_copy = None
-    if not target_view.is_contiguous():
-        transfer_target = torch.empty(
-            tuple(target_view.shape),
-            dtype=target_view.dtype,
-            device=target_view.device,
-        )
-        post_transfer_copy = StagedTensorCopy(
-            source=transfer_target,
-            target=target_view,
-        )
-
-    source_element_size = _source_element_size(source_descriptor, entry.source.shape)
-    return _MaterializedEntry(
-        target_tensor=transfer_target,
-        source_descriptor=TensorDescriptor(
-            name=transfer_name,
-            addr=source_descriptor.addr + source_offset * source_element_size,
-            size=source_elements * source_element_size,
-            device_id=source_descriptor.device_id,
-            dtype=source_descriptor.dtype,
-        ),
-        post_transfer_copy=post_transfer_copy,
+    if target_view.is_contiguous():
+        return target_view, None
+    transfer_target = torch.empty(
+        tuple(target_view.shape),
+        dtype=target_view.dtype,
+        device=target_view.device,
+    )
+    return transfer_target, StagedTensorCopy(
+        source=transfer_target,
+        target=target_view,
     )
 
 
@@ -291,6 +374,41 @@ def _contiguous_slice_span(
     tensor_name: str,
     side: str,
 ) -> tuple[int, int]:
+    start, elements, contiguous = _slice_linear_span(
+        tensor_shape,
+        tensor_slice,
+        tensor_name=tensor_name,
+        side=side,
+    )
+    if not contiguous:
+        raise RuntimeError(
+            f"ModelExpress {side} slice for {tensor_name!r} is not contiguous"
+        )
+    return start, elements
+
+
+def _slice_is_contiguous(
+    tensor_shape: tuple[int, ...],
+    tensor_slice: TensorSlice,
+    *,
+    tensor_name: str,
+) -> bool:
+    _start, _elements, contiguous = _slice_linear_span(
+        tensor_shape,
+        tensor_slice,
+        tensor_name=tensor_name,
+        side="source",
+    )
+    return contiguous
+
+
+def _slice_linear_span(
+    tensor_shape: tuple[int, ...],
+    tensor_slice: TensorSlice,
+    *,
+    tensor_name: str,
+    side: str,
+) -> tuple[int, int, bool]:
     _validate_slice_bounds(
         tensor_shape,
         tensor_slice,
@@ -312,11 +430,15 @@ def _contiguous_slice_span(
         )
     )
     elements = _numel(tensor_slice.shape)
-    if last - start + 1 != elements:
-        raise RuntimeError(
-            f"ModelExpress {side} slice for {tensor_name!r} is not contiguous"
-        )
-    return start, elements
+    return start, elements, last - start + 1 == elements
+
+
+def _slice_covers_full_dim(
+    tensor_shape: tuple[int, ...],
+    tensor_slice: TensorSlice,
+    dim: int,
+) -> bool:
+    return tensor_slice.offsets[dim] == 0 and tensor_slice.shape[dim] == tensor_shape[dim]
 
 
 def _validate_slice_bounds(
