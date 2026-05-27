@@ -132,6 +132,8 @@ def test_list_sources_returns_single_synthetic_ref_at_caller_rank():
     assert inst.mx_source_id == compute_mx_source_id(identity)
     assert inst.model_name == identity.model_name
     assert inst.identity == identity
+    assert inst.status == p2p_pb2.SOURCE_STATUS_READY
+    assert inst.updated_at == 0
 
 
 def test_list_sources_requires_identity():

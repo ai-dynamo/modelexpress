@@ -22,10 +22,15 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	P2PService_PublishMetadata_FullMethodName = "/model_express.p2p.P2pService/PublishMetadata"
-	P2PService_ListSources_FullMethodName     = "/model_express.p2p.P2pService/ListSources"
-	P2PService_GetMetadata_FullMethodName     = "/model_express.p2p.P2pService/GetMetadata"
-	P2PService_UpdateStatus_FullMethodName    = "/model_express.p2p.P2pService/UpdateStatus"
+	P2PService_PublishMetadata_FullMethodName       = "/model_express.p2p.P2pService/PublishMetadata"
+	P2PService_ListSources_FullMethodName           = "/model_express.p2p.P2pService/ListSources"
+	P2PService_GetMetadata_FullMethodName           = "/model_express.p2p.P2pService/GetMetadata"
+	P2PService_UpdateStatus_FullMethodName          = "/model_express.p2p.P2pService/UpdateStatus"
+	P2PService_BeginTransferLease_FullMethodName    = "/model_express.p2p.P2pService/BeginTransferLease"
+	P2PService_RenewTransferLease_FullMethodName    = "/model_express.p2p.P2pService/RenewTransferLease"
+	P2PService_CompleteTransferLease_FullMethodName = "/model_express.p2p.P2pService/CompleteTransferLease"
+	P2PService_GetTransferLease_FullMethodName      = "/model_express.p2p.P2pService/GetTransferLease"
+	P2PService_ListTransferLeases_FullMethodName    = "/model_express.p2p.P2pService/ListTransferLeases"
 )
 
 // P2PServiceClient is the client API for P2PService service.
@@ -47,6 +52,16 @@ type P2PServiceClient interface {
 	GetMetadata(ctx context.Context, in *GetMetadataRequest, opts ...grpc.CallOption) (*GetMetadataResponse, error)
 	// Update source status - called by source after NIXL registration and warmup
 	UpdateStatus(ctx context.Context, in *UpdateStatusRequest, opts ...grpc.CallOption) (*UpdateStatusResponse, error)
+	// Begin a durable transfer lease before pulling tensors from a source.
+	BeginTransferLease(ctx context.Context, in *BeginTransferLeaseRequest, opts ...grpc.CallOption) (*TransferLeaseResponse, error)
+	// Extend an active transfer lease while a long transfer is still running.
+	RenewTransferLease(ctx context.Context, in *RenewTransferLeaseRequest, opts ...grpc.CallOption) (*TransferLeaseResponse, error)
+	// Mark a transfer lease as completed, failed, or expired.
+	CompleteTransferLease(ctx context.Context, in *CompleteTransferLeaseRequest, opts ...grpc.CallOption) (*TransferLeaseResponse, error)
+	// Fetch a transfer lease by ID for recovery/debugging.
+	GetTransferLease(ctx context.Context, in *GetTransferLeaseRequest, opts ...grpc.CallOption) (*GetTransferLeaseResponse, error)
+	// List transfer leases for recovery/debugging.
+	ListTransferLeases(ctx context.Context, in *ListTransferLeasesRequest, opts ...grpc.CallOption) (*ListTransferLeasesResponse, error)
 }
 
 type p2PServiceClient struct {
@@ -97,6 +112,56 @@ func (c *p2PServiceClient) UpdateStatus(ctx context.Context, in *UpdateStatusReq
 	return out, nil
 }
 
+func (c *p2PServiceClient) BeginTransferLease(ctx context.Context, in *BeginTransferLeaseRequest, opts ...grpc.CallOption) (*TransferLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TransferLeaseResponse)
+	err := c.cc.Invoke(ctx, P2PService_BeginTransferLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *p2PServiceClient) RenewTransferLease(ctx context.Context, in *RenewTransferLeaseRequest, opts ...grpc.CallOption) (*TransferLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TransferLeaseResponse)
+	err := c.cc.Invoke(ctx, P2PService_RenewTransferLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *p2PServiceClient) CompleteTransferLease(ctx context.Context, in *CompleteTransferLeaseRequest, opts ...grpc.CallOption) (*TransferLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TransferLeaseResponse)
+	err := c.cc.Invoke(ctx, P2PService_CompleteTransferLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *p2PServiceClient) GetTransferLease(ctx context.Context, in *GetTransferLeaseRequest, opts ...grpc.CallOption) (*GetTransferLeaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetTransferLeaseResponse)
+	err := c.cc.Invoke(ctx, P2PService_GetTransferLease_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *p2PServiceClient) ListTransferLeases(ctx context.Context, in *ListTransferLeasesRequest, opts ...grpc.CallOption) (*ListTransferLeasesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListTransferLeasesResponse)
+	err := c.cc.Invoke(ctx, P2PService_ListTransferLeases_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // P2PServiceServer is the server API for P2PService service.
 // All implementations must embed UnimplementedP2PServiceServer
 // for forward compatibility.
@@ -116,6 +181,16 @@ type P2PServiceServer interface {
 	GetMetadata(context.Context, *GetMetadataRequest) (*GetMetadataResponse, error)
 	// Update source status - called by source after NIXL registration and warmup
 	UpdateStatus(context.Context, *UpdateStatusRequest) (*UpdateStatusResponse, error)
+	// Begin a durable transfer lease before pulling tensors from a source.
+	BeginTransferLease(context.Context, *BeginTransferLeaseRequest) (*TransferLeaseResponse, error)
+	// Extend an active transfer lease while a long transfer is still running.
+	RenewTransferLease(context.Context, *RenewTransferLeaseRequest) (*TransferLeaseResponse, error)
+	// Mark a transfer lease as completed, failed, or expired.
+	CompleteTransferLease(context.Context, *CompleteTransferLeaseRequest) (*TransferLeaseResponse, error)
+	// Fetch a transfer lease by ID for recovery/debugging.
+	GetTransferLease(context.Context, *GetTransferLeaseRequest) (*GetTransferLeaseResponse, error)
+	// List transfer leases for recovery/debugging.
+	ListTransferLeases(context.Context, *ListTransferLeasesRequest) (*ListTransferLeasesResponse, error)
 	mustEmbedUnimplementedP2PServiceServer()
 }
 
@@ -137,6 +212,21 @@ func (UnimplementedP2PServiceServer) GetMetadata(context.Context, *GetMetadataRe
 }
 func (UnimplementedP2PServiceServer) UpdateStatus(context.Context, *UpdateStatusRequest) (*UpdateStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateStatus not implemented")
+}
+func (UnimplementedP2PServiceServer) BeginTransferLease(context.Context, *BeginTransferLeaseRequest) (*TransferLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginTransferLease not implemented")
+}
+func (UnimplementedP2PServiceServer) RenewTransferLease(context.Context, *RenewTransferLeaseRequest) (*TransferLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewTransferLease not implemented")
+}
+func (UnimplementedP2PServiceServer) CompleteTransferLease(context.Context, *CompleteTransferLeaseRequest) (*TransferLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompleteTransferLease not implemented")
+}
+func (UnimplementedP2PServiceServer) GetTransferLease(context.Context, *GetTransferLeaseRequest) (*GetTransferLeaseResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTransferLease not implemented")
+}
+func (UnimplementedP2PServiceServer) ListTransferLeases(context.Context, *ListTransferLeasesRequest) (*ListTransferLeasesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListTransferLeases not implemented")
 }
 func (UnimplementedP2PServiceServer) mustEmbedUnimplementedP2PServiceServer() {}
 func (UnimplementedP2PServiceServer) testEmbeddedByValue()                    {}
@@ -231,6 +321,96 @@ func _P2PService_UpdateStatus_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _P2PService_BeginTransferLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginTransferLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(P2PServiceServer).BeginTransferLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: P2PService_BeginTransferLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(P2PServiceServer).BeginTransferLease(ctx, req.(*BeginTransferLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _P2PService_RenewTransferLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewTransferLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(P2PServiceServer).RenewTransferLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: P2PService_RenewTransferLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(P2PServiceServer).RenewTransferLease(ctx, req.(*RenewTransferLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _P2PService_CompleteTransferLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteTransferLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(P2PServiceServer).CompleteTransferLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: P2PService_CompleteTransferLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(P2PServiceServer).CompleteTransferLease(ctx, req.(*CompleteTransferLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _P2PService_GetTransferLease_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTransferLeaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(P2PServiceServer).GetTransferLease(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: P2PService_GetTransferLease_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(P2PServiceServer).GetTransferLease(ctx, req.(*GetTransferLeaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _P2PService_ListTransferLeases_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListTransferLeasesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(P2PServiceServer).ListTransferLeases(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: P2PService_ListTransferLeases_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(P2PServiceServer).ListTransferLeases(ctx, req.(*ListTransferLeasesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // P2PService_ServiceDesc is the grpc.ServiceDesc for P2PService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -253,6 +433,26 @@ var P2PService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateStatus",
 			Handler:    _P2PService_UpdateStatus_Handler,
+		},
+		{
+			MethodName: "BeginTransferLease",
+			Handler:    _P2PService_BeginTransferLease_Handler,
+		},
+		{
+			MethodName: "RenewTransferLease",
+			Handler:    _P2PService_RenewTransferLease_Handler,
+		},
+		{
+			MethodName: "CompleteTransferLease",
+			Handler:    _P2PService_CompleteTransferLease_Handler,
+		},
+		{
+			MethodName: "GetTransferLease",
+			Handler:    _P2PService_GetTransferLease_Handler,
+		},
+		{
+			MethodName: "ListTransferLeases",
+			Handler:    _P2PService_ListTransferLeases_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

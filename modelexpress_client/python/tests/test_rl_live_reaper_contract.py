@@ -187,7 +187,9 @@ def test_live_server_reaper_marks_workers_stale_after_heartbeat_timeout():
             identity=base_identity,
             status_filter=p2p_pb2.SOURCE_STATUS_READY,
         )
-        assert any(ref.worker_id == worker_id for ref in ready.instances)
+        ready_ref = next(ref for ref in ready.instances if ref.worker_id == worker_id)
+        assert ready_ref.status == p2p_pb2.SOURCE_STATUS_READY
+        assert ready_ref.updated_at == old_updated_at
 
         deadline = time.monotonic() + 5.0
         while True:
@@ -208,7 +210,9 @@ def test_live_server_reaper_marks_workers_stale_after_heartbeat_timeout():
             identity=base_identity,
             status_filter=p2p_pb2.SOURCE_STATUS_STALE,
         )
-        assert any(ref.worker_id == worker_id for ref in stale.instances)
+        stale_ref = next(ref for ref in stale.instances if ref.worker_id == worker_id)
+        assert stale_ref.status == p2p_pb2.SOURCE_STATUS_STALE
+        assert stale_ref.updated_at == fetched.worker.updated_at
 
         ready = client.list_sources(
             identity=base_identity,

@@ -180,6 +180,63 @@ func (SourceStatus) EnumDescriptor() ([]byte, []int) {
 	return file_p2p_proto_rawDescGZIP(), []int{2}
 }
 
+// Durable transfer lifecycle state. ACTIVE leases expire when expires_at passes
+// unless the target renews them; terminal states remain queryable.
+type TransferLeaseStatus int32
+
+const (
+	TransferLeaseStatus_TRANSFER_LEASE_STATUS_UNKNOWN   TransferLeaseStatus = 0
+	TransferLeaseStatus_TRANSFER_LEASE_STATUS_ACTIVE    TransferLeaseStatus = 1
+	TransferLeaseStatus_TRANSFER_LEASE_STATUS_COMPLETED TransferLeaseStatus = 2
+	TransferLeaseStatus_TRANSFER_LEASE_STATUS_FAILED    TransferLeaseStatus = 3
+	TransferLeaseStatus_TRANSFER_LEASE_STATUS_EXPIRED   TransferLeaseStatus = 4
+)
+
+// Enum value maps for TransferLeaseStatus.
+var (
+	TransferLeaseStatus_name = map[int32]string{
+		0: "TRANSFER_LEASE_STATUS_UNKNOWN",
+		1: "TRANSFER_LEASE_STATUS_ACTIVE",
+		2: "TRANSFER_LEASE_STATUS_COMPLETED",
+		3: "TRANSFER_LEASE_STATUS_FAILED",
+		4: "TRANSFER_LEASE_STATUS_EXPIRED",
+	}
+	TransferLeaseStatus_value = map[string]int32{
+		"TRANSFER_LEASE_STATUS_UNKNOWN":   0,
+		"TRANSFER_LEASE_STATUS_ACTIVE":    1,
+		"TRANSFER_LEASE_STATUS_COMPLETED": 2,
+		"TRANSFER_LEASE_STATUS_FAILED":    3,
+		"TRANSFER_LEASE_STATUS_EXPIRED":   4,
+	}
+)
+
+func (x TransferLeaseStatus) Enum() *TransferLeaseStatus {
+	p := new(TransferLeaseStatus)
+	*p = x
+	return p
+}
+
+func (x TransferLeaseStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TransferLeaseStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_p2p_proto_enumTypes[3].Descriptor()
+}
+
+func (TransferLeaseStatus) Type() protoreflect.EnumType {
+	return &file_p2p_proto_enumTypes[3]
+}
+
+func (x TransferLeaseStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TransferLeaseStatus.Descriptor instead.
+func (TransferLeaseStatus) EnumDescriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{3}
+}
+
 // All fields that affect weight tensor layout and transfer compatibility.
 // The server computes SHA256(canonical_json(identity)) and takes the first
 // 16 hex chars as the mx_source_id used to key metadata storage.
@@ -830,7 +887,13 @@ type SourceInstanceRef struct {
 	// Full source identity for this source group. This keeps ListSources
 	// lightweight relative to GetMetadata while letting clients inspect
 	// version/role/revision extra parameters without fetching tensor metadata.
-	Identity      *SourceIdentity `protobuf:"bytes,5,opt,name=identity,proto3" json:"identity,omitempty"`
+	Identity *SourceIdentity `protobuf:"bytes,5,opt,name=identity,proto3" json:"identity,omitempty"`
+	// Worker lifecycle status. Lets orchestrators inspect health without
+	// fetching full tensor metadata for every candidate.
+	Status SourceStatus `protobuf:"varint,6,opt,name=status,proto3,enum=model_express.p2p.SourceStatus" json:"status,omitempty"`
+	// Last worker status update timestamp (unix millis). Used by heartbeat
+	// and reaper observability.
+	UpdatedAt     int64 `protobuf:"varint,7,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -898,6 +961,20 @@ func (x *SourceInstanceRef) GetIdentity() *SourceIdentity {
 		return x.Identity
 	}
 	return nil
+}
+
+func (x *SourceInstanceRef) GetStatus() SourceStatus {
+	if x != nil {
+		return x.Status
+	}
+	return SourceStatus_SOURCE_STATUS_UNKNOWN
+}
+
+func (x *SourceInstanceRef) GetUpdatedAt() int64 {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return 0
 }
 
 type ListSourcesRequest struct {
@@ -1249,6 +1326,618 @@ func (x *UpdateStatusResponse) GetMessage() string {
 	return ""
 }
 
+type TransferLease struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Server-generated UUID unless BeginTransferLeaseRequest.lease_id is set.
+	LeaseId string `protobuf:"bytes,1,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	// Source worker being pulled from.
+	MxSourceId     string `protobuf:"bytes,2,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	SourceWorkerId string `protobuf:"bytes,3,opt,name=source_worker_id,json=sourceWorkerId,proto3" json:"source_worker_id,omitempty"`
+	// Target worker performing the pull.
+	TargetWorkerId   string `protobuf:"bytes,4,opt,name=target_worker_id,json=targetWorkerId,proto3" json:"target_worker_id,omitempty"`
+	TargetWorkerRank uint32 `protobuf:"varint,5,opt,name=target_worker_rank,json=targetWorkerRank,proto3" json:"target_worker_rank,omitempty"`
+	// RL/model update version associated with this transfer.
+	ModelVersion uint64              `protobuf:"varint,6,opt,name=model_version,json=modelVersion,proto3" json:"model_version,omitempty"`
+	Status       TransferLeaseStatus `protobuf:"varint,7,opt,name=status,proto3,enum=model_express.p2p.TransferLeaseStatus" json:"status,omitempty"`
+	CreatedAt    int64               `protobuf:"varint,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`  // unix millis
+	UpdatedAt    int64               `protobuf:"varint,9,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`  // unix millis
+	ExpiresAt    int64               `protobuf:"varint,10,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"` // unix millis
+	// Optional terminal error when status is FAILED or EXPIRED.
+	ErrorMessage string `protobuf:"bytes,11,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// Framework-agnostic extension point for roles, tensor layout IDs, etc.
+	Metadata      map[string]string `protobuf:"bytes,12,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransferLease) Reset() {
+	*x = TransferLease{}
+	mi := &file_p2p_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransferLease) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransferLease) ProtoMessage() {}
+
+func (x *TransferLease) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransferLease.ProtoReflect.Descriptor instead.
+func (*TransferLease) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *TransferLease) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *TransferLease) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *TransferLease) GetSourceWorkerId() string {
+	if x != nil {
+		return x.SourceWorkerId
+	}
+	return ""
+}
+
+func (x *TransferLease) GetTargetWorkerId() string {
+	if x != nil {
+		return x.TargetWorkerId
+	}
+	return ""
+}
+
+func (x *TransferLease) GetTargetWorkerRank() uint32 {
+	if x != nil {
+		return x.TargetWorkerRank
+	}
+	return 0
+}
+
+func (x *TransferLease) GetModelVersion() uint64 {
+	if x != nil {
+		return x.ModelVersion
+	}
+	return 0
+}
+
+func (x *TransferLease) GetStatus() TransferLeaseStatus {
+	if x != nil {
+		return x.Status
+	}
+	return TransferLeaseStatus_TRANSFER_LEASE_STATUS_UNKNOWN
+}
+
+func (x *TransferLease) GetCreatedAt() int64 {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return 0
+}
+
+func (x *TransferLease) GetUpdatedAt() int64 {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return 0
+}
+
+func (x *TransferLease) GetExpiresAt() int64 {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return 0
+}
+
+func (x *TransferLease) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *TransferLease) GetMetadata() map[string]string {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
+type BeginTransferLeaseRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional caller-supplied idempotency key. Empty means server-generated UUID.
+	LeaseId          string            `protobuf:"bytes,1,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	MxSourceId       string            `protobuf:"bytes,2,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	SourceWorkerId   string            `protobuf:"bytes,3,opt,name=source_worker_id,json=sourceWorkerId,proto3" json:"source_worker_id,omitempty"`
+	TargetWorkerId   string            `protobuf:"bytes,4,opt,name=target_worker_id,json=targetWorkerId,proto3" json:"target_worker_id,omitempty"`
+	TargetWorkerRank uint32            `protobuf:"varint,5,opt,name=target_worker_rank,json=targetWorkerRank,proto3" json:"target_worker_rank,omitempty"`
+	ModelVersion     uint64            `protobuf:"varint,6,opt,name=model_version,json=modelVersion,proto3" json:"model_version,omitempty"`
+	TtlMillis        uint64            `protobuf:"varint,7,opt,name=ttl_millis,json=ttlMillis,proto3" json:"ttl_millis,omitempty"`
+	Metadata         map[string]string `protobuf:"bytes,8,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *BeginTransferLeaseRequest) Reset() {
+	*x = BeginTransferLeaseRequest{}
+	mi := &file_p2p_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BeginTransferLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BeginTransferLeaseRequest) ProtoMessage() {}
+
+func (x *BeginTransferLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BeginTransferLeaseRequest.ProtoReflect.Descriptor instead.
+func (*BeginTransferLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *BeginTransferLeaseRequest) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *BeginTransferLeaseRequest) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *BeginTransferLeaseRequest) GetSourceWorkerId() string {
+	if x != nil {
+		return x.SourceWorkerId
+	}
+	return ""
+}
+
+func (x *BeginTransferLeaseRequest) GetTargetWorkerId() string {
+	if x != nil {
+		return x.TargetWorkerId
+	}
+	return ""
+}
+
+func (x *BeginTransferLeaseRequest) GetTargetWorkerRank() uint32 {
+	if x != nil {
+		return x.TargetWorkerRank
+	}
+	return 0
+}
+
+func (x *BeginTransferLeaseRequest) GetModelVersion() uint64 {
+	if x != nil {
+		return x.ModelVersion
+	}
+	return 0
+}
+
+func (x *BeginTransferLeaseRequest) GetTtlMillis() uint64 {
+	if x != nil {
+		return x.TtlMillis
+	}
+	return 0
+}
+
+func (x *BeginTransferLeaseRequest) GetMetadata() map[string]string {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
+}
+
+type RenewTransferLeaseRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LeaseId       string                 `protobuf:"bytes,1,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	TtlMillis     uint64                 `protobuf:"varint,2,opt,name=ttl_millis,json=ttlMillis,proto3" json:"ttl_millis,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RenewTransferLeaseRequest) Reset() {
+	*x = RenewTransferLeaseRequest{}
+	mi := &file_p2p_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewTransferLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewTransferLeaseRequest) ProtoMessage() {}
+
+func (x *RenewTransferLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewTransferLeaseRequest.ProtoReflect.Descriptor instead.
+func (*RenewTransferLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *RenewTransferLeaseRequest) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *RenewTransferLeaseRequest) GetTtlMillis() uint64 {
+	if x != nil {
+		return x.TtlMillis
+	}
+	return 0
+}
+
+type CompleteTransferLeaseRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LeaseId       string                 `protobuf:"bytes,1,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	Status        TransferLeaseStatus    `protobuf:"varint,2,opt,name=status,proto3,enum=model_express.p2p.TransferLeaseStatus" json:"status,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompleteTransferLeaseRequest) Reset() {
+	*x = CompleteTransferLeaseRequest{}
+	mi := &file_p2p_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompleteTransferLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompleteTransferLeaseRequest) ProtoMessage() {}
+
+func (x *CompleteTransferLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompleteTransferLeaseRequest.ProtoReflect.Descriptor instead.
+func (*CompleteTransferLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CompleteTransferLeaseRequest) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *CompleteTransferLeaseRequest) GetStatus() TransferLeaseStatus {
+	if x != nil {
+		return x.Status
+	}
+	return TransferLeaseStatus_TRANSFER_LEASE_STATUS_UNKNOWN
+}
+
+func (x *CompleteTransferLeaseRequest) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+type GetTransferLeaseRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LeaseId       string                 `protobuf:"bytes,1,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTransferLeaseRequest) Reset() {
+	*x = GetTransferLeaseRequest{}
+	mi := &file_p2p_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTransferLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTransferLeaseRequest) ProtoMessage() {}
+
+func (x *GetTransferLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTransferLeaseRequest.ProtoReflect.Descriptor instead.
+func (*GetTransferLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *GetTransferLeaseRequest) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+type ListTransferLeasesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional filters. Empty string / unset means no filter.
+	MxSourceId     string               `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	TargetWorkerId string               `protobuf:"bytes,2,opt,name=target_worker_id,json=targetWorkerId,proto3" json:"target_worker_id,omitempty"`
+	StatusFilter   *TransferLeaseStatus `protobuf:"varint,3,opt,name=status_filter,json=statusFilter,proto3,enum=model_express.p2p.TransferLeaseStatus,oneof" json:"status_filter,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ListTransferLeasesRequest) Reset() {
+	*x = ListTransferLeasesRequest{}
+	mi := &file_p2p_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListTransferLeasesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListTransferLeasesRequest) ProtoMessage() {}
+
+func (x *ListTransferLeasesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListTransferLeasesRequest.ProtoReflect.Descriptor instead.
+func (*ListTransferLeasesRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ListTransferLeasesRequest) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *ListTransferLeasesRequest) GetTargetWorkerId() string {
+	if x != nil {
+		return x.TargetWorkerId
+	}
+	return ""
+}
+
+func (x *ListTransferLeasesRequest) GetStatusFilter() TransferLeaseStatus {
+	if x != nil && x.StatusFilter != nil {
+		return *x.StatusFilter
+	}
+	return TransferLeaseStatus_TRANSFER_LEASE_STATUS_UNKNOWN
+}
+
+type TransferLeaseResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	Lease         *TransferLease         `protobuf:"bytes,3,opt,name=lease,proto3" json:"lease,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TransferLeaseResponse) Reset() {
+	*x = TransferLeaseResponse{}
+	mi := &file_p2p_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransferLeaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransferLeaseResponse) ProtoMessage() {}
+
+func (x *TransferLeaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransferLeaseResponse.ProtoReflect.Descriptor instead.
+func (*TransferLeaseResponse) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *TransferLeaseResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *TransferLeaseResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *TransferLeaseResponse) GetLease() *TransferLease {
+	if x != nil {
+		return x.Lease
+	}
+	return nil
+}
+
+type GetTransferLeaseResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Found         bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	Lease         *TransferLease         `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTransferLeaseResponse) Reset() {
+	*x = GetTransferLeaseResponse{}
+	mi := &file_p2p_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTransferLeaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTransferLeaseResponse) ProtoMessage() {}
+
+func (x *GetTransferLeaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTransferLeaseResponse.ProtoReflect.Descriptor instead.
+func (*GetTransferLeaseResponse) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *GetTransferLeaseResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *GetTransferLeaseResponse) GetLease() *TransferLease {
+	if x != nil {
+		return x.Lease
+	}
+	return nil
+}
+
+type ListTransferLeasesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Leases        []*TransferLease       `protobuf:"bytes,1,rep,name=leases,proto3" json:"leases,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListTransferLeasesResponse) Reset() {
+	*x = ListTransferLeasesResponse{}
+	mi := &file_p2p_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListTransferLeasesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListTransferLeasesResponse) ProtoMessage() {}
+
+func (x *ListTransferLeasesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListTransferLeasesResponse.ProtoReflect.Descriptor instead.
+func (*ListTransferLeasesResponse) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ListTransferLeasesResponse) GetLeases() []*TransferLease {
+	if x != nil {
+		return x.Leases
+	}
+	return nil
+}
+
 var File_p2p_proto protoreflect.FileDescriptor
 
 const file_p2p_proto_rawDesc = "" +
@@ -1314,7 +2003,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xd1\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xa9\x02\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -1323,7 +2012,10 @@ const file_p2p_proto_rawDesc = "" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
 	"workerRank\x12=\n" +
-	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xb0\x01\n" +
+	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x127\n" +
+	"\x06status\x18\x06 \x01(\x0e2\x1f.model_express.p2p.SourceStatusR\x06status\x12\x1d\n" +
+	"\n" +
+	"updated_at\x18\a \x01(\x03R\tupdatedAt\"\xb0\x01\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
@@ -1349,7 +2041,67 @@ const file_p2p_proto_rawDesc = "" +
 	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"J\n" +
 	"\x14UpdateStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage*\x8a\x01\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xbe\x04\n" +
+	"\rTransferLease\x12\x19\n" +
+	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12 \n" +
+	"\fmx_source_id\x18\x02 \x01(\tR\n" +
+	"mxSourceId\x12(\n" +
+	"\x10source_worker_id\x18\x03 \x01(\tR\x0esourceWorkerId\x12(\n" +
+	"\x10target_worker_id\x18\x04 \x01(\tR\x0etargetWorkerId\x12,\n" +
+	"\x12target_worker_rank\x18\x05 \x01(\rR\x10targetWorkerRank\x12#\n" +
+	"\rmodel_version\x18\x06 \x01(\x04R\fmodelVersion\x12>\n" +
+	"\x06status\x18\a \x01(\x0e2&.model_express.p2p.TransferLeaseStatusR\x06status\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\b \x01(\x03R\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"updated_at\x18\t \x01(\x03R\tupdatedAt\x12\x1d\n" +
+	"\n" +
+	"expires_at\x18\n" +
+	" \x01(\x03R\texpiresAt\x12#\n" +
+	"\rerror_message\x18\v \x01(\tR\ferrorMessage\x12J\n" +
+	"\bmetadata\x18\f \x03(\v2..model_express.p2p.TransferLease.MetadataEntryR\bmetadata\x1a;\n" +
+	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb3\x03\n" +
+	"\x19BeginTransferLeaseRequest\x12\x19\n" +
+	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12 \n" +
+	"\fmx_source_id\x18\x02 \x01(\tR\n" +
+	"mxSourceId\x12(\n" +
+	"\x10source_worker_id\x18\x03 \x01(\tR\x0esourceWorkerId\x12(\n" +
+	"\x10target_worker_id\x18\x04 \x01(\tR\x0etargetWorkerId\x12,\n" +
+	"\x12target_worker_rank\x18\x05 \x01(\rR\x10targetWorkerRank\x12#\n" +
+	"\rmodel_version\x18\x06 \x01(\x04R\fmodelVersion\x12\x1d\n" +
+	"\n" +
+	"ttl_millis\x18\a \x01(\x04R\tttlMillis\x12V\n" +
+	"\bmetadata\x18\b \x03(\v2:.model_express.p2p.BeginTransferLeaseRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\rMetadataEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"U\n" +
+	"\x19RenewTransferLeaseRequest\x12\x19\n" +
+	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12\x1d\n" +
+	"\n" +
+	"ttl_millis\x18\x02 \x01(\x04R\tttlMillis\"\x9e\x01\n" +
+	"\x1cCompleteTransferLeaseRequest\x12\x19\n" +
+	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12>\n" +
+	"\x06status\x18\x02 \x01(\x0e2&.model_express.p2p.TransferLeaseStatusR\x06status\x12#\n" +
+	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\"4\n" +
+	"\x17GetTransferLeaseRequest\x12\x19\n" +
+	"\blease_id\x18\x01 \x01(\tR\aleaseId\"\xcb\x01\n" +
+	"\x19ListTransferLeasesRequest\x12 \n" +
+	"\fmx_source_id\x18\x01 \x01(\tR\n" +
+	"mxSourceId\x12(\n" +
+	"\x10target_worker_id\x18\x02 \x01(\tR\x0etargetWorkerId\x12P\n" +
+	"\rstatus_filter\x18\x03 \x01(\x0e2&.model_express.p2p.TransferLeaseStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
+	"\x0e_status_filter\"\x83\x01\n" +
+	"\x15TransferLeaseResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x126\n" +
+	"\x05lease\x18\x03 \x01(\v2 .model_express.p2p.TransferLeaseR\x05lease\"h\n" +
+	"\x18GetTransferLeaseResponse\x12\x14\n" +
+	"\x05found\x18\x01 \x01(\bR\x05found\x126\n" +
+	"\x05lease\x18\x02 \x01(\v2 .model_express.p2p.TransferLeaseR\x05lease\"V\n" +
+	"\x1aListTransferLeasesResponse\x128\n" +
+	"\x06leases\x18\x01 \x03(\v2 .model_express.p2p.TransferLeaseR\x06leases*\x8a\x01\n" +
 	"\x10BackendFramework\x12\x1d\n" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
@@ -1363,13 +2115,24 @@ const file_p2p_proto_rawDesc = "" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +
 	"\x13SOURCE_STATUS_READY\x10\x02\x12\x17\n" +
-	"\x13SOURCE_STATUS_STALE\x10\x032\x93\x03\n" +
+	"\x13SOURCE_STATUS_STALE\x10\x03*\xc4\x01\n" +
+	"\x13TransferLeaseStatus\x12!\n" +
+	"\x1dTRANSFER_LEASE_STATUS_UNKNOWN\x10\x00\x12 \n" +
+	"\x1cTRANSFER_LEASE_STATUS_ACTIVE\x10\x01\x12#\n" +
+	"\x1fTRANSFER_LEASE_STATUS_COMPLETED\x10\x02\x12 \n" +
+	"\x1cTRANSFER_LEASE_STATUS_FAILED\x10\x03\x12!\n" +
+	"\x1dTRANSFER_LEASE_STATUS_EXPIRED\x10\x042\xc3\a\n" +
 	"\n" +
 	"P2pService\x12h\n" +
 	"\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n" +
 	"\vListSources\x12%.model_express.p2p.ListSourcesRequest\x1a&.model_express.p2p.ListSourcesResponse\x12\\\n" +
 	"\vGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n" +
-	"\fUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a'.model_express.p2p.UpdateStatusResponse2\x7f\n" +
+	"\fUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a'.model_express.p2p.UpdateStatusResponse\x12l\n" +
+	"\x12BeginTransferLease\x12,.model_express.p2p.BeginTransferLeaseRequest\x1a(.model_express.p2p.TransferLeaseResponse\x12l\n" +
+	"\x12RenewTransferLease\x12,.model_express.p2p.RenewTransferLeaseRequest\x1a(.model_express.p2p.TransferLeaseResponse\x12r\n" +
+	"\x15CompleteTransferLease\x12/.model_express.p2p.CompleteTransferLeaseRequest\x1a(.model_express.p2p.TransferLeaseResponse\x12k\n" +
+	"\x10GetTransferLease\x12*.model_express.p2p.GetTransferLeaseRequest\x1a+.model_express.p2p.GetTransferLeaseResponse\x12q\n" +
+	"\x12ListTransferLeases\x12,.model_express.p2p.ListTransferLeasesRequest\x1a-.model_express.p2p.ListTransferLeasesResponse2\x7f\n" +
 	"\rWorkerService\x12n\n" +
 	"\x11GetTensorManifest\x12+.model_express.p2p.GetTensorManifestRequest\x1a,.model_express.p2p.GetTensorManifestResponseb\x06proto3"
 
@@ -1385,58 +2148,89 @@ func file_p2p_proto_rawDescGZIP() []byte {
 	return file_p2p_proto_rawDescData
 }
 
-var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_p2p_proto_goTypes = []any{
-	(BackendFramework)(0),             // 0: model_express.p2p.BackendFramework
-	(MxSourceType)(0),                 // 1: model_express.p2p.MxSourceType
-	(SourceStatus)(0),                 // 2: model_express.p2p.SourceStatus
-	(*SourceIdentity)(nil),            // 3: model_express.p2p.SourceIdentity
-	(*TensorDescriptor)(nil),          // 4: model_express.p2p.TensorDescriptor
-	(*WorkerMetadata)(nil),            // 5: model_express.p2p.WorkerMetadata
-	(*GetTensorManifestRequest)(nil),  // 6: model_express.p2p.GetTensorManifestRequest
-	(*GetTensorManifestResponse)(nil), // 7: model_express.p2p.GetTensorManifestResponse
-	(*PublishMetadataRequest)(nil),    // 8: model_express.p2p.PublishMetadataRequest
-	(*PublishMetadataResponse)(nil),   // 9: model_express.p2p.PublishMetadataResponse
-	(*SourceInstanceRef)(nil),         // 10: model_express.p2p.SourceInstanceRef
-	(*ListSourcesRequest)(nil),        // 11: model_express.p2p.ListSourcesRequest
-	(*ListSourcesResponse)(nil),       // 12: model_express.p2p.ListSourcesResponse
-	(*GetMetadataRequest)(nil),        // 13: model_express.p2p.GetMetadataRequest
-	(*GetMetadataResponse)(nil),       // 14: model_express.p2p.GetMetadataResponse
-	(*UpdateStatusRequest)(nil),       // 15: model_express.p2p.UpdateStatusRequest
-	(*UpdateStatusResponse)(nil),      // 16: model_express.p2p.UpdateStatusResponse
-	nil,                               // 17: model_express.p2p.SourceIdentity.ExtraParametersEntry
+	(BackendFramework)(0),                // 0: model_express.p2p.BackendFramework
+	(MxSourceType)(0),                    // 1: model_express.p2p.MxSourceType
+	(SourceStatus)(0),                    // 2: model_express.p2p.SourceStatus
+	(TransferLeaseStatus)(0),             // 3: model_express.p2p.TransferLeaseStatus
+	(*SourceIdentity)(nil),               // 4: model_express.p2p.SourceIdentity
+	(*TensorDescriptor)(nil),             // 5: model_express.p2p.TensorDescriptor
+	(*WorkerMetadata)(nil),               // 6: model_express.p2p.WorkerMetadata
+	(*GetTensorManifestRequest)(nil),     // 7: model_express.p2p.GetTensorManifestRequest
+	(*GetTensorManifestResponse)(nil),    // 8: model_express.p2p.GetTensorManifestResponse
+	(*PublishMetadataRequest)(nil),       // 9: model_express.p2p.PublishMetadataRequest
+	(*PublishMetadataResponse)(nil),      // 10: model_express.p2p.PublishMetadataResponse
+	(*SourceInstanceRef)(nil),            // 11: model_express.p2p.SourceInstanceRef
+	(*ListSourcesRequest)(nil),           // 12: model_express.p2p.ListSourcesRequest
+	(*ListSourcesResponse)(nil),          // 13: model_express.p2p.ListSourcesResponse
+	(*GetMetadataRequest)(nil),           // 14: model_express.p2p.GetMetadataRequest
+	(*GetMetadataResponse)(nil),          // 15: model_express.p2p.GetMetadataResponse
+	(*UpdateStatusRequest)(nil),          // 16: model_express.p2p.UpdateStatusRequest
+	(*UpdateStatusResponse)(nil),         // 17: model_express.p2p.UpdateStatusResponse
+	(*TransferLease)(nil),                // 18: model_express.p2p.TransferLease
+	(*BeginTransferLeaseRequest)(nil),    // 19: model_express.p2p.BeginTransferLeaseRequest
+	(*RenewTransferLeaseRequest)(nil),    // 20: model_express.p2p.RenewTransferLeaseRequest
+	(*CompleteTransferLeaseRequest)(nil), // 21: model_express.p2p.CompleteTransferLeaseRequest
+	(*GetTransferLeaseRequest)(nil),      // 22: model_express.p2p.GetTransferLeaseRequest
+	(*ListTransferLeasesRequest)(nil),    // 23: model_express.p2p.ListTransferLeasesRequest
+	(*TransferLeaseResponse)(nil),        // 24: model_express.p2p.TransferLeaseResponse
+	(*GetTransferLeaseResponse)(nil),     // 25: model_express.p2p.GetTransferLeaseResponse
+	(*ListTransferLeasesResponse)(nil),   // 26: model_express.p2p.ListTransferLeasesResponse
+	nil,                                  // 27: model_express.p2p.SourceIdentity.ExtraParametersEntry
+	nil,                                  // 28: model_express.p2p.TransferLease.MetadataEntry
+	nil,                                  // 29: model_express.p2p.BeginTransferLeaseRequest.MetadataEntry
 }
 var file_p2p_proto_depIdxs = []int32{
 	1,  // 0: model_express.p2p.SourceIdentity.mx_source_type:type_name -> model_express.p2p.MxSourceType
 	0,  // 1: model_express.p2p.SourceIdentity.backend_framework:type_name -> model_express.p2p.BackendFramework
-	17, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
-	4,  // 3: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
+	27, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
+	5,  // 3: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
 	2,  // 4: model_express.p2p.WorkerMetadata.status:type_name -> model_express.p2p.SourceStatus
-	4,  // 5: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
-	3,  // 6: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	5,  // 7: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 8: model_express.p2p.SourceInstanceRef.identity:type_name -> model_express.p2p.SourceIdentity
-	3,  // 9: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	2,  // 10: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
-	10, // 11: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
-	5,  // 12: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	2,  // 13: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	8,  // 14: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	11, // 15: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	13, // 16: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	15, // 17: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	6,  // 18: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	9,  // 19: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	12, // 20: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	14, // 21: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	16, // 22: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	7,  // 23: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	19, // [19:24] is the sub-list for method output_type
-	14, // [14:19] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	5,  // 5: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
+	4,  // 6: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	6,  // 7: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
+	4,  // 8: model_express.p2p.SourceInstanceRef.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 9: model_express.p2p.SourceInstanceRef.status:type_name -> model_express.p2p.SourceStatus
+	4,  // 10: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 11: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
+	11, // 12: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
+	6,  // 13: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
+	2,  // 14: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
+	3,  // 15: model_express.p2p.TransferLease.status:type_name -> model_express.p2p.TransferLeaseStatus
+	28, // 16: model_express.p2p.TransferLease.metadata:type_name -> model_express.p2p.TransferLease.MetadataEntry
+	29, // 17: model_express.p2p.BeginTransferLeaseRequest.metadata:type_name -> model_express.p2p.BeginTransferLeaseRequest.MetadataEntry
+	3,  // 18: model_express.p2p.CompleteTransferLeaseRequest.status:type_name -> model_express.p2p.TransferLeaseStatus
+	3,  // 19: model_express.p2p.ListTransferLeasesRequest.status_filter:type_name -> model_express.p2p.TransferLeaseStatus
+	18, // 20: model_express.p2p.TransferLeaseResponse.lease:type_name -> model_express.p2p.TransferLease
+	18, // 21: model_express.p2p.GetTransferLeaseResponse.lease:type_name -> model_express.p2p.TransferLease
+	18, // 22: model_express.p2p.ListTransferLeasesResponse.leases:type_name -> model_express.p2p.TransferLease
+	9,  // 23: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	12, // 24: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	14, // 25: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	16, // 26: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	19, // 27: model_express.p2p.P2pService.BeginTransferLease:input_type -> model_express.p2p.BeginTransferLeaseRequest
+	20, // 28: model_express.p2p.P2pService.RenewTransferLease:input_type -> model_express.p2p.RenewTransferLeaseRequest
+	21, // 29: model_express.p2p.P2pService.CompleteTransferLease:input_type -> model_express.p2p.CompleteTransferLeaseRequest
+	22, // 30: model_express.p2p.P2pService.GetTransferLease:input_type -> model_express.p2p.GetTransferLeaseRequest
+	23, // 31: model_express.p2p.P2pService.ListTransferLeases:input_type -> model_express.p2p.ListTransferLeasesRequest
+	7,  // 32: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	10, // 33: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	13, // 34: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	15, // 35: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	17, // 36: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	24, // 37: model_express.p2p.P2pService.BeginTransferLease:output_type -> model_express.p2p.TransferLeaseResponse
+	24, // 38: model_express.p2p.P2pService.RenewTransferLease:output_type -> model_express.p2p.TransferLeaseResponse
+	24, // 39: model_express.p2p.P2pService.CompleteTransferLease:output_type -> model_express.p2p.TransferLeaseResponse
+	25, // 40: model_express.p2p.P2pService.GetTransferLease:output_type -> model_express.p2p.GetTransferLeaseResponse
+	26, // 41: model_express.p2p.P2pService.ListTransferLeases:output_type -> model_express.p2p.ListTransferLeasesResponse
+	8,  // 42: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	33, // [33:43] is the sub-list for method output_type
+	23, // [23:33] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }
@@ -1449,13 +2243,14 @@ func file_p2p_proto_init() {
 		(*WorkerMetadata_TransferEngineSessionId)(nil),
 	}
 	file_p2p_proto_msgTypes[8].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[19].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_p2p_proto_rawDesc), len(file_p2p_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   15,
+			NumEnums:      4,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

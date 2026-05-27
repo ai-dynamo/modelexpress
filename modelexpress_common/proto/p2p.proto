@@ -258,6 +258,14 @@ message SourceInstanceRef {
   // lightweight relative to GetMetadata while letting clients inspect
   // version/role/revision extra parameters without fetching tensor metadata.
   SourceIdentity identity = 5;
+
+  // Worker lifecycle status. Lets orchestrators inspect health without
+  // fetching full tensor metadata for every candidate.
+  SourceStatus status = 6;
+
+  // Last worker status update timestamp (unix millis). Used by heartbeat
+  // and reaper observability.
+  int64 updated_at = 7;
 }
 
 message ListSourcesRequest {

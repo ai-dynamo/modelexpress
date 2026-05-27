@@ -164,6 +164,8 @@ class MxK8sServiceClient(MxClientBase):
             model_name=identity.model_name,
             worker_rank=self._worker_rank,
             identity=identity,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            updated_at=0,
         )
         return p2p_pb2.ListSourcesResponse(instances=[ref])
 

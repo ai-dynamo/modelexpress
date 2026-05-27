@@ -163,6 +163,8 @@ impl P2pService for P2pServiceImpl {
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
                 identity: info.identity,
+                status: info.status,
+                updated_at: info.updated_at,
             })
             .collect();
 
@@ -828,6 +830,8 @@ mod tests {
         assert_eq!(resp.instances.len(), 2);
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(resp.instances[0].status, SourceStatus::Ready as i32);
+        assert_eq!(resp.instances[0].updated_at, 1234567890000);
         assert_eq!(
             resp.instances[0]
                 .identity
@@ -837,6 +841,8 @@ mod tests {
         );
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
+        assert_eq!(resp.instances[1].status, SourceStatus::Ready as i32);
+        assert_eq!(resp.instances[1].updated_at, 1234567890000);
     }
 
     #[tokio::test]
