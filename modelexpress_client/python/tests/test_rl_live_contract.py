@@ -235,7 +235,14 @@ def test_live_server_transfers_latest_retained_cuda_version():
         assert received.detach().cpu().tolist() == [11.0, 12.0, 13.0]
         assert receiver.last_receive_report is not None
         assert receiver.last_receive_report.resolved_model_version == 2
-        assert receiver.last_receive_report.attempts[0].bytes_transferred == 12
+        attempt = receiver.last_receive_report.attempts[0]
+        assert attempt.bytes_transferred == 12
+        if not attempt.lease_id:
+            pytest.skip("server does not expose transfer lease RPCs")
+        fetched = client.get_transfer_lease(attempt.lease_id)
+        assert fetched.found
+        assert fetched.lease.status == p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
+        assert fetched.lease.target_worker_id == receiver.worker_id
     finally:
         receiver.finalize()
         publisher.finalize()

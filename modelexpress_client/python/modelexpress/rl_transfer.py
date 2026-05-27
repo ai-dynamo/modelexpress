@@ -11,6 +11,7 @@ import logging
 import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -77,6 +78,7 @@ def _successful_attempt_from_candidate(
     bytes_transferred: int,
     tensor_count: int,
     duration_seconds: float,
+    lease_id: str = "",
 ) -> RlTransferAttempt:
     return RlTransferAttempt(
         mx_source_id=candidate.mx_source_id,
@@ -85,6 +87,7 @@ def _successful_attempt_from_candidate(
         role=candidate.metadata.role,
         model_version=candidate.metadata.model_version,
         success=True,
+        lease_id=lease_id,
         bytes_transferred=bytes_transferred,
         tensor_count=tensor_count,
         duration_seconds=duration_seconds,
@@ -103,7 +106,35 @@ def _failed_attempt_from_candidate(
         model_version=candidate.metadata.model_version,
         success=False,
         error=str(exc),
+        lease_id=_lease_id_for_exception(exc, candidate),
     )
+
+
+def _candidate_lease_key(candidate: RlSourceCandidate) -> tuple[str, str, int]:
+    return (candidate.mx_source_id, candidate.worker_id, candidate.worker_rank)
+
+
+class _LeasedTransferError(RuntimeError):
+    def __init__(
+        self,
+        exc: Exception,
+        lease_ids_by_candidate: Mapping[tuple[str, str, int], str],
+    ) -> None:
+        super().__init__(str(exc))
+        self.lease_ids_by_candidate = dict(lease_ids_by_candidate)
+
+    def lease_id_for(self, candidate: RlSourceCandidate) -> str:
+        return self.lease_ids_by_candidate.get(_candidate_lease_key(candidate), "")
+
+
+def _lease_id_for_exception(exc: Exception, candidate: RlSourceCandidate) -> str:
+    lease_id_for = getattr(exc, "lease_id_for", None)
+    if lease_id_for is None:
+        return ""
+    try:
+        return str(lease_id_for(candidate))
+    except Exception:
+        return ""
 
 
 class RlNixlWeightTransfer:
@@ -411,6 +442,7 @@ class RlNixlWeightTransfer:
                         bytes_transferred=result.bytes_transferred,
                         tensor_count=result.tensor_count,
                         duration_seconds=result.duration_seconds,
+                        lease_id=result.lease_id,
                     )
                 )
                 self.last_receive_report = RlTransferReport(
@@ -445,6 +477,7 @@ class RlNixlWeightTransfer:
                         bytes_transferred=source_result.bytes_transferred,
                         tensor_count=source_result.tensor_count,
                         duration_seconds=source_result.duration_seconds,
+                        lease_id=source_result.lease_id,
                     )
                     for source_result in result.source_results
                 )
@@ -507,18 +540,28 @@ class RlNixlWeightTransfer:
         target_tensors: dict[str, torch.Tensor] | None = None,
         target_specs: Sequence[TensorReceiveSpec] | None = None,
     ) -> _ReceiveCandidateResult:
-        with self._lease_coordinator.lease_candidate(
+        lease = self._lease_coordinator.lease_candidate(
             candidate,
             receiver_rank=receiver_rank,
-        ):
-            return self._receive_from_candidate_unleased(
-                candidate,
-                model_version,
-                receiver_rank=receiver_rank,
-                same_rank_only=same_rank_only,
-                target_tensors=target_tensors,
-                target_specs=target_specs,
-            )
+        )
+        try:
+            with lease:
+                result = self._receive_from_candidate_unleased(
+                    candidate,
+                    model_version,
+                    receiver_rank=receiver_rank,
+                    same_rank_only=same_rank_only,
+                    target_tensors=target_tensors,
+                    target_specs=target_specs,
+                )
+        except Exception as exc:
+            if lease.lease_id:
+                raise _LeasedTransferError(
+                    exc,
+                    {_candidate_lease_key(candidate): lease.lease_id},
+                ) from exc
+            raise
+        return replace(result, lease_id=lease.lease_id)
 
     def _receive_from_candidate_unleased(
         self,
@@ -647,20 +690,42 @@ class RlNixlWeightTransfer:
         target_tensors: dict[str, torch.Tensor] | None,
         target_specs: Sequence[TensorReceiveSpec] | None,
     ) -> DenseFanInReceiveResult:
-        leases = [
-            self._lease_coordinator.lease_candidate(candidate, receiver_rank=receiver_rank)
-            for candidate in candidates
-        ]
-        with contextlib.ExitStack() as stack:
-            for lease in leases:
-                stack.enter_context(lease)
-            return self._receive_from_candidate_group_unleased(
-                candidates,
-                receiver_rank=receiver_rank,
-                same_rank_only=same_rank_only,
-                target_tensors=target_tensors,
-                target_specs=target_specs,
+        lease_ids_by_candidate: dict[tuple[str, str, int], str] = {}
+        try:
+            with contextlib.ExitStack() as stack:
+                for candidate in candidates:
+                    lease = self._lease_coordinator.lease_candidate(
+                        candidate,
+                        receiver_rank=receiver_rank,
+                    )
+                    stack.enter_context(lease)
+                    if lease.lease_id:
+                        lease_ids_by_candidate[_candidate_lease_key(candidate)] = (
+                            lease.lease_id
+                        )
+                result = self._receive_from_candidate_group_unleased(
+                    candidates,
+                    receiver_rank=receiver_rank,
+                    same_rank_only=same_rank_only,
+                    target_tensors=target_tensors,
+                    target_specs=target_specs,
+                )
+        except Exception as exc:
+            if lease_ids_by_candidate:
+                raise _LeasedTransferError(exc, lease_ids_by_candidate) from exc
+            raise
+
+        source_results = tuple(
+            replace(
+                source_result,
+                lease_id=lease_ids_by_candidate.get(
+                    _candidate_lease_key(source_result.candidate),
+                    "",
+                ),
             )
+            for source_result in result.source_results
+        )
+        return replace(result, source_results=source_results)
 
     def _receive_from_candidate_group_unleased(
         self,

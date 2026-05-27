@@ -53,6 +53,7 @@ class DenseFanInSourceResult:
     bytes_transferred: int
     tensor_count: int
     duration_seconds: float
+    lease_id: str = ""
 
 
 @dataclass(frozen=True)

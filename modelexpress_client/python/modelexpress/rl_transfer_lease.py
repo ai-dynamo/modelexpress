@@ -218,6 +218,10 @@ class RlTransferLease:
     def disabled(cls) -> "RlTransferLease":
         return cls()
 
+    @property
+    def lease_id(self) -> str:
+        return self._lease_id
+
     def __enter__(self) -> "RlTransferLease":
         if self._mx_client is None or not self._lease_id:
             return self

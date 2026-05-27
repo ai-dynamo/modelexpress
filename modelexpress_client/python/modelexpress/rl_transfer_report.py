@@ -23,6 +23,7 @@ class RlTransferAttempt:
     model_version: int
     success: bool
     error: str | None = None
+    lease_id: str = ""
     bytes_transferred: int = 0
     tensor_count: int = 0
     duration_seconds: float = 0.0
@@ -66,3 +67,4 @@ class _ReceiveCandidateResult:
     bytes_transferred: int
     tensor_count: int
     duration_seconds: float
+    lease_id: str = ""

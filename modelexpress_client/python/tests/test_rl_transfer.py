@@ -8,6 +8,10 @@ import torch
 
 import modelexpress.rl_transfer as rl_transfer_module
 from modelexpress import p2p_pb2
+from modelexpress.rl_fanin_transfer import (
+    DenseFanInReceiveResult,
+    DenseFanInSourceResult,
+)
 from modelexpress.rl_metadata import (
     RlSourceMetadata,
     RlSourceRole,
@@ -41,6 +45,28 @@ class _FakeMxClient:
     def update_status(self, mx_source_id, worker_id, worker_rank, status):
         self.status_updates.append((mx_source_id, worker_id, worker_rank, status))
         return True
+
+
+class _LeaseRecordingMxClient(_FakeMxClient):
+    def __init__(self, response):
+        super().__init__(response)
+        self.lease_begins = []
+        self.lease_completes = []
+        self._lease_counts = {}
+
+    def begin_transfer_lease(self, **kwargs):
+        self.lease_begins.append(kwargs)
+        source_id = kwargs["mx_source_id"]
+        count = self._lease_counts.get(source_id, 0) + 1
+        self._lease_counts[source_id] = count
+        return p2p_pb2.TransferLease(lease_id=f"lease-{source_id}-{count}")
+
+    def renew_transfer_lease(self, lease_id, *, ttl_millis=0):
+        return p2p_pb2.TransferLease(lease_id=lease_id)
+
+    def complete_transfer_lease(self, lease_id, *, status, error_message=""):
+        self.lease_completes.append((lease_id, status, error_message))
+        return p2p_pb2.TransferLease(lease_id=lease_id, status=status)
 
 
 def _base_identity(**overrides):
@@ -562,6 +588,163 @@ def test_receive_tensors_retries_next_candidate_after_failure():
         True,
     ]
     assert transfer.last_receive_report.attempts[1].bytes_transferred == 4
+
+
+def test_receive_tensors_reports_transfer_lease_ids_across_retries():
+    class _LeasedRetryTransfer(RlNixlWeightTransfer):
+        def _receive_from_candidate_unleased(self, candidate, model_version, **kwargs):
+            del model_version
+            del kwargs
+            if candidate.mx_source_id == "source-a":
+                raise RuntimeError("boom")
+            return _ReceiveCandidateResult(
+                tensors=[("w", torch.zeros(1))],
+                bytes_transferred=4,
+                tensor_count=1,
+                duration_seconds=0.01,
+            )
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref("source-a", "worker-a", model_version=7),
+            _source_ref("source-b", "worker-b", model_version=7),
+        ]
+    )
+    fake_client = _LeaseRecordingMxClient(response)
+    transfer = _LeasedRetryTransfer(
+        mx_client=fake_client,
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    tensors = asyncio.run(
+        transfer.receive_tensors(model_version=None, receiver_rank=0)
+    )
+
+    assert tensors[0][0] == "w"
+    assert transfer.last_receive_report is not None
+    assert [
+        (attempt.mx_source_id, attempt.success, attempt.lease_id, attempt.error)
+        for attempt in transfer.last_receive_report.attempts
+    ] == [
+        ("source-a", False, "lease-source-a-1", "boom"),
+        ("source-b", True, "lease-source-b-1", None),
+    ]
+    assert fake_client.lease_completes == [
+        (
+            "lease-source-a-1",
+            p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+            "boom",
+        ),
+        (
+            "lease-source-b-1",
+            p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+            "",
+        ),
+    ]
+
+
+def test_receive_tensors_reports_empty_lease_id_when_leases_are_disabled():
+    class _LeaselessTransfer(RlNixlWeightTransfer):
+        def _receive_from_candidate_unleased(self, candidate, model_version, **kwargs):
+            del candidate
+            del model_version
+            del kwargs
+            return _ReceiveCandidateResult(
+                tensors=[("w", torch.zeros(1))],
+                bytes_transferred=4,
+                tensor_count=1,
+                duration_seconds=0.01,
+            )
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[_source_ref("source-a", "worker-a", model_version=7)]
+    )
+    transfer = _LeaselessTransfer(
+        mx_client=_FakeMxClient(response),
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    asyncio.run(transfer.receive_tensors(model_version=None, receiver_rank=0))
+
+    assert transfer.last_receive_report is not None
+    assert transfer.last_receive_report.attempts[0].lease_id == ""
+
+
+def test_receive_tensors_reports_dense_fanin_transfer_lease_ids():
+    class _LeasedFanInTransfer(RlNixlWeightTransfer):
+        def _receive_from_candidate_unleased(self, candidate, model_version, **kwargs):
+            del model_version
+            del kwargs
+            raise RuntimeError(f"single-source incomplete: {candidate.mx_source_id}")
+
+        def _receive_from_candidate_group_unleased(self, candidates, **kwargs):
+            del kwargs
+            return DenseFanInReceiveResult(
+                tensors=[("w", torch.zeros(4))],
+                source_results=tuple(
+                    DenseFanInSourceResult(
+                        candidate=candidate,
+                        bytes_transferred=8,
+                        tensor_count=1,
+                        duration_seconds=0.01,
+                    )
+                    for candidate in candidates
+                ),
+            )
+
+    response = p2p_pb2.ListSourcesResponse(
+        instances=[
+            _source_ref(
+                "source-r0",
+                "worker-r0",
+                model_version=7,
+                worker_rank=0,
+                source_world_size=2,
+            ),
+            _source_ref(
+                "source-r1",
+                "worker-r1",
+                model_version=7,
+                worker_rank=1,
+                source_world_size=2,
+            ),
+        ]
+    )
+    fake_client = _LeaseRecordingMxClient(response)
+    transfer = _LeasedFanInTransfer(
+        mx_client=fake_client,
+        base_identity=_base_identity(),
+        worker_id="worker-local",
+    )
+
+    tensors = asyncio.run(
+        transfer.receive_tensors(model_version=None, receiver_rank=0)
+    )
+
+    assert tensors[0][0] == "w"
+    assert transfer.last_receive_report is not None
+    assert [
+        (attempt.mx_source_id, attempt.success, attempt.lease_id)
+        for attempt in transfer.last_receive_report.attempts
+    ] == [
+        ("source-r0", False, "lease-source-r0-1"),
+        ("source-r1", False, "lease-source-r1-1"),
+        ("source-r0", True, "lease-source-r0-2"),
+        ("source-r1", True, "lease-source-r1-2"),
+    ]
+    completed_statuses = [
+        (lease_id, status) for lease_id, status, _error in fake_client.lease_completes
+    ]
+    assert completed_statuses[:2] == [
+        ("lease-source-r0-1", p2p_pb2.TRANSFER_LEASE_STATUS_FAILED),
+        ("lease-source-r1-1", p2p_pb2.TRANSFER_LEASE_STATUS_FAILED),
+    ]
+    assert set(completed_statuses[2:]) == {
+        ("lease-source-r0-2", p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED),
+        ("lease-source-r1-2", p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED),
+    }
 
 
 def test_receive_tensors_records_failed_transfer_report():
