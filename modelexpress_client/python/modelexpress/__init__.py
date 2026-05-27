@@ -73,12 +73,15 @@ from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.heartbeat import HeartbeatThread  # noqa: F401
+from .rl_metadata import RlSourceMetadata, RlSourceRole  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
+    "RlSourceMetadata",
+    "RlSourceRole",
     "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]
