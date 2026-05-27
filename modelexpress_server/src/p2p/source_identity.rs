@@ -69,7 +69,7 @@ mod tests {
 
     fn base_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.3.0".to_string(),
+            mx_version: "0.4.0".to_string(),
             mx_source_type: 0, // Weights (default)
             model_name: "deepseek-ai/DeepSeek-V3".to_string(),
             backend_framework: 1, // vllm

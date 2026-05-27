@@ -17,7 +17,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
-        mx_version="0.3.0",
+        mx_version="0.4.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name="deepseek-ai/DeepSeek-V3",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
