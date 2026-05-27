@@ -8,7 +8,7 @@
 
 use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
-use crate::p2p::state::P2pStateManager;
+use crate::p2p::state::{BeginTransferLeaseParams, P2pStateManager};
 use modelexpress_common::grpc::p2p::{
     BeginTransferLeaseRequest, CompleteTransferLeaseRequest, GetMetadataRequest,
     GetMetadataResponse, GetTransferLeaseRequest, GetTransferLeaseResponse, ListSourcesRequest,
@@ -307,20 +307,17 @@ impl P2pService for P2pServiceImpl {
         } else {
             Some(req.lease_id)
         };
-        match self
-            .state
-            .begin_transfer_lease(
-                requested_lease_id,
-                &req.mx_source_id,
-                &req.source_worker_id,
-                &req.target_worker_id,
-                req.target_worker_rank,
-                req.model_version,
-                req.ttl_millis,
-                req.metadata,
-            )
-            .await
-        {
+        let lease_params = BeginTransferLeaseParams {
+            lease_id: requested_lease_id,
+            mx_source_id: req.mx_source_id,
+            source_worker_id: req.source_worker_id,
+            target_worker_id: req.target_worker_id,
+            target_worker_rank: req.target_worker_rank,
+            model_version: req.model_version,
+            ttl_millis: req.ttl_millis,
+            metadata: req.metadata,
+        };
+        match self.state.begin_transfer_lease(lease_params).await {
             Ok(lease) => Ok(Response::new(TransferLeaseResponse {
                 success: true,
                 message: "transfer lease started".to_string(),

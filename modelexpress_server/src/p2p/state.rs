@@ -31,6 +31,18 @@ pub struct P2pStateManager {
     config: Option<BackendConfig>,
 }
 
+/// Parameters for starting a durable transfer lease.
+pub struct BeginTransferLeaseParams {
+    pub lease_id: Option<String>,
+    pub mx_source_id: String,
+    pub source_worker_id: String,
+    pub target_worker_id: String,
+    pub target_worker_rank: u32,
+    pub model_version: u64,
+    pub ttl_millis: u64,
+    pub metadata: HashMap<String, String>,
+}
+
 impl Default for P2pStateManager {
     fn default() -> Self {
         Self::new()
@@ -196,30 +208,25 @@ impl P2pStateManager {
     /// Create a durable ACTIVE transfer lease.
     pub async fn begin_transfer_lease(
         &self,
-        lease_id: Option<String>,
-        mx_source_id: &str,
-        source_worker_id: &str,
-        target_worker_id: &str,
-        target_worker_rank: u32,
-        model_version: u64,
-        ttl_millis: u64,
-        metadata: HashMap<String, String>,
+        params: BeginTransferLeaseParams,
     ) -> MetadataResult<TransferLeaseRecord> {
         let now = chrono::Utc::now().timestamp_millis();
-        let ttl = bounded_lease_ttl_millis(ttl_millis);
+        let ttl = bounded_lease_ttl_millis(params.ttl_millis);
         let record = TransferLeaseRecord {
-            lease_id: lease_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-            mx_source_id: mx_source_id.to_string(),
-            source_worker_id: source_worker_id.to_string(),
-            target_worker_id: target_worker_id.to_string(),
-            target_worker_rank,
-            model_version,
+            lease_id: params
+                .lease_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            mx_source_id: params.mx_source_id,
+            source_worker_id: params.source_worker_id,
+            target_worker_id: params.target_worker_id,
+            target_worker_rank: params.target_worker_rank,
+            model_version: params.model_version,
             status: TransferLeaseStatus::Active as i32,
             created_at: now,
             updated_at: now,
-            expires_at: now + ttl,
+            expires_at: now.saturating_add(ttl),
             error_message: String::new(),
-            metadata,
+            metadata: params.metadata,
         };
 
         self.get_backend()
@@ -303,7 +310,7 @@ impl P2pStateManager {
         }
 
         let now = chrono::Utc::now().timestamp_millis();
-        let expires_at = now + bounded_lease_ttl_millis(ttl_millis);
+        let expires_at = now.saturating_add(bounded_lease_ttl_millis(ttl_millis));
         self.get_backend()
             .await?
             .renew_transfer_lease(lease_id, now, expires_at)
@@ -794,16 +801,16 @@ mod tests {
         metadata.insert("role".to_string(), "trainer".to_string());
 
         let lease = manager
-            .begin_transfer_lease(
-                Some("lease-1".to_string()),
-                "abc123def456abcd",
-                "source-worker",
-                "target-worker",
-                3,
-                11,
-                5_000,
+            .begin_transfer_lease(BeginTransferLeaseParams {
+                lease_id: Some("lease-1".to_string()),
+                mx_source_id: "abc123def456abcd".to_string(),
+                source_worker_id: "source-worker".to_string(),
+                target_worker_id: "target-worker".to_string(),
+                target_worker_rank: 3,
+                model_version: 11,
+                ttl_millis: 5_000,
                 metadata,
-            )
+            })
             .await
             .expect("begin_transfer_lease failed");
 
