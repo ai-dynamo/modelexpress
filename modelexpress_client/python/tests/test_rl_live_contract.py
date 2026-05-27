@@ -438,6 +438,169 @@ def test_live_server_transfers_multi_source_dense_fanin_cuda_version():
         client.close()
 
 
+def test_live_server_allocated_fanin_replica_preserves_layout_metadata():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if torch.cuda.device_count() < 3:
+        pytest.skip("allocated dense fan-in replica live contract needs at least 3 CUDA devices")
+    pytest.importorskip("nixl._api")
+
+    client = MxClient(server_url=os.environ[_LIVE_SERVER_ENV])
+    model_name = f"mx-live-fanin-replica-{uuid.uuid4().hex[:8]}"
+    base_identity = _base_identity(model_name)
+    publisher_r0 = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-r0-{uuid.uuid4().hex[:8]}",
+        device_id=0,
+        timeout_seconds=20.0,
+    )
+    publisher_r1 = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"publisher-r1-{uuid.uuid4().hex[:8]}",
+        device_id=1,
+        timeout_seconds=20.0,
+    )
+    replica = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"replica-{uuid.uuid4().hex[:8]}",
+        device_id=2,
+        timeout_seconds=20.0,
+    )
+    restarted_receiver = RlNixlWeightTransfer(
+        mx_client=client,
+        base_identity=base_identity,
+        worker_id=f"restart-{uuid.uuid4().hex[:8]}",
+        device_id=2,
+        timeout_seconds=20.0,
+    )
+
+    try:
+        publisher_r0.publish_tensors(
+            {
+                "experts.w": torch.tensor(
+                    [[1.0, 2.0]],
+                    dtype=torch.float32,
+                    device="cuda:0",
+                )
+            },
+            model_version=19,
+            worker_rank=0,
+            source_world_size=2,
+            tensor_metadata={
+                "experts.w": {
+                    "global_shape": [2, 2],
+                    "shard_offsets": [0, 0],
+                    "expert_ids": [0],
+                    "expert_axis": 0,
+                }
+            },
+        )
+        publisher_r1.publish_tensors(
+            {
+                "experts.w": torch.tensor(
+                    [[3.0, 4.0]],
+                    dtype=torch.float32,
+                    device="cuda:1",
+                )
+            },
+            model_version=19,
+            worker_rank=1,
+            source_world_size=2,
+            tensor_metadata={
+                "experts.w": {
+                    "global_shape": [2, 2],
+                    "shard_offsets": [1, 0],
+                    "expert_ids": [1],
+                    "expert_axis": 0,
+                }
+            },
+        )
+
+        replica_tensors = asyncio.run(
+            replica.receive_tensors_and_publish_replica(
+                model_version=None,
+                receiver_rank=0,
+                roles=(RlSourceRole.TRAINER,),
+                replica_world_size=1,
+            )
+        )
+        torch.cuda.synchronize(0)
+        torch.cuda.synchronize(1)
+        torch.cuda.synchronize(2)
+
+        assert replica_tensors[0][0] == "experts.w"
+        assert replica_tensors[0][1].device.index == 2
+        assert replica_tensors[0][1].detach().cpu().tolist() == [
+            [1.0, 2.0],
+            [3.0, 4.0],
+        ]
+        refs = client.list_sources(
+            identity=None,
+            status_filter=p2p_pb2.SOURCE_STATUS_READY,
+        )
+        replica_metadata = []
+        for ref in refs.instances:
+            if not ref.HasField("identity") or ref.identity.model_name != model_name:
+                continue
+            metadata = get_rl_source_metadata(ref.identity)
+            if metadata.role == RlSourceRole.INFERENCE_REPLICA:
+                replica_metadata.append(metadata)
+        assert len(replica_metadata) == 1
+        assert replica_metadata[0].shape_registry["experts.w"] == {
+            "shape": [2, 2],
+            "dtype": "torch.float32",
+            "global_shape": [2, 2],
+            "shard_offsets": [0, 0],
+            "tensor_parallel_rank": 0,
+            "pipeline_parallel_rank": 0,
+            "expert_ids": [0, 1],
+            "expert_axis": 0,
+        }
+
+        publisher_r1.finalize()
+        publisher_r0.finalize()
+
+        expert_one = torch.zeros((1, 2), dtype=torch.float32, device="cuda:2")
+        recovered = asyncio.run(
+            restarted_receiver.receive_into_tensors(
+                {"experts.w": expert_one},
+                model_version=None,
+                receiver_rank=0,
+                roles=(RlSourceRole.INFERENCE_REPLICA,),
+                target_specs=[
+                    TensorReceiveSpec(
+                        name="experts.w",
+                        receiver_rank=0,
+                        shape=(1, 2),
+                        dtype="torch.float32",
+                        global_shape=(2, 2),
+                        shard_offsets=(0, 0),
+                        expert_ids=(1,),
+                        expert_axis=0,
+                    )
+                ],
+            )
+        )
+        torch.cuda.synchronize(2)
+
+        assert recovered == [("experts.w", expert_one)]
+        assert expert_one.detach().cpu().tolist() == [[3.0, 4.0]]
+        assert restarted_receiver.last_receive_report is not None
+        assert restarted_receiver.last_receive_report.resolved_model_version == 19
+        assert restarted_receiver.last_receive_report.attempts[0].role == (
+            RlSourceRole.INFERENCE_REPLICA
+        )
+    finally:
+        restarted_receiver.finalize()
+        replica.finalize()
+        publisher_r1.finalize()
+        publisher_r0.finalize()
+        client.close()
+
+
 def test_live_server_summarizes_failed_transfer_lease_cuda_version():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
