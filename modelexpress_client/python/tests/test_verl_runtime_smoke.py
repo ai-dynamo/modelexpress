@@ -41,6 +41,8 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
     assert result.source_roles == (RlSourceRole.TRAINER.value,)
     assert result.attempt_roles == (RlSourceRole.TRAINER.value,)
     assert result.attempt_successes == (True,)
+    assert result.attempt_source_statuses == (p2p_pb2.SOURCE_STATUS_READY,)
+    assert all(updated_at > 0 for updated_at in result.attempt_source_updated_at)
     assert result.retry_count == 0
     assert result.tensor_count == 15
     assert result.bytes_transferred > 0
@@ -97,6 +99,8 @@ def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
     assert result.receive_success
     assert result.source_roles == (RlSourceRole.TRAINER.value,)
     assert result.attempt_successes == (True,)
+    assert result.attempt_source_statuses == (p2p_pb2.SOURCE_STATUS_READY,)
+    assert all(updated_at > 0 for updated_at in result.attempt_source_updated_at)
     assert result.retry_count == 0
     assert result.tensor_count == 15
     assert result.bytes_transferred > 0
@@ -139,6 +143,12 @@ def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
     assert result.recovery_source_roles == (RlSourceRole.INFERENCE_REPLICA.value,)
     assert result.recovery_attempt_roles == (RlSourceRole.INFERENCE_REPLICA.value,)
     assert result.recovery_attempt_successes == (True,)
+    assert result.recovery_attempt_source_statuses == (
+        p2p_pb2.SOURCE_STATUS_READY,
+    )
+    assert all(
+        updated_at > 0 for updated_at in result.recovery_attempt_source_updated_at
+    )
     assert result.recovery_retry_count == 0
     assert result.recovery_tensor_count == 15
     assert result.recovery_bytes_transferred > 0
@@ -177,6 +187,13 @@ def test_live_verl_modelexpress_trainer_failure_falls_back_to_replica(
         RlSourceRole.INFERENCE_REPLICA.value,
     )
     assert result.recovery_attempt_successes == (False, True)
+    assert result.recovery_attempt_source_statuses == (
+        p2p_pb2.SOURCE_STATUS_READY,
+        p2p_pb2.SOURCE_STATUS_READY,
+    )
+    assert all(
+        updated_at > 0 for updated_at in result.recovery_attempt_source_updated_at
+    )
     assert result.recovery_retry_count == 1
     assert result.recovery_tensor_count == 15
     assert result.recovery_bytes_transferred > 0

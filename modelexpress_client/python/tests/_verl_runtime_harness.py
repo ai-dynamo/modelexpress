@@ -27,6 +27,8 @@ class VerlRuntimeSmokeResult:
     source_roles: tuple[str, ...] = ()
     attempt_roles: tuple[str, ...] = ()
     attempt_successes: tuple[bool, ...] = ()
+    attempt_source_statuses: tuple[int, ...] = ()
+    attempt_source_updated_at: tuple[int, ...] = ()
     retry_count: int = 0
     bytes_transferred: int = 0
     tensor_count: int = 0
@@ -44,6 +46,8 @@ class VerlRuntimeSmokeResult:
     recovery_source_roles: tuple[str, ...] = ()
     recovery_attempt_roles: tuple[str, ...] = ()
     recovery_attempt_successes: tuple[bool, ...] = ()
+    recovery_attempt_source_statuses: tuple[int, ...] = ()
+    recovery_attempt_source_updated_at: tuple[int, ...] = ()
     recovery_retry_count: int = 0
     recovery_bytes_transferred: int = 0
     recovery_tensor_count: int = 0
@@ -318,6 +322,12 @@ def run_verl_checkpoint_manager_update(
                 "attempt_successes": tuple(
                     attempt.success for attempt in report.attempts
                 ),
+                "attempt_source_statuses": tuple(
+                    int(attempt.source_status) for attempt in report.attempts
+                ),
+                "attempt_source_updated_at": tuple(
+                    int(attempt.source_updated_at) for attempt in report.attempts
+                ),
                 "bytes_transferred": sum(
                     attempt.bytes_transferred
                     for attempt in report.attempts
@@ -493,6 +503,12 @@ def run_verl_checkpoint_manager_update(
             source_roles=tuple(receive_report.get("source_roles", ())),
             attempt_roles=tuple(receive_report.get("attempt_roles", ())),
             attempt_successes=tuple(receive_report.get("attempt_successes", ())),
+            attempt_source_statuses=tuple(
+                receive_report.get("attempt_source_statuses", ())
+            ),
+            attempt_source_updated_at=tuple(
+                receive_report.get("attempt_source_updated_at", ())
+            ),
             retry_count=int(receive_report.get("retry_count", 0)),
             bytes_transferred=int(receive_report.get("bytes_transferred", 0)),
             tensor_count=int(receive_report.get("tensor_count", 0)),
@@ -523,6 +539,12 @@ def run_verl_checkpoint_manager_update(
             recovery_attempt_roles=tuple(recovery_report.get("attempt_roles", ())),
             recovery_attempt_successes=tuple(
                 recovery_report.get("attempt_successes", ())
+            ),
+            recovery_attempt_source_statuses=tuple(
+                recovery_report.get("attempt_source_statuses", ())
+            ),
+            recovery_attempt_source_updated_at=tuple(
+                recovery_report.get("attempt_source_updated_at", ())
             ),
             recovery_retry_count=int(recovery_report.get("retry_count", 0)),
             recovery_bytes_transferred=int(
