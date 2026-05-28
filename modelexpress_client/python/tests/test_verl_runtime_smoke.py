@@ -59,6 +59,46 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
     assert result.lease_summary_statuses is None
 
 
+def test_live_verl_checkpoint_manager_updates_rank_local_modelexpress(tmp_path):
+    """Exercise MX rank-local source selection through veRL's manager."""
+    torch = pytest.importorskip("torch")
+    if torch.cuda.device_count() < 4:
+        pytest.skip("rank-local veRL MX runtime smoke needs four CUDA devices")
+    run_verl_checkpoint_manager_update = _load_harness().run_verl_checkpoint_manager_update
+    result = run_verl_checkpoint_manager_update(
+        backend="modelexpress",
+        tmp_path=tmp_path,
+        verl_repo=Path(os.environ[_VERL_REPO_ENV]).resolve(),
+        mx_python_path=Path(__file__).resolve().parents[1],
+        server_url=os.environ[_LIVE_SERVER_ENV],
+        topology="rank_local",
+        trainer_world_size=2,
+        rollout_world_size=2,
+    )
+
+    assert result.backend == "modelexpress"
+    assert result.topology == "rank_local"
+    assert result.trainer_world_size == 2
+    assert result.rollout_world_size == 2
+    assert result.update_seconds > 0.0
+    assert result.check_seconds > 0.0
+    assert result.receive_report_count == 2
+    assert sorted(result.receive_report_receiver_ranks) == [0, 1]
+    assert sorted(result.receive_report_successful_source_worker_ranks) == [0, 1]
+    assert sorted(result.receive_report_attempt_worker_ranks) == [0, 1]
+    assert result.receive_success
+    assert result.requested_model_version == 17
+    assert result.resolved_model_version == 17
+    assert result.source_roles == (RlSourceRole.TRAINER.value,)
+    assert result.attempt_roles == (RlSourceRole.TRAINER.value,)
+    assert result.attempt_successes == (True,)
+    assert result.retry_count == 0
+    assert result.tensor_count == 15
+    assert result.bytes_transferred > 0
+    assert result.transfer_duration_seconds > 0.0
+    assert result.attempt_lease_ids
+
+
 def test_live_verl_checkpoint_manager_compares_nccl_and_modelexpress(tmp_path):
     """Run CE/NCCL and MX/NIXL through the same tiny veRL manager harness."""
     harness = _load_harness()

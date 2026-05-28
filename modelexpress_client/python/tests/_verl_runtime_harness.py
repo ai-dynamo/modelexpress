@@ -19,11 +19,18 @@ class VerlRuntimeSmokeResult:
     update_seconds: float
     check_seconds: float
     total_seconds: float
+    topology: str = "broadcast"
+    trainer_world_size: int = 1
+    rollout_world_size: int = 1
     failed: bool = False
     error_message: str = ""
     receive_success: bool = False
     requested_model_version: int | None = None
     resolved_model_version: int | None = None
+    receive_report_count: int = 0
+    receive_report_receiver_ranks: tuple[int, ...] = ()
+    receive_report_attempt_worker_ranks: tuple[int, ...] = ()
+    receive_report_successful_source_worker_ranks: tuple[int, ...] = ()
     source_roles: tuple[str, ...] = ()
     attempt_roles: tuple[str, ...] = ()
     attempt_worker_ids: tuple[str, ...] = ()
@@ -136,6 +143,8 @@ def _gbps(byte_count: int, seconds: float) -> float | None:
 def _json_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
     return value
 
 
@@ -152,6 +161,9 @@ def run_verl_checkpoint_manager_update(
     fail_trainer_transfer_before_recovery: bool = False,
     fail_refit_after_tensors: int | None = None,
     expect_update_failure: bool = False,
+    topology: str = "broadcast",
+    trainer_world_size: int = 1,
+    rollout_world_size: int = 1,
 ) -> VerlRuntimeSmokeResult:
     torch = pytest.importorskip("torch")
     ray = pytest.importorskip("ray")
@@ -162,8 +174,9 @@ def run_verl_checkpoint_manager_update(
     if backend == "nccl":
         pytest.importorskip("cupy")
 
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires at least two CUDA devices")
+    required_cuda_devices = trainer_world_size + rollout_world_size
+    if torch.cuda.device_count() < required_cuda_devices:
+        pytest.skip(f"requires at least {required_cuda_devices} CUDA devices")
 
     if not (verl_repo / "verl").is_dir():
         pytest.skip("MX_VERL_REPO_PATH does not point at a veRL checkout")
@@ -399,6 +412,7 @@ def run_verl_checkpoint_manager_update(
             return {
                 "requested_model_version": report.requested_model_version,
                 "resolved_model_version": report.resolved_model_version,
+                "receiver_rank": report.receiver_rank,
                 "success": report.success,
                 "retry_count": report.retry_count,
                 "source_roles": tuple(
@@ -409,6 +423,9 @@ def run_verl_checkpoint_manager_update(
                 ),
                 "attempt_worker_ids": tuple(
                     attempt.worker_id for attempt in report.attempts
+                ),
+                "attempt_worker_ranks": tuple(
+                    attempt.worker_rank for attempt in report.attempts
                 ),
                 "attempt_successes": tuple(
                     attempt.success for attempt in report.attempts
@@ -480,7 +497,7 @@ def run_verl_checkpoint_manager_update(
         ray.init(
             runtime_env={"env_vars": _ray_env(python_path)},
             include_dashboard=False,
-            num_gpus=2,
+            num_gpus=required_cuda_devices,
         )
 
         checkpoint_engine_config = _checkpoint_engine_config(
@@ -488,6 +505,7 @@ def run_verl_checkpoint_manager_update(
             model_name=model_name,
             server_url=server_url,
             republish_received=republish_received,
+            topology=topology,
         )
         model_config = HFModelConfig(
             path=str(model_path),
@@ -499,11 +517,17 @@ def run_verl_checkpoint_manager_update(
             name="vllm",
             checkpoint_engine=checkpoint_engine_config,
             tensor_model_parallel_size=1,
-            data_parallel_size=1,
+            data_parallel_size=rollout_world_size,
             pipeline_model_parallel_size=1,
         )
-        resource_pool = RayResourcePool(process_on_nodes=[2], max_colocate_count=3)
-        trainer_pool, rollout_pool = split_resource_pool(resource_pool, [1, 1])
+        resource_pool = RayResourcePool(
+            process_on_nodes=[required_cuda_devices],
+            max_colocate_count=max(required_cuda_devices, 3),
+        )
+        trainer_pool, rollout_pool = split_resource_pool(
+            resource_pool,
+            [trainer_world_size, rollout_world_size],
+        )
         trainer = create_trainer_worker_group(
             trainer_pool,
             model_config,
@@ -544,9 +568,10 @@ def run_verl_checkpoint_manager_update(
             check_started = time.perf_counter()
             rollout.check_weights()
             check_seconds = time.perf_counter() - check_started
-        receive_report = (
-            _receive_report_snapshot(rollout) if backend == "modelexpress" else {}
+        receive_reports = (
+            _receive_report_snapshots(rollout) if backend == "modelexpress" else ()
         )
+        receive_report = receive_reports[0] if receive_reports else {}
         recovery_update_seconds = 0.0
         recovery_check_seconds = 0.0
         recovery_report = {}
@@ -589,12 +614,16 @@ def run_verl_checkpoint_manager_update(
             recovery_check_started = time.perf_counter()
             recovery_rollout.check_weights()
             recovery_check_seconds = time.perf_counter() - recovery_check_started
-            recovery_report = _receive_report_snapshot(recovery_rollout)
+            recovery_reports = _receive_report_snapshots(recovery_rollout)
+            recovery_report = recovery_reports[0] if recovery_reports else {}
             recovery_lease_snapshot = _lease_snapshot(recovery_rollout)
         lease_snapshot = _lease_snapshot(rollout) if backend == "modelexpress" else {}
         return VerlRuntimeSmokeResult(
             backend=backend,
             model_name=model_name,
+            topology=topology,
+            trainer_world_size=trainer_world_size,
+            rollout_world_size=rollout_world_size,
             update_seconds=update_seconds,
             check_seconds=check_seconds,
             total_seconds=time.perf_counter() - total_started,
@@ -603,6 +632,7 @@ def run_verl_checkpoint_manager_update(
             receive_success=bool(receive_report.get("success", False)),
             requested_model_version=receive_report.get("requested_model_version"),
             resolved_model_version=receive_report.get("resolved_model_version"),
+            **_receive_report_rollup(receive_reports),
             source_roles=tuple(receive_report.get("source_roles", ())),
             attempt_roles=tuple(receive_report.get("attempt_roles", ())),
             attempt_worker_ids=tuple(receive_report.get("attempt_worker_ids", ())),
@@ -750,6 +780,7 @@ def _checkpoint_engine_config(
     model_name: str,
     server_url: str | None,
     republish_received: bool = False,
+    topology: str = "broadcast",
 ):
     from verl.workers.config import CheckpointEngineConfig
 
@@ -767,6 +798,7 @@ def _checkpoint_engine_config(
                     "dtype": "bfloat16",
                     "retain_latest_k": 1,
                     "timeout_seconds": 60.0,
+                    "topology": topology,
                     "republish_received": republish_received,
                     "retain_sources_on_finalize": True,
                 }
@@ -786,11 +818,37 @@ def _lease_snapshot(rollout):
     return snapshots
 
 
-def _receive_report_snapshot(rollout):
+def _receive_report_snapshots(rollout) -> tuple[dict[str, Any], ...]:
     snapshots = rollout.receive_report_snapshot()
     if isinstance(snapshots, list):
-        return snapshots[0] if snapshots else {}
-    return snapshots
+        return tuple(snapshot for snapshot in snapshots if snapshot)
+    if snapshots:
+        return (snapshots,)
+    return ()
+
+
+def _receive_report_rollup(reports: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    return {
+        "receive_report_count": len(reports),
+        "receive_report_receiver_ranks": tuple(
+            report["receiver_rank"] for report in reports if "receiver_rank" in report
+        ),
+        "receive_report_attempt_worker_ranks": tuple(
+            worker_rank
+            for report in reports
+            for worker_rank in report.get("attempt_worker_ranks", ())
+        ),
+        "receive_report_successful_source_worker_ranks": tuple(
+            worker_rank
+            for report in reports
+            for worker_rank, success in zip(
+                report.get("attempt_worker_ranks", ()),
+                report.get("attempt_successes", ()),
+                strict=True,
+            )
+            if success
+        ),
+    }
 
 
 def _create_tiny_qwen2_checkpoint(path: Path) -> Path:
