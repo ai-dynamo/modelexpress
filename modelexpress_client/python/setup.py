@@ -77,6 +77,8 @@ class BuildExtension(build_ext):
 
 
 def _ext_modules():
+    if os.environ.get("MX_SKIP_EXT"):
+        return []
     extra_compile_args = ["-std=c++17", "-O3", "-fPIC"]
     return [
         Extension(
