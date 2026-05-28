@@ -20,6 +20,7 @@ def test_verl_runtime_result_serializes_json_ready_values():
         total_seconds=2.0,
         source_roles=("trainer",),
         attempt_successes=(True,),
+        attempt_duration_seconds=(0.125,),
         lease_summary_statuses=None,
     )
 
@@ -28,6 +29,7 @@ def test_verl_runtime_result_serializes_json_ready_values():
     assert output["backend"] == "modelexpress"
     assert output["source_roles"] == ["trainer"]
     assert output["attempt_successes"] == [True]
+    assert output["attempt_duration_seconds"] == [0.125]
     assert output["lease_summary_statuses"] is None
 
 
@@ -49,6 +51,7 @@ def test_verl_runtime_comparison_serializes_summary():
         source_roles=("trainer",),
         bytes_transferred=1024,
         tensor_count=15,
+        transfer_duration_seconds=0.5,
         attempt_lease_ids=("lease-a",),
     )
 
@@ -63,6 +66,11 @@ def test_verl_runtime_comparison_serializes_summary():
         "modelexpress_to_nccl_update_ratio": 1.5,
         "modelexpress_bytes_transferred": 1024,
         "modelexpress_tensor_count": 15,
+        "modelexpress_transfer_duration_seconds": 0.5,
+        "modelexpress_effective_transfer_gbps": pytest.approx(0.000016384),
+        "modelexpress_effective_update_gbps": pytest.approx(
+            0.0000027306666666666
+        ),
         "modelexpress_retry_count": 0,
         "modelexpress_source_roles": ["trainer"],
         "modelexpress_attempt_lease_ids": ["lease-a"],

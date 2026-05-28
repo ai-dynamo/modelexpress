@@ -33,6 +33,8 @@ class VerlRuntimeSmokeResult:
     retry_count: int = 0
     bytes_transferred: int = 0
     tensor_count: int = 0
+    transfer_duration_seconds: float = 0.0
+    attempt_duration_seconds: tuple[float, ...] = ()
     attempt_lease_ids: tuple[str, ...] = ()
     report_lease_ids: tuple[str, ...] = ()
     matching_lease_statuses: tuple[int, ...] = ()
@@ -58,6 +60,8 @@ class VerlRuntimeSmokeResult:
     recovery_retry_count: int = 0
     recovery_bytes_transferred: int = 0
     recovery_tensor_count: int = 0
+    recovery_transfer_duration_seconds: float = 0.0
+    recovery_attempt_duration_seconds: tuple[float, ...] = ()
     recovery_attempt_lease_ids: tuple[str, ...] = ()
     recovery_report_lease_ids: tuple[str, ...] = ()
     recovery_matching_lease_statuses: tuple[int, ...] = ()
@@ -95,6 +99,17 @@ def verl_runtime_comparison_to_dict(
             ),
             "modelexpress_bytes_transferred": mx_result.bytes_transferred,
             "modelexpress_tensor_count": mx_result.tensor_count,
+            "modelexpress_transfer_duration_seconds": (
+                mx_result.transfer_duration_seconds
+            ),
+            "modelexpress_effective_transfer_gbps": _gbps(
+                mx_result.bytes_transferred,
+                mx_result.transfer_duration_seconds,
+            ),
+            "modelexpress_effective_update_gbps": _gbps(
+                mx_result.bytes_transferred,
+                mx_result.update_seconds,
+            ),
             "modelexpress_retry_count": mx_result.retry_count,
             "modelexpress_source_roles": list(mx_result.source_roles),
             "modelexpress_attempt_lease_ids": list(mx_result.attempt_lease_ids),
@@ -110,6 +125,12 @@ def _ratio(numerator: float, denominator: float) -> float | None:
     if denominator <= 0.0:
         return None
     return numerator / denominator
+
+
+def _gbps(byte_count: int, seconds: float) -> float | None:
+    if seconds <= 0.0:
+        return None
+    return byte_count * 8.0 / seconds / 1e9
 
 
 def _json_value(value: Any) -> Any:
@@ -406,6 +427,14 @@ def run_verl_checkpoint_manager_update(
                 "tensor_count": sum(
                     attempt.tensor_count for attempt in report.attempts if attempt.success
                 ),
+                "transfer_duration_seconds": sum(
+                    attempt.duration_seconds
+                    for attempt in report.attempts
+                    if attempt.success
+                ),
+                "attempt_duration_seconds": tuple(
+                    float(attempt.duration_seconds) for attempt in report.attempts
+                ),
                 "attempt_lease_ids": tuple(
                     attempt.lease_id for attempt in report.attempts if attempt.lease_id
                 ),
@@ -587,6 +616,12 @@ def run_verl_checkpoint_manager_update(
             retry_count=int(receive_report.get("retry_count", 0)),
             bytes_transferred=int(receive_report.get("bytes_transferred", 0)),
             tensor_count=int(receive_report.get("tensor_count", 0)),
+            transfer_duration_seconds=float(
+                receive_report.get("transfer_duration_seconds", 0.0)
+            ),
+            attempt_duration_seconds=tuple(
+                receive_report.get("attempt_duration_seconds", ())
+            ),
             attempt_lease_ids=tuple(receive_report.get("attempt_lease_ids", ())),
             report_lease_ids=tuple(lease_snapshot.get("report_lease_ids", ())),
             matching_lease_statuses=tuple(
@@ -640,6 +675,12 @@ def run_verl_checkpoint_manager_update(
                 recovery_report.get("bytes_transferred", 0)
             ),
             recovery_tensor_count=int(recovery_report.get("tensor_count", 0)),
+            recovery_transfer_duration_seconds=float(
+                recovery_report.get("transfer_duration_seconds", 0.0)
+            ),
+            recovery_attempt_duration_seconds=tuple(
+                recovery_report.get("attempt_duration_seconds", ())
+            ),
             recovery_attempt_lease_ids=tuple(
                 recovery_report.get("attempt_lease_ids", ())
             ),

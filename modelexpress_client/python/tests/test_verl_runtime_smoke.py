@@ -49,6 +49,9 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
     assert result.retry_count == 0
     assert result.tensor_count == 15
     assert result.bytes_transferred > 0
+    assert result.transfer_duration_seconds > 0.0
+    assert len(result.attempt_duration_seconds) == 1
+    assert result.attempt_duration_seconds[0] > 0.0
     assert result.attempt_lease_ids
     assert result.lease_summary_target_worker_id
     assert result.lease_summary_model_version == result.resolved_model_version
@@ -121,6 +124,9 @@ def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
     assert result.retry_count == 0
     assert result.tensor_count == 15
     assert result.bytes_transferred > 0
+    assert result.transfer_duration_seconds > 0.0
+    assert len(result.attempt_duration_seconds) == 1
+    assert result.attempt_duration_seconds[0] > 0.0
     assert result.report_lease_ids
     assert result.attempt_lease_ids == result.report_lease_ids
     assert result.transfer_lease_discovery_supported
@@ -175,6 +181,9 @@ def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
     assert result.recovery_retry_count == 0
     assert result.recovery_tensor_count == 15
     assert result.recovery_bytes_transferred > 0
+    assert result.recovery_transfer_duration_seconds > 0.0
+    assert len(result.recovery_attempt_duration_seconds) == 1
+    assert result.recovery_attempt_duration_seconds[0] > 0.0
     assert result.recovery_attempt_lease_ids
     assert result.recovery_attempt_lease_ids == result.recovery_report_lease_ids
     assert result.recovery_transfer_lease_discovery_supported
@@ -231,6 +240,10 @@ def test_live_verl_modelexpress_trainer_failure_falls_back_to_replica(
     assert result.recovery_retry_count == 1
     assert result.recovery_tensor_count == 15
     assert result.recovery_bytes_transferred > 0
+    assert result.recovery_transfer_duration_seconds > 0.0
+    assert len(result.recovery_attempt_duration_seconds) == 2
+    assert result.recovery_attempt_duration_seconds[0] >= 0.0
+    assert result.recovery_attempt_duration_seconds[1] > 0.0
     assert len(result.recovery_attempt_lease_ids) == 2
     assert result.recovery_attempt_lease_ids == result.recovery_report_lease_ids
     assert result.recovery_transfer_lease_discovery_supported
