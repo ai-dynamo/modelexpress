@@ -145,9 +145,16 @@ def test_benchmark_iteration_serializes_report_attempts():
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     )
+    assert item.matching_lease_status_names == (
+        "TRANSFER_LEASE_STATUS_FAILED",
+        "TRANSFER_LEASE_STATUS_COMPLETED",
+    )
     assert item.missing_lease_ids == ()
     assert item.non_completed_lease_statuses == (
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+    )
+    assert item.non_completed_lease_status_names == (
+        "TRANSFER_LEASE_STATUS_FAILED",
     )
     assert item.lease_summary_target_worker_id == "target-worker"
     assert item.lease_summary_model_version == 7
@@ -155,6 +162,10 @@ def test_benchmark_iteration_serializes_report_attempts():
     assert item.lease_summary_statuses == (
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
+    assert item.lease_summary_status_names == (
+        "TRANSFER_LEASE_STATUS_FAILED",
+        "TRANSFER_LEASE_STATUS_COMPLETED",
     )
     assert item.effective_bandwidth_gbps == pytest.approx(0.000016384)
     assert item.transfer_bandwidth_gbps == pytest.approx(0.0008192)
@@ -165,15 +176,27 @@ def test_benchmark_iteration_serializes_report_attempts():
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     ]
+    assert item.to_dict()["lease_summary_status_names"] == [
+        "TRANSFER_LEASE_STATUS_FAILED",
+        "TRANSFER_LEASE_STATUS_COMPLETED",
+    ]
     assert item.to_dict()["attempts"][0]["error"] == "first failed"
     assert item.to_dict()["attempts"][0]["lease_id"] == "lease-source-a"
     assert item.to_dict()["matching_lease_statuses"] == [
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     ]
+    assert item.to_dict()["matching_lease_status_names"] == [
+        "TRANSFER_LEASE_STATUS_FAILED",
+        "TRANSFER_LEASE_STATUS_COMPLETED",
+    ]
+    assert item.to_dict()["non_completed_lease_status_names"] == [
+        "TRANSFER_LEASE_STATUS_FAILED",
+    ]
     assert item.to_dict()["attempts"][1]["source_status"] == (
         p2p_pb2.SOURCE_STATUS_READY
     )
+    assert item.to_dict()["attempts"][1]["source_status_name"] == "SOURCE_STATUS_READY"
     assert item.to_dict()["attempts"][1]["source_updated_at"] == 1234567890000
     assert item.to_dict()["attempt_lease_ids"] == [
         "lease-source-a",

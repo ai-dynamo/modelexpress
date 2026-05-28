@@ -18,6 +18,7 @@ from typing import Any
 
 import torch
 
+from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 from modelexpress.rl_metadata import RlSourceRole
 from modelexpress.rl_shape_registry import torch_dtype_from_string
@@ -116,12 +117,15 @@ class RlTransferBenchmarkIteration:
     transfer_lease_discovery_supported: bool
     report_lease_ids: tuple[str, ...]
     matching_lease_statuses: tuple[int, ...]
+    matching_lease_status_names: tuple[str, ...]
     missing_lease_ids: tuple[str, ...]
     non_completed_lease_statuses: tuple[int, ...]
+    non_completed_lease_status_names: tuple[str, ...]
     lease_summary_target_worker_id: str
     lease_summary_model_version: int | None
     lease_summary_source_worker_id: str
     lease_summary_statuses: tuple[int, ...] | None
+    lease_summary_status_names: tuple[str, ...] | None
     source_role: str | None
     source_worker_id: str | None
     attempts: tuple[dict[str, Any], ...]
@@ -146,14 +150,23 @@ class RlTransferBenchmarkIteration:
             ),
             "report_lease_ids": list(self.report_lease_ids),
             "matching_lease_statuses": list(self.matching_lease_statuses),
+            "matching_lease_status_names": list(self.matching_lease_status_names),
             "missing_lease_ids": list(self.missing_lease_ids),
             "non_completed_lease_statuses": list(self.non_completed_lease_statuses),
+            "non_completed_lease_status_names": list(
+                self.non_completed_lease_status_names
+            ),
             "lease_summary_target_worker_id": self.lease_summary_target_worker_id,
             "lease_summary_model_version": self.lease_summary_model_version,
             "lease_summary_source_worker_id": self.lease_summary_source_worker_id,
             "lease_summary_statuses": (
                 list(self.lease_summary_statuses)
                 if self.lease_summary_statuses is not None
+                else None
+            ),
+            "lease_summary_status_names": (
+                list(self.lease_summary_status_names)
+                if self.lease_summary_status_names is not None
                 else None
             ),
             "source_role": self.source_role,
@@ -388,14 +401,30 @@ def _benchmark_iteration_from_report(
         matching_lease_statuses=tuple(
             int(lease.status) for lease in lease_summary.matching_leases
         ),
+        matching_lease_status_names=tuple(
+            _transfer_lease_status_name(lease.status)
+            for lease in lease_summary.matching_leases
+        ),
         missing_lease_ids=lease_summary.missing_lease_ids,
         non_completed_lease_statuses=tuple(
             int(lease.status) for lease in lease_summary.non_completed_matching_leases
+        ),
+        non_completed_lease_status_names=tuple(
+            _transfer_lease_status_name(lease.status)
+            for lease in lease_summary.non_completed_matching_leases
         ),
         lease_summary_target_worker_id=lease_summary.inventory.target_worker_id,
         lease_summary_model_version=lease_summary.inventory.model_version,
         lease_summary_source_worker_id=lease_summary.inventory.source_worker_id,
         lease_summary_statuses=lease_summary.inventory.statuses,
+        lease_summary_status_names=(
+            tuple(
+                _transfer_lease_status_name(status)
+                for status in lease_summary.inventory.statuses
+            )
+            if lease_summary.inventory.statuses is not None
+            else None
+        ),
         source_role=_role_value(report.source_role),
         source_worker_id=report.source_worker_id,
         attempts=tuple(_attempt_to_dict(attempt) for attempt in report.attempts),
@@ -413,6 +442,7 @@ def _attempt_to_dict(attempt: RlTransferAttempt) -> dict[str, Any]:
         "error": attempt.error,
         "lease_id": attempt.lease_id,
         "source_status": attempt.source_status,
+        "source_status_name": _source_status_name(attempt.source_status),
         "source_updated_at": attempt.source_updated_at,
         "bytes_transferred": attempt.bytes_transferred,
         "tensor_count": attempt.tensor_count,
@@ -422,6 +452,21 @@ def _attempt_to_dict(attempt: RlTransferAttempt) -> dict[str, Any]:
 
 def _role_value(role: RlSourceRole | None) -> str | None:
     return role.value if role is not None else None
+
+
+def _source_status_name(status: int) -> str:
+    return _enum_name(p2p_pb2.SourceStatus, int(status))
+
+
+def _transfer_lease_status_name(status: int) -> str:
+    return _enum_name(p2p_pb2.TransferLeaseStatus, int(status))
+
+
+def _enum_name(enum_type: Any, value: int) -> str:
+    try:
+        return str(enum_type.Name(value))
+    except ValueError:
+        return f"UNKNOWN_{value}"
 
 
 def _bandwidth_gbps(bytes_transferred: int, seconds: float) -> float:

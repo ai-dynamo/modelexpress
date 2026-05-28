@@ -60,6 +60,10 @@ def test_live_rl_benchmark_reports_transfer_lease_summary():
     assert iteration["transfer_lease_discovery_supported"] is True
     assert iteration["transfer_duration_seconds"] > 0.0
     assert iteration["transfer_bandwidth_gbps"] > 0.0
+    assert iteration["matching_lease_status_names"] == [
+        "TRANSFER_LEASE_STATUS_COMPLETED",
+    ]
+    assert iteration["non_completed_lease_status_names"] == []
     assert iteration["attempt_lease_ids"]
     assert iteration["report_lease_ids"] == iteration["attempt_lease_ids"]
     assert iteration["lease_summary_target_worker_id"]
