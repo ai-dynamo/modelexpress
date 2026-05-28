@@ -95,6 +95,10 @@ python -m modelexpress.rl_benchmark \
 
 Use `--output-json` when transport libraries also write logs to the console.
 The benchmark requires CUDA, NIXL, and a running ModelExpress server.
+Add `--republish-received --recover-latest-from-replica` to benchmark the
+P2P-elastic path where a receiver republishes as an inference replica and a
+restarted receiver recovers the latest version from that replica after the
+trainer source is marked stale.
 
 ## RL Transfer Leases
 

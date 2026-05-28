@@ -51,6 +51,8 @@ class RlTransferBenchmarkConfig:
     timeout_seconds: float = 60.0
     retain_latest_k: int = 1
     verify: bool = True
+    republish_received: bool = False
+    recover_latest_from_replica: bool = False
 
     def __post_init__(self) -> None:
         tensor_shape = tuple(int(dim) for dim in self.tensor_shape)
@@ -68,6 +70,8 @@ class RlTransferBenchmarkConfig:
             raise ValueError("CUDA device ids must be non-negative")
         if self.timeout_seconds <= 0.0:
             raise ValueError("timeout_seconds must be positive")
+        if self.recover_latest_from_replica and not self.republish_received:
+            raise ValueError("recover_latest_from_replica requires republish_received")
         object.__setattr__(self, "tensor_shape", tensor_shape)
         object.__setattr__(self, "dtype", str(torch_dtype_from_string(self.dtype)))
 
@@ -93,7 +97,77 @@ class RlTransferBenchmarkConfig:
             "timeout_seconds": self.timeout_seconds,
             "retain_latest_k": self.retain_latest_k,
             "verify": self.verify,
+            "republish_received": self.republish_received,
+            "recover_latest_from_replica": self.recover_latest_from_replica,
             "tensor_bytes": self.tensor_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class RlTransferBenchmarkReceive:
+    """Measurements for one benchmark receive phase."""
+
+    receive_seconds: float
+    transfer_duration_seconds: float
+    effective_bandwidth_gbps: float
+    transfer_bandwidth_gbps: float
+    retry_count: int
+    attempt_lease_ids: tuple[str, ...]
+    transfer_lease_discovery_supported: bool
+    report_lease_ids: tuple[str, ...]
+    matching_lease_statuses: tuple[int, ...]
+    matching_lease_status_names: tuple[str, ...]
+    missing_lease_ids: tuple[str, ...]
+    non_completed_lease_statuses: tuple[int, ...]
+    non_completed_lease_status_names: tuple[str, ...]
+    lease_summary_target_worker_id: str
+    lease_summary_model_version: int | None
+    lease_summary_source_worker_id: str
+    lease_summary_statuses: tuple[int, ...] | None
+    lease_summary_status_names: tuple[str, ...] | None
+    source_role: str | None
+    source_worker_id: str | None
+    transferred_bytes: int
+    tensor_count: int
+    attempts: tuple[dict[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receive_seconds": self.receive_seconds,
+            "transfer_duration_seconds": self.transfer_duration_seconds,
+            "effective_bandwidth_gbps": self.effective_bandwidth_gbps,
+            "transfer_bandwidth_gbps": self.transfer_bandwidth_gbps,
+            "retry_count": self.retry_count,
+            "attempt_lease_ids": list(self.attempt_lease_ids),
+            "transfer_lease_discovery_supported": (
+                self.transfer_lease_discovery_supported
+            ),
+            "report_lease_ids": list(self.report_lease_ids),
+            "matching_lease_statuses": list(self.matching_lease_statuses),
+            "matching_lease_status_names": list(self.matching_lease_status_names),
+            "missing_lease_ids": list(self.missing_lease_ids),
+            "non_completed_lease_statuses": list(self.non_completed_lease_statuses),
+            "non_completed_lease_status_names": list(
+                self.non_completed_lease_status_names
+            ),
+            "lease_summary_target_worker_id": self.lease_summary_target_worker_id,
+            "lease_summary_model_version": self.lease_summary_model_version,
+            "lease_summary_source_worker_id": self.lease_summary_source_worker_id,
+            "lease_summary_statuses": (
+                list(self.lease_summary_statuses)
+                if self.lease_summary_statuses is not None
+                else None
+            ),
+            "lease_summary_status_names": (
+                list(self.lease_summary_status_names)
+                if self.lease_summary_status_names is not None
+                else None
+            ),
+            "source_role": self.source_role,
+            "source_worker_id": self.source_worker_id,
+            "transferred_bytes": self.transferred_bytes,
+            "tensor_count": self.tensor_count,
+            "attempts": list(self.attempts),
         }
 
 
@@ -129,6 +203,7 @@ class RlTransferBenchmarkIteration:
     source_role: str | None
     source_worker_id: str | None
     attempts: tuple[dict[str, Any], ...]
+    recovery_receive: RlTransferBenchmarkReceive | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -172,6 +247,11 @@ class RlTransferBenchmarkIteration:
             "source_role": self.source_role,
             "source_worker_id": self.source_worker_id,
             "attempts": list(self.attempts),
+            "recovery_receive": (
+                self.recovery_receive.to_dict()
+                if self.recovery_receive is not None
+                else None
+            ),
         }
 
 
@@ -193,12 +273,17 @@ class RlTransferBenchmarkResult:
         effective_bandwidth = [item.effective_bandwidth_gbps for item in measured]
         transfer_bandwidth = [item.transfer_bandwidth_gbps for item in measured]
         transfer_seconds = [item.transfer_duration_seconds for item in measured]
+        recovery_receives = [
+            item.recovery_receive
+            for item in measured
+            if item.recovery_receive is not None
+        ]
         attempts = [
             attempt
             for item in measured
             for attempt in item.attempts
         ]
-        return {
+        summary = {
             "iterations": len(measured),
             "total_transferred_bytes": sum(item.transferred_bytes for item in measured),
             "mean_receive_seconds": statistics.fmean(receive_seconds),
@@ -231,7 +316,33 @@ class RlTransferBenchmarkResult:
             "non_completed_matching_leases": sum(
                 len(item.non_completed_lease_statuses) for item in measured
             ),
+            "recovery_iterations": len(recovery_receives),
         }
+        if recovery_receives:
+            summary.update(
+                {
+                    "mean_recovery_receive_seconds": statistics.fmean(
+                        item.receive_seconds for item in recovery_receives
+                    ),
+                    "mean_recovery_transfer_duration_seconds": statistics.fmean(
+                        item.transfer_duration_seconds for item in recovery_receives
+                    ),
+                    "mean_recovery_transfer_bandwidth_gbps": statistics.fmean(
+                        item.transfer_bandwidth_gbps for item in recovery_receives
+                    ),
+                    "recovery_total_retries": sum(
+                        item.retry_count for item in recovery_receives
+                    ),
+                    "recovery_source_roles": sorted(
+                        {
+                            item.source_role
+                            for item in recovery_receives
+                            if item.source_role is not None
+                        }
+                    ),
+                }
+            )
+        return summary
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -274,6 +385,17 @@ def run_mx_rl_transfer_benchmark(
         device_id=config.target_device_id,
         timeout_seconds=config.timeout_seconds,
     )
+    restarted_receiver = (
+        RlNixlWeightTransfer(
+            mx_client=client,
+            base_identity=base_identity,
+            worker_id=f"mx-rl-bench-restart-{uuid.uuid4().hex[:8]}",
+            device_id=config.target_device_id,
+            timeout_seconds=config.timeout_seconds,
+        )
+        if config.recover_latest_from_replica
+        else None
+    )
 
     iterations: list[RlTransferBenchmarkIteration] = []
     try:
@@ -298,13 +420,23 @@ def run_mx_rl_transfer_benchmark(
             }
             torch.cuda.synchronize(config.target_device_id)
             receive_start = time.perf_counter()
-            received = asyncio.run(
-                receiver.receive_into_tensors(
-                    target_tensors,
-                    model_version=model_version,
-                    receiver_rank=0,
+            if config.republish_received:
+                received = asyncio.run(
+                    receiver.receive_and_publish_replica(
+                        target_tensors,
+                        model_version=model_version,
+                        receiver_rank=0,
+                        replica_world_size=1,
+                    )
                 )
-            )
+            else:
+                received = asyncio.run(
+                    receiver.receive_into_tensors(
+                        target_tensors,
+                        model_version=model_version,
+                        receiver_rank=0,
+                    )
+                )
             torch.cuda.synchronize(config.target_device_id)
             receive_seconds = time.perf_counter() - receive_start
 
@@ -314,6 +446,14 @@ def run_mx_rl_transfer_benchmark(
             if config.verify:
                 _verify_received(source_tensors, dict(received))
             lease_summary = _lease_summary_for_report(receiver, report)
+            recovery_receive = None
+            if restarted_receiver is not None:
+                publisher.mark_current_source_stale()
+                recovery_receive = _recover_latest_from_replica(
+                    config=config,
+                    restarted_receiver=restarted_receiver,
+                    source_tensors=source_tensors,
+                )
             iterations.append(
                 _benchmark_iteration_from_report(
                     index=index,
@@ -324,9 +464,12 @@ def run_mx_rl_transfer_benchmark(
                     receive_seconds=receive_seconds,
                     report=report,
                     lease_summary=lease_summary,
+                    recovery_receive=recovery_receive,
                 )
             )
     finally:
+        if restarted_receiver is not None:
+            restarted_receiver.finalize()
         receiver.finalize()
         publisher.finalize()
         client.close()
@@ -351,6 +494,41 @@ def _lease_summary_for_report(
     )
 
 
+def _recover_latest_from_replica(
+    *,
+    config: RlTransferBenchmarkConfig,
+    restarted_receiver: RlNixlWeightTransfer,
+    source_tensors: dict[str, torch.Tensor],
+) -> RlTransferBenchmarkReceive:
+    recovery_tensors = {
+        name: torch.empty_like(tensor, device=f"cuda:{config.target_device_id}")
+        for name, tensor in source_tensors.items()
+    }
+    torch.cuda.synchronize(config.target_device_id)
+    receive_start = time.perf_counter()
+    recovered = asyncio.run(
+        restarted_receiver.receive_into_tensors(
+            recovery_tensors,
+            model_version=None,
+            receiver_rank=0,
+            roles=(RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER),
+        )
+    )
+    torch.cuda.synchronize(config.target_device_id)
+    receive_seconds = time.perf_counter() - receive_start
+
+    report = restarted_receiver.last_receive_report
+    if report is None or not report.success:
+        raise RuntimeError("ModelExpress RL benchmark replica recovery did not succeed")
+    if config.verify:
+        _verify_received(source_tensors, dict(recovered))
+    return _benchmark_receive_from_report(
+        receive_seconds=receive_seconds,
+        report=report,
+        lease_summary=_lease_summary_for_report(restarted_receiver, report),
+    )
+
+
 def _benchmark_iteration_from_report(
     *,
     index: int,
@@ -361,7 +539,54 @@ def _benchmark_iteration_from_report(
     receive_seconds: float,
     report: RlTransferReport,
     lease_summary: RlTransferLeaseReportSummary | None = None,
+    recovery_receive: RlTransferBenchmarkReceive | None = None,
 ) -> RlTransferBenchmarkIteration:
+    receive = _benchmark_receive_from_report(
+        receive_seconds=receive_seconds,
+        report=report,
+        lease_summary=lease_summary,
+    )
+    return RlTransferBenchmarkIteration(
+        index=index,
+        warmup=warmup,
+        model_version=model_version,
+        tensor_count=receive.tensor_count,
+        expected_bytes=expected_bytes,
+        transferred_bytes=receive.transferred_bytes,
+        publish_seconds=publish_seconds,
+        receive_seconds=receive.receive_seconds,
+        transfer_duration_seconds=receive.transfer_duration_seconds,
+        effective_bandwidth_gbps=receive.effective_bandwidth_gbps,
+        transfer_bandwidth_gbps=receive.transfer_bandwidth_gbps,
+        retry_count=receive.retry_count,
+        attempt_lease_ids=receive.attempt_lease_ids,
+        transfer_lease_discovery_supported=(
+            receive.transfer_lease_discovery_supported
+        ),
+        report_lease_ids=receive.report_lease_ids,
+        matching_lease_statuses=receive.matching_lease_statuses,
+        matching_lease_status_names=receive.matching_lease_status_names,
+        missing_lease_ids=receive.missing_lease_ids,
+        non_completed_lease_statuses=receive.non_completed_lease_statuses,
+        non_completed_lease_status_names=receive.non_completed_lease_status_names,
+        lease_summary_target_worker_id=receive.lease_summary_target_worker_id,
+        lease_summary_model_version=receive.lease_summary_model_version,
+        lease_summary_source_worker_id=receive.lease_summary_source_worker_id,
+        lease_summary_statuses=receive.lease_summary_statuses,
+        lease_summary_status_names=receive.lease_summary_status_names,
+        source_role=receive.source_role,
+        source_worker_id=receive.source_worker_id,
+        attempts=receive.attempts,
+        recovery_receive=recovery_receive,
+    )
+
+
+def _benchmark_receive_from_report(
+    *,
+    receive_seconds: float,
+    report: RlTransferReport,
+    lease_summary: RlTransferLeaseReportSummary | None = None,
+) -> RlTransferBenchmarkReceive:
     successful_attempts = [attempt for attempt in report.attempts if attempt.success]
     transferred_bytes = sum(attempt.bytes_transferred for attempt in successful_attempts)
     tensor_count = sum(attempt.tensor_count for attempt in successful_attempts)
@@ -377,14 +602,7 @@ def _benchmark_iteration_from_report(
             ),
         )
     lease_discovery_supported = lease_summary.inventory.discovery_supported
-    return RlTransferBenchmarkIteration(
-        index=index,
-        warmup=warmup,
-        model_version=model_version,
-        tensor_count=tensor_count,
-        expected_bytes=expected_bytes,
-        transferred_bytes=transferred_bytes,
-        publish_seconds=publish_seconds,
+    return RlTransferBenchmarkReceive(
         receive_seconds=receive_seconds,
         transfer_duration_seconds=transfer_duration_seconds,
         effective_bandwidth_gbps=_bandwidth_gbps(transferred_bytes, receive_seconds),
@@ -427,6 +645,8 @@ def _benchmark_iteration_from_report(
         ),
         source_role=_role_value(report.source_role),
         source_worker_id=report.source_worker_id,
+        tensor_count=tensor_count,
+        transferred_bytes=transferred_bytes,
         attempts=tuple(_attempt_to_dict(attempt) for attempt in report.attempts),
     )
 
@@ -553,6 +773,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retain-latest-k", type=int, default=1)
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument(
+        "--republish-received",
+        action="store_true",
+        help="Publish the primary receive result as an inference replica.",
+    )
+    parser.add_argument(
+        "--recover-latest-from-replica",
+        action="store_true",
+        help="After primary republish, stale the trainer and recover latest from the replica.",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -577,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             retain_latest_k=args.retain_latest_k,
             verify=not args.no_verify,
+            republish_received=args.republish_received,
+            recover_latest_from_replica=args.recover_latest_from_replica,
         )
     )
     output = json.dumps(result.to_dict(), indent=2, sort_keys=True)

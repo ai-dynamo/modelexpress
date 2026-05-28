@@ -11,6 +11,7 @@ from modelexpress.rl_benchmark import (
     RlTransferBenchmarkResult,
     _build_parser,
     _benchmark_iteration_from_report,
+    _benchmark_receive_from_report,
     _lease_summary_for_report,
     _parse_tensor_shape,
 )
@@ -64,6 +65,13 @@ def test_benchmark_config_rejects_invalid_values():
             server_url="localhost:8001",
             model_name="bench",
             source_device_id=-1,
+        )
+
+    with pytest.raises(ValueError, match="requires republish_received"):
+        RlTransferBenchmarkConfig(
+            server_url="localhost:8001",
+            model_name="bench",
+            recover_latest_from_replica=True,
         )
 
 
@@ -203,6 +211,7 @@ def test_benchmark_iteration_serializes_report_attempts():
         "lease-source-b",
     ]
     assert item.to_dict()["transfer_bandwidth_gbps"] == pytest.approx(0.0008192)
+    assert item.to_dict()["recovery_receive"] is None
 
 
 def test_benchmark_lease_summary_scopes_to_report_version_and_source_worker():
@@ -378,6 +387,83 @@ def test_benchmark_result_summary_ignores_warmups():
     assert not summary["lease_discovery_supported"]
     assert summary["iterations_with_missing_lease_ids"] == 0
     assert summary["non_completed_matching_leases"] == 0
+    assert summary["recovery_iterations"] == 0
+
+
+def test_benchmark_result_summary_reports_replica_recovery_receive():
+    primary_report = RlTransferReport(
+        requested_model_version=3,
+        resolved_model_version=3,
+        receiver_rank=0,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="trainer-source",
+                worker_id="trainer-worker",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=3,
+                success=True,
+                bytes_transferred=100,
+                tensor_count=1,
+                duration_seconds=0.01,
+            ),
+        ),
+    )
+    recovery_report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=3,
+        receiver_rank=0,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="replica-source",
+                worker_id="replica-worker",
+                worker_rank=0,
+                role=RlSourceRole.INFERENCE_REPLICA,
+                model_version=3,
+                success=True,
+                bytes_transferred=100,
+                tensor_count=1,
+                duration_seconds=0.02,
+            ),
+        ),
+    )
+    recovery_receive = _benchmark_receive_from_report(
+        receive_seconds=2.0,
+        report=recovery_report,
+    )
+    iteration = _benchmark_iteration_from_report(
+        index=0,
+        warmup=False,
+        model_version=3,
+        expected_bytes=100,
+        publish_seconds=0.1,
+        receive_seconds=1.0,
+        report=primary_report,
+        recovery_receive=recovery_receive,
+    )
+    result = RlTransferBenchmarkResult(
+        backend="modelexpress",
+        config=RlTransferBenchmarkConfig(
+            server_url="localhost:8001",
+            model_name="bench",
+            republish_received=True,
+            recover_latest_from_replica=True,
+        ),
+        iterations=(iteration,),
+    )
+
+    output = result.to_dict()
+    summary = output["summary"]
+    recovery_output = output["iterations"][0]["recovery_receive"]
+
+    assert summary["recovery_iterations"] == 1
+    assert summary["mean_recovery_receive_seconds"] == 2.0
+    assert summary["mean_recovery_transfer_duration_seconds"] == 0.02
+    assert summary["mean_recovery_transfer_bandwidth_gbps"] == pytest.approx(0.00004)
+    assert summary["recovery_total_retries"] == 0
+    assert summary["recovery_source_roles"] == ["inference_replica"]
+    assert recovery_output["source_role"] == "inference_replica"
+    assert recovery_output["transferred_bytes"] == 100
 
 
 def test_parse_tensor_shape_accepts_comma_or_x_separators():
@@ -389,6 +475,15 @@ def test_parse_tensor_shape_accepts_comma_or_x_separators():
 
 
 def test_parser_accepts_output_json_path(tmp_path):
-    args = _build_parser().parse_args(["--output-json", str(tmp_path / "result.json")])
+    args = _build_parser().parse_args(
+        [
+            "--republish-received",
+            "--recover-latest-from-replica",
+            "--output-json",
+            str(tmp_path / "result.json"),
+        ]
+    )
 
     assert args.output_json == tmp_path / "result.json"
+    assert args.republish_received is True
+    assert args.recover_latest_from_replica is True
