@@ -37,6 +37,10 @@ class RlTransferLeaseInventory:
     target_worker_id: str
     leases: tuple["p2p_pb2.TransferLease", ...] = ()
     discovery_supported: bool = True
+    mx_source_id: str = ""
+    statuses: tuple[int, ...] | None = None
+    model_version: int | None = None
+    source_worker_id: str = ""
 
     @property
     def active_leases(self) -> tuple["p2p_pb2.TransferLease", ...]:
@@ -242,10 +246,15 @@ class RlTransferLeaseCoordinator:
         empty inventory so framework adapters can preserve compatibility.
         """
         list_leases = getattr(self._mx_client, "list_transfer_leases", None)
+        status_scope = _status_scope(statuses)
         if list_leases is None:
             return RlTransferLeaseInventory(
                 target_worker_id=self._target_worker_id,
                 discovery_supported=False,
+                mx_source_id=mx_source_id,
+                statuses=status_scope,
+                model_version=model_version,
+                source_worker_id=source_worker_id,
             )
 
         try:
@@ -253,7 +262,7 @@ class RlTransferLeaseCoordinator:
                 list_leases,
                 mx_source_id=mx_source_id,
                 target_worker_id=self._target_worker_id,
-                statuses=statuses,
+                statuses=status_scope,
                 model_version=model_version,
                 source_worker_id=source_worker_id,
             )
@@ -262,6 +271,10 @@ class RlTransferLeaseCoordinator:
                 return RlTransferLeaseInventory(
                     target_worker_id=self._target_worker_id,
                     discovery_supported=False,
+                    mx_source_id=mx_source_id,
+                    statuses=status_scope,
+                    model_version=model_version,
+                    source_worker_id=source_worker_id,
                 )
             raise
 
@@ -269,6 +282,10 @@ class RlTransferLeaseCoordinator:
             target_worker_id=self._target_worker_id,
             leases=leases,
             discovery_supported=True,
+            mx_source_id=mx_source_id,
+            statuses=status_scope,
+            model_version=model_version,
+            source_worker_id=source_worker_id,
         )
 
     @property
@@ -398,3 +415,9 @@ def _list_leases_by_status(
         for lease in response.leases:
             leases_by_id.setdefault(lease.lease_id, lease)
     return tuple(leases_by_id.values())
+
+
+def _status_scope(statuses: Iterable[int] | None) -> tuple[int, ...] | None:
+    if statuses is None:
+        return None
+    return tuple(int(status) for status in statuses)

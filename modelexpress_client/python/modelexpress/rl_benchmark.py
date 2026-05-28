@@ -117,6 +117,10 @@ class RlTransferBenchmarkIteration:
     matching_lease_statuses: tuple[int, ...]
     missing_lease_ids: tuple[str, ...]
     non_completed_lease_statuses: tuple[int, ...]
+    lease_summary_target_worker_id: str
+    lease_summary_model_version: int | None
+    lease_summary_source_worker_id: str
+    lease_summary_statuses: tuple[int, ...] | None
     source_role: str | None
     source_worker_id: str | None
     attempts: tuple[dict[str, Any], ...]
@@ -142,6 +146,14 @@ class RlTransferBenchmarkIteration:
             "matching_lease_statuses": list(self.matching_lease_statuses),
             "missing_lease_ids": list(self.missing_lease_ids),
             "non_completed_lease_statuses": list(self.non_completed_lease_statuses),
+            "lease_summary_target_worker_id": self.lease_summary_target_worker_id,
+            "lease_summary_model_version": self.lease_summary_model_version,
+            "lease_summary_source_worker_id": self.lease_summary_source_worker_id,
+            "lease_summary_statuses": (
+                list(self.lease_summary_statuses)
+                if self.lease_summary_statuses is not None
+                else None
+            ),
             "source_role": self.source_role,
             "source_worker_id": self.source_worker_id,
             "attempts": list(self.attempts),
@@ -368,6 +380,10 @@ def _benchmark_iteration_from_report(
         non_completed_lease_statuses=tuple(
             int(lease.status) for lease in lease_summary.non_completed_matching_leases
         ),
+        lease_summary_target_worker_id=lease_summary.inventory.target_worker_id,
+        lease_summary_model_version=lease_summary.inventory.model_version,
+        lease_summary_source_worker_id=lease_summary.inventory.source_worker_id,
+        lease_summary_statuses=lease_summary.inventory.statuses,
         source_role=_role_value(report.source_role),
         source_worker_id=report.source_worker_id,
         attempts=tuple(_attempt_to_dict(attempt) for attempt in report.attempts),

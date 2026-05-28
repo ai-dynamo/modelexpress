@@ -314,15 +314,24 @@ def test_transfer_lease_coordinator_lists_target_attempts_by_status():
 
     inventory = coordinator.list_target_leases(
         mx_source_id="source",
-        statuses=(
-            p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
-            p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
+        statuses=iter(
+            (
+                p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
+                p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
+            )
         ),
         model_version=8,
         source_worker_id="source-worker",
     )
 
     assert inventory.discovery_supported
+    assert inventory.mx_source_id == "source"
+    assert inventory.statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_ACTIVE,
+        p2p_pb2.TRANSFER_LEASE_STATUS_EXPIRED,
+    )
+    assert inventory.model_version == 8
+    assert inventory.source_worker_id == "source-worker"
     assert [lease.lease_id for lease in inventory.leases] == [
         "lease-active",
         "lease-expired",

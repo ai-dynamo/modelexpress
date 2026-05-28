@@ -103,6 +103,12 @@ def test_benchmark_iteration_serializes_report_attempts():
         report,
         RlTransferLeaseInventory(
             target_worker_id="target-worker",
+            statuses=(
+                p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+                p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+            ),
+            model_version=7,
+            source_worker_id="worker-b",
             leases=(
                 _lease(
                     "lease-source-a",
@@ -143,7 +149,21 @@ def test_benchmark_iteration_serializes_report_attempts():
     assert item.non_completed_lease_statuses == (
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
     )
+    assert item.lease_summary_target_worker_id == "target-worker"
+    assert item.lease_summary_model_version == 7
+    assert item.lease_summary_source_worker_id == "worker-b"
+    assert item.lease_summary_statuses == (
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    )
     assert item.effective_bandwidth_gbps == pytest.approx(0.000016384)
+    assert item.to_dict()["lease_summary_target_worker_id"] == "target-worker"
+    assert item.to_dict()["lease_summary_model_version"] == 7
+    assert item.to_dict()["lease_summary_source_worker_id"] == "worker-b"
+    assert item.to_dict()["lease_summary_statuses"] == [
+        p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
+        p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
+    ]
     assert item.to_dict()["attempts"][0]["error"] == "first failed"
     assert item.to_dict()["attempts"][0]["lease_id"] == "lease-source-a"
     assert item.to_dict()["matching_lease_statuses"] == [
@@ -186,6 +206,8 @@ def test_benchmark_lease_summary_scopes_to_report_version_and_source_worker():
             self.kwargs = kwargs
             return RlTransferLeaseInventory(
                 target_worker_id="target-worker",
+                model_version=kwargs["model_version"],
+                source_worker_id=kwargs["source_worker_id"],
                 leases=(
                     _lease(
                         "lease-a",
@@ -201,6 +223,8 @@ def test_benchmark_lease_summary_scopes_to_report_version_and_source_worker():
         "model_version": 7,
         "source_worker_id": "worker-a",
     }
+    assert summary.inventory.model_version == 7
+    assert summary.inventory.source_worker_id == "worker-a"
     assert [lease.lease_id for lease in summary.matching_leases] == ["lease-a"]
 
 
@@ -239,6 +263,8 @@ def test_benchmark_lease_summary_keeps_multi_source_reports_unscoped():
             self.kwargs = kwargs
             return RlTransferLeaseInventory(
                 target_worker_id="target-worker",
+                model_version=kwargs["model_version"],
+                source_worker_id=kwargs["source_worker_id"],
                 leases=(
                     _lease(
                         "lease-a",
@@ -258,6 +284,8 @@ def test_benchmark_lease_summary_keeps_multi_source_reports_unscoped():
         "model_version": 7,
         "source_worker_id": "",
     }
+    assert summary.inventory.model_version == 7
+    assert summary.inventory.source_worker_id == ""
     assert [lease.lease_id for lease in summary.matching_leases] == [
         "lease-a",
         "lease-b",

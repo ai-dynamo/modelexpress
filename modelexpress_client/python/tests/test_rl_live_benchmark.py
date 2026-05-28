@@ -58,6 +58,10 @@ def test_live_rl_benchmark_reports_transfer_lease_summary():
     assert iteration["transfer_lease_discovery_supported"] is True
     assert iteration["attempt_lease_ids"]
     assert iteration["report_lease_ids"] == iteration["attempt_lease_ids"]
+    assert iteration["lease_summary_target_worker_id"]
+    assert iteration["lease_summary_model_version"] == iteration["model_version"]
+    assert iteration["lease_summary_source_worker_id"] == iteration["source_worker_id"]
+    assert iteration["lease_summary_statuses"] is None
     assert iteration["missing_lease_ids"] == []
     assert iteration["matching_lease_statuses"] == [
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED
