@@ -3,7 +3,7 @@
 
 # ModelExpress K8s CI.
 #
-# Eight jobs:
+# Nine jobs:
 #   build-server        — builds and pushes the MX coordination server image
 #                         from ci/k8s/server/Dockerfile.server. Runs on the
 #                         self-hosted builder runner
@@ -63,6 +63,12 @@
 #                          launch command. Uncomment the sglang matrix entry
 #                          once both are addressed.
 #
+#   ci-status-check     — umbrella job that needs every gating job above.
+#                         Single check that the branch-protection rule on
+#                         `main` requires; adding a new gating job means
+#                         appending it to this job's `needs:` list, no
+#                         branch-protection reconfigure needed.
+#
 # To add a new inference engine:
 #   1. Add ci/k8s/client/<engine>/Dockerfile
 #   2. Add ci/k8s/client/<engine>/manifest-*.yaml + test_p2p_k8s.py
@@ -73,6 +79,9 @@
 #   5. If the engine also runs under a Dynamo DGD (`dynamo-<engine>`), add it
 #      to the build-client matrix with the dynamo-specific Dockerfile and
 #      consider extending test-with-dynamo to a matrix.
+#   6. If you add a new top-level test job (not just a matrix entry), add
+#      its job key to `ci-status-check`'s `needs:` list so it's covered by
+#      the branch-protection gate.
 #
 # Required secrets:
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
@@ -684,3 +693,44 @@ jobs:
           s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
           s3_region: ${{ env.MX_CI_S3_REGION }}
           hf_token: ${{ secrets.HF_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Umbrella status check for branch protection.
+  #
+  # Aggregates the result of every gating job in this workflow into a single
+  # check that GitHub's branch-protection rule on `main` requires. The
+  # indirection lets us add or remove gating jobs by editing only the `needs:`
+  # list below — no need to update the branch-protection configuration in the
+  # GitHub repo settings every time.
+  #
+  # `if: always()` is load-bearing: without it, a failed dependency would
+  # mark this job as `skipped`, which GitHub branch protection treats as
+  # `pending` indefinitely, blocking the PR forever. With `always()`, the
+  # job runs and the bash check below decides pass/fail based on each
+  # dependency's `.result`.
+  #
+  # `success` and `skipped` are both accepted as "passing":
+  #   - `success` is the happy path
+  #   - `skipped` accommodates conditional jobs (e.g., a job behind a
+  #     changed-files filter that legitimately didn't need to run). None of
+  #     our gating jobs are skippable today, but the allowance future-proofs
+  #     the gate without forcing a reconfigure.
+  # ---------------------------------------------------------------------------
+  ci-status-check:
+    name: CI status check
+    runs-on: ubuntu-latest
+    needs:
+      - build-server
+      - build-client
+      - ensure-vcluster
+      - test-p2p
+      - test-tp
+      - test-with-dynamo
+      - test-stale-metadata
+      - model-streamer
+    if: always()
+    steps:
+      - name: All dependent jobs succeeded (or skipped)
+        run: |
+          echo '${{ toJson(needs) }}' \
+            | jq -e 'to_entries | map(.value.result) | all(. as $r | ["success", "skipped"] | any($r == .))'
