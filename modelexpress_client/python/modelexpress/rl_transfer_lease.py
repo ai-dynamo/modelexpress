@@ -156,9 +156,12 @@ def summarize_report_leases(
         for lease_id in report_lease_ids
         if lease_id in leases_by_id
     )
-    missing_lease_ids = tuple(
-        lease_id for lease_id in report_lease_ids if lease_id not in leases_by_id
-    )
+    if inventory.discovery_supported:
+        missing_lease_ids = tuple(
+            lease_id for lease_id in report_lease_ids if lease_id not in leases_by_id
+        )
+    else:
+        missing_lease_ids = ()
     return RlTransferLeaseReportSummary(
         report=report,
         inventory=inventory,

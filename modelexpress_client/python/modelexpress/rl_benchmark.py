@@ -353,9 +353,6 @@ def _benchmark_iteration_from_report(
             ),
         )
     lease_discovery_supported = lease_summary.inventory.discovery_supported
-    missing_lease_ids = (
-        lease_summary.missing_lease_ids if lease_discovery_supported else ()
-    )
     return RlTransferBenchmarkIteration(
         index=index,
         warmup=warmup,
@@ -376,7 +373,7 @@ def _benchmark_iteration_from_report(
         matching_lease_statuses=tuple(
             int(lease.status) for lease in lease_summary.matching_leases
         ),
-        missing_lease_ids=missing_lease_ids,
+        missing_lease_ids=lease_summary.missing_lease_ids,
         non_completed_lease_statuses=tuple(
             int(lease.status) for lease in lease_summary.non_completed_matching_leases
         ),

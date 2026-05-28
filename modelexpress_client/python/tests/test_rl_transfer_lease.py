@@ -286,6 +286,36 @@ def test_transfer_lease_summary_handles_absent_report():
     assert not summary.has_missing_leases
 
 
+def test_transfer_lease_summary_does_not_mark_missing_when_discovery_unsupported():
+    report = RlTransferReport(
+        requested_model_version=None,
+        resolved_model_version=7,
+        receiver_rank=0,
+        attempts=(
+            RlTransferAttempt(
+                mx_source_id="source",
+                worker_id="worker-a",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=7,
+                success=True,
+                lease_id="lease-v7-completed",
+            ),
+        ),
+    )
+    inventory = RlTransferLeaseInventory(
+        target_worker_id="target-worker",
+        discovery_supported=False,
+    )
+
+    summary = summarize_report_leases(report, inventory)
+
+    assert summary.report_lease_ids == ("lease-v7-completed",)
+    assert summary.matching_leases == ()
+    assert summary.missing_lease_ids == ()
+    assert not summary.has_missing_leases
+
+
 def test_transfer_lease_coordinator_lists_target_attempts_by_status():
     client = _LeaseClient()
     client.leases_by_status = {
