@@ -15,6 +15,10 @@ from modelexpress.rl_benchmark import (
     _lease_summary_for_report,
     _parse_tensor_shape,
 )
+from modelexpress.rl_benchmark_fanin import (
+    _dense_fanin_target_specs,
+    _dense_fanin_tensor_metadata,
+)
 from modelexpress.rl_metadata import RlSourceRole
 from modelexpress.rl_transfer import RlTransferAttempt, RlTransferReport
 from modelexpress.rl_transfer_lease import (
@@ -43,6 +47,23 @@ def test_benchmark_config_normalizes_dtype_and_counts_bytes():
     assert config.dtype == "torch.float16"
     assert config.tensor_bytes == 3 * 2 * 4 * 2
     assert config.to_dict()["tensor_shape"] == [2, 4]
+    assert config.to_dict()["source_device_ids"] == [0]
+
+
+def test_benchmark_config_describes_dense_fanin_sources():
+    config = RlTransferBenchmarkConfig(
+        server_url="localhost:8001",
+        model_name="bench",
+        tensor_count=2,
+        tensor_shape=(4, 8),
+        source_device_id=1,
+        dense_fanin_sources=2,
+    )
+
+    assert config.tensor_bytes == 2 * 4 * 8 * 4
+    assert config.source_device_ids == (1, 2)
+    assert config.to_dict()["dense_fanin_sources"] == 2
+    assert config.to_dict()["source_device_ids"] == [1, 2]
 
 
 def test_benchmark_config_rejects_invalid_values():
@@ -81,6 +102,56 @@ def test_benchmark_config_rejects_invalid_values():
             republish_received=True,
             fail_trainer_transfer_before_recovery=True,
         )
+
+    with pytest.raises(ValueError, match="dense_fanin_sources"):
+        RlTransferBenchmarkConfig(
+            server_url="localhost:8001",
+            model_name="bench",
+            dense_fanin_sources=0,
+        )
+
+    with pytest.raises(ValueError, match="first dimension"):
+        RlTransferBenchmarkConfig(
+            server_url="localhost:8001",
+            model_name="bench",
+            tensor_shape=(3, 4),
+            dense_fanin_sources=2,
+        )
+
+    with pytest.raises(ValueError, match="primary receive benchmarks"):
+        RlTransferBenchmarkConfig(
+            server_url="localhost:8001",
+            model_name="bench",
+            tensor_shape=(4, 4),
+            dense_fanin_sources=2,
+            republish_received=True,
+        )
+
+
+def test_dense_fanin_benchmark_builds_layout_metadata_and_target_specs():
+    config = RlTransferBenchmarkConfig(
+        server_url="localhost:8001",
+        model_name="bench",
+        tensor_count=2,
+        tensor_shape=(4, 8),
+        dense_fanin_sources=2,
+    )
+
+    metadata = _dense_fanin_tensor_metadata(config, rank=1)
+    specs = _dense_fanin_target_specs(config)
+
+    assert metadata == {
+        "w0": {"global_shape": [4, 8], "shard_offsets": [2, 0]},
+        "w1": {"global_shape": [4, 8], "shard_offsets": [2, 0]},
+    }
+    spec_layouts = [
+        (spec.name, spec.shape, spec.global_shape, spec.shard_offsets)
+        for spec in specs
+    ]
+    assert spec_layouts == [
+        ("w0", (4, 8), (4, 8), (0, 0)),
+        ("w1", (4, 8), (4, 8), (0, 0)),
+    ]
 
 
 def test_benchmark_iteration_serializes_report_attempts():
@@ -503,6 +574,8 @@ def test_parse_tensor_shape_accepts_comma_or_x_separators():
 def test_parser_accepts_output_json_path(tmp_path):
     args = _build_parser().parse_args(
         [
+            "--dense-fanin-sources",
+            "2",
             "--republish-received",
             "--recover-latest-from-replica",
             "--fail-trainer-transfer-before-recovery",
@@ -512,6 +585,7 @@ def test_parser_accepts_output_json_path(tmp_path):
     )
 
     assert args.output_json == tmp_path / "result.json"
+    assert args.dense_fanin_sources == 2
     assert args.republish_received is True
     assert args.recover_latest_from_replica is True
     assert args.fail_trainer_transfer_before_recovery is True

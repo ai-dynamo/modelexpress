@@ -54,6 +54,7 @@ class RlTransferBenchmarkConfig:
     republish_received: bool = False
     recover_latest_from_replica: bool = False
     fail_trainer_transfer_before_recovery: bool = False
+    dense_fanin_sources: int = 1
 
     def __post_init__(self) -> None:
         tensor_shape = tuple(int(dim) for dim in self.tensor_shape)
@@ -67,6 +68,8 @@ class RlTransferBenchmarkConfig:
             raise ValueError("warmup_iterations must be non-negative")
         if self.retain_latest_k <= 0:
             raise ValueError("retain_latest_k must be positive")
+        if self.dense_fanin_sources <= 0:
+            raise ValueError("dense_fanin_sources must be positive")
         if self.source_device_id < 0 or self.target_device_id < 0:
             raise ValueError("CUDA device ids must be non-negative")
         if self.timeout_seconds <= 0.0:
@@ -81,6 +84,16 @@ class RlTransferBenchmarkConfig:
                 "fail_trainer_transfer_before_recovery requires "
                 "recover_latest_from_replica"
             )
+        if self.dense_fanin_sources > 1:
+            if tensor_shape[0] % self.dense_fanin_sources != 0:
+                raise ValueError(
+                    "tensor_shape first dimension must be divisible by "
+                    "dense_fanin_sources"
+                )
+            if self.republish_received or self.recover_latest_from_replica:
+                raise ValueError(
+                    "dense_fanin_sources is scoped to primary receive benchmarks"
+                )
         object.__setattr__(self, "tensor_shape", tensor_shape)
         object.__setattr__(self, "dtype", str(torch_dtype_from_string(self.dtype)))
 
@@ -91,6 +104,12 @@ class RlTransferBenchmarkConfig:
             numel *= dim
         dtype = torch_dtype_from_string(self.dtype)
         return self.tensor_count * numel * torch.empty((), dtype=dtype).element_size()
+
+    @property
+    def source_device_ids(self) -> tuple[int, ...]:
+        return tuple(
+            self.source_device_id + index for index in range(self.dense_fanin_sources)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +130,8 @@ class RlTransferBenchmarkConfig:
             "fail_trainer_transfer_before_recovery": (
                 self.fail_trainer_transfer_before_recovery
             ),
+            "dense_fanin_sources": self.dense_fanin_sources,
+            "source_device_ids": list(self.source_device_ids),
             "tensor_bytes": self.tensor_bytes,
         }
 
@@ -382,6 +403,20 @@ def run_mx_rl_transfer_benchmark(
         quantization="",
         revision="",
     )
+    if config.dense_fanin_sources > 1:
+        from modelexpress.rl_benchmark_fanin import (
+            run_mx_dense_fanin_transfer_benchmark,
+        )
+
+        try:
+            return run_mx_dense_fanin_transfer_benchmark(
+                config=config,
+                client=client,
+                base_identity=base_identity,
+            )
+        finally:
+            client.close()
+
     publisher = RlNixlWeightTransfer(
         mx_client=client,
         base_identity=base_identity,
@@ -748,6 +783,15 @@ def _require_live_dependencies(config: RlTransferBenchmarkConfig) -> None:
         raise RuntimeError("CUDA is required for the ModelExpress RL benchmark")
     if config.source_device_id >= torch.cuda.device_count():
         raise RuntimeError(f"source device {config.source_device_id} is not available")
+    unavailable_sources = [
+        device_id
+        for device_id in config.source_device_ids
+        if device_id >= torch.cuda.device_count()
+    ]
+    if unavailable_sources:
+        raise RuntimeError(
+            f"source devices {unavailable_sources} are not available"
+        )
     if config.target_device_id >= torch.cuda.device_count():
         raise RuntimeError(f"target device {config.target_device_id} is not available")
     try:
@@ -790,6 +834,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-device-id", type=int, default=0)
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--retain-latest-k", type=int, default=1)
+    parser.add_argument(
+        "--dense-fanin-sources",
+        type=int,
+        default=1,
+        help=(
+            "Publish this many contiguous first-dimension source shards and "
+            "benchmark one dense fan-in receive."
+        ),
+    )
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument(
         "--republish-received",
@@ -834,6 +887,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             retain_latest_k=args.retain_latest_k,
             verify=not args.no_verify,
+            dense_fanin_sources=args.dense_fanin_sources,
             republish_received=args.republish_received,
             recover_latest_from_replica=args.recover_latest_from_replica,
             fail_trainer_transfer_before_recovery=(

@@ -78,6 +78,57 @@ def test_live_rl_benchmark_reports_transfer_lease_summary():
     assert iteration["attempts"][0]["lease_id"] == iteration["attempt_lease_ids"][0]
 
 
+def test_live_rl_benchmark_reports_dense_fanin_transfer():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("nixl._api")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if torch.cuda.device_count() < 3:
+        pytest.skip("live RL dense fan-in benchmark needs at least 3 CUDA devices")
+
+    result = run_mx_rl_transfer_benchmark(
+        RlTransferBenchmarkConfig(
+            server_url=os.environ[_LIVE_SERVER_ENV],
+            model_name=f"mx-live-rl-benchmark-fanin-{uuid.uuid4().hex[:8]}",
+            tensor_count=2,
+            tensor_shape=(256, 128),
+            iterations=1,
+            warmup_iterations=0,
+            source_device_id=0,
+            target_device_id=2,
+            dense_fanin_sources=2,
+        )
+    )
+
+    output = result.to_dict()
+    summary = output["summary"]
+    iteration = output["iterations"][0]
+
+    assert output["config"]["dense_fanin_sources"] == 2
+    assert output["config"]["source_device_ids"] == [0, 1]
+    assert summary["iterations"] == 1
+    assert summary["total_attempts"] == 2
+    assert summary["successful_attempts"] == 2
+    assert summary["failed_attempts"] == 0
+    assert summary["total_transferred_bytes"] == iteration["expected_bytes"]
+    assert iteration["transferred_bytes"] == iteration["expected_bytes"]
+    assert iteration["tensor_count"] == 4
+    assert iteration["transfer_duration_seconds"] > 0.0
+    assert iteration["transfer_bandwidth_gbps"] > 0.0
+    assert [attempt["worker_rank"] for attempt in iteration["attempts"]] == [0, 1]
+    assert [attempt["role"] for attempt in iteration["attempts"]] == [
+        "trainer",
+        "trainer",
+    ]
+    assert [attempt["success"] for attempt in iteration["attempts"]] == [True, True]
+    if iteration["transfer_lease_discovery_supported"]:
+        assert iteration["matching_lease_status_names"] == [
+            "TRANSFER_LEASE_STATUS_COMPLETED",
+            "TRANSFER_LEASE_STATUS_COMPLETED",
+        ]
+        assert iteration["missing_lease_ids"] == []
+
+
 def test_live_rl_benchmark_recovers_latest_from_replica():
     torch = pytest.importorskip("torch")
     pytest.importorskip("nixl._api")
