@@ -69,7 +69,7 @@ mod tests {
 
     fn base_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.3.0".to_string(),
+            mx_version: "0.4.0".to_string(),
             mx_source_type: 0, // Weights (default)
             model_name: "deepseek-ai/DeepSeek-V3".to_string(),
             backend_framework: 1, // vllm
@@ -180,14 +180,14 @@ mod tests {
     // the mismatch is caught in CI.
     #[test]
     fn test_python_cross_check_base_identity() {
-        assert_eq!(compute_mx_source_id(&base_identity()), "b0c2c67edeaefc20");
+        assert_eq!(compute_mx_source_id(&base_identity()), "e2438ef16adcf628");
     }
 
     #[test]
     fn test_python_cross_check_with_revision() {
         let mut pinned = base_identity();
         pinned.revision = "abc123def4567890".to_string();
-        assert_eq!(compute_mx_source_id(&pinned), "40704b34e4b7deaa");
+        assert_eq!(compute_mx_source_id(&pinned), "7b7803769825576e");
     }
 
     #[test]
@@ -203,7 +203,7 @@ mod tests {
             .insert("Foo".to_string(), "a".to_string());
         id.extra_parameters
             .insert("foo".to_string(), "b".to_string());
-        assert_eq!(compute_mx_source_id(&id), "bd9ea6c70d83fef1");
+        assert_eq!(compute_mx_source_id(&id), "deecf6684507f09c");
     }
 
     #[test]
