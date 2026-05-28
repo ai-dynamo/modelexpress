@@ -39,7 +39,7 @@ class VllmAdapter(EngineAdapter):
         return build_source_identity(self.vllm_config, self.model_config)
 
     def get_worker_rank(self) -> int:
-        return _get_vllm_worker_rank(self.vllm_config)
+        return _get_vllm_worker_rank(self.vllm_config, self.target_device)
 
     def get_global_rank(self) -> int:
         return get_global_rank(self.target_device)
@@ -199,24 +199,19 @@ def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
         object.__setattr__(load_config, "model_loader_extra_config", extra_config)
 
 
-def _get_vllm_worker_rank(vllm_config: VllmConfig) -> int:
-    """Return the vLLM model-shard key used for source/target matching.
+def _get_vllm_worker_rank(
+    vllm_config: VllmConfig, target_device: torch.device
+) -> int:
+    """Return the vLLM model-shard key (torch.distributed world rank).
 
-    vLLM's parallel_config.rank is flattened in model-parallel order. Modulo the
-    model-parallel size keeps the TP/PP shard identity and ignores DP replicas,
-    whose weights are interchangeable.
+    Falls back to vllm_config.parallel_config.rank when torch.distributed is
+    not initialised and the target device has no index (pre-init / bare-cuda
+    test paths), so workers in the same DP still get distinct keys.
     """
-    parallel_config = vllm_config.parallel_config
-    rank = parallel_config.rank
-    tp_size = int(parallel_config.tensor_parallel_size)
-    pp_size = int(parallel_config.pipeline_parallel_size)
-    model_parallel_size = max(1, tp_size * pp_size)
-    worker_rank = int(rank) % model_parallel_size
-    logger.debug(
-        "Got vLLM worker rank from parallel_config: "
-        "rank=%d worker_rank=%d model_parallel_size=%d",
-        rank, worker_rank, model_parallel_size,
-    )
+    worker_rank = get_global_rank(target_device)
+    if worker_rank == 0 and target_device.index is None:
+        worker_rank = int(vllm_config.parallel_config.rank)
+    logger.debug("vLLM worker rank: %d", worker_rank)
     return worker_rank
 
 
