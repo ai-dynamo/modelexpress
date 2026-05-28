@@ -434,6 +434,30 @@ def test_select_candidates_ignore_stale_refs_but_keep_legacy_unknown_health():
     assert [candidate.mx_source_id for candidate in selected] == ["ready-v8"]
 
 
+def test_select_candidates_prefers_freshest_duplicate_rank_source():
+    candidates = [
+        _candidate(
+            "older-v8",
+            version=8,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            updated_at=100,
+        ),
+        _candidate(
+            "newer-v8",
+            version=8,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            updated_at=200,
+        ),
+    ]
+
+    selected = select_rl_source_candidates(candidates, receiver_rank=0)
+
+    assert [candidate.mx_source_id for candidate in selected] == [
+        "newer-v8",
+        "older-v8",
+    ]
+
+
 def test_select_candidates_retention_ignores_incomplete_newer_version():
     candidates = [
         _candidate("trainer-v8", version=8),

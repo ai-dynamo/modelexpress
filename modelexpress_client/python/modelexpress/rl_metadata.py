@@ -393,6 +393,7 @@ def select_rl_source_candidates(
             role_priority[candidate.metadata.role],
             candidate.worker_rank != receiver_rank,
             candidate.worker_rank,
+            -int(candidate.updated_at),
             candidate.worker_id,
         ),
     )
