@@ -277,40 +277,14 @@ jobs:
         # tells us whether the vCluster was already showing signs of strain
         # (restarts, OOMs, evictions, low headroom) or was healthy at the start
         # — pointing the investigation at either cluster-health or test-load.
-        # Uses the host kubeconfig (set by connect-vcluster) since the vCluster
-        # pod itself is a host-cluster resource.
+        # Same action is invoked with `if: failure()` from each test job to
+        # capture state at the moment a test failed (which may post-date
+        # this baseline).
         if: always()
-        shell: bash
-        run: |
-          set +e
-          SELECTOR="app=vcluster,release=${VCLUSTER_NAME}"
-
-          echo "::group::vCluster pod summary"
-          kubectl get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
-            -o wide 2>&1 || true
-          echo "::endgroup::"
-
-          echo "::group::vCluster container restart count + last termination"
-          # Restart count > 0 or any non-empty lastState.terminated is a smoking
-          # gun for a recent crash — most likely OOM or a control-plane bug.
-          kubectl get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
-            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.containerStatuses[*]}  {.name}: restartCount={.restartCount}, lastState={.lastState}{"\n"}{end}{end}' 2>&1 || true
-          echo
-          echo "::endgroup::"
-
-          echo "::group::vCluster pod resource usage (kubectl top)"
-          # Requires metrics-server in the host cluster. Failure here is fine —
-          # the diagnostic is best-effort and shouldn't gate the job.
-          kubectl top pod -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" 2>&1 || \
-            echo "(kubectl top unavailable — metrics-server not installed or not ready)"
-          echo "::endgroup::"
-
-          echo "::group::Recent events in ${VCLUSTER_NAMESPACE} (last 30)"
-          # Catches scheduler/eviction/probe-failure events for the vCluster
-          # pod and any sibling resources.
-          kubectl get events -n "${VCLUSTER_NAMESPACE}" \
-            --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
-          echo "::endgroup::"
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
       - name: Reap vCluster port-forward
         # connect-vcluster backgrounds a `kubectl port-forward` and exports
@@ -403,6 +377,17 @@ jobs:
           source_port: ${{ matrix.source_port }}
           worker_port: ${{ matrix.worker_port }}
           pytest_args: ${{ matrix.pytest_args }}
+
+      - name: Dump vCluster diagnostics on failure
+        # Captures vCluster control-plane state at the moment of failure
+        # (pod status, recent events, syncer logs, controller-identity
+        # overlay) — surfaces infra-side disruption that may be the real
+        # cause rather than the test itself.
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
       - name: Reap vCluster port-forward
         # connect-vcluster backgrounds a `kubectl port-forward` and exports
@@ -508,6 +493,13 @@ jobs:
           worker_port: ${{ matrix.worker_port }}
           tp_size: ${{ matrix.tp_size }}
 
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
       - name: Reap vCluster port-forward
         # connect-vcluster backgrounds a `kubectl port-forward` and exports
         # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
@@ -576,6 +568,13 @@ jobs:
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
 
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
       - name: Reap vCluster port-forward
         if: always()
         run: |
@@ -636,6 +635,13 @@ jobs:
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           source_port: ${{ matrix.source_port }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
       - name: Reap vCluster port-forward
         if: always()

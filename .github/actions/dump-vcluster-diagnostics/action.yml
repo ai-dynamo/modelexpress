@@ -1,0 +1,161 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Dump vCluster diagnostics'
+description: |
+  Snapshot vCluster control-plane state (pod status, conditions, recent events,
+  controller-identity overlay for disruption events, syncer logs). Used in two
+  places:
+
+    1. The `ensure-vcluster` job runs this with `if: always()` to establish a
+       baseline of vCluster health BEFORE any test fires.
+    2. Each test job runs it again with `if: failure()` so that whenever a
+       test step fails for any reason, we capture the vCluster's state at
+       that moment — useful when the failure was actually caused by infra-
+       side disruption (mid-run eviction, syncer hiccup, etc.), which the
+       baseline at job-start can't show.
+
+  All groups use `set +e` + `|| true` so the diagnostic itself never gates
+  the calling step's exit code.
+
+  Uses the host kubeconfig because the vCluster pod is a host-cluster
+  resource (the vCluster API server, which `KUBECONFIG=.kubeconfig-vcluster`
+  points to, doesn't see its own pod).
+
+inputs:
+  vcluster_name:
+    description: 'Name of the vCluster (used in the app=vcluster,release=<name> selector)'
+    required: true
+  vcluster_namespace:
+    description: 'Host namespace the vCluster lives in'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Dump vCluster diagnostics
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        VCLUSTER_NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        set +e
+        SELECTOR="app=vcluster,release=${VCLUSTER_NAME}"
+        # Always read from the host kubeconfig written by connect-vcluster.
+        KCTL="kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-host"
+
+        echo "::group::vCluster pod summary"
+        ${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+          -o wide 2>&1 || true
+        echo "::endgroup::"
+
+        echo "::group::vCluster container restart count + last termination"
+        # Restart count > 0 or any non-empty lastState.terminated is a smoking
+        # gun for a recent crash — most likely OOM or a control-plane bug.
+        ${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.containerStatuses[*]}  {.name}: restartCount={.restartCount}, lastState={.lastState}{"\n"}{end}{end}' 2>&1 || true
+        echo
+        echo "::endgroup::"
+
+        echo "::group::vCluster pod conditions"
+        # status.conditions shows the why behind Ready=False / PodScheduled=False
+        # (e.g., "Unschedulable: 0/N nodes are available"). Tiny output, high
+        # signal — usually one line tells you everything.
+        ${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.conditions[*]}  {.type}={.status} reason={.reason} message={.message}{"\n"}{end}{end}' 2>&1 || true
+        echo
+        echo "::endgroup::"
+
+        echo "::group::Recent events in ${VCLUSTER_NAMESPACE} (last 50)"
+        # Catches scheduler/eviction/probe-failure events for the vCluster
+        # pod and any sibling resources.
+        ${KCTL} get events -n "${VCLUSTER_NAMESPACE}" \
+          --sort-by='.lastTimestamp' 2>&1 | tail -50 || true
+        echo "::endgroup::"
+
+        echo "::group::Warning events in ${VCLUSTER_NAMESPACE} (signal-only view)"
+        # Same window as above but filtered to Warning type — easier to scan
+        # for "what's broken" without the noise of routine Normal events.
+        ${KCTL} get events -n "${VCLUSTER_NAMESPACE}" \
+          --field-selector type=Warning \
+          --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
+        echo "::endgroup::"
+
+        NODE=$(${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+          -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
+
+        echo "::group::Events on the node hosting the vCluster pod"
+        # Node-level disruption events (cordon, drain, taint changes,
+        # autoscaler decisions like Drifted / Underutilized) fire on the
+        # Node object — cluster-scoped — so namespace-scoped event queries
+        # miss them. Filter by involvedObject=Node to catch them.
+        if [ -n "${NODE}" ]; then
+          echo "Node: ${NODE}"
+          ${KCTL} get events --all-namespaces \
+            --field-selector "involvedObject.kind=Node,involvedObject.name=${NODE}" \
+            --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
+        else
+          echo "(no node assigned to vCluster pod yet)"
+        fi
+        echo "::endgroup::"
+
+        echo "::group::Recent disruption-related events with source.component (who emitted them)"
+        # The default `kubectl get events` output doesn't show
+        # source.component / reportingController — the fields that name
+        # the controller that emitted each event. Those are the most
+        # diagnostic pieces of info for "what controller is causing
+        # this": karpenter / cluster-autoscaler / descheduler / kubelet
+        # / something custom. We capture all four "this pod's life is
+        # being disturbed" reasons we've seen in the wild, plus a
+        # couple more standard ones, so the dump catches the full
+        # disruption sequence (eviction trigger → kubelet container
+        # stop → readiness probe failures during shutdown → mount/IO
+        # errors on the replacement pod).
+        #
+        # Scoped to ${VCLUSTER_NAMESPACE}: this is where the vCluster pod
+        # and every synced-from-vCluster pod lives, so the pod-side
+        # disruption signals (Evicted / Killing / Unhealthy) all land
+        # here. Node-level disruption events are captured separately by
+        # the node-events group above; scoping this view tightly avoids
+        # noise from unrelated workloads in other host namespaces.
+        #
+        # `--field-selector` doesn't OR across reasons, so we drop it
+        # and use awk to keep the header line plus any matching rows.
+        # The full list is shown in the existing event groups above;
+        # this view is just the controller-identity overlay on top.
+        ${KCTL} get events -n "${VCLUSTER_NAMESPACE}" \
+          --sort-by='.lastTimestamp' \
+          -o custom-columns='LAST-SEEN:.lastTimestamp,OBJECT:.involvedObject.name,REASON:.reason,SOURCE:.source.component,REPORTING:.reportingController,MESSAGE:.message' \
+          2>&1 | awk 'NR==1 || /Evicted|Killing|Preempted|TaintManagerEviction|NodeNotReady|Unhealthy|FailedMount|Drained|Drifted|Underutilized|Consolidating|Expired/' \
+          | tail -30 || true
+        echo "::endgroup::"
+
+        echo "::group::vCluster syncer error/warn entries (current + previous container)"
+        # The syncer logs every reconciliation, so an unfiltered tail is
+        # 95% routine INFO chatter and 5% signal. Filter to lines that
+        # contain a level token (error / warn / panic / fatal) — that's
+        # what we'd actually look at when triaging.
+        #
+        # Time-based bound (--since=30m) on the current container so we
+        # see the last ~half-hour of activity regardless of throughput.
+        # Previous container is a static log (the container is dead), so
+        # use --tail=500 to bound by lines instead.
+        for POD in $(${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          echo "--- ${POD} syncer (current, error/warn in last 30m) ---"
+          ${KCTL} logs -n "${VCLUSTER_NAMESPACE}" "${POD}" -c syncer --since=30m 2>&1 \
+            | grep -iE '\b(error|warn|panic|fatal)\b' \
+            | tail -30 \
+            || echo "(no error/warn entries)"
+          echo "--- ${POD} syncer (previous, if any — error/warn in last 500 lines) ---"
+          if ${KCTL} logs -n "${VCLUSTER_NAMESPACE}" "${POD}" -c syncer --previous --tail=500 \
+               > /tmp/prev_syncer.log 2>/dev/null; then
+            grep -iE '\b(error|warn|panic|fatal)\b' /tmp/prev_syncer.log \
+              | tail -30 \
+              || echo "(no error/warn entries in the previous container log)"
+          else
+            echo "(no previous container log)"
+          fi
+          rm -f /tmp/prev_syncer.log
+        done
+        echo "::endgroup::"
