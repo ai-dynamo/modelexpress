@@ -72,7 +72,7 @@ spec:
             - --model
             - $(MX_MODEL_URI)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "8"
             - --enable-expert-parallel

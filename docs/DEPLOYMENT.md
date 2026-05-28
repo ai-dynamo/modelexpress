@@ -302,7 +302,7 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM uses `--load-format mx`, which auto-detects whether to load from disk or receive via RDMA. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM uses `--load-format modelexpress`, which auto-detects whether to load from disk or receive via RDMA; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Choosing a Metadata Backend
 
@@ -328,7 +328,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address (ignored when client uses `k8s-service` backend) |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
+| `MX_REGISTER_LOADERS` | `1` | Auto-register the `modelexpress` and `mx` loaders with vLLM |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
@@ -348,7 +348,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
-| `VLLM_PLUGINS` | - | Set to `modelexpress` to register the mx loader |
+| `VLLM_PLUGINS` | - | Set to `modelexpress` to register the `modelexpress` and `mx` loaders |
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
@@ -599,7 +599,7 @@ spec:
             - { name: MX_MODEL_REVISION,   value: "<pinned-commit-sha>" }
             - { name: MX_WORKER_GRPC_PORT, value: "6555" }
             # MX_K8S_SERVICE_PATTERN defaults to `mx-sources`; omit unless overriding.
-          args: ["--model", "$(MODEL_NAME)", "--load-format", "mx", "--tensor-parallel-size", "2"]
+          args: ["--model", "$(MODEL_NAME)", "--load-format", "modelexpress", "--tensor-parallel-size", "2"]
           resources: { limits: { nvidia.com/gpu: 2 } }
 ```
 

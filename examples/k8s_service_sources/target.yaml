@@ -85,7 +85,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "1"
           ports:
@@ -160,7 +160,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "1"
           ports:

@@ -112,7 +112,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "2"
           # Expose both per-rank ports on the pod; the Service routes
