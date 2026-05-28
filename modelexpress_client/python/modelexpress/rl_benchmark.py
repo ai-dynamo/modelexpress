@@ -53,6 +53,7 @@ class RlTransferBenchmarkConfig:
     verify: bool = True
     republish_received: bool = False
     recover_latest_from_replica: bool = False
+    fail_trainer_transfer_before_recovery: bool = False
 
     def __post_init__(self) -> None:
         tensor_shape = tuple(int(dim) for dim in self.tensor_shape)
@@ -72,6 +73,14 @@ class RlTransferBenchmarkConfig:
             raise ValueError("timeout_seconds must be positive")
         if self.recover_latest_from_replica and not self.republish_received:
             raise ValueError("recover_latest_from_replica requires republish_received")
+        if (
+            self.fail_trainer_transfer_before_recovery
+            and not self.recover_latest_from_replica
+        ):
+            raise ValueError(
+                "fail_trainer_transfer_before_recovery requires "
+                "recover_latest_from_replica"
+            )
         object.__setattr__(self, "tensor_shape", tensor_shape)
         object.__setattr__(self, "dtype", str(torch_dtype_from_string(self.dtype)))
 
@@ -99,6 +108,9 @@ class RlTransferBenchmarkConfig:
             "verify": self.verify,
             "republish_received": self.republish_received,
             "recover_latest_from_replica": self.recover_latest_from_replica,
+            "fail_trainer_transfer_before_recovery": (
+                self.fail_trainer_transfer_before_recovery
+            ),
             "tensor_bytes": self.tensor_bytes,
         }
 
@@ -448,7 +460,10 @@ def run_mx_rl_transfer_benchmark(
             lease_summary = _lease_summary_for_report(receiver, report)
             recovery_receive = None
             if restarted_receiver is not None:
-                publisher.mark_current_source_stale()
+                if config.fail_trainer_transfer_before_recovery:
+                    publisher.shutdown_nixl_manager()
+                else:
+                    publisher.mark_current_source_stale()
                 recovery_receive = _recover_latest_from_replica(
                     config=config,
                     restarted_receiver=restarted_receiver,
@@ -511,7 +526,11 @@ def _recover_latest_from_replica(
             recovery_tensors,
             model_version=None,
             receiver_rank=0,
-            roles=(RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER),
+            roles=(
+                (RlSourceRole.TRAINER, RlSourceRole.INFERENCE_REPLICA)
+                if config.fail_trainer_transfer_before_recovery
+                else (RlSourceRole.INFERENCE_REPLICA, RlSourceRole.TRAINER)
+            ),
         )
     )
     torch.cuda.synchronize(config.target_device_id)
@@ -783,6 +802,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="After primary republish, stale the trainer and recover latest from the replica.",
     )
     parser.add_argument(
+        "--fail-trainer-transfer-before-recovery",
+        action="store_true",
+        help=(
+            "Before replica recovery, drop the trainer NIXL manager without "
+            "marking it stale so recovery records trainer failure then replica fallback."
+        ),
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -809,6 +836,9 @@ def main(argv: list[str] | None = None) -> int:
             verify=not args.no_verify,
             republish_received=args.republish_received,
             recover_latest_from_replica=args.recover_latest_from_replica,
+            fail_trainer_transfer_before_recovery=(
+                args.fail_trainer_transfer_before_recovery
+            ),
         )
     )
     output = json.dumps(result.to_dict(), indent=2, sort_keys=True)

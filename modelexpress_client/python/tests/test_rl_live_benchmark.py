@@ -119,3 +119,52 @@ def test_live_rl_benchmark_recovers_latest_from_replica():
             "TRANSFER_LEASE_STATUS_COMPLETED",
         ]
         assert recovery["missing_lease_ids"] == []
+
+
+def test_live_rl_benchmark_falls_back_from_failed_trainer_to_replica():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("nixl._api")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("live RL benchmark trainer fallback needs at least 2 CUDA devices")
+
+    result = run_mx_rl_transfer_benchmark(
+        RlTransferBenchmarkConfig(
+            server_url=os.environ[_LIVE_SERVER_ENV],
+            model_name=f"mx-live-rl-benchmark-fallback-{uuid.uuid4().hex[:8]}",
+            tensor_count=1,
+            tensor_shape=(128, 128),
+            iterations=1,
+            warmup_iterations=0,
+            source_device_id=0,
+            target_device_id=1,
+            timeout_seconds=5.0,
+            republish_received=True,
+            recover_latest_from_replica=True,
+            fail_trainer_transfer_before_recovery=True,
+        )
+    )
+
+    output = result.to_dict()
+    summary = output["summary"]
+    recovery = output["iterations"][0]["recovery_receive"]
+
+    assert summary["recovery_iterations"] == 1
+    assert summary["recovery_total_retries"] == 1
+    assert summary["recovery_source_roles"] == ["inference_replica"]
+    assert [attempt["role"] for attempt in recovery["attempts"]] == [
+        "trainer",
+        "inference_replica",
+    ]
+    assert [attempt["success"] for attempt in recovery["attempts"]] == [False, True]
+    assert recovery["source_role"] == "inference_replica"
+    assert recovery["retry_count"] == 1
+    assert recovery["transfer_duration_seconds"] > 0.0
+    assert recovery["transfer_bandwidth_gbps"] > 0.0
+    if recovery["transfer_lease_discovery_supported"]:
+        assert recovery["matching_lease_status_names"] == [
+            "TRANSFER_LEASE_STATUS_FAILED",
+            "TRANSFER_LEASE_STATUS_COMPLETED",
+        ]
+        assert recovery["missing_lease_ids"] == []

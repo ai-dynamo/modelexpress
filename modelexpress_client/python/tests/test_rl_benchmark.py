@@ -74,6 +74,14 @@ def test_benchmark_config_rejects_invalid_values():
             recover_latest_from_replica=True,
         )
 
+    with pytest.raises(ValueError, match="requires recover_latest_from_replica"):
+        RlTransferBenchmarkConfig(
+            server_url="localhost:8001",
+            model_name="bench",
+            republish_received=True,
+            fail_trainer_transfer_before_recovery=True,
+        )
+
 
 def test_benchmark_iteration_serializes_report_attempts():
     report = RlTransferReport(
@@ -415,6 +423,16 @@ def test_benchmark_result_summary_reports_replica_recovery_receive():
         receiver_rank=0,
         attempts=(
             RlTransferAttempt(
+                mx_source_id="trainer-source",
+                worker_id="trainer-worker",
+                worker_rank=0,
+                role=RlSourceRole.TRAINER,
+                model_version=3,
+                success=False,
+                error="trainer unavailable",
+                lease_id="lease-trainer",
+            ),
+            RlTransferAttempt(
                 mx_source_id="replica-source",
                 worker_id="replica-worker",
                 worker_rank=0,
@@ -460,10 +478,18 @@ def test_benchmark_result_summary_reports_replica_recovery_receive():
     assert summary["mean_recovery_receive_seconds"] == 2.0
     assert summary["mean_recovery_transfer_duration_seconds"] == 0.02
     assert summary["mean_recovery_transfer_bandwidth_gbps"] == pytest.approx(0.00004)
-    assert summary["recovery_total_retries"] == 0
+    assert summary["recovery_total_retries"] == 1
     assert summary["recovery_source_roles"] == ["inference_replica"]
     assert recovery_output["source_role"] == "inference_replica"
     assert recovery_output["transferred_bytes"] == 100
+    assert [attempt["role"] for attempt in recovery_output["attempts"]] == [
+        "trainer",
+        "inference_replica",
+    ]
+    assert [attempt["success"] for attempt in recovery_output["attempts"]] == [
+        False,
+        True,
+    ]
 
 
 def test_parse_tensor_shape_accepts_comma_or_x_separators():
@@ -479,6 +505,7 @@ def test_parser_accepts_output_json_path(tmp_path):
         [
             "--republish-received",
             "--recover-latest-from-replica",
+            "--fail-trainer-transfer-before-recovery",
             "--output-json",
             str(tmp_path / "result.json"),
         ]
@@ -487,3 +514,4 @@ def test_parser_accepts_output_json_path(tmp_path):
     assert args.output_json == tmp_path / "result.json"
     assert args.republish_received is True
     assert args.recover_latest_from_replica is True
+    assert args.fail_trainer_transfer_before_recovery is True

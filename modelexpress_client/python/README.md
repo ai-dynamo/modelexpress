@@ -98,7 +98,9 @@ The benchmark requires CUDA, NIXL, and a running ModelExpress server.
 Add `--republish-received --recover-latest-from-replica` to benchmark the
 P2P-elastic path where a receiver republishes as an inference replica and a
 restarted receiver recovers the latest version from that replica after the
-trainer source is marked stale.
+trainer source is marked stale. Add `--fail-trainer-transfer-before-recovery`
+to keep the trainer source advertised but unreachable, so the recovery artifact
+records a failed trainer attempt followed by replica fallback.
 
 ## RL Transfer Leases
 
