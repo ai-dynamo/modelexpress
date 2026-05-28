@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -13,6 +14,7 @@ from modelexpress.rl_metadata import RlSourceRole
 
 _LIVE_SERVER_ENV = "MX_LIVE_SERVER_URL"
 _VERL_REPO_ENV = "MX_VERL_REPO_PATH"
+_RUNTIME_COMPARISON_OUTPUT_ENV = "MX_VERL_RUNTIME_OUTPUT_JSON"
 _HARNESS = "_mx_verl_runtime_harness"
 
 pytestmark = pytest.mark.skipif(
@@ -56,7 +58,8 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
 
 def test_live_verl_checkpoint_manager_compares_nccl_and_modelexpress(tmp_path):
     """Run CE/NCCL and MX/NIXL through the same tiny veRL manager harness."""
-    run_verl_checkpoint_manager_update = _load_harness().run_verl_checkpoint_manager_update
+    harness = _load_harness()
+    run_verl_checkpoint_manager_update = harness.run_verl_checkpoint_manager_update
     verl_repo = Path(os.environ[_VERL_REPO_ENV]).resolve()
     mx_python_path = Path(__file__).resolve().parents[1]
     nccl_result = run_verl_checkpoint_manager_update(
@@ -79,11 +82,19 @@ def test_live_verl_checkpoint_manager_compares_nccl_and_modelexpress(tmp_path):
     assert mx_result.attempt_successes == (True,)
     assert mx_result.tensor_count == 15
     assert mx_result.bytes_transferred > 0
+    comparison = harness.verl_runtime_comparison_to_dict(nccl_result, mx_result)
     print(
         "veRL tiny-Qwen2 update timings: "
         f"nccl={nccl_result.update_seconds:.6f}s, "
         f"modelexpress={mx_result.update_seconds:.6f}s"
     )
+    if output_json := os.environ.get(_RUNTIME_COMPARISON_OUTPUT_ENV):
+        output_path = Path(output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(comparison, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
 
 def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):

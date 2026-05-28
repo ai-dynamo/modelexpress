@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -69,6 +69,53 @@ class VerlRuntimeSmokeResult:
     recovery_lease_summary_statuses: tuple[int, ...] | None = None
     recovery_transfer_lease_discovery_supported: bool = False
     recovery_success: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            field.name: _json_value(getattr(self, field.name))
+            for field in fields(self)
+        }
+
+
+def verl_runtime_comparison_to_dict(
+    nccl_result: VerlRuntimeSmokeResult,
+    mx_result: VerlRuntimeSmokeResult,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "benchmark": "verl_tiny_qwen2_checkpoint_manager",
+        "summary": {
+            "nccl_update_seconds": nccl_result.update_seconds,
+            "modelexpress_update_seconds": mx_result.update_seconds,
+            "update_seconds_delta": mx_result.update_seconds
+            - nccl_result.update_seconds,
+            "modelexpress_to_nccl_update_ratio": _ratio(
+                mx_result.update_seconds,
+                nccl_result.update_seconds,
+            ),
+            "modelexpress_bytes_transferred": mx_result.bytes_transferred,
+            "modelexpress_tensor_count": mx_result.tensor_count,
+            "modelexpress_retry_count": mx_result.retry_count,
+            "modelexpress_source_roles": list(mx_result.source_roles),
+            "modelexpress_attempt_lease_ids": list(mx_result.attempt_lease_ids),
+        },
+        "results": {
+            "nccl": nccl_result.to_dict(),
+            "modelexpress": mx_result.to_dict(),
+        },
+    }
+
+
+def _ratio(numerator: float, denominator: float) -> float | None:
+    if denominator <= 0.0:
+        return None
+    return numerator / denominator
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    return value
 
 
 def run_verl_checkpoint_manager_update(
