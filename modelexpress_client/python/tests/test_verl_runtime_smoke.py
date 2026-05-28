@@ -40,6 +40,7 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
     assert result.resolved_model_version == 17
     assert result.source_roles == (RlSourceRole.TRAINER.value,)
     assert result.attempt_roles == (RlSourceRole.TRAINER.value,)
+    assert len(result.attempt_worker_ids) == 1
     assert result.attempt_successes == (True,)
     assert result.attempt_source_statuses == (p2p_pb2.SOURCE_STATUS_READY,)
     assert all(updated_at > 0 for updated_at in result.attempt_source_updated_at)
@@ -47,6 +48,10 @@ def test_live_verl_checkpoint_manager_updates_weights_with_modelexpress(tmp_path
     assert result.tensor_count == 15
     assert result.bytes_transferred > 0
     assert result.attempt_lease_ids
+    assert result.lease_summary_target_worker_id
+    assert result.lease_summary_model_version == result.resolved_model_version
+    assert result.lease_summary_source_worker_id == result.attempt_worker_ids[0]
+    assert result.lease_summary_statuses is None
 
 
 def test_live_verl_checkpoint_manager_compares_nccl_and_modelexpress(tmp_path):
@@ -98,6 +103,7 @@ def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
     assert "synthetic veRL refit failure" in result.error_message
     assert result.receive_success
     assert result.source_roles == (RlSourceRole.TRAINER.value,)
+    assert len(result.attempt_worker_ids) == 1
     assert result.attempt_successes == (True,)
     assert result.attempt_source_statuses == (p2p_pb2.SOURCE_STATUS_READY,)
     assert all(updated_at > 0 for updated_at in result.attempt_source_updated_at)
@@ -107,6 +113,10 @@ def test_live_verl_modelexpress_refit_failure_exposes_lease_summary(tmp_path):
     assert result.report_lease_ids
     assert result.attempt_lease_ids == result.report_lease_ids
     assert result.transfer_lease_discovery_supported
+    assert result.lease_summary_target_worker_id
+    assert result.lease_summary_model_version == result.resolved_model_version
+    assert result.lease_summary_source_worker_id == result.attempt_worker_ids[0]
+    assert result.lease_summary_statuses is None
     assert result.matching_lease_statuses == (
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     )
@@ -143,6 +153,7 @@ def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
     assert result.recovery_resolved_model_version == 17
     assert result.recovery_source_roles == (RlSourceRole.INFERENCE_REPLICA.value,)
     assert result.recovery_attempt_roles == (RlSourceRole.INFERENCE_REPLICA.value,)
+    assert len(result.recovery_attempt_worker_ids) == 1
     assert result.recovery_attempt_successes == (True,)
     assert result.recovery_attempt_source_statuses == (
         p2p_pb2.SOURCE_STATUS_READY,
@@ -156,6 +167,16 @@ def test_live_verl_modelexpress_restarted_rollout_recovers_latest_from_replica(
     assert result.recovery_attempt_lease_ids
     assert result.recovery_attempt_lease_ids == result.recovery_report_lease_ids
     assert result.recovery_transfer_lease_discovery_supported
+    assert result.recovery_lease_summary_target_worker_id
+    assert (
+        result.recovery_lease_summary_model_version
+        == result.recovery_resolved_model_version
+    )
+    assert (
+        result.recovery_lease_summary_source_worker_id
+        == result.recovery_attempt_worker_ids[0]
+    )
+    assert result.recovery_lease_summary_statuses is None
     assert result.recovery_matching_lease_statuses == (
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     )
@@ -187,6 +208,7 @@ def test_live_verl_modelexpress_trainer_failure_falls_back_to_replica(
         RlSourceRole.TRAINER.value,
         RlSourceRole.INFERENCE_REPLICA.value,
     )
+    assert len(result.recovery_attempt_worker_ids) == 2
     assert result.recovery_attempt_successes == (False, True)
     assert result.recovery_attempt_source_statuses == (
         p2p_pb2.SOURCE_STATUS_READY,
@@ -201,6 +223,13 @@ def test_live_verl_modelexpress_trainer_failure_falls_back_to_replica(
     assert len(result.recovery_attempt_lease_ids) == 2
     assert result.recovery_attempt_lease_ids == result.recovery_report_lease_ids
     assert result.recovery_transfer_lease_discovery_supported
+    assert result.recovery_lease_summary_target_worker_id
+    assert (
+        result.recovery_lease_summary_model_version
+        == result.recovery_resolved_model_version
+    )
+    assert result.recovery_lease_summary_source_worker_id == ""
+    assert result.recovery_lease_summary_statuses is None
     assert result.recovery_matching_lease_statuses == (
         p2p_pb2.TRANSFER_LEASE_STATUS_FAILED,
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,

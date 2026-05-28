@@ -26,6 +26,7 @@ class VerlRuntimeSmokeResult:
     resolved_model_version: int | None = None
     source_roles: tuple[str, ...] = ()
     attempt_roles: tuple[str, ...] = ()
+    attempt_worker_ids: tuple[str, ...] = ()
     attempt_successes: tuple[bool, ...] = ()
     attempt_source_statuses: tuple[int, ...] = ()
     attempt_source_updated_at: tuple[int, ...] = ()
@@ -37,6 +38,10 @@ class VerlRuntimeSmokeResult:
     matching_lease_statuses: tuple[int, ...] = ()
     missing_lease_ids: tuple[str, ...] = ()
     non_completed_lease_statuses: tuple[int, ...] = ()
+    lease_summary_target_worker_id: str = ""
+    lease_summary_model_version: int | None = None
+    lease_summary_source_worker_id: str = ""
+    lease_summary_statuses: tuple[int, ...] | None = None
     transfer_lease_discovery_supported: bool = False
     manager_cleanup_supported: bool = False
     replica_events: tuple[str, ...] = ()
@@ -46,6 +51,7 @@ class VerlRuntimeSmokeResult:
     recovery_resolved_model_version: int | None = None
     recovery_source_roles: tuple[str, ...] = ()
     recovery_attempt_roles: tuple[str, ...] = ()
+    recovery_attempt_worker_ids: tuple[str, ...] = ()
     recovery_attempt_successes: tuple[bool, ...] = ()
     recovery_attempt_source_statuses: tuple[int, ...] = ()
     recovery_attempt_source_updated_at: tuple[int, ...] = ()
@@ -57,6 +63,10 @@ class VerlRuntimeSmokeResult:
     recovery_matching_lease_statuses: tuple[int, ...] = ()
     recovery_missing_lease_ids: tuple[str, ...] = ()
     recovery_non_completed_lease_statuses: tuple[int, ...] = ()
+    recovery_lease_summary_target_worker_id: str = ""
+    recovery_lease_summary_model_version: int | None = None
+    recovery_lease_summary_source_worker_id: str = ""
+    recovery_lease_summary_statuses: tuple[int, ...] | None = None
     recovery_transfer_lease_discovery_supported: bool = False
     recovery_success: bool = False
 
@@ -306,6 +316,10 @@ def run_verl_checkpoint_manager_update(
                     int(lease.status)
                     for lease in summary.non_completed_matching_leases
                 ),
+                "lease_summary_target_worker_id": summary.inventory.target_worker_id,
+                "lease_summary_model_version": summary.inventory.model_version,
+                "lease_summary_source_worker_id": summary.inventory.source_worker_id,
+                "lease_summary_statuses": summary.inventory.statuses,
                 "discovery_supported": summary.inventory.discovery_supported,
             }
 
@@ -324,6 +338,9 @@ def run_verl_checkpoint_manager_update(
                 ),
                 "attempt_roles": tuple(
                     attempt.role.value for attempt in report.attempts
+                ),
+                "attempt_worker_ids": tuple(
+                    attempt.worker_id for attempt in report.attempts
                 ),
                 "attempt_successes": tuple(
                     attempt.success for attempt in report.attempts
@@ -512,6 +529,7 @@ def run_verl_checkpoint_manager_update(
             resolved_model_version=receive_report.get("resolved_model_version"),
             source_roles=tuple(receive_report.get("source_roles", ())),
             attempt_roles=tuple(receive_report.get("attempt_roles", ())),
+            attempt_worker_ids=tuple(receive_report.get("attempt_worker_ids", ())),
             attempt_successes=tuple(receive_report.get("attempt_successes", ())),
             attempt_source_statuses=tuple(
                 receive_report.get("attempt_source_statuses", ())
@@ -531,6 +549,16 @@ def run_verl_checkpoint_manager_update(
             non_completed_lease_statuses=tuple(
                 lease_snapshot.get("non_completed_lease_statuses", ())
             ),
+            lease_summary_target_worker_id=str(
+                lease_snapshot.get("lease_summary_target_worker_id", "")
+            ),
+            lease_summary_model_version=lease_snapshot.get(
+                "lease_summary_model_version"
+            ),
+            lease_summary_source_worker_id=str(
+                lease_snapshot.get("lease_summary_source_worker_id", "")
+            ),
+            lease_summary_statuses=lease_snapshot.get("lease_summary_statuses"),
             transfer_lease_discovery_supported=bool(
                 lease_snapshot.get("discovery_supported", False)
             ),
@@ -548,6 +576,9 @@ def run_verl_checkpoint_manager_update(
             ),
             recovery_source_roles=tuple(recovery_report.get("source_roles", ())),
             recovery_attempt_roles=tuple(recovery_report.get("attempt_roles", ())),
+            recovery_attempt_worker_ids=tuple(
+                recovery_report.get("attempt_worker_ids", ())
+            ),
             recovery_attempt_successes=tuple(
                 recovery_report.get("attempt_successes", ())
             ),
@@ -576,6 +607,18 @@ def run_verl_checkpoint_manager_update(
             ),
             recovery_non_completed_lease_statuses=tuple(
                 recovery_lease_snapshot.get("non_completed_lease_statuses", ())
+            ),
+            recovery_lease_summary_target_worker_id=str(
+                recovery_lease_snapshot.get("lease_summary_target_worker_id", "")
+            ),
+            recovery_lease_summary_model_version=recovery_lease_snapshot.get(
+                "lease_summary_model_version"
+            ),
+            recovery_lease_summary_source_worker_id=str(
+                recovery_lease_snapshot.get("lease_summary_source_worker_id", "")
+            ),
+            recovery_lease_summary_statuses=recovery_lease_snapshot.get(
+                "lease_summary_statuses"
             ),
             recovery_transfer_lease_discovery_supported=bool(
                 recovery_lease_snapshot.get("discovery_supported", False)
