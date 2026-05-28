@@ -356,7 +356,7 @@ sequenceDiagram
 
 ### Three-Tier Loading Strategy
 
-The `MxModelLoader` (`--load-format mx`) auto-detects the best loading strategy:
+The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
 
 1. **RDMA** -- If `ListSources` returns READY instances with matching rank, receive weights via NIXL/Mooncake
 2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU

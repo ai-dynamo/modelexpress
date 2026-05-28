@@ -20,7 +20,7 @@ graph TD
 
 ### Key Design Points
 
-1. **Engine loader integration**: vLLM uses `--load-format mx`; SGLang uses `remote_instance` with backend `modelexpress`.
+1. **Engine loader integration**: vLLM uses `--load-format modelexpress`; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with backend `modelexpress`.
 2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly).
 3. **Engine post-load hooks**: The ModelExpress adapter handles engine-specific post-load processing and tensor discovery.
 4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU).

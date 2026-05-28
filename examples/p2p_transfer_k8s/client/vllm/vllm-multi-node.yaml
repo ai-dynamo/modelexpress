@@ -139,7 +139,7 @@ spec:
                 ray start --head --port=6379 --num-gpus=4
                 until ray status --address=127.0.0.1:6379 >/dev/null 2>&1; do sleep 1; done
                 RAY_ADDRESS=127.0.0.1:6379 vllm serve $MODEL_NAME \
-                  --load-format mx \
+                  --load-format modelexpress \
                   --tensor-parallel-size 4 \
                   --pipeline-parallel-size 2 \
                   --max-model-len 32768 \

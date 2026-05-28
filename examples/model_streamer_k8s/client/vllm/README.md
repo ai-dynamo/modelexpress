@@ -4,7 +4,7 @@
 
 This recipe shows how to start a vLLM pod that loads model weights from Azure Blob Storage through ModelExpress ModelStreamer. It uses [`vllm-single-node-streamer-azure.yaml`](vllm-single-node-streamer-azure.yaml) as the deployment template.
 
-This path does not require a model PVC. The pod streams weights directly from Azure Blob Storage at startup by using `--load-format mx` and an `az://` model URI.
+This path does not require a model PVC. The pod streams weights directly from Azure Blob Storage at startup by using `--load-format modelexpress` and an `az://` model URI. The `mx` load format is kept as a backward-compatible alias.
 
 ### Prerequisites
 

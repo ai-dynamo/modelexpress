@@ -43,7 +43,7 @@ graph LR
 
 - **ModelExpress server** (Kubernetes CRD backend): tracks which workers have the model Ready, handles heartbeats, and reaps stale entries. Decode and prefill publish under the same `source_id` (derived from model identity), so any worker of either service can serve as an RDMA source for any other worker of either service.
 - **Frontend**: Dynamo's HTTP entry point; routes to decode workers round-robin.
-- **Workers**: `--load-format mx` means the first replica loads from disk and publishes metadata; every subsequent replica receives weights from a Ready source over RDMA.
+- **Workers**: `--load-format modelexpress` means the first replica loads from disk and publishes metadata; every subsequent replica receives weights from a Ready source over RDMA. The `mx` load format is kept as a backward-compatible alias.
 
 ## Prerequisites
 
