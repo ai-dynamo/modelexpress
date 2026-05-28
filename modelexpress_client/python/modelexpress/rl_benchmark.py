@@ -110,6 +110,7 @@ class RlTransferBenchmarkIteration:
     receive_seconds: float
     transfer_duration_seconds: float
     effective_bandwidth_gbps: float
+    transfer_bandwidth_gbps: float
     retry_count: int
     attempt_lease_ids: tuple[str, ...]
     transfer_lease_discovery_supported: bool
@@ -137,6 +138,7 @@ class RlTransferBenchmarkIteration:
             "receive_seconds": self.receive_seconds,
             "transfer_duration_seconds": self.transfer_duration_seconds,
             "effective_bandwidth_gbps": self.effective_bandwidth_gbps,
+            "transfer_bandwidth_gbps": self.transfer_bandwidth_gbps,
             "retry_count": self.retry_count,
             "attempt_lease_ids": list(self.attempt_lease_ids),
             "transfer_lease_discovery_supported": (
@@ -175,7 +177,9 @@ class RlTransferBenchmarkResult:
     def summary(self) -> dict[str, Any]:
         measured = self.measured_iterations
         receive_seconds = [item.receive_seconds for item in measured]
-        bandwidth = [item.effective_bandwidth_gbps for item in measured]
+        effective_bandwidth = [item.effective_bandwidth_gbps for item in measured]
+        transfer_bandwidth = [item.transfer_bandwidth_gbps for item in measured]
+        transfer_seconds = [item.transfer_duration_seconds for item in measured]
         attempts = [
             attempt
             for item in measured
@@ -188,9 +192,16 @@ class RlTransferBenchmarkResult:
             "median_receive_seconds": statistics.median(receive_seconds),
             "min_receive_seconds": min(receive_seconds),
             "max_receive_seconds": max(receive_seconds),
-            "mean_effective_bandwidth_gbps": statistics.fmean(bandwidth),
-            "median_effective_bandwidth_gbps": statistics.median(bandwidth),
-            "max_effective_bandwidth_gbps": max(bandwidth),
+            "mean_transfer_duration_seconds": statistics.fmean(transfer_seconds),
+            "median_transfer_duration_seconds": statistics.median(transfer_seconds),
+            "min_transfer_duration_seconds": min(transfer_seconds),
+            "max_transfer_duration_seconds": max(transfer_seconds),
+            "mean_effective_bandwidth_gbps": statistics.fmean(effective_bandwidth),
+            "median_effective_bandwidth_gbps": statistics.median(effective_bandwidth),
+            "max_effective_bandwidth_gbps": max(effective_bandwidth),
+            "mean_transfer_bandwidth_gbps": statistics.fmean(transfer_bandwidth),
+            "median_transfer_bandwidth_gbps": statistics.median(transfer_bandwidth),
+            "max_transfer_bandwidth_gbps": max(transfer_bandwidth),
             "total_retries": sum(item.retry_count for item in measured),
             "total_attempts": len(attempts),
             "successful_attempts": sum(1 for attempt in attempts if attempt["success"]),
@@ -364,6 +375,10 @@ def _benchmark_iteration_from_report(
         receive_seconds=receive_seconds,
         transfer_duration_seconds=transfer_duration_seconds,
         effective_bandwidth_gbps=_bandwidth_gbps(transferred_bytes, receive_seconds),
+        transfer_bandwidth_gbps=_bandwidth_gbps(
+            transferred_bytes,
+            transfer_duration_seconds,
+        ),
         retry_count=report.retry_count,
         attempt_lease_ids=tuple(
             attempt.lease_id for attempt in report.attempts if attempt.lease_id

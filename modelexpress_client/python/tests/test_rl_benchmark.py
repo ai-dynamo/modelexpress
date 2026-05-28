@@ -157,6 +157,7 @@ def test_benchmark_iteration_serializes_report_attempts():
         p2p_pb2.TRANSFER_LEASE_STATUS_COMPLETED,
     )
     assert item.effective_bandwidth_gbps == pytest.approx(0.000016384)
+    assert item.transfer_bandwidth_gbps == pytest.approx(0.0008192)
     assert item.to_dict()["lease_summary_target_worker_id"] == "target-worker"
     assert item.to_dict()["lease_summary_model_version"] == 7
     assert item.to_dict()["lease_summary_source_worker_id"] == "worker-b"
@@ -178,6 +179,7 @@ def test_benchmark_iteration_serializes_report_attempts():
         "lease-source-a",
         "lease-source-b",
     ]
+    assert item.to_dict()["transfer_bandwidth_gbps"] == pytest.approx(0.0008192)
 
 
 def test_benchmark_lease_summary_scopes_to_report_version_and_source_worker():
@@ -344,6 +346,8 @@ def test_benchmark_result_summary_ignores_warmups():
     assert summary["iterations"] == 1
     assert summary["total_transferred_bytes"] == 100
     assert summary["mean_receive_seconds"] == 1.0
+    assert summary["mean_transfer_duration_seconds"] == 0.01
+    assert summary["mean_transfer_bandwidth_gbps"] == pytest.approx(0.00008)
     assert summary["total_attempts"] == 1
     assert summary["successful_attempts"] == 1
     assert summary["failed_attempts"] == 0
