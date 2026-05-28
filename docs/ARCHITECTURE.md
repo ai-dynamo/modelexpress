@@ -729,7 +729,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the `modelexpress` and `mx` loaders with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |

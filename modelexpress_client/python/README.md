@@ -26,7 +26,7 @@ pip install -e ".[dev]"
 
 ## Quick Start with vLLM
 
-ModelExpress integrates with vLLM via custom model loaders. Set `MX_REGISTER_LOADERS=1` to auto-register them, or call `register_modelexpress_loaders()` in your code.
+ModelExpress integrates with vLLM via custom model loaders. vLLM can discover the package through its `vllm.general_plugins` entrypoint; set `VLLM_PLUGINS=modelexpress` if your vLLM deployment requires explicit plugin selection. For manual registration, call `register_modelexpress_loaders()` in your code.
 
 ```bash
 export MODEL_EXPRESS_URL="modelexpress-server:8001"
@@ -81,7 +81,6 @@ register_modelexpress_loaders()
 |----------|---------|-------------|
 | `MODEL_EXPRESS_URL` | `localhost:8001` | ModelExpress gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compatible alias for `MODEL_EXPRESS_URL` |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register `modelexpress` and `mx` loaders with vLLM |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
 | `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
