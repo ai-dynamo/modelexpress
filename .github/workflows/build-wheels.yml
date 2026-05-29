@@ -83,7 +83,7 @@ jobs:
 
       - name: Upload to Artifactory
         run: |
-          DEST="${{ secrets.ARTIFACTORY_REPO_NAME }}/${{ steps.dest.outputs.subpath }}/"
+          DEST="${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}/${{ steps.dest.outputs.subpath }}/"
           echo "Uploading to: ${DEST}"
           jf rt upload --flat "dist/*.whl" "${DEST}"
           jf rt upload --flat "dist/*.tar.gz" "${DEST}"

@@ -241,7 +241,7 @@ docker run --rm -v "$PWD/dist:/out" mx-wheel-builder cp -r /dist/. /out/
 every push to `main` / `release/**`, building both archs in parallel on
 velonix self-hosted runners and uploading the artifacts to NV Artifactory.
 
-Destination layout under `${ARTIFACTORY_REPO_NAME}`:
+Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
 
 | Event | Subpath |
 |---|---|
@@ -252,7 +252,7 @@ Each path contains the 6 artifacts from one arch: 4 manylinux wheels
 (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
 gated on the `release_automation` GitHub environment, which holds three
 secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
-and `ARTIFACTORY_REPO_NAME`.
+and `ARTIFACTORY_PYPI_REPO_NAME`.
 
 ### Custom Client Image (P2P Transfers)
 
