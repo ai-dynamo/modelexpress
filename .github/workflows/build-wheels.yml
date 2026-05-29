@@ -9,7 +9,7 @@
 #   - push to main and release/**: lands under post-merge/<sha>/<run_id>/<run_attempt>/<arch>/
 #
 # Runs in parallel to (does not gate on) the rest of CI. The upload step is
-# environment-gated on `release_automation`, so the Artifactory secrets are
+# environment-gated on `automated-release`, so the Artifactory secrets are
 # only injected for in-repo PRs and protected pushes. Fork PR builds will run
 # the buildx step (to surface broken Dockerfile changes) but skip the upload.
 
@@ -32,7 +32,7 @@ permissions:
 jobs:
   build-and-upload:
     name: Build & upload wheels (${{ matrix.arch }})
-    environment: release_automation
+    environment: automated-release
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

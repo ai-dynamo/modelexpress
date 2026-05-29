@@ -250,7 +250,7 @@ Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
 
 Each path contains the 6 artifacts from one arch: 4 manylinux wheels
 (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
-gated on the `release_automation` GitHub environment, which holds three
+gated on the `automated-release` GitHub environment, which holds three
 secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
 and `ARTIFACTORY_PYPI_REPO_NAME`.
 
