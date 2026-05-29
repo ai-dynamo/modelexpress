@@ -24,25 +24,30 @@ WORKDIR /src
 COPY modelexpress_client/python /src
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/python/cp313-cp313/bin:${PATH}"
+
+# uv drives the per-Python builds (PEP 517, with build isolation).
+# auditwheel only needs to live in one Python; it operates on built wheels.
+RUN /opt/python/cp313-cp313/bin/pip install --upgrade uv auditwheel
 
 RUN set -eux; \
     arch=$(uname -m); \
     mkdir -p /tmp/raw /dist; \
-    for PYBIN in /opt/python/cp310-cp310/bin \
-                 /opt/python/cp311-cp311/bin \
-                 /opt/python/cp312-cp312/bin \
-                 /opt/python/cp313-cp313/bin; do \
-        "$PYBIN/pip" install --upgrade pip build auditwheel; \
-        "$PYBIN/python" -m build --wheel --outdir /tmp/raw .; \
+    for PY in /opt/python/cp310-cp310/bin/python \
+              /opt/python/cp311-cp311/bin/python \
+              /opt/python/cp312-cp312/bin/python \
+              /opt/python/cp313-cp313/bin/python; do \
+        uv build --wheel --python "$PY" --out-dir /tmp/raw .; \
     done; \
     for whl in /tmp/raw/*.whl; do \
         auditwheel repair --plat "manylinux_2_28_${arch}" -w /dist "$whl"; \
     done
 
 RUN set -eux; \
-    MX_SKIP_EXT=1 /opt/python/cp313-cp313/bin/python -m build \
-        --wheel --sdist --outdir /dist .
+    MX_SKIP_EXT=1 uv build --wheel --sdist \
+        --python /opt/python/cp313-cp313/bin/python --out-dir /dist .; \
+    rm -f /dist/.gitignore
 
 FROM scratch AS export
 COPY --from=builder /dist/ /
