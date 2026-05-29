@@ -5,26 +5,30 @@
 # and uploads the resulting artifacts to NV Artifactory.
 #
 # Triggered on:
-#   - pull_request: every PR push, lands under pr/<pr_id>/<sha>/<run_id>/<run_attempt>/<arch>/
-#   - push to main and release/**: lands under post-merge/<sha>/<run_id>/<run_attempt>/<arch>/
+#   - push to pull-request/<pr_id> (mirrored from contributor PRs by
+#     copy-pr-bot): lands under pr/<pr_id>/<sha>/<run_id>/<run_attempt>/<arch>/
+#   - push to main and release/**: lands under
+#     post-merge/<sha>/<run_id>/<run_attempt>/<arch>/
 #
-# Runs in parallel to (does not gate on) the rest of CI. The upload step is
-# environment-gated on `automated-release`, so the Artifactory secrets are
-# only injected for in-repo PRs and protected pushes. Fork PR builds will run
-# the buildx step (to surface broken Dockerfile changes) but skip the upload.
+# copy-pr-bot mirrors PRs (including fork PRs) into the pull-request/<pr_id>
+# branch namespace inside this repo, which lets the workflow access
+# environment-scoped secrets that fork PRs can't reach directly.
+#
+# Runs in parallel to (does not gate on) the rest of CI. Upload is
+# environment-gated on `automated-release`.
 
 name: Build & upload client wheels
 
 on:
-  pull_request:
   push:
     branches:
+      - 'pull-request/*'
       - main
       - 'release/**'
 
 concurrency:
   group: build-wheels-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
 
 permissions:
   contents: read
@@ -55,11 +59,15 @@ jobs:
       - name: Compute artifactory subpath
         id: dest
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            SUBPATH="pr/${{ github.event.pull_request.number }}/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
-          else
-            SUBPATH="post-merge/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
-          fi
+          case "${GITHUB_REF_NAME}" in
+            pull-request/*)
+              PR_ID="${GITHUB_REF_NAME#pull-request/}"
+              SUBPATH="pr/${PR_ID}/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
+              ;;
+            *)
+              SUBPATH="post-merge/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
+              ;;
+          esac
           echo "subpath=${SUBPATH}" >> "$GITHUB_OUTPUT"
           echo "Destination subpath: ${SUBPATH}"
 
