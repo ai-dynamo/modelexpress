@@ -97,7 +97,7 @@ spec:
           runAsGroup: 1000
           fsGroup: 1000
         mainContainer:
-          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
+          image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
           imagePullPolicy: IfNotPresent
           env:
             - name: MODEL_EXPRESS_SERVER_PORT
