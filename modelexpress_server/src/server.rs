@@ -19,9 +19,7 @@ use crate::cache::CacheEvictionService;
 use crate::config::ServerConfig;
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::registry::state::RegistryManager;
-use crate::services::{
-    ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl, init_model_tracker,
-};
+use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
@@ -34,7 +32,8 @@ const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 /// gRPC services, and tears everything down once `shutdown` resolves. Logging is the
 /// caller's responsibility: install a subscriber before calling this.
 ///
-/// NOTE: not re-entrant. Call once per process; it initializes a process-wide tracker.
+/// All server state (registry, download tracker, P2P) is instance-scoped, so this
+/// can be called multiple times in one process, including concurrently.
 pub async fn run_server(
     config: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -63,10 +62,8 @@ pub async fn run_server(
         }
     }
 
-    // Initialize the process-wide download tracker, injected with the registry.
+    // Initialize the download tracker, injected with the registry.
     let tracker = Arc::new(ModelDownloadTracker::new(registry.clone()));
-    init_model_tracker(tracker)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     // Create cache eviction service
     let cache_service = CacheEvictionService::new(
@@ -94,7 +91,7 @@ pub async fn run_server(
     // Create service implementations
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
-    let model_service = ModelServiceImpl;
+    let model_service = ModelServiceImpl::new(tracker);
 
     // Create standard gRPC health service (grpc.health.v1.Health)
     let (health_reporter, health_service_v1) = tonic_health::server::health_reporter();

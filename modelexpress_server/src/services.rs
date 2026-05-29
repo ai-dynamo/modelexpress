@@ -126,8 +126,17 @@ impl ApiService for ApiServiceImpl {
 }
 
 /// Model service implementation
-#[derive(Debug, Default)]
-pub struct ModelServiceImpl;
+#[derive(Clone)]
+pub struct ModelServiceImpl {
+    tracker: Arc<ModelDownloadTracker>,
+}
+
+impl ModelServiceImpl {
+    /// Each server owns its tracker, so multiple servers can run in one process.
+    pub fn new(tracker: Arc<ModelDownloadTracker>) -> Self {
+        Self { tracker }
+    }
+}
 
 /// Helper function to collect all files in a model directory recursively
 fn collect_model_files(
@@ -230,15 +239,8 @@ impl ModelService for ModelServiceImpl {
         let ignore_weights = model_request.ignore_weights;
 
         // Spawn a task to handle the streaming download updates
+        let tracker = self.tracker.clone();
         tokio::spawn(async move {
-            let Some(tracker) = model_tracker() else {
-                let _ = tx
-                    .send(Err(Status::unavailable(
-                        "server startup incomplete: model tracker not initialized",
-                    )))
-                    .await;
-                return;
-            };
             // Run the full claim + wait + retry flow. `ensure_model_downloaded` sends
             // its own initial status update (based on the `ClaimOutcome` returned by the
             // registry), so we don't do a pre-check here — a pre-check would either
@@ -531,12 +533,7 @@ impl ModelService for ModelServiceImpl {
         let model_name = download::canonical_model_name(&delete_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        let Some(tracker) = model_tracker() else {
-            return Err(Status::unavailable(
-                "server startup incomplete: model tracker not initialized",
-            ));
-        };
-
+        let tracker = self.tracker.clone();
         tracker.delete_status(&model_name).await;
         info!("Deleted registry record for model '{model_name}'");
 
@@ -840,27 +837,6 @@ impl ModelDownloadTracker {
     }
 }
 
-/// Global model download tracker. Initialized by `main.rs` after the registry is
-/// connected, then read via `model_tracker()` from gRPC service handlers.
-static MODEL_TRACKER: std::sync::OnceLock<Arc<ModelDownloadTracker>> = std::sync::OnceLock::new();
-
-/// Initialize the process-wide tracker. Called exactly once during server startup.
-/// Returns an error if called twice — main.rs propagates it as a startup failure.
-pub fn init_model_tracker(
-    tracker: Arc<ModelDownloadTracker>,
-) -> Result<Arc<ModelDownloadTracker>, &'static str> {
-    MODEL_TRACKER
-        .set(tracker.clone())
-        .map(|()| tracker)
-        .map_err(|_| "init_model_tracker called more than once")
-}
-
-/// Read the process-wide tracker. Returns `None` if `init_model_tracker` hasn't run yet,
-/// letting gRPC handlers return `Status::unavailable` instead of crashing the server.
-pub fn model_tracker() -> Option<&'static Arc<ModelDownloadTracker>> {
-    MODEL_TRACKER.get()
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -1116,12 +1092,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_model_tracker_uninitialized_returns_none() {
-        // The process-wide MODEL_TRACKER hasn't been init'd in tests, so
-        // model_tracker() returns None — the service layer uses this to respond with
-        // Status::unavailable rather than panic.
-        assert!(model_tracker().is_none());
+    /// Build a model service backed by a real in-memory registry. The file-serving
+    /// tests below don't touch the tracker, but the service now owns one.
+    fn test_model_service() -> ModelServiceImpl {
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(
+            crate::registry::backend::memory::InMemoryRegistryBackend::new(),
+        )));
+        ModelServiceImpl::new(Arc::new(ModelDownloadTracker::new(registry)))
     }
 
     #[test]
@@ -1256,7 +1233,7 @@ mod tests {
         std::fs::write(model_dir.join("subdir/nested.txt"), b"nested")
             .expect("Failed to write nested");
 
-        let service = ModelServiceImpl;
+        let service = test_model_service();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1340,7 +1317,7 @@ mod tests {
             .expect("Failed to write config");
         std::fs::write(model_dir.join("model.bin"), vec![0u8; 100]).expect("Failed to write model");
 
-        let service = ModelServiceImpl;
+        let service = test_model_service();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1383,7 +1360,7 @@ mod tests {
         std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
             .expect("Failed to write config");
 
-        let service = ModelServiceImpl;
+        let service = test_model_service();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1404,7 +1381,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_model_files_not_found() {
-        let service = ModelServiceImpl;
+        let service = test_model_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "non-existent-model-12345".to_string(),
@@ -1421,7 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_model_files_not_found() {
-        let service = ModelServiceImpl;
+        let service = test_model_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "non-existent-model-12345".to_string(),
@@ -1438,7 +1415,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_model_downloaded_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let service = test_model_service();
 
         let request = Request::new(ModelDownloadRequest {
             model_name: "test/model".to_string(),
@@ -1455,7 +1432,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_model_files_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let service = test_model_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
@@ -1473,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_model_files_rejects_invalid_provider() {
-        let service = ModelServiceImpl;
+        let service = test_model_service();
 
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
@@ -1506,7 +1483,7 @@ mod tests {
         std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
             .expect("Failed to write model file");
 
-        let service = ModelServiceImpl;
+        let service = test_model_service();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
@@ -1547,7 +1524,7 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("empty.bin"), []).expect("Failed to write empty file");
 
-        let service = ModelServiceImpl;
+        let service = test_model_service();
         let request = Request::new(ModelFilesRequest {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
