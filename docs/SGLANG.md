@@ -84,7 +84,7 @@ Later replicas discover the source and load via the selected ModelExpress
 transport.
 
 ```bash
-export MODEL_EXPRESS_URL=modelexpress-server:8001
+export MX_SERVER_ADDRESS=modelexpress-server:8001
 
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30000 \
