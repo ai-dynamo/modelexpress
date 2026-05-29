@@ -45,6 +45,8 @@ graph LR
 - **Frontend**: Dynamo's HTTP entry point; routes to decode workers round-robin.
 - **Workers**: `--load-format modelexpress` means the first replica loads from disk and publishes metadata; every subsequent replica receives weights from a Ready source over RDMA. The `mx` load format is kept as a backward-compatible alias.
 
+> **ModelExpress server address.** These examples set `MODEL_EXPRESS_URL`. ModelExpress is standardizing on `MX_SERVER_ADDRESS` as the recommended variable going forward, but Dynamo's ModelExpress integration (operator injection and the native `mx-source` / `mx-target` load formats) currently uses `MODEL_EXPRESS_URL`. The `modelexpress` plugin loader used here accepts either, so for Dynamo deployments set `MODEL_EXPRESS_URL` for now.
+
 ## Prerequisites
 
 1. **Dynamo operator** installed (provides the `DynamoGraphDeployment` CRD).
