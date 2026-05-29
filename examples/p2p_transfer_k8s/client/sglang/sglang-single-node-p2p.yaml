@@ -56,6 +56,12 @@ spec:
           args:
             - --model-path
             - $(MODEL_NAME)
+            # Bind all interfaces on the Service port. SGLang defaults to
+            # 127.0.0.1:30000, which the Service (port 8000) cannot reach.
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
             - --load-format
             - remote_instance
             - --remote-instance-weight-loader-backend
@@ -72,6 +78,16 @@ spec:
           ports:
             - containerPort: 8000
               protocol: TCP
+          # Gate Service traffic on the HTTP API being up. Without a probe the
+          # pod reports Ready at container start, masking bind/port mismatches.
+          # Large-model startup is slow, so allow a wide failure window.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 60
           env:
             - name: HF_HOME
               value: "/models"
