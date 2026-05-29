@@ -63,7 +63,7 @@ For ModelStreamer-only startup examples that stream weights from Azure Blob Stor
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MODEL_EXPRESS_URL` / `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration | `modelexpress-server:8001` |
+| `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration (recommended). `MODEL_EXPRESS_URL` is deprecated and pending removal, but is still required by some paths today and takes precedence when both are set; set both during the transition. | `modelexpress-server:8001` |
 | `MX_RDMA_NIC_PIN` | Per-rank NIC pinning for RDMA-capable deployments | `auto` |
 
 ### ModelExpress Server
