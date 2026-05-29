@@ -1092,11 +1092,11 @@ mod tests {
         );
     }
 
-    /// Build a model service backed by a real in-memory registry. The file-serving
-    /// tests below don't touch the tracker, but the service now owns one.
+    /// Model service for the file-serving tests, which don't touch the tracker. A
+    /// no-expectation mock backend keeps them off the `memory-backend` feature.
     fn test_model_service() -> ModelServiceImpl {
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(
-            crate::registry::backend::memory::InMemoryRegistryBackend::new(),
+            crate::registry::backend::MockRegistryBackend::new(),
         )));
         ModelServiceImpl::new(Arc::new(ModelDownloadTracker::new(registry)))
     }
