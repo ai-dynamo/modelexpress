@@ -235,6 +235,25 @@ docker build -f docker/Dockerfile.client-wheel -t mx-wheel-builder .
 docker run --rm -v "$PWD/dist:/out" mx-wheel-builder cp -r /dist/. /out/
 ```
 
+#### CI uploads to Artifactory
+
+`.github/workflows/build-wheels.yml` runs this Dockerfile on every PR and
+every push to `main` / `release/**`, building both archs in parallel on
+velonix self-hosted runners and uploading the artifacts to NV Artifactory.
+
+Destination layout under `${ARTIFACTORY_REPO_NAME}`:
+
+| Event | Subpath |
+|---|---|
+| `pull_request` | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+
+Each path contains the 6 artifacts from one arch: 4 manylinux wheels
+(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
+gated on the `release_automation` GitHub environment, which holds three
+secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
+and `ARTIFACTORY_REPO_NAME`.
+
 ### Custom Client Image (P2P Transfers)
 
 For GPU-to-GPU weight transfers with vLLM:
