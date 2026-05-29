@@ -72,6 +72,89 @@ Client CLI arguments are defined in a shared struct to avoid duplication:
 4. Implement the service trait in `modelexpress_server/src/` (new file or existing)
 5. Register the service in `modelexpress_server/src/main.rs` during server startup
 
+## Bumping the ModelExpress Version
+
+ModelExpress version strings split into two categories with different bump
+cadences. **Confusing them is the most common mistake** — public-image
+references on `main` pointing at a tag that doesn't yet exist sends users
+at a broken pull.
+
+### On `main` (e.g. 0.4.0 → 0.5.0)
+
+Bump the workspace/chart version and the protocol-version fixtures. **Do
+not** touch any reference to the public release container image.
+
+Files to bump:
+
+- `Cargo.toml` — `[workspace.package].version` and the three internal
+  `modelexpress-{common,client,server}` path-dep `version =` entries.
+- `Cargo.lock` — regenerate with `cargo update --workspace` (touches only
+  our four crates: `modelexpress-{common,client,server}` plus
+  `model-express-workspace-tests`).
+- `modelexpress_client/python/pyproject.toml` — `[project].version`.
+- `modelexpress_client/python/uv.lock` — regenerate with `uv lock`
+  (from `modelexpress_client/python/`).
+- `helm/Chart.yaml` — `version` and `appVersion` (chart version tracks
+  the workspace; chart image tag does not — see below).
+- `docs/metadata.md` — `mx_version` example values (search the file for
+  the old version literal; expect ~2 hits).
+- `modelexpress_server/src/p2p/{source_identity,state,service}.rs` and
+  `modelexpress_server/src/p2p/backend/redis.rs` — `mx_version` strings
+  in `mod tests` fixtures.
+- `modelexpress_client/python/tests/test_source_id.py` and
+  `test_k8s_service_client.py` — `mx_version` strings in test fixtures.
+
+`mx_version` is part of the `SourceIdentity` proto, which is hashed into
+the `mx_source_id`. After bumping the version literals, the pinned
+source-id assertions break. Capture the new hashes by running the
+failing tests:
+
+```bash
+cd modelexpress_client/python && .venv/bin/python -m pytest \
+  tests/test_source_id.py -v -k "pinned_hash or case_colliding"
+```
+
+Update the three Python assertions in `tests/test_source_id.py` and the
+three matching Rust assertions in
+`modelexpress_server/src/p2p/source_identity.rs` (search for
+`test_python_cross_check_*`) so both sides cross-check on the new hashes.
+
+Verify end-to-end before committing:
+
+```bash
+cargo check --workspace --tests
+cd modelexpress_client/python && .venv/bin/python -m pytest tests/
+```
+
+### Public-image tag references — separate cadence
+
+These references point at the public release container on NGC. They lag
+behind the workspace version because the container has to be built and
+published first:
+
+- `examples/**/*.yaml` — `image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:<tag>`
+- `helm/values*.yaml` — `image.tag`
+- `helm/README.md` — `image.tag` row + `docker pull` example
+- Any CI manifest comment that contrasts against `nvcr.io/<old_tag>` for
+  context (e.g. `ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml`)
+
+Lifecycle:
+
+1. Bump the workspace/Python/Helm-chart version on `main` (this section's
+   primary procedure). Image-tag references are left untouched.
+2. Cut the `release/<X.Y.Z>` branch from `main`. The branch inherits the
+   still-stale image-tag references.
+3. After the release tag is set and the container is published on NGC,
+   bump the image-tag references on the release branch
+   (e.g. `harrison/bump-examples-<X.Y.Z>` against `release/<X.Y.Z>`).
+4. Cherry-pick that image-tag-bump commit back to `main`. This is the
+   only time image-tag refs change on `main`, and only ever after the
+   container actually exists on NGC.
+
+Pulling references at a tag that doesn't yet exist on NGC sends users
+at a broken `docker pull`, which is why these never move ahead of the
+container publish.
+
 ## Git Workflow
 
 Feature branches use `<username>/feature-name` format, forked from `main`.
@@ -100,5 +183,6 @@ When making changes, update the appropriate documentation files:
 | Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |
 | Contribution process, DCO | `CONTRIBUTING.md` |
 | New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
+| Version-bump procedure changes | `CLAUDE.md` (Bumping the ModelExpress Version section) |
 
 **A feature is incomplete until documentation is updated.**
