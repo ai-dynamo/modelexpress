@@ -55,7 +55,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `mx` loader and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
+- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
@@ -64,7 +64,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 | Runtime | Integration |
 |---------|-------------|
-| vLLM | `--load-format mx` for P2P weight transfer |
+| vLLM | `--load-format modelexpress` for P2P weight transfer; `mx` is a backward-compatible alias |
 | NVIDIA Dynamo (vLLM) | `get_model_path` API; [Dynamo model cache K8s example](examples/dynamo_model_cache_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
 | SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
@@ -75,7 +75,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](model-express-architecture.png)
 
-*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format mx` for inference.
+*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format modelexpress` for inference.
 
 ```
                     ┌─────────────────────────────────────────────────────────────────┐
@@ -150,7 +150,8 @@ Override [values-production.yaml](helm/values-production.yaml) for your env. Ful
 ```python
 from modelexpress import register_modelexpress_loaders
 register_modelexpress_loaders()
-# vllm serve <model> --load-format mx --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
+# vllm serve <model> --load-format modelexpress
+# The mx load format is kept as a backward-compatible alias.
 ```
 
 First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).

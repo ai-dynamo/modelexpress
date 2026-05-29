@@ -138,7 +138,7 @@ spec:
             - --model
             - nvidia/Kimi-K2.5-NVFP4
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "4"
             - --max-model-len
@@ -207,7 +207,7 @@ spec:
             - --model
             - nvidia/Kimi-K2.5-NVFP4
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "4"
             - --max-model-len

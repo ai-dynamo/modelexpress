@@ -156,7 +156,7 @@ ModelExpress/
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── rank_utils.py               # Rank detection utilities
-│       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
+│       ├── vllm_worker.py              # Compatibility worker for older manual registration
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
 │       └── p2p_pb2_grpc.py             # Generated gRPC stubs
@@ -516,7 +516,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 | Module | Purpose |
 |--------|---------|
-| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
+| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
@@ -529,7 +529,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
-| `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
+| `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
 
@@ -562,7 +562,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 ### vLLM Loader
 
-**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
+**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format modelexpress`; `mx` alias):
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
@@ -729,7 +729,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |

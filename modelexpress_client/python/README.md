@@ -26,18 +26,17 @@ pip install -e ".[dev]"
 
 ## Quick Start with vLLM
 
-ModelExpress integrates with vLLM via custom model loaders. Set `MX_REGISTER_LOADERS=1` to auto-register them, or call `register_modelexpress_loaders()` in your code.
+ModelExpress integrates with vLLM via custom model loaders. vLLM can discover the package through its `vllm.general_plugins` entrypoint; set `VLLM_PLUGINS=modelexpress` if your vLLM deployment requires explicit plugin selection. For manual registration, call `register_modelexpress_loaders()` in your code.
 
 ```bash
 export MODEL_EXPRESS_URL="modelexpress-server:8001"
 
 vllm serve deepseek-ai/DeepSeek-V3 \
-    --load-format mx \
-    --tensor-parallel-size 8 \
-    --worker-cls modelexpress.vllm_worker.ModelExpressWorker
+    --load-format modelexpress \
+    --tensor-parallel-size 8
 ```
 
-Starting the vLLM engine with `mx` loader on the source worker will load the weights from disk and register/publish the NIXL and tensor metadata to the MX server.
+Starting the vLLM engine with the `modelexpress` load format on the source worker will load the weights from disk and register/publish the NIXL and tensor metadata to the MX server. The `mx` load format is kept as a backward-compatible alias.
 And on the target worker, it will retrieve these metadata from MX serverand stream weights over RDMA from GPU to GPU.
 
 ## Programmatic Usage
@@ -73,7 +72,7 @@ client.close()
 from modelexpress import register_modelexpress_loaders
 
 register_modelexpress_loaders()
-# Now vLLM recognizes --load-format mx-source and mx-target
+# Now vLLM recognizes --load-format modelexpress and mx
 ```
 
 ## Environment Variables
@@ -82,7 +81,6 @@ register_modelexpress_loaders()
 |----------|---------|-------------|
 | `MODEL_EXPRESS_URL` | `localhost:8001` | ModelExpress gRPC server address |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compatible alias for `MODEL_EXPRESS_URL` |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register `mx` loader with vLLM |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
 | `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
@@ -106,7 +104,7 @@ register_modelexpress_loaders()
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
-| `modelexpress.vllm_worker` | vLLM worker extensions |
+| `modelexpress.vllm_worker` | Compatibility worker extension for older manual-registration workflows |
 
 ## How It Works
 
