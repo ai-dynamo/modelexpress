@@ -100,7 +100,9 @@ spec:
           value: "nvidia/Kimi-K2.5-NVFP4"
         - name: VLLM_PLUGINS
           value: "modelexpress"
-        - name: MX_SERVER_ADDRESS
+        # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
+        # standardizing on MX_SERVER_ADDRESS going forward (see README).
+        - name: MODEL_EXPRESS_URL
           value: "mx-vllm-disagg-sn-modelexpress:8000"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
@@ -172,7 +174,9 @@ spec:
           value: "nvidia/Kimi-K2.5-NVFP4"
         - name: VLLM_PLUGINS
           value: "modelexpress"
-        - name: MX_SERVER_ADDRESS
+        # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
+        # standardizing on MX_SERVER_ADDRESS going forward (see README).
+        - name: MODEL_EXPRESS_URL
           value: "mx-vllm-disagg-sn-modelexpress:8000"
         - name: NIXL_LOG_LEVEL
           value: "INFO"

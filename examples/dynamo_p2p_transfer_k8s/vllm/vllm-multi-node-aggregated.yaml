@@ -109,7 +109,9 @@ spec:
           value: "nvidia/Kimi-K2.5-NVFP4"
         - name: VLLM_PLUGINS
           value: "modelexpress"
-        - name: MX_SERVER_ADDRESS
+        # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
+        # standardizing on MX_SERVER_ADDRESS going forward (see README).
+        - name: MODEL_EXPRESS_URL
           value: "mx-vllm-modelexpress:8000"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN

@@ -29,7 +29,7 @@ pip install -e ".[dev]"
 ModelExpress integrates with vLLM via custom model loaders. vLLM can discover the package through its `vllm.general_plugins` entrypoint; set `VLLM_PLUGINS=modelexpress` if your vLLM deployment requires explicit plugin selection. For manual registration, call `register_modelexpress_loaders()` in your code.
 
 ```bash
-export MODEL_EXPRESS_URL="modelexpress-server:8001"
+export MX_SERVER_ADDRESS="modelexpress-server:8001"
 
 vllm serve deepseek-ai/DeepSeek-V3 \
     --load-format modelexpress \
@@ -79,8 +79,8 @@ register_modelexpress_loaders()
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_EXPRESS_URL` | `localhost:8001` | ModelExpress gRPC server address |
-| `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compatible alias for `MODEL_EXPRESS_URL` |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress gRPC server address (recommended) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
 | `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
