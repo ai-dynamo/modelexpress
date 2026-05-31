@@ -205,6 +205,11 @@ platform it produces:
   extension; runtime falls back to the pool-reg path)
 - sdist tarball
 
+The `manylinux_2_28` base images and `auditwheel` are pinned (by digest and
+version respectively) so published artifacts are reproducible. Refresh the
+base-image digests deliberately with
+`docker buildx imagetools inspect quay.io/pypa/manylinux_2_28_<arch>`.
+
 The Dockerfile is multi-arch. Pick the target with buildx `--platform`:
 
 ```bash

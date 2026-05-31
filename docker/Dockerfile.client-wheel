@@ -14,8 +14,11 @@
 # Multi-arch: pick the platform with buildx --platform. See
 # docs/DEPLOYMENT.md for the full invocation examples.
 
-FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder-amd64
-FROM quay.io/pypa/manylinux_2_28_aarch64 AS builder-arm64
+# Base images pinned by digest for reproducible release builds.
+# Digests track the manylinux_2_28 `latest` tag as of 2026-05-30.
+# Refresh with: docker buildx imagetools inspect quay.io/pypa/manylinux_2_28_<arch>
+FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:6c62d0cc6477b491315d96026357c7927e523d63c50c1b4636dd59ce73ddde93 AS builder-amd64
+FROM quay.io/pypa/manylinux_2_28_aarch64@sha256:9cb0c7e71b5697e298dc74b7af6e4ee8763355374e64fb83e45b22455089c83d AS builder-arm64
 
 ARG TARGETARCH
 FROM builder-${TARGETARCH} AS builder
@@ -29,7 +32,9 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 # uv drives the per-Python builds (PEP 517, with build isolation).
 # auditwheel only needs to live in one Python; it operates on built wheels.
-RUN /opt/python/cp313-cp313/bin/pip install --upgrade uv auditwheel
+# auditwheel is pinned: it sets the platform tag and vendors libs into the
+# repaired wheel, so its version directly affects the published artifact.
+RUN /opt/python/cp313-cp313/bin/pip install --upgrade uv auditwheel==6.7.0
 
 RUN set -eux; \
     arch=$(uname -m); \
