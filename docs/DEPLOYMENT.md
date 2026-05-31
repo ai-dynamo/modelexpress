@@ -231,9 +231,8 @@ host). Native builds on the matching arch run without emulation.
 Without buildx (single arch, matches the host):
 
 ```bash
-docker build -f docker/Dockerfile.client-wheel -t mx-wheel-builder .
-docker run --rm -v "$PWD/dist:/out" mx-wheel-builder cp -r /dist/. /out/
-```
+docker build -f docker/Dockerfile.client-wheel --target builder -t mx-wheel-builder .
+docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /out/'
 
 #### CI uploads to Artifactory
 
