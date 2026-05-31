@@ -64,8 +64,10 @@ graph TD
 ModelExpress/
 ├── Cargo.toml                          # Workspace root (4 members)
 ├── Cargo.lock
-├── Dockerfile                          # Multi-stage production image
-├── docker-compose.yml                  # Single-service dev setup
+├── docker/
+│   ├── Dockerfile                      # Multi-stage production image
+│   ├── Dockerfile.client-wheel         # Builds Python client wheels + sdist
+│   └── docker-compose.yml              # Single-service dev setup
 ├── run_integration_tests.sh            # Integration test runner
 ├── test_client.sh                      # Client test script
 ├── test_grpc_transfer_k8s.sh           # K8s gRPC transfer test

@@ -163,7 +163,7 @@ Load model weights directly from Azure Blob Storage, S3, or a PVC-backed local p
 ### Docker
 
 ```bash
-docker-compose up --build
+docker compose -f docker/docker-compose.yml up --build
 ```
 
 ---

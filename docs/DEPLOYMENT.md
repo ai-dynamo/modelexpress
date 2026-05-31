@@ -180,7 +180,7 @@ See [`CLI.md`](CLI.md) for full CLI usage documentation.
 The multi-stage Dockerfile builds all binaries (server, CLI, test tools):
 
 ```bash
-docker build -t model-express .
+docker build -f docker/Dockerfile -t model-express .
 docker run -p 8001:8001 model-express
 ```
 
@@ -189,8 +189,75 @@ docker run -p 8001:8001 model-express
 Single-service setup for local development:
 
 ```bash
-docker-compose up --build
+docker compose -f docker/docker-compose.yml up --build
 ```
+
+### Python Client Distributions
+
+`docker/Dockerfile.client-wheel` builds the publishable artifacts for the
+Python client on top of `quay.io/pypa/manylinux_2_28_${arch}`. Per target
+platform it produces:
+
+- `manylinux_2_28_x86_64` or `manylinux_2_28_aarch64` wheels for cp310,
+  cp311, cp312, cp313 (each compiles the `modelexpress.vmm._alloc_ext` shim
+  against the matching CPython ABI and is hardened with `auditwheel repair`)
+- `py3-none-any` pure-Python wheel built with `MX_SKIP_EXT=1` (no compiled
+  extension; runtime falls back to the pool-reg path)
+- sdist tarball
+
+The `manylinux_2_28` base images and `auditwheel` are pinned (by digest and
+version respectively) so published artifacts are reproducible. Refresh the
+base-image digests deliberately with
+`docker buildx imagetools inspect quay.io/pypa/manylinux_2_28_<arch>`.
+
+The Dockerfile is multi-arch. Pick the target with buildx `--platform`:
+
+```bash
+# x86_64 only -> ./dist/*.whl, ./dist/*.tar.gz
+docker buildx build --platform linux/amd64 \
+  -f docker/Dockerfile.client-wheel \
+  --target export --output type=local,dest=./dist .
+
+# arm64 only -> ./dist/*.whl, ./dist/*.tar.gz
+docker buildx build --platform linux/arm64 \
+  -f docker/Dockerfile.client-wheel \
+  --target export --output type=local,dest=./dist .
+
+# Both at once -> ./dist/linux_amd64/* and ./dist/linux_arm64/*
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -f docker/Dockerfile.client-wheel \
+  --target export --output type=local,dest=./dist .
+```
+
+Cross-platform builds need QEMU emulation registered with buildx
+(`docker run --privileged --rm tonistiigi/binfmt --install all` once per
+host). Native builds on the matching arch run without emulation.
+
+Without buildx (single arch, matches the host):
+
+```bash
+docker build -f docker/Dockerfile.client-wheel --target builder -t mx-wheel-builder .
+docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /out/'
+
+#### CI uploads to Artifactory
+
+`.github/workflows/build-wheels.yml` runs this Dockerfile on every PR
+(via `copy-pr-bot` mirroring into `pull-request/<pr_id>` branches) and
+every push to `main` / `release/**`, building both archs in parallel on
+velonix self-hosted runners and uploading the artifacts to NV Artifactory.
+
+Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
+
+| Event | Subpath |
+|---|---|
+| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+
+Each path contains the 6 artifacts from one arch: 4 manylinux wheels
+(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
+gated on the `automated-release` GitHub environment, which holds three
+secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
+and `ARTIFACTORY_PYPI_REPO_NAME`.
 
 ### Custom Client Image (P2P Transfers)
 
