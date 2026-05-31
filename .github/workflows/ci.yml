@@ -292,7 +292,7 @@ jobs:
 
     - name: Build Docker image
       run: |
-        docker build -t model-express:latest .
+        docker build -f docker/Dockerfile -t model-express:latest .
 
     - name: Test Docker image
       run: |
