@@ -12,24 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Lint PR
+name: Label PR
 
 on:
-  pull_request:
+  pull_request_target:
     types:
       - opened
       - edited
       - synchronize
       - reopened
 
-permissions: {}
+permissions:
+  issues: write
+  pull-requests: write
 
 jobs:
   conventional-commits:
-    name: Validate PR title
+    name: Add PR title label
     runs-on: ubuntu-latest
     steps:
       - uses: ytanikin/pr-conventional-commits@b628c5a234cc32513014b7bfdd1e47b532124d98
         with:
           task_types: '["feat", "fix", "docs", "test", "ci", "refactor", "perf", "chore", "revert", "style", "build"]'
-          add_label: 'false'
+          add_label: 'true'
