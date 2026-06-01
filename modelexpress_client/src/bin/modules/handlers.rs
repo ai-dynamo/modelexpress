@@ -12,7 +12,7 @@ use modelexpress_common::{
 };
 use serde_json::Value;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
 
 fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> String {
@@ -51,6 +51,24 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
             "formatted_size": stats.format_model_size(model)
         })
     }
+}
+
+fn infer_provider_from_model_name(model_name: &str) -> ModelProvider {
+    let model_name = model_name.trim_start();
+    if model_name.starts_with("gs://") {
+        ModelProvider::Gcs
+    } else if model_name.starts_with("ngc://") {
+        ModelProvider::Ngc
+    } else {
+        ModelProvider::HuggingFace
+    }
+}
+
+fn resolve_validation_model_path(cache_root: &Path, model_name: &str) -> (ModelProvider, PathBuf) {
+    let provider = infer_provider_from_model_name(model_name);
+    let model_path = resolve_model_path(cache_root, provider, model_name, None)
+        .unwrap_or_else(|_| cache_root.join(model_name));
+    (provider, model_path)
 }
 
 /// Handle the health check command
@@ -517,16 +535,8 @@ async fn validate_models(
     let storage_config = get_storage_config(storage_path_override)?;
 
     if let Some(name) = model_name {
-        // Validate specific model.
-        // Try the HuggingFace cache layout first (models--org--name/snapshots/...),
-        // then fall back to a plain path join for other providers.
-        let model_path = resolve_model_path(
-            &storage_config.local_path,
-            ModelProvider::HuggingFace,
-            &name,
-            None,
-        )
-        .unwrap_or_else(|_| storage_config.local_path.join(&name));
+        let (provider, model_path) =
+            resolve_validation_model_path(&storage_config.local_path, &name);
         let exists = model_path.exists();
 
         match format {
@@ -535,14 +545,16 @@ async fn validate_models(
                 if exists {
                     println!("✅ Model '{name}' found in storage");
 
-                    // Check for common model files
-                    let required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"];
-                    for file in &required_files {
-                        let file_path = model_path.join(file);
-                        if file_path.exists() {
-                            debug!("  ✅ {} found", file);
-                        } else {
-                            println!("  ⚠️  {file} missing");
+                    if provider == ModelProvider::HuggingFace {
+                        // Check for common HuggingFace model files.
+                        let required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"];
+                        for file in &required_files {
+                            let file_path = model_path.join(file);
+                            if file_path.exists() {
+                                debug!("  ✅ {} found", file);
+                            } else {
+                                println!("  ⚠️  {file} missing");
+                            }
                         }
                     }
                 } else {
@@ -654,4 +666,44 @@ fn get_storage_config(
     // Otherwise, try to discover configuration
     CacheConfig::discover()
         .map_err(|e| format!("Failed to discover storage configuration: {e}").into())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_validate_resolves_gcs_model_name_to_gcs_cache_path() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_name = "gs://bucket/foo/bar";
+        let expected_path = temp_dir
+            .path()
+            .join("gcs")
+            .join("bucket")
+            .join("foo")
+            .join("bar");
+        fs::create_dir_all(&expected_path).expect("Failed to create GCS cache path");
+
+        let (provider, model_path) = resolve_validation_model_path(temp_dir.path(), model_name);
+
+        assert_eq!(provider, ModelProvider::Gcs);
+        assert_eq!(model_path, expected_path);
+        assert!(model_path.exists());
+        assert!(!temp_dir.path().join(model_name).exists());
+    }
+
+    #[test]
+    fn test_validate_provider_inference_keeps_ambiguous_names_hugging_face() {
+        assert_eq!(
+            infer_provider_from_model_name("nvidia/model/version"),
+            ModelProvider::HuggingFace
+        );
+        assert_eq!(
+            infer_provider_from_model_name("ngc://nvidia/model/version"),
+            ModelProvider::Ngc
+        );
+    }
 }
