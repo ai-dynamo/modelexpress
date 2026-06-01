@@ -11,6 +11,8 @@ use modelexpress_common::{
     download,
 };
 use serde_json::Value;
+use std::borrow::Cow;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info};
@@ -55,20 +57,55 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
 
 fn infer_provider_from_model_name(model_name: &str) -> ModelProvider {
     let model_name = model_name.trim_start();
-    if model_name.starts_with("gs://") {
+    if strip_ascii_prefix_ignore_case(model_name, "gs://").is_some() {
         ModelProvider::Gcs
-    } else if model_name.starts_with("ngc://") {
+    } else if strip_ascii_prefix_ignore_case(model_name, "ngc://").is_some() {
         ModelProvider::Ngc
     } else {
         ModelProvider::HuggingFace
     }
 }
 
+fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    if candidate.eq_ignore_ascii_case(prefix) {
+        value.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
+fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
+    let model_name = model_name.trim_start();
+    if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "gs://") {
+        Cow::Owned(format!("gs://{rest}"))
+    } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "ngc://") {
+        Cow::Owned(format!("ngc://{rest}"))
+    } else {
+        Cow::Borrowed(model_name)
+    }
+}
+
 fn resolve_validation_model_path(cache_root: &Path, model_name: &str) -> (ModelProvider, PathBuf) {
-    let provider = infer_provider_from_model_name(model_name);
-    let model_path = resolve_model_path(cache_root, provider, model_name, None)
-        .unwrap_or_else(|_| cache_root.join(model_name));
+    let normalized_name = normalize_model_name_scheme(model_name);
+    let provider = infer_provider_from_model_name(normalized_name.as_ref());
+    let model_path = resolve_model_path(cache_root, provider, normalized_name.as_ref(), None)
+        .unwrap_or_else(|_| cache_root.join(normalized_name.as_ref()));
     (provider, model_path)
+}
+
+fn has_huggingface_weights(model_path: &Path) -> bool {
+    if model_path.join("pytorch_model.bin").exists() {
+        return true;
+    }
+
+    fs::read_dir(model_path).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.ends_with(".safetensors") || name == "model.safetensors.index.json"
+            })
+        })
+    })
 }
 
 /// Handle the health check command
@@ -547,7 +584,7 @@ async fn validate_models(
 
                     if provider == ModelProvider::HuggingFace {
                         // Check for common HuggingFace model files.
-                        let required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"];
+                        let required_files = ["config.json", "tokenizer.json"];
                         for file in &required_files {
                             let file_path = model_path.join(file);
                             if file_path.exists() {
@@ -555,6 +592,12 @@ async fn validate_models(
                             } else {
                                 println!("  ⚠️  {file} missing");
                             }
+                        }
+
+                        if !has_huggingface_weights(&model_path) {
+                            println!(
+                                "  ⚠️  missing model weights (expected pytorch_model.bin or safetensors)"
+                            );
                         }
                     }
                 } else {
@@ -678,7 +721,7 @@ mod tests {
     #[test]
     fn test_validate_resolves_gcs_model_name_to_gcs_cache_path() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let model_name = "gs://bucket/foo/bar";
+        let model_name = "GS://bucket/foo/bar";
         let expected_path = temp_dir
             .path()
             .join("gcs")
@@ -692,7 +735,7 @@ mod tests {
         assert_eq!(provider, ModelProvider::Gcs);
         assert_eq!(model_path, expected_path);
         assert!(model_path.exists());
-        assert!(!temp_dir.path().join(model_name).exists());
+        assert!(!temp_dir.path().join("GS://bucket/foo/bar").exists());
     }
 
     #[test]
@@ -705,5 +748,21 @@ mod tests {
             infer_provider_from_model_name("ngc://nvidia/model/version"),
             ModelProvider::Ngc
         );
+        assert_eq!(
+            infer_provider_from_model_name("NgC://nvidia/model/version"),
+            ModelProvider::Ngc
+        );
+    }
+
+    #[test]
+    fn test_huggingface_weights_accepts_safetensors() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        fs::write(
+            temp_dir.path().join("model-00001-of-00002.safetensors"),
+            b"",
+        )
+        .expect("Failed to write safetensors shard");
+
+        assert!(has_huggingface_weights(temp_dir.path()));
     }
 }
