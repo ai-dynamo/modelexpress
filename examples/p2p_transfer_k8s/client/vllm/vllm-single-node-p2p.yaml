@@ -83,8 +83,6 @@ spec:
               value: "INFO"
             - name: UCX_LOG_LEVEL
               value: "INFO"
-            - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
@@ -110,7 +108,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "8"
           resources:

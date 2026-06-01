@@ -17,7 +17,13 @@ inputs:
 
 outputs:
   kubeconfig_base64:
-    description: 'Base64-encoded kubeconfig for the vCluster (points to 127.0.0.1:8443 via port-forward)'
+    description: |
+      Base64-encoded kubeconfig for the vCluster. Server URL points at
+      127.0.0.1:<dynamic-port> — the port is picked per-invocation to avoid
+      collisions on self-hosted runners. The backgrounded `kubectl
+      port-forward` keeps the connection alive; the calling workflow should
+      add an `if: always()` cleanup step that runs `kill ${VCLUSTER_PF_PID}`
+      so the process doesn't outlive the job (PID exported via $GITHUB_ENV).
     value: ${{ steps.connect.outputs.kubeconfig_base64 }}
 
 runs:
@@ -25,8 +31,10 @@ runs:
   steps:
     - name: Setup host kubeconfig
       shell: bash
+      env:
+        KUBECONFIG_B64: ${{ inputs.host_kubeconfig_base64 }}
       run: |
-        echo "${{ inputs.host_kubeconfig_base64 }}" | base64 -d > ${{ github.workspace }}/.kubeconfig-host
+        echo "${KUBECONFIG_B64}" | base64 -d > ${{ github.workspace }}/.kubeconfig-host
         chmod 600 ${{ github.workspace }}/.kubeconfig-host
         echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-host" >> $GITHUB_ENV
 
@@ -41,17 +49,45 @@ runs:
         NAMESPACE: ${{ inputs.vcluster_namespace }}
       run: |
         echo "::group::Port-forward and generate vCluster kubeconfig"
-        kubectl port-forward -n ${NAMESPACE} svc/${VCLUSTER_NAME} 8443:443 &
+
+        # Pick an OS-assigned free port instead of hardcoding 8443. Avoids
+        # collisions on self-hosted runners where a leftover port-forward
+        # process from a prior job can still be bound to 8443 — we'd
+        # silently reuse that orphan and possibly point at the wrong
+        # vCluster. With a fresh port each invocation we either bind
+        # cleanly or fail loudly.
+        LOCAL_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+        echo "Using local port ${LOCAL_PORT} for the vCluster port-forward"
+
+        kubectl port-forward -n ${NAMESPACE} svc/${VCLUSTER_NAME} ${LOCAL_PORT}:443 &
+        PF_PID=$!
+        # Fail fast if the port-forward died (e.g. port still racing or
+        # vCluster Service missing). Without this check the subsequent
+        # vcluster + kubectl calls would surface confusing connectivity
+        # errors several steps later.
         sleep 5
+        if ! kill -0 ${PF_PID} 2>/dev/null; then
+          echo "ERROR: port-forward exited before ready (LOCAL_PORT=${LOCAL_PORT})"
+          exit 1
+        fi
+        # Persist the PID so a downstream cleanup step (or the caller's
+        # `if: always()` reaper) can `kill ${PF_PID}` instead of leaking
+        # the process for the next job on this runner to inherit.
+        echo "VCLUSTER_PF_PID=${PF_PID}" >> "$GITHUB_ENV"
 
         vcluster connect ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
-          --server=https://127.0.0.1:8443 \
+          --server=https://127.0.0.1:${LOCAL_PORT} \
           --print > ${{ github.workspace }}/.kubeconfig-vcluster
+        # kubectl warns on world/group-readable kubeconfigs. The file
+        # already had restrictive content (server URL + cert + token) so
+        # tighten the mode to match.
+        chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
 
         echo "Verifying vCluster connectivity..."
         kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-vcluster get ns
 
         KUBECONFIG_B64=$(base64 -w 0 < ${{ github.workspace }}/.kubeconfig-vcluster)
+        echo "::add-mask::${KUBECONFIG_B64}"
         echo "kubeconfig_base64=${KUBECONFIG_B64}" >> $GITHUB_OUTPUT
         echo "::endgroup::"

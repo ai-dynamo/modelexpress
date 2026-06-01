@@ -20,7 +20,7 @@ graph TD
 
 ### Key Design Points
 
-1. **Engine loader integration**: vLLM uses `--load-format mx`; SGLang uses `remote_instance` with backend `modelexpress`.
+1. **Engine loader integration**: vLLM uses `--load-format modelexpress`; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with backend `modelexpress`.
 2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly).
 3. **Engine post-load hooks**: The ModelExpress adapter handles engine-specific post-load processing and tensor discovery.
 4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU).
@@ -55,7 +55,7 @@ See [`client/`](client/) for engine deployment manifests:
 
 The ModelExpress loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from storage and becomes a source for future nodes.
 
-The vLLM ModelStreamer manifests under [`client/vllm/`](client/vllm/) are storage-loading examples. They do not require P2P by default; their comments show the extra environment variables and RDMA resources needed if you want those pods to publish as P2P sources after streaming from S3, Azure Blob Storage, or local disk.
+For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
 
 ## Environment Variables
 
@@ -63,7 +63,7 @@ The vLLM ModelStreamer manifests under [`client/vllm/`](client/vllm/) are storag
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MODEL_EXPRESS_URL` / `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration | `modelexpress-server:8001` |
+| `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration (recommended). `MODEL_EXPRESS_URL` is deprecated and pending removal, but is still required by some paths today and takes precedence when both are set; set both during the transition. | `modelexpress-server:8001` |
 | `MX_RDMA_NIC_PIN` | Per-rank NIC pinning for RDMA-capable deployments | `auto` |
 
 ### ModelExpress Server

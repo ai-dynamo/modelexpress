@@ -106,7 +106,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "1"
           ports:
@@ -114,11 +114,11 @@ spec:
               containerPort: 6555
           resources:
             limits:
-              nvidia.com/gpu: 1
-              rdma/shared_ib: 1
+              nvidia.com/gpu: "1"
+              rdma/shared_ib: "1"
             requests:
-              nvidia.com/gpu: 1
-              rdma/shared_ib: 1
+              nvidia.com/gpu: "1"
+              rdma/shared_ib: "1"
           readinessProbe:
             # Ready once the WorkerGrpcServer is serving. The standard
             # grpc_health_probe image reports NOT_SERVING until the server
@@ -211,7 +211,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "1"
           ports:
@@ -219,11 +219,11 @@ spec:
               containerPort: 6555
           resources:
             limits:
-              nvidia.com/gpu: 1
-              rdma/shared_ib: 1
+              nvidia.com/gpu: "1"
+              rdma/shared_ib: "1"
             requests:
-              nvidia.com/gpu: 1
-              rdma/shared_ib: 1
+              nvidia.com/gpu: "1"
+              rdma/shared_ib: "1"
           readinessProbe:
             exec:
               command:

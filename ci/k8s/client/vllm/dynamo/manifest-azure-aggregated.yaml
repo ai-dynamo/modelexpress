@@ -1,0 +1,223 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Aggregated-serving Dynamo + ModelExpress P2P CI manifest for row 7.
+#
+# Distinct from the existing ci/k8s/client/vllm/manifest-azure*.yaml in two
+# important ways:
+#   1. Deployment unit is DynamoGraphDeployment (Dynamo operator CRD), not raw
+#      Job / StatefulSet. Exercises the operator-driven lifecycle.
+#   2. Worker runtime is `python3 -m dynamo.vllm` (the dynamo-shipped vLLM
+#      entrypoint), not bare `vllm.entrypoints.openai.api_server`. This is
+#      what actual dynamo users run.
+#
+# Topology (scaled down from examples/dynamo_p2p_transfer_k8s/vllm/vllm-multi-node-aggregated.yaml):
+#   - Model: Qwen/Qwen2.5-0.5B (matches the rest of CI; cached in S3)
+#   - TP=1, single-node per replica, 1 GPU + 1 IB device per worker
+#   - 3 services in one DGD:
+#       ModelExpress  — MX server (kubernetes CRD backend), service name
+#                       `mx-dynamo-vllm-modelexpress`
+#       Frontend      — dynamo HTTP entry point, service name
+#                       `mx-dynamo-vllm-frontend`
+#       VllmWorker    — inference workers (starts at replicas=1; the test
+#                       scales to 2 to exercise the P2P path)
+#   - podAntiAffinity on workers spreads replicas across hosts so the second
+#     replica's RDMA pull goes cross-host
+#
+# Source bootstrap is HuggingFace (same as our other P2P tests) — first
+# replica downloads weights from HF, publishes metadata, subsequent replicas
+# pull via NIXL RDMA. No PVC required.
+#
+# Environment variables substituted by envsubst before apply:
+#   DGD_NAME           — `metadata.name` of the DGD. Must match the
+#                        `dgd_name` input on the run-mx-dynamo-test action
+#                        so the action's `kubectl patch / delete dgd` calls
+#                        target the right object. The operator derives
+#                        child Service names from this (e.g. the
+#                        ModelExpress component's Service is
+#                        `${DGD_NAME}-modelexpress`).
+#   MX_CI_MODEL        — HuggingFace model id
+#   WORKER_IMAGE       — image built from ci/k8s/client/vllm/dynamo/Dockerfile
+#                        (dynamo vllm-runtime + modelexpress client)
+#   MX_SERVER_IMAGE    — image built from ci/k8s/server/Dockerfile.server
+#                        (our own MX server, not the public nvcr.io/0.3.0)
+
+---
+# apiVersion: nvidia.com/v1alpha1 is deprecated in favor of v1beta1, but the
+# v1beta1 schema is a full rewrite (spec.services map → spec.components list,
+# extraPodSpec → podTemplate.spec, mainContainer → containers[name=main]).
+# The deprecation warning is cosmetic — the operator's conversion webhook
+# translates v1alpha1 → v1beta1 transparently. Migrate when the spec is stable
+# or when v1alpha1 stops being served, whichever comes first.
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${DGD_NAME}
+spec:
+  backendFramework: vllm
+  services:
+    # ---- ModelExpress P2P metadata server -------------------------------
+    ModelExpress:
+      componentType: frontend
+      replicas: 1
+      livenessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      readinessProbe:
+        tcpSocket:
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      extraPodSpec:
+        serviceAccountName: modelexpress
+        # Pull secret for nvcr.io — needed because the pre-installed cluster
+        # operator (in dynamo-system) wasn't configured with
+        # `dynamo.dockerRegistry.useKubernetesSecret=true`, so it doesn't
+        # auto-inject pull secrets into the pods it creates from this DGD.
+        imagePullSecrets:
+          - name: worker-registry
+        mainContainer:
+          image: ${MX_SERVER_IMAGE}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - exec /app/modelexpress-server --port 8000
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+    # ---- Dynamo Frontend (HTTP entry point) -----------------------------
+    # Uses the upstream `dynamo-frontend` image (smaller, ~2 GB) rather than
+    # the combined worker image (~12 GB). The Frontend only runs
+    # `python3 -m dynamo.frontend` — it doesn't need vLLM or modelexpress
+    # baked in. This is critical for our cluster's ephemeral-storage budget:
+    # extracting the 12 GB worker image on the Frontend's node ran the node
+    # OOD on disk and triggered the whole gang to evict.
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      # Frontend just routes HTTP — light request bounds. Modeled on the
+      # dynamo team's recipes/qwen3.6-35b/deploy/dynamo-fd.yaml pattern but
+      # scaled down for Qwen 0.5B's load. Setting these prevents the pod
+      # from getting OOMKilled if traffic bursts and gives K8s a clear
+      # signal during scheduling.
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      extraPodSpec:
+        imagePullSecrets:
+          - name: worker-registry
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.1.1
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --http-port
+            - "8000"
+
+    # ---- vLLM workers with ModelExpress P2P weight transfer -------------
+    # Initial replicas=1. The test will patch to replicas=2 after the first
+    # replica has loaded its weights from HF and published ModelMetadata —
+    # the second replica then discovers the source via mx-server and pulls
+    # weights via NIXL RDMA instead of re-downloading.
+    VllmWorker:
+      envFromSecret: hf-token-secret
+      componentType: worker
+      replicas: 1
+      sharedMemory:
+        size: 64Gi
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+          gpu: "1"
+          custom:
+            rdma/ib: "1"
+        limits:
+          gpu: "1"
+          custom:
+            rdma/ib: "1"
+      envs:
+        - name: VLLM_PLUGINS
+          value: "modelexpress"
+        - name: MX_SERVER_ADDRESS
+          value: "${DGD_NAME}-modelexpress:8000"
+        # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
+        - name: MX_RDMA_NIC_PIN
+          value: "auto"
+        - name: UCX_RNDV_SCHEME
+          value: "get_zcopy"
+        - name: UCX_RNDV_THRESH
+          value: "0"
+      extraPodSpec:
+        imagePullSecrets:
+          - name: worker-registry
+        # Pin to a specific GPU node pool — replicas need to share an IB
+        # partition key for RDMA between them. The test cluster splits GPU
+        # nodes across multiple pkeys; UCX rejects RC/DC transports when
+        # peer pkeys differ. Without pinning, replicas land on whichever
+        # pool the scheduler picks, and any cross-pool pair gets
+        # `local pkey 0xXXXX differs from remote pkey 0xYYYY` and falls
+        # back to direct HF download. A MIG-sliced pool is fine for TP=1
+        # (one slice per pod is sufficient for Qwen 0.5B).
+        nodeSelector:
+          agentpool: a100a
+        # Spread the two worker replicas across hosts so the second replica's
+        # P2P pull from the first goes cross-host over IB rather than intra-
+        # host loopback. Combined with the nodeSelector above, this forces
+        # both replicas onto different hosts within the same pool (same pkey,
+        # different IB endpoints). nvidia.com/dynamo-* labels are auto-
+        # applied by the operator.
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                    nvidia.com/dynamo-component-type: worker
+          # Defense-in-depth: keep both replicas in the same agentpool even
+          # if the nodeSelector above is ever broadened. This rule alone
+          # isn't sufficient (it allows any single pool, including ones
+          # incompatible with TP=1), so the nodeSelector above is the
+          # primary control. Kept for parity with manifest-azure.yaml's
+          # pattern.
+          podAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: agentpool
+                labelSelector:
+                  matchLabels:
+                    nvidia.com/dynamo-graph-deployment-name: ${DGD_NAME}
+                    nvidia.com/dynamo-component-type: worker
+        mainContainer:
+          image: ${WORKER_IMAGE}
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --trust-remote-code

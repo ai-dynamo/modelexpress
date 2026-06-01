@@ -15,8 +15,8 @@ services:
 
   model-express-server:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     ports:
       - "8001:8001"
     environment:

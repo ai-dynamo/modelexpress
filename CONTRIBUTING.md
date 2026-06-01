@@ -134,8 +134,8 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx vLLM loader |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
@@ -145,10 +145,10 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 
 ```bash
 # Build production image
-docker build -t model-express .
+docker build -f docker/Dockerfile -t model-express .
 
 # Run with docker-compose
-docker-compose up --build
+docker compose -f docker/docker-compose.yml up --build
 
 # Build P2P client image
 docker build -f examples/p2p_transfer_k8s/Dockerfile.client \

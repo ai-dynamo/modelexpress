@@ -15,7 +15,6 @@
 # Azure-specific differences vs manifest-gcp.yaml:
 #   - No GKE multi-network annotations (not supported on AKS)
 #   - rdma/ib resource limit exposes InfiniBand RDMA device (A100 SXM4 nodes)
-#   - UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy for InfiniBand (no GID index needed)
 #   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (workaround for ucx#11259)
 #   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools (amd64)
 #
@@ -40,13 +39,38 @@ spec:
       restartPolicy: Never
       imagePullSecrets:
         - name: worker-registry
+      # Pin to a specific GPU node pool rather than leaving the agentpool
+      # open. Other pools in the cluster may have too few active nodes for
+      # source + target anti-affinity to find a peer host, leaving target
+      # Pending forever. The agentpool podAffinity below becomes redundant
+      # (both pods already constrained here) but is kept for self-
+      # documentation + as defense if this nodeSelector is removed.
+      nodeSelector:
+        agentpool: a100a
       affinity:
+        # podAntiAffinity on hostname: keep source and target on different
+        # physical hosts so RDMA still exercises true cross-host IB, not
+        # intra-node loopback.
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
                   app: mx-p2p-worker
               topologyKey: kubernetes.io/hostname
+        # podAffinity on agentpool: keep source and target in the SAME node
+        # pool. The test cluster splits GPU nodes across multiple
+        # InfiniBand partitions — pools have different pkeys, and pods on
+        # different pkeys can't talk RDMA to each other (UCX error:
+        # "local pkey 0xXXXX differs from remote pkey 0xYYYY",
+        # NIXL_ERR_BACKEND on the receive). Combined with hostname anti-
+        # affinity, this forces source/target onto different hosts WITHIN
+        # the same IB partition.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
@@ -85,8 +109,6 @@ spec:
               value: "0"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            - name: UCX_TLS
-              value: "rc_x,rc,dc_x,dc,cuda_copy"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH

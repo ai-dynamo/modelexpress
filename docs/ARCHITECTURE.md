@@ -64,8 +64,10 @@ graph TD
 ModelExpress/
 ├── Cargo.toml                          # Workspace root (4 members)
 ├── Cargo.lock
-├── Dockerfile                          # Multi-stage production image
-├── docker-compose.yml                  # Single-service dev setup
+├── docker/
+│   ├── Dockerfile                      # Multi-stage production image
+│   ├── Dockerfile.client-wheel         # Builds Python client wheels + sdist
+│   └── docker-compose.yml              # Single-service dev setup
 ├── run_integration_tests.sh            # Integration test runner
 ├── test_client.sh                      # Client test script
 ├── test_grpc_transfer_k8s.sh           # K8s gRPC transfer test
@@ -156,7 +158,7 @@ ModelExpress/
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── rank_utils.py               # Rank detection utilities
-│       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
+│       ├── vllm_worker.py              # Compatibility worker for older manual registration
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
 │       └── p2p_pb2_grpc.py             # Generated gRPC stubs
@@ -215,13 +217,20 @@ ModelExpress/
 │   │       ├── vllm/
 │   │       │   ├── Dockerfile          # vLLM + ModelExpress client image
 │   │       │   ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
-│   │       │   ├── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
-│   │       │   └── vllm-single-node-streamer-*.yaml # ModelStreamer storage loading
+│   │       │   └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
 │   │       └── sglang/
 │   │           ├── Dockerfile          # SGLang + ModelExpress client image
 │   │           └── sglang-single-node-p2p.yaml
+│   ├── model_streamer_k8s/             # ModelStreamer startup examples
+│   │   ├── README.md
+│   │   └── client/
+│   │       └── vllm/
+│   │           ├── README.md
+│   │           ├── vllm-single-node-streamer-azure.yaml
+│   │           ├── vllm-single-node-streamer-s3.yaml
+│   │           └── vllm-single-node-streamer-local.yaml
 │   ├── crds.yaml                       # ModelMetadata + ModelCacheEntry CRDs (cluster-admin)
-│   ├── aggregated_k8s/                 # Dynamo aggregated serving example
+│   ├── dynamo_model_cache_k8s/         # Dynamo model-cache serving example
 │   │   ├── README.md
 │   │   └── agg.yaml
 │   └── dynamo_p2p_transfer_k8s/        # Dynamo DGD with P2P weight transfer
@@ -509,7 +518,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 | Module | Purpose |
 |--------|---------|
-| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
+| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
@@ -522,7 +531,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
-| `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
+| `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
 
@@ -555,7 +564,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 ### vLLM Loader
 
-**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
+**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format modelexpress`; `mx` alias):
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
@@ -722,9 +731,8 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
-| `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
 | `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
 | `MX_VMM_ARENA` | `0` | Install a `CUDAPluggableAllocator` that routes weight-loading allocations into a CUDA VMM arena, then registers the used arena range once through dmabuf at end-of-load. Reserves 16.0 TiB of VA by default and commits physical memory only for mapped allocations. See [VMM Arena](#vmm-arena-cudapluggableallocator-hook) |
@@ -747,7 +755,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 | Variable | Recommended | Description |
 |----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand |
 | `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
 | `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
 | `NIXL_LOG_LEVEL` | `INFO` | NIXL logging (DEBUG for troubleshooting) |

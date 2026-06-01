@@ -112,7 +112,7 @@ spec:
             - --model
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "2"
           # Expose both per-rank ports on the pod; the Service routes
@@ -124,11 +124,11 @@ spec:
               containerPort: 6556
           resources:
             limits:
-              nvidia.com/gpu: 2
-              rdma/shared_ib: 2
+              nvidia.com/gpu: "2"
+              rdma/shared_ib: "2"
             requests:
-              nvidia.com/gpu: 2
-              rdma/shared_ib: 2
+              nvidia.com/gpu: "2"
+              rdma/shared_ib: "2"
           # Readiness probe checks rank-0's port only; in practice all
           # ranks in a pod finish loading around the same time, so the
           # first one being ready is a reasonable proxy.

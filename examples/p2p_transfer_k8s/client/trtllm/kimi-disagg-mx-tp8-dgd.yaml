@@ -288,8 +288,6 @@ spec:
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            - name: UCX_TLS
-              value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
               value: "3"
             - name: UCX_RC_TIMEOUT
@@ -495,8 +493,6 @@ spec:
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
-            - name: UCX_TLS
-              value: "cuda_ipc,cuda_copy,rc"
             - name: UCX_IB_GID_INDEX
               value: "3"
             - name: UCX_RC_TIMEOUT

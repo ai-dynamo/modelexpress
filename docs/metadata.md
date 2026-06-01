@@ -30,7 +30,7 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 
 | Field | Example | Purpose |
 |-------|---------|---------|
-| `mx_version` | `"0.3.0"` | Format compatibility across upgrades |
+| `mx_version` | `"0.5.0"` | Format compatibility across upgrades |
 | `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH` | Type of tensors being served |
 | `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
@@ -189,7 +189,7 @@ No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by 
 ```
 # Source index -- identity stored once, workers as presence markers
 mx:source:a1b2c3d4e5f67890
-  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.3.0",...}
+  __attributes__  ->  {"model_name":"deepseek-ai/DeepSeek-V3","mx_version":"0.5.0",...}
   f3a2b1c4        ->  "0"    # worker_id f3a2b1c4, global rank 0
   e7d6c5b8        ->  "1"    # worker_id e7d6c5b8, global rank 1
 
@@ -356,7 +356,7 @@ sequenceDiagram
 
 ### Three-Tier Loading Strategy
 
-The `MxModelLoader` (`--load-format mx`) auto-detects the best loading strategy:
+The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
 
 1. **RDMA** -- If `ListSources` returns READY instances with matching rank, receive weights via NIXL/Mooncake
 2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU
@@ -380,7 +380,8 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` |
-| `MX_SERVER_ADDRESS` | `modelexpress-server:8001` | gRPC server address |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_REDIS_HOST` / `REDIS_HOST` | `localhost` | Redis host |
 | `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |

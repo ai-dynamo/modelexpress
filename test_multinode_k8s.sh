@@ -47,7 +47,7 @@ done
 # Step 1: Build and distribute image
 if [ "$SKIP_BUILD" = false ]; then
     echo "Building Docker image modelexpress:multinode-test..."
-    docker build -t modelexpress:multinode-test .
+    docker build -f docker/Dockerfile -t modelexpress:multinode-test .
 
     if command -v /snap/bin/microk8s &>/dev/null; then
         echo "Distributing image to microk8s cluster nodes..."

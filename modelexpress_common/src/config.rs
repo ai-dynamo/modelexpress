@@ -337,6 +337,16 @@ pub struct ConnectionConfig {
     pub retry_delay_secs: Option<u64>,
 }
 
+pub fn normalize_grpc_endpoint(endpoint: impl Into<String>) -> String {
+    let endpoint = endpoint.into();
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() || endpoint.contains("://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
@@ -351,7 +361,7 @@ impl Default for ConnectionConfig {
 impl ConnectionConfig {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
-            endpoint: endpoint.into(),
+            endpoint: normalize_grpc_endpoint(endpoint),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
             max_retries: Some(3),
             retry_delay_secs: Some(1),
@@ -413,6 +423,27 @@ mod tests {
         let config = ConnectionConfig::default();
         assert!(config.endpoint.contains("8001"));
         assert_eq!(config.timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_normalize_grpc_endpoint_accepts_bare_host_port() {
+        assert_eq!(
+            normalize_grpc_endpoint("modelexpress-server:8001"),
+            "http://modelexpress-server:8001"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint("http://modelexpress-server:8001"),
+            "http://modelexpress-server:8001"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint(" modelexpress-server:8001 "),
+            "http://modelexpress-server:8001"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint(" http://modelexpress-server:8001 "),
+            "http://modelexpress-server:8001"
+        );
+        assert_eq!(normalize_grpc_endpoint(" "), "");
     }
 
     #[test]

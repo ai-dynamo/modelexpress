@@ -1,0 +1,301 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Run ModelExpress Stale-Metadata CI Test'
+description: |
+  CI lifecycle for the row-18 stale-metadata test. Wraps:
+
+    1. Create namespace + secrets in the test namespace.
+    2. Deploy mx-server with the Redis backend (sidecar pattern) and
+       compressed reaper knobs (MX_HEARTBEAT_TIMEOUT_SECS=30,
+       MX_REAPER_SCAN_INTERVAL_SECS=10).
+    3. Apply a source-only client manifest (no target Job).
+    4. Wait for the source's /health to return 200 — proxy for "the
+       worker is fully up and has published metadata to mx-server".
+    5. Run pytest, which:
+         a. Verifies the server returns the source via
+            `ListSources(status_filter=READY)`.
+         b. Force-deletes the source pod.
+         c. Waits ~60s for the reaper to mark the dead source STALE.
+         d. Verifies `ListSources(status_filter=READY)` now returns 0
+            instances — i.e., the server correctly excludes stale entries.
+    6. Delete the namespace on exit.
+
+  Differs from run-mx-p2p-test in two important ways:
+    - Only ONE client pod (source). No target, no RDMA transfer.
+    - Uses mx-server-redis.yaml (Redis backend) rather than the default
+      K8s CRD backend. The reaper logic is backend-agnostic, but Redis is
+      the in-scope coverage for this iteration. K8s CRD coverage is a
+      future follow-up.
+
+  Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are generated into
+  ci/k8s/client/ at action runtime via grpcio-tools, so the test can call
+  the mx-server gRPC API without depending on the full modelexpress
+  python package (which has heavy torch / nixl install costs).
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for the vCluster'
+    required: true
+  namespace:
+    description: 'Namespace inside the vCluster for this test run'
+    required: true
+  server_image:
+    description: 'Fully-qualified MX server image (ci/k8s/server/Dockerfile.server)'
+    required: true
+  worker_image:
+    description: 'Fully-qualified worker image (must match the source manifest framework)'
+    required: true
+  manifest:
+    description: 'Repo-root-relative path to the source K8s manifest (e.g. ci/k8s/client/vllm/manifest-azure.yaml). Envsubst is run on it before apply.'
+    required: true
+  test_script:
+    description: 'Repo-root-relative path to the pytest file to run'
+    required: false
+    default: 'ci/k8s/client/test_stale_metadata.py'
+  model:
+    description: 'HuggingFace model id — exposed as MX_CI_MODEL for envsubst and pytest'
+    required: false
+    default: 'Qwen/Qwen2.5-0.5B'
+  hf_token:
+    description: 'HuggingFace token — written as hf-token-secret in the test namespace'
+    required: true
+  worker_registry:
+    description: 'Registry hostname for the worker image (used to create worker-registry imagePullSecret)'
+    required: true
+  ngc_api_key:
+    description: 'NGC API key — used to create the worker-registry imagePullSecret'
+    required: true
+  source_port:
+    description: 'Port the source worker listens on — exported as WORKER_PORT for the source manifest and probed via /health'
+    required: false
+    default: '8001'
+  pod_ready_timeout_seconds:
+    description: 'Seconds to wait for the source pod /health to return 200'
+    required: false
+    default: '900'
+  heartbeat_timeout_secs:
+    description: |
+      Server-side reaper threshold (MX_HEARTBEAT_TIMEOUT_SECS) — sources
+      with no heartbeat within this window get marked STALE. Compressed
+      from the production default (90s) to keep the test's wait window
+      short. Threaded to BOTH the manifest's env block (the deployed
+      server's actual reaper config) and pytest (the wait calculation),
+      so they cannot drift.
+    required: false
+    default: '30'
+  reaper_scan_interval_secs:
+    description: |
+      How often the server-side reaper scans for stale sources
+      (MX_REAPER_SCAN_INTERVAL_SECS). After a missed heartbeat the next
+      scan transitions the source READY → STALE; with this set to 10s the
+      test waits at most one extra scan interval before STALE is visible.
+      Threaded to manifest + pytest identically to heartbeat_timeout_secs.
+    required: false
+    default: '10'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup vCluster kubeconfig
+      shell: bash
+      env:
+        KUBECONFIG_B64: ${{ inputs.kubeconfig_base64 }}
+      run: |
+        echo "${KUBECONFIG_B64}" | base64 -d > ${{ github.workspace }}/.kubeconfig-vcluster
+        chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
+        echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-vcluster" >> $GITHUB_ENV
+
+    - name: Setup test namespace
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create namespace ${NAMESPACE}"
+        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Create worker registry pull secret
+      shell: bash
+      env:
+        NGC_API_KEY: ${{ inputs.ngc_api_key }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create worker-registry pull secret"
+        kubectl create secret docker-registry worker-registry \
+          --docker-server="nvcr.io" \
+          --docker-username='$oauthtoken' \
+          --docker-password="${NGC_API_KEY}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Create HF token secret
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf_token }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create hf-token-secret"
+        kubectl create secret generic hf-token-secret \
+          --from-literal=HF_TOKEN="${HF_TOKEN}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Deploy MX server (Redis backend)
+      shell: bash
+      env:
+        MX_SERVER_IMAGE: ${{ inputs.server_image }}
+        MX_HEARTBEAT_TIMEOUT_SECS: ${{ inputs.heartbeat_timeout_secs }}
+        MX_REAPER_SCAN_INTERVAL_SECS: ${{ inputs.reaper_scan_interval_secs }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        [[ "${MX_HEARTBEAT_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: heartbeat_timeout_secs must be a positive integer, got '${MX_HEARTBEAT_TIMEOUT_SECS}'"; exit 1; }
+        [[ "${MX_REAPER_SCAN_INTERVAL_SECS}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: reaper_scan_interval_secs must be a positive integer, got '${MX_REAPER_SCAN_INTERVAL_SECS}'"; exit 1; }
+        echo "::group::Deploy mx-server with Redis sidecar in ${NAMESPACE} (heartbeat=${MX_HEARTBEAT_TIMEOUT_SECS}s, scan=${MX_REAPER_SCAN_INTERVAL_SECS}s)"
+        envsubst < ci/k8s/server/mx-server-redis.yaml | kubectl apply -n ${NAMESPACE} -f -
+        kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
+        echo "::endgroup::"
+
+    - name: Apply source manifest
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        NAMESPACE: ${{ inputs.namespace }}
+        WORKER_PORT: ${{ inputs.source_port }}
+        MANIFEST: ${{ inputs.manifest }}
+      run: |
+        echo "::group::Apply source-only manifest (JOB_NAME=mx-source, WORKER_PORT=${WORKER_PORT})"
+        # JOB_NAME=mx-source identifies the Job as a "source" for the
+        # downstream test (which kills it by label selector
+        # job-name=mx-source). The existing per-framework manifests are
+        # parameterized by JOB_NAME so we reuse them as-is.
+        export JOB_NAME=mx-source
+        envsubst < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Wait for source /health to return 200
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        WORKER_PORT: ${{ inputs.source_port }}
+        TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
+      run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        echo "::group::Waiting for source /health to return 200"
+        # Same pattern as run-mx-p2p-test's target-health wait — probes via
+        # `kubectl exec ... curl localhost:${PORT}/health` rather than
+        # port-forward, avoiding the vCluster PF flake mode.
+        deadline=$((SECONDS + TIMEOUT))
+        SOURCE_POD=""
+        while [ $SECONDS -lt $deadline ]; do
+          SOURCE_POD=$(kubectl get pods -n ${NAMESPACE} \
+            -l job-name=mx-source \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+          if [ -n "${SOURCE_POD}" ] && kubectl exec -n ${NAMESPACE} "${SOURCE_POD}" -- \
+               curl -sf -m 5 "http://localhost:${WORKER_PORT}/health" >/dev/null 2>&1; then
+            echo "Source ${SOURCE_POD} /health returned 200."
+            break
+          fi
+
+          FAILED=$(kubectl get pods -n ${NAMESPACE} \
+              -l job-name=mx-source --no-headers 2>/dev/null \
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+          if [ -n "${FAILED}" ]; then
+            echo "ERROR: source pod entered failure state: ${FAILED}"
+            exit 1
+          fi
+
+          echo "Source /health not ready yet (pod=${SOURCE_POD:-<not-created>})..."
+          sleep 10
+        done
+
+        if ! kubectl exec -n ${NAMESPACE} "${SOURCE_POD}" -- \
+             curl -sf -m 5 "http://localhost:${WORKER_PORT}/health" >/dev/null 2>&1; then
+          echo "ERROR: source /health did not return 200 within ${TIMEOUT}s"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Install test dependencies
+      shell: bash
+      run: |
+        # grpcio-tools brings protoc + the python plugin for stub generation.
+        # We avoid `pip install modelexpress_client/python` because that pulls
+        # torch + nixl[cu12] just to expose the gRPC stubs we need.
+        pip install pytest grpcio grpcio-tools
+
+    - name: Generate gRPC stubs
+      shell: bash
+      run: |
+        echo "::group::Generate p2p_pb2 + p2p_pb2_grpc into ci/k8s/client/"
+        python -m grpc_tools.protoc \
+          -I modelexpress_common/proto \
+          --python_out=ci/k8s/client \
+          --grpc_python_out=ci/k8s/client \
+          modelexpress_common/proto/p2p.proto
+        ls -la ci/k8s/client/p2p_pb2*.py
+        echo "::endgroup::"
+
+    - name: Run tests
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        TEST_SCRIPT: ${{ inputs.test_script }}
+        HEARTBEAT_TIMEOUT_SECS: ${{ inputs.heartbeat_timeout_secs }}
+        REAPER_SCAN_INTERVAL_SECS: ${{ inputs.reaper_scan_interval_secs }}
+      run: |
+        pytest "${TEST_SCRIPT}" -v \
+          --namespace "${NAMESPACE}" \
+          --model "${MX_CI_MODEL}" \
+          --heartbeat-timeout-secs "${HEARTBEAT_TIMEOUT_SECS}" \
+          --reaper-scan-interval-secs "${REAPER_SCAN_INTERVAL_SECS}"
+
+    - name: Dump pod logs
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        set +eo pipefail
+        echo "::group::Pod summary"
+        kubectl get pods -n ${NAMESPACE} -o wide 2>&1 || true
+        echo "::endgroup::"
+
+        echo "::group::Namespace events (last 50, newest first)"
+        kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' 2>&1 | tail -50 || true
+        echo "::endgroup::"
+
+        for POD in $(kubectl get pods -n ${NAMESPACE} --no-headers 2>/dev/null \
+            | awk '{print $1}'); do
+          echo "::group::describe ${POD}"
+          kubectl describe pod -n ${NAMESPACE} "${POD}" 2>&1 | tail -60 || true
+          echo "::endgroup::"
+          echo "::group::logs ${POD} (all containers)"
+          kubectl logs -n ${NAMESPACE} "${POD}" --all-containers --tail=150 2>&1 || true
+          echo "::endgroup::"
+        done
+
+    - name: Cleanup test namespace
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Delete namespace ${NAMESPACE}"
+        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
+          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers. Investigate the stuck resource."
+          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
+            | jq '.spec.finalizers = []' \
+            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f -
+        fi
+        echo "::endgroup::"

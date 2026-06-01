@@ -14,7 +14,8 @@
 #   - PVC with model weights pre-downloaded (HF Hub cache layout)
 #
 # For P2P RDMA serving after load, also set MX_SERVER_ADDRESS
-# and add RDMA resources (rdma/ib), UCX env vars — see vllm-single-node-p2p.yaml.
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/vllm/.
 apiVersion: v1
 kind: Service
 metadata:
@@ -71,7 +72,7 @@ spec:
             - --model
             - $(MX_MODEL_URI)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "8"
             - --enable-expert-parallel
