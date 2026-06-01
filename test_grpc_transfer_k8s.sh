@@ -149,7 +149,7 @@ build_and_load_image() {
     cd "$(dirname "$0")"
 
     # Build the image locally
-    docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" . 2>&1 | tail -5
+    docker build -f docker/Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" . 2>&1 | tail -5
 
     # Load into kind cluster
     log_info "Loading image into kind cluster..."

@@ -144,10 +144,10 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 
 ```bash
 # Build production image
-docker build -t model-express .
+docker build -f docker/Dockerfile -t model-express .
 
 # Run with docker-compose
-docker-compose up --build
+docker compose -f docker/docker-compose.yml up --build
 
 # Build P2P client image
 docker build -f examples/p2p_transfer_k8s/Dockerfile.client \

@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds the modelexpress Python client wheels via docker/Dockerfile.client-wheel
+# and uploads the resulting artifacts to NV Artifactory.
+#
+# Triggered on:
+#   - push to pull-request/<pr_id> (mirrored from contributor PRs by
+#     copy-pr-bot): lands under pr/<pr_id>/<sha>/<run_id>/<run_attempt>/<arch>/
+#   - push to main and release/**: lands under
+#     post-merge/<sha>/<run_id>/<run_attempt>/<arch>/
+#
+# copy-pr-bot mirrors PRs (including fork PRs) into the pull-request/<pr_id>
+# branch namespace inside this repo, which lets the workflow access
+# environment-scoped secrets that fork PRs can't reach directly.
+#
+# Runs in parallel to (does not gate on) the rest of CI. Upload is
+# environment-gated on `automated-release`.
+
+name: Build & upload client wheels
+
+on:
+  push:
+    branches:
+      - 'pull-request/*'
+      - main
+      - 'release/**'
+
+concurrency:
+  group: build-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-upload:
+    name: Build & upload wheels (${{ matrix.arch }})
+    environment: automated-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: prod-modelexpress-builder-amd-v1
+            platform: linux/amd64
+          - arch: arm64
+            runner: prod-modelexpress-builder-arm-v1
+            platform: linux/arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute artifactory subpath
+        id: dest
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            pull-request/*)
+              PR_ID="${GITHUB_REF_NAME#pull-request/}"
+              SUBPATH="pr/${PR_ID}/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
+              ;;
+            *)
+              SUBPATH="post-merge/${{ github.sha }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.arch }}"
+              ;;
+          esac
+          echo "subpath=${SUBPATH}" >> "$GITHUB_OUTPUT"
+          echo "Destination subpath: ${SUBPATH}"
+
+      - name: Build wheels
+        run: |
+          mkdir -p dist
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            -f docker/Dockerfile.client-wheel \
+            --target export \
+            --output type=local,dest=./dist \
+            .
+          echo "Built artifacts:"
+          ls -la dist/
+
+      - name: Set up JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+
+      - name: Upload to Artifactory
+        run: |
+          DEST="${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}/${{ steps.dest.outputs.subpath }}/"
+          echo "Uploading to: ${DEST}"
+          jf rt upload --flat "dist/*.whl" "${DEST}"
+          jf rt upload --flat "dist/*.tar.gz" "${DEST}"
