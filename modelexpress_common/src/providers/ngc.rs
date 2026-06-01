@@ -226,27 +226,13 @@ struct PaginationInfo {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ModelVersion {
-    storage_version: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ModelFileV2 {
-    path: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ArtifactFilesResponse {
     request_status: Option<RequestStatus>,
     pagination_info: Option<PaginationInfo>,
-    // V1 storage: presigned URLs returned directly
+    // The files-manifest endpoint returns presigned download URLs paired with their
+    // relative paths, for both V1/V2 storage and both org/team scopes.
     urls: Option<Vec<String>>,
     filepath: Option<Vec<String>>,
-    // V2 storage: file metadata only; downloads use /files/{path} with Bearer auth
-    model_files: Option<Vec<ModelFileV2>>,
-    model_version: Option<ModelVersion>,
 }
 
 impl ArtifactFilesResponse {
@@ -267,29 +253,11 @@ impl ArtifactFilesResponse {
         Ok(())
     }
 
-    fn is_v2_storage(&self) -> bool {
-        self.model_version
-            .as_ref()
-            .and_then(|mv| mv.storage_version.as_deref())
-            == Some("V2")
-    }
-
-    /// Extract (download_urls, rel_paths).
+    /// Extract (presigned_download_urls, rel_paths) from a files-manifest response.
     ///
-    /// V1: presigned URLs come directly from the API response.
-    /// V2: download URLs are constructed as `{files_base_url}/{path}`; the NGC API
-    ///     redirects to a presigned S3/CDN URL. reqwest strips Authorization on
-    ///     cross-origin redirect, so callers must pass Bearer auth for the initial hop.
-    fn into_files(self, files_base_url: &str) -> Result<(Vec<String>, Vec<String>)> {
-        if self.is_v2_storage() {
-            let files = self.model_files.unwrap_or_default();
-            let paths: Vec<String> = files.into_iter().map(|f| f.path).collect();
-            let urls: Vec<String> = paths
-                .iter()
-                .map(|p| format!("{files_base_url}/{p}"))
-                .collect();
-            return Ok((urls, paths));
-        }
+    /// The manifest endpoint returns self-authenticating presigned URLs paired with
+    /// their relative paths, so no per-file URL construction or auth forwarding is needed.
+    fn into_files(self) -> Result<(Vec<String>, Vec<String>)> {
         let urls = self.urls.unwrap_or_default();
         let paths = self.filepath.unwrap_or_default();
         if urls.len() != paths.len() {
@@ -357,126 +325,69 @@ fn bearer_header(token: &str) -> Result<HeaderValue> {
 
 // ── NGC API calls ─────────────────────────────────────────────────────────────
 
-/// Fetch all presigned download URLs for an org-level artifact (no team), paging as needed.
+/// Fetch presigned download URLs + relative paths for an NGC artifact, paging as needed.
 ///
-/// Org-level responses contain presigned S3/CDN URLs; the Authorization header
-/// must NOT be forwarded when fetching those URLs.
-async fn fetch_org_artifact_files(
+/// Uses the files-manifest endpoint
+/// `…/v2/org/{org}[/team/{team}]/{type}/{name}/{version}/files` (note: no `versions/`
+/// path segment). For both V1 and V2 storage and both org and team scopes, it returns
+/// self-authenticating presigned `urls[]` paired with `filepath[]` for every file,
+/// top-level and nested alike. The presigned URLs carry their own auth, so the
+/// Authorization header must NOT be forwarded when downloading them.
+///
+/// Some NGC orgs (e.g. the `nim` public catalog) use UAM, which gates the listing
+/// endpoint behind org membership the token may not carry, returning 400/401
+/// "Org contex missing". In that case we fall back to the `checksums.blake3`
+/// per-artifact manifest served from the versioned `…/versions/{version}/files`
+/// endpoint and download each file via `/files/{path}` with Bearer auth.
+///
+/// The returned bool is `true` only for the UAM fallback, signalling that downloads
+/// need the Authorization header (and token refresh); it is `false` for presigned URLs.
+async fn fetch_artifact_files(
     client: &reqwest::Client,
     auth: &HeaderValue,
     id: &NgcArtifactId,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let mut all_urls: Vec<String> = Vec::new();
-    let mut all_paths: Vec<String> = Vec::new();
-    let mut page = 1i32;
+) -> Result<(Vec<String>, Vec<String>, bool)> {
+    let api_base = ngc_api_base();
+    let artifact_base = match &id.team {
+        Some(team) => format!(
+            "{api_base}/v2/org/{}/team/{}/{}/{}",
+            id.org, team, id.artifact_type, id.name
+        ),
+        None => format!(
+            "{api_base}/v2/org/{}/{}/{}",
+            id.org, id.artifact_type, id.name
+        ),
+    };
+    let manifest_base = format!("{artifact_base}/{}/files", id.version);
 
-    loop {
-        let api_base = ngc_api_base();
-        let url = format!(
-            "{api_base}/v2/org/{}/{}/{}/versions/{}/files?page-size={PAGE_SIZE}&page-number={page}",
-            id.org, id.artifact_type, id.name, id.version
-        );
-        let files_base = format!(
-            "{api_base}/v2/org/{}/{}/{}/versions/{}/files",
-            id.org, id.artifact_type, id.name, id.version
-        );
-        debug!("NGC org files: GET {url}");
-
-        let response = client
-            .get(&url)
-            .header(AUTHORIZATION, auth.clone())
-            .send()
-            .await
-            .context("NGC org files request failed")?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("Failed to read NGC org files response")?;
-
-        if !status.is_success() {
-            anyhow::bail!("NGC API returned {status}: {body}");
-        }
-
-        let parsed: ArtifactFilesResponse = serde_json::from_str(&body)
-            .with_context(|| format!("Failed to parse NGC org files response: {body}"))?;
-        parsed.check_request_status()?;
-
-        let total_pages = parsed
-            .pagination_info
-            .as_ref()
-            .and_then(|p| p.total_pages)
-            .unwrap_or(1);
-
-        let (urls, paths) = parsed.into_files(&files_base)?;
-        all_urls.extend(urls);
-        all_paths.extend(paths);
-
-        if page >= total_pages {
-            break;
-        }
-        page = page.saturating_add(1);
-    }
-
-    Ok((all_urls, all_paths))
-}
-
-/// Fetch all download URLs for a team artifact, paging as needed.
-///
-/// V1 storage: returns presigned URLs directly; Bearer auth must NOT be forwarded to those URLs.
-/// V2 storage: returns file paths; download URLs are `/files/{path}` with Bearer auth.
-///   reqwest strips Authorization on cross-origin redirect (to S3/CDN), so it is safe to
-///   always pass Bearer auth for team artifacts regardless of storage version.
-///
-/// Some NGC orgs (e.g. the `nim` public catalog) use UAM which gates the bulk `/files`
-/// listing endpoint behind org membership the token may not carry, returning 400
-/// "Org contex missing". In that case we fall back to fetching `checksums.blake3` —
-/// a per-artifact manifest that is accessible without org membership — and deriving
-/// the file list from it. Individual `/files/{path}` downloads are not UAM-gated.
-async fn fetch_team_artifact_files(
-    client: &reqwest::Client,
-    auth: &HeaderValue,
-    id: &NgcArtifactId,
-    team: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let files_base = format!(
-        "{}/v2/org/{}/team/{}/{}/{}/versions/{}/files",
-        ngc_api_base(),
-        id.org,
-        team,
-        id.artifact_type,
-        id.name,
-        id.version
-    );
     let mut all_urls: Vec<String> = Vec::new();
     let mut all_paths: Vec<String> = Vec::new();
     let mut page = 1i32;
     let mut uam_blocked = false;
 
     loop {
-        let url = format!("{files_base}?page-size={PAGE_SIZE}&page-number={page}");
-        debug!("NGC team files: GET {url}");
+        let url = format!("{manifest_base}?page-size={PAGE_SIZE}&page-number={page}");
+        debug!("NGC files manifest: GET {url}");
 
         let response = client
             .get(&url)
             .header(AUTHORIZATION, auth.clone())
             .send()
             .await
-            .context("NGC team files request failed")?;
+            .context("NGC files manifest request failed")?;
 
         let status = response.status();
         let body = response
             .text()
             .await
-            .context("Failed to read NGC team files response")?;
+            .context("Failed to read NGC files manifest response")?;
 
         if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
         {
             warn!(
-                "NGC bulk file listing returned {status} for {}/{}/{}/{} — \
+                "NGC files manifest returned {status} for {}/{} — \
                  falling back to checksums.blake3 manifest (response: {body})",
-                id.org, team, id.artifact_type, id.name
+                id.org, id.name
             );
             uam_blocked = true;
             break;
@@ -487,7 +398,7 @@ async fn fetch_team_artifact_files(
         }
 
         let parsed: ArtifactFilesResponse = serde_json::from_str(&body)
-            .with_context(|| format!("Failed to parse NGC team files response: {body}"))?;
+            .with_context(|| format!("Failed to parse NGC files manifest response: {body}"))?;
         parsed.check_request_status()?;
 
         let total_pages = parsed
@@ -496,7 +407,7 @@ async fn fetch_team_artifact_files(
             .and_then(|p| p.total_pages)
             .unwrap_or(1);
 
-        let (urls, paths) = parsed.into_files(&files_base)?;
+        let (urls, paths) = parsed.into_files()?;
         all_urls.extend(urls);
         all_paths.extend(paths);
 
@@ -507,15 +418,16 @@ async fn fetch_team_artifact_files(
     }
 
     if uam_blocked {
-        let (urls, paths) = fetch_files_via_checksum_manifest(client, auth, &files_base).await?;
-        all_urls.extend(urls);
-        all_paths.extend(paths);
+        let versioned_base = format!("{artifact_base}/versions/{}/files", id.version);
+        let (urls, paths) =
+            fetch_files_via_checksum_manifest(client, auth, &versioned_base).await?;
+        return Ok((urls, paths, true));
     }
 
     if all_urls.is_empty() {
-        anyhow::bail!("NGC team artifact has no files or is not accessible with the provided key");
+        anyhow::bail!("NGC artifact has no files or is not accessible with the provided key");
     }
-    Ok((all_urls, all_paths))
+    Ok((all_urls, all_paths, false))
 }
 
 /// Fall-back file enumeration for NGC orgs whose bulk `/files` listing endpoint is
@@ -911,19 +823,20 @@ impl ModelProviderTrait for NgcProvider {
             id.org, id.team, id.artifact_type, id.name, id.version
         );
 
-        let (urls, paths, auth_for_download, token_refresh) = if let Some(team) = &id.team {
-            let (u, p) = fetch_team_artifact_files(&client, &auth, &id, team).await?;
-            (u, p, Some(auth.clone()), Some((api_key.as_str(), &id)))
-        } else {
-            let (u, p) = fetch_org_artifact_files(&client, &auth, &id).await?;
-            // Org artifact URLs are presigned; do not forward the Authorization header
-            // and token refresh is unnecessary (presigned URLs carry their own auth).
-            (u, p, None, None)
-        };
+        let (urls, paths, needs_auth) = fetch_artifact_files(&client, &auth, &id).await?;
 
         if urls.is_empty() {
             anyhow::bail!("NGC artifact '{model_name}' has no downloadable files");
         }
+
+        // Presigned manifest URLs carry their own auth, so the Authorization header is
+        // not forwarded and token refresh is unnecessary. Only the UAM checksum-fallback
+        // path downloads via the API and needs the Bearer header (and periodic refresh).
+        let (auth_for_download, token_refresh) = if needs_auth {
+            (Some(auth.clone()), Some((api_key.as_str(), &id)))
+        } else {
+            (None, None)
+        };
 
         let downloaded = download_files(
             &client,
@@ -1223,75 +1136,26 @@ mod tests {
     }
 
     #[test]
-    fn test_is_v2_storage_true() {
-        let resp = ArtifactFilesResponse {
-            request_status: None,
-            pagination_info: None,
-            urls: None,
-            filepath: None,
-            model_files: Some(vec![ModelFileV2 {
-                path: "config.json".to_string(),
-            }]),
-            model_version: Some(ModelVersion {
-                storage_version: Some("V2".to_string()),
-            }),
-        };
-        assert!(resp.is_v2_storage());
-    }
-
-    #[test]
-    fn test_is_v2_storage_false_when_absent() {
-        let resp = ArtifactFilesResponse {
-            request_status: None,
-            pagination_info: None,
-            urls: Some(vec!["https://example.com/file".to_string()]),
-            filepath: Some(vec!["file.bin".to_string()]),
-            model_files: None,
-            model_version: None,
-        };
-        assert!(!resp.is_v2_storage());
-    }
-
-    #[test]
-    fn test_into_files_v2() {
-        let resp = ArtifactFilesResponse {
-            request_status: None,
-            pagination_info: None,
-            urls: None,
-            filepath: None,
-            model_files: Some(vec![
-                ModelFileV2 {
-                    path: "config.json".to_string(),
-                },
-                ModelFileV2 {
-                    path: "tokenizer.json".to_string(),
-                },
-            ]),
-            model_version: Some(ModelVersion {
-                storage_version: Some("V2".to_string()),
-            }),
-        };
-        let (urls, paths) = resp.into_files("https://api.ngc.nvidia.com/v2/org/nim/team/nvidia/models/mymodel/versions/v1/files").expect("into_files");
-        assert_eq!(paths, vec!["config.json", "tokenizer.json"]);
-        assert!(urls[0].ends_with("/files/config.json"));
-        assert!(urls[1].ends_with("/files/tokenizer.json"));
-    }
-
-    #[test]
-    fn test_into_files_v1() {
+    fn test_into_files_presigned() {
+        // The manifest endpoint returns presigned urls paired with relative paths,
+        // including nested paths, for both V1 and V2 storage and both scopes.
         let resp = ArtifactFilesResponse {
             request_status: None,
             pagination_info: None,
             urls: Some(vec![
-                "https://s3.example.com/presigned/config.json?token=abc".to_string(),
+                "https://xfiles.ngc.nvidia.com/presigned/config.json?Signature=abc".to_string(),
+                "https://xfiles.ngc.nvidia.com/presigned/weights/model.bin?Signature=def"
+                    .to_string(),
             ]),
-            filepath: Some(vec!["config.json".to_string()]),
-            model_files: None,
-            model_version: None,
+            filepath: Some(vec![
+                "config.json".to_string(),
+                "weights/model.bin".to_string(),
+            ]),
         };
-        let (urls, paths) = resp.into_files("unused_base").expect("into_files");
-        assert_eq!(paths, vec!["config.json"]);
+        let (urls, paths) = resp.into_files().expect("into_files");
+        assert_eq!(paths, vec!["config.json", "weights/model.bin"]);
         assert!(urls[0].contains("presigned"));
+        assert!(urls[1].contains("Signature"));
     }
 
     #[test]
@@ -1439,8 +1303,6 @@ mod tests {
             pagination_info: None,
             urls: None,
             filepath: None,
-            model_files: None,
-            model_version: None,
         };
         assert!(resp.check_request_status().is_ok());
     }
@@ -1455,8 +1317,6 @@ mod tests {
             pagination_info: None,
             urls: None,
             filepath: None,
-            model_files: None,
-            model_version: None,
         };
         let err = resp.check_request_status().expect_err("should fail");
         assert!(err.to_string().contains("INVALID_REQUEST"));
@@ -1470,23 +1330,19 @@ mod tests {
             pagination_info: None,
             urls: None,
             filepath: None,
-            model_files: None,
-            model_version: None,
         };
         assert!(resp.check_request_status().is_ok());
     }
 
     #[test]
-    fn test_into_files_v1_mismatched_lengths() {
+    fn test_into_files_mismatched_lengths() {
         let resp = ArtifactFilesResponse {
             request_status: None,
             pagination_info: None,
             urls: Some(vec!["a".to_string(), "b".to_string()]),
             filepath: Some(vec!["x".to_string()]),
-            model_files: None,
-            model_version: None,
         };
-        assert!(resp.into_files("unused").is_err());
+        assert!(resp.into_files().is_err());
     }
 
     #[test]
@@ -1576,6 +1432,7 @@ mod tests {
         async fn new(env_lock: &'a MutexGuard<'static, ()>) -> Self {
             let temp_dir = tempfile::TempDir::new().expect("tempdir");
             let server = MockServer::start().await;
+            let uri = server.uri();
 
             Mock::given(method("GET"))
                 .and(path_regex(r"^/token"))
@@ -1586,26 +1443,25 @@ mod tests {
                 .mount(&server)
                 .await;
 
+            // Files-manifest endpoint (no `versions/` segment): returns presigned URLs
+            // pointing back at this mock server, paired with relative paths.
             Mock::given(method("GET"))
-                .and(path_regex(
-                    r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
-                ))
+                .and(path_regex(r"/models/[^/]+/[^/]+/files$"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "requestStatus": {"statusCode": "SUCCESS"},
                     "paginationInfo": {"totalPages": 1},
-                    "modelVersion": {"storageVersion": "V2"},
-                    "modelFiles": [
-                        {"path": "config.json"},
-                        {"path": "tokenizer.json"}
-                    ]
+                    "urls": [
+                        format!("{uri}/dl/config.json"),
+                        format!("{uri}/dl/tokenizer.json")
+                    ],
+                    "filepath": ["config.json", "tokenizer.json"]
                 })))
                 .mount(&server)
                 .await;
 
+            // Presigned download URLs are fetched without an Authorization header.
             Mock::given(method("GET"))
-                .and(path_regex(
-                    r"/v2/org/.*/team/.*/models/.*/versions/.*/files/.+",
-                ))
+                .and(path_regex(r"^/dl/"))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
                 .mount(&server)
                 .await;
@@ -1634,7 +1490,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_download_model_v2_with_mock() {
+    async fn test_download_model_presigned_with_mock() {
         let env_lock = acquire_env_mutex();
         let mock = MockNgcServer::new(&env_lock).await;
 
@@ -1658,6 +1514,7 @@ mod tests {
         let env_lock = acquire_env_mutex();
         let temp_dir = tempfile::TempDir::new().expect("tempdir");
         let server = MockServer::start().await;
+        let uri = server.uri();
 
         Mock::given(method("GET"))
             .and(path_regex(r"^/token"))
@@ -1668,27 +1525,23 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path_regex(
-                r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
-            ))
+            .and(path_regex(r"/models/[^/]+/[^/]+/files$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "requestStatus": {"statusCode": "SUCCESS"},
                 "paginationInfo": {"totalPages": 1},
-                "modelVersion": {"storageVersion": "V2"},
-                "modelFiles": [
-                    {"path": "config.json"},
-                    {"path": "README.md"},
-                    {"path": ".gitignore"},
-                    {"path": "photo.png"}
-                ]
+                "urls": [
+                    format!("{uri}/dl/config.json"),
+                    format!("{uri}/dl/README.md"),
+                    format!("{uri}/dl/.gitignore"),
+                    format!("{uri}/dl/photo.png")
+                ],
+                "filepath": ["config.json", "README.md", ".gitignore", "photo.png"]
             })))
             .mount(&server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path_regex(
-                r"/v2/org/.*/team/.*/models/.*/versions/.*/files/config\.json",
-            ))
+            .and(path_regex(r"^/dl/config\.json"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
             .mount(&server)
             .await;
@@ -1729,9 +1582,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path_regex(
-                r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
-            ))
+            .and(path_regex(r"/models/[^/]+/[^/]+/files$"))
             .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
                 "requestStatus": {
                     "statusCode": "INVALID_REQUEST",
@@ -1782,24 +1633,21 @@ mod tests {
         let env_lock = acquire_env_mutex();
         let temp_dir = tempfile::TempDir::new().expect("tempdir");
         let server = MockServer::start().await;
+        let uri = server.uri();
 
         Mock::given(method("GET"))
-            .and(path_regex(
-                r"/v2/org/.*/team/.*/models/.*/versions/.*/files$",
-            ))
+            .and(path_regex(r"/models/[^/]+/[^/]+/files$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "requestStatus": {"statusCode": "SUCCESS"},
                 "paginationInfo": {"totalPages": 1},
-                "modelVersion": {"storageVersion": "V2"},
-                "modelFiles": [{"path": "config.json"}]
+                "urls": [format!("{uri}/dl/config.json")],
+                "filepath": ["config.json"]
             })))
             .mount(&server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path_regex(
-                r"/v2/org/.*/team/.*/models/.*/versions/.*/files/.+",
-            ))
+            .and(path_regex(r"^/dl/"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
             .mount(&server)
             .await;
