@@ -6,9 +6,11 @@ pub mod cache;
 pub mod config;
 pub mod p2p;
 pub mod registry;
+pub mod server;
 pub mod services;
 
 // Re-export for testing
 pub use cache::*;
 pub use config::*;
+pub use server::run_server;
 pub use services::*;
