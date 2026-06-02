@@ -1,9 +1,14 @@
 # ModelExpress × verl — Design Overview
 
-**Last Updated**: April 2026
-**Status**: E2E working — cross-node RDMA weight transfers via `MxCheckpointEngine` on 2× GB200 nodes (GKE).
+**Last Updated**: June 2026
+**Status**: Production-validated on B200 + InfiniBand at frontier scale — Qwen3-235B-A22B FP8 hot refit at 41.7 s / 45.8 Gbps median, MX is the fastest *completing* NIXL plane; veRL-native NIXL fails 3/3 at this scale.
 
-This document covers how ModelExpress (MX) plugs into [verl](https://github.com/volcengine/verl) for RL post-training weight synchronization. It walks through the component design, **how MX relates to verl’s native `nixl` checkpoint engine**, the Ray actor integration, the `CheckpointEngine` surface, and the GB200 prototype results.
+This document covers how ModelExpress (MX) plugs into [verl](https://github.com/volcengine/verl) for RL post-training weight synchronization. It walks through the component design, **how MX relates to verl’s native `nixl` checkpoint engine**, the Ray actor integration, the `CheckpointEngine` surface, and the prototype + production-scale benchmark results.
+
+> **Two implementations exist.** This document describes the architecture; the *implementation* has gone through two generations:
+>
+> - **Gen 1 (April 2026, `kavink/RL`):** `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 LOC, inside a verl fork). Validated on Qwen2.5-1.5B BF16 / GB200 / ~1.25 s avg. Architecturally proves the design.
+> - **Gen 2 (June 2026, `athreesh/modelexpress-private @ athreesh/docs-reproduce-from-fresh-devbox`):** `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` + 3 sibling modules + 14 test modules. Lives inside MX, loaded into upstream verl via `checkpoint_engine.custom_backend_module` — **no verl fork required**. Validated at Qwen3-235B-A22B FP8 / B200 + IB / 41.7 s. Adds leases, recovery, reshard, FP8 + per-expert layouts. See [§7 — Implementation evolution](#7-implementation-evolution-gen-1--gen-2) below.
 
 ---
 
@@ -15,10 +20,11 @@ verl is a Ray-orchestrated RL framework. Its `CheckpointEngine` plugin system is
 
 | Layer | Role | Implementation |
 |-------|------|----------------|
-| Metadata plane | Source discovery, version tracking, topology coordination | MX Server (gRPC) + Redis |
+| Metadata plane | Source discovery, version tracking, topology coordination, **transfer leases**, **versioning + retention** | MX Server (gRPC) + Redis |
 | Data plane | GPU-to-GPU tensor transport | NIXL (UCX / `rc_mlx5` / RoCE) |
-| verl integration | `CheckpointEngine` ABC implementation | `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 lines) |
+| verl integration | `CheckpointEngine` ABC implementation, registered as backend `modelexpress` | **Gen 2:** `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` + `verl_publish_metadata.py` + `verl_receive_metadata.py` + `verl_rollout_preflight.py`. Loaded via verl's `checkpoint_engine.custom_backend_module` plugin hook — **no verl fork required**. <br>**Gen 1:** `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 LOC, inside verl fork; archived on `kavink/RL`). |
 | Transport choreography | Bucket metadata handshake per transfer | ZMQ PUSH/PULL |
+| Production-scale features (Gen 2) | Transfer leases · source-death recovery · per-expert FSDP source for MoE · FP8 + Cutlass per-channel layouts · multi-source dense fan-in · tree fan-out with peer-republish | `rl_reshard.py`, `rl_metadata.py`, lease RPCs in `modelexpress_server` |
 
 ### Component diagram (vertical, document-friendly)
 
@@ -214,7 +220,9 @@ sequenceDiagram
     Note over V: vLLM resumes with updated weights
 ```
 
-**Observed per-step timing** (GB200, Qwen2.5-1.5B BF16, cross-node RoCE):
+**Observed per-step timing** — two reference points showing the architecture scales:
+
+### Gen 1 reference: Qwen2.5-1.5B BF16, 2× GB200 cross-node RoCE (April 2026)
 
 | Phase | Wall time |
 |-------|-----------|
@@ -223,7 +231,34 @@ sequenceDiagram
 | `finalize` | ~0.1s |
 | **Total `update_weights`** | **~1.25s avg** (range 1.22-1.28s) |
 
-For the same model and cluster, the default `naive` engine averages **~1.6s** (in-process copy). The MX engine is faster *and* does a real cross-node transfer — the naive baseline only works because hybrid mode colocates trainer and rollout on the same GPUs.
+For the same model and cluster, the default `naive` engine averages **~1.6s** (in-process copy). MX is faster *and* does a real cross-node transfer — the naive baseline only works because hybrid mode colocates trainer and rollout on the same GPUs.
+
+### Gen 2 reference: Qwen3-235B-A22B FP8 hot refit, B200 + InfiniBand (June 2026)
+
+The Gen 2 implementation was benchmarked against three other transports on the **same image, same model, same cluster**, all real hot refits with `outputs_changed=true` verification. Median of 3 samples:
+
+| Plane | Median update | Median effective Gbps | Result |
+|-------|--------------:|----------------------:|--------|
+| **MX/NIXL** (this design) | **41.7 s** | **45.8 Gbps** | 3/3 green — fastest *completing* plane |
+| veRL-native NCCL | 63.8 s | 30.0 Gbps | 3/3 green (variance 27–291 s) |
+| Moonshot CE (mooncake) | 124.8 s | 15.3 Gbps | 3/3 green (consistent) |
+| veRL-native NIXL | — | — | **3/3 DIED** (`ActorDiedError` in `build_process_group`) |
+
+Headline: **MX is the fastest green plane at 235B (~3× faster than CE) AND the only NIXL plane that completes** — the "commodity transport" competitor (veRL-native NIXL) cannot finish a 235B refit; it dies before transfer. A transport *API existing* ≠ it *working at scale*.
+
+**Performance shape:** the refit is **orchestration-bound, not bandwidth-bound**. The IB NIC is saturated during the ~2.3 s of pure transfer; the ~39 s total is source-prep (FSDP gather + cuda_copy) and per-tensor manager/apply over 18,432 expert tensors. Optimization levers = bucket experts (fewer units) + pipeline source-prep with transfer (real double-buffer overlap, not per-tensor tweaks).
+
+### Fault tolerance during a collective (clean two-sided win, June 2026)
+
+Identical fault — kill a participant mid-broadcast across distinct B200 nodes, N=4:
+
+| Backend | Outcome |
+|---------|---------|
+| **MX/NIXL (tree fan-out)** | **Recovers** — `failed_then_succeeded=true`, `completed_from_alternate_source=true`, output-verified |
+| **MX/NIXL (ring)** | **Recovers** — peer-republish completes correctly |
+| NCCL broadcast | **Wedges / dies** (`ActorDiedError`) |
+
+This is the moat statement on silicon: a participant dies mid-broadcast → MX's elastic-membership collective recovers and completes; NCCL's rigid collective stalls. Consistent with the 235B veRL-native death (same failure mode, larger model).
 
 ---
 
@@ -542,3 +577,59 @@ This proved publisher/receiver correctness before moving to cross-node.
 3. **The ARM64 path is painful but survivable.** All the image work is in `docker/Dockerfile.mx-arm64` and the compat shim, aligned with other GB200 MX + vLLM container iterations on the same stack.
 4. **Standalone rollout is the production shape.** Hybrid/colocated mode is useful for debugging but cannot drive any non-naive checkpoint engine — true for NIXL, NCCL, and MX alike.
 
+---
+
+## 7. Implementation evolution — Gen 1 → Gen 2
+
+The architecture in §1 has stayed stable; what's changed between April 2026 and June 2026 is the packaging, the production-scale features layered on top, and the validation surface.
+
+### 7.1 Gen 1 (April 2026, `kavink/RL`) — architectural PoC
+
+| Property | Value |
+|----------|-------|
+| File | `verl/checkpoint_engine/mx_checkpoint_engine.py` (single 461-LOC file) |
+| Lives in | A **fork of verl** — required to maintain a verl branch in lockstep with MX changes |
+| Registered as | Backend `mx` via `@CheckpointEngineRegistry.register("mx")` directly inside verl |
+| Validated on | Qwen2.5-1.5B BF16, 2× GB200 cross-node RoCE, ~1.25 s/refit, 10 PPO/GRPO steps |
+| Features | Star topology, MX Server + Redis catalog, ZMQ bucket metadata, NIXL RDMA READ |
+| Not yet covered | Production-scale FP8, MoE expert layouts, per-expert FSDP source, source-death recovery, transfer leases, mixed-TP reshard |
+
+**What it proved:** the architectural pattern works. Star topology + catalog-driven discovery is a viable alternative to verl-native NIXL's driver-wired ring. Cross-node RoCE RDMA at ~210 Gbps cold-start is real.
+
+### 7.2 Gen 2 (June 2026, `athreesh/modelexpress-private @ athreesh/docs-reproduce-from-fresh-devbox`) — production hardening
+
+| Property | Value |
+|----------|-------|
+| Entry point | `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` |
+| Sibling modules | `verl_publish_metadata.py` (publisher-side tensor-name resolution), `verl_receive_metadata.py` (receiver-side rank-indexed resolver, source-shape-aware), `verl_rollout_preflight.py` (production-backend validator for SGLang/vLLM gates), `rl_metadata.py` (`RlSourceRole`, `RlTreeFanoutPolicy` enums), `rl_reshard.py` |
+| Lives in | **MX repo itself** — no verl fork required |
+| Registered as | Backend `modelexpress` via verl's `checkpoint_engine.custom_backend_module` plugin hook (configured in user YAML, not in verl source) |
+| Validated on | Qwen3-235B-A22B FP8 hot refit, B200 + InfiniBand cross-node, 41.7 s/refit @ 45.8 Gbps median, 3/3 green — plus Qwen3-30B-A3B (18 432 expert tensors / 54 GiB), per-expert HF/FSDP source, fault-tolerance kill-mid-broadcast (recovers via peer-republish where NCCL wedges) |
+| New features | Transfer leases (server-side RPC for in-flight read tracking) · source-death recovery (`mx-rl-recovery-fallback` — re-source from peer when holder dies) · multi-source dense fan-in for reshard · per-expert HF/FSDP source for MoE · FP8 + Cutlass per-channel layouts · ring + tree fan-out topologies with peer-republish |
+| Test surface | Tier A 300 unit tests · Tier B 92 Rust server tests · Tier C live RL contracts · Tier D reaper contract · Tier E 56 real-veRL runtime cases |
+
+**What it proves:** the design scales to frontier model sizes (1 T parameters demonstrated separately via the Moonshot CE comparison row; 235B FP8 the headline) and survives the production failure modes (mid-transfer participant death, FP8 expert layouts, sharded source-to-fused-rollout translation).
+
+### 7.3 The packaging change is the headline operational win
+
+Gen 1 required a **verl fork** — every verl version bump meant re-rebasing the `mx_checkpoint_engine.py` change. Gen 2 uses verl's `custom_backend_module` plugin hook (a one-line config pointing at any importable module that registers via `CheckpointEngineRegistry`). The implementation lives entirely inside `ai-dynamo/modelexpress`, which means:
+
+- **No verl fork to maintain.** Upstream verl version bumps don't touch MX.
+- **One backend, many verl versions.** A single MX release works against any verl that exposes `custom_backend_module` (verl >= 0.7).
+- **The MX-side test surface is the regression net.** Tier A/B/C/D/E catch breakage during MX development; verl's own CI is unaffected.
+
+### 7.4 Where the Gen 2 code lives
+
+- Branch: [`athreesh/modelexpress-private:athreesh/docs-reproduce-from-fresh-devbox`](https://github.com/athreesh/modelexpress-private/tree/athreesh/docs-reproduce-from-fresh-devbox) (~192 commits ahead of `main`)
+- Entry-point file: `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py`
+- Validation artifacts: `.k8s-test/artifacts/qwen235-fp8-scaling-summary-20260602.md`, `nixl-broadcast-fault-qwen05-1e2212f-20260602.compact.json`
+- veRL config knob: `actor_rollout_ref.rollout.checkpoint_engine.backend: modelexpress` + `actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module: modelexpress.integrations.verl_checkpoint_engine`
+
+### 7.5 Roadmap to upstream
+
+Gen 2 currently lives in a private fork. The path to consolidation:
+
+1. Merge the Gen 2 integration into `ai-dynamo/modelexpress` (likely on `kavink/nemo_rl_moe` or a new branch).
+2. Retire `verl/checkpoint_engine/mx_checkpoint_engine.py` from the verl fork in favor of the `custom_backend_module` path.
+3. Update this doc's component diagram to drop the "in-verl-fork" boxes and show `custom_backend_module` as the loading mechanism.
+4. Cross-link this doc and the `NEMORL_MX_OVERVIEW.md` to make the "same MX, different framework integration depth" story explicit (verl uses fat clients; NemoRL uses v2 fat clients; prime-rl uses thin client + reimplements rendezvous).
