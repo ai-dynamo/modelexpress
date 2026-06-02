@@ -153,6 +153,40 @@ jobs:
       working-directory: modelexpress_client/go
       run: go test ./...
 
+  artifact-transfer-contract:
+    name: Artifact Transfer Contract
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-artifact-transfer-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-artifact-transfer-
+          ${{ runner.os }}-cargo-
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Run artifact transfer contract tests
+      run: |
+        cargo test -p model-express-workspace-tests --test artifact_transfer_contract
+
   integration-test:
     name: Integration Tests
     runs-on: ubuntu-latest

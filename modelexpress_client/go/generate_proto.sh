@@ -52,7 +52,10 @@ echo "Generating Go protobuf and gRPC bindings from ${PROTO_DIR}..."
         "${PROTO_FILES[@]}"
 )
 
-mapfile -d '' generated_files < <(find "${GEN_DIR}" -type f \( -name "*.pb.go" -o -name "*_grpc.pb.go" \) -print0 | sort -z)
+generated_files=()
+while IFS= read -r -d '' file; do
+    generated_files+=("${file}")
+done < <(find "${GEN_DIR}" -type f \( -name "*.pb.go" -o -name "*_grpc.pb.go" \) -print0 | sort -z)
 
 if [[ "${#generated_files[@]}" -eq 0 ]]; then
     echo "error: no Go protobuf files were generated" >&2

@@ -5,8 +5,13 @@
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
-use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use super::{
+    ArtifactSourceMetadataRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
+    TensorRecord, WorkerRecord,
+};
+use crate::p2p::k8s_types::{
+    ArtifactSourceStatus, ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus,
+};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -219,6 +224,9 @@ impl MetadataBackend for KubernetesBackend {
                 },
                 spec: ModelMetadataSpec {
                     model_name: model_name.to_string(),
+                    source_type: ModelMetadataSpec::source_type_name_from_proto(
+                        identity.mx_source_type,
+                    ),
                 },
                 status: None,
             };
@@ -275,6 +283,10 @@ impl MetadataBackend for KubernetesBackend {
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            artifact_source: worker_record
+                .artifact_source
+                .clone()
+                .map(ArtifactSourceStatus::from),
         };
 
         let max_retries: u32 = 5;
@@ -420,6 +432,10 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                artifact_source: worker_status
+                    .artifact_source
+                    .clone()
+                    .map(ArtifactSourceMetadataRecord::from),
             });
         }
 
@@ -703,5 +719,27 @@ impl MetadataBackend for KubernetesBackend {
             source_id, worker_id, worker_rank, max_retries
         )
         .into())
+    }
+}
+
+impl From<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
+    fn from(record: ArtifactSourceMetadataRecord) -> Self {
+        Self {
+            artifact_id: record.artifact_id,
+            total_size: record.total_size,
+            file_count: record.file_count,
+            chunk_count: record.chunk_count,
+        }
+    }
+}
+
+impl From<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
+    fn from(status: ArtifactSourceStatus) -> Self {
+        Self {
+            artifact_id: status.artifact_id,
+            total_size: status.total_size,
+            file_count: status.file_count,
+            chunk_count: status.chunk_count,
+        }
     }
 }

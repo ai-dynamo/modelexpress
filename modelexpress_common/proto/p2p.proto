@@ -37,14 +37,18 @@ enum BackendFramework {
   BACKEND_FRAMEWORK_TRT_LLM = 3;
 }
 
-// Type of tensors the source is serving
+// Type of reusable material the source is serving.
 enum MxSourceType {
-  MX_SOURCE_TYPE_WEIGHTS = 0;    // Base model weights (default)
-  MX_SOURCE_TYPE_LORA = 1;       // LoRA adapter weights
-  MX_SOURCE_TYPE_CUDA_GRAPH = 2; // CUDA graph artifacts
+  MX_SOURCE_TYPE_WEIGHTS = 0;             // Base model weights (default)
+  MX_SOURCE_TYPE_LORA = 1;                // LoRA adapter weights
+  MX_SOURCE_TYPE_CUDA_GRAPH = 2;          // CUDA graph artifacts
+  MX_SOURCE_TYPE_TORCH_COMPILE_CACHE = 3; // torch.compile cache files
+  MX_SOURCE_TYPE_TRITON_CACHE = 4;        // Triton cache files
 }
 
-// All fields that affect weight tensor layout and transfer compatibility.
+// All fields that affect source compatibility for reusable model material.
+// Source-type-specific fields are populated only by the source types that need
+// them; empty optional fields are ignored by current source-id canonicalization.
 // The server computes SHA256(canonical_json(identity)) and takes the first
 // 16 hex chars as the mx_source_id used to key metadata storage.
 message SourceIdentity {
@@ -86,6 +90,29 @@ message SourceIdentity {
   // full content check. Empty string means "unknown revision" and is
   // compatible with older publishers that pre-date this field.
   string revision = 11;
+
+  // Optional source-type-scoped compatibility fields for file-backed artifacts.
+  // Empty fields are ignored by current source-id canonicalization so existing
+  // weight identities keep stable mx_source_id values.
+
+  // Backend framework version (for example vLLM, SGLang, or TRT-LLM version).
+  string backend_framework_version = 12;
+
+  // PyTorch version used to produce framework cache artifacts.
+  string torch_version = 13;
+
+  // CUDA toolkit/runtime version relevant to generated cache artifacts.
+  string cuda_version = 14;
+
+  // Triton compiler/runtime version relevant to Triton cache artifacts.
+  string triton_version = 15;
+
+  // GPU architecture or capability (for example "sm90" or "9.0").
+  string gpu_arch = 16;
+
+  // Digest of source-type-specific compile/cache configuration not otherwise
+  // represented by explicit fields.
+  string compile_config_digest = 17;
 }
 
 // ============================================================================
@@ -107,6 +134,28 @@ message TensorDescriptor {
 
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
+}
+
+// Small discovery summary for file-backed artifact sources. Full file and
+// chunk manifests are served by WorkerService, not stored in Redis or CRDs.
+message ArtifactSourceMetadata {
+  // Digest of the canonical sealed artifact manifest.
+  string artifact_id = 1;
+
+  // Total artifact bytes across all manifest files.
+  uint64 total_size = 2;
+
+  // Number of files in the sealed artifact manifest.
+  uint32 file_count = 3;
+
+  // Number of transfer chunks in the sealed artifact manifest.
+  uint32 chunk_count = 4;
+}
+
+// Tensor source payload for the source_payload migration. Writers populate this
+// field; readers fall back to WorkerMetadata.tensors for old metadata.
+message TensorSourceMetadata {
+  repeated TensorDescriptor tensors = 1;
 }
 
 // ============================================================================
@@ -133,8 +182,9 @@ message WorkerMetadata {
     string transfer_engine_session_id = 10;
   }
 
-  // Tensor descriptors for this worker's GPU
-  repeated TensorDescriptor tensors = 3;
+  // Deprecated: use source_payload.tensor_source. Readers keep this only as a
+  // fallback for metadata published by old writers.
+  repeated TensorDescriptor tensors = 3 [deprecated = true];
 
   // Worker lifecycle status
   SourceStatus status = 4;
@@ -152,8 +202,19 @@ message WorkerMetadata {
   // NIXL agent name (used by targets to identify the remote agent)
   string agent_name = 7;
 
-  // host:port for the worker's gRPC WorkerService (tensor manifest)
+  // host:port for the worker's gRPC WorkerService. This is the single
+  // per-worker manifest service endpoint; source_payload does not introduce
+  // a separate artifact endpoint.
   string worker_grpc_endpoint = 8;
+
+  // Source-type-specific bounded metadata. This selects the metadata payload
+  // shape, not a transfer endpoint. Readers should prefer tensor_source over
+  // deprecated tensors when both are present, and fall back to tensors for old
+  // writers.
+  oneof source_payload {
+    TensorSourceMetadata tensor_source = 20;
+    ArtifactSourceMetadata artifact_source = 21;
+  }
 }
 
 // ============================================================================

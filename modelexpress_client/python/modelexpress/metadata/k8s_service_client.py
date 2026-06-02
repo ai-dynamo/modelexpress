@@ -47,6 +47,7 @@ import time
 import grpc
 
 from .. import p2p_pb2
+from .payload import tensor_source_metadata
 from .. import p2p_pb2_grpc
 from ..client import MxClientBase
 from .source_id import compute_mx_source_id
@@ -244,7 +245,7 @@ class MxK8sServiceClient(MxClientBase):
                     worker_rank=resp.worker_rank,
                     metadata_endpoint=resp.metadata_endpoint,
                     agent_name=resp.agent_name,
-                    tensors=list(resp.tensors),
+                    tensor_source=tensor_source_metadata(resp.tensors),
                     status=p2p_pb2.SOURCE_STATUS_READY,
                     worker_grpc_endpoint=endpoint,
                 )

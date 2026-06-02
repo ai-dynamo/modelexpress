@@ -46,7 +46,7 @@ fn canonical_json(identity: &SourceIdentity) -> String {
         sorted_extra.entry(lk).or_insert_with(|| v.to_lowercase());
     }
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "mx_version": identity.mx_version.to_lowercase(),
         "mx_source_type": identity.mx_source_type,
         "model_name": identity.model_name.to_lowercase(),
@@ -58,8 +58,39 @@ fn canonical_json(identity: &SourceIdentity) -> String {
         "quantization": identity.quantization.to_lowercase(),
         "extra_parameters": sorted_extra,
         "revision": identity.revision.to_lowercase(),
-    })
-    .to_string()
+    });
+
+    if let Some(object) = payload.as_object_mut() {
+        insert_non_empty_lowercase(
+            object,
+            "backend_framework_version",
+            &identity.backend_framework_version,
+        );
+        insert_non_empty_lowercase(object, "torch_version", &identity.torch_version);
+        insert_non_empty_lowercase(object, "cuda_version", &identity.cuda_version);
+        insert_non_empty_lowercase(object, "triton_version", &identity.triton_version);
+        insert_non_empty_lowercase(object, "gpu_arch", &identity.gpu_arch);
+        insert_non_empty_lowercase(
+            object,
+            "compile_config_digest",
+            &identity.compile_config_digest,
+        );
+    }
+
+    payload.to_string()
+}
+
+fn insert_non_empty_lowercase(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) {
+    if !value.is_empty() {
+        object.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_lowercase()),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +111,12 @@ mod tests {
             quantization: String::new(),
             extra_parameters: Default::default(),
             revision: String::new(),
+            backend_framework_version: String::new(),
+            torch_version: String::new(),
+            cuda_version: String::new(),
+            triton_version: String::new(),
+            gpu_arch: String::new(),
+            compile_config_digest: String::new(),
         }
     }
 
@@ -136,6 +173,49 @@ mod tests {
             compute_mx_source_id(&base_identity()),
             compute_mx_source_id(&lora)
         );
+    }
+
+    #[test]
+    fn test_empty_artifact_fields_preserve_existing_id() {
+        assert_eq!(compute_mx_source_id(&base_identity()), "5a5f555570065064");
+    }
+
+    #[test]
+    fn test_artifact_compatibility_fields_affect_id() {
+        let mut artifact = base_identity();
+        artifact.mx_source_type =
+            modelexpress_common::grpc::p2p::MxSourceType::TorchCompileCache as i32;
+        artifact.backend_framework_version = "0.10.0".to_string();
+        artifact.torch_version = "2.8.0+cu128".to_string();
+        artifact.cuda_version = "12.8".to_string();
+        artifact.triton_version = "3.4.0".to_string();
+        artifact.gpu_arch = "SM90".to_string();
+        artifact.compile_config_digest = "abc123".to_string();
+
+        let mut different_torch = artifact.clone();
+        different_torch.torch_version = "2.9.0+cu128".to_string();
+
+        assert_ne!(
+            compute_mx_source_id(&artifact),
+            compute_mx_source_id(&different_torch)
+        );
+    }
+
+    #[test]
+    fn test_artifact_compatibility_fields_are_case_insensitive() {
+        let mut upper = base_identity();
+        upper.mx_source_type =
+            modelexpress_common::grpc::p2p::MxSourceType::TorchCompileCache as i32;
+        upper.backend_framework_version = "VLLM-0.10.0".to_string();
+        upper.gpu_arch = "SM90".to_string();
+
+        let mut lower = base_identity();
+        lower.mx_source_type =
+            modelexpress_common::grpc::p2p::MxSourceType::TorchCompileCache as i32;
+        lower.backend_framework_version = "vllm-0.10.0".to_string();
+        lower.gpu_arch = "sm90".to_string();
+
+        assert_eq!(compute_mx_source_id(&upper), compute_mx_source_id(&lower));
     }
 
     #[test]

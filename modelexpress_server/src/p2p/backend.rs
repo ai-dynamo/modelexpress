@@ -10,7 +10,9 @@
 //! Select the backend via `MX_METADATA_BACKEND=redis` or `MX_METADATA_BACKEND=kubernetes`.
 
 use async_trait::async_trait;
-use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
+use modelexpress_common::grpc::p2p::{
+    ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorSourceMetadata, WorkerMetadata,
+};
 use std::sync::Arc;
 
 pub mod kubernetes;
@@ -117,6 +119,8 @@ pub struct WorkerRecord {
     pub agent_name: String,
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     pub worker_grpc_endpoint: String,
+    /// Small discovery summary for file-backed artifact sources.
+    pub artifact_source: Option<ArtifactSourceMetadataRecord>,
 }
 
 /// Tensor descriptor record
@@ -129,10 +133,21 @@ pub struct TensorRecord {
     pub dtype: String,
 }
 
+/// Bounded artifact discovery summary stored with worker metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtifactSourceMetadataRecord {
+    pub artifact_id: String,
+    pub total_size: u64,
+    pub file_count: u32,
+    pub chunk_count: u32,
+}
+
 // Conversions from gRPC types
 impl From<WorkerMetadata> for WorkerRecord {
+    #[allow(deprecated)]
     fn from(meta: WorkerMetadata) -> Self {
         use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+        use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
         let backend_metadata = match meta.backend_metadata {
             Some(BackendMetadata::NixlMetadata(data)) => BackendMetadataRecord::Nixl(data),
             Some(BackendMetadata::TransferEngineSessionId(sid)) => {
@@ -140,15 +155,24 @@ impl From<WorkerMetadata> for WorkerRecord {
             }
             None => BackendMetadataRecord::None,
         };
+        let (tensors, artifact_source) = match meta.source_payload {
+            Some(SourcePayload::TensorSource(tensor_source)) => (tensor_source.tensors, None),
+            Some(SourcePayload::ArtifactSource(artifact)) => (
+                Vec::new(),
+                Some(ArtifactSourceMetadataRecord::from(artifact)),
+            ),
+            None => (meta.tensors, None),
+        };
         Self {
             worker_rank: meta.worker_rank,
             backend_metadata,
-            tensors: meta.tensors.into_iter().map(TensorRecord::from).collect(),
+            tensors: tensors.into_iter().map(TensorRecord::from).collect(),
             status: meta.status,
             updated_at: meta.updated_at,
             metadata_endpoint: meta.metadata_endpoint,
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
+            artifact_source,
         }
     }
 }
@@ -169,6 +193,20 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
 impl From<WorkerRecord> for WorkerMetadata {
     fn from(record: WorkerRecord) -> Self {
         use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+        use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
+        let tensors: Vec<modelexpress_common::grpc::p2p::TensorDescriptor> = record
+            .tensors
+            .into_iter()
+            .map(modelexpress_common::grpc::p2p::TensorDescriptor::from)
+            .collect();
+        let source_payload = match record.artifact_source {
+            Some(artifact) => Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata::from(
+                artifact,
+            ))),
+            None => Some(SourcePayload::TensorSource(TensorSourceMetadata {
+                tensors: tensors.clone(),
+            })),
+        };
         let backend_metadata = match record.backend_metadata {
             BackendMetadataRecord::Nixl(data) => Some(BackendMetadata::NixlMetadata(data)),
             BackendMetadataRecord::TransferEngine(sid) => {
@@ -179,16 +217,13 @@ impl From<WorkerRecord> for WorkerMetadata {
         Self {
             worker_rank: record.worker_rank,
             backend_metadata,
-            tensors: record
-                .tensors
-                .into_iter()
-                .map(modelexpress_common::grpc::p2p::TensorDescriptor::from)
-                .collect(),
             status: record.status,
             updated_at: record.updated_at,
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            source_payload,
+            ..Default::default()
         }
     }
 }
@@ -201,6 +236,28 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+        }
+    }
+}
+
+impl From<ArtifactSourceMetadata> for ArtifactSourceMetadataRecord {
+    fn from(meta: ArtifactSourceMetadata) -> Self {
+        Self {
+            artifact_id: meta.artifact_id,
+            total_size: meta.total_size,
+            file_count: meta.file_count,
+            chunk_count: meta.chunk_count,
+        }
+    }
+}
+
+impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadata {
+    fn from(record: ArtifactSourceMetadataRecord) -> Self {
+        Self {
+            artifact_id: record.artifact_id,
+            total_size: record.total_size,
+            file_count: record.file_count,
+            chunk_count: record.chunk_count,
         }
     }
 }

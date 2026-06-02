@@ -25,6 +25,29 @@ pub struct ModelMetadataSpec {
     /// Full model name (e.g., deepseek-ai/DeepSeek-V3)
     #[serde(rename = "modelName")]
     pub model_name: String,
+
+    /// Source type from SourceIdentity (e.g., weights, torch_compile_cache).
+    #[serde(rename = "sourceType", default = "default_source_type")]
+    pub source_type: String,
+}
+
+fn default_source_type() -> String {
+    "unknown".to_string()
+}
+
+impl ModelMetadataSpec {
+    /// Convert an `MxSourceType` proto enum value (i32) to the CRD source type string.
+    pub fn source_type_name_from_proto(mx_source_type: i32) -> String {
+        match mx_source_type {
+            0 => "weights",
+            1 => "lora",
+            2 => "cuda_graph",
+            3 => "torch_compile_cache",
+            4 => "triton_cache",
+            _ => "unknown",
+        }
+        .to_string()
+    }
 }
 
 /// ModelMetadata status - the observed state
@@ -93,6 +116,30 @@ pub struct WorkerStatus {
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     #[serde(rename = "workerGrpcEndpoint", default)]
     pub worker_grpc_endpoint: String,
+
+    /// Small discovery summary for file-backed artifact sources.
+    #[serde(rename = "artifactSource", default)]
+    pub artifact_source: Option<ArtifactSourceStatus>,
+}
+
+/// Bounded artifact discovery summary stored in ModelMetadata status.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ArtifactSourceStatus {
+    /// Digest of the canonical sealed artifact manifest.
+    #[serde(rename = "artifactId")]
+    pub artifact_id: String,
+
+    /// Total artifact bytes across all manifest files.
+    #[serde(rename = "totalSize")]
+    pub total_size: u64,
+
+    /// Number of files in the sealed artifact manifest.
+    #[serde(rename = "fileCount")]
+    pub file_count: u32,
+
+    /// Number of transfer chunks in the sealed artifact manifest.
+    #[serde(rename = "chunkCount")]
+    pub chunk_count: u32,
 }
 
 impl WorkerStatus {
@@ -213,6 +260,29 @@ pub fn sanitize_model_name(model_name: &str) -> String {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_source_type_name_from_proto() {
+        assert_eq!(ModelMetadataSpec::source_type_name_from_proto(0), "weights");
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(3),
+            "torch_compile_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(99),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn test_model_metadata_spec_defaults_missing_source_type() {
+        let spec: ModelMetadataSpec =
+            serde_json::from_str(r#"{"modelName":"Qwen/Qwen2.5-0.5B-Instruct"}"#)
+                .expect("spec should deserialize without sourceType");
+
+        assert_eq!(spec.model_name, "Qwen/Qwen2.5-0.5B-Instruct");
+        assert_eq!(spec.source_type, "unknown");
+    }
 
     #[test]
     fn test_status_roundtrip() {
