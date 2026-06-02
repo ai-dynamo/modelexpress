@@ -79,6 +79,52 @@ ROLE_INFERENCE_REPLICA = "inference_replica"
 _V2_SIDECAR_NAME = "__mx_v2_meta__"
 
 
+def parse_v2_extras(meta) -> dict[str, str]:
+    """Extract v2 extra_parameters from a ``GetMetadataResponse``.
+
+    Tries three transports in order — `SourceIdentity.extra_parameters`
+    (clean path), `TensorDescriptor` sidecar named `__mx_v2_meta__`
+    (Rust-server-echo workaround), `WorkerMetadata.agent_name` legacy
+    string encoding. Returns the merged extras dict, or an empty dict
+    when the source is not v2.
+
+    Shared between :meth:`MxV2RefitReceiver.discover_v2_sources` and the
+    initial-load discovery in :mod:`modelexpress.load_strategy.rdma_strategy`.
+    """
+    identity = getattr(meta, "identity", None)
+    extra: dict[str, str] = (
+        dict(identity.extra_parameters)
+        if identity is not None and identity.extra_parameters
+        else {}
+    )
+    if not extra:
+        for td in meta.worker.tensors:
+            if td.name == _V2_SIDECAR_NAME and td.dtype:
+                try:
+                    sidecar = json.loads(td.dtype)
+                    if isinstance(sidecar, dict):
+                        for k, v in sidecar.items():
+                            extra[k] = str(v)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                break
+    if not extra:
+        agent_name = getattr(meta.worker, "agent_name", "") or ""
+        if agent_name.startswith("mx_v2|"):
+            parts = agent_name.split("|")
+            if len(parts) >= 4:
+                extra["mx_v2"] = "1"
+                extra["role"] = parts[1]
+                for piece in parts[2:]:
+                    if "=" in piece:
+                        k, v = piece.split("=", 1)
+                        if k == "rank":
+                            extra["worker_rank"] = v
+                        elif k == "version":
+                            extra["training_step"] = v
+    return extra
+
+
 # Trainer world layout descriptor. Receivers can sanity-check that the
 # layout they expect matches what the trainer actually published.
 @dataclass(frozen=True)
@@ -411,6 +457,8 @@ class MxV2RefitReceiver:
         worker_rank: int,
         listen_port: int | None = None,
     ):
+        import uuid
+
         self._receiver = MxRefitReceiver(
             agent_name=agent_name,
             device_id=device_id,
@@ -420,6 +468,16 @@ class MxV2RefitReceiver:
         self._worker_rank = worker_rank
         self._initialized = False
         self._registered_buffers: dict[str, torch.Tensor] = {}
+        # Used by publish_self_as_source for the tree-fan-out v2 publish.
+        # The Rust MX server's PublishMetadata RPC requires a non-empty
+        # worker_id; generate one per receiver so we don't fail with
+        # "PublishMetadata failed: worker_id is required".
+        self._self_publish_worker_id = uuid.uuid4().hex[:8]
+        # Heartbeat for the self-publish so the server doesn't mark our
+        # inference_replica source STALE between refit cycles. Started on
+        # the first successful publish_self_as_source call; stopped on
+        # shutdown.
+        self._self_publish_heartbeat: HeartbeatThread | None = None
 
     @property
     def worker_rank(self) -> int:
@@ -497,46 +555,10 @@ class MxV2RefitReceiver:
             if not getattr(meta, "found", False):
                 continue
 
-            # Read v2 metadata. We try three transports in order:
-            #   (a) SourceIdentity.extra_parameters (the cleanest path; works
-            #       once the Rust server populates GetMetadataResponse.identity).
-            #   (b) Synthetic TensorDescriptor sidecar named ``__mx_v2_meta__``
-            #       (preserved by the current Rust server; the path the
-            #       prototype actually uses today).
-            #   (c) WorkerMetadata.agent_name string-encoded marker (legacy).
-            identity = getattr(meta, "identity", None)
-            extra: dict[str, str] = (
-                dict(identity.extra_parameters)
-                if identity is not None and identity.extra_parameters
-                else {}
-            )
-            if not extra:
-                # Sidecar transport: scan tensors for the magic marker.
-                for td in meta.worker.tensors:
-                    if td.name == _V2_SIDECAR_NAME and td.dtype:
-                        try:
-                            sidecar = json.loads(td.dtype)
-                            if isinstance(sidecar, dict):
-                                for k, v in sidecar.items():
-                                    extra[k] = str(v)
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-                        break
-            if not extra:
-                # Agent-name transport: "mx_v2|<role>|rank=N|version=K|orig=...".
-                agent_name = getattr(meta.worker, "agent_name", "") or ""
-                if agent_name.startswith("mx_v2|"):
-                    parts = agent_name.split("|")
-                    if len(parts) >= 4:
-                        extra["mx_v2"] = "1"
-                        extra["role"] = parts[1]
-                        for piece in parts[2:]:
-                            if "=" in piece:
-                                k, v = piece.split("=", 1)
-                                if k == "rank":
-                                    extra["worker_rank"] = v
-                                elif k == "version":
-                                    extra["training_step"] = v
+            # Read v2 metadata via the shared parser (handles the three
+            # transports: identity.extra_parameters, sidecar tensor, and
+            # agent_name legacy encoding).
+            extra = parse_v2_extras(meta)
             if extra.get("mx_v2") != "1":
                 # Not a v2 source; ignore.
                 continue
@@ -721,15 +743,38 @@ class MxV2RefitReceiver:
             mx_source_id = client.publish_metadata(
                 identity=identity,
                 worker=worker_meta,
-                worker_id=self._receiver._worker_id
-                if hasattr(self._receiver, "_worker_id")
-                else "",
+                worker_id=self._self_publish_worker_id,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "publish_self_as_source failed: %s", e, exc_info=True
             )
             return None
+
+        # Start (or restart) a heartbeat so the server doesn't mark this
+        # source STALE after the heartbeat-detection timeout. Without
+        # this, subsequent autoscaled pods would only see the trainer
+        # (or other heartbeat-backed sources) and skip the
+        # inference_replica fan-out path entirely.
+        try:
+            if self._self_publish_heartbeat is not None:
+                self._self_publish_heartbeat.stop()
+                self._self_publish_heartbeat = None
+            self._self_publish_heartbeat = HeartbeatThread(
+                mx_client=client,
+                mx_source_id=mx_source_id,
+                worker_id=self._self_publish_worker_id,
+                worker_rank=self._worker_rank,
+                nixl_manager=nixl,
+            )
+            self._self_publish_heartbeat.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "publish_self_as_source: heartbeat start failed: %s",
+                e,
+                exc_info=True,
+            )
+
         logger.info(
             "Published self as inference_replica: rank=%d version=%d mx_source_id=%s",
             self._worker_rank,
@@ -742,6 +787,12 @@ class MxV2RefitReceiver:
         # MxRefitReceiver has no shutdown method in the existing code; the
         # NIXL transfer manager and MxClient are torn down by Python's gc.
         # Future: when refit_receiver gains a shutdown(), call it here.
+        if self._self_publish_heartbeat is not None:
+            try:
+                self._self_publish_heartbeat.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._self_publish_heartbeat = None
         self._initialized = False
 
 
@@ -753,4 +804,5 @@ __all__ = [
     "ROLE_TRAINER",
     "TrainerWorldLayout",
     "V2SourceCandidate",
+    "parse_v2_extras",
 ]

@@ -69,3 +69,14 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+    # Set by RdmaStrategy after a successful v2 RDMA pull so the downstream
+    # publish_metadata step can tag this worker as an ``inference_replica``
+    # source at the picked training_step. 0 means "no v2 source was used"
+    # (loaded from disk or from a v1 source); publish stays v1.
+    loaded_version: int = 0
+    # Set by the engine adapter when running MoE with EP>1. Maps
+    # layer index → set of expert IDs this rank needs. Used by
+    # RdmaStrategy._rank_v2_candidates to drop inference_replica sources
+    # that don't cover this rank's experts. None when EP=1 (the common
+    # dense case) — no filter applied.
+    needed_experts_per_layer: "dict[int, set[int]] | None" = None

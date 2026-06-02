@@ -12,7 +12,12 @@ from vllm.model_executor.model_loader import register_model_loader
 logger = logging.getLogger(__name__)
 
 
-_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
+# Includes "mx-source" / "mx-target" so dynamo.vllm's gating (which accepts
+# those as the user-facing CLI choices in
+# components/src/dynamo/vllm/main.py) reaches a valid registered loader.
+# Without these, vLLM raises "Load format `mx-target` is not supported"
+# even though dynamo's main.py thinks it triggered the integration.
+_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx", "mx-source", "mx-target")
 
 
 def _patch_vllm_s3_format_check() -> None:

@@ -234,6 +234,35 @@ def _get_vllm_device_id(target_device: torch.device) -> int:
     return device_id
 
 
+def compute_needed_experts(vllm_config) -> "dict[int, set[int]] | None":
+    """Return the per-layer expert IDs this rank needs, or None.
+
+    Used by :meth:`modelexpress.load_strategy.rdma_strategy.RdmaStrategy._rank_v2_candidates`
+    to filter out v2 inference_replica sources whose
+    ``owned_experts_per_layer`` doesn't cover this rank's slice.
+
+    Returns:
+        ``None`` when expert-parallel size is 1 (the common dense case) —
+        no MoE filter is applied. For EP>1 this is a placeholder that
+        currently returns ``None`` with a warning; downstream picks fall
+        back on the trainer source (always authoritative). Full
+        EP-aware introspection requires reading model.named_modules()
+        which isn't available at discovery time — track as a follow-up.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    ep_size = int(getattr(parallel_config, "expert_parallel_size", 1) or 1)
+    if ep_size <= 1:
+        return None
+    logger.warning(
+        "compute_needed_experts: EP=%d, but MoE expert filtering at boot "
+        "is not yet implemented; v2 inference_replicas may be picked even "
+        "if they don't cover this rank's experts. Trainer sources are still "
+        "preferred and always cover the full set.",
+        ep_size,
+    )
+    return None
+
+
 def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
     """Build a LoadContext from vLLM config objects."""
 
@@ -251,4 +280,5 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
         adapter=adapter,
+        needed_experts_per_layer=compute_needed_experts(vllm_config),
     )
