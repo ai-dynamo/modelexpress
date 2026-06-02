@@ -25,6 +25,7 @@ const (
 	ModelService_EnsureModelDownloaded_FullMethodName = "/model_express.model.ModelService/EnsureModelDownloaded"
 	ModelService_StreamModelFiles_FullMethodName      = "/model_express.model.ModelService/StreamModelFiles"
 	ModelService_ListModelFiles_FullMethodName        = "/model_express.model.ModelService/ListModelFiles"
+	ModelService_DeleteModel_FullMethodName           = "/model_express.model.ModelService/DeleteModel"
 )
 
 // ModelServiceClient is the client API for ModelService service.
@@ -39,6 +40,8 @@ type ModelServiceClient interface {
 	StreamModelFiles(ctx context.Context, in *ModelFilesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FileChunk], error)
 	// Get list of files for a model (useful for resumable transfers)
 	ListModelFiles(ctx context.Context, in *ModelFilesRequest, opts ...grpc.CallOption) (*ModelFileList, error)
+	// Delete a model record from the server-side registry (used by `model clear`)
+	DeleteModel(ctx context.Context, in *DeleteModelRequest, opts ...grpc.CallOption) (*DeleteModelResponse, error)
 }
 
 type modelServiceClient struct {
@@ -97,6 +100,16 @@ func (c *modelServiceClient) ListModelFiles(ctx context.Context, in *ModelFilesR
 	return out, nil
 }
 
+func (c *modelServiceClient) DeleteModel(ctx context.Context, in *DeleteModelRequest, opts ...grpc.CallOption) (*DeleteModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteModelResponse)
+	err := c.cc.Invoke(ctx, ModelService_DeleteModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ModelServiceServer is the server API for ModelService service.
 // All implementations must embed UnimplementedModelServiceServer
 // for forward compatibility.
@@ -109,6 +122,8 @@ type ModelServiceServer interface {
 	StreamModelFiles(*ModelFilesRequest, grpc.ServerStreamingServer[FileChunk]) error
 	// Get list of files for a model (useful for resumable transfers)
 	ListModelFiles(context.Context, *ModelFilesRequest) (*ModelFileList, error)
+	// Delete a model record from the server-side registry (used by `model clear`)
+	DeleteModel(context.Context, *DeleteModelRequest) (*DeleteModelResponse, error)
 	mustEmbedUnimplementedModelServiceServer()
 }
 
@@ -127,6 +142,9 @@ func (UnimplementedModelServiceServer) StreamModelFiles(*ModelFilesRequest, grpc
 }
 func (UnimplementedModelServiceServer) ListModelFiles(context.Context, *ModelFilesRequest) (*ModelFileList, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListModelFiles not implemented")
+}
+func (UnimplementedModelServiceServer) DeleteModel(context.Context, *DeleteModelRequest) (*DeleteModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteModel not implemented")
 }
 func (UnimplementedModelServiceServer) mustEmbedUnimplementedModelServiceServer() {}
 func (UnimplementedModelServiceServer) testEmbeddedByValue()                      {}
@@ -189,6 +207,24 @@ func _ModelService_ListModelFiles_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ModelService_DeleteModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ModelServiceServer).DeleteModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ModelService_DeleteModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ModelServiceServer).DeleteModel(ctx, req.(*DeleteModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ModelService_ServiceDesc is the grpc.ServiceDesc for ModelService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -199,6 +235,10 @@ var ModelService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListModelFiles",
 			Handler:    _ModelService_ListModelFiles_Handler,
+		},
+		{
+			MethodName: "DeleteModel",
+			Handler:    _ModelService_DeleteModel_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
