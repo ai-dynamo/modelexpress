@@ -39,3 +39,19 @@ After loading, every worker publishes its metadata so future instances can disco
 - ModelExpress server deployed (see [`../server/`](../server/))
 - HuggingFace token secret: `kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>`
 - PVC with model weights (see [`../model-download.yaml`](../model-download.yaml))
+
+## Verify
+
+The SGLang deployment defines a readiness probe on `/health`, so it reports
+Ready only after warmup completes. Wait for that, then confirm the
+OpenAI-compatible API serves the expected model:
+
+```bash
+kubectl rollout status deployment/mx-sglang --timeout=20m
+kubectl exec deployment/mx-sglang -c sglang -- \
+  curl -sS http://localhost:8000/v1/models
+```
+
+The vLLM examples do not define a readiness probe, so `rollout status` returns
+as soon as the container starts. Poll the same `curl` (swapping in the vLLM
+deployment and container names) until it returns the model list.
