@@ -45,6 +45,9 @@ docker push <YOUR_REGISTRY>/modelexpress-aws-efa:latest
 ```
 
 Edit the `image:` field in `vllm-aws-efa.yaml` to point at your pushed tag.
+The manifest defaults to `deepseek-ai/DeepSeek-V3` with
+`--tensor-parallel-size 8` and eight GPUs. If you switch models, update the
+tensor-parallel size and GPU request/limit to match that model.
 
 ## Deploy
 
