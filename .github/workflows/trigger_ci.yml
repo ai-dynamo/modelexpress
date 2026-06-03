@@ -20,6 +20,9 @@ concurrency:
 
 jobs:
   trigger:
+    # Fork PRs do not receive repository secrets, so the GitLab mirror workflow
+    # would fail with empty TOKEN/MIRROR_URL/PIPELINE_* values.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@main
     with:
       ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
