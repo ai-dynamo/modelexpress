@@ -13,7 +13,7 @@ use modelexpress_common::{
 use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> String {
     if detailed {
@@ -141,9 +141,18 @@ pub async fn handle_model_command(
         ModelCommands::Clear {
             provider,
             model_name,
-        } => clear_model(storage_path_override, provider, &model_name, format).await,
+        } => {
+            clear_model(
+                storage_path_override,
+                provider,
+                &model_name,
+                server_config,
+                format,
+            )
+            .await
+        }
         ModelCommands::ClearAll { yes } => {
-            clear_all_models(storage_path_override, yes, format).await
+            clear_all_models(storage_path_override, yes, server_config, format).await
         }
         ModelCommands::Validate { model_name } => {
             validate_models(storage_path_override, model_name, format).await
@@ -458,15 +467,45 @@ async fn show_model_status(
     Ok(())
 }
 
+/// Best-effort deletion of a model's server-side registry record. Removing the local
+/// files is the primary intent of `model clear`, so a server that is unreachable or
+/// returns an error is surfaced as a warning rather than failing the command. Returns
+/// `Ok(())` when the record was deleted, `Err(reason)` otherwise.
+async fn delete_model_registry_record(
+    server_config: &ClientConfig,
+    model_name: &str,
+    provider: ModelProvider,
+) -> Result<(), String> {
+    let mut client = Client::new(server_config.clone())
+        .await
+        .map_err(|e| format!("could not connect to server: {e}"))?;
+    client
+        .delete_model_on_server(model_name, provider)
+        .await
+        .map_err(|e| format!("server registry delete failed: {e}"))
+}
+
 async fn clear_model(
     storage_path_override: Option<PathBuf>,
     provider: ModelProvider,
     model_name: &str,
+    server_config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
 
     storage_config.clear_model(model_name, provider)?;
+
+    // Also drop the server-side registry record so a later `model download` re-fetches
+    // the files instead of hitting a stale DOWNLOADED record and returning a false success.
+    let registry_warning =
+        match delete_model_registry_record(&server_config, model_name, provider).await {
+            Ok(()) => None,
+            Err(reason) => {
+                warn!("Cleared local files for '{model_name}' but {reason}");
+                Some(reason)
+            }
+        };
 
     match format {
         OutputFormat::Human => {
@@ -474,13 +513,22 @@ async fn clear_model(
                 "✅ Model '{model_name}' cleared from storage for provider {}",
                 provider
             );
+            match &registry_warning {
+                None => println!("   Server registry record removed"),
+                Some(reason) => println!(
+                    "{}",
+                    format!("⚠️  Server registry record NOT removed: {reason}").yellow()
+                ),
+            }
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
                 "message": format!("Model '{}' cleared from storage", model_name),
                 "model_name": model_name,
-                "provider": provider.to_string()
+                "provider": provider.to_string(),
+                "registry_cleared": registry_warning.is_none(),
+                "registry_warning": registry_warning,
             });
             print_output(&output, format);
         }
@@ -492,6 +540,7 @@ async fn clear_model(
 async fn clear_all_models(
     storage_path_override: Option<PathBuf>,
     yes: bool,
+    server_config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
@@ -509,16 +558,49 @@ async fn clear_all_models(
         }
     }
 
+    // Capture the cached models before clearing so we can drop their registry records too.
+    let cached = storage_config
+        .get_cache_stats()
+        .map(|stats| {
+            stats
+                .models
+                .into_iter()
+                .map(|model| (model.name, model.provider))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     storage_config.clear_all()?;
+
+    let mut registry_failures = 0usize;
+    for (name, provider) in &cached {
+        if let Err(reason) = delete_model_registry_record(&server_config, name, *provider).await {
+            warn!("Cleared local files for '{name}' but {reason}");
+            registry_failures = registry_failures.saturating_add(1);
+        }
+    }
 
     match format {
         OutputFormat::Human => {
             println!("✅ All models cleared from storage");
+            if registry_failures == 0 {
+                println!("   Server registry records removed");
+            } else {
+                println!(
+                    "{}",
+                    format!(
+                        "⚠️  {registry_failures} server registry record(s) NOT removed (see warnings)"
+                    )
+                    .yellow()
+                );
+            }
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
-                "message": "All models cleared from storage"
+                "message": "All models cleared from storage",
+                "registry_records_cleared": cached.len().saturating_sub(registry_failures),
+                "registry_records_failed": registry_failures,
             });
             print_output(&output, format);
         }

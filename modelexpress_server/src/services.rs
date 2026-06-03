@@ -10,8 +10,9 @@ use modelexpress_common::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
         model::{
-            FileChunk, ModelDownloadRequest, ModelFileInfo, ModelFileList, ModelFileSelector,
-            ModelFilesRequest, ModelProvider as GrpcModelProvider, ModelStatusUpdate,
+            DeleteModelRequest, DeleteModelResponse, FileChunk, ModelDownloadRequest,
+            ModelFileInfo, ModelFileList, ModelFileSelector, ModelFilesRequest,
+            ModelProvider as GrpcModelProvider, ModelStatusUpdate,
             model_service_server::ModelService,
         },
     },
@@ -41,6 +42,25 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
             .ok()
             .map(std::path::PathBuf::from)
     }
+}
+
+/// Returns true if the model's files are present in the given cache directory. Used to
+/// guard against stale `DOWNLOADED` registry records that point at a cache entry which no
+/// longer exists on disk (e.g. left behind by a client-side `model clear`). When no cache
+/// directory is configured we cannot verify, so we assume the files are present to preserve
+/// existing behavior rather than loop re-downloading forever.
+async fn model_files_present(
+    cache_dir: Option<std::path::PathBuf>,
+    model_name: &str,
+    provider: ModelProvider,
+) -> bool {
+    let Some(cache_dir) = cache_dir else {
+        return true;
+    };
+    download::get_provider(provider)
+        .get_model_path(model_name, cache_dir)
+        .await
+        .is_ok()
 }
 
 /// Health service implementation
@@ -494,6 +514,37 @@ impl ModelService for ModelServiceImpl {
             total_size,
         }))
     }
+
+    async fn delete_model(
+        &self,
+        request: Request<DeleteModelRequest>,
+    ) -> Result<Response<DeleteModelResponse>, Status> {
+        let delete_request = request.into_inner();
+
+        let grpc_provider = GrpcModelProvider::try_from(delete_request.provider).map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid provider value: {}",
+                delete_request.provider
+            ))
+        })?;
+        let provider = ModelProvider::from(grpc_provider);
+        let model_name = download::canonical_model_name(&delete_request.model_name, provider)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let Some(tracker) = model_tracker() else {
+            return Err(Status::unavailable(
+                "server startup incomplete: model tracker not initialized",
+            ));
+        };
+
+        tracker.delete_status(&model_name).await;
+        info!("Deleted registry record for model '{model_name}'");
+
+        Ok(Response::new(DeleteModelResponse {
+            success: true,
+            message: Some(format!("Model '{model_name}' removed from registry")),
+        }))
+    }
 }
 
 /// Type alias for the complex waiting channels type
@@ -670,24 +721,49 @@ impl ModelDownloadTracker {
         // Atomically try to claim this model for download. The `ClaimOutcome` tells us
         // whether THIS replica won the claim or is observing someone else's claim —
         // status alone (`DOWNLOADING`) can't distinguish those cases across replicas.
-        let (status, is_owner) = match self
-            .registry
-            .try_claim_for_download(model_name, provider)
-            .await
-        {
-            Ok(ClaimOutcome::Claimed) => (ModelStatus::DOWNLOADING, true),
-            Ok(ClaimOutcome::AlreadyExists(existing)) => (existing, false),
-            Err(e) => {
-                error!("Failed to claim model for download: {e}");
-                let error_update = ModelStatusUpdate {
-                    model_name: model_name.to_string(),
-                    status: modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
-                        as i32,
-                    message: Some("Registry error occurred".to_string()),
-                    provider: GrpcModelProvider::from(provider) as i32,
-                };
-                let _ = tx.send(Ok(error_update)).await;
-                return ModelStatus::ERROR;
+        // A claim may report an existing `DOWNLOADED` record whose files no longer exist
+        // on disk (e.g. after a client-side `model clear` that only removed local files).
+        // When that happens we drop the stale record and re-claim once, so the download
+        // path runs instead of returning a false success. Bounded to two attempts to
+        // avoid looping if the delete or a concurrent re-claim keeps the record around.
+        const MAX_CLAIM_ATTEMPTS: usize = 2;
+        let mut attempt: usize = 0;
+        let (status, is_owner) = loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .registry
+                .try_claim_for_download(model_name, provider)
+                .await
+            {
+                Ok(ClaimOutcome::Claimed) => break (ModelStatus::DOWNLOADING, true),
+                Ok(ClaimOutcome::AlreadyExists(existing)) => {
+                    if existing == ModelStatus::DOWNLOADED
+                        && attempt < MAX_CLAIM_ATTEMPTS
+                        && !model_files_present(get_server_cache_dir(), model_name, provider).await
+                    {
+                        error!(
+                            "Registry reports model '{model_name}' as DOWNLOADED but its files \
+                             are missing from the cache; clearing the stale record and \
+                             re-downloading"
+                        );
+                        self.delete_status(model_name).await;
+                        continue;
+                    }
+                    break (existing, false);
+                }
+                Err(e) => {
+                    error!("Failed to claim model for download: {e}");
+                    let error_update = ModelStatusUpdate {
+                        model_name: model_name.to_string(),
+                        status: modelexpress_common::grpc::model::ModelStatus::from(
+                            ModelStatus::ERROR,
+                        ) as i32,
+                        message: Some("Registry error occurred".to_string()),
+                        provider: GrpcModelProvider::from(provider) as i32,
+                    };
+                    let _ = tx.send(Ok(error_update)).await;
+                    return ModelStatus::ERROR;
+                }
             }
         };
 
@@ -1210,6 +1286,40 @@ mod tests {
             response.total_size,
             br#"{"model":"test"}"#.len() as u64 + b"nested".len() as u64
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_model_files_present_reflects_disk_state() {
+        let env_lock = acquire_env_mutex();
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        // No files on disk: a stale DOWNLOADED record must not be honored.
+        assert!(
+            !model_files_present(
+                Some(cache_dir.clone()),
+                "test/model",
+                ModelProvider::HuggingFace
+            )
+            .await
+        );
+
+        // Once the snapshot exists, the cache hit is real.
+        let model_dir = cache_dir.join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+        assert!(
+            model_files_present(Some(cache_dir), "test/model", ModelProvider::HuggingFace).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_files_present_assumes_present_without_cache_dir() {
+        // With no configured cache directory we cannot verify, so we must not force a
+        // re-download loop: assume the files are present.
+        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace).await);
     }
 
     #[tokio::test]

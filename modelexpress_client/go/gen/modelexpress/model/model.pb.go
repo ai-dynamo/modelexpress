@@ -124,6 +124,112 @@ func (ModelProvider) EnumDescriptor() ([]byte, []int) {
 	return file_model_proto_rawDescGZIP(), []int{1}
 }
 
+// Request to delete a model record from the registry
+type DeleteModelRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ModelName     string                 `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	Provider      ModelProvider          `protobuf:"varint,2,opt,name=provider,proto3,enum=model_express.model.ModelProvider" json:"provider,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteModelRequest) Reset() {
+	*x = DeleteModelRequest{}
+	mi := &file_model_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteModelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteModelRequest) ProtoMessage() {}
+
+func (x *DeleteModelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_model_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteModelRequest.ProtoReflect.Descriptor instead.
+func (*DeleteModelRequest) Descriptor() ([]byte, []int) {
+	return file_model_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *DeleteModelRequest) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+func (x *DeleteModelRequest) GetProvider() ModelProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return ModelProvider_HUGGING_FACE
+}
+
+// Response for a model deletion request
+type DeleteModelResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Message       *string                `protobuf:"bytes,2,opt,name=message,proto3,oneof" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteModelResponse) Reset() {
+	*x = DeleteModelResponse{}
+	mi := &file_model_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteModelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteModelResponse) ProtoMessage() {}
+
+func (x *DeleteModelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_model_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteModelResponse.ProtoReflect.Descriptor instead.
+func (*DeleteModelResponse) Descriptor() ([]byte, []int) {
+	return file_model_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *DeleteModelResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *DeleteModelResponse) GetMessage() string {
+	if x != nil && x.Message != nil {
+		return *x.Message
+	}
+	return ""
+}
+
 // Request to ensure a model is downloaded
 type ModelDownloadRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -136,7 +242,7 @@ type ModelDownloadRequest struct {
 
 func (x *ModelDownloadRequest) Reset() {
 	*x = ModelDownloadRequest{}
-	mi := &file_model_proto_msgTypes[0]
+	mi := &file_model_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -148,7 +254,7 @@ func (x *ModelDownloadRequest) String() string {
 func (*ModelDownloadRequest) ProtoMessage() {}
 
 func (x *ModelDownloadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[0]
+	mi := &file_model_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -161,7 +267,7 @@ func (x *ModelDownloadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelDownloadRequest.ProtoReflect.Descriptor instead.
 func (*ModelDownloadRequest) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{0}
+	return file_model_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ModelDownloadRequest) GetModelName() string {
@@ -199,7 +305,7 @@ type ModelStatusUpdate struct {
 
 func (x *ModelStatusUpdate) Reset() {
 	*x = ModelStatusUpdate{}
-	mi := &file_model_proto_msgTypes[1]
+	mi := &file_model_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -211,7 +317,7 @@ func (x *ModelStatusUpdate) String() string {
 func (*ModelStatusUpdate) ProtoMessage() {}
 
 func (x *ModelStatusUpdate) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[1]
+	mi := &file_model_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -224,7 +330,7 @@ func (x *ModelStatusUpdate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelStatusUpdate.ProtoReflect.Descriptor instead.
 func (*ModelStatusUpdate) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{1}
+	return file_model_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ModelStatusUpdate) GetModelName() string {
@@ -272,7 +378,7 @@ type ModelFilesRequest struct {
 
 func (x *ModelFilesRequest) Reset() {
 	*x = ModelFilesRequest{}
-	mi := &file_model_proto_msgTypes[2]
+	mi := &file_model_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -284,7 +390,7 @@ func (x *ModelFilesRequest) String() string {
 func (*ModelFilesRequest) ProtoMessage() {}
 
 func (x *ModelFilesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[2]
+	mi := &file_model_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -297,7 +403,7 @@ func (x *ModelFilesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelFilesRequest.ProtoReflect.Descriptor instead.
 func (*ModelFilesRequest) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{2}
+	return file_model_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ModelFilesRequest) GetModelName() string {
@@ -339,7 +445,7 @@ type ModelFileSelector struct {
 
 func (x *ModelFileSelector) Reset() {
 	*x = ModelFileSelector{}
-	mi := &file_model_proto_msgTypes[3]
+	mi := &file_model_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -351,7 +457,7 @@ func (x *ModelFileSelector) String() string {
 func (*ModelFileSelector) ProtoMessage() {}
 
 func (x *ModelFileSelector) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[3]
+	mi := &file_model_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -364,7 +470,7 @@ func (x *ModelFileSelector) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelFileSelector.ProtoReflect.Descriptor instead.
 func (*ModelFileSelector) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{3}
+	return file_model_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ModelFileSelector) GetPaths() []string {
@@ -397,7 +503,7 @@ type FileChunk struct {
 
 func (x *FileChunk) Reset() {
 	*x = FileChunk{}
-	mi := &file_model_proto_msgTypes[4]
+	mi := &file_model_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -409,7 +515,7 @@ func (x *FileChunk) String() string {
 func (*FileChunk) ProtoMessage() {}
 
 func (x *FileChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[4]
+	mi := &file_model_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -422,7 +528,7 @@ func (x *FileChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileChunk.ProtoReflect.Descriptor instead.
 func (*FileChunk) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{4}
+	return file_model_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *FileChunk) GetRelativePath() string {
@@ -489,7 +595,7 @@ type ModelFileList struct {
 
 func (x *ModelFileList) Reset() {
 	*x = ModelFileList{}
-	mi := &file_model_proto_msgTypes[5]
+	mi := &file_model_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -501,7 +607,7 @@ func (x *ModelFileList) String() string {
 func (*ModelFileList) ProtoMessage() {}
 
 func (x *ModelFileList) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[5]
+	mi := &file_model_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -514,7 +620,7 @@ func (x *ModelFileList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelFileList.ProtoReflect.Descriptor instead.
 func (*ModelFileList) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{5}
+	return file_model_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ModelFileList) GetModelName() string {
@@ -551,7 +657,7 @@ type ModelFileInfo struct {
 
 func (x *ModelFileInfo) Reset() {
 	*x = ModelFileInfo{}
-	mi := &file_model_proto_msgTypes[6]
+	mi := &file_model_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -563,7 +669,7 @@ func (x *ModelFileInfo) String() string {
 func (*ModelFileInfo) ProtoMessage() {}
 
 func (x *ModelFileInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_model_proto_msgTypes[6]
+	mi := &file_model_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -576,7 +682,7 @@ func (x *ModelFileInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelFileInfo.ProtoReflect.Descriptor instead.
 func (*ModelFileInfo) Descriptor() ([]byte, []int) {
-	return file_model_proto_rawDescGZIP(), []int{6}
+	return file_model_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ModelFileInfo) GetRelativePath() string {
@@ -597,7 +703,16 @@ var File_model_proto protoreflect.FileDescriptor
 
 const file_model_proto_rawDesc = "" +
 	"\n" +
-	"\vmodel.proto\x12\x13model_express.model\"\x9c\x01\n" +
+	"\vmodel.proto\x12\x13model_express.model\"s\n" +
+	"\x12DeleteModelRequest\x12\x1d\n" +
+	"\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\x12>\n" +
+	"\bprovider\x18\x02 \x01(\x0e2\".model_express.model.ModelProviderR\bprovider\"Z\n" +
+	"\x13DeleteModelResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1d\n" +
+	"\amessage\x18\x02 \x01(\tH\x00R\amessage\x88\x01\x01B\n" +
+	"\n" +
+	"\b_message\"\x9c\x01\n" +
 	"\x14ModelDownloadRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12>\n" +
@@ -649,11 +764,12 @@ const file_model_proto_rawDesc = "" +
 	"\rModelProvider\x12\x10\n" +
 	"\fHUGGING_FACE\x10\x00\x12\a\n" +
 	"\x03NGC\x10\x01\x12\a\n" +
-	"\x03GCS\x10\x022\xb8\x02\n" +
+	"\x03GCS\x10\x022\x9a\x03\n" +
 	"\fModelService\x12l\n" +
 	"\x15EnsureModelDownloaded\x12).model_express.model.ModelDownloadRequest\x1a&.model_express.model.ModelStatusUpdate0\x01\x12\\\n" +
 	"\x10StreamModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\x1e.model_express.model.FileChunk0\x01\x12\\\n" +
-	"\x0eListModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\".model_express.model.ModelFileListb\x06proto3"
+	"\x0eListModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\".model_express.model.ModelFileList\x12`\n" +
+	"\vDeleteModel\x12'.model_express.model.DeleteModelRequest\x1a(.model_express.model.DeleteModelResponseb\x06proto3"
 
 var (
 	file_model_proto_rawDescOnce sync.Once
@@ -668,36 +784,41 @@ func file_model_proto_rawDescGZIP() []byte {
 }
 
 var file_model_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_model_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_model_proto_goTypes = []any{
 	(ModelStatus)(0),             // 0: model_express.model.ModelStatus
 	(ModelProvider)(0),           // 1: model_express.model.ModelProvider
-	(*ModelDownloadRequest)(nil), // 2: model_express.model.ModelDownloadRequest
-	(*ModelStatusUpdate)(nil),    // 3: model_express.model.ModelStatusUpdate
-	(*ModelFilesRequest)(nil),    // 4: model_express.model.ModelFilesRequest
-	(*ModelFileSelector)(nil),    // 5: model_express.model.ModelFileSelector
-	(*FileChunk)(nil),            // 6: model_express.model.FileChunk
-	(*ModelFileList)(nil),        // 7: model_express.model.ModelFileList
-	(*ModelFileInfo)(nil),        // 8: model_express.model.ModelFileInfo
+	(*DeleteModelRequest)(nil),   // 2: model_express.model.DeleteModelRequest
+	(*DeleteModelResponse)(nil),  // 3: model_express.model.DeleteModelResponse
+	(*ModelDownloadRequest)(nil), // 4: model_express.model.ModelDownloadRequest
+	(*ModelStatusUpdate)(nil),    // 5: model_express.model.ModelStatusUpdate
+	(*ModelFilesRequest)(nil),    // 6: model_express.model.ModelFilesRequest
+	(*ModelFileSelector)(nil),    // 7: model_express.model.ModelFileSelector
+	(*FileChunk)(nil),            // 8: model_express.model.FileChunk
+	(*ModelFileList)(nil),        // 9: model_express.model.ModelFileList
+	(*ModelFileInfo)(nil),        // 10: model_express.model.ModelFileInfo
 }
 var file_model_proto_depIdxs = []int32{
-	1, // 0: model_express.model.ModelDownloadRequest.provider:type_name -> model_express.model.ModelProvider
-	0, // 1: model_express.model.ModelStatusUpdate.status:type_name -> model_express.model.ModelStatus
-	1, // 2: model_express.model.ModelStatusUpdate.provider:type_name -> model_express.model.ModelProvider
-	1, // 3: model_express.model.ModelFilesRequest.provider:type_name -> model_express.model.ModelProvider
-	5, // 4: model_express.model.ModelFilesRequest.file_selector:type_name -> model_express.model.ModelFileSelector
-	8, // 5: model_express.model.ModelFileList.files:type_name -> model_express.model.ModelFileInfo
-	2, // 6: model_express.model.ModelService.EnsureModelDownloaded:input_type -> model_express.model.ModelDownloadRequest
-	4, // 7: model_express.model.ModelService.StreamModelFiles:input_type -> model_express.model.ModelFilesRequest
-	4, // 8: model_express.model.ModelService.ListModelFiles:input_type -> model_express.model.ModelFilesRequest
-	3, // 9: model_express.model.ModelService.EnsureModelDownloaded:output_type -> model_express.model.ModelStatusUpdate
-	6, // 10: model_express.model.ModelService.StreamModelFiles:output_type -> model_express.model.FileChunk
-	7, // 11: model_express.model.ModelService.ListModelFiles:output_type -> model_express.model.ModelFileList
-	9, // [9:12] is the sub-list for method output_type
-	6, // [6:9] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	1,  // 0: model_express.model.DeleteModelRequest.provider:type_name -> model_express.model.ModelProvider
+	1,  // 1: model_express.model.ModelDownloadRequest.provider:type_name -> model_express.model.ModelProvider
+	0,  // 2: model_express.model.ModelStatusUpdate.status:type_name -> model_express.model.ModelStatus
+	1,  // 3: model_express.model.ModelStatusUpdate.provider:type_name -> model_express.model.ModelProvider
+	1,  // 4: model_express.model.ModelFilesRequest.provider:type_name -> model_express.model.ModelProvider
+	7,  // 5: model_express.model.ModelFilesRequest.file_selector:type_name -> model_express.model.ModelFileSelector
+	10, // 6: model_express.model.ModelFileList.files:type_name -> model_express.model.ModelFileInfo
+	4,  // 7: model_express.model.ModelService.EnsureModelDownloaded:input_type -> model_express.model.ModelDownloadRequest
+	6,  // 8: model_express.model.ModelService.StreamModelFiles:input_type -> model_express.model.ModelFilesRequest
+	6,  // 9: model_express.model.ModelService.ListModelFiles:input_type -> model_express.model.ModelFilesRequest
+	2,  // 10: model_express.model.ModelService.DeleteModel:input_type -> model_express.model.DeleteModelRequest
+	5,  // 11: model_express.model.ModelService.EnsureModelDownloaded:output_type -> model_express.model.ModelStatusUpdate
+	8,  // 12: model_express.model.ModelService.StreamModelFiles:output_type -> model_express.model.FileChunk
+	9,  // 13: model_express.model.ModelService.ListModelFiles:output_type -> model_express.model.ModelFileList
+	3,  // 14: model_express.model.ModelService.DeleteModel:output_type -> model_express.model.DeleteModelResponse
+	11, // [11:15] is the sub-list for method output_type
+	7,  // [7:11] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_model_proto_init() }
@@ -706,14 +827,15 @@ func file_model_proto_init() {
 		return
 	}
 	file_model_proto_msgTypes[1].OneofWrappers = []any{}
-	file_model_proto_msgTypes[4].OneofWrappers = []any{}
+	file_model_proto_msgTypes[3].OneofWrappers = []any{}
+	file_model_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_model_proto_rawDesc), len(file_model_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   7,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

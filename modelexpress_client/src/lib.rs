@@ -10,7 +10,8 @@ use modelexpress_common::{
         api::{ApiRequest, api_service_client::ApiServiceClient},
         health::{HealthRequest, health_service_client::HealthServiceClient},
         model::{
-            ModelDownloadRequest, ModelFilesRequest, model_service_client::ModelServiceClient,
+            DeleteModelRequest, ModelDownloadRequest, ModelFilesRequest,
+            ModelProvider as GrpcModelProvider, model_service_client::ModelServiceClient,
         },
     },
     models::{ModelStatus, Status},
@@ -242,6 +243,34 @@ impl Client {
         cache_config.clear_all().map_err(|e| {
             modelexpress_common::Error::Server(format!("Failed to clear cache: {e}")).into()
         })
+    }
+
+    /// Delete a model's record from the server-side registry. This complements
+    /// `clear_cached_model` (which only removes local files) so a cleared model does
+    /// not leave behind a stale `DOWNLOADED` record that would satisfy a later download
+    /// request without re-fetching the files.
+    pub async fn delete_model_on_server(
+        &mut self,
+        model_name: &str,
+        provider: ModelProvider,
+    ) -> CommonResult<()> {
+        let request = tonic::Request::new(DeleteModelRequest {
+            model_name: model_name.to_string(),
+            provider: GrpcModelProvider::from(provider) as i32,
+        });
+
+        let response = self.model_client.delete_model(request).await?;
+        let inner = response.into_inner();
+        if inner.success {
+            Ok(())
+        } else {
+            Err(modelexpress_common::Error::Server(
+                inner
+                    .message
+                    .unwrap_or_else(|| "Failed to delete model from registry".to_string()),
+            )
+            .into())
+        }
     }
 
     pub async fn get_model_path(
@@ -741,7 +770,8 @@ mod tests {
     use modelexpress_common::{
         cache::CacheConfig,
         grpc::model::{
-            FileChunk, ModelDownloadRequest, ModelFileList, ModelFilesRequest, ModelStatusUpdate,
+            DeleteModelRequest, DeleteModelResponse, FileChunk, ModelDownloadRequest,
+            ModelFileList, ModelFilesRequest, ModelStatusUpdate,
             model_service_server::{ModelService, ModelServiceServer},
         },
     };
@@ -794,6 +824,15 @@ mod tests {
                 "list_model_files is not used in this test",
             ))
         }
+
+        async fn delete_model(
+            &self,
+            _request: Request<DeleteModelRequest>,
+        ) -> Result<Response<DeleteModelResponse>, Status> {
+            Err(Status::unimplemented(
+                "delete_model is not used in this test",
+            ))
+        }
     }
 
     #[tonic::async_trait]
@@ -824,6 +863,15 @@ mod tests {
         ) -> Result<Response<ModelFileList>, Status> {
             Err(Status::unimplemented(
                 "list_model_files is not used in this test",
+            ))
+        }
+
+        async fn delete_model(
+            &self,
+            _request: Request<DeleteModelRequest>,
+        ) -> Result<Response<DeleteModelResponse>, Status> {
+            Err(Status::unimplemented(
+                "delete_model is not used in this test",
             ))
         }
     }
@@ -858,6 +906,15 @@ mod tests {
         ) -> Result<Response<ModelFileList>, Status> {
             Err(Status::unimplemented(
                 "list_model_files is not used in this test",
+            ))
+        }
+
+        async fn delete_model(
+            &self,
+            _request: Request<DeleteModelRequest>,
+        ) -> Result<Response<DeleteModelResponse>, Status> {
+            Err(Status::unimplemented(
+                "delete_model is not used in this test",
             ))
         }
     }
@@ -903,6 +960,15 @@ mod tests {
         ) -> Result<Response<ModelFileList>, Status> {
             Err(Status::unimplemented(
                 "list_model_files is not used in this test",
+            ))
+        }
+
+        async fn delete_model(
+            &self,
+            _request: Request<DeleteModelRequest>,
+        ) -> Result<Response<DeleteModelResponse>, Status> {
+            Err(Status::unimplemented(
+                "delete_model is not used in this test",
             ))
         }
     }
@@ -954,6 +1020,15 @@ mod tests {
         ) -> Result<Response<ModelFileList>, Status> {
             Err(Status::unimplemented(
                 "list_model_files is not used in this test",
+            ))
+        }
+
+        async fn delete_model(
+            &self,
+            _request: Request<DeleteModelRequest>,
+        ) -> Result<Response<DeleteModelResponse>, Status> {
+            Err(Status::unimplemented(
+                "delete_model is not used in this test",
             ))
         }
     }
