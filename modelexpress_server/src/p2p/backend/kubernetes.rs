@@ -286,7 +286,8 @@ impl MetadataBackend for KubernetesBackend {
             artifact_source: worker_record
                 .artifact_source
                 .clone()
-                .map(ArtifactSourceStatus::from),
+                .map(ArtifactSourceStatus::try_from)
+                .transpose()?,
         };
 
         let max_retries: u32 = 5;
@@ -435,7 +436,8 @@ impl MetadataBackend for KubernetesBackend {
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
-                    .map(ArtifactSourceMetadataRecord::from),
+                    .map(ArtifactSourceMetadataRecord::try_from)
+                    .transpose()?,
             });
         }
 
@@ -722,24 +724,77 @@ impl MetadataBackend for KubernetesBackend {
     }
 }
 
-impl From<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
-    fn from(record: ArtifactSourceMetadataRecord) -> Self {
-        Self {
+impl TryFrom<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
+    type Error = std::io::Error;
+
+    fn try_from(record: ArtifactSourceMetadataRecord) -> Result<Self, Self::Error> {
+        let total_size = i64::try_from(record.total_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact total_size {} exceeds Kubernetes int64 range",
+                    record.total_size
+                ),
+            )
+        })?;
+
+        Ok(Self {
             artifact_id: record.artifact_id,
-            total_size: record.total_size,
+            total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
-        }
+        })
     }
 }
 
-impl From<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
-    fn from(status: ArtifactSourceStatus) -> Self {
-        Self {
+impl TryFrom<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
+    type Error = std::io::Error;
+
+    fn try_from(status: ArtifactSourceStatus) -> Result<Self, Self::Error> {
+        let total_size = u64::try_from(status.total_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact totalSize {} from Kubernetes is negative",
+                    status.total_size
+                ),
+            )
+        })?;
+
+        Ok(Self {
             artifact_id: status.artifact_id,
-            total_size: status.total_size,
+            total_size,
             file_count: status.file_count,
             chunk_count: status.chunk_count,
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_status_rejects_total_size_above_k8s_int64() {
+        let record = ArtifactSourceMetadataRecord {
+            artifact_id: "artifact".to_string(),
+            total_size: i64::MAX as u64 + 1,
+            file_count: 1,
+            chunk_count: 1,
+        };
+
+        assert!(ArtifactSourceStatus::try_from(record).is_err());
+    }
+
+    #[test]
+    fn artifact_record_rejects_negative_k8s_total_size() {
+        let status = ArtifactSourceStatus {
+            artifact_id: "artifact".to_string(),
+            total_size: -1,
+            file_count: 1,
+            chunk_count: 1,
+        };
+
+        assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
     }
 }

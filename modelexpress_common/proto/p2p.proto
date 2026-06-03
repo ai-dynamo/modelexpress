@@ -136,8 +136,9 @@ message TensorDescriptor {
   string dtype = 5;
 }
 
-// Small discovery summary for file-backed artifact sources. Full file and
-// chunk manifests are served by WorkerService, not stored in Redis or CRDs.
+// Small discovery summary for file-backed artifact sources. This does not carry
+// full file or chunk manifests; artifact manifest and transfer RPCs are future
+// work outside this contract.
 message ArtifactSourceMetadata {
   // Digest of the canonical sealed artifact manifest.
   string artifact_id = 1;
@@ -202,9 +203,9 @@ message WorkerMetadata {
   // NIXL agent name (used by targets to identify the remote agent)
   string agent_name = 7;
 
-  // host:port for the worker's gRPC WorkerService. This is the single
-  // per-worker manifest service endpoint; source_payload does not introduce
-  // a separate artifact endpoint.
+  // host:port for the worker's gRPC WorkerService, used today for tensor
+  // manifests. Artifact source payloads do not define a transfer endpoint in
+  // this contract.
   string worker_grpc_endpoint = 8;
 
   // Source-type-specific bounded metadata. This selects the metadata payload
@@ -221,7 +222,8 @@ message WorkerMetadata {
 // Worker Service (P2P tensor manifest exchange)
 // ============================================================================
 
-// Per-worker gRPC service for direct tensor manifest retrieval.
+// Per-worker gRPC service for direct tensor manifest retrieval. Artifact
+// manifest retrieval is not part of this service yet.
 // Sources start this service when MX_P2P_METADATA=1. Targets call
 // GetTensorManifest to fetch tensor descriptors directly from the
 // source worker instead of from the central metadata server.

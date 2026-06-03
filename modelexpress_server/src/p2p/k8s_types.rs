@@ -129,9 +129,10 @@ pub struct ArtifactSourceStatus {
     #[serde(rename = "artifactId")]
     pub artifact_id: String,
 
-    /// Total artifact bytes across all manifest files.
+    /// Total artifact bytes across all manifest files. Kubernetes OpenAPI
+    /// exposes this as int64; the backend converts to/from the proto uint64.
     #[serde(rename = "totalSize")]
-    pub total_size: u64,
+    pub total_size: i64,
 
     /// Number of files in the sealed artifact manifest.
     #[serde(rename = "fileCount")]
