@@ -347,3 +347,139 @@ async fn get_status_counts_reflects_stored_records() {
 
     flushdb(15);
 }
+
+/// Open a raw async connection for tests that must inspect or seed keys directly,
+/// bypassing the backend's provider-scoped write path.
+async fn raw_conn() -> redis::aio::MultiplexedConnection {
+    redis::Client::open(redis_url().as_str())
+        .expect("open redis client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("async redis connection")
+}
+
+async fn key_exists(key: &str) -> bool {
+    let mut conn = raw_conn().await;
+    redis::cmd("EXISTS")
+        .arg(key)
+        .query_async::<i64>(&mut conn)
+        .await
+        .expect("EXISTS")
+        == 1
+}
+
+/// Seed a pre-0.5.0 legacy name-only record (`mx:model:{name}`) directly, to exercise
+/// lazy migration on claim.
+async fn seed_legacy_record(name: &str, provider: &str, status: &str) {
+    let mut conn = raw_conn().await;
+    let now = "2026-01-01T00:00:00+00:00";
+    let _: () = redis::cmd("HSET")
+        .arg(format!("mx:model:{name}"))
+        .arg("status")
+        .arg(status)
+        .arg("provider")
+        .arg(provider)
+        .arg("created_at")
+        .arg(now)
+        .arg("last_used_at")
+        .arg(now)
+        .query_async(&mut conn)
+        .await
+        .expect("seed legacy record");
+}
+
+/// Regression test for the MX 0.4.0 name-only-key collision: the same model name
+/// requested under two providers must yield two independent records, never a false
+/// cache hit against the record stored under a different provider.
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn cross_provider_claims_do_not_collide() {
+    let backend = fresh_backend().await;
+    let name = unique_name("cross/model");
+
+    let first = backend
+        .try_claim_for_download(&name, ModelProvider::Gcs)
+        .await
+        .expect("gcs claim");
+    assert_eq!(first, ClaimOutcome::Claimed);
+
+    // The SAME name under a different provider must win its OWN fresh claim, not observe
+    // the GCS record as AlreadyExists.
+    let second = backend
+        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .await
+        .expect("hf claim");
+    assert_eq!(
+        second,
+        ClaimOutcome::Claimed,
+        "HuggingFace claim must not collide with the existing GCS record"
+    );
+
+    // Both provider-scoped records exist; no legacy name-only key was written.
+    assert!(key_exists(&format!("mx:model:Gcs:{name}")).await);
+    assert!(key_exists(&format!("mx:model:HuggingFace:{name}")).await);
+    assert!(!key_exists(&format!("mx:model:{name}")).await);
+
+    // delete_model clears every variant.
+    backend.delete_model(&name).await.expect("delete");
+    assert!(!key_exists(&format!("mx:model:Gcs:{name}")).await);
+    assert!(!key_exists(&format!("mx:model:HuggingFace:{name}")).await);
+}
+
+/// A legacy record claimed under its OWN provider is adopted and migrated to the
+/// provider-scoped key (the legacy key is removed).
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn legacy_record_migrates_on_matching_provider_claim() {
+    let backend = fresh_backend().await;
+    let name = unique_name("legacy/match");
+    seed_legacy_record(&name, "Gcs", "DOWNLOADED").await;
+
+    let outcome = backend
+        .try_claim_for_download(&name, ModelProvider::Gcs)
+        .await
+        .expect("gcs claim over legacy");
+    assert_eq!(
+        outcome,
+        ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)
+    );
+
+    // Migrated: lives at the provider-scoped key, legacy key gone, fields preserved.
+    assert!(key_exists(&format!("mx:model:Gcs:{name}")).await);
+    assert!(!key_exists(&format!("mx:model:{name}")).await);
+    let rec = backend
+        .get_model_record(&name)
+        .await
+        .expect("record")
+        .expect("present");
+    assert_eq!(rec.provider, ModelProvider::Gcs);
+    assert_eq!(rec.status, ModelStatus::DOWNLOADED);
+
+    backend.delete_model(&name).await.expect("delete");
+}
+
+/// A legacy record claimed under a DIFFERENT provider must not be adopted: the claim
+/// wins fresh under its own key and the legacy record is left untouched.
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn legacy_record_ignored_on_mismatched_provider_claim() {
+    let backend = fresh_backend().await;
+    let name = unique_name("legacy/mismatch");
+    seed_legacy_record(&name, "Gcs", "DOWNLOADED").await;
+
+    let outcome = backend
+        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .await
+        .expect("hf claim over mismatched legacy");
+    assert_eq!(outcome, ClaimOutcome::Claimed);
+
+    // HF record created; the mismatched GCS legacy record remains.
+    assert!(key_exists(&format!("mx:model:HuggingFace:{name}")).await);
+    assert!(
+        key_exists(&format!("mx:model:{name}")).await,
+        "mismatched-provider legacy record must remain untouched"
+    );
+
+    backend.delete_model(&name).await.expect("delete");
+    assert!(!key_exists(&format!("mx:model:{name}")).await);
+}

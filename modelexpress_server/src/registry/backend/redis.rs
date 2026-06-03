@@ -3,12 +3,17 @@
 
 //! Redis backend for the model registry.
 //!
-//! One Redis Hash per cached model at `mx:model:{model_name}`, with fields `provider`,
-//! `status`, `created_at`, `last_used_at`, and optional `message`. LRU and status tallies
-//! use on-demand `SCAN` + pipelined reads (no secondary indexes).
+//! One Redis Hash per cached model at `mx:model:{provider}:{model_name}`, fields
+//! `provider`, `status`, `created_at`, `last_used_at`, optional `message`. The provider is
+//! in the key so the same name under different providers stays distinct (a `gs://` GCS
+//! object can't satisfy a HuggingFace claim). LRU/status tallies use `SCAN` + pipelined
+//! reads.
 //!
-//! Lua scripts combine claim/retry/set-status mutations into single atomic EVALs so
-//! concurrent readers never see a partially-written record.
+//! Pre-0.5.0 records live at the legacy name-only key `mx:model:{model_name}`; they are
+//! migrated lazily on claim (see [`CLAIM_LUA`]) and read transparently meanwhile.
+//!
+//! Mutations run as single atomic EVALs. Multi-key EVALs (e.g. the claim's RENAME) assume
+//! a single Redis instance (`ConnectionManager`, not a cluster) so all keys share a slot.
 
 use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use async_trait::async_trait;
@@ -33,8 +38,33 @@ mod fields {
     pub const MESSAGE: &str = "message";
 }
 
-fn model_key(model_name: &str) -> String {
+/// Every provider, for enumerating candidate keys in name-addressed lookups.
+const ALL_PROVIDERS: [ModelProvider; 3] = [
+    ModelProvider::HuggingFace,
+    ModelProvider::Ngc,
+    ModelProvider::Gcs,
+];
+
+/// Provider-scoped key: `mx:model:{Provider}:{model_name}`.
+fn model_key(provider: ModelProvider, model_name: &str) -> String {
+    format!("{KEY_PREFIX}{}:{model_name}", provider_str(provider))
+}
+
+/// Legacy name-only key, pre-provider-scoped keys.
+/// TODO(0.5.0 migration): remove once no deployment has pre-0.5.0 keys; see [`CLAIM_LUA`].
+fn legacy_model_key(model_name: &str) -> String {
     format!("{KEY_PREFIX}{model_name}")
+}
+
+/// Keys a record for `model_name` may live under when the provider isn't known up front
+/// (status/eviction/deletion): one per provider plus the legacy key. Fixed fan-out, no SCAN.
+fn candidate_keys(model_name: &str) -> Vec<String> {
+    let mut keys: Vec<String> = ALL_PROVIDERS
+        .iter()
+        .map(|p| model_key(*p, model_name))
+        .collect();
+    keys.push(legacy_model_key(model_name));
+    keys
 }
 
 fn provider_str(p: ModelProvider) -> &'static str {
@@ -157,8 +187,21 @@ impl RedisRegistryBackend {
         Ok(keys)
     }
 
+    /// Model name from a scanned key, for both `mx:model:{Provider}:{name}` and legacy
+    /// `mx:model:{name}`. A leading known-provider token + `:` is the prefix; else the
+    /// whole remainder is the name. Real names never collide (GCS is `gs://`, HF/NGC
+    /// `org/...`), and the provider is read from the hash field regardless.
     fn model_name_from_key(key: &str) -> Option<&str> {
-        key.strip_prefix(KEY_PREFIX)
+        let rest = key.strip_prefix(KEY_PREFIX)?;
+        for p in ALL_PROVIDERS {
+            if let Some(name) = rest
+                .strip_prefix(provider_str(p))
+                .and_then(|r| r.strip_prefix(':'))
+            {
+                return Some(name);
+            }
+        }
+        Some(rest)
     }
 
     fn record_from_hash(
@@ -200,8 +243,14 @@ impl RegistryBackend for RedisRegistryBackend {
 
     async fn get_status(&self, model_name: &str) -> RegistryResult<Option<ModelStatus>> {
         let mut conn = self.get_conn().await?;
-        let value: Option<String> = conn.hget(model_key(model_name), fields::STATUS).await?;
-        match value {
+        // Provider-agnostic: the caller may not know the provider, so HGET every candidate
+        // key in one round-trip and take the first that exists (a name maps to one provider).
+        let mut pipe = redis::pipe();
+        for k in candidate_keys(model_name) {
+            pipe.hget(k, fields::STATUS);
+        }
+        let values: Vec<Option<String>> = pipe.query_async(&mut conn).await?;
+        match values.into_iter().flatten().next() {
             Some(s) => Ok(Some(status_from_str(&s)?)),
             None => Ok(None),
         }
@@ -209,11 +258,19 @@ impl RegistryBackend for RedisRegistryBackend {
 
     async fn get_model_record(&self, model_name: &str) -> RegistryResult<Option<ModelRecord>> {
         let mut conn = self.get_conn().await?;
-        let pairs: Vec<(String, String)> = conn.hgetall(model_key(model_name)).await?;
-        if pairs.is_empty() {
-            return Ok(None);
+        // Provider-agnostic: how eviction discovers the provider from a bare name. First
+        // non-empty hash wins; its `provider` field is authoritative.
+        let mut pipe = redis::pipe();
+        for k in candidate_keys(model_name) {
+            pipe.hgetall(k);
         }
-        Ok(Some(Self::record_from_hash(model_name, pairs)?))
+        let hashes: Vec<Vec<(String, String)>> = pipe.query_async(&mut conn).await?;
+        for pairs in hashes {
+            if !pairs.is_empty() {
+                return Ok(Some(Self::record_from_hash(model_name, pairs)?));
+            }
+        }
+        Ok(None)
     }
 
     async fn set_status(
@@ -225,7 +282,7 @@ impl RegistryBackend for RedisRegistryBackend {
     ) -> RegistryResult<()> {
         let mut conn = self.get_conn().await?;
         let now = Utc::now().to_rfc3339();
-        let key = model_key(model_name);
+        let key = model_key(provider, model_name);
         // A single EVAL so the status/provider/last_used_at/message/created_at updates
         // are atomic: concurrent get_model_record calls see either the pre- or post-
         // update record, never a half-written one (HGETALL never interleaves with the
@@ -250,20 +307,22 @@ impl RegistryBackend for RedisRegistryBackend {
     async fn touch_model(&self, model_name: &str) -> RegistryResult<()> {
         let mut conn = self.get_conn().await?;
         let now = Utc::now().to_rfc3339();
-        // HSET on a missing key would create a malformed record (last_used_at only).
-        // Gate on EXISTS so touch is purely an update, never a create.
-        let key = model_key(model_name);
-        let exists: bool = conn.exists(&key).await?;
-        if !exists {
-            return Ok(());
+        // Provider-agnostic: bump last_used_at on whichever candidate key exists. The EVAL
+        // gates each HSET on EXISTS so touch never creates a (last_used_at-only) record.
+        let keys = candidate_keys(model_name);
+        let script = redis::Script::new(TOUCH_LUA);
+        let mut invocation = script.prepare_invoke();
+        for k in &keys {
+            invocation.key(k);
         }
-        let _: () = conn.hset(&key, fields::LAST_USED_AT, now).await?;
+        let _: i32 = invocation.arg(&now).invoke_async(&mut conn).await?;
         Ok(())
     }
 
     async fn delete_model(&self, model_name: &str) -> RegistryResult<()> {
         let mut conn = self.get_conn().await?;
-        let _: () = conn.del(model_key(model_name)).await?;
+        // Delete every variant (all providers + legacy); DEL ignores absent keys.
+        let _: () = conn.del(candidate_keys(model_name)).await?;
         Ok(())
     }
 
@@ -334,15 +393,15 @@ impl RegistryBackend for RedisRegistryBackend {
         provider: ModelProvider,
     ) -> RegistryResult<ClaimOutcome> {
         let mut conn = self.get_conn().await?;
-        let key = model_key(model_name);
+        let key = model_key(provider, model_name);
+        let legacy = legacy_model_key(model_name);
         let now = Utc::now().to_rfc3339();
-        // Atomic claim + populate: a single EVAL so readers never see a partially-written
-        // record. The script returns a sentinel string — `CLAIM_WON_SENTINEL` if we
-        // created the record, or the existing status string if someone else already
-        // claimed it. This distinction is what lets callers know which replica owns
-        // the download (status alone can't — both claimer and observer see DOWNLOADING).
+        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record, else the
+        // existing status, so callers know which replica owns the download (status alone
+        // can't — both see DOWNLOADING). KEYS[2] is the legacy key for migration (see below).
         let result: String = redis::Script::new(CLAIM_LUA)
             .key(&key)
+            .key(&legacy)
             .arg(CLAIM_WON_SENTINEL)
             .arg(status_str(ModelStatus::DOWNLOADING))
             .arg(provider_str(provider))
@@ -363,7 +422,9 @@ impl RegistryBackend for RedisRegistryBackend {
         provider: ModelProvider,
     ) -> RegistryResult<bool> {
         let mut conn = self.get_conn().await?;
-        let key = model_key(model_name);
+        // Retry only runs after a claim observed AlreadyExists (which already migrated any
+        // legacy record), so the CAS targets the provider-scoped key directly.
+        let key = model_key(provider, model_name);
         let now = Utc::now().to_rfc3339();
         // Atomic CAS: flip status from ERROR to DOWNLOADING. Returns 1 on win, 0 on
         // miss. Only the winner spawns the retry download.
@@ -384,13 +445,26 @@ impl RegistryBackend for RedisRegistryBackend {
 /// it cannot be confused with any real `ModelStatus` string.
 const CLAIM_WON_SENTINEL: &str = "__MX_CLAIM_WON__";
 
-/// Atomic claim: if the hash has no `status` field, populate all fields in one shot and
-/// return the win sentinel; otherwise return the existing `status` unchanged.
+/// Atomic claim against the provider-scoped key, lazily migrating legacy records:
+///   1. provider-scoped key exists -> return its status (normal hit);
+///   2. matching-provider legacy record -> RENAME onto the new key, adopt it. A
+///      different-provider legacy record is left alone and does NOT satisfy the claim
+///      (the fix: a GCS record can't answer a HuggingFace claim);
+///   3. else populate fields, return the win sentinel.
 ///
-/// KEYS[1] = model key, ARGV = [win_sentinel, status, provider, now, message]
+/// TODO(0.5.0 migration): drop the KEYS[2] arm once all deployments have drained legacy keys.
+///
+/// KEYS = [provider-scoped, legacy]; ARGV = [win_sentinel, status, provider, now, message]
 const CLAIM_LUA: &str = r#"
 local existing = redis.call("HGET", KEYS[1], "status")
 if existing then return existing end
+local legacy_status = redis.call("HGET", KEYS[2], "status")
+if legacy_status then
+    if redis.call("HGET", KEYS[2], "provider") == ARGV[3] then
+        redis.call("RENAME", KEYS[2], KEYS[1])
+        return legacy_status
+    end
+end
 redis.call("HSET", KEYS[1],
     "status", ARGV[2],
     "provider", ARGV[3],
@@ -398,6 +472,18 @@ redis.call("HSET", KEYS[1],
     "last_used_at", ARGV[4],
     "message", ARGV[5])
 return ARGV[1]
+"#;
+
+/// Bump `last_used_at` on the first existing candidate key. KEYS = candidate keys,
+/// ARGV[1] = now. Returns 1 if a record was touched, 0 if none existed.
+const TOUCH_LUA: &str = r#"
+for i = 1, #KEYS do
+    if redis.call("EXISTS", KEYS[i]) == 1 then
+        redis.call("HSET", KEYS[i], "last_used_at", ARGV[1])
+        return 1
+    end
+end
+return 0
 "#;
 
 /// Atomic CAS: flip status from `from_status` to `to_status` (also refreshing
@@ -470,12 +556,43 @@ mod tests {
 
     #[test]
     fn model_key_and_parse() {
-        let k = model_key("meta-llama/Llama-3.1-70B");
-        assert_eq!(k, "mx:model:meta-llama/Llama-3.1-70B");
+        // Provider-scoped key round-trips through model_name_from_key.
+        let k = model_key(ModelProvider::HuggingFace, "meta-llama/Llama-3.1-70B");
+        assert_eq!(k, "mx:model:HuggingFace:meta-llama/Llama-3.1-70B");
         assert_eq!(
             RedisRegistryBackend::model_name_from_key(&k),
             Some("meta-llama/Llama-3.1-70B")
         );
+
+        // A GCS gs:// name is not mistaken for the `Gcs` provider segment.
+        let g = model_key(ModelProvider::Gcs, "gs://bucket/org/model/rev");
+        assert_eq!(g, "mx:model:Gcs:gs://bucket/org/model/rev");
+        assert_eq!(
+            RedisRegistryBackend::model_name_from_key(&g),
+            Some("gs://bucket/org/model/rev")
+        );
+
+        // Legacy name-only keys (no provider segment) parse to the whole remainder.
+        let legacy = legacy_model_key("gs://bucket/org/model/rev");
+        assert_eq!(legacy, "mx:model:gs://bucket/org/model/rev");
+        assert_eq!(
+            RedisRegistryBackend::model_name_from_key(&legacy),
+            Some("gs://bucket/org/model/rev")
+        );
+        assert_eq!(
+            RedisRegistryBackend::model_name_from_key("mx:model:meta-llama/Llama-3.1-70B"),
+            Some("meta-llama/Llama-3.1-70B")
+        );
+    }
+
+    #[test]
+    fn candidate_keys_cover_all_providers_and_legacy() {
+        let keys = candidate_keys("org/model");
+        assert_eq!(keys.len(), 4);
+        assert!(keys.contains(&"mx:model:HuggingFace:org/model".to_string()));
+        assert!(keys.contains(&"mx:model:Ngc:org/model".to_string()));
+        assert!(keys.contains(&"mx:model:Gcs:org/model".to_string()));
+        assert!(keys.contains(&"mx:model:org/model".to_string())); // legacy
     }
 
     #[test]
