@@ -468,8 +468,9 @@ func (x *TensorDescriptor) GetDtype() string {
 	return ""
 }
 
-// Small discovery summary for file-backed artifact sources. Full file and
-// chunk manifests are served by WorkerService, not stored in Redis or CRDs.
+// Small discovery summary for file-backed artifact sources. This does not carry
+// full file or chunk manifests; artifact manifest and transfer RPCs are future
+// work outside this contract.
 type ArtifactSourceMetadata struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Digest of the canonical sealed artifact manifest.
@@ -614,9 +615,9 @@ type WorkerMetadata struct {
 	MetadataEndpoint string `protobuf:"bytes,6,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
 	// NIXL agent name (used by targets to identify the remote agent)
 	AgentName string `protobuf:"bytes,7,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
-	// host:port for the worker's gRPC WorkerService. This is the single
-	// per-worker manifest service endpoint; source_payload does not introduce
-	// a separate artifact endpoint.
+	// host:port for the worker's gRPC WorkerService, used today for tensor
+	// manifests. Artifact source payloads do not define a transfer endpoint in
+	// this contract.
 	WorkerGrpcEndpoint string `protobuf:"bytes,8,opt,name=worker_grpc_endpoint,json=workerGrpcEndpoint,proto3" json:"worker_grpc_endpoint,omitempty"`
 	// Source-type-specific bounded metadata. This selects the metadata payload
 	// shape, not a transfer endpoint. Readers should prefer tensor_source over
