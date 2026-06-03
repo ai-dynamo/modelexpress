@@ -24,6 +24,15 @@ from .context import LoadResult
 logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
 
+def _resolve_model_uri(ctx: LoadContext) -> str:
+    """Resolve the model URI used by ModelStreamer across engine configs."""
+    for attr in ("model_weights", "model", "model_path"):
+        value = getattr(ctx.model_config, attr, None)
+        if value:
+            return value
+    return os.environ.get("MX_MODEL_URI", "")
+
+
 class ModelStreamerStrategy(LoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
@@ -59,7 +68,9 @@ class ModelStreamerStrategy(LoadStrategy):
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
-        model_uri = getattr(ctx.model_config, "model_weights", None) or ctx.model_config.model
+        model_uri = _resolve_model_uri(ctx)
+        if not model_uri:
+            raise StrategyFailed("ModelStreamer model URI is not configured", mutated=False)
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:
