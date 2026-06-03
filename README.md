@@ -178,7 +178,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
 | `MX_METADATA_BACKEND` | (required) | `redis` \| `kubernetes` |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (`redis` backend only) |
+| `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 
