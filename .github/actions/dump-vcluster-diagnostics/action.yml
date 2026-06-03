@@ -148,14 +148,20 @@ runs:
             | tail -30 \
             || echo "(no error/warn entries)"
           echo "--- ${POD} syncer (previous, if any — error/warn in last 500 lines) ---"
+          # Per-job + per-pod temp path. ${RUNNER_TEMP} is isolated per
+          # GitHub Actions job; without it, concurrent jobs landing on
+          # the same self-hosted runner host would race on /tmp and
+          # garble each other's diagnostics (test-p2p alone has
+          # max-parallel=3, plus the other test jobs).
+          PREV_LOG="${RUNNER_TEMP:-/tmp}/prev_syncer_${POD}.log"
           if ${KCTL} logs -n "${VCLUSTER_NAMESPACE}" "${POD}" -c syncer --previous --tail=500 \
-               > /tmp/prev_syncer.log 2>/dev/null; then
-            grep -iE '\b(error|warn|panic|fatal)\b' /tmp/prev_syncer.log \
+               > "${PREV_LOG}" 2>/dev/null; then
+            grep -iE '\b(error|warn|panic|fatal)\b' "${PREV_LOG}" \
               | tail -30 \
               || echo "(no error/warn entries in the previous container log)"
           else
             echo "(no previous container log)"
           fi
-          rm -f /tmp/prev_syncer.log
+          rm -f "${PREV_LOG}"
         done
         echo "::endgroup::"
