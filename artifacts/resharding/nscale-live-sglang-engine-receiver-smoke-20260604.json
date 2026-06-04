@@ -1,0 +1,293 @@
+{
+  "engine_class": "Engine",
+  "framework_version": "0.0.0.dev1+g229cadec0",
+  "installed_segments": [
+    {
+      "bytes": 8192,
+      "source_id": "trainer-rank0",
+      "target_key": "sglang:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "tensor_name": "lm_head.weight"
+    },
+    {
+      "bytes": 8192,
+      "source_id": "trainer-rank1",
+      "target_key": "sglang:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "tensor_name": "lm_head.weight"
+    }
+  ],
+  "metrics": {
+    "activation_install_duration_ms": 13.550841948017478,
+    "engine_start_duration_ms": 8766.467156005092,
+    "initial_weight_fetch_duration_ms": 100.5797809921205,
+    "planner_duration_ms": 0.1850019907578826,
+    "request_build_duration_ms": 0.08607201743870974,
+    "restore_duration_ms": 2.1875129314139485,
+    "segment_assembly_duration_ms": 0.07274805102497339,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "lm_head.weight": 2
+    },
+    "target_tensor_bytes": 16384,
+    "trainer_to_inference_bytes": 16384,
+    "validate_weight_fetch_duration_ms": 1.2790559558197856
+  },
+  "mode": "live-sglang-engine-owned-weight-smoke",
+  "model_name": "mx-live-sglang-engine-receiver-smoke",
+  "model_path": "/tmp/mx-sglang-tiny-llama-aygoipla",
+  "model_version": "step-live-sglang-engine-receiver",
+  "module_class": "sglang.Engine",
+  "module_path": "sglang.Engine",
+  "proof": {
+    "actual_nixl_reads_used": false,
+    "allclose": true,
+    "checksum_gate": true,
+    "host_side_torch_cat_used": false,
+    "real_runtime_engine_used": true,
+    "real_trainer_process_used": false,
+    "receiver_installed_into_runtime_owned_tensor": true,
+    "receiver_installed_into_sglang_engine_owned_tensor": true,
+    "receiver_installed_into_sglang_owned_tensor": true,
+    "receiver_request_from_runtime_owned_tensor": true,
+    "receiver_request_from_sglang_engine_weight": true,
+    "receiver_segment_assembly_used": true,
+    "restored_original_tensor": true,
+    "runtime_imported": true,
+    "runtime_owned_target_tensor": true,
+    "sglang_engine_get_weights_by_name_used": true,
+    "sglang_engine_owned_target_tensor": true,
+    "sglang_engine_started": true,
+    "sglang_engine_update_weights_from_tensor_used": true,
+    "sglang_imported": true,
+    "sglang_owned_target_tensor": true,
+    "synthetic_trainer_payloads_used": true,
+    "target_slice_spans_multiple_trainers": true,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false
+  },
+  "request": {
+    "destination_strides": [
+      64,
+      1
+    ],
+    "dtype": "float32",
+    "element_size_bytes": 4,
+    "layout_tags": {
+      "runtime_framework": "sglang",
+      "runtime_lifecycle": "engine-update-weights-refit-smoke",
+      "runtime_module_path": "sglang.Engine",
+      "runtime_tensor_name": "lm_head.weight",
+      "sglang_module_path": "sglang.Engine",
+      "sglang_tensor_name": "lm_head.weight",
+      "storage_layout": "row-major",
+      "target_contiguous": true
+    },
+    "model_name": "mx-live-sglang-engine-receiver-smoke",
+    "model_version": "step-live-sglang-engine-receiver",
+    "quantization_scope": "absent",
+    "requested_range": [
+      [
+        0,
+        64
+      ],
+      [
+        0,
+        64
+      ]
+    ],
+    "runtime_framework": "sglang",
+    "target_id": "sglang:lm_head.weight",
+    "target_offset_bytes": 0,
+    "target_shape": [
+      64,
+      64
+    ],
+    "tensor_name": "lm_head.weight"
+  },
+  "result": "pass",
+  "runtime_framework": "sglang",
+  "schema_version": 1,
+  "segment_plans": [
+    {
+      "bytes": 8192,
+      "lease_version": "trainer-rank0-live-sglang-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank0-live-sglang-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank0",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "target_byte_offset": 0,
+      "target_id": "sglang:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "target_runtime": "sglang",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "bytes": 8192,
+      "lease_version": "trainer-rank1-live-sglang-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank1-live-sglang-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank1",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "target_byte_offset": 8192,
+      "target_id": "sglang:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "target_runtime": "sglang",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "sglang_version": "0.0.0.dev1+g229cadec0",
+  "source_ownerships": [
+    {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": 4,
+      "global_shape": [
+        64,
+        64
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-live-sglang-engine-receiver-smoke",
+      "model_version": "step-live-sglang-engine-receiver",
+      "nixl_descriptor_id": "trainer-rank0-live-sglang-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank0",
+      "source_lease": "trainer-rank0-live-sglang-receiver-smoke",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": 4,
+      "global_shape": [
+        64,
+        64
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-live-sglang-engine-receiver-smoke",
+      "model_version": "step-live-sglang-engine-receiver",
+      "nixl_descriptor_id": "trainer-rank1-live-sglang-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank1",
+      "source_lease": "trainer-rank1-live-sglang-receiver-smoke",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          64
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "target_device": "cpu",
+  "target_dtype": "float32",
+  "target_key": "sglang:lm_head.weight",
+  "target_shape": [
+    64,
+    64
+  ],
+  "target_tensor_name": "lm_head.weight",
+  "validation": {
+    "allclose": true,
+    "assembled_allclose": true,
+    "checksum": -241.0,
+    "checksum_matches": true,
+    "expected_checksum": -241.0,
+    "max_abs_error": 0.0,
+    "original_checksum": 2.6817269325256348,
+    "restore_message": "Success",
+    "restore_success": true,
+    "restored_checksum": 2.6817269325256348,
+    "restored_original": true,
+    "update_message": "Success",
+    "update_success": true
+  }
+}

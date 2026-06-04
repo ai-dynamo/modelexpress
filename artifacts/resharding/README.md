@@ -300,7 +300,19 @@ Files:
   `nscale-sglang-gpu-import-smoke.log`: one-GPU nscale SGLang runtime import
   smoke using the Docker-published SGLang image. The pod scheduled on a GPU
   node, imported SGLang, and saw CUDA with one device. This is runtime
-  availability evidence, not a live SGLang engine-owned refit artifact.
+  availability evidence, superseded for live refit by the Engine smoke below.
+- `nscale-live-sglang-engine-receiver-smoke-20260604.json`, `.log`, and
+  `-placement.log`: completed 1-GPU live SGLang Engine-owned weight smoke.
+  The CLI creates a tiny Llama checkpoint, starts SGLang
+  `0.0.0.dev1+g229cadec0`, uses `Engine.get_weights_by_name` to fetch
+  `lm_head.weight`, builds a receiver-side request, plans two synthetic
+  trainer-held ranges, assembles the replacement from segment payloads,
+  installs it through `Engine.update_weights_from_tensor`, validates
+  checksum/allclose through SGLang, and restores the original weight. The
+  artifact records `real_runtime_engine_used=true`,
+  `sglang_engine_update_weights_from_tensor_used=true`,
+  `actual_nixl_reads_used=false`, and
+  `synthetic_trainer_payloads_used=true`.
 - `nscale-cursor-code-review-availability-vllm-smoke.log`: nscale availability
   check for `cursor-code-review`. The command was not found in the pod PATH or
   searched nscale directories, so review was not run rather than using the local

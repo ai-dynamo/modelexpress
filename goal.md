@@ -278,11 +278,9 @@ The current POC does **not** prove:
 
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Full live vLLM or SGLang process integration with real trainer-owned payloads
-  and the production post-load/refit lifecycle. A tiny live vLLM V1
-  engine-owned tensor smoke is now proven through `LLM.apply_model`, but it
-  still uses synthetic trainer payloads and does not use NIXL. SGLang has
-  receiver-shaped module proof plus CUDA import proof, but no live SGLang
-  engine-owned refit artifact.
+  and the production post-load/refit lifecycle. Tiny live vLLM V1 and
+  SGLang Engine-owned tensor/weight smokes are now proven, but both still
+  use synthetic trainer payloads and do not use NIXL.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -440,7 +438,7 @@ Remaining gap:
 
 ### Level 4: Real Runtime Refit
 
-Status: not implemented; CPU receiver-install smoke implemented.
+Status: not implemented; CPU receiver-install plus tiny live vLLM/SGLang engine smokes implemented.
 
 Goal:
 
@@ -496,13 +494,20 @@ Current partial evidence:
   `nscale-live-vllm-receiver-v0-env-unsupported-block-20260604.log` explain why
   the V1 path uses `LLM.apply_model` instead of parent-process module traversal
   or `VLLM_USE_V1=0`.
-- `modelexpress.refit_sglang_receiver_smoke` wraps the same helper with SGLang
-  runtime metadata. `artifacts/resharding/nscale-sglang-receiver-smoke.json`
-  proves an SGLang-shaped module-owned tensor path: the receiver request is
-  tagged `runtime_framework=sglang`, the target slice spans two synthetic
-  trainer holders, install validates checksum/allclose, and the original tensor
-  is restored. It records `real_runtime_engine_used=false`, so it is not a live
-  SGLang engine-owned refit proof.
+- `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
+  SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
+  `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the
+  module-shaped path with `real_runtime_engine_used=false`.
+  `artifacts/resharding/nscale-live-sglang-engine-receiver-smoke-20260604.json`,
+  `.log`, and `-placement.log` prove a 1-GPU live SGLang Engine path: the
+  CLI creates a tiny Llama checkpoint, starts SGLang
+  `0.0.0.dev1+g229cadec0`, fetches `lm_head.weight` via
+  `Engine.get_weights_by_name`, builds a receiver-side `SliceRequest`, plans
+  two synthetic trainer-held ranges, assembles the replacement from segment
+  payloads, installs it through `Engine.update_weights_from_tensor`, validates
+  checksum/allclose through SGLang, and restores the original weight. This is
+  live SGLang engine-owned weight evidence, not real trainer/NIXL data-plane
+  evidence.
 - SGLang runtime availability is now separately banked.
   `artifacts/resharding/nscale-sglang-runtime-import-probe.json` verifies
   `torch`, `sglang`, and `sglang.srt` import in the nscale SGLang runtime
@@ -578,28 +583,25 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Wire the SGLang wrapper to a real SGLang engine-owned module instead of
-   the current SGLang-shaped module smoke.
-2. Attach the live vLLM receiver-owned tensor path to real trainer-owned/NIXL
-   payloads instead of synthetic trainer payloads.
-3. Promote the receiver tensor install smoke into full live vLLM and SGLang
+1. Attach the live vLLM and SGLang receiver-owned tensor/weight paths to real
+   trainer-owned/NIXL payloads instead of synthetic trainer payloads.
+2. Promote the receiver tensor install smokes into full live vLLM and SGLang
    process integration with each engine's post-load/refit lifecycle, using the
    same source-published ownership and receiver-side request path.
-4. Repeat stale-before-read and hard in-flight source-kill recovery against
+3. Repeat stale-before-read and hard in-flight source-kill recovery against
    real trainer-owned/runtime-owned tensors once live receiver ownership exists.
-5. Scale the vLLM receiver artifact beyond the tiny single-tensor apply-model
-   smoke and add a live SGLang receiver artifact after the cold-load path is
-   stable.
-6. Extend the quantized Qwen fallback from helper-level runtime tensor install
+4. Scale the vLLM and SGLang receiver artifacts beyond tiny single-tensor
+   smokes after the cold-load path is stable.
+5. Extend the quantized Qwen fallback from helper-level runtime tensor install
    to real Qwen FP8 payload bytes and real engine-owned model tensors.
-7. Extend versioned rollback from CPU/runtime-tensor transaction semantics
+6. Extend versioned rollback from CPU/runtime-tensor transaction semantics
    to GPU-resident rollback across multiple training steps.
-8. Add an nscale fanout microbenchmark for rollout replicas using the simulator
+7. Add an nscale fanout microbenchmark for rollout replicas using the simulator
    scenario as the shape contract.
-9. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
+8. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
    schedulable, then generate a passing normalized table only if MX/NIXL,
    NCCL Reshard, and CheckpointEngine rows all have checksum/allclose gates.
-10. After the synthetic table passes, repeat the same schema for real Qwen/full
+9. After the synthetic table passes, repeat the same schema for real Qwen/full
    runtime rows before making any competitive Level-5 claim.
 
 ## Current Claim We Can Safely Make
@@ -622,9 +624,11 @@ Safe claim:
 > CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
 > CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
 > scenario. A tiny live vLLM V1 engine-owned tensor smoke now passes through
-> `LLM.apply_model` with checksum/allclose on `cuda:0`; SGLang has
-> module-shaped receiver install evidence and a separate one-GPU CUDA import
-> smoke, but no live SGLang engine-owned refit claim.
+> `LLM.apply_model` with checksum/allclose on `cuda:0`; a tiny live SGLang
+> Engine-owned weight smoke now passes through `Engine.get_weights_by_name`
+> and `Engine.update_weights_from_tensor` with checksum/allclose and restore.
+> Both runtime smokes still use synthetic trainer payloads and do not prove
+> real trainer/NIXL refit.
 
 Unsafe claim:
 
