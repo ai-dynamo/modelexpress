@@ -1,0 +1,50 @@
+Name:             mx-vllm-probe-1780601186
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           run=mx-vllm-probe-1780601186
+Annotations:      <none>
+Status:           Pending
+IP:
+IPs:              <none>
+Containers:
+  probe:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      bash
+      -lc
+      python3 /tmp/vllm_probe.py
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /tmp/vllm_probe.py from script (rw,path="vllm_probe.py")
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-cwrrv (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False
+Volumes:
+  script:
+    Type:      ConfigMap (a volume populated by a ConfigMap)
+    Name:      mx-vllm-probe-script
+    Optional:  false
+  kube-api-access-cwrrv:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age                  From                Message
+  ----     ------             ----                 ----                -------
+  Warning  FailedScheduling   60s (x5 over 5m19s)  default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  0s (x26 over 5m7s)   cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached

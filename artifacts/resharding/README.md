@@ -250,6 +250,23 @@ Files:
   rejects dtype drift before rollback, and is not GPU-resident rollback proof.
 - `nscale-runtime-refit-versioned-rollback-pytest.log`: focused nscale
   receiver rollback gate (`11 passed`).
+- `nscale-vllm-receiver-smoke-pytest.log`: focused nscale Python gate for the
+  current-branch vLLM receiver-owned tensor smoke helper (`4 passed`). It covers
+  receiver request creation from a module-owned tensor, two-source planning,
+  install into that tensor, checksum/allclose validation, and original tensor
+  restore. This is not a live GPU vLLM artifact.
+- `nscale-vllm-receiver-smoke-capacity-block.json` and
+  `nscale-vllm-receiver-smoke-capacity-block.log`: honest block for the first
+  1-GPU live vLLM receiver smoke probe. The pod stayed Pending with `0/29 nodes`,
+  `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler max
+  node group size reached, so no live vLLM checksum artifact was produced.
+- `nscale-vllm-receiver-smoke-final-verify.log`: final focused nscale gate for
+  this vLLM receiver-smoke change. It records Black checks, focused pytest
+  (`52 passed`), JSON validation, and `git diff --check`.
+- `nscale-cursor-code-review-availability-vllm-smoke.log`: nscale availability
+  check for `cursor-code-review`. The command was not found in the pod PATH or
+  searched nscale directories, so review was not run rather than using the local
+  laptop.
 - Qwen MoE manifest extraction is covered by the Python gate. It classifies
   stacked expert-axis tensors, per-expert tensor-name layouts, global
   quantization metadata, generated-on-target tensors, and layout-sensitive

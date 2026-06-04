@@ -278,7 +278,9 @@ The current POC does **not** prove:
 
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
-  post-load/refit lifecycle.
+  post-load/refit lifecycle. A current-branch vLLM receiver smoke CLI now exists,
+  but the first 1-GPU live-vLLM probe was capacity-blocked and did not produce a
+  live runtime checksum artifact.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -477,6 +479,19 @@ Current partial evidence:
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
+- `modelexpress.refit_vllm_receiver_smoke` now provides a current-branch vLLM
+  receiver-owned tensor smoke CLI. It loads or creates a tiny vLLM-compatible
+  model, locates an in-process vLLM `torch.nn.Module`, builds a receiver-side
+  `SliceRequest` from a live parameter tensor, plans two synthetic trainer-held
+  source ranges, installs planned payloads into that vLLM-owned tensor, validates
+  checksum/allclose, and restores the original tensor. Focused nscale tests:
+  `artifacts/resharding/nscale-vllm-receiver-smoke-pytest.log` (`4 passed`).
+  This is code-path and module-owned tensor evidence, not a live GPU vLLM proof.
+- A 1-GPU live vLLM receiver smoke probe was attempted but capacity-blocked:
+  `artifacts/resharding/nscale-vllm-receiver-smoke-capacity-block.json` and
+  `.log` record `0/29 nodes`, `10 Insufficient nvidia.com/gpu`, `19` untolerated
+  taints, and autoscaler max node group size reached. The live vLLM receiver
+  checksum artifact remains unproven.
 
 ### Level 5: Competitive Benchmark
 
@@ -540,23 +555,26 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Promote the receiver tensor install smoke into live vLLM and SGLang process
-   integration with each engine's post-load/refit lifecycle, using the same
-   source-published ownership and receiver-side request path.
-2. Repeat stale-before-read and hard in-flight source-kill recovery against
+1. Re-run `modelexpress.refit_vllm_receiver_smoke` when a 1-GPU nscale slot is
+   schedulable and bank a live vLLM receiver checksum/allclose artifact, then
+   replicate the same receiver-owned tensor shape against an SGLang image.
+2. Promote the receiver tensor install smoke into full live vLLM and SGLang
+   process integration with each engine's post-load/refit lifecycle, using the
+   same source-published ownership and receiver-side request path.
+3. Repeat stale-before-read and hard in-flight source-kill recovery against
    real trainer-owned/runtime-owned tensors once live receiver ownership exists.
-3. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
+4. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
    the cold-load path is stable.
-4. Extend the quantized Qwen fallback from helper-level runtime tensor install
+5. Extend the quantized Qwen fallback from helper-level runtime tensor install
    to real Qwen FP8 payload bytes and real engine-owned model tensors.
-5. Extend versioned rollback from CPU/runtime-tensor transaction semantics
+6. Extend versioned rollback from CPU/runtime-tensor transaction semantics
    to GPU-resident rollback across multiple training steps.
-6. Add an nscale fanout microbenchmark for rollout replicas using the simulator
+7. Add an nscale fanout microbenchmark for rollout replicas using the simulator
    scenario as the shape contract.
-7. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
+8. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
    schedulable, then generate a passing normalized table only if MX/NIXL,
    NCCL Reshard, and CheckpointEngine rows all have checksum/allclose gates.
-8. After the synthetic table passes, repeat the same schema for real Qwen/full
+9. After the synthetic table passes, repeat the same schema for real Qwen/full
    runtime rows before making any competitive Level-5 claim.
 
 ## Current Claim We Can Safely Make

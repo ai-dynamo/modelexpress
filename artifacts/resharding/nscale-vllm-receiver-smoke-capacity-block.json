@@ -1,0 +1,19 @@
+{
+  "autoscaler_message": "pod didn't trigger scale-up: 1 max node group size reached",
+  "capacity_blocked": true,
+  "claim_scope": "GPU live vLLM receiver smoke not run; code path and unit/module-owned tensor smoke are available for next schedulable 1-GPU slot.",
+  "code_path_added": true,
+  "image": "docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a",
+  "live_vllm_receiver_gpu_smoke_pass": false,
+  "log_artifact": "nscale-vllm-receiver-smoke-capacity-block.log",
+  "mode": "live-vllm-receiver-owned-tensor-smoke-gpu-probe",
+  "namespace": "anish-dynamo",
+  "pod": "mx-vllm-probe-1780601186",
+  "requested_gpus": 1,
+  "result": "blocked",
+  "run_id": "mx-vllm-probe-1780601186",
+  "scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+  "schema_version": 1,
+  "unit_pytest_artifact": "nscale-vllm-receiver-smoke-pytest.log",
+  "unit_pytest_passed": 4
+}
