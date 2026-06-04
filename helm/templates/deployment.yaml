@@ -65,6 +65,22 @@ spec:
             {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 12 }}
             {{- end }}
+            {{- if .Values.security.enabled }}
+            - name: MODEL_EXPRESS_SECURITY_MODE
+              value: {{ .Values.security.mode | quote }}
+            {{- with .Values.security.tokenAudiences }}
+            - name: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.security.allowedServiceAccounts }}
+            - name: MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.security.cacheTtlSecs }}
+            - name: MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
+              value: {{ .Values.security.cacheTtlSecs | quote }}
+            {{- end }}
+            {{- end }}
           {{- if .Values.command }}
           command:
             {{- toYaml .Values.command | nindent 12 }}

@@ -13,11 +13,13 @@ use modelexpress_common::grpc::{
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
 };
 use tonic::transport::Server;
+use tower::Layer;
 use tracing::{error, info};
 
+use crate::auth::{AuthLayer, AuthState};
 use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
-use crate::config::ServerConfig;
+use crate::config::{AuthMode, ServerConfig};
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
@@ -151,20 +153,48 @@ pub async fn run_server(
         }
     };
 
-    // Start the gRPC server
+    let mode = config.security.resolve_mode();
+    let auth_layer = if mode == AuthMode::Off {
+        info!("ServiceAccount auth: disabled");
+        None
+    } else {
+        config
+            .security
+            .validate_resolved(mode)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let client = kube::Client::try_default().await.map_err(|e| {
+            error!("ServiceAccount auth enabled but kube client init failed: {e}");
+            e
+        })?;
+        info!(
+            "ServiceAccount auth: enforce ({} allowed service account(s), {} audience(s))",
+            config.security.allowed_service_accounts.len(),
+            config.security.token_audiences.len()
+        );
+        Some(AuthLayer::new(Arc::new(AuthState::new(
+            client,
+            &config.security,
+        ))))
+    };
+
+    let api = ApiServiceServer::new(api_service);
+    let model = ModelServiceServer::new(model_service);
+    let p2p = P2pServiceServer::new(p2p_service)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+
     info!("Starting gRPC server on: {addr}");
-    let server_result = Server::builder()
+    let router = Server::builder()
         .add_service(health_service_v1)
-        .add_service(HealthServiceServer::new(health_service))
-        .add_service(ApiServiceServer::new(api_service))
-        .add_service(ModelServiceServer::new(model_service))
-        .add_service(
-            P2pServiceServer::new(p2p_service)
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
-        )
-        .serve_with_shutdown(addr, shutdown_signal)
-        .await;
+        .add_service(HealthServiceServer::new(health_service));
+    let router = match &auth_layer {
+        Some(layer) => router
+            .add_service(layer.layer(api))
+            .add_service(layer.layer(model))
+            .add_service(layer.layer(p2p)),
+        None => router.add_service(api).add_service(model).add_service(p2p),
+    };
+    let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
 
     // Wait for background services to complete
     if let Some(handle) = cache_handle
