@@ -309,7 +309,7 @@ Current partial evidence:
   vLLM-shaped and SGLang-shaped runtime tensor install smokes on nscale.
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
-  (`275 passed, 19 skipped`).
+  (`276 passed, 19 skipped`).
 
 ### Level 5: Competitive Benchmark
 
@@ -346,7 +346,7 @@ Current partial evidence:
   predicted bottlenecks.
 - nscale full Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
-  (`275 passed, 19 skipped`).
+  (`276 passed, 19 skipped`).
 
 ## Near-Term Achievable Work
 

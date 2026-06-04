@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from modelexpress import p2p_pb2
 from modelexpress.metadata.source_id import compute_mx_source_id
 from modelexpress.refit_poc import (
@@ -12,6 +14,7 @@ from modelexpress.refit_poc import (
     primary_ownerships,
     refit_source_identity,
 )
+from modelexpress.refit_poc_artifacts import artifact_base, build_planner_artifacts
 from modelexpress.resharding import SliceOwnership, SliceRequest
 from modelexpress.resharding_control_plane import (
     build_refit_source_identity,
@@ -276,6 +279,68 @@ def test_refit_poc_live_mx_plan_context_uses_returned_metadata():
         "trainer-rank1",
         "trainer-rank2-alt",
     }
+
+
+def test_refit_poc_artifacts_use_live_mx_returned_plan_context():
+    client = InMemoryMxClient()
+    identity = refit_source_identity()
+    all_ownerships = [
+        replace(primary_ownerships()[0], source_lease="live-lease-rank0"),
+        primary_ownerships()[1],
+        *alternate_ownerships(),
+    ]
+    source_id = None
+
+    for ownership in all_ownerships:
+        source_id = publish_slice_ownerships(
+            client,
+            identity=identity,
+            ownerships=[ownership],
+            worker_id=ownership.worker_id,
+            worker_rank=ownership.worker_rank,
+        )
+        assert client.update_status(
+            source_id,
+            ownership.worker_id,
+            ownership.worker_rank,
+            p2p_pb2.SOURCE_STATUS_READY,
+        )
+
+    request = inference_request()
+    context = _live_mx_plan_context(
+        request,
+        timeout_seconds=0,
+        mx_client=client,
+    )
+
+    planner_artifacts = build_planner_artifacts(
+        request=request,
+        plan_context=context,
+    )
+    assert planner_artifacts["plan_source"] == "live-mx-server"
+    assert planner_artifacts["control_plane_mode"] == "live-mx"
+    assert planner_artifacts["primary_ownerships"][0]["source_lease"] == (
+        "live-lease-rank0"
+    )
+
+    result = artifact_base(
+        mode="nixl-distributed-4rank",
+        gpu_count=0,
+        copied_bytes=64,
+        copy_duration_ms=0.0,
+        validation={
+            "allclose": True,
+            "checksum": None,
+            "expected_checksum": None,
+            "max_abs_error": 0.0,
+        },
+        request=request,
+        plan_context=context,
+    )
+    assert result["planner"]["plan_source"] == "live-mx-server"
+    assert result["planner"]["primary_ownerships"][0]["source_lease"] == (
+        "live-lease-rank0"
+    )
 
 
 def _published_ready_client():

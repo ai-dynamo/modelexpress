@@ -28,8 +28,8 @@ Files:
   and Qwen/safetensors manifest extraction (`24 passed, 1 skipped`).
 - `nscale-python-full-pytest.log`: full nscale Python 3.12 package test tree
   after the safetensors/Qwen BF16+FP8 manifest, FP8 zero-copy fallback,
-  receiver-install smoke, and competitive simulator changes
-  (`275 passed, 19 skipped`).
+  receiver-install smoke, competitive simulator changes, and resharding/refit
+  POC module split (`276 passed, 19 skipped`).
 - `competitive-refit-simulation.json`: CPU byte/cost simulator artifact for a
   two-step RL rollout shape. It compares MX direct bipartite P2P, MX
   primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
