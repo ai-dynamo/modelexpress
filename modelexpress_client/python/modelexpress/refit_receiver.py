@@ -89,6 +89,14 @@ class MxRefitReceiver:
         self._client: MxClient | None = None
         self._initialized = False
         self._current_step = -1
+        # Persistent scratch buffers for receive_weights_scratch, reused across
+        # refits. Allocating + NIXL-registering fresh buffers every refit is
+        # fragile: leaking the registrations corrupts later transfers (stale
+        # regions over reused memory), and deregistering each refit corrupts the
+        # next one. The trainer's tensor set is stable across versions, so we
+        # allocate + register ONCE and RDMA into the same buffers every time.
+        self._scratch_tensors: dict[str, torch.Tensor] = {}
+        self._scratch_sig: tuple[tuple[str, int], ...] | None = None
 
     @property
     def current_step(self) -> int:
@@ -351,23 +359,42 @@ class MxRefitReceiver:
             if not t.name.startswith("__mx_") and t.size > 0
         ]
 
-        scratch_tensors: dict[str, torch.Tensor] = {}
-        scratch_shapes: dict[str, tuple[int, ...]] = {}
-        for td in source_tensors:
-            dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
-            elem_size = torch.tensor([], dtype=dt).element_size()
-            numel = td.size // elem_size
-            scratch_tensors[td.name] = torch.empty(
-                numel, dtype=dt, device=f"cuda:{self._device_id}"
+        # Reuse persistent scratch buffers when the source tensor set is
+        # unchanged (the common case: same model, same tensors every refit).
+        # Allocate + NIXL-register only on the first refit (or if the layout
+        # changes), so the registration table stays stable and RDMA always
+        # targets the same registered buffers — no per-refit register/free
+        # churn (which silently corrupts later transfers).
+        sig = tuple(sorted((td.name, td.size) for td in source_tensors))
+        if sig != self._scratch_sig:
+            # Layout changed (or first call) — (re)allocate + register once.
+            if self._scratch_tensors:
+                self._nixl.deregister(self._nixl.last_reg_descs)
+            scratch_tensors: dict[str, torch.Tensor] = {}
+            for td in source_tensors:
+                dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
+                elem_size = torch.tensor([], dtype=dt).element_size()
+                numel = td.size // elem_size
+                scratch_tensors[td.name] = torch.empty(
+                    numel, dtype=dt, device=f"cuda:{self._device_id}"
+                )
+            self._nixl.register_tensors(scratch_tensors)
+            self._scratch_tensors = scratch_tensors
+            self._scratch_sig = sig
+            logger.info(
+                f"Allocated + registered {len(scratch_tensors)} persistent "
+                f"scratch buffers "
+                f"({sum(t.numel() * t.element_size() for t in scratch_tensors.values()) / 1e9:.2f} GB)"
             )
-            scratch_shapes[td.name] = (numel,)
-
-        logger.info(
-            f"Allocated {len(scratch_tensors)} scratch buffers "
-            f"({sum(t.numel() * t.element_size() for t in scratch_tensors.values()) / 1e9:.2f} GB)"
-        )
-
-        self._nixl.register_tensors(scratch_tensors)
+        else:
+            # Re-point the NIXL name→tensor map at our persistent buffers in
+            # case another register_tensors call (e.g. tree_scale_out model
+            # params) replaced it since the last refit.
+            self._nixl.rebind_tensors(self._scratch_tensors)
+            logger.info(
+                f"Reusing {len(self._scratch_tensors)} persistent scratch buffers"
+            )
+        scratch_tensors = self._scratch_tensors
 
         transferred, skipped, elapsed = self._nixl.receive_from_source(
             source_metadata=worker.nixl_metadata,

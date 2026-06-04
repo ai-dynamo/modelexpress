@@ -97,6 +97,12 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        # Handle from the most recent register_memory call, kept so callers
+        # (e.g. the scratch refit path) can deregister it after a transfer.
+        self._reg_descs: Any = None
+        # Name of the most recently loaded remote agent, so we can invalidate
+        # its (possibly stale) metadata before re-loading on the next refit.
+        self._last_remote_agent: str | None = None
 
     @property
     def agent_name(self) -> str:
@@ -255,11 +261,15 @@ class NixlTransferManager:
                 (base, size, self._device_id, "")
                 for base, size in allocations
             ]
-            self._agent.register_memory(alloc_tuples, mem_type="cuda", backends=self._backends)
+            self._reg_descs = self._agent.register_memory(
+                alloc_tuples, mem_type="cuda", backends=self._backends
+            )
             reg_count = len(allocations)
         else:
             tensor_list = list(tensors.values())
-            self._agent.register_memory(tensor_list, backends=self._backends)
+            self._reg_descs = self._agent.register_memory(
+                tensor_list, backends=self._backends
+            )
             reg_count = len(tensor_list)
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
@@ -465,7 +475,19 @@ class NixlTransferManager:
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
+            # Invalidate any previously-loaded metadata for the source first.
+            # The trainer re-allocates + re-registers its publish buffers every
+            # version (new addresses), but loadRemoteMD on an already-known
+            # agent name does not refresh the cached descriptors — so without
+            # this the worker keeps RDMA-reading the trainer's stale (freed/
+            # reused) v1 addresses on every later refit.
+            if self._last_remote_agent is not None:
+                try:
+                    self._agent.remove_remote_agent(self._last_remote_agent)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("remove_remote_agent failed: %s", e)
             remote_agent_name = self._agent.add_remote_agent(source_metadata)
+            self._last_remote_agent = remote_agent_name
             add_time = time.perf_counter() - add_start
             logger.info(
                 f"[TIMING] add_remote_agent: {add_time:.3f}s "
@@ -581,6 +603,38 @@ class NixlTransferManager:
         )
 
         return total_bytes, matched_tensors, duration
+
+    @property
+    def last_reg_descs(self) -> Any:
+        """Handle from the most recent register_memory call (for deregister)."""
+        return self._reg_descs
+
+    def rebind_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Re-point the name->tensor map used by receive_from_source WITHOUT
+        re-registering memory with NIXL.
+
+        Used by the persistent-scratch refit path: the buffers stay registered
+        across refits, but ``self._tensors`` (which ``receive_from_source``
+        resolves source names against) may have been overwritten by another
+        ``register_tensors`` call in between. This restores it cheaply.
+        """
+        self._build_tensor_descriptors(tensors)
+
+    def deregister(self, reg_descs: Any) -> None:
+        """Release a prior NIXL memory registration.
+
+        Without this, per-refit scratch registrations accumulate in the NIXL
+        agent (its metadata blob grows every refit). Once the freed scratch
+        memory is reused while stale registrations still cover it, subsequent
+        RDMA transfers mistarget and leave tensors unwritten — silently
+        corrupting refitted weights. See ``MxRefitReceiver.receive_weights_scratch``.
+        """
+        if reg_descs is None or self._agent is None:
+            return
+        try:
+            self._agent.deregister_memory(reg_descs)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("NIXL deregister_memory failed: %s", e)
 
     def is_healthy(self) -> bool:
         """Check if the NIXL agent is initialized and has registered metadata."""

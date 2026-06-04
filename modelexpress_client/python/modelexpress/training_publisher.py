@@ -174,9 +174,14 @@ class MxTrainingPublisher:
         This is the all-at-once variant. For layer-by-layer streaming,
         use :meth:`publish_layer` instead.
 
-        NIXL memory regions are registered only on the first call since
-        parameter tensor addresses stay constant across optimizer steps.
-        Subsequent calls reuse the cached metadata and descriptors.
+        NIXL memory regions are re-registered every call. Callers that publish
+        the model's parameter ``.data`` directly have constant addresses across
+        steps, but callers that publish gathered/materialized tensors (e.g.
+        DTensor ``full_tensor()`` in NeMo-RL) get a FRESH allocation each
+        version — caching the first registration would publish stale/freed
+        addresses and the receiver would RDMA-read garbage from v2 on. The
+        previous registration is deregistered first so the registration table
+        does not grow.
 
         Args:
             named_tensors: Mapping of parameter name to GPU tensor.
@@ -199,13 +204,18 @@ class MxTrainingPublisher:
             )
         self._publish_mode = "weights"
 
-        if not self._registered:
-            self._nixl.register_tensors(named_tensors)
-            self._registered = True
-            logger.info(
-                f"Registered {len(named_tensors)} tensors with NIXL "
-                f"(metadata={len(self._nixl.nixl_metadata)} bytes)"
-            )
+        # Re-register every publish: the published tensors may be fresh
+        # allocations each version (DTensor full_tensor()), so caching the
+        # first registration would freeze the metadata at v1's (later freed)
+        # addresses. Deregister the prior registration first to avoid growth.
+        if self._registered:
+            self._nixl.deregister(self._nixl.last_reg_descs)
+        self._nixl.register_tensors(named_tensors)
+        self._registered = True
+        logger.info(
+            f"Registered {len(named_tensors)} tensors with NIXL "
+            f"(metadata={len(self._nixl.nixl_metadata)} bytes)"
+        )
         metadata = self._nixl.nixl_metadata
         descriptors = self._nixl.tensor_descriptors
 
