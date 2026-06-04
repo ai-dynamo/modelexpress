@@ -15,7 +15,7 @@ def test_post_submit_probe_writes_marker_without_sleep(monkeypatch, tmp_path):
 
     _post_submit_probe(
         trace_label="trainer-rank0",
-        remote_agent_name="remote-rank0",
+        remote_agent_name=b"remote-rank0",
         remote_descs=[(0x1000, 16, 0), (0x2000, 32, 0)],
         local_descs=[(0x3000, 16, 1), (0x4000, 32, 1)],
     )
@@ -23,7 +23,10 @@ def test_post_submit_probe_writes_marker_without_sleep(monkeypatch, tmp_path):
     payload = json.loads(marker.read_text(encoding="utf-8"))
     assert payload["phase"] == "nixl.read_submitted"
     assert payload["trace_label"] == "trainer-rank0"
-    assert payload["remote_agent_name"] == "remote-rank0"
+    assert payload["remote_agent_name"] == {
+        "bytes": len(b"remote-rank0"),
+        "hex_prefix": b"remote-rank0"[:16].hex(),
+    }
     assert payload["remote_desc_count"] == 2
     assert payload["local_desc_count"] == 2
     assert payload["bytes"] == 48

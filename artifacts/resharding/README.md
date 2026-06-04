@@ -143,6 +143,13 @@ Files:
   post-submit marker/sleep hook for a later hard source-pod kill proof
   (`4 passed`). This is harness-readiness evidence only; it records
   `hard_pod_kill_inflight_proven=false`.
+- `nscale-hard-kill-gpu-attempt-json-serialization-block.json` and
+  `nscale-hard-kill-gpu-attempt-json-serialization-block.log`: honest GPU
+  attempt artifact for `hardkillgpu-20260604-185555`. Four GPU pods scheduled
+  across the intended source/target nodes and the target reached NIXL setup,
+  but the run stopped before the kill marker because the post-submit probe
+  tried to JSON-serialize byte-valued remote agent metadata. This is a
+  software-block artifact, not a hard-kill proof.
 - `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
   pytest run inside the nscale target pod after the cross-node patch
   (`8 passed`). It covers the MX refit endpoint helper path, including legacy

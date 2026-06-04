@@ -1,0 +1,22 @@
+{
+  "allclose": false,
+  "blocker": "post-submit probe attempted to JSON-serialize byte-valued remote agent names returned by NIXL add_remote_agent",
+  "checksum_validated": false,
+  "fix_committed_in_next_patch": "make post-submit probe JSON-safe for bytes",
+  "gpu_pods_scheduled": true,
+  "hard_pod_kill_inflight_nixl_read_proven": false,
+  "log_artifact": "nscale-hard-kill-gpu-attempt-json-serialization-block.log",
+  "mode": "nixl-crossnode-hard-kill-gpu-attempt",
+  "mx_endpoints_discovered": true,
+  "nixl_target_agent_constructed": true,
+  "payload_columns": 67108864,
+  "post_submit_marker_seen": false,
+  "read_failure_recovery_used": false,
+  "result": "blocked",
+  "run_id": "hardkillgpu-20260604-185555",
+  "schema_version": 1,
+  "source_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+  "source_pod_force_deleted": false,
+  "target_allocated_bytes": 1073741824,
+  "target_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h"
+}

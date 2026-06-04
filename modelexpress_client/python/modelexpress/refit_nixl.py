@@ -169,7 +169,7 @@ def _env_float(name: str, default: float = 0.0) -> float:
 def _post_submit_probe(
     *,
     trace_label: str,
-    remote_agent_name: str,
+    remote_agent_name: Any,
     remote_descs: list[tuple[int, int, int]],
     local_descs: list[tuple[int, int, int]],
 ) -> None:
@@ -189,7 +189,7 @@ def _post_submit_probe(
     payload = {
         "phase": "nixl.read_submitted",
         "trace_label": trace_label,
-        "remote_agent_name": remote_agent_name,
+        "remote_agent_name": _probe_json_safe(remote_agent_name),
         "remote_desc_count": len(remote_descs),
         "local_desc_count": len(local_descs),
         "bytes": sum(int(desc[1]) for desc in remote_descs),
@@ -205,6 +205,13 @@ def _post_submit_probe(
 
     if sleep_seconds > 0.0:
         time.sleep(sleep_seconds)
+
+
+def _probe_json_safe(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+        return {"bytes": len(data), "hex_prefix": data[:16].hex()}
+    return value
 
 
 def select_cuda_device(local_rank: int) -> tuple[int, bool]:

@@ -233,7 +233,12 @@ Artifacts under `artifacts/resharding/` prove:
   `artifacts/resharding/nscale-hard-kill-harness-support-smoke.json` and
   `artifacts/resharding/nscale-hard-kill-harness-pytest.log` (`4 passed`).
   This is harness readiness only; it is not a hard GPU in-flight pod-kill
-  proof.
+  proof. A first GPU attempt scheduled the source/target pods and reached
+  target NIXL setup, but was blocked before the kill marker by byte-valued
+  NIXL remote agent metadata in the post-submit probe:
+  `artifacts/resharding/nscale-hard-kill-gpu-attempt-json-serialization-block.json`.
+  The probe now serializes byte metadata safely; the actual hard-kill proof
+  still requires a rerun with `read_failure_recovery_used=true`.
 - A competitive refit simulator now compares MX direct bipartite P2P,
   MX primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
   movement, and CheckpointEngine-style full gather/apply. The committed nscale

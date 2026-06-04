@@ -402,5 +402,11 @@
   "hard_kill_harness_pytest_passed": 4,
   "hard_kill_harness_payload_scaling_added": true,
   "hard_kill_harness_post_submit_probe_added": true,
-  "hard_pod_kill_inflight_nixl_read_proven": false
+  "hard_pod_kill_inflight_nixl_read_proven": false,
+  "hard_kill_gpu_attempt_json_serialization_block_artifact": "nscale-hard-kill-gpu-attempt-json-serialization-block.json",
+  "hard_kill_gpu_attempt_json_serialization_block_log": "nscale-hard-kill-gpu-attempt-json-serialization-block.log",
+  "hard_kill_gpu_attempt_pods_scheduled": true,
+  "hard_kill_gpu_attempt_nixl_target_agent_constructed": true,
+  "hard_kill_gpu_attempt_post_submit_marker_seen": false,
+  "hard_kill_probe_byte_metadata_json_safe_added": true
 }

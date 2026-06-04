@@ -1,0 +1,371 @@
+# nscale hard-kill GPU attempt JSON serialization block
+run_id=hardkillgpu-20260604-185555
+timestamp_utc=2026-06-04T18:58:27Z
+
+## pod status
+NAME                                             READY   STATUS    RESTARTS   AGE     IP            NODE                                         NOMINATED NODE   READINESS GATES
+mx-hardkill-src0-hardkillgpu-20260604-185555     1/1     Running   0          2m29s   10.0.12.69    cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-hardkill-src1-hardkillgpu-20260604-185555     1/1     Running   0          2m29s   10.0.12.81    cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-hardkill-src2-hardkillgpu-20260604-185555     1/1     Running   0          2m28s   10.0.12.181   cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-hardkill-target-hardkillgpu-20260604-185555   0/1     Error     0          2m28s   10.0.20.177   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+
+## target log
+Get:1 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:2 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:3 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy InRelease [18.1 kB]
+Get:4 http://archive.ubuntu.com/ubuntu jammy InRelease [270 kB]
+Get:5 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2705 kB]
+Get:6 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy/main amd64 Packages [38.9 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:8 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [77.8 kB]
+Get:9 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [7129 kB]
+Get:10 http://archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:11 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [3974 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy/restricted amd64 Packages [164 kB]
+Get:13 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1299 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [17.5 MB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages [1792 kB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [266 kB]
+Get:17 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1607 kB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [86.4 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [4344 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [7451 kB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [35.6 kB]
+Get:22 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [82.8 kB]
+Fetched 49.2 MB in 2s (28.5 MB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20240203~22.04.1).
+The following additional packages will be installed:
+  git-man liberror-perl
+Suggested packages:
+  gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+  gitk gitweb git-cvs git-mediawiki git-svn
+Recommended packages:
+  less ssh-client
+The following NEW packages will be installed:
+  git git-man liberror-perl
+0 upgraded, 3 newly installed, 0 to remove and 72 not upgraded.
+Need to get 4154 kB of archives.
+After this operation, 21.0 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy/main amd64 liberror-perl all 0.17029-1 [26.5 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git-man all 1:2.34.1-1ubuntu1.17 [954 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git amd64 1:2.34.1-1ubuntu1.17 [3174 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 4154 kB in 0s (23.1 MB/s)
+Selecting previously unselected package liberror-perl.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 23674 files and directories currently installed.)
+Preparing to unpack .../liberror-perl_0.17029-1_all.deb ...
+Unpacking liberror-perl (0.17029-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../git-man_1%3a2.34.1-1ubuntu1.17_all.deb ...
+Unpacking git-man (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package git.
+Preparing to unpack .../git_1%3a2.34.1-1ubuntu1.17_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.17) ...
+Setting up liberror-perl (0.17029-1) ...
+Setting up git-man (1:2.34.1-1ubuntu1.17) ...
+Setting up git (1:2.34.1-1ubuntu1.17) ...
+Cloning into '/workspace/modelexpress'...
+Updating files:   0% (2/316)Updating files:   1% (4/316)Updating files:   2% (7/316)Updating files:   3% (10/316)Updating files:   4% (13/316)Updating files:   5% (16/316)Updating files:   6% (19/316)Updating files:   7% (23/316)Updating files:   8% (26/316)Updating files:   9% (29/316)Updating files:  10% (32/316)Updating files:  11% (35/316)Updating files:  12% (38/316)Updating files:  13% (42/316)Updating files:  14% (45/316)Updating files:  15% (48/316)Updating files:  16% (51/316)Updating files:  17% (54/316)Updating files:  18% (57/316)Updating files:  19% (61/316)Updating files:  20% (64/316)Updating files:  21% (67/316)Updating files:  22% (70/316)Updating files:  23% (73/316)Updating files:  24% (76/316)Updating files:  25% (79/316)Updating files:  26% (83/316)Updating files:  27% (86/316)Updating files:  28% (89/316)Updating files:  29% (92/316)Updating files:  30% (95/316)Updating files:  31% (98/316)Updating files:  32% (102/316)Updating files:  33% (105/316)Updating files:  34% (108/316)Updating files:  35% (111/316)Updating files:  36% (114/316)Updating files:  37% (117/316)Updating files:  38% (121/316)Updating files:  39% (124/316)Updating files:  40% (127/316)Updating files:  41% (130/316)Updating files:  42% (133/316)Updating files:  43% (136/316)Updating files:  44% (140/316)Updating files:  45% (143/316)Updating files:  46% (146/316)Updating files:  47% (149/316)Updating files:  48% (152/316)Updating files:  49% (155/316)Updating files:  50% (158/316)Updating files:  51% (162/316)Updating files:  52% (165/316)Updating files:  53% (168/316)Updating files:  54% (171/316)Updating files:  55% (174/316)Updating files:  56% (177/316)Updating files:  57% (181/316)Updating files:  58% (184/316)Updating files:  59% (187/316)Updating files:  60% (190/316)Updating files:  61% (193/316)Updating files:  62% (196/316)Updating files:  63% (200/316)Updating files:  64% (203/316)Updating files:  65% (206/316)Updating files:  66% (209/316)Updating files:  67% (212/316)Updating files:  68% (215/316)Updating files:  69% (219/316)Updating files:  70% (222/316)Updating files:  71% (225/316)Updating files:  72% (228/316)Updating files:  73% (231/316)Updating files:  74% (234/316)Updating files:  75% (237/316)Updating files:  76% (241/316)Updating files:  77% (244/316)Updating files:  78% (247/316)Updating files:  79% (250/316)Updating files:  80% (253/316)Updating files:  81% (256/316)Updating files:  82% (260/316)Updating files:  83% (263/316)Updating files:  84% (266/316)Updating files:  85% (269/316)Updating files:  86% (272/316)Updating files:  87% (275/316)Updating files:  88% (279/316)Updating files:  89% (282/316)Updating files:  90% (285/316)Updating files:  91% (288/316)Updating files:  92% (291/316)Updating files:  93% (294/316)Updating files:  94% (298/316)Updating files:  95% (301/316)Updating files:  96% (304/316)Updating files:  97% (307/316)Updating files:  98% (310/316)Updating files:  99% (313/316)Updating files: 100% (316/316)Updating files: 100% (316/316), done.
+Note: switching to '03de5771382051bd4e8862af4abe2e149f47c9a1'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 03de577 Add cross-node hard-kill refit harness controls
+[mx-refit-crossnode] {"expected_source_ids": ["trainer-rank0", "trainer-rank1", "trainer-rank2-alt"], "failed_source_ids": [], "phase": "target.wait_for_mx_endpoints.start", "run_id": "hardkillgpu-20260604-185555", "stale_source_ids": []}
+[mx-refit-crossnode] {"metadata_query_duration_ms": 778.0381720513105, "phase": "target.wait_for_mx_endpoints.done", "planner_duration_ms": 0.17649400979280472, "run_id": "hardkillgpu-20260604-185555", "source_ids": ["trainer-rank0", "trainer-rank1", "trainer-rank2-alt"], "source_statuses": {"trainer-rank0": {"status": 2, "status_name": "SOURCE_STATUS_READY", "updated_at": 1780599369090}, "trainer-rank1": {"status": 2, "status_name": "SOURCE_STATUS_READY", "updated_at": 1780599370188}, "trainer-rank2-alt": {"status": 2, "status_name": "SOURCE_STATUS_READY", "updated_at": 1780599370214}}}
+[mx-refit-crossnode] {"phase": "target.allocate_buffer.start", "shape": [4, 67108864]}
+[mx-refit-crossnode] {"device": "cuda:0", "phase": "target.allocate_buffer.done"}
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-target-hardkillgpu-20260604-185555", "phase": "target.nixl_agent.construct.start", "ucx": {"MX_NIXL_BACKEND": "UCX", "MX_RDMA_NIC_PIN": "auto", "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "", "UCX_IB_DEVICES": "", "UCX_MAX_RNDV_RAILS": "", "UCX_NET_DEVICES": "mlx5_5:1", "UCX_RNDV_SCHEME": "get_zcopy", "UCX_RNDV_THRESH": "0", "UCX_TLS": "rc_x,rc,tcp,cuda_copy"}}
+2026-06-04 18:56:11 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-04 18:56:11 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-crossnode-target-hardkillgpu-20260604-185555
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-target-hardkillgpu-20260604-185555", "nixl_backends": ["UCX"], "phase": "target.nixl_agent.construct.done"}
+[mx-refit-crossnode] {"bytes": 1073741824, "phase": "target.register_target.start"}
+[mx-refit-crossnode] {"phase": "target.register_target.done", "registration_duration_ms": 6.242271978408098}
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank0", "metadata_bytes": 440, "phase": "target.add_remote_agent.start", "source_id": "trainer-rank0"}
+[mx-refit-crossnode] {"add_remote_agent_duration_ms": 2.1488929633051157, "phase": "target.add_remote_agent.done", "remote_agent_name": {"bytes": 61, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "source_id": "trainer-rank0"}
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank1", "metadata_bytes": 440, "phase": "target.add_remote_agent.start", "source_id": "trainer-rank1"}
+[mx-refit-crossnode] {"add_remote_agent_duration_ms": 2.0760700572282076, "phase": "target.add_remote_agent.done", "remote_agent_name": {"bytes": 61, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "source_id": "trainer-rank1"}
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank2-alt", "metadata_bytes": 444, "phase": "target.add_remote_agent.start", "source_id": "trainer-rank2-alt"}
+[mx-refit-crossnode] {"add_remote_agent_duration_ms": 2.008696086704731, "phase": "target.add_remote_agent.done", "remote_agent_name": {"bytes": 65, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "source_id": "trainer-rank2-alt"}
+[mx-refit-crossnode] {"phase": "target.read_segments.start", "primary_segment_count": 2, "readable_source_ids": ["trainer-rank0", "trainer-rank1", "trainer-rank2-alt"], "recovery_segment_count": 0}
+[mx-refit-crossnode] {"error": "Object of type bytes is not JSON serializable", "phase": "target.read_segments.primary_source_failed", "segment_count": 1, "source_id": "trainer-rank0"}
+[mx-refit-crossnode] {"error": "Object of type bytes is not JSON serializable", "phase": "target.read_segments.primary_source_failed", "segment_count": 1, "source_id": "trainer-rank1"}
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/modelexpress/modelexpress_client/python/modelexpress/refit_crossnode.py", line 1093, in <module>
+    main()
+  File "/workspace/modelexpress/modelexpress_client/python/modelexpress/refit_crossnode.py", line 1067, in main
+    run_target(
+  File "/workspace/modelexpress/modelexpress_client/python/modelexpress/refit_crossnode.py", line 785, in run_target
+    ) = _read_plans_with_runtime_recovery(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/modelexpress/modelexpress_client/python/modelexpress/refit_crossnode.py", line 370, in _read_plans_with_runtime_recovery
+    runtime_recovery_plans = plan_segments(
+                             ^^^^^^^^^^^^^^
+  File "/workspace/modelexpress/modelexpress_client/python/modelexpress/resharding_planner.py", line 130, in plan_segments
+    raise CoverageError(
+modelexpress.resharding_types.CoverageError: tensor 'model.layers.0.mlp.experts.w1.weight' has 1 missing range(s)
+
+## source rank0 log
+Get:1 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:2 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:3 http://archive.ubuntu.com/ubuntu jammy InRelease [270 kB]
+Get:4 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2705 kB]
+Get:5 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy InRelease [18.1 kB]
+Get:6 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [7129 kB]
+Get:7 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy/main amd64 Packages [38.9 kB]
+Get:8 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1299 kB]
+Get:9 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [3974 kB]
+Get:10 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [77.8 kB]
+Get:11 http://archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:13 http://archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [266 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [17.5 MB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy/restricted amd64 Packages [164 kB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages [1792 kB]
+Get:17 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1607 kB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [7451 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [86.4 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [4344 kB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [82.8 kB]
+Get:22 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [35.6 kB]
+Fetched 49.2 MB in 2s (27.0 MB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20240203~22.04.1).
+The following additional packages will be installed:
+  git-man liberror-perl
+Suggested packages:
+  gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+  gitk gitweb git-cvs git-mediawiki git-svn
+Recommended packages:
+  less ssh-client
+The following NEW packages will be installed:
+  git git-man liberror-perl
+0 upgraded, 3 newly installed, 0 to remove and 72 not upgraded.
+Need to get 4154 kB of archives.
+After this operation, 21.0 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy/main amd64 liberror-perl all 0.17029-1 [26.5 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git-man all 1:2.34.1-1ubuntu1.17 [954 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git amd64 1:2.34.1-1ubuntu1.17 [3174 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 4154 kB in 0s (23.2 MB/s)
+Selecting previously unselected package liberror-perl.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 23674 files and directories currently installed.)
+Preparing to unpack .../liberror-perl_0.17029-1_all.deb ...
+Unpacking liberror-perl (0.17029-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../git-man_1%3a2.34.1-1ubuntu1.17_all.deb ...
+Unpacking git-man (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package git.
+Preparing to unpack .../git_1%3a2.34.1-1ubuntu1.17_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.17) ...
+Setting up liberror-perl (0.17029-1) ...
+Setting up git-man (1:2.34.1-1ubuntu1.17) ...
+Setting up git (1:2.34.1-1ubuntu1.17) ...
+Cloning into '/workspace/modelexpress'...
+Note: switching to '03de5771382051bd4e8862af4abe2e149f47c9a1'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 03de577 Add cross-node hard-kill refit harness controls
+2026-06-04 18:56:08 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-04 18:56:08 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank0
+{"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank0", "cuda_device": 0, "gpu_reuse_used": false, "metrics": {"nixl_metadata_duration_ms": 0.014413031749427319, "nixl_registration_duration_ms": 5.047159967944026, "publish_duration_ms": 38.452243083156645}, "mode": "nixl-crossnode-source", "nixl_backends": ["UCX"], "node_name": "cluster-0967a26d-pool-14bee067-prctr-9c2x7", "payload_columns": 67108864, "pod_name": "mx-hardkill-src0-hardkillgpu-20260604-185555", "result": "source-ready", "role": "source", "run_id": "hardkillgpu-20260604-185555", "schema_version": 1, "single_source_ownership_mode": true, "source_filter": {"source_id": "trainer-rank0", "source_worker_rank": 0}, "source_ownership_count": 1, "source_publications": [{"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank0", "metadata_bytes": 440, "mx_source_id": "8be7185192378118", "publish_duration_ms": 38.452243083156645, "source_id": "trainer-rank0", "tensor_addr": 125446465257472, "tensor_bytes": 805306368, "tensor_device_id": 0, "worker_id": "rank0", "worker_rank": 0}], "ucx": {"MX_NIXL_BACKEND": "UCX", "MX_RDMA_NIC_PIN": "auto", "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "", "UCX_IB_DEVICES": "", "UCX_MAX_RNDV_RAILS": "", "UCX_NET_DEVICES": "mlx5_2:1", "UCX_RNDV_SCHEME": "get_zcopy", "UCX_RNDV_THRESH": "0", "UCX_TLS": "rc_x,rc,tcp,cuda_copy"}}
+
+## source rank1 log
+Get:1 http://archive.ubuntu.com/ubuntu jammy InRelease [270 kB]
+Get:2 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:3 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:4 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy InRelease [18.1 kB]
+Get:5 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy/main amd64 Packages [38.9 kB]
+Get:6 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [3974 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:8 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [7129 kB]
+Get:9 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [77.8 kB]
+Get:10 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1299 kB]
+Get:11 http://archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [266 kB]
+Get:13 http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages [1792 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy/restricted amd64 Packages [164 kB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [17.5 MB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1607 kB]
+Get:17 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [7451 kB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [86.4 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [4344 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [35.6 kB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [82.8 kB]
+Get:22 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2705 kB]
+Fetched 49.2 MB in 2s (25.2 MB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20240203~22.04.1).
+The following additional packages will be installed:
+  git-man liberror-perl
+Suggested packages:
+  gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+  gitk gitweb git-cvs git-mediawiki git-svn
+Recommended packages:
+  less ssh-client
+The following NEW packages will be installed:
+  git git-man liberror-perl
+0 upgraded, 3 newly installed, 0 to remove and 72 not upgraded.
+Need to get 4154 kB of archives.
+After this operation, 21.0 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy/main amd64 liberror-perl all 0.17029-1 [26.5 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git-man all 1:2.34.1-1ubuntu1.17 [954 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git amd64 1:2.34.1-1ubuntu1.17 [3174 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 4154 kB in 0s (24.9 MB/s)
+Selecting previously unselected package liberror-perl.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 23674 files and directories currently installed.)
+Preparing to unpack .../liberror-perl_0.17029-1_all.deb ...
+Unpacking liberror-perl (0.17029-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../git-man_1%3a2.34.1-1ubuntu1.17_all.deb ...
+Unpacking git-man (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package git.
+Preparing to unpack .../git_1%3a2.34.1-1ubuntu1.17_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.17) ...
+Setting up liberror-perl (0.17029-1) ...
+Setting up git-man (1:2.34.1-1ubuntu1.17) ...
+Setting up git (1:2.34.1-1ubuntu1.17) ...
+Cloning into '/workspace/modelexpress'...
+Note: switching to '03de5771382051bd4e8862af4abe2e149f47c9a1'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 03de577 Add cross-node hard-kill refit harness controls
+2026-06-04 18:56:10 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-04 18:56:10 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank1
+{"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank1", "cuda_device": 0, "gpu_reuse_used": false, "metrics": {"nixl_metadata_duration_ms": 0.01372897531837225, "nixl_registration_duration_ms": 5.453565041534603, "publish_duration_ms": 18.038201960735023}, "mode": "nixl-crossnode-source", "nixl_backends": ["UCX"], "node_name": "cluster-0967a26d-pool-14bee067-prctr-9c2x7", "payload_columns": 67108864, "pod_name": "mx-hardkill-src1-hardkillgpu-20260604-185555", "result": "source-ready", "role": "source", "run_id": "hardkillgpu-20260604-185555", "schema_version": 1, "single_source_ownership_mode": true, "source_filter": {"source_id": "trainer-rank1", "source_worker_rank": 1}, "source_ownership_count": 1, "source_publications": [{"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank1", "metadata_bytes": 440, "mx_source_id": "8be7185192378118", "publish_duration_ms": 18.038201960735023, "source_id": "trainer-rank1", "tensor_addr": 124414297374720, "tensor_bytes": 1342177280, "tensor_device_id": 0, "worker_id": "rank1", "worker_rank": 1}], "ucx": {"MX_NIXL_BACKEND": "UCX", "MX_RDMA_NIC_PIN": "auto", "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "", "UCX_IB_DEVICES": "", "UCX_MAX_RNDV_RAILS": "", "UCX_NET_DEVICES": "mlx5_11:1", "UCX_RNDV_SCHEME": "get_zcopy", "UCX_RNDV_THRESH": "0", "UCX_TLS": "rc_x,rc,tcp,cuda_copy"}}
+
+## source rank2-alt log
+Get:1 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:2 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:3 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy InRelease [18.1 kB]
+Get:4 http://archive.ubuntu.com/ubuntu jammy InRelease [270 kB]
+Get:5 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2705 kB]
+Get:6 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy/main amd64 Packages [38.9 kB]
+Get:7 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [77.8 kB]
+Get:8 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [3974 kB]
+Get:9 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1299 kB]
+Get:10 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [7129 kB]
+Get:11 http://archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:13 http://archive.ubuntu.com/ubuntu jammy/restricted amd64 Packages [164 kB]
+Get:14 http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [17.5 MB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages [1792 kB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [266 kB]
+Get:17 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1607 kB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [86.4 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [7451 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [4344 kB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [82.8 kB]
+Get:22 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [35.6 kB]
+Fetched 49.2 MB in 2s (25.6 MB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20240203~22.04.1).
+The following additional packages will be installed:
+  git-man liberror-perl
+Suggested packages:
+  gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+  gitk gitweb git-cvs git-mediawiki git-svn
+Recommended packages:
+  less ssh-client
+The following NEW packages will be installed:
+  git git-man liberror-perl
+0 upgraded, 3 newly installed, 0 to remove and 72 not upgraded.
+Need to get 4154 kB of archives.
+After this operation, 21.0 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy/main amd64 liberror-perl all 0.17029-1 [26.5 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git-man all 1:2.34.1-1ubuntu1.17 [954 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git amd64 1:2.34.1-1ubuntu1.17 [3174 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 4154 kB in 0s (23.2 MB/s)
+Selecting previously unselected package liberror-perl.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 23674 files and directories currently installed.)
+Preparing to unpack .../liberror-perl_0.17029-1_all.deb ...
+Unpacking liberror-perl (0.17029-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../git-man_1%3a2.34.1-1ubuntu1.17_all.deb ...
+Unpacking git-man (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package git.
+Preparing to unpack .../git_1%3a2.34.1-1ubuntu1.17_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.17) ...
+Setting up liberror-perl (0.17029-1) ...
+Setting up git-man (1:2.34.1-1ubuntu1.17) ...
+Setting up git (1:2.34.1-1ubuntu1.17) ...
+Cloning into '/workspace/modelexpress'...
+Note: switching to '03de5771382051bd4e8862af4abe2e149f47c9a1'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 03de577 Add cross-node hard-kill refit harness controls
+2026-06-04 18:56:10 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-04 18:56:10 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank2-alt
+{"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank2-alt", "cuda_device": 0, "gpu_reuse_used": false, "metrics": {"nixl_metadata_duration_ms": 0.03595207817852497, "nixl_registration_duration_ms": 3.071230952627957, "publish_duration_ms": 39.39564700704068}, "mode": "nixl-crossnode-source", "nixl_backends": ["UCX"], "node_name": "cluster-0967a26d-pool-14bee067-prctr-9c2x7", "payload_columns": 67108864, "pod_name": "mx-hardkill-src2-hardkillgpu-20260604-185555", "result": "source-ready", "role": "source", "run_id": "hardkillgpu-20260604-185555", "schema_version": 1, "single_source_ownership_mode": true, "source_filter": {"source_id": "trainer-rank2-alt", "source_worker_rank": 2}, "source_ownership_count": 1, "source_publications": [{"agent_name": "mx-crossnode-source-hardkillgpu-20260604-185555-trainer-rank2-alt", "metadata_bytes": 444, "mx_source_id": "8be7185192378118", "publish_duration_ms": 39.39564700704068, "source_id": "trainer-rank2-alt", "tensor_addr": 139703542087680, "tensor_bytes": 805306368, "tensor_device_id": 0, "worker_id": "rank2", "worker_rank": 2}], "ucx": {"MX_NIXL_BACKEND": "UCX", "MX_RDMA_NIC_PIN": "auto", "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "", "UCX_IB_DEVICES": "", "UCX_MAX_RNDV_RAILS": "", "UCX_NET_DEVICES": "mlx5_5:1", "UCX_RNDV_SCHEME": "get_zcopy", "UCX_RNDV_THRESH": "0", "UCX_TLS": "rc_x,rc,tcp,cuda_copy"}}
