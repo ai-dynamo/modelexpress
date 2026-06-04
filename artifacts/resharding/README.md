@@ -156,6 +156,20 @@ Files:
   normalized Level-5 timing table. Comparable checksum-backed MX/NIXL, NCCL
   Reshard, and CheckpointEngine timings were not run in that pass because the
   required multi-GPU nscale capacity was unavailable.
+- `nscale-level5-normalizer-pytest.log`: focused nscale Python gate for the
+  checksum-gated Level-5 timing normalizer and existing refit control-plane
+  paths (`18 passed`).
+- `nscale-level5-same-node-synthetic-table-missing-baselines.json`: normalized
+  synthetic same-node Level-5 table generated from the existing same-node
+  MX/NIXL checksum-backed artifact. The MX row passes, the NCCL Reshard and
+  CheckpointEngine rows are explicitly unmeasured, and the table result is
+  correctly `fail`.
+- `nscale-level5-baseline-capacity-block.json` and
+  `nscale-level5-baseline-capacity-block.log`: honest block for the new
+  synthetic same-node NCCL Reshard and CheckpointEngine baseline runners. The
+  4-GPU pod stayed Pending with `0/29 nodes`,
+  `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler
+  max node group size reached.
 - `nscale-level5-existing-job-evidence-audit.json`: audit of existing nscale
   timing jobs that looked close to Level-5 evidence. It banks real Qwen3 BF16
   full-model/vLLM timing context for MX live refit, NCCL, and
@@ -185,5 +199,6 @@ live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
 artifacts, with the one-pod-per-source-rank and stale-source recovery target JSONs as
 the strictest cross-node claims. The NCCL distributed JSON remains the Level 1 comparison
 artifact. Existing Qwen3 timing jobs are now banked as partial competitive
-context, but real Level-5 timing remains unproven until comparable
-checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine runs are completed.
+context. The Level-5 normalizer/baseline harness now exists, but real Level-5
+timing remains unproven until comparable checksum-backed MX/NIXL, NCCL
+Reshard, and CheckpointEngine rows are completed in the same placement scope.
