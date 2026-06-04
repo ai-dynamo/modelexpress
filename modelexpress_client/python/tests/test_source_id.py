@@ -59,6 +59,41 @@ def test_different_revision_gives_different_id():
     assert compute_mx_source_id(_base_identity()) != compute_mx_source_id(pinned)
 
 
+def test_empty_artifact_fields_preserve_existing_id():
+    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
+
+
+def test_artifact_compatibility_fields_affect_id():
+    artifact = _base_identity()
+    artifact.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    artifact.backend_framework_version = "0.10.0"
+    artifact.torch_version = "2.8.0+cu128"
+    artifact.cuda_version = "12.8"
+    artifact.triton_version = "3.4.0"
+    artifact.gpu_arch = "SM90"
+    artifact.compile_config_digest = "abc123"
+
+    different_torch = p2p_pb2.SourceIdentity()
+    different_torch.CopyFrom(artifact)
+    different_torch.torch_version = "2.9.0+cu128"
+
+    assert compute_mx_source_id(artifact) != compute_mx_source_id(different_torch)
+
+
+def test_artifact_compatibility_fields_are_case_insensitive():
+    upper = _base_identity()
+    upper.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    upper.backend_framework_version = "VLLM-0.10.0"
+    upper.gpu_arch = "SM90"
+
+    lower = _base_identity()
+    lower.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    lower.backend_framework_version = "vllm-0.10.0"
+    lower.gpu_arch = "sm90"
+
+    assert compute_mx_source_id(upper) == compute_mx_source_id(lower)
+
+
 def test_extra_parameters_sorted():
     a = _base_identity()
     a.extra_parameters["z_key"] = "val"

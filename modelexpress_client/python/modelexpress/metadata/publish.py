@@ -14,6 +14,7 @@ import grpc
 import torch
 
 from .heartbeat import HeartbeatThread
+from .payload import tensor_source_metadata
 from ..client import MxClient
 from .. import p2p_pb2
 
@@ -177,7 +178,7 @@ def publish_metadata_and_ready(
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
-            tensors=tensor_protos,
+            tensor_source=tensor_source_metadata(tensor_protos),
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,
