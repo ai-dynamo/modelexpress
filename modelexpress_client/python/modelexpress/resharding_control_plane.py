@@ -19,6 +19,8 @@ from .resharding import (
 )
 from .types import TensorDescriptor
 
+_REFIT_OWNERSHIP_SIDECAR_PREFIX = "mx-refit-ownership-v1:"
+
 
 @dataclass(frozen=True)
 class RefitNixlEndpoint:
@@ -342,6 +344,10 @@ def publish_refit_nixl_endpoint(
         if worker_rank is not None
         else int(ownership.worker_rank or 0)
     )
+    encoded_metadata_endpoint = _encode_refit_ownership_sidecar(
+        ownership=ownership,
+        metadata_endpoint=metadata_endpoint,
+    )
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=resolved_worker_rank,
         nixl_metadata=bytes(nixl_metadata),
@@ -349,7 +355,7 @@ def publish_refit_nixl_endpoint(
         slice_ownerships=[slice_ownership_to_proto(ownership)],
         status=status,
         agent_name=agent_name,
-        metadata_endpoint=metadata_endpoint,
+        metadata_endpoint=encoded_metadata_endpoint,
         worker_grpc_endpoint=worker_grpc_endpoint,
     )
     return mx_client.publish_metadata(identity, worker, resolved_worker_id)
@@ -407,8 +413,16 @@ def list_refit_nixl_endpoints(
             continue
         tensors_by_name = {tensor.name: tensor for tensor in tensors}
 
-        for ownership_desc in worker.slice_ownerships:
-            ownership = slice_ownership_from_proto(ownership_desc)
+        ownerships = [
+            slice_ownership_from_proto(ownership_desc)
+            for ownership_desc in worker.slice_ownerships
+        ]
+        sidecar = _decode_refit_ownership_sidecar(worker.metadata_endpoint)
+        if not ownerships and sidecar is not None:
+            ownerships = [sidecar[0]]
+
+        metadata_endpoint = sidecar[1] if sidecar is not None else worker.metadata_endpoint
+        for ownership in ownerships:
             tensor = tensors_by_name.get(ownership.tensor_name)
             if tensor is None and len(tensors) == 1:
                 tensor = tensors[0]
@@ -423,7 +437,7 @@ def list_refit_nixl_endpoints(
                     tensor=tensor,
                     agent_name=worker.agent_name,
                     nixl_metadata=bytes(worker.nixl_metadata),
-                    metadata_endpoint=worker.metadata_endpoint,
+                    metadata_endpoint=metadata_endpoint,
                     worker_grpc_endpoint=worker.worker_grpc_endpoint,
                 )
             )
@@ -481,6 +495,47 @@ def _range_to_proto(tensor_range: Iterable[tuple[int, int]]):
 
 def _range_from_proto(ranges) -> tuple[tuple[int, int], ...]:
     return tuple((int(axis.start), int(axis.end)) for axis in ranges)
+
+
+def _encode_refit_ownership_sidecar(
+    *,
+    ownership: SliceOwnership,
+    metadata_endpoint: str,
+) -> str:
+    """Encode ownership in a legacy field for older MX server deployments.
+
+    The current schema stores ownership in ``WorkerMetadata.slice_ownerships``.
+    Some live server images can accept the new client proto but drop that field
+    while preserving older string fields. The sidecar keeps cross-node POCs
+    honest without replacing the primary schema path.
+    """
+
+    if metadata_endpoint:
+        return metadata_endpoint
+
+    payload = {
+        "metadata_endpoint": metadata_endpoint,
+        "ownership": ownership.to_dict(),
+    }
+    return _REFIT_OWNERSHIP_SIDECAR_PREFIX + json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _decode_refit_ownership_sidecar(
+    metadata_endpoint: str,
+) -> tuple[SliceOwnership, str] | None:
+    if not metadata_endpoint.startswith(_REFIT_OWNERSHIP_SIDECAR_PREFIX):
+        return None
+    payload = json.loads(
+        metadata_endpoint[len(_REFIT_OWNERSHIP_SIDECAR_PREFIX) :]
+    )
+    return (
+        SliceOwnership.from_dict(payload["ownership"]),
+        str(payload.get("metadata_endpoint", "")),
+    )
 
 
 def _layout_tags_to_proto(layout_tags: dict[str, object]) -> dict[str, str]:

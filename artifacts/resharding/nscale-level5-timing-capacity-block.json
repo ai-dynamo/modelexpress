@@ -1,0 +1,23 @@
+{
+  "artifact": "nscale-one-pod-per-source-capacity-block.log",
+  "baselines_measured": false,
+  "checkpoint_engine_timing_measured": false,
+  "cross_node_claim_made": false,
+  "mx_nixl_timing_measured": false,
+  "nccl_reshard_timing_measured": false,
+  "probe": "level5-real-timing-table",
+  "reason": "Required multi-GPU nscale capacity was unavailable during the one-pod-per-source probe.",
+  "reported_metrics": {
+    "checksum": false,
+    "install_duration_ms": false,
+    "planner_duration_ms": false,
+    "publish_duration_ms": false,
+    "read_duration_ms": false,
+    "redundant_byte_factor": false,
+    "registration_duration_ms": false,
+    "trainer_to_inference_bytes": false
+  },
+  "result": "blocked",
+  "scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+  "scale_up_message": "pod didn't trigger scale-up: 1 max node group size reached"
+}

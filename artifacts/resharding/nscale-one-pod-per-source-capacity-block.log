@@ -1,0 +1,200 @@
+# One-pod-per-source-rank cross-node capacity probe
+Thu Jun  4 15:43:46 UTC 2026
+
+NAME                  READY   STATUS    RESTARTS   AGE   IP       NODE     NOMINATED NODE   READINESS GATES
+mx-rankpod-cap-src0   0/1     Pending   0          47s   <none>   <none>   <none>           <none>
+mx-rankpod-cap-src1   0/1     Pending   0          46s   <none>   <none>   <none>           <none>
+mx-rankpod-cap-src2   0/1     Pending   0          46s   <none>   <none>   <none>           <none>
+
+Name:             mx-rankpod-cap-src0
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           app=mx-rankpod-capacity
+                  rank=0
+                  role=source
+Annotations:      <none>
+Status:           Pending
+IP:               
+IPs:              <none>
+Containers:
+  mx:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      bash
+      -lc
+      sleep 600
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-t2h9q (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False 
+Volumes:
+  kube-api-access-t2h9q:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age   From                Message
+  ----     ------             ----  ----                -------
+  Warning  FailedScheduling   50s   default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  41s   cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached
+
+
+Name:             mx-rankpod-cap-src1
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           app=mx-rankpod-capacity
+                  rank=1
+                  role=source
+Annotations:      <none>
+Status:           Pending
+IP:               
+IPs:              <none>
+Containers:
+  mx:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      bash
+      -lc
+      sleep 600
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-gxrzd (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False 
+Volumes:
+  kube-api-access-gxrzd:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age   From                Message
+  ----     ------             ----  ----                -------
+  Warning  FailedScheduling   49s   default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  41s   cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached
+
+
+Name:             mx-rankpod-cap-src2
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           app=mx-rankpod-capacity
+                  rank=2
+                  role=source
+Annotations:      <none>
+Status:           Pending
+IP:               
+IPs:              <none>
+Containers:
+  mx:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      bash
+      -lc
+      sleep 600
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-7fxtd (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False 
+Volumes:
+  kube-api-access-7fxtd:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age   From                Message
+  ----     ------             ----  ----                -------
+  Warning  FailedScheduling   50s   default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  42s   cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached
+
+LAST SEEN   TYPE      REASON              OBJECT                                    MESSAGE
+47m         Normal    Killing             pod/mx-reshard-live-nixl-endpoint-proof   Stopping container mx
+47m         Normal    Killing             pod/mx-reshard-server-builder             Stopping container mx-reshard-server-builder
+47m         Normal    Killing             pod/mx-reshard-live-nixl-endpoint-proof   Stopping container redis
+47m         Normal    Killing             pod/mx-reshard-cpu-endpoint-test          Stopping container mx-reshard-cpu-endpoint-test
+43m         Normal    Scheduled           pod/mx-crossnode-probe-a                  Successfully assigned anish-dynamo/mx-crossnode-probe-a to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+43m         Normal    Scheduled           pod/mx-crossnode-probe-b                  Successfully assigned anish-dynamo/mx-crossnode-probe-b to cluster-0967a26d-pool-14bee067-prctr-bw4bt
+43m         Normal    Pulled              pod/mx-crossnode-probe-b                  Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f" already present on machine
+43m         Normal    Created             pod/mx-crossnode-probe-b                  Created container: mx
+43m         Normal    Pulled              pod/mx-crossnode-probe-a                  Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f" already present on machine
+43m         Normal    Created             pod/mx-crossnode-probe-a                  Created container: mx
+43m         Normal    Started             pod/mx-crossnode-probe-a                  Started container mx
+43m         Normal    Started             pod/mx-crossnode-probe-b                  Started container mx
+31m         Normal    Scheduled           pod/mx-crossnode-refit-source             Successfully assigned anish-dynamo/mx-crossnode-refit-source to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+31m         Normal    Created             pod/mx-crossnode-refit-source             Created container: mx
+31m         Normal    Started             pod/mx-crossnode-refit-source             Started container mx
+31m         Normal    Pulled              pod/mx-crossnode-refit-source             Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f" already present on machine
+31m         Normal    Scheduled           pod/mx-crossnode-refit-target             Successfully assigned anish-dynamo/mx-crossnode-refit-target to cluster-0967a26d-pool-14bee067-prctr-bw4bt
+31m         Normal    Started             pod/mx-crossnode-refit-target             Started container mx
+31m         Normal    Pulled              pod/mx-crossnode-refit-target             Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f" already present on machine
+31m         Normal    Created             pod/mx-crossnode-refit-target             Created container: mx
+23m         Normal    Scheduled           pod/mx-crossnode-refit-target             Successfully assigned anish-dynamo/mx-crossnode-refit-target to cluster-0967a26d-pool-14bee067-prctr-w4xnn
+23m         Normal    Pulled              pod/mx-crossnode-refit-target             Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f" already present on machine
+23m         Normal    Created             pod/mx-crossnode-refit-target             Created container: mx
+23m         Normal    Started             pod/mx-crossnode-refit-target             Started container mx
+16m         Warning   FailedKillPod       pod/mx-crossnode-probe-b                  error killing pod: [failed to "KillContainer" for "mx" with KillContainerError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded", failed to "KillPodSandbox" for "1a9448ba-fad4-470f-8d5e-5f39caf32a59" with KillPodSandboxError: "rpc error: code = DeadlineExceeded desc = stream terminated by RST_STREAM with error code: CANCEL"]
+9m45s       Warning   FailedKillPod       pod/mx-crossnode-refit-target             error killing pod: [failed to "KillContainer" for "mx" with KillContainerError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded", failed to "KillPodSandbox" for "5c9a9ee5-93b1-43bf-9b51-106f02f0ac04" with KillPodSandboxError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded"]
+8m18s       Warning   FailedKillPod       pod/mx-crossnode-probe-b                  error killing pod: [failed to "KillContainer" for "mx" with KillContainerError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded", failed to "KillPodSandbox" for "1a9448ba-fad4-470f-8d5e-5f39caf32a59" with KillPodSandboxError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded"]
+7m25s       Normal    Killing             pod/mx-crossnode-refit-target             Stopping container mx
+7m25s       Normal    Killing             pod/mx-crossnode-refit-source             Stopping container mx
+2m58s       Normal    NotTriggerScaleUp   pod/mx-rankpod-src0                       pod didn't trigger scale-up: 1 max node group size reached
+2m58s       Normal    NotTriggerScaleUp   pod/mx-rankpod-src2                       pod didn't trigger scale-up: 1 max node group size reached
+2m58s       Normal    NotTriggerScaleUp   pod/mx-rankpod-src1                       pod didn't trigger scale-up: 1 max node group size reached
+2m36s       Warning   FailedScheduling    pod/mx-rankpod-src2                       0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+2m36s       Warning   FailedScheduling    pod/mx-rankpod-src0                       0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+2m36s       Warning   FailedScheduling    pod/mx-rankpod-src1                       0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+100s        Warning   FailedKillPod       pod/mx-crossnode-refit-target             error killing pod: [failed to "KillContainer" for "mx" with KillContainerError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded", failed to "KillPodSandbox" for "5c9a9ee5-93b1-43bf-9b51-106f02f0ac04" with KillPodSandboxError: "rpc error: code = DeadlineExceeded desc = stream terminated by RST_STREAM with error code: CANCEL"]
+99s         Normal    Killing             pod/mx-crossnode-refit-target             Stopping container mx
+43s         Normal    NotTriggerScaleUp   pod/mx-rankpod-cap-src2                   pod didn't trigger scale-up: 1 max node group size reached
+43s         Normal    NotTriggerScaleUp   pod/mx-rankpod-cap-src1                   pod didn't trigger scale-up: 1 max node group size reached
+43s         Normal    NotTriggerScaleUp   pod/mx-rankpod-cap-src0                   pod didn't trigger scale-up: 1 max node group size reached
+13s         Warning   FailedKillPod       pod/mx-crossnode-probe-b                  error killing pod: [failed to "KillContainer" for "mx" with KillContainerError: "rpc error: code = DeadlineExceeded desc = stream terminated by RST_STREAM with error code: CANCEL", failed to "KillPodSandbox" for "1a9448ba-fad4-470f-8d5e-5f39caf32a59" with KillPodSandboxError: "rpc error: code = DeadlineExceeded desc = context deadline exceeded"]
+12s         Normal    Killing             pod/mx-crossnode-probe-b                  Stopping container mx
+1s          Warning   FailedScheduling    pod/mx-rankpod-cap-src2                   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+1s          Warning   FailedScheduling    pod/mx-rankpod-cap-src1                   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+1s          Warning   FailedScheduling    pod/mx-rankpod-cap-src0                   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.

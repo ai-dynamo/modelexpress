@@ -66,7 +66,12 @@ The first control-plane integration step lives in
 `modelexpress.resharding_control_plane` and the P2P metadata proto. It adds
 slice ownership descriptors to `WorkerMetadata`, preserves them through central
 server records and K8s-service manifest retrieval, and lets targets plan from
-metadata returned by MX-client-shaped APIs. The live central-server lifecycle is
+metadata returned by MX-client-shaped APIs. Refit endpoint publication also
+dual-writes ownership into a prefixed legacy string sidecar so targets can
+recover ownership from older live MX server images that preserve tensor/NIXL
+fields but drop the newer `slice_ownerships` proto field. The sidecar is only a
+compatibility bridge; the production schema remains `slice_ownerships`.
+The live central-server lifecycle is
 covered by the nscale Redis-backed smoke in
 `artifacts/resharding/nscale-live-control-plane.log`. The NIXL POC now has a
 `--control-plane live-mx` path that publishes source-rank ownerships through MX
@@ -83,6 +88,21 @@ and compressed server log in
 `artifacts/resharding/nscale-live-mx-nixl-endpoint-server.log.gz`. The earlier
 capacity-blocked attempt remains recorded in
 `artifacts/resharding/nscale-live-mx-nixl-capacity.log`.
+
+The current cross-node proof is
+`artifacts/resharding/nscale-crossnode-mx-nixl-refit.json`, with source
+publication evidence in `artifacts/resharding/nscale-crossnode-mx-nixl-source.json`,
+UCX/NIXL debug output in `artifacts/resharding/nscale-crossnode-mx-nixl-refit.log`,
+and placement evidence in
+`artifacts/resharding/nscale-crossnode-mx-nixl-capacity.log`. It runs two pods
+on two GPU nodes: `mx-crossnode-refit-source` on
+`cluster-0967a26d-pool-14bee067-prctr-g2j7h` and
+`mx-crossnode-refit-target` on
+`cluster-0967a26d-pool-14bee067-prctr-w4xnn`. The target discovers source
+NIXL endpoint metadata from MX, constructs a target NIXL agent, adds the remote
+source agent, forms UCX rc lanes over `mlx5_3:1` with
+`UCX_TLS=rc_x,rc,tcp,cuda_copy`, excludes bonded NICs, performs planned
+one-sided READs into the target buffer, and validates allclose/checksum.
 
 Qwen-style MoE manifest classification lives in
 `modelexpress.resharding_manifest`. It emits tensor family,
@@ -159,15 +179,26 @@ drives the NIXL data plane in a completed GPU run. The stronger endpoint proof
 is `nscale-live-mx-nixl-endpoint-refit.json`: source NIXL agent metadata and
 remote CUDA tensor descriptors are discovered through MX worker metadata, and
 the artifact records `torch_distributed_nixl_metadata_exchange_used=false`.
-Multi-pod cross-node refit and real runtime-owned refit are still future gates.
+The current cross-node proof is `nscale-crossnode-mx-nixl-refit.json`: source
+and target pods run on distinct GPU nodes and the target validates UCX/IB rc
+NIXL segment reads from MX-discovered endpoints. Independent source-pod fan-in
+and real runtime-owned refit are still future gates. The first nscale attempt
+to schedule independent source-rank pods is recorded as a capacity block in
+`nscale-one-pod-per-source-capacity-block.log` and
+`nscale-one-pod-per-source-capacity-block.json`; it does not create a
+one-pod-per-source checksum claim.
 The Level 3 control-plane evidence is in `nscale-control-plane-pytest.log`,
 `nscale-refit-endpoint-control-plane-pytest.log`, `docker-rust-p2p-tests.log`,
 `nscale-live-control-plane.log`, `nscale-live-mx-nixl-refit.log`,
 `nscale-live-mx-nixl-server.log`, and
-`nscale-live-mx-nixl-endpoint-server.log.gz`. Qwen BF16/FP8
+`nscale-live-mx-nixl-endpoint-server.log.gz`, plus the cross-node source,
+target, and placement logs. Qwen BF16/FP8
 safetensors-header extraction, real FP8 zero-copy fallback, and receiver-side
 runtime tensor install smokes are covered by `nscale-python-full-pytest.log`.
 The partial Level 5 simulator evidence is `competitive-refit-simulation.json`.
+The real Level 5 timing table against MX/NIXL, NCCL Reshard, and
+CheckpointEngine remains unmeasured; the current capacity block is recorded in
+`nscale-level5-timing-capacity-block.json`.
 
 ## Metrics
 

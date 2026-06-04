@@ -128,6 +128,33 @@ Artifacts under `artifacts/resharding/` prove:
   `torch_distributed_nixl_metadata_exchange_used=false`, three MX-discovered
   source endpoints, actual one-sided NIXL reads, allclose/checksum validation,
   and no GPU reuse.
+- A two-pod cross-node B200 live-MX NIXL endpoint run proves the same refit path
+  can cross GPU nodes over UCX/IB rc:
+  `artifacts/resharding/nscale-crossnode-mx-nixl-refit.json`. Source endpoint
+  metadata was published by `mx-crossnode-refit-source` on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`; the target ran in
+  `mx-crossnode-refit-target` on
+  `cluster-0967a26d-pool-14bee067-prctr-w4xnn`. The target discovered three
+  source endpoints from MX, used `UCX_TLS=rc_x,rc,tcp,cuda_copy`, pinned
+  `UCX_NET_DEVICES=mlx5_3:1`, excluded `mlx5_bond_0`, performed actual NIXL
+  READs for 64 bytes across two source holders, and validated
+  `allclose=true` with checksum `556224.0`.
+- The live nscale server image used for that cross-node run drops the newer
+  `slice_ownerships` proto field even though tensor/NIXL fields survive. The
+  source now dual-writes ownership into the new proto field and a prefixed
+  legacy string sidecar so older MX server deployments can still return
+  ownership for endpoint planning. This is a compatibility bridge, not a
+  replacement for the production schema.
+- A one-pod-per-source-rank cross-node proof was capacity-probed but not run:
+  `artifacts/resharding/nscale-one-pod-per-source-capacity-block.log` and
+  `.json` record three independent source-rank GPU pods Pending with
+  `0/29 nodes are available`, `10 Insufficient nvidia.com/gpu`, and
+  autoscaler max node group size reached. No target pod was created and no
+  one-pod-per-source-rank checksum claim is made.
+- A Level-5 real timing table was also not run in this pass:
+  `artifacts/resharding/nscale-level5-timing-capacity-block.json` records that
+  MX/NIXL, NCCL Reshard, and CheckpointEngine measured baselines remain
+  unmeasured because the required multi-GPU nscale capacity was unavailable.
 - A Qwen-style MoE manifest extractor now classifies expert-axis tensors,
   layout-sensitive shared-expert tensors, global quantization metadata, and
   generated-on-target tensors from tensor names/shapes.
@@ -166,12 +193,12 @@ Artifacts under `artifacts/resharding/` prove:
   requested slice once across the trainer/inference boundary and is preferred
   under the declared assumptions.
 
-This is a **Level 3 same-node synthetic proof**, not a production refit
+This is a **Level 3 cross-node synthetic proof**, not a production refit
 implementation. Level 3 control-plane metadata lifecycle support is proven
 through a live central MX server smoke, and live MX-returned ownership plus
-source endpoint metadata now drives a completed same-node NIXL GPU data-plane
-run. Multi-pod, cross-node, and real runtime-owned trainer/inference refit are
-still unproven.
+source endpoint metadata now drives completed same-node and two-pod cross-node
+NIXL GPU data-plane runs. Real runtime-owned trainer/inference refit is still
+unproven.
 
 ## What Is Not Proven Yet
 
@@ -180,7 +207,7 @@ The current POC does **not** prove:
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
   post-load/refit lifecycle.
-- Multi-pod cross-node refit.
+- One-pod-per-source-rank cross-node refit with independent source pod churn.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
 - Runtime fallback installation of real quantized Qwen tensors after
@@ -189,6 +216,7 @@ The current POC does **not** prove:
 - Versioned rollback using multiple GPU-resident training steps.
 - Performance competitiveness against NCCL Reshard, CheckpointEngine, Mooncake,
   or TorchStore-style systems beyond the committed CPU byte/cost simulator.
+- A measured Level-5 timing table against NCCL Reshard and CheckpointEngine.
 
 ## Proof Levels
 
@@ -230,8 +258,8 @@ Limit:
 
 ### Level 2: Real NIXL Segment Reads
 
-Status: implemented for same-node cross-GPU synthetic refit; cross-node remains
-pending.
+Status: implemented for same-node cross-GPU synthetic refit and a two-pod
+cross-node synthetic refit over UCX/IB rc.
 
 Goal:
 
@@ -245,14 +273,16 @@ Acceptance evidence:
 
 - nscale same-node cross-GPU artifact:
   `artifacts/resharding/nscale-nixl-distributed-refit.json`.
+- nscale two-pod cross-node artifact:
+  `artifacts/resharding/nscale-crossnode-mx-nixl-refit.json`.
 - Captures NIXL registration duration, metadata blob size/identity,
   `add_remote_agent`, prep duration, raw read duration, and checksum.
-- Cross-node/multi-pod remains the next Level 2 extension.
+- Independent source-pod fan-in remains the next Level 2 extension.
 
 ### Level 3: MX Control Plane Integration
 
-Status: implemented for same-node synthetic live-MX NIXL refit; production
-runtime and multi-pod integration remain pending.
+Status: implemented for same-node and two-pod cross-node synthetic live-MX NIXL
+refit; production runtime integration remains pending.
 
 Goal:
 
@@ -296,6 +326,13 @@ Current evidence:
 - Endpoint control-plane nscale tests:
   `artifacts/resharding/nscale-refit-endpoint-control-plane-pytest.log`
   (`7 passed`).
+- Two-pod cross-node MX endpoint NIXL proof:
+  `artifacts/resharding/nscale-crossnode-mx-nixl-refit.json`.
+- Cross-node source artifact and UCX debug log:
+  `artifacts/resharding/nscale-crossnode-mx-nixl-source.json` and
+  `artifacts/resharding/nscale-crossnode-mx-nixl-refit.log`.
+- Cross-node placement/capacity log:
+  `artifacts/resharding/nscale-crossnode-mx-nixl-capacity.log`.
 - Earlier capacity-blocked attempt, superseded by the completed run:
   `artifacts/resharding/nscale-live-mx-nixl-capacity.log`.
 - Qwen MoE manifest extractor in `modelexpress.resharding_manifest`.
@@ -308,11 +345,13 @@ Current evidence:
 
 Remaining gap:
 
-- Run the live-MX NIXL path across multiple pods/nodes with distinct source,
-  target, and alternate-holder processes. The same-node proof now carries
-  source NIXL endpoints through MX, but process placement is still one torchrun
-  job with Gloo synchronization. Then repeat the proof against real
-  trainer-owned and runtime-owned tensors.
+- Split the source holders into independent source pods/processes so primary
+  and alternate holders can churn independently. The current cross-node proof
+  uses one source pod on node A publishing all source endpoint records and one
+  target pod on node B. The first nscale attempt to schedule three independent
+  source-rank GPU pods was blocked by current GPU capacity:
+  `artifacts/resharding/nscale-one-pod-per-source-capacity-block.log`. Then
+  repeat the proof against real trainer-owned and runtime-owned tensors.
 
 ### Level 4: Real Runtime Refit
 
@@ -344,7 +383,8 @@ Current partial evidence:
 ### Level 5: Competitive Benchmark
 
 Status: partially implemented; CPU competitive simulator implemented, real
-timing benchmark not implemented.
+timing benchmark not implemented. The first nscale timing attempt is blocked by
+multi-GPU capacity, not by a successful benchmark result.
 
 Goal:
 
@@ -377,13 +417,15 @@ Current partial evidence:
 - nscale full Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
+- Capacity block artifact for the real measured timing table:
+  `artifacts/resharding/nscale-level5-timing-capacity-block.json`.
 
 ## Near-Term Achievable Work
 
 These are the next useful things to do, in order:
 
-1. Add a multi-pod nscale test: two source pods, one target pod, one alternate
-   source pod.
+1. Add a multi-source-pod nscale test: two source pods, one target pod, one
+   alternate source pod, with independent source-pod failure/recovery.
 2. Promote the receiver tensor install smoke into live vLLM and SGLang process
    integration with each engine's post-load/refit lifecycle.
 3. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
@@ -401,17 +443,19 @@ Safe claim:
 
 > MX now has a planner and synthetic GPU POC showing that source-published slice
 > ownership plus receiver-side slice requests can drive multi-source GPU
-> assembly, same-node NIXL one-sided segment reads, and segment-level recovery
-> without trainer full all-gather. The same slice ownership metadata now
+> assembly, same-node and two-pod cross-node NIXL one-sided segment reads, and
+> segment-level recovery without trainer full all-gather. The same slice
+> ownership metadata now
 > round-trips through a live Redis-backed central MX server on nscale and has
 > driven a completed 4-B200 live-MX NIXL refit POC where the target plans from
 > MX-returned metadata and gets source NIXL endpoint handles from MX worker
-> metadata rather than torch object gather. The metadata side also covers real
-> Qwen3 MoE and Qwen3 FP8 safetensors headers, including real global-required
-> quantization metadata, plus CPU runtime-shaped vLLM/SGLang target tensor
-> install smokes. A CPU competitive simulator now records MX direct, MX fanout,
-> NCCL Reshard, and CheckpointEngine-style byte/cost comparisons for a two-step
-> RL rollout scenario.
+> metadata rather than torch object gather. The cross-node run uses two pods on
+> two GPU nodes over UCX/IB rc and validates checksum/allclose. The metadata
+> side also covers real Qwen3 MoE and Qwen3 FP8 safetensors headers, including
+> real global-required quantization metadata, plus CPU runtime-shaped
+> vLLM/SGLang target tensor install smokes. A CPU competitive simulator now
+> records MX direct, MX fanout, NCCL Reshard, and CheckpointEngine-style
+> byte/cost comparisons for a two-step RL rollout scenario.
 
 Unsafe claim:
 

@@ -301,6 +301,42 @@ def test_publish_and_plan_refit_nixl_endpoints_from_mx_metadata():
     assert endpoints_by_source_id["trainer-rank1"].tensor.device_id == 1
 
 
+def test_refit_nixl_endpoint_recovers_ownership_from_legacy_sidecar():
+    client = InMemoryMxClient()
+    identity = _identity()
+    ownership = _ownerships()[0]
+
+    source_id = publish_refit_nixl_endpoint(
+        client,
+        identity=identity,
+        ownership=ownership,
+        tensor=TensorDescriptor(
+            name=ownership.tensor_name,
+            addr=0xD00D,
+            size=128,
+            device_id=0,
+            dtype=ownership.dtype,
+        ),
+        agent_name="mx-refit-rank0",
+        nixl_metadata=b"nixl-metadata-0",
+        worker_id=ownership.worker_id,
+        worker_rank=ownership.worker_rank,
+    )
+
+    worker = client._workers[(source_id, ownership.worker_id)]["worker"]
+    assert worker.metadata_endpoint.startswith("mx-refit-ownership-v1:")
+    del worker.slice_ownerships[:]
+
+    endpoints = list_refit_nixl_endpoints(client, identity=identity)
+
+    assert len(endpoints) == 1
+    endpoint = endpoints[0]
+    assert endpoint.ownership == ownership
+    assert endpoint.source_id == "trainer-rank0"
+    assert endpoint.metadata_endpoint == ""
+    assert endpoint.nixl_metadata == b"nixl-metadata-0"
+
+
 def test_refit_poc_live_mx_plan_context_uses_returned_metadata():
     client = InMemoryMxClient()
     identity = refit_source_identity()

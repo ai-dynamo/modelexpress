@@ -1,0 +1,905 @@
+I0604 15:32:47.584387    1281 nixl_log.cpp:79] NIXL version: 0.10.1 (git: d5c127e5)
+2026-06-04 15:32:47 NIXL INFO    logging.py:82 Log level set to DEBUG from NIXL_LOG_LEVEL environment variable
+[mx-refit-crossnode] {"expected_source_ids": ["trainer-rank0", "trainer-rank1", "trainer-rank2-alt"], "phase": "target.wait_for_mx_endpoints.start", "run_id": "mx-crossnode-1780587009"}
+[mx-refit-crossnode] {"metadata_query_duration_ms": 30.89727694168687, "phase": "target.wait_for_mx_endpoints.done", "planner_duration_ms": 0.17054704949259758, "run_id": "mx-crossnode-1780587009", "source_ids": ["trainer-rank0", "trainer-rank1", "trainer-rank2-alt"]}
+[mx-refit-crossnode] {"phase": "target.allocate_buffer.start", "shape": [4, 4]}
+[mx-refit-crossnode] {"device": "cuda:0", "phase": "target.allocate_buffer.done"}
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-target-mx-crossnode-1780587009", "phase": "target.nixl_agent.construct.start", "ucx": {"MX_NIXL_BACKEND": "UCX", "MX_RDMA_NIC_PIN": "auto", "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "", "UCX_IB_DEVICES": "", "UCX_MAX_RNDV_RAILS": "1", "UCX_NET_DEVICES": "mlx5_3:1", "UCX_RNDV_SCHEME": "get_zcopy", "UCX_RNDV_THRESH": "0", "UCX_TLS": "rc_x,rc,tcp,cuda_copy"}}
+I0604 15:32:48.132863    1281 nixl_agent.cpp:118] NIXL ETCD is disabled
+I0604 15:32:48.132901    1281 nixl_plugin_manager.cpp:303] Loading plugins from: /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins
+I0604 15:32:48.138689    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: OBJ
+I0604 15:32:48.139883    1281 nixl_plugin_manager.cpp:245] Failed to load plugin from /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/libplugin_GPUNETIO.so: /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libmlx5-79ef1d27.so.1.24.48.0: version `MLX5_1.25' not found (required by /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libdoca_common-d1bdeaea.so.3.2.0118)
+I0604 15:32:48.139898    1281 nixl_plugin_manager.cpp:398] Failed to load plugin 'GPUNETIO' from any directory
+I0604 15:32:48.140187    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: POSIX
+I0604 15:32:48.141911    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: AZURE_BLOB
+I0604 15:32:48.142471    1281 nixl_plugin_manager.cpp:472] Discovered and loaded telemetry plugin: prometheus
+I0604 15:32:48.142601    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: GDS
+I0604 15:32:48.186053    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: UCX
+I0604 15:32:48.186472    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: GUSLI
+I0604 15:32:48.186835    1281 nixl_plugin_manager.cpp:245] Failed to load plugin from /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/libplugin_LIBFABRIC.so: libfabric.so.1: cannot open shared object file: No such file or directory
+I0604 15:32:48.186844    1281 nixl_plugin_manager.cpp:398] Failed to load plugin 'LIBFABRIC' from any directory
+I0604 15:32:48.187050    1281 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: GDS_MT
+I0604 15:32:48.187062    1281 nixl_plugin_manager.cpp:614] Loading static plugin: BUFFER
+[1780587168.185963] [mx-crossnode-refit-target:1281 :0]             cpu.c:338  UCX  DEBUG measured tsc frequency 2291.525 MHz after 0.22 ms
+[1780587168.185986] [mx-crossnode-refit-target:1281 :0]            init.c:120  UCX  DEBUG /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libucs-2be8eb38.so.0.0.0 loaded at 0x772eb18bc000
+[1780587168.186000] [mx-crossnode-refit-target:1281 :0]            init.c:122  UCX  DEBUG cmd line: python3 -m modelexpress.refit_crossnode --role target --run-id mx-crossnode-1780587009 --artifact /workspace/crossnode-target.json --timeout-seconds 120 --source-pod mx-crossnode-refit-source --source-node cluster-0967a26d-pool-14bee067-prctr-g2j7h --target-pod mx-crossnode-refit-target --target-node cluster-0967a26d-pool-14bee067-prctr-w4xnn 
+[1780587168.186008] [mx-crossnode-refit-target:1281 :0]          module.c:72   UCX  DEBUG ucs library path: /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libucs-2be8eb38.so.0.0.0
+[1780587168.186010] [mx-crossnode-refit-target:1281 :0]          module.c:304  UCX  DEBUG loading modules for ucs
+[1780587168.187156] [mx-crossnode-refit-target:1281 :0]            time.c:22   UCX  DEBUG arch clock frequency: 2291525114.16 Hz
+[1780587168.187187] [mx-crossnode-refit-target:1281 :0]          module.c:304  UCX  DEBUG loading modules for uct
+[1780587168.187190] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'cuda' with mode 0x1
+[1780587168.187350] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_cuda.so.0.0.0 [0x3de87780]
+[1780587168.187355] [mx-crossnode-refit-target:1281 :0]          module.c:200  UCX  DEBUG calling 'ucs_module_global_init' in '/usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_cuda.so.0.0.0': [0x772eb175c790]
+[1780587168.187358] [mx-crossnode-refit-target:1281 :0]          module.c:304  UCX  DEBUG loading modules for uct_cuda
+[1780587168.187359] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'gdrcopy' with mode 0x1
+[1780587168.187669] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_cuda_gdrcopy.so.0.0.0 [0x3de89fa0]
+[1780587168.187672] [mx-crossnode-refit-target:1281 :0]          module.c:162  UCX  DEBUG ignoring 'ucs_module_global_init' (0x772eb175c790) from libuct_cuda.so.0.0.0 (0x772eb1752000), expected in libuct_cuda_gdrcopy.so.0.0.0 (772eb2207000)
+[1780587168.187674] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'ib' with mode 0x1
+[1780587168.188227] [mx-crossnode-refit-target:1281 :0]          module.c:304  UCX  DEBUG loading modules for uct_ib
+[1780587168.188229] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'mlx5' with mode 0x1
+[1780587168.188533] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_ib_mlx5.so.0.0.0 [0x3de89730]
+[1780587168.188539] [mx-crossnode-refit-target:1281 :0]          module.c:200  UCX  DEBUG calling 'ucs_module_global_init' in '/usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_ib_mlx5.so.0.0.0': [0x772eb1681ef0]
+[1780587168.188542] [mx-crossnode-refit-target:1281 :0]          module.c:304  UCX  DEBUG loading modules for uct_ib_mlx5
+[1780587168.188544] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'gda' with mode 0x1
+[1780587168.188765] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_ib_mlx5_gda.so.0.0.0 [0x3deb0670]
+[1780587168.188771] [mx-crossnode-refit-target:1281 :0]          module.c:162  UCX  DEBUG ignoring 'ucs_module_global_init' (0x772eb1681ef0) from libuct_ib_mlx5.so.0.0.0 (0x772eb166d000), expected in libuctI0604 15:32:48.189659    1281 config.cpp:45] Modified UCX config: ADDRESS_VERSION=v2
+I0604 15:32:48.189672    1281 config.cpp:30] UCX env var has already been set: RNDV_THRESH=0
+I0604 15:32:48.189693    1281 config.cpp:45] Modified UCX config: MAX_RMA_RAILS=2
+I0604 15:32:48.189792    1281 config.cpp:45] Modified UCX config: IB_PCI_RELAXED_ORDERING=try
+I0604 15:32:48.189809    1281 config.cpp:45] Modified UCX config: RCACHE_MAX_UNRELEASED=1024
+I0604 15:32:48.190182    1281 config.cpp:42] Failed to modify UCX config: RC_GDA_NUM_CHANNELS=4: Invalid parameter
+I0604 15:32:48.190200    1281 config.cpp:45] Modified UCX config: MAX_COMPONENT_MDS=32
+_ib_mlx5_gda.so.0.0.0 (772eb165e000)
+[1780587168.188784] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'efa' with mode 0x1
+[1780587168.189265] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_ib_efa.so.0.0.0 [0x3deae640]
+[1780587168.189274] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_ib.so.0.0.0 [0x3de8add0]
+[1780587168.189275] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'rdmacm' with mode 0x1
+[1780587168.189499] [mx-crossnode-refit-target:1281 :0]          module.c:278  UCX  DEBUG dlopen('/usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/ucx/libuct_rdmacm.so.0.0.0', mode=0x1) failed: librdmacm.so.1: cannot open shared object file: No such file or directory
+[1780587168.189510] [mx-crossnode-refit-target:1281 :0]          module.c:278  UCX  DEBUG dlopen('/usr/lib64/ucx/libuct_rdmacm.so.0.0.0', mode=0x1) failed: /usr/lib64/ucx/libuct_rdmacm.so.0.0.0: cannot open shared object file: No such file or directory
+[1780587168.189511] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'cma' with mode 0x1
+[1780587168.189619] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libuct_cma.so.0.0.0 [0x3de86940]
+[1780587168.190181] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:909  UCX  DEBUG 'RC_GDA_NUM_CHANNELS' configuration is invalid
+[1780587168.190212] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2463 UCX  INFO  Version 1.20.0 (loaded from /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libucp-826465bc.so.0.0.0)
+[1780587168.190215] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2199 UCX  DEBUG estimated number of endpoints is 1
+[1780587168.190216] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2206 UCX  DEBUG estimated number of endpoints per node is 1
+[1780587168.190217] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2213 UCX  DEBUG node local id is 0
+[1780587168.190220] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2223 UCX  DEBUG estimated bcopy bandwidth is 7340032000.000000
+[1780587168.190226] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2288 UCX  DEBUG allocation method[0] is md 'sysv'
+[1780587168.190227] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2288 UCX  DEBUG allocation method[1] is md 'posix'
+[1780587168.190228] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2300 UCX  DEBUG allocation method[2] is 'thp'
+[1780587168.190228] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2288 UCX  DEBUG allocation method[3] is md '*'
+[1780587168.190229] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2300 UCX  DEBUG allocation method[4] is 'mmap'
+[1780587168.190230] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2300 UCX  DEBUG allocation method[5] is 'heap'
+[1780587168.190272] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 0 for bus id 4b:00.0
+[1780587168.190289] [mx-crossnode-refit-target:1281 :0]     gdr_copy_md.c:290  UCX  DEBUG could not open gdr copy. disabling gdr copy resource
+[1780587168.278884] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md self because it has no selected transport resources
+[1780587168.279102] [mx-crossnode-refit-target:1281 :0]            topo.c:1290 UCX  DEBUG /sys/class/net/eth0: sysfs path undetected
+[1780587168.279105] [mx-crossnode-refit-target:1281 :0]            topo.c:714  UCX  DEBUG eth0: system device unknown
+[1780587168.279163] [mx-crossnode-refit-target:1281 :0]            topo.c:1290 UCX  DEBUG /sys/class/net/lo: sysfs path undetected
+[1780587168.279163] [mx-crossnode-refit-target:1281 :0]            topo.c:714  UCX  DEBUG lo: system device unknown
+[1780587168.279186] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md tcp because it has no selected transport resources
+[1780587168.279208] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md sysv because it has no selected transport resources
+[1780587168.279250] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md posix because it has no selected transport resources
+[1780587168.279263] [mx-crossnode-refit-target:1281 :0]    cuda_copy_md.c:110  UCX  DEBUG dmabuf is supported on cuda device 0
+[1780587168.279575] [mx-crossnode-refit-target:1281 :0]     cuda_ipc_md.c:484  UCX  DEBUG fabric_info: state=3 status=0 uuid=00000000:00000000:00000000:00000000
+[1780587168.279576] [mx-crossnode-refit-target:1281 :0]     cuda_ipc_md.c:505  UCX  DEBUG multi-node NVLINK support is disabled
+[1780587168.279596] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md cuda_ipc because it has no selected transport resources
+[1780587168.279604] [mx-crossnode-refit-target:1281 :0]     gdr_copy_md.c:290  UCX  DEBUG could not open gdr copy. disabling gdr copy resource
+[1780587168.280074] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.286061] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_0) failed: 95
+[1780587168.287146] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_0: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.295235] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_0: PF sysfs path is '/sys/devices/pci0000:15/0000:15:01.0/0000:16:00.0/0000:17:01.0/0000:19:00.0'
+[1780587168.295255] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 1 for bus id 19:00.0
+[1780587168.295256] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_0: bdf_name 0000:19:00.0 sys_dev 1
+[1780587168.295268] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_0: vendor_id 0x15b3 device_id 4129
+[1780587168.296315] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_0: mkey_by_name_reserve is not supported
+[1780587168.296316] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_0: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.296570] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_0: ODP is supported, version 2: memory=host
+[1780587168.296572] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_0: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.296820] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3debe680 [id=53 ref 1] ???() to hash
+[1780587168.296881] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 53 events 0x1 mode thread_spinlock
+[1780587168.296883] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_0' (InfiniBand channel adapter) with 1 ports
+[1780587168.296888] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_0: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.296891] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_0: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.296894] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_0: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.296902] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_0: dmabuf is supported
+[1780587168.296906] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.297221] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_0: opened DEVX md log_max_qp=17
+[1780587168.298041] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_0: KSM dm memory registration status "Success" range 0x7732db9fd000..0x7732db9fd040 iova 0x0 mkey_index 0x0
+[1780587168.298388] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_0: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732db9fd000 atomic mkey_index 0x0
+[1780587168.299371] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_0: relaxed order memory access is enabled
+[1780587168.299873] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_0: KSM flush-mr memory registration status "Success" range 0x3dec3000..0x3dec3008 iova 0x0 mkey_index 0x0
+[1780587168.300069] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_0, syndrome 0x172df6: Remote I/O error
+[1780587168.300070] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_0: XGVMI is not supported
+[1780587168.300071] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_0: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.308313] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.308338] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_0 because it has no selected transport resources
+[1780587168.308344] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_0: md=0x3debcc00 md->flags=0x3f51f7f flush_rkey=0x1fff00
+[1780587168.308974] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.308977] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_0
+[1780587168.308982] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3debe680 [id=53 ref 1] ???() from hash
+[1780587168.308983] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3debe680 [id=53 ref 1] ???()
+[1780587168.309143] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3debe680 [id=53 ref 0] ???()
+[1780587168.310726] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.316038] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_1) failed: 95
+[1780587168.317148] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_1: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.325224] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_1: PF sysfs path is '/sys/devices/pci0000:26/0000:26:01.0/0000:27:00.0/0000:28:01.0/0000:2a:00.0'
+[1780587168.325243] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 2 for bus id 2a:00.0
+[1780587168.325244] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_1: bdf_name 0000:2a:00.0 sys_dev 2
+[1780587168.325253] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_1: vendor_id 0x15b3 device_id 4129
+[1780587168.326253] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_1: mkey_by_name_reserve is not supported
+[1780587168.326254] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_1: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.326469] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_1: ODP is supported, version 2: memory=host
+[1780587168.326470] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_1: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.326692] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec43e0 [id=53 ref 1] ???() to hash
+[1780587168.326754] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 53 events 0x1 mode thread_spinlock
+[1780587168.326755] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_1' (InfiniBand channel adapter) with 1 ports
+[1780587168.326758] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_1: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.326761] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_1: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.326763] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_1: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.326768] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_1: dmabuf is supported
+[1780587168.326770] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.327078] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_1: opened DEVX md log_max_qp=17
+[1780587168.328011] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_1: KSM dm memory registration status "Success" range 0x7732db9fd000..0x7732db9fd040 iova 0x0 mkey_index 0x0
+[1780587168.328356] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_1: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732db9fd000 atomic mkey_index 0x0
+[1780587168.329362] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_1: relaxed order memory access is enabled
+[1780587168.329864] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_1: KSM flush-mr memory registration status "Success" range 0x3ded1000..0x3ded1008 iova 0x0 mkey_index 0x0
+[1780587168.330060] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_1, syndrome 0x172df6: Remote I/O error
+[1780587168.330061] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_1: XGVMI is not supported
+[1780587168.330062] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_1: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.338059] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.338084] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_1 because it has no selected transport resources
+[1780587168.338088] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_1: md=0x3dec4dd0 md->flags=0x3f51f7f flush_rkey=0x1fff00
+[1780587168.338955] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.338957] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_1
+[1780587168.338959] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec43e0 [id=53 ref 1] ???() from hash
+[1780587168.338960] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec43e0 [id=53 ref 1] ???()
+[1780587168.339140] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec43e0 [id=53 ref 0] ???()
+[1780587168.341139] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.346510] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_2) failed: 95
+[1780587168.347609] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_2: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.355807] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_2: PF sysfs path is '/sys/devices/pci0000:37/0000:37:01.0/0000:38:00.0/0000:39:01.0/0000:3b:00.0'
+[1780587168.355825] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 3 for bus id 3b:00.0
+[1780587168.355826] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_2: bdf_name 0000:3b:00.0 sys_dev 3
+[1780587168.355834] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_2: vendor_id 0x15b3 device_id 4129
+[1780587168.356817] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_2: mkey_by_name_reserve is not supported
+[1780587168.356818] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_2: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.357033] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_2: ODP is supported, version 2: memory=host
+[1780587168.357033] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_2: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.357257] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec5380 [id=53 ref 1] ???() to hash
+[1780587168.357315] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 53 events 0x1 mode thread_spinlock
+[1780587168.357316] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_2' (InfiniBand channel adapter) with 1 ports
+[1780587168.357319] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_2: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.357321] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_2: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.357323] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_2: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.357328] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_2: dmabuf is supported
+[1780587168.357329] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.357664] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_2: opened DEVX md log_max_qp=17
+[1780587168.358536] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_2: KSM dm memory registration status "Success" range 0x7732db9fd000..0x7732db9fd040 iova 0x0 mkey_index 0x0
+[1780587168.358872] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_2: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732db9fd000 atomic mkey_index 0x0
+[1780587168.359927] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_2: relaxed order memory access is enabled
+[1780587168.360440] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_2: KSM flush-mr memory registration status "Success" range 0x3ded5000..0x3ded5008 iova 0x0 mkey_index 0x0
+[1780587168.360634] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_2, syndrome 0x172df6: Remote I/O error
+[1780587168.360635] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_2: XGVMI is not supported
+[1780587168.360636] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_2: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.368580] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.368604] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_2 because it has no selected transport resources
+[1780587168.368619] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_2: md=0x3dec3810 md->flags=0x3f51f7f flush_rkey=0x1fff00
+[1780587168.369515] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.369516] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_2
+[1780587168.369518] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec5380 [id=53 ref 1] ???() from hash
+[1780587168.369519] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec5380 [id=53 ref 1] ???()
+[1780587168.369690] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec5380 [id=53 ref 0] ???()
+[1780587168.371232] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.377014] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_3) failed: 95
+[1780587168.378195] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_3: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.386107] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_3: PF sysfs path is '/sys/devices/pci0000:48/0000:48:01.0/0000:49:00.0/0000:4a:01.0/0000:4c:00.0'
+[1780587168.386125] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 4 for bus id 4c:00.0
+[1780587168.386126] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_3: bdf_name 0000:4c:00.0 sys_dev 4
+[1780587168.386135] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_3: vendor_id 0x15b3 device_id 4129
+[1780587168.387136] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_3: mkey_by_name_reserve is not supported
+[1780587168.387137] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_3: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.387351] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_3: ODP is supported, version 2: memory=host
+[1780587168.387352] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_3: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.387586] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec5a50 [id=53 ref 1] ???() to hash
+[1780587168.387643] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 53 events 0x1 mode thread_spinlock
+[1780587168.387645] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_3' (InfiniBand channel adapter) with 1 ports
+[1780587168.387648] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_3: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.387650] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_3: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.387652] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_3: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.387657] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_3: dmabuf is supported
+[1780587168.387658] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.387993] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_3: opened DEVX md log_max_qp=17
+[1780587168.388956] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_3: KSM dm memory registration status "Success" range 0x7732db9fd000..0x7732db9fd040 iova 0x0 mkey_index 0x0
+[1780587168.389335] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_3: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732db9fd000 atomic mkey_index 0x0
+[1780587168.390348] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_3: relaxed order memory access is enabled
+[1780587168.390850] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_3: KSM flush-mr memory registration status "Success" range 0x3ded9000..0x3ded9008 iova 0x0 mkey_index 0x0
+[1780587168.391046] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_3, syndrome 0x172df6: Remote I/O error
+[1780587168.391046] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_3: XGVMI is not supported
+[1780587168.391047] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_3: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.399218] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.399262] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.404838] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_4) failed: 95
+[1780587168.405961] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_4: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.411845] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_4: PF sysfs path is '/sys/devices/pci0000:97/0000:97:01.0/0000:98:00.0/0000:99:01.0/0000:9b:00.0'
+[1780587168.411863] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 5 for bus id 9b:00.0
+[1780587168.411864] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_4: bdf_name 0000:9b:00.0 sys_dev 5
+[1780587168.411873] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_4: vendor_id 0x15b3 device_id 4129
+[1780587168.412387] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_4: mkey_by_name_reserve is not supported
+[1780587168.412388] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_4: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.412509] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_4: ODP is supported, version 2: memory=host
+[1780587168.412510] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_4: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.412639] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec4230 [id=58 ref 1] ???() to hash
+[1780587168.412644] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.412645] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_4' (InfiniBand channel adapter) with 1 ports
+[1780587168.412648] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_4: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.412651] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_4: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.412653] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_4: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.412658] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_4: dmabuf is supported
+[1780587168.412659] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.412866] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_4: opened DEVX md log_max_qp=17
+[1780587168.413343] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_4: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.413582] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_4: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.414132] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_4: relaxed order memory access is enabled
+[1780587168.414495] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_4: KSM flush-mr memory registration status "Success" range 0x3dedd000..0x3dedd008 iova 0x0 mkey_index 0x0
+[1780587168.414589] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_4, syndrome 0x172df6: Remote I/O error
+[1780587168.414590] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_4: XGVMI is not supported
+[1780587168.414591] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_4: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.421188] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.421208] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_4 because it has no selected transport resources
+[1780587168.421212] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_4: md=0x3ded8860 md->flags=0x3f51f7f flush_rkey=0x11d00
+[1780587168.421759] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.421760] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_4
+[1780587168.421762] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec4230 [id=58 ref 1] ???() from hash
+[1780587168.421763] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec4230 [id=58 ref 1] ???()
+[1780587168.421766] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec4230 [id=58 ref 0] ???()
+[1780587168.423040] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.428601] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_5) failed: 95
+[1780587168.429734] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_5: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.438291] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_5: PF sysfs path is '/sys/devices/pci0000:a7/0000:a7:01.0/0000:a8:00.0/0000:a9:01.0/0000:ab:00.0'
+[1780587168.438309] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 6 for bus id ab:00.0
+[1780587168.438311] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_5: bdf_name 0000:ab:00.0 sys_dev 6
+[1780587168.438319] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_5: vendor_id 0x15b3 device_id 4129
+[1780587168.439371] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_5: mkey_by_name_reserve is not supported
+[1780587168.439372] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_5: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.439606] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_5: ODP is supported, version 2: memory=host
+[1780587168.439607] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_5: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.439830] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3debf2e0 [id=58 ref 1] ???() to hash
+[1780587168.439846] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.439847] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_5' (InfiniBand channel adapter) with 1 ports
+[1780587168.439850] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_5: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.439852] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_5: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.439854] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_5: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.439859] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_5: dmabuf is supported
+[1780587168.439860] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.440157] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_5: opened DEVX md log_max_qp=17
+[1780587168.440925] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_5: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.441325] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_5: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.442338] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_5: relaxed order memory access is enabled
+[1780587168.442962] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_5: KSM flush-mr memory registration status "Success" range 0x3dee1000..0x3dee1008 iova 0x0 mkey_index 0x0
+[1780587168.443291] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_5, syndrome 0x172df6: Remote I/O error
+[1780587168.443292] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_5: XGVMI is not supported
+[1780587168.443293] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_5: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.451883] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.451903] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_5 because it has no selected transport resources
+[1780587168.451908] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_5: md=0x3dec0e20 md->flags=0x3f51f7f flush_rkey=0x11f00
+[1780587168.452581] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.452583] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_5
+[1780587168.452585] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3debf2e0 [id=58 ref 1] ???() from hash
+[1780587168.452586] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3debf2e0 [id=58 ref 1] ???()
+[1780587168.452588] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3debf2e0 [id=58 ref 0] ???()
+[1780587168.454215] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.459527] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_6) failed: 95
+[1780587168.460144] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_6: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.467544] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_6: PF sysfs path is '/sys/devices/pci0000:b7/0000:b7:01.0/0000:b8:00.0/0000:b9:01.0/0000:bb:00.0'
+[1780587168.467573] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 7 for bus id bb:00.0
+[1780587168.467574] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_6: bdf_name 0000:bb:00.0 sys_dev 7
+[1780587168.467582] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_6: vendor_id 0x15b3 device_id 4129
+[1780587168.468604] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_6: mkey_by_name_reserve is not supported
+[1780587168.468605] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_6: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.468830] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_6: ODP is supported, version 2: memory=host
+[1780587168.468831] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_6: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.469064] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3ded8cd0 [id=58 ref 1] ???() to hash
+[1780587168.469070] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.469071] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_6' (InfiniBand channel adapter) with 1 ports
+[1780587168.469074] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_6: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.469076] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_6: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.469078] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_6: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.469083] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_6: dmabuf is supported
+[1780587168.469084] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.469422] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_6: opened DEVX md log_max_qp=17
+[1780587168.470232] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_6: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.470691] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_6: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.471776] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_6: relaxed order memory access is enabled
+[1780587168.472330] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_6: KSM flush-mr memory registration status "Success" range 0x3dedd000..0x3dedd008 iova 0x0 mkey_index 0x0
+[1780587168.472546] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_6, syndrome 0x172df6: Remote I/O error
+[1780587168.472547] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_6: XGVMI is not supported
+[1780587168.472547] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_6: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.479796] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.479815] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_6 because it has no selected transport resources
+[1780587168.479819] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_6: md=0x3dec0e20 md->flags=0x3f51f7f flush_rkey=0x1ffe00
+[1780587168.480464] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.480465] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_6
+[1780587168.480467] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3ded8cd0 [id=58 ref 1] ???() from hash
+[1780587168.480468] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3ded8cd0 [id=58 ref 1] ???()
+[1780587168.480470] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3ded8cd0 [id=58 ref 0] ???()
+[1780587168.481667] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.486866] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_7) failed: 95
+[1780587168.487443] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_7: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.495308] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_7: PF sysfs path is '/sys/devices/pci0000:b7/0000:b7:01.0/0000:b8:00.0/0000:b9:01.0/0000:bb:00.1'
+[1780587168.495326] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 8 for bus id bb:00.1
+[1780587168.495327] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_7: bdf_name 0000:bb:00.1 sys_dev 8
+[1780587168.495335] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_7: vendor_id 0x15b3 device_id 4129
+[1780587168.496506] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_7: mkey_by_name_reserve is not supported
+[1780587168.496507] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_7: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.496784] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_7: ODP is supported, version 2: memory=host
+[1780587168.496785] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_7: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.497018] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3debf2a0 [id=58 ref 1] ???() to hash
+[1780587168.497024] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.497025] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_7' (InfiniBand channel adapter) with 1 ports
+[1780587168.497028] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_7: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.497030] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_7: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.497032] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_7: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.497037] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_7: dmabuf is supported
+[1780587168.497039] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.497395] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_7: opened DEVX md log_max_qp=17
+[1780587168.498297] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_7: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.498676] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_7: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.499741] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_7: relaxed order memory access is enabled
+[1780587168.500314] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_7: KSM flush-mr memory registration status "Success" range 0x3dee5000..0x3dee5008 iova 0x0 mkey_index 0x0
+[1780587168.500499] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_7, syndrome 0x172df6: Remote I/O error
+[1780587168.500500] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_7: XGVMI is not supported
+[1780587168.500501] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_7: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.508425] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.508444] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_7 because it has no selected transport resources
+[1780587168.508448] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_7: md=0x3dec2230 md->flags=0x3f51f7f flush_rkey=0x23be00
+[1780587168.509108] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.509110] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_7
+[1780587168.509111] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3debf2a0 [id=58 ref 1] ???() from hash
+[1780587168.509112] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3debf2a0 [id=58 ref 1] ???()
+[1780587168.509115] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3debf2a0 [id=58 ref 0] ???()
+[1780587168.510225] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.514995] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_8) failed: 95
+[1780587168.515571] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_8: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.522807] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_8: PF sysfs path is '/sys/devices/pci0000:b7/0000:b7:01.0/0000:b8:00.0/0000:b9:01.0/0000:bb:00.2'
+[1780587168.522825] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 9 for bus id bb:00.2
+[1780587168.522826] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_8: bdf_name 0000:bb:00.2 sys_dev 9
+[1780587168.522835] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_8: vendor_id 0x15b3 device_id 4129
+[1780587168.523867] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_8: mkey_by_name_reserve is not supported
+[1780587168.523868] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_8: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.524093] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_8: ODP is supported, version 2: memory=host
+[1780587168.524095] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_8: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.524328] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3ded8cd0 [id=58 ref 1] ???() to hash
+[1780587168.524333] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.524334] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_8' (InfiniBand channel adapter) with 1 ports
+[1780587168.524348] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_8: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.524350] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_8: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.524352] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_8: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.524356] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_8: dmabuf is supported
+[1780587168.524358] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.524674] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_8: opened DEVX md log_max_qp=17
+[1780587168.525515] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_8: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.525935] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_8: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.526978] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_8: relaxed order memory access is enabled
+[1780587168.527501] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_8: KSM flush-mr memory registration status "Success" range 0x3dee1000..0x3dee1008 iova 0x0 mkey_index 0x0
+[1780587168.527686] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_8, syndrome 0x172df6: Remote I/O error
+[1780587168.527687] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_8: XGVMI is not supported
+[1780587168.527688] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_8: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.534843] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.534864] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_8 because it has no selected transport resources
+[1780587168.534869] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_8: md=0x3dec2230 md->flags=0x3f51f7f flush_rkey=0x21bf00
+[1780587168.535573] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.535574] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_8
+[1780587168.535576] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3ded8cd0 [id=58 ref 1] ???() from hash
+[1780587168.535577] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3ded8cd0 [id=58 ref 1] ???()
+[1780587168.535579] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3ded8cd0 [id=58 ref 0] ???()
+[1780587168.536767] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.543274] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_bond_0) failed: 95
+[1780587168.544556] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_bond_0: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.551505] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_bond_0: PF sysfs path is '/sys/devices/pci0000:d7/0000:d7:01.0/0000:d8:00.0'
+[1780587168.551521] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 10 for bus id d8:00.0
+[1780587168.551522] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_bond_0: bdf_name 0000:d8:00.0 sys_dev 10
+[1780587168.551542] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_bond_0: vendor_id 0x15b3 device_id 41692
+[1780587168.552626] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_bond_0: mkey_by_name_reserve is not supported
+[1780587168.552627] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_bond_0: dp_ordering support: force=0 ooo_rw_rc=0 ooo_rw_dc=0
+[1780587168.552852] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_bond_0: ODP is supported, version 2: memory=host
+[1780587168.552853] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_bond_0: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.553076] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec3910 [id=58 ref 1] ???() to hash
+[1780587168.553081] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.553082] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_bond_0' (InfiniBand channel adapter) with 1 ports
+[1780587168.553085] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_bond_0: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.553087] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_bond_0: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.553089] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_bond_0: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.553096] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_bond_0: dmabuf is supported
+[1780587168.553098] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.553423] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_bond_0: opened DEVX md log_max_qp=17
+[1780587168.554253] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_bond_0: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.554641] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_bond_0: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.555635] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_bond_0: relaxed order memory access is enabled
+[1780587168.556156] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_bond_0: KSM flush-mr memory registration status "Success" range 0x3dee5000..0x3dee5008 iova 0x0 mkey_index 0x0
+[1780587168.556362] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_bond_0: XGVMI is supported
+[1780587168.556363] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_bond_0: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.557928] [mx-crossnode-refit-target:1281 :0]             sys.c:460  UCX  DEBUG failed to read from /sys/class/infiniband/mlx5_bond_0/ports/1/gid_attrs/types/0: Invalid argument
+[1780587168.557935] [mx-crossnode-refit-target:1281 :0]             sys.c:460  UCX  DEBUG failed to read from /sys/class/infiniband/mlx5_bond_0/ports/1/gid_attrs/types/0: Invalid argument
+[1780587168.557940] [mx-crossnode-refit-target:1281 :0]             sys.c:460  UCX  DEBUG failed to read from /sys/class/infiniband/mlx5_bond_0/ports/1/gid_attrs/types/0: Invalid argument
+[1780587168.557945] [mx-crossnode-refit-target:1281 :0]             sys.c:460  UCX  DEBUG failed to read from /sys/class/infiniband/mlx5_bond_0/ports/1/gid_attrs/types/0: Invalid argument
+[1780587168.557950] [mx-crossnode-refit-target:1281 :0]             sys.c:460  UCX  DEBUG failed to read from /sys/class/infiniband/mlx5_bond_0/ports/1/gid_attrs/types/0: Invalid argument
+[1780587168.568058] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.568077] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_bond_0 because it has no selected transport resources
+[1780587168.568082] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_bond_0: md=0x3dec2060 md->flags=0x3f1dfbb flush_rkey=0x203e00
+[1780587168.568837] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.568839] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_bond_0
+[1780587168.568840] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec3910 [id=58 ref 1] ???() from hash
+[1780587168.568841] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec3910 [id=58 ref 1] ???()
+[1780587168.568844] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec3910 [id=58 ref 0] ???()
+[1780587168.570646] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.575697] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_9) failed: 95
+[1780587168.576324] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_9: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.583570] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_9: PF sysfs path is '/sys/devices/pci0000:b7/0000:b7:01.0/0000:b8:00.0/0000:b9:01.0/0000:bb:00.3'
+[1780587168.583588] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 11 for bus id bb:00.3
+[1780587168.583589] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_9: bdf_name 0000:bb:00.3 sys_dev 11
+[1780587168.583597] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_9: vendor_id 0x15b3 device_id 4129
+[1780587168.584713] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_9: mkey_by_name_reserve is not supported
+[1780587168.584714] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_9: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.584937] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_9: ODP is supported, version 2: memory=host
+[1780587168.584938] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_9: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.585213] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3debf2a0 [id=58 ref 1] ???() to hash
+[1780587168.585218] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.585219] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_9' (InfiniBand channel adapter) with 1 ports
+[1780587168.585222] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_9: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.585224] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_9: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.585226] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_9: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.585230] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_9: dmabuf is supported
+[1780587168.585232] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.585560] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_9: opened DEVX md log_max_qp=17
+[1780587168.586494] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_9: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.586891] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_9: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.587916] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_9: relaxed order memory access is enabled
+[1780587168.588438] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_9: KSM flush-mr memory registration status "Success" range 0x3dedd000..0x3dedd008 iova 0x0 mkey_index 0x0
+[1780587168.588622] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_9, syndrome 0x172df6: Remote I/O error
+[1780587168.588623] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_9: XGVMI is not supported
+[1780587168.588624] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_9: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.596129] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.596148] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_9 because it has no selected transport resources
+[1780587168.596154] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_9: md=0x3dec1ef0 md->flags=0x3f51f7f flush_rkey=0x25bf00
+[1780587168.596848] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.596849] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_9
+[1780587168.596851] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3debf2a0 [id=58 ref 1] ???() from hash
+[1780587168.596852] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3debf2a0 [id=58 ref 1] ???()
+[1780587168.596855] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3debf2a0 [id=58 ref 0] ???()
+[1780587168.598259] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.603794] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_10) failed: 95
+[1780587168.604964] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_10: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.613326] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_10: PF sysfs path is '/sys/devices/pci0000:b7/0000:b7:01.0/0000:b8:00.0/0000:b9:02.0/0000:bc:00.0'
+[1780587168.613343] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 12 for bus id bc:00.0
+[1780587168.613344] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_10: bdf_name 0000:bc:00.0 sys_dev 12
+[1780587168.613352] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_10: vendor_id 0x15b3 device_id 4129
+[1780587168.614356] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_10: mkey_by_name_reserve is not supported
+[1780587168.614357] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_10: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.614571] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_10: ODP is supported, version 2: memory=host
+[1780587168.614572] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_10: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.614857] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3debfbd0 [id=58 ref 1] ???() to hash
+[1780587168.614862] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.614863] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_10' (InfiniBand channel adapter) with 1 ports
+[1780587168.614866] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_10: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.614868] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_10: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.614870] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_10: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.614874] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_10: dmabuf is supported
+[1780587168.614876] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.615193] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_10: opened DEVX md log_max_qp=17
+[1780587168.615962] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_10: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.616289] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_10: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.617131] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_10: relaxed order memory access is enabled
+[1780587168.617488] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_10: KSM flush-mr memory registration status "Success" range 0x3dee1000..0x3dee1008 iova 0x0 mkey_index 0x0
+[1780587168.617584] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_10, syndrome 0x172df6: Remote I/O error
+[1780587168.617585] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_10: XGVMI is not supported
+[1780587168.617586] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_10: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.625086] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.625110] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_10 because it has no selected transport resources
+[1780587168.625114] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_10: md=0x3ded6750 md->flags=0x3f51f7f flush_rkey=0x11b00
+[1780587168.625958] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.625959] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_10
+[1780587168.625961] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3debfbd0 [id=58 ref 1] ???() from hash
+[1780587168.625962] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3debfbd0 [id=58 ref 1] ???()
+[1780587168.625964] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3debfbd0 [id=58 ref 0] ???()
+[1780587168.628002] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:958  UCX  DEBUG apply UCT configuration IB_PCI_RELAXED_ORDERING=try
+[1780587168.633633] [mx-crossnode-refit-target:1281 :0]       ib_efa_md.c:38   UCX  DEBUG efadv_query_device(mlx5_11) failed: 95
+[1780587168.634823] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1064 UCX  DEBUG mlx5_11: md open by 'uct_ib_efa_md_ops' failed, trying next
+[1780587168.643216] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_11: PF sysfs path is '/sys/devices/pci0000:c7/0000:c7:01.0/0000:c8:00.0/0000:c9:01.0/0000:cb:00.0'
+[1780587168.643234] [mx-crossnode-refit-target:1281 :0]            topo.c:343  UCX  DEBUG added sys_dev 13 for bus id cb:00.0
+[1780587168.643236] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_11: bdf_name 0000:cb:00.0 sys_dev 13
+[1780587168.643244] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_11: vendor_id 0x15b3 device_id 4129
+[1780587168.644255] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_11: mkey_by_name_reserve is not supported
+[1780587168.644256] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_11: dp_ordering support: force=1 ooo_rw_rc=1 ooo_rw_dc=1
+[1780587168.644471] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_11: ODP is supported, version 2: memory=host
+[1780587168.644472] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_11: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.644695] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dee0010 [id=58 ref 1] ???() to hash
+[1780587168.644700] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.644701] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_11' (InfiniBand channel adapter) with 1 ports
+[1780587168.644704] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_11: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.644706] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_11: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.644708] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_11: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.644712] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_11: dmabuf is supported
+[1780587168.644714] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.645021] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_11: opened DEVX md log_max_qp=17
+[1780587168.645791] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_11: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.646127] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_11: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.647069] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_11: relaxed order memory access is enabled
+[1780587168.647612] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_11: KSM flush-mr memory registration status "Success" range 0x3dedd000..0x3dedd008 iova 0x0 mkey_index 0x0
+[1780587168.647797] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.h:1044 UCX  DEBUG mlx5dv_devx_general_cmd(ALLOW_OTHER_VHCA_ACCESS) failed on mlx5_11, syndrome 0x172df6: Remote I/O error
+[1780587168.647798] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_11: XGVMI is not supported
+[1780587168.647799] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1068 UCX  DEBUG mlx5_11: md open by 'uct_ib_mlx5_devx_md_ops' is successful
+[1780587168.655948] [mx-crossnode-refit-target:1281 :0]          uct_md.c:96   UCX  DEBUG failed to query srd resources: No such device
+[1780587168.655981] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_11 because it has no selected transport resources
+[1780587168.655985] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_11: md=0x3ded6750 md->flags=0x3f51f7f flush_rkey=0x12600
+[1780587168.656504] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.656505] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_11
+[1780587168.656507] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dee0010 [id=58 ref 1] ???() from hash
+[1780587168.656508] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dee0010 [id=58 ref 1] ???()
+[1780587168.656510] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dee0010 [id=58 ref 0] ???()
+[1780587168.747364] [mx-crossnode-refit-target:1281 :0]            topo.c:1293 UCX  DEBUG /sys/class/infiniband/mlx5_bond_0: PF sysfs path is '/sys/devices/pci0000:d7/0000:d7:01.0/0000:d8:00.0'
+[1780587168.747369] [mx-crossnode-refit-target:1281 :0]            topo.c:710  UCX  DEBUG mlx5_bond_0: bdf_name 0000:d8:00.0 sys_dev 10
+[1780587168.747379] [mx-crossnode-refit-target:1281 :0]       ib_device.c:537  UCX  DEBUG mlx5_bond_0: vendor_id 0x15b3 device_id 41692
+[1780587168.748405] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2077 UCX  DEBUG mlx5_bond_0: mkey_by_name_reserve is not supported
+[1780587168.748407] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2060 UCX  DEBUG mlx5_bond_0: dp_ordering support: force=0 ooo_rw_rc=0 ooo_rw_dc=0
+[1780587168.748621] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:1828 UCX  DEBUG mlx5_bond_0: ODP is supported, version 2: memory=host
+[1780587168.748622] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:87   UCX  DEBUG mlx5_bond_0: direct NIC is disabled because declaration of mlx5dv_get_data_direct_sysfs_path was not found
+[1780587168.748845] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec2af0 [id=58 ref 1] ???() to hash
+[1780587168.748851] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 58 events 0x1 mode thread_spinlock
+[1780587168.748852] [mx-crossnode-refit-target:1281 :0]       ib_device.c:648  UCX  DEBUG initialized device 'mlx5_bond_0' (InfiniBand channel adapter) with 1 ports
+[1780587168.748855] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_bond_0: cuda GPUDirect RDMA is not detected by checking /sys/kernel/mm/memory_peers/nv_mem/version
+[1780587168.748857] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_bond_0: cuda GPUDirect RDMA is detected by checking /sys/module/nvidia_peermem/version
+[1780587168.748859] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1223 UCX  DEBUG mlx5_bond_0: rocm GPUDirect RDMA is not detected by checking /dev/kfd
+[1780587168.748863] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1250 UCX  DEBUG mlx5_bond_0: dmabuf is supported
+[1780587168.748865] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool devx dbrec: align 64, maxelems 4294967295, elemsize 40
+[1780587168.749202] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2582 UCX  DEBUG mlx5_bond_0: opened DEVX md log_max_qp=17
+[1780587168.749991] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_bond_0: KSM dm memory registration status "Success" range 0x7732dad98000..0x7732dad98040 iova 0x0 mkey_index 0x0
+[1780587168.750380] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_bond_0: KSM atomic-key memory registration status "Success" range (nil)..0x40 iova 0x7732dad98000 atomic mkey_index 0x0
+[1780587168.751344] [mx-crossnode-refit-target:1281 :0]           ib_md.c:1208 UCX  DEBUG mlx5_bond_0: relaxed order memory access is disabled
+[1780587168.751844] [mx-crossnoI0604 15:32:48.830153    1281 hw_info.cpp:102] Found IB device #1: 0000:3b:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.830448    1281 hw_info.cpp:110] Found GPU #1: 0000:ba:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.830741    1281 hw_info.cpp:102] Found IB device #2: 0000:4c:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.830986    1281 hw_info.cpp:110] Found GPU #2: 0000:3a:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.831108    1281 hw_info.cpp:102] Found IB device #3: 0000:cb:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.831504    1281 hw_info.cpp:102] Found IB device #4: 0000:bb:00.3 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.831621    1281 hw_info.cpp:110] Found GPU #3: 0000:4b:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.831890    1281 hw_info.cpp:102] Found IB device #5: 0000:19:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.831939    1281 hw_info.cpp:110] Found GPU #4: 0000:ca:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.832018    1281 hw_info.cpp:102] Found IB device #6: 0000:bb:00.1 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.832676    1281 hw_info.cpp:110] Found GPU #5: 0000:18:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.833272    1281 hw_info.cpp:110] Found GPU #6: 0000:29:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.833330    1281 hw_info.cpp:102] Found IB device #7: 0000:ab:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.833572    1281 hw_info.cpp:102] Found IB device #8: 0000:9b:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.834027    1281 hw_info.cpp:102] Found IB device #9: 0000:bc:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.834195    1281 hw_info.cpp:110] Found GPU #7: 0000:aa:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.834359    1281 hw_info.cpp:102] Found IB device #10: 0000:bb:00.2 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.834410    1281 hw_info.cpp:110] Found GPU #8: 0000:9a:00.0 vendor=0x0x10de class=0x0x302
+I0604 15:32:48.834739    1281 hw_info.cpp:102] Found IB device #11: 0000:2a:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.834914    1281 hw_info.cpp:102] Found IB device #12: 0000:bb:00.0 vendor=0x0x15b3 class=0x0x207
+I0604 15:32:48.835355    1281 ucx_utils.cpp:649] hwInfo { numNvidiaGpus=8, numIbDevices=12 }
+de-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_bond_0: KSM flush-mr memory registration status "Success" range 0x3dedd000..0x3dedd008 iova 0x0 mkey_index 0x0
+[1780587168.752102] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2641 UCX  DEBUG mlx5_bond_0: XGVMI is supported
+[1780587168.752140] [mx-crossnode-refit-target:1281 :0]             sys.c:460  UCX  DEBUG failed to read from /sys/class/infiniband/mlx5_bond_0/ports/1/gid_attrs/types/0: Invalid argument
+[1780587168.752148] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md mlx5_bond_0 because it has no selected transport resources
+[1780587168.752153] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_bond_0: md=0x3ded6750 md->flags=0x3f1dfbb flush_rkey=0x203e00
+[1780587168.752727] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587168.752728] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_bond_0
+[1780587168.752730] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec2af0 [id=58 ref 1] ???() from hash
+[1780587168.752731] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec2af0 [id=58 ref 1] ???()
+[1780587168.752733] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec2af0 [id=58 ref 0] ???()
+[1780587168.754373] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1721 UCX  DEBUG closing md cma because it has no selected transport resources
+[1780587168.754377] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1893 UCX  DEBUG register host memory on: cuda_cpy, mlx5_3
+[1780587168.754378] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1893 UCX  DEBUG register cuda memory on: cuda_cpy, mlx5_3
+[1780587168.754379] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1893 UCX  DEBUG register cuda-managed memory on: cuda_cpy
+[1780587168.754379] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1881 UCX  DEBUG no memory domain supports registering rocm memory
+[1780587168.754380] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1881 UCX  DEBUG no memory domain supports registering rocm-managed memory
+[1780587168.754381] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1881 UCX  DEBUG no memory domain supports registering rdma memory
+[1780587168.754381] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1881 UCX  DEBUG no memory domain supports registering ze-host memory
+[1780587168.754382] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1881 UCX  DEBUG no memory domain supports registering ze-device memory
+[1780587168.754382] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:1881 UCX  DEBUG no memory domain supports registering ze-managed memory
+[1780587168.754392] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rcache_mp: align 8, maxelems 4294967295, elemsize 144
+[1780587168.754414] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3ded8cd0 [id=57 ref 1] ???() to hash
+[1780587168.754419] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 57 events 0x1 mode thread_spinlock
+[1780587168.754503] [mx-crossnode-refit-target:1281 :0]          module.c:304  UCX  DEBUG loading modules for ucm
+[1780587168.754505] [mx-crossnode-refit-target:1281 :0]          module.c:257  UCX  DEBUG loading module 'cuda' with mode 0x1001
+[1780587168.754634] [mx-crossnode-refit-target:1281 :0]          module.c:192  UCX  DEBUG loaded /usr/local/lib/python3.12/dist-packages/nixl_cu12.libs/ucx/libucm_cuda.so.0.0.0 [0x3ded39f0]
+[1780587168.829806] [mx-crossnode-refit-target:1281 :0]     ucp_context.c:2536 UCX  DEBUG created ucp context ucp_context_0 0x3deac9b0 [2 mds 5 tls] features 0x5e tl bitmap 0x1f 0x0
+[1780587168.837286] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1436 UCX  DEBUG created interface[0]=0x3dec1330 using cuda_copy/cuda on worker 0x3df3c4f0
+[1780587168.837762] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1211 UCX  DEBUG using pkey[0] 0xffff on mlx5_3:1/IB
+[1780587168.838990] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1819 UCX  DEBUG created uct_ib_iface_t headroom_ofs 12 payload_ofs 92 hdr_ofs 91 data_sz 8256
+[1780587168.839000] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rc_recv_desc: align 64, maxelems 4294967295, elemsize 8355
+[1780587168.839001] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rc_send_desc: align 64, maxelems 4294967295, elemsize 8320
+[1780587168.839071] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool send-ops-mpool: align 64, maxelems 4294967295, elemsize 48
+[1780587168.839726] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool pending-ops: align 1, maxelems 4294967295, elemsize 64
+[1780587168.839729] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rc_verbs_short_desc: align 64, maxelems 4294967295, elemsize 192
+[1780587168.840236] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1330 UCX  DEBUG mlx5_3: iface 0x3dedc050 created RC QP 0x3940 on mlx5_3:1 TX wr:409 sge:5 inl:124 resp:64 RX wr:0 sge:0 resp:64
+[1780587168.840810] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1436 UCX  DEBUG created interface[1]=0x3dedc050 using rc_verbs/mlx5_3:1 on worker 0x3df3c4f0
+[1780587168.841044] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1211 UCX  DEBUG using pkey[0] 0xffff on mlx5_3:1/IB
+[1780587168.842042] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1819 UCX  DEBUG created uct_ib_iface_t headroom_ofs 12 payload_ofs 92 hdr_ofs 44 data_sz 4136
+[1780587168.842046] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:205  UCX  DEBUG create QP: max_send_sge=6 (config=6, dev=30) max_inline_data=64B (config=64B, dev=4096B) 
+[1780587168.842655] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1330 UCX  DEBUG mlx5_3: iface 0x3e01c010 created UD QP 0x4962 on mlx5_3:1 TX wr:341 sge:6 inl:124 resp:0 RX wr:4096 sge:1 resp:0
+[1780587168.843306] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ud_recv_skb: align 64, maxelems 4294967295, elemsize 4188
+[1780587168.844314] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG mpool ud_recv_skb: allocated chunk 0x772eb0f7b018 of 544744 bytes with 128 elements
+[1780587168.844317] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ud_tx_skb: align 64, maxelems 4294967295, elemsize 4208
+[1780587168.844330] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80::605e:6503:a4:822a to hash on device mlx5_3 port 1 index 0)
+[1780587168.844338] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 1)
+[1780587168.844344] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 2)
+[1780587168.844350] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 3)
+[1780587168.844356] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 4)
+[1780587168.844362] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 5)
+[1780587168.844368] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 6)
+[1780587168.844373] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e01c010: adding gid fe80:: to hash on device mlx5_3 port 1 index 7)
+[1780587168.844581] [mx-crossnode-refit-target:1281 :0]     timer_wheel.c:40   UCX  DEBUG high res timer created log=23 resolution=3660.709607 usec wanted: 2499.999657 usec
+[1780587168.844608] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec2620 [id=62 ref 1] ???() to hash
+[1780587168.844613] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 62 events 0x5 mode thread_spinlock
+[1780587168.844644] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1436 UCX  DEBUG created interface[2]=0x3e01c010 using ud_verbs/mlx5_3:1 on worker 0x3df3c4f0
+[1780587168.844935] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1211 UCX  DEBUG using pkey[0] 0xffff on mlx5_3:1/IB
+[1780587168.844950] [mx-crossnode-refit-target:1281 :0]       ib_device.c:1485 UCX  DEBUG max IB CQE size is 128
+[1780587168.845742] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG mpool devx dbrec: allocated chunk 0x3dee5010 of 8176 bytes with 127 elements
+[1780587168.848107] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1819 UCX  DEBUG created uct_ib_iface_t headroom_ofs 12 payload_ofs 92 hdr_ofs 90 data_sz 8256
+[1780587168.848121] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rc_recv_desc: align 64, maxelems 4294967295, elemsize 8354
+[1780587168.848122] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rc_send_desc: align 64, maxelems 4294967295, elemsize 8320
+[1780587168.848193] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool send-ops-mpool: align 64, maxelems 4294967295, elemsize 48
+[1780587168.848814] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool pending-ops: align 1, maxelems 4294967295, elemsize 64
+[1780587168.849025] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:1108 UCX  DEBUG SL=0 (AR support - no) was selected on mlx5_3:1, SLs with AR support = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, SLs without AR support = { <none> }
+[1780587168.849685] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool mlx5_dm_desc: align 64, maxelems 1, elemsize 64
+[1780587168.849688] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool rc_mlx5_atomic_desc: align 64, maxelems 4294967295, elemsize 72
+[1780587168.858122] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dec5380 [id=64 ref 1] ???() to hash
+[1780587168.858128] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 64 events 0x1 mode thread_spinlock
+[1780587168.858175] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1436 UCX  DEBUG created interface[3]=0x3e18d0c0 using rc_mlx5/mlx5_3:1 on worker 0x3df3c4f0
+[1780587168.860449] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1211 UCX  DEBUG using pkey[0] 0xffff on mlx5_3:1/IB
+[1780587168.861627] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1819 UCX  DEBUG created uct_ib_iface_t headroom_ofs 12 payload_ofs 92 hdr_ofs 44 data_sz 4136
+[1780587168.861629] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:205  UCX  DEBUG create QP: max_send_sge=6 (config=6, dev=30) max_inline_data=64B (config=64B, dev=4096B) 
+[1780587168.862055] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1330 UCX  DEBUG mlx5_3: iface 0x3e0ce4c0 created UD QP 0x4964 on mlx5_3:1 TX wr:256 sge:2 inl:60 resp:0 RX wr:4096 sge:1 resp:0
+[1780587168.862058] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:801  UCX  DEBUG tx wq 32768 bytes [bb=64, nwqe=512] mmio_mode bf_post_mt
+[1780587168.862659] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ud_recv_skb: align 64, maxelems 4294967295, elemsize 4188
+[1780587168.863473] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG mpool ud_recv_skb: allocated chunk 0x772eb0ef6018 of 544744 bytes with 128 elements
+[1780587168.863475] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ud_tx_skb: align 64, maxelems 4294967295, elemsize 4208
+[1780587168.863487] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80::605e:6503:a4:822a to hash on device mlx5_3 port 1 index 0)
+[1780587168.863505] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 1)
+[1780587168.863511] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 2)
+[1780587168.863516] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 3)
+[1780587168.863522] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 4)
+[1780587168.863528] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 5)
+[1780587168.863533] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 6)
+[1780587168.863539] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:389  UCX  DEBUG iface 0x3e0ce4c0: adding gid fe80:: to hash on device mlx5_3 port 1 index 7)
+[1780587168.863747] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:1108 UCX  DEBUG SL=0 (AR support - no) was selected on mlx5_3:1, SLs with AR support = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, SLs without AR support = { <none> }
+[1780587168.863761] [mx-crossnode-refit-target:1281 :0]     timer_wheel.c:40   UCX  DEBUG high res timer created log=23 resolution=3660.709607 usec wanted: 2499.999657 usec
+[1780587168.863775] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3ded1a70 [id=66 ref 1] ???() to hash
+[1780587168.863781] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 66 events 0x5 mode thread_spinlock
+[1780587168.863810] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1436 UCX  DEBUG created interface[4]=0x3e0ce4c0 using ud_mlx5/mlx5_3:1 on worker 0x3df3c4f0
+[1780587168.863812] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1150 UCX  DEBUG selected scalable tl bitmap: 0x1f 0x0 (5 tls)
+[1780587168.863826] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dee4d40 [id=67 ref 1] ???() to hash
+[1780587168.863828] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 67 events 0x0 mode thread_spinlock
+[1780587168.863830] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3dee4d80 [id=61 ref 1] ???() to hash
+[1780587168.863832] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 61 events 0x0 mode thread_spinlock
+[1780587168.863847] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG added async handler 0x3ded1d60 [id=65 ref 1] ???() to hash
+[1780587168.863849] [mx-crossnode-refit-target:1281 :0]           async.c:521  UCX  DEBUG listening to async event fd 65 events 0x0 mode thread_spinlock
+[1780587168.863868] [mx-crossnode-refit-target:1281 :0]      tcp_sockcm.c:228  UCX  DEBUG created tcp_sockcm 0x3e2f7930
+[1780587168.863998] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:408  UCX  DEBUG created ep 0x772eb1308000 to <no debug data> mem_type_ep:cuda
+[1780587168.864040] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG         no active message lane for rndv/rtr
+[1780587168.864042] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG         no active message lane for rndv/rtr/mtype
+[1780587168.864048] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG         no active message lane for am/rndv
+[1780587168.864065] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG               no active message lane for rndv/rtr
+[1780587168.864066] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG               no active message lane for rndv/rtr/mtype
+[1780587168.864106] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG               no active message lane for rndv/rtr
+[1780587168.864107] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG               no active message lane for rndv/rtr/mtype
+[1780587168.864124] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG               no active message lane for rndv/rtr
+[1780587168.864125] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG               no active message lane for rndv/rtr/mtype
+[1780587168.864134] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG             no active message lane for rndv/ats
+[1780587168.864135] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG             no active message lane for rndv/rtr
+[1780587168.864138] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG                 no active message lane for rndv/rtr
+[1780587168.864140] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG                 no active message lane for rndv/rtr/mtype
+[1780587168.864144] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG                     no active message lane for rndv/rtr
+[1780587168.864145] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG                     no active message lane for rndv/rtr/mtype
+[1780587168.864150] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG             no active message lane for rndv/rtr/mtype
+[1780587168.864154] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG                 no active message lane for rndv/rtr
+[1780587168.864155] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG                 no active message lane for rndv/rtr/mtype
+[1780587168.864164] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG         no active message lane for rndv/rtr
+[1780587168.864165] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG         no active message lane for rndv/rtr/mtype
+[1780587168.864168] [mx-crossnode-refit-target:1281 :0]      proto_rndv.c:517  UCX  DEBUG         no active message lane for am/rndv
+[1780587168.864175] [mx-crossnode-refit-target:1281 :0]          wireup.c:1267 UCX  DEBUG   ep 0x772eb1308000: am_lane <none> wireup_msg_lane <none> cm_lane <none> keepalive_lane <none> reachable_mds 0x1
+[1780587168.864178] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb1308000: lane[0]:  0:cuda_copy/cuda.0 md[0]        -> addr[0].md[0]/cuda_cpy/sysdev[0] seg 0 rma_bw#0
+[1780587168.864179] [mx-crossnode-refit-target:1281 :0]          wireup.c:1293 UCX  DEBUG   ep 0x772eb1308000: err mode 0, flags 0x1
+[1780587168.864215] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:408  UCX  DEBUG created ep 0x772eb1308040 to <no debug data> mem_type_ep:cuda-managed
+[1780587168.864224] [mx-crossnode-refit-target:1281 :0]          wireup.c:1267 UCX  DEBUG   ep 0x772eb1308040: am_lane <none> wireup_msg_lane <none> cm_lane <none> keepalive_lane <none> reachable_mds 0x1
+[1780587168.864225] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb1308040: lane[0]:  0:cuda_copy/cuda.0 md[0]        -> addr[0].md[0]/cuda_cpy/sysdev[0] seg 0 rma_bw#0
+[1780587168.864226] [mx-crossnode-refit-target:1281 :0]          wireup.c:1293 UCX  DEBUG   ep 0x772eb1308040: err mode 0, flags 0x1
+[1780587168.864228] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ucp_requests: align 64, maxelems 4294967295, elemsize 280
+[1780587168.864229] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ucp_rkeys: align 64, maxelems 4294967295, elemsize 104
+[1780587168.864230] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ucp_reg_bufs: align 64, maxelems 4294967295, elemsize 8216
+[178058716I0604 15:32:48.864451    1371 ucx_backend.cpp:334] shared thread 0x3dec8010{engine: 0x3bf07330, worker_ids: [0]} running
+8.864231] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ucp_am_bufs: align 64, maxelems 4294967295, elemsize 153
+[1780587168.864237] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ucp_am_bufs: align 64, maxelems 4294967295, elemsize 1113
+[1780587168.864238] [mx-crossnode-refit-target:1281 :0]           mpool.c:136  UCX  DEBUG mpool ucp_am_bufs: align 64, maxelems 4294967295, elemsize 8344
+[1780587168.864239] [mx-crossnode-refit-target:1281 :0]       mpool_set.c:129  UCX  DEBUG mpool_set:ucp_am_bufs, sizes map 0x80000440, largest size 8255, mpools num 3
+[1780587168.864243] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1729 UCX  DEBUG worker 0x3df3c4f0: using device atomics
+[1780587168.864259] [mx-crossnode-refit-target:1281 :0]          parser.c:2364 UCX  INFO  UCX_* env variables: UCX_RNDV_THRESH=0 UCX_MAX_RNDV_RAILS=1 UCX_TLS=rc_x,rc,tcp,cuda_copy UCX_LOG_LEVEL=debug UCX_RNDV_SCHEME=get_zcopy UCX_NET_DEVICES=mlx5_3:1
+[1780587168.864485] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:408  UCX  DEBUG created ep 0x772eb1308080 to <no debug data> from api call
+[1780587168.864513] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1912 UCX  INFO    ucp_context_0 self cfg#1 rma(rc_mlx5/mlx5_3:1)  amo(rc_mlx5/mlx5_3:1)  am(rc_mlx5/mlx5_3:1 rc_mlx5/mlx5_3:1)  ka(ud_mlx5/mlx5_3:1)
+[1780587168.871631] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG             mpool rc_recv_desc: allocated chunk 0x772e31800018 of 39845864 bytes with 4752 elements
+[1780587168.871935] [mx-crossnode-refit-target:1281 :0]         uct_mem.c:307  UCX  DEBUG               could not allocate get_alloc_md_id: cuda memory length=1 flags=0x368 num_methods=1
+[1780587168.872309] [mx-crossnode-refit-target:1281 :0]    cuda_copy_md.c:230  UCX  DEBUG               cuMemCreate(&alloc_handle->generic_handle, alloc_handle->length, &prop, 0) failed: operation not permitted
+[1780587168.876175] [mx-crossnode-refit-target:1281 :0]          wireup.c:1267 UCX  DEBUG   ep 0x772eb1308080: am_lane 0 wireup_msg_lane 2 cm_lane <none> keepalive_lane 2 reachable_mds 0x3
+[1780587168.876179] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb1308080: lane[0]:  3:rc_mlx5/mlx5_3:1.0 md[1]      -> addr[3].md[1]/ib/sysdev[4] seg 8192 rma_bw#0 amo#0 am
+[1780587168.876181] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb1308080: lane[1]:  3:rc_mlx5/mlx5_3:1.1 md[1]      -> addr[3].md[1]/ib/sysdev[4] seg 8192 rma_bw#1
+[1780587168.876183] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb1308080: lane[2]:  4:ud_mlx5/mlx5_3:1.0 md[1]      -> addr[4].md[1]/ib/sysdev[4] seg 4032 keepalive wireup
+[1780587168.876184] [mx-crossnode-refit-target:1281 :0]          wireup.c:1293 UCX  DEBUG   ep 0x772eb1308080: err mode 1, flags 0x1
+[1780587168.879415] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2798 UCX  DEBUG   counter_set_id on mlx5_3:1 is 0x1
+[1780587168.879831] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:165  UCX  DEBUG   created rc ep 0x3debd010
+[1780587168.879850] [mx-crossnode-refit-target:1281 :0]       wireup_ep.c:525  UCX  DEBUG   ep 0x772eb1308080: wireup_ep 0x3ded79e0 created next_ep 0x3debd010 to <no debug data> using rc_mlx5/mlx5_3:1
+[1780587168.880979] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:165  UCX  DEBUG   created rc ep 0x3dec1230
+[1780587168.880981] [mx-crossnode-refit-target:1281 :0]       wireup_ep.c:525  UCX  DEBUG   ep 0x772eb1308080: wireup_ep 0x3bea4f80 created next_ep 0x3dec1230 to <no debug data> using rc_mlx5/mlx5_3:1
+[1780587168.880987] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.880994] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.881000] [mx-crossnode-refit-target:1281 :0]           ud_ep.c:423  UCX  DEBUG   created ep ep=0x772ea8005430 I0604 15:32:48.882894    1281 ucx_utils.cpp:152] ep 0x772eb1308080: state 0 -> 1
+I0604 15:32:48.882918    1281 nixl_agent.cpp:397] Created backend: UCX
+2026-06-04 15:32:48 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-04 15:32:48 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-crossnode-target-mx-crossnode-1780587009
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-target-mx-crossnode-1780587009", "nixl_backends": ["UCX"], "phase": "target.nixl_agent.construct.done"}
+[mx-refit-crossnode] {"bytes": 64, "phase": "target.register_target.start"}
+[mx-refit-crossnode] {"phase": "target.register_target.done", "registration_duration_ms": 5.832401104271412}
+[mx-refit-crossnode] {"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "metadata_bytes": 614, "phase": "target.add_remote_agent.start", "source_id": "trainer-rank0"}
+I0604 15:32:48.889022    1281 nixl_agent.cpp:1619] Loading remote metadata for agent: mx-crossnode-source-mx-crossnode-1780587009
+iface=0x3e0ce4c0 id=0
+[1780587168.881017] [mx-crossnode-refit-target:1281 :0]           ud_ep.c:526  UCX  DEBUG   mlx5_3:1/IB lid 1931 qpn 0x4964 epid 0 ep 0x772ea8005430 connected to IFACE lid 1931 fe80:: pkey 0xffff qpn 0x4964
+[1780587168.881018] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.881020] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.882797] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG   mpool ud_tx_skb: allocated chunk 0x772e9f000018 of 6291432 bytes with 1489 elements
+[1780587168.882869] [mx-crossnode-refit-target:1281 :0]           async.c:247  UCX  DEBUG   added async handler 0x3e42ad60 [id=1000021 ref 1] ???() to hash
+[1780587168.882884] [mx-crossnode-refit-target:1281 :0]          wireup.c:2003 UCX  DEBUG ep 0x772eb1308080: send wireup request (flags=0x4080)
+[1780587168.882909] [mx-crossnode-refit-target:1281 :1]        ib_iface.c:1063 UCX  DEBUG iface 0x3e0ce4c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.882920] [mx-crossnode-refit-target:1281 :1]           ud_ep.c:844  UCX  DEBUG simultaneous CREQ ep=0x772ea8005430(iface=0x3e0ce4c0 conn_sn=0 ep_id=0, dest_ep_id=16777215 rx_psn=0)
+[1780587168.884943] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:203  UCX  DEBUG mlx5_3: KSM atomic-key memory registration status "Success" range 0x772e80000000..0x772ed1200000 iova 0x772e800007f8 atomic mkey_index 0x0
+[1780587168.886611] [mx-crossnode-refit-target:1281 :1]           mpool.c:281  UCX  DEBUG mpool ud_recv_skb: allocated chunk 0x772e9c200018 of 20971496 bytes with 4964 elements
+[1780587168.887332] [mx-crossnode-refit-target:1281 :1]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e18d0c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.888006] [mx-crossnode-refit-target:1281 :1]    rc_mlx5_devx.c:506  UCX  DEBUG   connected rc devx qp 0x3941 on mlx5_3:1/IB to lid 1931(+0) sl 0 remote_qp 0x3941 mtu 4096 timer 18x7 rnr 13x7 rd_atom 16
+[1780587168.888008] [mx-crossnode-refit-target:1281 :1]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e18d0c0: ah_attr dlid=1931 sl=0 port=1 src_path_bits=0
+[1780587168.888668] [mx-crossnode-refit-target:1281 :1]    rc_mlx5_devx.c:506  UCX  DEBUG   connected rc devx qp 0x3943 on mlx5_3:1/IB to lid 1931(+0) sl 0 remote_qp 0x3943 mtu 4096 timer 18x7 rnr 13x7 rd_atom 16
+[1780587168.888687] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG   mpool ucp_rkeys: allocated chunk 0x3e3a31d0 of 16472 bytes with 128 elements
+[1780587168.888984] [mx-crossnode-refit-target:1281 :1]       wireup_ep.c:457  UCX  DEBUG ep 0x772eb1308080: destroy wireup ep 0x3ded79e0
+[1780587168.888985] [mx-crossnode-refit-target:1281 :1]       wireup_ep.c:457  UCX  DEBUG ep 0x772eb1308080: destroy wireup ep 0x3bea4f80
+[1780587168.889057] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:408  UCX  DEBUG created ep 0x772eb13080c0 to <no debug data> from api call
+[1780587168.889093] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:1912 UCX  INFO    ucp_context_0 inter-node cfg#2 rma(rc_mlx5/mlx5_3:1)  amo(rc_mlx5/mlx5_3:1)  am(rc_mlx5/mlx5_3:1 rc_mlx5/mlx5_3:1)  ka(ud_mlx5/mlx5_3:1)
+[1780587168.889934] [mx-crossnode-refit-target:1281 :0]          wireup.c:1267 UCX  DEBUG   ep 0x772eb13080c0: am_lane 0 wireup_msg_lane 2 cm_lane <none> keepalive_lane 2 reachable_mds 0x2
+[1780587168.889937] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb13080c0: lane[0]:  3:rc_mlx5/mlx5_3:1.0 md[1]      -> addr[3].md[1]/ib/sysdev[13] seg 8192 rma_bw#0 amo#0 am
+[1780587168.889939] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb13080c0: lane[1]:  3:rc_mlx5/mlx5_3:1.1 md[1]      -> addr[3].md[1]/ib/sysdev[13] seg 8192 rma_bw#1
+[1780587168.889940] [mx-crossnode-refit-target:1281 :0]          wireup.c:1290 UCX  DEBUG   ep 0x772eb13080c0: lane[2]:  4:ud_mlx5/mlx5_3:1.0 md[1]      -> addr[4].I0604 15:32:48.891908    1281 ucx_utils.cpp:152] ep 0x772eb13080c0: state 0 -> 1
+[mx-refit-crossnode] {"add_remote_agent_duration_ms": 2.9246939811855555, "phase": "target.add_remote_agent.done", "remote_agent_name": {"bytes": 43, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "source_id": "trainer-rank0"}
+[mx-refit-crossnode] {"phase": "target.read_segments.start", "primary_segment_count": 1, "recovery_segment_count": 1}
+I0604 15:32:48.892042    1281 nixl_agent.cpp:815] reqH descList size down to 1
+I0604 15:32:48.892056    1281 ucx_backend.cpp:1070] engine 0x3bf07330 bound shared worker 0 to thread 131060340294784
+E0604 15:32:48.901297    1281 nixl_agent.cpp:1178] getXferTelemetry: cannot return values when telemetry is not enabled.
+I0604 15:32:48.901439    1281 nixl_agent.cpp:815] reqH descList size down to 1
+E0604 15:32:48.902528    1281 nixl_agent.cpp:1178] getXferTelemetry: cannot return values when telemetry is not enabled.
+[mx-refit-crossnode] {"phase": "target.read_segments.done", "raw_nixl_read_duration_ms": 10.586734977550805}
+[mx-refit-crossnode] {"allclose": true, "checksum": 556224.0, "expected_checksum": 556224.0, "max_abs_error": 0.0, "phase": "target.validation.done"}
+{"control_plane": {"metadata_query_duration_ms": 30.89727694168687, "mode": "live-mx-cross-node", "planner_duration_ms": 0.17054704949259758, "server_url": "mx-server-rl:8001", "source_endpoints_from_control_plane": [{"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "metadata_bytes": 614, "metadata_endpoint": "", "mx_source_id": "a206fb91f3d65240", "ownership": {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank0-primary", "quantization_scope": "absent", "source_id": "trainer-rank0", "source_lease": "lease-rank0-primary", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, "source_id": "trainer-rank0", "tensor": {"addr": 128340283360768, "device_id": 0, "dtype": "float32", "name": "model.layers.0.mlp.experts.w1.weight", "size": 48}, "worker_grpc_endpoint": "", "worker_id": "rank0", "worker_rank": 0}, {"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "metadata_bytes": 614, "metadata_endpoint": "", "mx_source_id": "a206fb91f3d65240", "ownership": {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank1-primary", "quantization_scope": "absent", "source_id": "trainer-rank1", "source_lease": "lease-rank1-primary", "source_range": [[3, 8], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}, "source_id": "trainer-rank1", "tensor": {"addr": 128340283361280, "device_id": 0, "dtype": "float32", "name": "model.layers.0.mlp.experts.w1.weight", "size": 80}, "worker_grpc_endpoint": "", "worker_id": "rank1", "worker_rank": 1}, {"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "metadata_bytes": 614, "metadata_endpoint": "", "mx_source_id": "a206fb91f3d65240", "ownership": {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp-replica"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank2-alt", "quantization_scope": "absent", "source_id": "trainer-rank2-alt", "source_lease": "lease-rank2-alt", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}, "source_id": "trainer-rank2-alt", "tensor": {"addr": 128340283361792, "device_id": 0, "dtype": "float32", "name": "model.layers.0.mlp.experts.w1.weight", "size": 48}, "worker_grpc_endpoint": "", "worker_id": "rank2", "worker_rank": 2}]}, "distributed": {"backend": "nixl-read+mx-endpoint-control+no-torch-distributed", "cross_node": true, "gpu_reuse_used": false, "source_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h", "source_pod": "mx-crossnode-refit-source", "source_roles_in_source_pod": ["trainer-rank0", "trainer-rank1", "trainer-rank2-alt"], "target_agent_name": "mx-crossnode-target-mx-crossnode-1780587009", "target_node": "cluster-0967a26d-pool-14bee067-prctr-w4xnn", "target_pod": "mx-crossnode-refit-target", "world_size": 2}, "gpu_count": 2, "metadata_smokes": {"cross_framework_compatible_requests": {"frameworks": ["vllm", "sglang"], "passed": true, "same_source_publication": true}, "qwen_moe_expert_axis": {"passed": true, "sglang_segment_count": 2, "source_ids": ["moe-source-0", "moe-source-1"], "vllm_segment_count": 2}, "tensor_family_classification": {"model.layers.0.mlp.experts.w1.weight": "moe-expert-axis-shard", "model.layers.0.mlp.experts.w1.weight_scale_inv": "quantization-global-required-fallback", "model.rotary_emb.inv_freq": "generated-on-target"}}, "metrics": {"activation_install_duration_ms": 0.0, "gpu_copy_duration_ms": 0.0, "inference_side_fanout_bytes": 0, "metadata_query_duration_ms": 30.89727694168687, "nixl_add_remote_agent_duration_ms": 2.9246939811855555, "nixl_prep_duration_ms": 0.057284021750092506, "nixl_read_group_count": 2, "nixl_registration_duration_ms": 5.832401104271412, "planner_duration_ms": 0.17054704949259758, "publish_duration_ms": 0.0, "raw_nixl_read_duration_ms": 10.586734977550805, "recovery_segment_count": 1, "rediscovery_count": 1, "redundant_cross_boundary_factor": 1.0, "registration_duration_ms": 0.0, "retry_count": 1, "segment_count": 2, "source_count_per_target_tensor": {"inference-crossnode-target": 2}, "successful_nixl_source_count": 2, "trainer_to_inference_bytes": 64}, "mode": "nixl-crossnode-2pod", "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl": {"add_remote_agent_duration_ms": {"mx-crossnode-source-mx-crossnode-1780587009": 2.9246939811855555}, "nixl_backends": ["UCX"], "primary_reads": [{"backend": "UCX", "bytes": 48, "prep_duration_ms": 0.04112999886274338, "read_duration_ms": 9.213360026478767, "segment_count": 1, "segments": [{"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-crossnode-target", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "source_id": "trainer-rank1", "source_rank": 1, "telemetry": null}], "recovery_reads": [{"backend": "UCX", "bytes": 16, "prep_duration_ms": 0.01615402288734913, "read_duration_ms": 1.0731170186772943, "segment_count": 1, "segments": [{"bytes": 16, "lease_version": "lease-rank2-alt", "nixl_descriptor_id": "nixl-rank2-alt", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank2-alt", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-crossnode-target", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "source_id": "trainer-rank2-alt", "source_rank": 2, "telemetry": null}], "remote_agent_names": {"trainer-rank0": {"bytes": 43, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "trainer-rank1": {"bytes": 43, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "trainer-rank2-alt": {"bytes": 43, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}}, "source_metadata": {"trainer-rank0": {"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "device_id": 0, "metadata_bytes": 614, "registered_bytes": 48, "source_range": [[0, 3], [0, 4]], "worker_rank": 0}, "trainer-rank1": {"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "device_id": 0, "metadata_bytes": 614, "registered_bytes": 80, "source_range": [[3, 8], [0, 4]], "worker_rank": 1}, "trainer-rank2-alt": {"agent_name": "mx-crossnode-source-mx-crossnode-1780587009", "device_id": 0, "metadata_bytes": 614, "registered_bytes": 48, "source_range": [[0, 3], [0, 4]], "worker_rank": 2}}, "target_agent_name": "mx-crossnode-target-mx-crossnode-1780587009", "ucx": {"MX_NIXL_BACKEND": "UCX", "MX_RDMA_NIC_PIN": "auto", "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "", "UCX_IB_DEVICES": "", "UCX_MAX_RNDV_RAILS": "1", "UCX_NET_DEVICES": "mlx5_3:1", "UCX_RNDV_SCHEME": "get_zcopy", "UCX_RNDV_THRESH": "0", "UCX_TLS": "rc_x,rc,tcp,cuda_copy"}}, "planner": {"alternate_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp-replica"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank2-alt", "quantization_scope": "absent", "source_id": "trainer-rank2-alt", "source_lease": "lease-rank2-alt", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "control_plane_mode": "live-mx-cross-node", "discovered_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank0-primary", "quantization_scope": "absent", "source_id": "trainer-rank0", "source_lease": "lease-rank0-primary", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank1-primary", "quantization_scope": "absent", "source_id": "trainer-rank1", "source_lease": "lease-rank1-primary", "source_range": [[3, 8], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}, {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp-replica"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank2-alt", "quantization_scope": "absent", "source_id": "trainer-rank2-alt", "source_lease": "lease-rank2-alt", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "plan_source": "live-mx-server", "primary_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank0-primary", "quantization_scope": "absent", "source_id": "trainer-rank0", "source_lease": "lease-rank0-primary", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "nixl_descriptor_id": "nixl-rank1-primary", "quantization_scope": "absent", "source_id": "trainer-rank1", "source_lease": "lease-rank1-primary", "source_range": [[3, 8], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "primary_segment_plans": [{"bytes": 16, "lease_version": "lease-rank0-primary", "nixl_descriptor_id": "nixl-rank0-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank0", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-crossnode-target", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-crossnode-target", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "primary_segment_plans_json": [{"bytes": 16, "lease_version": "lease-rank0-primary", "nixl_descriptor_id": "nixl-rank0-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank0", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-crossnode-target", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-crossnode-target", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "recovery_segment_plans": [{"bytes": 16, "lease_version": "lease-rank2-alt", "nixl_descriptor_id": "nixl-rank2-alt", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank2-alt", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-crossnode-target", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "request": {"destination_strides": null, "dtype": "float32", "element_size_bytes": null, "layout_tags": {"ep": 2, "moe_expert_axis": 0, "storage_layout": "row-major", "target_layout": "tp2-ep2", "tp": 2}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001-mx-crossnode-1780587009", "quantization_scope": "absent", "requested_range": [[2, 6], [0, 4]], "runtime_framework": "vllm", "target_id": "inference-crossnode-target", "target_offset_bytes": 0, "target_shape": [4, 4], "tensor_name": "model.layers.0.mlp.experts.w1.weight"}, "simulation": {"inference_side_fanout_bytes": 0, "planner_duration_ms": null, "predicted_bottleneck": "trainer-to-inference", "preferred_strategy": "direct-bipartite-p2p", "redundant_cross_boundary_factor": 1.0, "segment_count": 2, "source_balance_bytes": {"trainer-rank0": 16, "trainer-rank1": 48}, "source_count_per_target_tensor": {"inference-crossnode-target": 2}, "target_balance_bytes": {"inference-crossnode-target": 64}, "trainer_to_inference_bytes": 64, "uncovered_ranges": []}}, "proof": {"actual_nixl_reads_used": true, "cross_node_pods": true, "failed_source_ids": ["trainer-rank0"], "failed_then_succeeded": true, "gpu_target_assembly_succeeded": true, "host_side_torch_cat_used": false, "live_mx_returned_metadata_used_for_nixl_plan": true, "mlx5_bond_excluded_from_ucx_devices": true, "nixl_reads_land_at_segment_offsets": true, "nixl_source_endpoints_from_mx": true, "replanned_only_failed_segments": true, "source_pod_separate_from_target_pod": true, "target_buffer_preallocated": true, "target_slice_spans_multiple_trainers": true, "torch_distributed_control_plane_used": false, "torch_distributed_data_transfer_used": false, "torch_distributed_nixl_metadata_exchange_used": false, "trainer_full_all_gather_used": false, "trainer_side_inference_layout_conversion_used": false, "ucx_ib_rc_requested": true}, "result": "pass", "schema_version": 1, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "validation": {"allclose": true, "checksum": 556224.0, "expected_checksum": 556224.0, "max_abs_error": 0.0}}I0604 15:32:49.004182    1371 ucx_backend.cpp:367] shared thread 0x3dec8010{engine: 0x3bf07330, worker_ids: [0]} exiting
+md[1]/ib/sysdev[13] seg 4032 keepalive wireup
+[1780587168.889949] [mx-crossnode-refit-target:1281 :0]          wireup.c:1293 UCX  DEBUG   ep 0x772eb13080c0: err mode 1, flags 0x0
+[1780587168.891018] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:165  UCX  DEBUG   created rc ep 0x3e43b080
+[1780587168.891021] [mx-crossnode-refit-target:1281 :0]       wireup_ep.c:525  UCX  DEBUG   ep 0x772eb13080c0: wireup_ep 0x3bf28df0 created next_ep 0x3e43b080 to <no debug data> using rc_mlx5/mlx5_3:1
+[1780587168.891885] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:165  UCX  DEBUG   created rc ep 0x3decc010
+[1780587168.891887] [mx-crossnode-refit-target:1281 :0]       wireup_ep.c:525  UCX  DEBUG   ep 0x772eb13080c0: wireup_ep 0x3bea5930 created next_ep 0x3decc010 to <no debug data> using rc_mlx5/mlx5_3:1
+[1780587168.891890] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=643 sl=0 port=1 src_path_bits=0
+[1780587168.891892] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=643 sl=0 port=1 src_path_bits=0
+[1780587168.891895] [mx-crossnode-refit-target:1281 :0]           ud_ep.c:423  UCX  DEBUG   created ep ep=0x3e4479d0 iface=0x3e0ce4c0 id=1
+[1780587168.891898] [mx-crossnode-refit-target:1281 :0]           ud_ep.c:526  UCX  DEBUG   mlx5_3:1/IB lid 1931 qpn 0x4964 epid 1 ep 0x3e4479d0 connected to IFACE lid 643 fe80:: pkey 0xffff qpn 0x5548
+[1780587168.891899] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=643 sl=0 port=1 src_path_bits=0
+[1780587168.891900] [mx-crossnode-refit-target:1281 :0]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e0ce4c0: ah_attr dlid=643 sl=0 port=1 src_path_bits=0
+[1780587168.891904] [mx-crossnode-refit-target:1281 :0]          wireup.c:2003 UCX  DEBUG ep 0x772eb13080c0: send wireup request (flags=0x4040)
+[1780587168.892072] [mx-crossnode-refit-target:1281 :0]           mpool.c:281  UCX  DEBUG mpool ucp_requests: allocated chunk 0x3e4582a4 of 41044 bytes with 128 elements
+[1780587168.892199] [mx-crossnode-refit-target:1281 :0]           flush.c:455  UCX  DEBUG flush_nbx ep 0x772eb13080c0
+[1780587168.896052] [mx-crossnode-refit-target:1281 :1]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e18d0c0: ah_attr dlid=643 sl=0 port=1 src_path_bits=0
+[1780587168.896727] [mx-crossnode-refit-target:1281 :1]    rc_mlx5_devx.c:506  UCX  DEBUG   connected rc devx qp 0x3944 on mlx5_3:1/IB to lid 643(+0) sl 0 remote_qp 0x4416 mtu 4096 timer 18x7 rnr 13x7 rd_atom 16
+[1780587168.896728] [mx-crossnode-refit-target:1281 :1]        ib_iface.c:1063 UCX  DEBUG   iface 0x3e18d0c0: ah_attr dlid=643 sl=0 port=1 src_path_bits=0
+[1780587168.897374] [mx-crossnode-refit-target:1281 :1]    rc_mlx5_devx.c:506  UCX  DEBUG   connected rc devx qp 0x3945 on mlx5_3:1/IB to lid 643(+0) sl 0 remote_qp 0x4417 mtu 4096 timer 18x7 rnr 13x7 rd_atom 16
+[1780587168.897376] [mx-crossnode-refit-target:1281 :1]       wireup_ep.c:457  UCX  DEBUG ep 0x772eb13080c0: destroy wireup ep 0x3bf28df0
+[1780587168.897377] [mx-crossnode-refit-target:1281 :1]       wireup_ep.c:457  UCX  DEBUG ep 0x772eb13080c0: destroy wireup ep 0x3bea5930
+[1780587168.900061] [mx-crossnode-refit-target:1281 :1]           mpool.c:281  UCX  DEBUG mpool rc_send_desc: allocated chunk 0x772e9e400018 of 10485736 bytes with 1260 elements
+[1780587168.900212] [mx-crossnode-refit-target:1281 :1]           mpool.c:281  UCX  DEBUG mpool send-ops-mpool: allocated chunk 0x772e580015f0 of 16472 bytes with 256 elements
+[1780587168.900336] [mx-crossnode-refit-target:1281 :1]           mpool.c:136  UCX  DEBUG mpool cuda_event_descriptors: align 64, maxelems 4294967295, elemsize 32
+[1780587168.901454] [mx-crossnode-refit-target:1281 :0]           flush.c:455  UCX  DEBUG flush_nbx ep 0x772eb13080c0
+[1780587169.004240] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1757 UCX  DEBUG ep 0x772eb13080c0 flags 0x4097 cfg_index 2: close_nbx(flags=0x0)
+[1780587169.004243] [mx-crossnode-refit-target:1281 :0]           flush.c:455  UCX  DEBUG close ep 0x772eb13080c0
+[1780587169.004254] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1757 UCX  DEBUG ep 0x772eb1308080 flags 0x4097 cfg_index 1: close_nbx(flags=0x0)
+[1780587169.004254] [mx-crossnode-refit-target:1281 :0]           flush.c:455  UCX  DEBUG close ep 0x772eb1308080
+[1780587169.004256] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:2923 UCX  DEBUG destroy worker 0x3df3c4f0
+[1780587169.004258] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:2909 UCX  DEBUG worker 0x3df3c4f0: destroy all endpoints
+[1780587169.004259] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb1308080: purge uct_ep[0]=0x3debd010
+[1780587169.004263] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb1308080: purge uct_ep[1]=0x3dec1230
+[1780587169.004264] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb1308080: purge uct_ep[2]=0x772ea8005430
+[1780587169.004265] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1291 UCX  DEBUG ep 0x772eb1308080: destroy
+[1780587169.004266] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1609 UCX  DEBUG ep 0x772eb1308080: cleanup lanes
+[1780587169.004267] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb1308080: pending & destroy uct_ep[0]=0x3debd010
+[1780587169.004273] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:1002 UCX  DEBUG device uverbs3: modify QP 0x3debd058 num 0x3941 to state 6
+[1780587169.004700] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:185  UCX  DEBUG destroy rc ep 0x3debd010
+[1780587169.004703] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb1308080: pending & destroy uct_ep[1]=0x3dec1230
+[1780587169.004704] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:1002 UCX  DEBUG device uverbs3: modify QP 0x3dec1278 num 0x3943 to state 6
+[1780587169.005383] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:185  UCX  DEBUG destroy rc ep 0x3dec1230
+[1780587169.005384] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb1308080: pending & destroy uct_ep[2]=0x772ea8005430
+[1780587169.005386] [mx-crossnode-refit-target:1281 :0]           ud_ep.c:1819 UCX  DEBUG ep 0x772ea8005430: disconnect
+[1780587169.005389] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb13080c0: purge uct_ep[0]=0x3e43b080
+[1780587169.005390] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb13080c0: purge uct_ep[1]=0x3decc010
+[1780587169.005390] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb13080c0: purge uct_ep[2]=0x3e4479d0
+[1780587169.005391] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1291 UCX  DEBUG ep 0x772eb13080c0: destroy
+[1780587169.005391] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1609 UCX  DEBUG ep 0x772eb13080c0: cleanup lanes
+[1780587169.005392] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb13080c0: pending & destroy uct_ep[0]=0x3e43b080
+[1780587169.005393] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:1002 UCX  DEBUG device uverbs3: modify QP 0x3e43b0c8 num 0x3944 to state 6
+[1780587169.005966] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:185  UCX  DEBUG destroy rc ep 0x3e43b080
+[1780587169.005967] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb13080c0: pending & destroy uct_ep[1]=0x3decc010
+[1780587169.005968] [mx-crossnode-refit-target:1281 :0]         ib_mlx5.c:1002 UCX  DEBUG device uverbs3: modify QP 0x3decc058 num 0x3945 to state 6
+[1780587169.006560] [mx-crossnode-refit-target:1281 :0]           rc_ep.c:185  UCX  DEBUG destroy rc ep 0x3decc010
+[1780587169.006561] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb13080c0: pending & destroy uct_ep[2]=0x3e4479d0
+[1780587169.006562] [mx-crossnode-refit-target:1281 :0]           ud_ep.c:1819 UCX  DEBUG ep 0x3e4479d0: disconnect
+[1780587169.006570] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:2909 UCX  DEBUG worker 0x3df3c4f0: destroy internal endpoints
+[1780587169.006574] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb1308000: purge uct_ep[0]=0x3e0d7e20
+[1780587169.006575] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1291 UCX  DEBUG ep 0x772eb1308000: destroy
+[1780587169.006576] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1609 UCX  DEBUG ep 0x772eb1308000: cleanup lanes
+[1780587169.006577] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb1308000: pending & destroy uct_ep[0]=0x3e0d7e20
+[1780587169.006579] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1284 UCX  DEBUG ep 0x772eb1308040: purge uct_ep[0]=0x3e0d7e00
+[1780587169.006580] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1291 UCX  DEBUG ep 0x772eb1308040: destroy
+[1780587169.006581] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1609 UCX  DEBUG ep 0x772eb1308040: cleanup lanes
+[1780587169.006581] [mx-crossnode-refit-target:1281 :0]          ucp_ep.c:1620 UCX  DEBUG ep 0x772eb1308040: pending & destroy uct_ep[0]=0x3e0d7e00
+[1780587169.006582] [mx-crossnode-refit-target:1281 :0]      ucp_worker.c:244  UCX  DEBUG worker 0x3df3c4f0: remove active message handlers
+[1780587169.006593] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ucp_reg_bufs destroyed
+[1780587169.006594] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ucp_am_bufs destroyed
+[1780587169.006595] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ucp_am_bufs destroyed
+[1780587169.006596] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ucp_am_bufs destroyed
+[1780587169.006599] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ucp_rkeys destroyed
+[1780587169.006600] [mx-crossnode-refit-target:1281 :a]       ib_device.c:519  UCX  DEBUG IB Async event on mlx5_3: SRQ-attached QP 0x3941 was flushed
+[1780587169.006604] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ucp_requests destroyed
+[1780587169.006606] [mx-crossnode-refit-target:1281 :a]       ib_device.c:519  UCX  DEBUG IB Async event on mlx5_3: SRQ-attached QP 0x3943 was flushed
+[1780587169.006608] [mx-crossnode-refit-target:1281 :a]       ib_device.c:519  UCX  DEBUG IB Async event on mlx5_3: SRQ-attached QP 0x3944 was flushed
+[1780587169.006613] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dee4d40 [id=67 ref 1] ???() from hash
+[1780587169.006618] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dee4d40 [id=67 ref 1] ???()
+[1780587169.006620] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dee4d40 [id=67 ref 0] ???()
+[1780587169.006624] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool cuda_event_descriptors destroyed
+[1780587169.006649] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dee4d80 [id=61 ref 1] ???() from hash
+[1780587169.006651] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dee4d80 [id=61 ref 1] ???()
+[1780587169.006653] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dee4d80 [id=61 ref 0] ???()
+[1780587169.006656] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rc_verbs_short_desc destroyed
+[1780587169.007161] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool send-ops-mpool destroyed
+[1780587169.007162] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rc_send_desc destroyed
+[1780587169.007162] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rc_recv_desc destroyed
+[1780587169.007163] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool pending-ops destroyed
+[1780587169.007943] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec2620 [id=62 ref 1] ???() from hash
+[1780587169.007948] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec2620 [id=62 ref 1] ???()
+[1780587169.007950] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec2620 [id=62 ref 0] ???()
+[1780587169.007952] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:623  UCX  DEBUG iface(0x3e01c010): cep cleanup
+[1780587169.007953] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ud_tx_skb destroyed
+[1780587169.009111] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ud_recv_skb destroyed
+[1780587169.009112] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:636  UCX  DEBUG iface(0x3e01c010): ptr_array cleanup
+[1780587169.009629] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3ded1d60 [id=65 ref 1] ???() from hash
+[1780587169.009631] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3ded1d60 [id=65 ref 1] ???()
+[1780587169.009633] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3ded1d60 [id=65 ref 0] ???()
+[1780587169.013909] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec5380 [id=64 ref 1] ???() from hash
+[1780587169.013913] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec5380 [id=64 ref 1] ???()
+[1780587169.013915] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec5380 [id=64 ref 0] ???()
+[1780587169.013921] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rc_mlx5_atomic_desc destroyed
+[1780587169.013922] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool mlx5_dm_desc destroyed
+[1780587169.015509] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool send-ops-mpool destroyed
+[1780587169.015860] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rc_send_desc destroyed
+[1780587169.016330] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rc_recv_desc destroyed
+[1780587169.016331] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool pending-ops destroyed
+[1780587169.017332] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3e42ad60 [id=1000021 ref 1] ???() from hash
+[1780587169.017334] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3e42ad60 [id=1000021 ref 1] ???()
+[1780587169.017336] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3e42ad60 [id=1000021 ref 0] ???()
+[1780587169.017337] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3ded1a70 [id=66 ref 1] ???() from hash
+[1780587169.017338] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3ded1a70 [id=66 ref 1] ???()
+[1780587169.017340] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3ded1a70 [id=66 ref 0] ???()
+[1780587169.017346] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:623  UCX  DEBUG iface(0x3e0ce4c0): cep cleanup
+[1780587169.017803] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ud_tx_skb destroyed
+[1780587169.019305] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool ud_recv_skb destroyed
+[1780587169.019306] [mx-crossnode-refit-target:1281 :0]        ud_iface.c:636  UCX  DEBUG iface(0x3e0ce4c0): ptr_array cleanup
+[1780587169.020258] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3ded8cd0 [id=57 ref 1] ???() from hash
+[1780587169.020259] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handle
+r 0x3ded8cd0 [id=57 ref 1] ???()
+[1780587169.020269] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3ded8cd0 [id=57 ref 0] ???()
+[1780587169.020656] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool rcache_mp destroyed
+[1780587169.020662] [mx-crossnode-refit-target:1281 :0]    ib_mlx5dv_md.c:2677 UCX  DEBUG mlx5_3: md=0x3ded6240 md->flags=0x3f51f7f flush_rkey=0x1fff00
+[1780587169.021568] [mx-crossnode-refit-target:1281 :0]           mpool.c:194  UCX  DEBUG mpool devx dbrec destroyed
+[1780587169.021580] [mx-crossnode-refit-target:1281 :0]       ib_device.c:669  UCX  DEBUG destroying ib device mlx5_3
+[1780587169.021596] [mx-crossnode-refit-target:1281 :0]           async.c:172  UCX  DEBUG removed async handler 0x3dec5a50 [id=53 ref 1] ???() from hash
+[1780587169.021598] [mx-crossnode-refit-target:1281 :0]           async.c:575  UCX  DEBUG removing async handler 0x3dec5a50 [id=53 ref 1] ???()
+[1780587169.021814] [mx-crossnode-refit-target:1281 :0]           async.c:187  UCX  DEBUG release async handler 0x3dec5a50 [id=53 ref 0] ???()

@@ -1,0 +1,17 @@
+I0604 15:30:22.130852    1188 nixl_log.cpp:79] NIXL version: 0.10.1 (git: d5c127e5)
+2026-06-04 15:30:22 NIXL INFO    logging.py:82 Log level set to INFO from NIXL_LOG_LEVEL environment variable
+I0604 15:30:22.692983    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: OBJ
+I0604 15:30:22.694239    1188 nixl_plugin_manager.cpp:245] Failed to load plugin from /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/libplugin_GPUNETIO.so: /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libmlx5-79ef1d27.so.1.24.48.0: version `MLX5_1.25' not found (required by /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/../../nixl_cu12.libs/libdoca_common-d1bdeaea.so.3.2.0118)
+I0604 15:30:22.694254    1188 nixl_plugin_manager.cpp:398] Failed to load plugin 'GPUNETIO' from any directory
+I0604 15:30:22.694546    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: POSIX
+I0604 15:30:22.696222    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: AZURE_BLOB
+I0604 15:30:22.696768    1188 nixl_plugin_manager.cpp:472] Discovered and loaded telemetry plugin: prometheus
+I0604 15:30:22.696908    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: GDS
+I0604 15:30:22.740322    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: UCX
+I0604 15:30:22.740709    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: GUSLI
+I0604 15:30:22.741085    1188 nixl_plugin_manager.cpp:245] Failed to load plugin from /usr/local/lib/python3.12/dist-packages/nixl_cu12/../.nixl_cu12.mesonpy.libs/plugins/libplugin_LIBFABRIC.so: libfabric.so.1: cannot open shared object file: No such file or directory
+I0604 15:30:22.741094    1188 nixl_plugin_manager.cpp:398] Failed to load plugin 'LIBFABRIC' from any directory
+I0604 15:30:22.741304    1188 nixl_plugin_manager.cpp:460] Discovered and loaded backend plugin: GDS_MT
+I0604 15:30:22.741314    1188 nixl_plugin_manager.cpp:614] Loading static plugin: BUFFER
+2026-06-04 15:30:23 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-04 15:30:23 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-crossnode-source-mx-crossnode-1780587009

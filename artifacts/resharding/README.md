@@ -72,6 +72,45 @@ Files:
   verification that was capacity-blocked (`Insufficient nvidia.com/gpu`;
   autoscaler max size reached). It is superseded by
   `nscale-live-mx-nixl-refit.json`.
+- `nscale-crossnode-mx-nixl-capacity.log`: placement evidence for the completed
+  two-pod cross-node proof. It records `mx-crossnode-refit-source` and
+  `mx-crossnode-refit-target` running on distinct GPU nodes.
+- `nscale-crossnode-mx-nixl-source.json`: source-side publication artifact for
+  the completed cross-node proof. It records source endpoint publication
+  through MX, UCX backend selection, automatic non-bond NIC pinning, and the
+  source pod/node.
+- `nscale-crossnode-mx-nixl-source.log`: source-side NIXL/UCX startup log for
+  the completed cross-node proof.
+- `nscale-crossnode-mx-nixl-refit.json`: completed two-pod cross-node live-MX
+  NIXL endpoint proof. The target pod on a second GPU node discovers source
+  NIXL endpoint metadata from MX, plans from MX-returned ownership metadata,
+  performs actual UCX/IB rc NIXL READs into planned target offsets, and
+  validates checksum/allclose. The artifact records `cross_node=true`,
+  `nixl_source_endpoints_from_mx=true`,
+  `torch_distributed_nixl_metadata_exchange_used=false`,
+  `UCX_TLS=rc_x,rc,tcp,cuda_copy`, `UCX_NET_DEVICES=mlx5_3:1`, and
+  `mlx5_bond_excluded_from_ucx_devices=true`.
+- `nscale-crossnode-mx-nixl-refit.log`: target-side UCX/NIXL debug log for the
+  completed cross-node proof, including endpoint wait, NIXL agent construction,
+  remote-agent add, inter-node rc lane setup, segment READs, and validation.
+- `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
+  pytest run inside the nscale target pod after the cross-node patch
+  (`8 passed`). It covers the MX refit endpoint helper path, including legacy
+  sidecar recovery when a live server drops `slice_ownerships`.
+- `nscale-cpu-crossnode-final-verify.log`: final nscale CPU verification for
+  this change. It runs syntax checks on the changed Python modules, validates
+  the cross-node and capacity-block JSON artifacts, and reruns the focused
+  control-plane pytest (`8 passed`).
+- `nscale-one-pod-per-source-capacity-block.log` and
+  `nscale-one-pod-per-source-capacity-block.json`: honest capacity block for
+  the stricter one-pod-per-source-rank proof. Three independent source-rank GPU
+  pods remained Pending with `0/29 nodes`, `10 Insufficient nvidia.com/gpu`,
+  and autoscaler max node group size reached. No target pod was created and no
+  checksum claim is made.
+- `nscale-level5-timing-capacity-block.json`: honest block for the requested
+  real Level-5 timing table. MX/NIXL, NCCL Reshard, and CheckpointEngine
+  measured timings were not run because the required multi-GPU nscale capacity
+  was unavailable.
 - `qwen3-30b-a3b-moe-manifest.json.gz` and
   `qwen3-30b-a3b-moe-manifest.summary.json`: real Qwen/Qwen3-30B-A3B
   safetensors-header coverage artifact generated through HTTP range reads over
@@ -90,6 +129,8 @@ Files:
   quantization metadata, generated-on-target tensors, and layout-sensitive
   shared-expert tensors.
 
-The NIXL JSON is the primary Level 2 proof artifact. The live-MX NIXL endpoint
-JSON is the strongest current Level 3 same-node proof artifact. The NCCL
-distributed JSON remains the Level 1 comparison artifact.
+The NIXL JSON is the primary Level 2 same-node proof artifact. The cross-node
+live-MX NIXL endpoint JSON is the strongest current Level 3 synthetic proof
+artifact. The NCCL distributed JSON remains the Level 1 comparison artifact.
+One-pod-per-source-rank and real Level-5 timing remain blocked/unproven until
+fresh capacity allows checksum-backed runs.
