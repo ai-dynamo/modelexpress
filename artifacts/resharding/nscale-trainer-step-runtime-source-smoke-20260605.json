@@ -1,0 +1,46 @@
+{
+  "full_checksum": -430.2265625,
+  "local_session_date": "2026-06-05",
+  "mode": "trainer-step-runtime-source-helper-smoke",
+  "proof": {
+    "gpu_runtime_smoke": false,
+    "real_rl_training_loop_used": false,
+    "static_replacement_formula_source_values_used": false,
+    "synthetic_training_objective_used": true,
+    "trainer_optimizer_step_publisher_used": true,
+    "trainer_owned_parameter_tensor_used": true
+  },
+  "provenance": {
+    "learning_rate": 0.125,
+    "optimizer": "SGD",
+    "optimizer_step_count": 1,
+    "optimizer_step_publisher_used": true,
+    "real_rl_training_loop_used": false,
+    "source_payload_generator": "torch.optim.SGD",
+    "static_replacement_formula_used": false,
+    "synthetic_training_objective_used": true,
+    "trainer_owned_parameter_tensor_used": true
+  },
+  "range_matches_full_replacement": true,
+  "result": "pass",
+  "schema_version": 1,
+  "shape": [
+    7,
+    4
+  ],
+  "source_checksum": -244.46875,
+  "source_range": [
+    [
+      2,
+      6
+    ],
+    [
+      0,
+      4
+    ]
+  ],
+  "source_shape": [
+    4,
+    4
+  ]
+}

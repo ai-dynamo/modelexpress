@@ -215,6 +215,10 @@ Files:
   4-GPU pod stayed Pending with `0/29 nodes`,
   `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler
   max node group size reached.
+- `nscale-level5-baseline-capacity-block-20260605.json` and
+  `nscale-level5-baseline-capacity-block-20260605.log`: fresh 2026-06-05
+  rerun of the same 4-GPU checksum-backed Level-5 baseline pod. It hit the same
+  scheduler/autoscaler block, so the normalized Level-5 table remains unproven.
 - `nscale-level5-existing-job-evidence-audit.json`: audit of existing nscale
   timing jobs that looked close to Level-5 evidence. It banks real Qwen3 BF16
   full-model/vLLM timing context for MX live refit, NCCL, and
@@ -297,10 +301,26 @@ Files:
   `source_rank_owned_trainer_tensors_used=true`, 4,096 trainer-to-inference
   bytes, about 0.94 ms raw NIXL read duration, about 0.18 ms in-worker
   activation install duration, and about 84.3 ms end-to-end `apply_model`
-  install duration. Scope boundary: this is same-node/one-pod evidence with GPU
-  reuse; NIXL lands in staging and is copied through `apply_model`, so it is not
-  cross-node, not direct NIXL landing into vLLM-owned storage, and not a live
-  trainer optimizer loop.
+  install duration. Scope boundary: this committed GPU artifact is
+  same-node/one-pod evidence with GPU reuse and the earlier deterministic
+  source values; NIXL lands in staging and is copied through `apply_model`, so
+  it is not cross-node, not direct NIXL landing into vLLM-owned storage, and not
+  a live trainer optimizer loop.
+- `nscale-trainer-step-runtime-source-smoke-20260605.json` and
+  `nscale-trainer-step-runtime-source-pytest-20260605.log`: nscale CPU evidence
+  for the new optimizer-step source publisher used by the vLLM/SGLang NIXL
+  runtime bridge source helpers. It runs a source-rank `torch.optim.SGD` step
+  over a synthetic objective, materializes only the source-owned range, proves
+  that range reconstructs the post-step full target slice, and records
+  `optimizer_step_publisher_used=true` plus
+  `static_replacement_formula_used=false` (`13 passed`). This is code-path
+  evidence only; it is not a live GPU runtime rerun.
+- `nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json` and
+  `.log`: honest block for the attempted live vLLM+NIXL runtime GPU rerun using
+  the optimizer-step source publisher patch. The 1-GPU pod stayed Pending with
+  `0/29 nodes`, `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and
+  autoscaler max node group size reached, so no new vLLM GPU runtime claim is
+  made.
 - `nscale-sglang-receiver-smoke.json` and
   `nscale-sglang-receiver-smoke.log`: SGLang-shaped module-owned receiver smoke
   using `modelexpress.refit_sglang_receiver_smoke`. It builds an SGLang
@@ -367,10 +387,12 @@ live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
 artifacts, with the one-pod-per-source-rank, stale-source recovery, and
 hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
 claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
-artifacts, but both remain one-pod/GPU-reuse proofs with deterministic
-trainer-like source values and staging-copy runtime APIs. The NCCL distributed
-JSON remains the Level 1 comparison artifact. Existing Qwen3 timing jobs are now
-banked as partial competitive context. The Level-5 normalizer/baseline harness
-now exists, but real Level-5 timing remains unproven until comparable
-checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine rows are completed
-in the same placement scope.
+artifacts, but both committed GPU artifacts remain one-pod/GPU-reuse proofs
+with deterministic trainer-like source values and staging-copy runtime APIs.
+The current branch has CPU-tested optimizer-step source-publisher code for the
+runtime bridges, with a live vLLM GPU rerun capacity-blocked on 2026-06-05. The
+NCCL distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
+timing jobs are now banked as partial competitive context. The Level-5
+normalizer/baseline harness now exists, but real Level-5 timing remains unproven
+until comparable checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine
+rows are completed in the same placement scope.

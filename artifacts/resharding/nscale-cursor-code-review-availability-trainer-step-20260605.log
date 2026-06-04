@@ -1,0 +1,12 @@
+cursor-code-review availability check on nscale
+Thu Jun  4 22:59:03 UTC 2026
+PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+cursor-code-review not found in PATH
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-hardkill.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-sglang-engine.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-sglang-nixl-runtime.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-sglang-smoke.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-trainer-step-20260605.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-vllm-applymodel.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-vllm-nixl-runtime.log
+/workspace/modelexpress/artifacts/resharding/nscale-cursor-code-review-availability-vllm-smoke.log

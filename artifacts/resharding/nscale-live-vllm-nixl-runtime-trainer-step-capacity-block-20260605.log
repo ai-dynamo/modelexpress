@@ -1,0 +1,9 @@
+Name:             mx-vllm-trainerstep-20260605-005556
+Namespace:        anish-dynamo
+Status:           Pending until deleted after scheduler block
+Requested GPUs:   1
+Purpose:          Run live vLLM+NIXL runtime smoke with optimizer-step source publisher patch
+
+Events:
+2026-06-04T22:56:01Z	Normal	NotTriggerScaleUp	pod didn't trigger scale-up: 1 max node group size reached
+2026-06-04T22:56:21Z	Warning	FailedScheduling	0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.

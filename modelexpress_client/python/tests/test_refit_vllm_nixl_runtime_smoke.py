@@ -80,6 +80,8 @@ def test_vllm_nixl_runtime_plan_splits_source_rank_owned_rows():
     assert [owner.worker_rank for owner in owners] == [0, 1]
     assert owners[0].source_range == ((0, 3), (0, 4))
     assert owners[1].source_range == ((3, 7), (0, 4))
+    assert owners[0].layout_tags["optimizer_step_publisher"] is True
+    assert owners[1].layout_tags["synthetic_training_objective"] is True
     assert [plan.source_id for plan in plans] == ["trainer-rank0", "trainer-rank1"]
     assert [plan.target_byte_offset for plan in plans] == [0, 48]
     assert [plan.bytes for plan in plans] == [48, 64]
@@ -165,9 +167,15 @@ def test_vllm_nixl_runtime_refit_installs_and_restores_worker_weight(tmp_path):
     assert result["proof"]["actual_nixl_reads_used"] is True
     assert result["proof"]["source_rank_owned_trainer_tensors_used"] is True
     assert result["proof"]["trainer_like_source_processes_used"] is True
+    assert result["proof"]["trainer_optimizer_step_publisher_used"] is True
+    assert result["proof"]["trainer_owned_parameter_tensor_used"] is True
     assert result["proof"]["real_training_loop_used"] is False
+    assert result["proof"]["real_rl_training_loop_used"] is False
+    assert result["proof"]["synthetic_training_objective_used"] is True
     assert result["proof"]["synthetic_trainer_payloads_used"] is False
-    assert result["proof"]["synthetic_source_values_used"] is True
+    assert result["proof"]["synthetic_source_values_used"] is False
+    assert result["proof"]["static_replacement_formula_source_values_used"] is False
+    assert result["trainer_source_update"]["optimizer_step_publisher_used"] is True
     assert result["proof"]["nixl_reads_land_directly_in_runtime_tensor"] is False
     assert result["proof"]["runtime_update_from_nixl_staging_tensor"] is True
     assert result["proof"]["runtime_update_payload_copied_through_apply_model"] is True

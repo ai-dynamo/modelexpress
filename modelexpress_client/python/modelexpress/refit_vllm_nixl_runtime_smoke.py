@@ -12,7 +12,8 @@ weight.
 
 The NIXL reads do not land directly in vLLM-owned storage; the target copies the
 assembled staging tensor through the apply_model callback boundary. Source
-values are deterministic POC values, not a live optimizer step.
+values come from a source-rank optimizer-step publisher over a small synthetic
+objective, not from the older static replacement formula or a full RL loop.
 """
 
 from __future__ import annotations
@@ -34,6 +35,11 @@ from .refit_nixl import (
     apply_nixl_ucx_pin,
     read_segment_groups,
     select_cuda_device,
+)
+from .refit_trainer_step import (
+    materialize_trainer_step_source_tensor,
+    trainer_step_replacement_tensor,
+    trainer_step_source_provenance,
 )
 from .refit_vllm_receiver_smoke import (
     _json_default,
@@ -114,12 +120,7 @@ def _replacement_tensor(
     dtype: torch.dtype,
     device: torch.device | str,
 ) -> torch.Tensor:
-    numel = 1
-    for dim in shape:
-        numel *= int(dim)
-    values = torch.arange(numel, device=device, dtype=torch.float32)
-    values = ((values % 257) - 128) / 8
-    return values.reshape(shape).to(dtype=dtype)
+    return trainer_step_replacement_tensor(shape, dtype=dtype, device=device)
 
 
 def _range_slices(tensor_range: TensorRange) -> tuple[slice, ...]:
@@ -150,6 +151,9 @@ def build_vllm_nixl_source_ownerships(
         "storage_layout": "row-major",
         "source_tensor_owner": "torchrun-trainer-rank",
         "runtime_refit_target": "vllm.LLM.apply_model",
+        "trainer_update_source": "torch.optim.SGD-step-publisher",
+        "optimizer_step_publisher": True,
+        "synthetic_training_objective": True,
     }
     return [
         SliceOwnership(
@@ -230,12 +234,11 @@ def materialize_vllm_nixl_source_tensor(
 ) -> torch.Tensor:
     """Create the rank-owned trainer payload for one source range."""
 
-    full_replacement = _replacement_tensor(
-        owner.global_shape,
+    return materialize_trainer_step_source_tensor(
+        owner,
         dtype=dtype,
         device=device,
     )
-    return full_replacement[_range_slices(owner.source_range)].contiguous()
 
 
 def _inspect_vllm_worker_model(
@@ -486,9 +489,14 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
         "source_rank_owned_trainer_tensors_used": True,
         "trainer_like_source_processes_used": True,
         "real_trainer_process_used": False,
+        "trainer_optimizer_step_publisher_used": True,
+        "trainer_owned_parameter_tensor_used": True,
         "real_training_loop_used": False,
+        "real_rl_training_loop_used": False,
+        "synthetic_training_objective_used": True,
         "synthetic_trainer_payloads_used": False,
-        "synthetic_source_values_used": True,
+        "synthetic_source_values_used": False,
+        "static_replacement_formula_source_values_used": False,
         "target_slice_spans_multiple_trainers": source_count >= 2,
         "checksum_gate": bool(validation["checksum_matches"]),
         "staging_checksum_gate": staging_checksum_matches,
@@ -556,6 +564,7 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
         },
         "distributed": distributed,
         "nixl": {"reads": nixl_reads},
+        "trainer_source_update": trainer_step_source_provenance(),
         "worker_result_count": len(worker_results),
         "runtime_module_discovery_path": "vllm.apply_model",
     }
@@ -746,6 +755,7 @@ def run_vllm_nixl_runtime_refit_distributed(
                     "tensor_bytes": int(
                         source_tensor.numel() * source_tensor.element_size()
                     ),
+                    "source_payload_provenance": trainer_step_source_provenance(),
                 }
             )
         elif rank == target_rank:
@@ -858,6 +868,9 @@ def run_vllm_nixl_runtime_refit_distributed(
                         "registered_bytes": info["registered_bytes"],
                         "registration_duration_ms": info["registration_duration_ms"],
                         "metadata_duration_ms": info["metadata_duration_ms"],
+                        "source_payload_provenance": info.get(
+                            "source_payload_provenance", {}
+                        ),
                     }
                     for source_id, info in sorted(sources_by_id.items())
                 },

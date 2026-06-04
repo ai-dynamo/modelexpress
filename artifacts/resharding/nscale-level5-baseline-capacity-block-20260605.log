@@ -1,0 +1,9 @@
+Name:             mx-level5-baseline-20260605-004747
+Namespace:        anish-dynamo
+Status:           Pending until deleted after scheduler block
+Requested GPUs:   4
+Purpose:          Run checksum-backed synthetic same-node Level-5 NCCL Reshard and CheckpointEngine baseline rows
+
+Events:
+2026-06-04T22:47:50Z	Warning	FailedScheduling	0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+2026-06-04T22:48:02Z	Normal	NotTriggerScaleUp	pod didn't trigger scale-up: 1 max node group size reached

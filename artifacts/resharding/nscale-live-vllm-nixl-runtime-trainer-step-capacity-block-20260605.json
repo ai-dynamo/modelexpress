@@ -1,0 +1,26 @@
+{
+  "autoscaler_message": "pod did not trigger scale-up: 1 max node group size reached",
+  "block_type": "nscale-1gpu-capacity",
+  "blocked": true,
+  "cpu_helper_artifact": "nscale-trainer-step-runtime-source-smoke-20260605.json",
+  "event_timestamps_utc": [
+    "2026-06-04T22:56:01Z",
+    "2026-06-04T22:56:21Z"
+  ],
+  "gpu_runtime_rows_measured": false,
+  "local_session_date": "2026-06-05",
+  "log_artifact": "nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.log",
+  "log_excerpt": [
+    "2026-06-04T22:56:01Z\tNormal\tNotTriggerScaleUp\tpod didn't trigger scale-up: 1 max node group size reached",
+    "2026-06-04T22:56:21Z\tWarning\tFailedScheduling\t0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling."
+  ],
+  "namespace": "anish-dynamo",
+  "new_gpu_runtime_claim_safe": false,
+  "pod": "mx-vllm-trainerstep-20260605-005556",
+  "purpose": "Run live vLLM+NIXL runtime smoke with optimizer-step source publisher patch.",
+  "pytest_log_artifact": "nscale-trainer-step-runtime-source-pytest-20260605.log",
+  "requested_gpus": 1,
+  "result": "blocked",
+  "scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+  "schema_version": 1
+}

@@ -247,9 +247,20 @@ Artifacts under `artifacts/resharding/` prove:
   staging, installs via `Engine.update_weights_from_tensor`, and validates
   allclose/checksum. The vLLM artifact reads 4,096 bytes from two trainer-like
   source ranks into CUDA staging, installs/restores through `LLM.apply_model`,
-  and validates allclose/checksum. Both artifacts use deterministic source
-  values and staging-copy runtime APIs; they do not prove direct NIXL writes
-  into runtime-owned storage or a live trainer optimizer loop.
+  and validates allclose/checksum. Those committed GPU artifacts still use the
+  earlier deterministic source values and staging-copy runtime APIs; they do not
+  prove direct NIXL writes into runtime-owned storage or a live trainer
+  optimizer loop.
+- Current branch runtime bridge source helpers now replace the static source
+  formula with a source-rank `torch.optim.SGD` optimizer-step publisher over a
+  small synthetic objective. The nscale CPU artifact
+  `artifacts/resharding/nscale-trainer-step-runtime-source-smoke-20260605.json`
+  and pytest log `artifacts/resharding/nscale-trainer-step-runtime-source-pytest-20260605.log`
+  prove source-owned ranges reconstruct the post-step target tensor and that
+  vLLM/SGLang artifact flags now expose optimizer-step provenance. A live vLLM
+  GPU rerun of this updated path was attempted but 1-GPU nscale scheduling was
+  blocked:
+  `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`.
 - Target-side runtime read-failure recovery logic now exists in the cross-node
   harness. A nscale unit test simulates a READY primary source failing during
   its read group, verifies that only that failed source range is replanned from
@@ -293,8 +304,11 @@ The current POC does **not** prove:
   payloads, cross-node runtime placement, direct runtime-buffer NIXL landing,
   and the production post-load/refit lifecycle. Tiny live vLLM V1 and SGLang
   Engine-owned tensor/weight smokes are proven, and same-node vLLM/SGLang
-  NIXL-to-runtime bridges are proven, but those bridges still use deterministic
-  trainer-like source values and staging-copy engine APIs.
+  NIXL-to-runtime bridges are proven, but the committed GPU bridge artifacts
+  still use deterministic trainer-like source values and staging-copy engine
+  APIs. The current branch has CPU-tested optimizer-step source publishers, but
+  no live GPU runtime rerun yet because the 1-GPU nscale smoke was capacity
+  blocked.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -529,6 +543,17 @@ Current partial evidence:
   `real_training_loop_used=false`. This is real NIXL-to-live-vLLM runtime
   evidence, but it is not cross-node, not direct zero-copy into vLLM-owned
   storage, and not a live trainer/optimizer loop.
+- `modelexpress.refit_trainer_step` now provides the shared optimizer-step
+  source publisher used by the vLLM/SGLang NIXL runtime bridge source helpers.
+  It materializes only the source-owned range from a source-rank
+  `torch.optim.SGD` parameter step over a synthetic objective and records
+  explicit provenance (`optimizer_step_publisher_used=true`,
+  `static_replacement_formula_used=false`). nscale CPU evidence:
+  `artifacts/resharding/nscale-trainer-step-runtime-source-smoke-20260605.json`
+  and `artifacts/resharding/nscale-trainer-step-runtime-source-pytest-20260605.log`
+  (`13 passed`). A live vLLM GPU rerun of the updated path was attempted but
+  blocked by 1-GPU nscale capacity:
+  `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`.
 - `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
   SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
   `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the
@@ -637,14 +662,19 @@ Current partial evidence:
   bank the failed 4-GPU nscale baseline scheduling attempt: `0/29 nodes`,
   `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler
   max node group size reached.
+- `artifacts/resharding/nscale-level5-baseline-capacity-block-20260605.json`
+  and `.log` bank the fresh 2026-06-05 rerun attempt for the same 4-GPU
+  checksum-backed Level-5 NCCL/CheckpointEngine baseline pod. It hit the same
+  scheduler/autoscaler block, so no new Level-5 timing row is claimed.
 
 ## Near-Term Achievable Work
 
 These are the next useful things to do, in order:
 
-1. Replace deterministic trainer-like source tensors in the vLLM/SGLang NIXL
-   runtime bridges with a real trainer process or optimizer-step publisher that
-   owns the source tensors and publishes the same MX/NIXL descriptors.
+1. Finish replacing deterministic trainer-like source tensors in the
+   vLLM/SGLang NIXL runtime bridges. The current branch has the optimizer-step
+   source publisher implemented and CPU-tested; the next step is a live GPU
+   rerun once 1-GPU nscale capacity is available, then a real trainer loop.
 2. Move the live vLLM/SGLang NIXL runtime bridges out of same-node, one-pod
    GPU-reuse scope into cross-node, one-pod-per-source-rank placement while
    keeping the allclose/checksum gates.
@@ -691,9 +721,11 @@ Safe claim:
 > `Engine.update_weights_from_tensor`. Same-node, one-pod vLLM+NIXL and
 > SGLang+NIXL runtime bridges now prove trainer-like source-rank CUDA shards can
 > be NIXL-read into staging and installed through engine APIs with
-> allclose/checksum. They still use deterministic source values, staging-copy
-> runtime APIs, GPU reuse, and no live trainer optimizer loop; they do not prove
-> production real trainer/runtime refit or cross-node runtime bridging.
+> allclose/checksum. The committed GPU artifacts still use deterministic source
+> values, staging-copy runtime APIs, GPU reuse, and no live trainer optimizer
+> loop. The current branch adds a CPU-tested optimizer-step source publisher for
+> those runtime bridges, but its live GPU rerun is capacity-blocked; it does not
+> prove production real trainer/runtime refit or cross-node runtime bridging.
 
 Unsafe claim:
 

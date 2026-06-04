@@ -1,0 +1,26 @@
+{
+  "autoscaler_message": "pod did not trigger scale-up: 1 max node group size reached",
+  "baseline_rows_measured": false,
+  "block_type": "nscale-4gpu-capacity",
+  "blocked": true,
+  "event_timestamps_utc": [
+    "2026-06-04T22:47:50Z",
+    "2026-06-04T22:48:02Z"
+  ],
+  "level5_claim_safe": false,
+  "local_session_date": "2026-06-05",
+  "log_artifact": "nscale-level5-baseline-capacity-block-20260605.log",
+  "log_excerpt": [
+    "2026-06-04T22:47:50Z\tWarning\tFailedScheduling\t0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+    "2026-06-04T22:48:02Z\tNormal\tNotTriggerScaleUp\tpod didn't trigger scale-up: 1 max node group size reached"
+  ],
+  "mx_nixl_row_source": "nscale-nixl-distributed-refit.json",
+  "namespace": "anish-dynamo",
+  "normalized_table_artifact": "nscale-level5-same-node-synthetic-table-missing-baselines.json",
+  "pod": "mx-level5-baseline-20260605-004747",
+  "purpose": "Run checksum-backed synthetic same-node Level-5 NCCL Reshard and CheckpointEngine baseline rows.",
+  "requested_gpus": 4,
+  "result": "blocked",
+  "scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+  "schema_version": 1
+}
