@@ -39,6 +39,13 @@ try:
         read_segment_groups,
         select_cuda_device,
     )
+    from .refit_live_mx import (
+        live_mx_endpoint_context as _live_mx_endpoint_context,
+        live_mx_plan_context as _live_mx_plan_context,
+        publish_live_mx_rank_endpoint as _publish_live_mx_rank_endpoint,
+        publish_live_mx_rank_ownership as _publish_live_mx_rank_ownership,
+        refit_source_identity,
+    )
     from .refit_poc_artifacts import (
         artifact_base as _artifact_base,
         build_planner_artifacts,
@@ -63,9 +70,7 @@ try:
     )
     from .resharding import (
         SegmentPlan,
-        SliceOwnership,
         SliceRequest,
-        plan_segments,
         range_extents,
     )
 except ImportError:
@@ -74,6 +79,13 @@ except ImportError:
         apply_nixl_ucx_pin,
         read_segment_groups,
         select_cuda_device,
+    )
+    from modelexpress.refit_live_mx import (
+        live_mx_endpoint_context as _live_mx_endpoint_context,
+        live_mx_plan_context as _live_mx_plan_context,
+        publish_live_mx_rank_endpoint as _publish_live_mx_rank_endpoint,
+        publish_live_mx_rank_ownership as _publish_live_mx_rank_ownership,
+        refit_source_identity,
     )
     from modelexpress.refit_poc_artifacts import (
         artifact_base as _artifact_base,
@@ -99,190 +111,9 @@ except ImportError:
     )
     from modelexpress.resharding import (
         SegmentPlan,
-        SliceOwnership,
         SliceRequest,
-        plan_segments,
         range_extents,
     )
-
-def refit_source_identity():
-    control_plane = _import_control_plane()
-    return control_plane["build_refit_source_identity"](
-        model_name=MODEL_NAME,
-        model_version=MODEL_VERSION,
-        dtype="float32",
-        trainer_framework="synthetic-fsdp",
-        trainer_layout="fsdp",
-    )
-
-
-def _publish_live_mx_rank_ownership(rank: int) -> dict[str, Any]:
-    owner = ownerships_by_rank().get(rank)
-    if owner is None:
-        return {
-            "mode": CONTROL_PLANE_LIVE_MX,
-            "published": False,
-            "reason": "rank-has-no-source-ownership",
-        }
-
-    control_plane = _import_control_plane()
-    p2p_pb2 = control_plane["p2p_pb2"]
-    mx_client = control_plane["MxClient"]()
-    try:
-        identity = refit_source_identity()
-        publish_start = time.perf_counter()
-        mx_source_id = control_plane["publish_slice_ownerships"](
-            mx_client,
-            identity=identity,
-            ownerships=[owner],
-            worker_id=owner.worker_id,
-            worker_rank=rank,
-        )
-        publish_duration_ms = (time.perf_counter() - publish_start) * 1000
-
-        status_start = time.perf_counter()
-        status_updated = mx_client.update_status(
-            mx_source_id,
-            owner.worker_id,
-            rank,
-            p2p_pb2.SOURCE_STATUS_READY,
-        )
-        status_duration_ms = (time.perf_counter() - status_start) * 1000
-        if not status_updated:
-            raise RuntimeError(
-                f"failed to mark live MX ownership READY for rank {rank}"
-            )
-        return {
-            "mode": CONTROL_PLANE_LIVE_MX,
-            "published": True,
-            "mx_source_id": mx_source_id,
-            "worker_id": owner.worker_id,
-            "worker_rank": rank,
-            "source_id": owner.source_id,
-            "publish_duration_ms": publish_duration_ms,
-            "status_update_duration_ms": status_duration_ms,
-            "server_url": getattr(mx_client, "server_url", ""),
-        }
-    finally:
-        mx_client.close()
-
-
-def _live_mx_plan_context(
-    request: SliceRequest,
-    *,
-    timeout_seconds: float = 30.0,
-    mx_client=None,
-) -> dict[str, Any]:
-    control_plane = _import_control_plane()
-    owns_client = mx_client is None
-    if mx_client is None:
-        mx_client = control_plane["MxClient"]()
-
-    try:
-        identity = refit_source_identity()
-        expected_source_ids = set(PRIMARY_SOURCE_IDS) | set(ALTERNATE_SOURCE_IDS)
-        deadline = time.time() + timeout_seconds
-        metadata_query_start = time.perf_counter()
-        discovered: list[SliceOwnership] = []
-        while True:
-            discovered = control_plane["list_slice_ownerships"](
-                mx_client,
-                identity=identity,
-            )
-            present_source_ids = {owner.source_id for owner in discovered}
-            if expected_source_ids.issubset(present_source_ids):
-                break
-            if time.time() >= deadline:
-                missing = sorted(expected_source_ids - present_source_ids)
-                raise RuntimeError(
-                    "timed out waiting for live MX slice ownership metadata "
-                    f"(missing={missing}, present={sorted(present_source_ids)})"
-                )
-            time.sleep(0.1)
-        metadata_query_duration_ms = (
-            time.perf_counter() - metadata_query_start
-        ) * 1000
-
-        primary_owners = _select_ownerships_by_source_id(
-            discovered,
-            PRIMARY_SOURCE_IDS,
-        )
-        alternate_owners = _select_ownerships_by_source_id(
-            discovered,
-            ALTERNATE_SOURCE_IDS,
-        )
-        planner_start = time.perf_counter()
-        primary_plans = plan_segments(primary_owners, [request])
-        failed_primary_plans = [
-            plan
-            for plan in primary_plans
-            if plan.source_id in FAILED_PRIMARY_SOURCE_IDS
-        ]
-        recovery_requests = [
-            inference_request(requested_range=plan.target_range)
-            for plan in failed_primary_plans
-        ]
-        recovery_plans = plan_segments(alternate_owners, recovery_requests)
-        planner_duration_ms = (time.perf_counter() - planner_start) * 1000
-
-        return {
-            "mode": CONTROL_PLANE_LIVE_MX,
-            "plan_source": "live-mx-server",
-            "primary_plans": primary_plans,
-            "recovery_plans": recovery_plans,
-            "primary_ownerships": primary_owners,
-            "alternate_ownerships": alternate_owners,
-            "discovered_ownerships": discovered,
-            "metadata_query_duration_ms": metadata_query_duration_ms,
-            "planner_duration_ms": planner_duration_ms,
-            "server_url": getattr(mx_client, "server_url", ""),
-        }
-    finally:
-        if owns_client:
-            mx_client.close()
-
-
-def _select_ownerships_by_source_id(
-    ownerships: list[SliceOwnership],
-    source_ids: tuple[str, ...],
-) -> list[SliceOwnership]:
-    selected: dict[str, SliceOwnership] = {}
-    for owner in sorted(ownerships, key=lambda item: (item.source_id, item.worker_id)):
-        if owner.source_id in source_ids:
-            selected[owner.source_id] = owner
-    missing = [source_id for source_id in source_ids if source_id not in selected]
-    if missing:
-        raise RuntimeError(f"missing expected source ownerships: {missing}")
-    return [selected[source_id] for source_id in source_ids]
-
-
-def _import_control_plane() -> dict[str, Any]:
-    if _SCRIPT_DIR.endswith("/modelexpress") and _PACKAGE_PARENT not in sys.path:
-        sys.path.insert(0, _PACKAGE_PARENT)
-    try:
-        from . import p2p_pb2
-        from .client import MxClient
-        from .resharding_control_plane import (
-            build_refit_source_identity,
-            list_slice_ownerships,
-            publish_slice_ownerships,
-        )
-    except ImportError:
-        from modelexpress import p2p_pb2
-        from modelexpress.client import MxClient
-        from modelexpress.resharding_control_plane import (
-            build_refit_source_identity,
-            list_slice_ownerships,
-            publish_slice_ownerships,
-        )
-
-    return {
-        "p2p_pb2": p2p_pb2,
-        "MxClient": MxClient,
-        "build_refit_source_identity": build_refit_source_identity,
-        "list_slice_ownerships": list_slice_ownerships,
-        "publish_slice_ownerships": publish_slice_ownerships,
-    }
 
 
 def _import_torch():
@@ -564,26 +395,20 @@ def run_nixl_distributed(
             "published": False,
         }
         if control_plane == CONTROL_PLANE_LIVE_MX:
-            publish_context = _publish_live_mx_rank_ownership(rank)
-            dist.barrier()
-            if rank == 3:
-                plan_context = _live_mx_plan_context(request)
-            else:
-                plan_context = {
-                    "mode": CONTROL_PLANE_LIVE_MX,
-                    "plan_source": "live-mx-server",
-                    "primary_plans": [],
-                    "recovery_plans": [],
-                    "primary_ownerships": [],
-                    "alternate_ownerships": [],
-                    "discovered_ownerships": [],
-                    "metadata_query_duration_ms": 0.0,
-                    "planner_duration_ms": 0.0,
-                }
+            plan_context = {
+                "mode": CONTROL_PLANE_LIVE_MX,
+                "plan_source": "live-mx-server",
+                "primary_plans": [],
+                "recovery_plans": [],
+                "primary_ownerships": [],
+                "alternate_ownerships": [],
+                "discovered_ownerships": [],
+                "source_endpoints_by_id": {},
+                "metadata_query_duration_ms": 0.0,
+                "planner_duration_ms": 0.0,
+            }
         else:
             plan_context = _synthetic_plan_context(request)
-        primary_plans = plan_context["primary_plans"]
-        recovery_plans = plan_context["recovery_plans"]
 
         agent_name = f"mx-refit-rank{rank}"
         adapter = NixlAdapter(agent_name)
@@ -629,6 +454,8 @@ def run_nixl_distributed(
             ),
             "control_plane": publish_context,
         }
+        if control_plane != CONTROL_PLANE_LIVE_MX:
+            local_info["metadata"] = metadata
         if rank in owner_by_rank:
             assert source_tensor is not None
             owner = owner_by_rank[rank]
@@ -655,6 +482,25 @@ def run_nixl_distributed(
                 }
             )
 
+        if control_plane == CONTROL_PLANE_LIVE_MX:
+            if rank in owner_by_rank:
+                publish_context = _publish_live_mx_rank_endpoint(
+                    rank,
+                    agent_name=agent_name,
+                    nixl_metadata=metadata,
+                    tensor_addr=int(local_info["addr"]),
+                    tensor_bytes=int(local_info["tensor_bytes"]),
+                    device_id=int(local_info["device_id"]),
+                )
+                local_info["control_plane"] = publish_context
+            dist.barrier()
+            if rank == 3:
+                plan_context = _live_mx_endpoint_context(request)
+            else:
+                plan_context["endpoint_source"] = "mx-worker-metadata"
+
+        primary_plans = plan_context["primary_plans"]
+        recovery_plans = plan_context["recovery_plans"]
         gathered: list[dict[str, Any] | None] = [None] * world_size
         dist.all_gather_object(gathered, local_info)
 
@@ -665,17 +511,28 @@ def run_nixl_distributed(
             assert target is not None
             if not primary_plans or not recovery_plans:
                 raise RuntimeError("target rank did not receive segment plans")
-            sources_by_id = {
-                info["source_id"]: info
-                for info in gathered
-                if info is not None and info.get("role") == "source"
-            }
+            endpoint_by_source_id = plan_context.get("source_endpoints_by_id", {})
+            if endpoint_by_source_id:
+                sources_by_id = {
+                    source_id: endpoint.to_nixl_source_info()
+                    for source_id, endpoint in endpoint_by_source_id.items()
+                }
+            else:
+                sources_by_id = {
+                    info["source_id"]: info
+                    for info in gathered
+                    if info is not None and info.get("role") == "source"
+                }
 
             add_remote_timings: dict[str, float] = {}
             remote_agent_names: dict[str, str] = {}
             for source_id, info in sorted(sources_by_id.items()):
                 add_start = time.perf_counter()
-                remote_agent_names[source_id] = adapter.add_remote_agent(info["metadata"])
+                if endpoint_by_source_id:
+                    remote_metadata = endpoint_by_source_id[source_id].nixl_metadata
+                else:
+                    remote_metadata = info["metadata"]
+                remote_agent_names[source_id] = adapter.add_remote_agent(remote_metadata)
                 add_remote_timings[source_id] = (time.perf_counter() - add_start) * 1000
 
             transfer_start = time.perf_counter()
@@ -719,6 +576,10 @@ def run_nixl_distributed(
                     "actual_nixl_reads_used": True,
                     "torch_distributed_data_transfer_used": False,
                     "torch_distributed_control_plane_used": True,
+                    "torch_distributed_nixl_metadata_exchange_used": not bool(
+                        endpoint_by_source_id
+                    ),
+                    "nixl_source_endpoints_from_mx": bool(endpoint_by_source_id),
                     "live_mx_returned_metadata_used_for_nixl_plan": (
                         control_plane == CONTROL_PLANE_LIVE_MX
                     ),
@@ -727,7 +588,11 @@ def run_nixl_distributed(
                 }
             )
             result["distributed"] = {
-                "backend": "nixl-read+gloo-control",
+                "backend": (
+                    "nixl-read+mx-endpoint-control+gloo-sync"
+                    if endpoint_by_source_id
+                    else "nixl-read+gloo-control"
+                ),
                 "nixl_backends": backends,
                 "world_size": world_size,
                 "target_rank": 3,
@@ -844,6 +709,10 @@ def _control_plane_artifact(
         ],
         "alternate_ownerships_from_control_plane": [
             owner.to_dict() for owner in plan_context.get("alternate_ownerships", [])
+        ],
+        "source_endpoints_from_control_plane": [
+            endpoint.to_dict()
+            for endpoint in plan_context.get("source_endpoints_by_id", {}).values()
         ],
         "primary_segment_plans": [
             plan.to_dict() for plan in plan_context.get("primary_plans", [])

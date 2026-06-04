@@ -8,6 +8,7 @@ from dataclasses import replace
 from modelexpress import p2p_pb2
 from modelexpress.metadata.source_id import compute_mx_source_id
 from modelexpress.refit_poc import (
+    _live_mx_endpoint_context,
     _live_mx_plan_context,
     alternate_ownerships,
     inference_request,
@@ -15,11 +16,15 @@ from modelexpress.refit_poc import (
     refit_source_identity,
 )
 from modelexpress.refit_poc_artifacts import artifact_base, build_planner_artifacts
+from modelexpress.types import TensorDescriptor
 from modelexpress.resharding import SliceOwnership, SliceRequest
 from modelexpress.resharding_control_plane import (
     build_refit_source_identity,
+    list_refit_nixl_endpoints,
     list_slice_ownerships,
+    plan_from_mx_refit_endpoints,
     plan_from_mx_metadata,
+    publish_refit_nixl_endpoint,
     publish_slice_ownerships,
     segment_plan_from_proto,
     segment_plan_to_proto,
@@ -239,6 +244,63 @@ def test_publish_list_get_status_and_plan_from_mx_metadata():
     assert plans[1].target_range == ((3, 6), (0, 4))
 
 
+def test_publish_and_plan_refit_nixl_endpoints_from_mx_metadata():
+    client = InMemoryMxClient()
+    identity = _identity()
+    ownerships = _ownerships()
+
+    unused_ownership = replace(
+        ownerships[1],
+        source_id="trainer-rank-unused",
+        worker_id="rank-unused",
+        worker_rank=99,
+        source_range=((6, 8), (0, 4)),
+        source_lease="lease-unused",
+        nixl_descriptor_id="nixl-unused",
+    )
+
+    for idx, ownership in enumerate([*ownerships, unused_ownership]):
+        publish_refit_nixl_endpoint(
+            client,
+            identity=identity,
+            ownership=ownership,
+            tensor=TensorDescriptor(
+                name=ownership.tensor_name,
+                addr=0xABC000 + idx * 4096,
+                size=128 + idx,
+                device_id=idx,
+                dtype=ownership.dtype,
+            ),
+            agent_name=f"mx-refit-rank{idx}",
+            nixl_metadata=f"nixl-metadata-{idx}".encode(),
+            worker_id=ownership.worker_id,
+            worker_rank=idx,
+        )
+
+    endpoints = list_refit_nixl_endpoints(client, identity=identity)
+    assert {endpoint.source_id for endpoint in endpoints} == {
+        "trainer-rank0",
+        "trainer-rank1",
+        "trainer-rank-unused",
+    }
+    endpoint_by_source_id = {endpoint.source_id: endpoint for endpoint in endpoints}
+    rank0_endpoint = endpoint_by_source_id["trainer-rank0"]
+    assert rank0_endpoint.agent_name == "mx-refit-rank0"
+    assert rank0_endpoint.nixl_metadata == b"nixl-metadata-0"
+    assert rank0_endpoint.tensor.addr == 0xABC000
+    assert rank0_endpoint.to_nixl_source_info()["addr"] == 0xABC000
+
+    plans, endpoints_by_source_id = plan_from_mx_refit_endpoints(
+        client,
+        identity=identity,
+        requests=[_request()],
+    )
+    assert [plan.source_id for plan in plans] == ["trainer-rank0", "trainer-rank1"]
+    assert sorted(endpoints_by_source_id) == ["trainer-rank0", "trainer-rank1"]
+    assert "trainer-rank-unused" not in endpoints_by_source_id
+    assert endpoints_by_source_id["trainer-rank1"].tensor.device_id == 1
+
+
 def test_refit_poc_live_mx_plan_context_uses_returned_metadata():
     client = InMemoryMxClient()
     identity = refit_source_identity()
@@ -279,6 +341,55 @@ def test_refit_poc_live_mx_plan_context_uses_returned_metadata():
         "trainer-rank1",
         "trainer-rank2-alt",
     }
+
+
+def test_refit_poc_live_mx_endpoint_context_uses_returned_nixl_endpoints():
+    client = InMemoryMxClient()
+    identity = refit_source_identity()
+    all_ownerships = [*primary_ownerships(), *alternate_ownerships()]
+
+    for idx, ownership in enumerate(all_ownerships):
+        publish_refit_nixl_endpoint(
+            client,
+            identity=identity,
+            ownership=ownership,
+            tensor=TensorDescriptor(
+                name=ownership.tensor_name,
+                addr=0xC0FFEE + idx * 4096,
+                size=64,
+                device_id=idx,
+                dtype=ownership.dtype,
+            ),
+            agent_name=f"mx-refit-rank{idx}",
+            nixl_metadata=f"nixl-endpoint-{idx}".encode(),
+            worker_id=ownership.worker_id,
+            worker_rank=ownership.worker_rank,
+        )
+
+    context = _live_mx_endpoint_context(
+        inference_request(),
+        timeout_seconds=0,
+        mx_client=client,
+    )
+
+    assert context["plan_source"] == "live-mx-server"
+    assert context["endpoint_source"] == "mx-worker-metadata"
+    assert [plan.source_id for plan in context["primary_plans"]] == [
+        "trainer-rank0",
+        "trainer-rank1",
+    ]
+    assert [plan.source_id for plan in context["recovery_plans"]] == [
+        "trainer-rank2-alt"
+    ]
+    endpoints_by_source_id = context["source_endpoints_by_id"]
+    assert sorted(endpoints_by_source_id) == [
+        "trainer-rank0",
+        "trainer-rank1",
+        "trainer-rank2-alt",
+    ]
+    rank0_endpoint = endpoints_by_source_id["trainer-rank0"]
+    assert rank0_endpoint.nixl_metadata == b"nixl-endpoint-0"
+    assert endpoints_by_source_id["trainer-rank2-alt"].tensor.device_id == 2
 
 
 def test_refit_poc_artifacts_use_live_mx_returned_plan_context():

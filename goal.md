@@ -120,6 +120,14 @@ Artifacts under `artifacts/resharding/` prove:
   planning from returned metadata, actual one-sided NIXL reads into planned
   target offsets, and segment-level replan from an alternate holder after a
   failed source segment.
+- A second 4-rank/4-B200 live-MX NIXL endpoint run proves the target can fetch
+  source NIXL agent metadata and remote CUDA tensor descriptors from MX worker
+  metadata instead of torch distributed object gather:
+  `artifacts/resharding/nscale-live-mx-nixl-endpoint-refit.json`. The artifact
+  records `nixl_source_endpoints_from_mx=true`,
+  `torch_distributed_nixl_metadata_exchange_used=false`, three MX-discovered
+  source endpoints, actual one-sided NIXL reads, allclose/checksum validation,
+  and no GPU reuse.
 - A Qwen-style MoE manifest extractor now classifies expert-axis tensors,
   layout-sensitive shared-expert tensors, global quantization metadata, and
   generated-on-target tensors from tensor names/shapes.
@@ -160,9 +168,10 @@ Artifacts under `artifacts/resharding/` prove:
 
 This is a **Level 3 same-node synthetic proof**, not a production refit
 implementation. Level 3 control-plane metadata lifecycle support is proven
-through a live central MX server smoke, and live MX-returned metadata now drives
-a completed same-node NIXL GPU data-plane run. Multi-pod, cross-node, and real
-runtime-owned trainer/inference refit are still unproven.
+through a live central MX server smoke, and live MX-returned ownership plus
+source endpoint metadata now drives a completed same-node NIXL GPU data-plane
+run. Multi-pod, cross-node, and real runtime-owned trainer/inference refit are
+still unproven.
 
 ## What Is Not Proven Yet
 
@@ -278,6 +287,15 @@ Current evidence:
   `artifacts/resharding/nscale-live-mx-nixl-refit.log`.
 - Live central-server log from that proof:
   `artifacts/resharding/nscale-live-mx-nixl-server.log`.
+- MX-discovered NIXL endpoint proof:
+  `artifacts/resharding/nscale-live-mx-nixl-endpoint-refit.json`.
+- Endpoint proof log:
+  `artifacts/resharding/nscale-live-mx-nixl-endpoint-refit.log`.
+- Endpoint proof server log:
+  `artifacts/resharding/nscale-live-mx-nixl-endpoint-server.log.gz`.
+- Endpoint control-plane nscale tests:
+  `artifacts/resharding/nscale-refit-endpoint-control-plane-pytest.log`
+  (`7 passed`).
 - Earlier capacity-blocked attempt, superseded by the completed run:
   `artifacts/resharding/nscale-live-mx-nixl-capacity.log`.
 - Qwen MoE manifest extractor in `modelexpress.resharding_manifest`.
@@ -291,7 +309,9 @@ Current evidence:
 Remaining gap:
 
 - Run the live-MX NIXL path across multiple pods/nodes with distinct source,
-  target, and alternate-holder processes, then repeat the proof against real
+  target, and alternate-holder processes. The same-node proof now carries
+  source NIXL endpoints through MX, but process placement is still one torchrun
+  job with Gloo synchronization. Then repeat the proof against real
   trainer-owned and runtime-owned tensors.
 
 ### Level 4: Real Runtime Refit
@@ -385,12 +405,13 @@ Safe claim:
 > without trainer full all-gather. The same slice ownership metadata now
 > round-trips through a live Redis-backed central MX server on nscale and has
 > driven a completed 4-B200 live-MX NIXL refit POC where the target plans from
-> MX-returned metadata. The metadata side also covers real Qwen3 MoE and Qwen3
-> FP8 safetensors headers, including real global-required quantization metadata,
-> plus CPU runtime-shaped vLLM/SGLang target tensor install smokes. A CPU
-> competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
-> CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
-> scenario.
+> MX-returned metadata and gets source NIXL endpoint handles from MX worker
+> metadata rather than torch object gather. The metadata side also covers real
+> Qwen3 MoE and Qwen3 FP8 safetensors headers, including real global-required
+> quantization metadata, plus CPU runtime-shaped vLLM/SGLang target tensor
+> install smokes. A CPU competitive simulator now records MX direct, MX fanout,
+> NCCL Reshard, and CheckpointEngine-style byte/cost comparisons for a two-step
+> RL rollout scenario.
 
 Unsafe claim:
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from typing import Iterable, Sequence
 
@@ -16,6 +17,64 @@ from .resharding import (
     classify_tensor_family,
     plan_segments,
 )
+from .types import TensorDescriptor
+
+
+@dataclass(frozen=True)
+class RefitNixlEndpoint:
+    """MX-discovered source endpoint for a planned NIXL segment read."""
+
+    mx_source_id: str
+    worker_id: str
+    worker_rank: int
+    ownership: SliceOwnership
+    tensor: TensorDescriptor
+    agent_name: str
+    nixl_metadata: bytes
+    metadata_endpoint: str = ""
+    worker_grpc_endpoint: str = ""
+
+    @property
+    def source_id(self) -> str:
+        return self.ownership.source_id
+
+    def to_nixl_source_info(self) -> dict[str, object]:
+        """Return the shape expected by the refit NIXL read adapter."""
+
+        return {
+            "rank": self.worker_rank,
+            "agent_name": self.agent_name,
+            "source_id": self.source_id,
+            "worker_id": self.worker_id,
+            "source_range": self.ownership.source_range,
+            "addr": self.tensor.addr,
+            "device_id": self.tensor.device_id,
+            "tensor_bytes": self.tensor.size,
+            "registered_bytes": self.tensor.size,
+            "metadata_bytes": len(self.nixl_metadata),
+            "registration_duration_ms": 0.0,
+            "metadata_duration_ms": 0.0,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mx_source_id": self.mx_source_id,
+            "worker_id": self.worker_id,
+            "worker_rank": self.worker_rank,
+            "source_id": self.source_id,
+            "agent_name": self.agent_name,
+            "metadata_bytes": len(self.nixl_metadata),
+            "metadata_endpoint": self.metadata_endpoint,
+            "worker_grpc_endpoint": self.worker_grpc_endpoint,
+            "tensor": {
+                "name": self.tensor.name,
+                "addr": self.tensor.addr,
+                "size": self.tensor.size,
+                "device_id": self.tensor.device_id,
+                "dtype": self.tensor.dtype,
+            },
+            "ownership": self.ownership.to_dict(),
+        }
 
 
 def build_refit_source_identity(
@@ -208,6 +267,34 @@ def segment_plan_from_proto(
     )
 
 
+def tensor_descriptor_to_proto(
+    descriptor: TensorDescriptor,
+) -> p2p_pb2.TensorDescriptor:
+    """Convert a Python tensor descriptor to the MX P2P proto contract."""
+
+    return p2p_pb2.TensorDescriptor(
+        name=descriptor.name,
+        addr=int(descriptor.addr),
+        size=int(descriptor.size),
+        device_id=int(descriptor.device_id),
+        dtype=descriptor.dtype,
+    )
+
+
+def tensor_descriptor_from_proto(
+    descriptor: p2p_pb2.TensorDescriptor,
+) -> TensorDescriptor:
+    """Convert an MX P2P tensor descriptor to the Python metadata model."""
+
+    return TensorDescriptor(
+        name=descriptor.name,
+        addr=int(descriptor.addr),
+        size=int(descriptor.size),
+        device_id=int(descriptor.device_id),
+        dtype=descriptor.dtype,
+    )
+
+
 def publish_slice_ownerships(
     mx_client,
     *,
@@ -225,6 +312,47 @@ def publish_slice_ownerships(
         status=status,
     )
     return mx_client.publish_metadata(identity, worker, worker_id)
+
+
+def publish_refit_nixl_endpoint(
+    mx_client,
+    *,
+    identity: p2p_pb2.SourceIdentity,
+    ownership: SliceOwnership,
+    tensor: TensorDescriptor,
+    agent_name: str,
+    nixl_metadata: bytes,
+    worker_id: str | None = None,
+    worker_rank: int | None = None,
+    metadata_endpoint: str = "",
+    worker_grpc_endpoint: str = "",
+    status: int = p2p_pb2.SOURCE_STATUS_READY,
+) -> str:
+    """Publish slice ownership plus NIXL endpoint metadata through MX.
+
+    This is the multi-pod handoff contract: source processes publish the
+    logical slice they own and the NIXL handle/address the target needs to read
+    that slice. Targets can then discover transfer endpoints from MX records
+    instead of relying on torch distributed object gathers.
+    """
+
+    resolved_worker_id = worker_id or ownership.worker_id
+    resolved_worker_rank = (
+        int(worker_rank)
+        if worker_rank is not None
+        else int(ownership.worker_rank or 0)
+    )
+    worker = p2p_pb2.WorkerMetadata(
+        worker_rank=resolved_worker_rank,
+        nixl_metadata=bytes(nixl_metadata),
+        tensors=[tensor_descriptor_to_proto(tensor)],
+        slice_ownerships=[slice_ownership_to_proto(ownership)],
+        status=status,
+        agent_name=agent_name,
+        metadata_endpoint=metadata_endpoint,
+        worker_grpc_endpoint=worker_grpc_endpoint,
+    )
+    return mx_client.publish_metadata(identity, worker, resolved_worker_id)
 
 
 def list_slice_ownerships(
@@ -251,6 +379,80 @@ def list_slice_ownerships(
             for desc in metadata.worker.slice_ownerships
         )
     return ownerships
+
+
+def list_refit_nixl_endpoints(
+    mx_client,
+    *,
+    identity: p2p_pb2.SourceIdentity,
+    status_filter: int | None = p2p_pb2.SOURCE_STATUS_READY,
+) -> list[RefitNixlEndpoint]:
+    """Query MX for READY source workers and return NIXL refit endpoints."""
+
+    response = mx_client.list_sources(identity, status_filter=status_filter)
+    endpoints: list[RefitNixlEndpoint] = []
+    for instance in response.instances:
+        metadata = mx_client.get_metadata(instance.mx_source_id, instance.worker_id)
+        has_worker = (
+            metadata.HasField("worker")
+            if hasattr(metadata, "HasField")
+            else getattr(metadata, "worker", None) is not None
+        )
+        if not metadata.found or not has_worker:
+            continue
+
+        worker = metadata.worker
+        tensors = [tensor_descriptor_from_proto(desc) for desc in worker.tensors]
+        if not worker.nixl_metadata or not tensors:
+            continue
+        tensors_by_name = {tensor.name: tensor for tensor in tensors}
+
+        for ownership_desc in worker.slice_ownerships:
+            ownership = slice_ownership_from_proto(ownership_desc)
+            tensor = tensors_by_name.get(ownership.tensor_name)
+            if tensor is None and len(tensors) == 1:
+                tensor = tensors[0]
+            if tensor is None:
+                continue
+            endpoints.append(
+                RefitNixlEndpoint(
+                    mx_source_id=instance.mx_source_id,
+                    worker_id=instance.worker_id,
+                    worker_rank=int(worker.worker_rank),
+                    ownership=ownership,
+                    tensor=tensor,
+                    agent_name=worker.agent_name,
+                    nixl_metadata=bytes(worker.nixl_metadata),
+                    metadata_endpoint=worker.metadata_endpoint,
+                    worker_grpc_endpoint=worker.worker_grpc_endpoint,
+                )
+            )
+    return endpoints
+
+
+def plan_from_mx_refit_endpoints(
+    mx_client,
+    *,
+    identity: p2p_pb2.SourceIdentity,
+    requests: Sequence[SliceRequest],
+    status_filter: int | None = p2p_pb2.SOURCE_STATUS_READY,
+) -> tuple[list[SegmentPlan], dict[str, RefitNixlEndpoint]]:
+    """Plan requested slices and return the MX-discovered endpoints used."""
+
+    endpoints = list_refit_nixl_endpoints(
+        mx_client,
+        identity=identity,
+        status_filter=status_filter,
+    )
+    plans = plan_segments([endpoint.ownership for endpoint in endpoints], requests)
+    endpoints_by_source_id = {endpoint.source_id: endpoint for endpoint in endpoints}
+    planned_source_ids = {plan.source_id for plan in plans}
+    endpoint_by_source_id = {
+        source_id: endpoints_by_source_id[source_id]
+        for source_id in planned_source_ids
+        if source_id in endpoints_by_source_id
+    }
+    return plans, endpoint_by_source_id
 
 
 def plan_from_mx_metadata(

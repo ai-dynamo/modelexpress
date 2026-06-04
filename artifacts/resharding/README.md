@@ -55,6 +55,19 @@ Files:
   target metadata query, and emitted JSON artifact.
 - `nscale-live-mx-nixl-server.log`: live Rust server log from the completed
   live-MX NIXL GPU proof.
+- `nscale-refit-endpoint-control-plane-pytest.log`: focused nscale Python 3.12
+  gate for MX-published refit NIXL endpoint metadata (`7 passed`).
+- `nscale-live-mx-nixl-endpoint-refit.json`: completed 4-rank/4-B200 live-MX
+  NIXL endpoint proof. Source ranks publish slice ownership, NIXL agent
+  metadata, and remote CUDA tensor descriptors through MX; the target discovers
+  three source endpoints from MX, plans from MX-returned ownerships, performs
+  actual NIXL READs, and validates checksum/allclose. The proof records
+  `torch_distributed_nixl_metadata_exchange_used=false`.
+- `nscale-live-mx-nixl-endpoint-refit.log`: full torchrun log for the endpoint
+  proof.
+- `nscale-live-mx-nixl-endpoint-server.log.gz`: compressed live Rust server log
+  for the endpoint proof. The raw log is compressed to stay below the
+  repository's large-file hook limit.
 - `nscale-live-mx-nixl-capacity.log`: earlier attempted live-MX NIXL GPU
   verification that was capacity-blocked (`Insufficient nvidia.com/gpu`;
   autoscaler max size reached). It is superseded by
@@ -77,6 +90,6 @@ Files:
   quantization metadata, generated-on-target tensors, and layout-sensitive
   shared-expert tensors.
 
-The NIXL JSON is the primary Level 2 proof artifact. The live-MX NIXL JSON is
-the primary Level 3 same-node proof artifact. The NCCL distributed JSON remains
-the Level 1 comparison artifact.
+The NIXL JSON is the primary Level 2 proof artifact. The live-MX NIXL endpoint
+JSON is the strongest current Level 3 same-node proof artifact. The NCCL
+distributed JSON remains the Level 1 comparison artifact.
