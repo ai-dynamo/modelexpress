@@ -17,6 +17,7 @@ from modelexpress.resharding_manifest import (
     classify_qwen_moe_tensor,
 )
 from modelexpress.resharding_receiver import (
+    begin_runtime_refit_transaction,
     build_receiver_requests_from_runtime_tensors,
     install_global_required_quantization_payloads_into_runtime_tensors,
     install_segment_payloads_into_runtime_tensors,
@@ -215,3 +216,138 @@ def _find_repo_artifact(relative_path: str) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _versioned_owner(tensor_name, shape, *, model_version, source_id="trainer-rank0"):
+    return SliceOwnership(
+        model_name="qwen",
+        model_version=model_version,
+        tensor_name=tensor_name,
+        global_shape=shape,
+        dtype="float32",
+        source_range=tuple((0, dim) for dim in shape),
+        worker_id=f"{source_id}-worker",
+        source_id=source_id,
+        source_lease=f"{source_id}-{model_version}-lease",
+        nixl_descriptor_id=f"{source_id}-{model_version}-desc",
+        layout_tags={"storage_layout": "row-major", "trainer_layout": "fsdp"},
+    )
+
+
+def test_runtime_refit_transaction_rolls_back_multilayer_runtime_install():
+    tensor_names = [
+        "model.layers.0.mlp.experts.w1.weight",
+        "model.layers.1.mlp.experts.w1.weight",
+    ]
+    previous_by_name = {
+        tensor_names[0]: torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        tensor_names[1]: torch.arange(12, 24, dtype=torch.float32).reshape(3, 4),
+    }
+    runtime_by_name = {
+        name: tensor.clone() for name, tensor in previous_by_name.items()
+    }
+    runtime_by_target = {
+        f"vllm:{name}": tensor for name, tensor in runtime_by_name.items()
+    }
+
+    requests = build_receiver_requests_from_runtime_tensors(
+        runtime_by_name,
+        model_name="qwen",
+        model_version="step-8",
+        runtime_framework="vllm",
+        target_id_prefix="vllm",
+        layout_tags_by_tensor={name: {"moe_expert_axis": 0} for name in tensor_names},
+    )
+    plans = plan_segments(
+        [
+            _versioned_owner(
+                name, tuple(runtime_by_name[name].shape), model_version="step-8"
+            )
+            for name in tensor_names
+        ],
+        requests,
+    )
+    payload_by_name = {
+        tensor_names[0]: torch.full((3, 4), 80.0, dtype=torch.float32),
+        tensor_names[1]: torch.full((3, 4), 81.0, dtype=torch.float32),
+    }
+    payloads = [(plan, payload_by_name[plan.tensor_name]) for plan in plans]
+
+    transaction = begin_runtime_refit_transaction(
+        runtime_by_target,
+        previous_model_version="step-7",
+        target_model_version="step-8",
+    )
+    installed = install_segment_payloads_into_runtime_tensors(
+        payloads, runtime_by_target
+    )
+
+    assert len(transaction.snapshots) == 2
+    assert [item.tensor_name for item in installed] == tensor_names
+    for name in tensor_names:
+        torch.testing.assert_close(runtime_by_name[name], payload_by_name[name])
+
+    transaction.rollback()
+
+    assert transaction.rolled_back is True
+    assert transaction.committed is False
+    for name in tensor_names:
+        torch.testing.assert_close(runtime_by_name[name], previous_by_name[name])
+
+
+def test_runtime_refit_transaction_commit_keeps_new_version_and_blocks_rollback():
+    tensor_name = "model.layers.0.mlp.experts.w2.weight"
+    runtime = torch.zeros((2, 4), dtype=torch.float32)
+    runtime_by_name = {tensor_name: runtime}
+    runtime_by_target = {f"sglang:{tensor_name}": runtime}
+    requests = build_receiver_requests_from_runtime_tensors(
+        runtime_by_name,
+        model_name="qwen",
+        model_version="step-9",
+        runtime_framework="sglang",
+        target_id_prefix="sglang",
+    )
+    plans = plan_segments(
+        [_versioned_owner(tensor_name, (2, 4), model_version="step-9")],
+        requests,
+    )
+    payload = torch.full((2, 4), 9.0, dtype=torch.float32)
+
+    transaction = begin_runtime_refit_transaction(
+        runtime_by_target,
+        previous_model_version="step-8",
+        target_model_version="step-9",
+    )
+    install_segment_payloads_into_runtime_tensors(
+        [(plans[0], payload)], runtime_by_target
+    )
+    transaction.commit()
+
+    assert transaction.committed is True
+    assert transaction.rolled_back is False
+    assert transaction.to_dict()["target_model_version"] == "step-9"
+    torch.testing.assert_close(runtime, payload)
+    with pytest.raises(RuntimeError, match="cannot rollback a committed"):
+        transaction.rollback()
+
+
+def test_runtime_refit_transaction_rejects_same_version():
+    with pytest.raises(ValueError, match="must differ"):
+        begin_runtime_refit_transaction(
+            {"weight": torch.zeros((1,), dtype=torch.float32)},
+            previous_model_version="step-7",
+            target_model_version="step-7",
+        )
+
+
+def test_runtime_refit_transaction_rejects_dtype_change_before_rollback():
+    runtime_by_target = {"vllm:weight": torch.ones((2,), dtype=torch.float32)}
+    transaction = begin_runtime_refit_transaction(
+        runtime_by_target,
+        previous_model_version="step-7",
+        target_model_version="step-8",
+    )
+    runtime_by_target["vllm:weight"] = torch.ones((2,), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="changed dtype"):
+        transaction.rollback()

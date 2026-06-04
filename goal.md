@@ -261,7 +261,9 @@ The current POC does **not** prove:
   detected. The helper path is implemented and tested with a real manifest
   entry, but payload bytes are still synthetic.
 - Hierarchical fanout to many rollout replicas.
-- Versioned rollback using multiple GPU-resident training steps.
+- Versioned rollback using multiple GPU-resident training steps. A
+  receiver-side CPU/runtime tensor transaction helper now proves rollback
+  semantics for multiple versions, but not GPU-resident rollback.
 - Performance competitiveness against NCCL Reshard, CheckpointEngine, Mooncake,
   or TorchStore-style systems beyond the committed CPU byte/cost simulator.
 - A measured Level-5 timing table against NCCL Reshard and CheckpointEngine.
@@ -423,8 +425,9 @@ Current partial evidence:
 
 - `modelexpress.resharding_receiver` builds receiver requests from runtime-owned
   torch tensors, installs planned segment payloads into target tensor slices,
-  and installs global-required quantization fallback payloads into
-  runtime-owned metadata tensors.
+  installs global-required quantization fallback payloads into runtime-owned
+  metadata tensors, and can snapshot/rollback runtime tensors across
+  model-version installs.
 - `modelexpress_client/python/tests/test_resharding_receiver.py` covers
   vLLM-shaped and SGLang-shaped runtime tensor install smokes on nscale,
   including a real Qwen3 FP8 `weight_scale_inv` manifest entry for the
@@ -434,6 +437,13 @@ Current partial evidence:
   (`17 passed`).
 - Runtime fallback install artifact:
   `artifacts/resharding/qwen3-30b-a3b-fp8-runtime-fallback-install-smoke.json`.
+- Runtime versioned rollback helper evidence:
+  `artifacts/resharding/nscale-runtime-refit-versioned-rollback-smoke.json`
+  and `artifacts/resharding/nscale-runtime-refit-versioned-rollback-pytest.log`
+  (`11 passed`). The smoke installs two Qwen-style layer tensors for
+  `step-8`, rolls back to `step-7`, then installs and commits `step-9`;
+  it is CPU/runtime-tensor evidence, not GPU-resident rollback proof. It also
+  rejects dtype drift before rollback.
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
@@ -508,12 +518,14 @@ These are the next useful things to do, in order:
    the cold-load path is stable.
 4. Extend the quantized Qwen fallback from helper-level runtime tensor install
    to real Qwen FP8 payload bytes and real engine-owned model tensors.
-5. Add an nscale fanout microbenchmark for rollout replicas using the simulator
+5. Extend versioned rollback from CPU/runtime-tensor transaction semantics
+   to GPU-resident rollback across multiple training steps.
+6. Add an nscale fanout microbenchmark for rollout replicas using the simulator
    scenario as the shape contract.
-6. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
+7. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
    schedulable, then generate a passing normalized table only if MX/NIXL,
    NCCL Reshard, and CheckpointEngine rows all have checksum/allclose gates.
-7. After the synthetic table passes, repeat the same schema for real Qwen/full
+8. After the synthetic table passes, repeat the same schema for real Qwen/full
    runtime rows before making any competitive Level-5 claim.
 
 ## Current Claim We Can Safely Make

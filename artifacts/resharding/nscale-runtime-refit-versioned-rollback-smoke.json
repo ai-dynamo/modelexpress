@@ -1,0 +1,96 @@
+{
+  "committed_model_version": "step-9",
+  "gpu_resident": false,
+  "mode": "runtime-refit-versioned-rollback-cpu-smoke",
+  "model_name": "qwen",
+  "multi_layer_runtime_install": true,
+  "previous_model_version": "step-7",
+  "result": "pass",
+  "rolled_back_model_version": "step-8",
+  "runtime_framework": "vllm",
+  "runtime_owned_tensors": true,
+  "schema_version": 1,
+  "step8_transaction": {
+    "committed": false,
+    "previous_model_version": "step-7",
+    "rolled_back": true,
+    "snapshots": [
+      {
+        "bytes": 48,
+        "checksum": 66.0,
+        "dtype": "float32",
+        "shape": [
+          3,
+          4
+        ],
+        "target_key": "vllm:model.layers.0.mlp.experts.w1.weight"
+      },
+      {
+        "bytes": 48,
+        "checksum": 210.0,
+        "dtype": "float32",
+        "shape": [
+          3,
+          4
+        ],
+        "target_key": "vllm:model.layers.1.mlp.experts.w1.weight"
+      }
+    ],
+    "target_model_version": "step-8"
+  },
+  "step9_transaction": {
+    "committed": true,
+    "previous_model_version": "step-7",
+    "rolled_back": false,
+    "snapshots": [
+      {
+        "bytes": 48,
+        "checksum": 66.0,
+        "dtype": "float32",
+        "shape": [
+          3,
+          4
+        ],
+        "target_key": "vllm:model.layers.0.mlp.experts.w1.weight"
+      },
+      {
+        "bytes": 48,
+        "checksum": 210.0,
+        "dtype": "float32",
+        "shape": [
+          3,
+          4
+        ],
+        "target_key": "vllm:model.layers.1.mlp.experts.w1.weight"
+      }
+    ],
+    "target_model_version": "step-9"
+  },
+  "tensor_names": [
+    "model.layers.0.mlp.experts.w1.weight",
+    "model.layers.1.mlp.experts.w1.weight"
+  ],
+  "trainer_side_inference_layout_conversion_used": false,
+  "validation": {
+    "commit_checksums": {
+      "model.layers.0.mlp.experts.w1.weight": 1080.0,
+      "model.layers.1.mlp.experts.w1.weight": 1092.0
+    },
+    "commit_matches_step9": true,
+    "dtype_drift_error": "runtime target tensor 'vllm:weight' changed dtype from float32 to float16",
+    "dtype_drift_rejected": true,
+    "previous_checksums": {
+      "model.layers.0.mlp.experts.w1.weight": 66.0,
+      "model.layers.1.mlp.experts.w1.weight": 210.0
+    },
+    "rollback_checksums": {
+      "model.layers.0.mlp.experts.w1.weight": 66.0,
+      "model.layers.1.mlp.experts.w1.weight": 210.0
+    },
+    "rollback_matches_previous": true,
+    "step8_installed_checksums": {
+      "model.layers.0.mlp.experts.w1.weight": 960.0,
+      "model.layers.1.mlp.experts.w1.weight": 972.0
+    }
+  }
+}

@@ -45,6 +45,137 @@ class InstalledQuantizationFallback:
     runtime_framework: str
 
 
+@dataclass(frozen=True)
+class RuntimeTensorSnapshot:
+    """Metadata for one tensor snapshot captured before a versioned refit."""
+
+    target_key: str
+    shape: tuple[int, ...]
+    dtype: str
+    bytes: int
+    checksum: float
+
+
+@dataclass
+class RuntimeRefitTransaction:
+    """Rollback handle for installing one target model version into runtime tensors."""
+
+    previous_model_version: str
+    target_model_version: str
+    _target_tensors: Mapping[str, torch.Tensor]
+    _snapshots: dict[str, torch.Tensor]
+    snapshots: tuple[RuntimeTensorSnapshot, ...]
+    committed: bool = False
+    rolled_back: bool = False
+
+    def commit(self) -> None:
+        """Mark the target version active and release rollback snapshots."""
+
+        if self.rolled_back:
+            raise RuntimeError("cannot commit a rolled-back runtime refit transaction")
+        self._snapshots.clear()
+        self.committed = True
+
+    def rollback(self) -> None:
+        """Restore the previous model version into the runtime-owned tensors."""
+
+        if self.committed:
+            raise RuntimeError("cannot rollback a committed runtime refit transaction")
+        for target_key, snapshot in self._snapshots.items():
+            if target_key not in self._target_tensors:
+                raise KeyError(f"missing runtime target tensor {target_key!r}")
+            target = self._target_tensors[target_key]
+            if tuple(int(dim) for dim in target.shape) != tuple(
+                int(dim) for dim in snapshot.shape
+            ):
+                raise ValueError(
+                    f"runtime target tensor {target_key!r} changed shape from "
+                    f"{tuple(int(dim) for dim in snapshot.shape)} to "
+                    f"{tuple(int(dim) for dim in target.shape)}"
+                )
+            if target.dtype != snapshot.dtype:
+                raise ValueError(
+                    f"runtime target tensor {target_key!r} changed dtype from "
+                    f"{_torch_dtype_name(snapshot.dtype)} to "
+                    f"{_torch_dtype_name(target.dtype)}"
+                )
+            with torch.no_grad():
+                target.copy_(snapshot.to(device=target.device))
+        self._snapshots.clear()
+        self.rolled_back = True
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "previous_model_version": self.previous_model_version,
+            "target_model_version": self.target_model_version,
+            "committed": self.committed,
+            "rolled_back": self.rolled_back,
+            "snapshots": [
+                {
+                    "target_key": snapshot.target_key,
+                    "shape": list(snapshot.shape),
+                    "dtype": snapshot.dtype,
+                    "bytes": snapshot.bytes,
+                    "checksum": snapshot.checksum,
+                }
+                for snapshot in self.snapshots
+            ],
+        }
+
+
+def begin_runtime_refit_transaction(
+    target_tensors: Mapping[str, torch.Tensor],
+    *,
+    previous_model_version: str,
+    target_model_version: str,
+    target_keys: Iterable[str] | None = None,
+) -> RuntimeRefitTransaction:
+    """Snapshot runtime-owned tensors before installing a new model version.
+
+    The snapshots stay on the tensors' current devices, so GPU callers can keep
+    rollback state device-resident. CPU tests use the same path.
+    """
+
+    if not previous_model_version:
+        raise ValueError("previous_model_version is required")
+    if not target_model_version:
+        raise ValueError("target_model_version is required")
+    if previous_model_version == target_model_version:
+        raise ValueError("target_model_version must differ from previous_model_version")
+
+    selected_keys = (
+        tuple(target_keys) if target_keys is not None else tuple(target_tensors)
+    )
+    if not selected_keys:
+        raise ValueError("at least one runtime tensor must be snapshotted")
+
+    snapshots: dict[str, torch.Tensor] = {}
+    snapshot_metadata: list[RuntimeTensorSnapshot] = []
+    for target_key in selected_keys:
+        if target_key not in target_tensors:
+            raise KeyError(f"missing runtime target tensor {target_key!r}")
+        target = target_tensors[target_key]
+        snapshot = target.detach().clone()
+        snapshots[target_key] = snapshot
+        snapshot_metadata.append(
+            RuntimeTensorSnapshot(
+                target_key=target_key,
+                shape=tuple(int(dim) for dim in target.shape),
+                dtype=_torch_dtype_name(target.dtype),
+                bytes=int(target.numel() * target.element_size()),
+                checksum=_tensor_checksum(target),
+            )
+        )
+
+    return RuntimeRefitTransaction(
+        previous_model_version=previous_model_version,
+        target_model_version=target_model_version,
+        _target_tensors=target_tensors,
+        _snapshots=snapshots,
+        snapshots=tuple(snapshot_metadata),
+    )
+
+
 def build_receiver_requests_from_runtime_tensors(
     tensors: Mapping[str, torch.Tensor],
     *,
@@ -250,6 +381,10 @@ def _target_layout_tags(
 
 def _torch_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
+
+
+def _tensor_checksum(tensor: torch.Tensor) -> float:
+    return float(tensor.detach().float().sum().item())
 
 
 def _normalize_dtype_name(dtype: str) -> str:

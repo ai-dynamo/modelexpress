@@ -384,5 +384,16 @@
   "qwen_fp8_runtime_fallback_install_allclose": true,
   "qwen_fp8_runtime_fallback_install_checksum_matches": true,
   "qwen_fp8_runtime_fallback_install_zero_copy_plan_created": false,
-  "qwen_fp8_runtime_fallback_trainer_side_inference_layout_conversion_used": false
+  "qwen_fp8_runtime_fallback_trainer_side_inference_layout_conversion_used": false,
+  "runtime_refit_versioned_rollback_added": true,
+  "runtime_refit_versioned_rollback_artifact": "nscale-runtime-refit-versioned-rollback-smoke.json",
+  "runtime_refit_versioned_rollback_pytest_artifact": "nscale-runtime-refit-versioned-rollback-pytest.log",
+  "runtime_refit_versioned_rollback_pytest_passed": 11,
+  "runtime_refit_versioned_rollback_multi_layer": true,
+  "runtime_refit_versioned_rollback_previous_version": "step-7",
+  "runtime_refit_versioned_rollback_rolled_back_version": "step-8",
+  "runtime_refit_versioned_rollback_committed_version": "step-9",
+  "runtime_refit_versioned_rollback_cpu_runtime_tensor_proven": true,
+  "runtime_refit_versioned_rollback_gpu_resident_proven": false,
+  "runtime_refit_versioned_rollback_dtype_drift_rejected": true
 }

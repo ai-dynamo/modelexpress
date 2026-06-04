@@ -198,6 +198,13 @@ Files:
 - `nscale-qwen-fp8-runtime-fallback-install-pytest.log`: focused nscale
   Python gate for receiver fallback install and Qwen manifest handling
   (`17 passed`).
+- `nscale-runtime-refit-versioned-rollback-smoke.json`: CPU/runtime-tensor
+  rollback smoke for two Qwen-style layer tensors. It snapshots `step-7`,
+  installs `step-8`, rolls back to `step-7`, then installs and commits
+  `step-9`, with checksum validation. It records `gpu_resident=false`,
+  rejects dtype drift before rollback, and is not GPU-resident rollback proof.
+- `nscale-runtime-refit-versioned-rollback-pytest.log`: focused nscale
+  receiver rollback gate (`11 passed`).
 - Qwen MoE manifest extraction is covered by the Python gate. It classifies
   stacked expert-axis tensors, per-expert tensor-name layouts, global
   quantization metadata, generated-on-target tensors, and layout-sensitive
