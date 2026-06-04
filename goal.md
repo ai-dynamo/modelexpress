@@ -167,10 +167,19 @@ Artifacts under `artifacts/resharding/` prove:
   `0/29 nodes are available`, `10 Insufficient nvidia.com/gpu`, and
   autoscaler max node group size reached. That block is now superseded by the
   later checksum-backed one-pod-per-source-rank run above.
-- A Level-5 real timing table was also not run in this pass:
-  `artifacts/resharding/nscale-level5-timing-capacity-block.json` records that
-  MX/NIXL, NCCL Reshard, and CheckpointEngine measured baselines remain
-  unmeasured because the required multi-GPU nscale capacity was unavailable.
+- A dedicated normalized Level-5 real timing table was also not run in that
+  pass: `artifacts/resharding/nscale-level5-timing-capacity-block.json`
+  records that comparable checksum-backed MX/NIXL, NCCL Reshard, and
+  CheckpointEngine measured baselines remained unmeasured because the required
+  multi-GPU nscale capacity was unavailable.
+- Existing real Qwen3 BF16 timing jobs were audited in
+  `artifacts/resharding/nscale-level5-existing-job-evidence-audit.json`. The
+  audit records five-sample full-model/vLLM timing context for MX live refit,
+  NCCL, and CheckpointEngine, including 61,064,245,248-byte Qwen3 payloads.
+  Those jobs are useful competitive context, but they do **not** satisfy the
+  Level-5 claim because they validate by live vLLM output-change rather than
+  allclose/checksum and do not expose a common registration/publish/planner/
+  read/install metric schema across all three rows.
 - A Qwen-style MoE manifest extractor now classifies expert-axis tensors,
   layout-sensitive shared-expert tensors, global quantization metadata, and
   generated-on-target tensors from tensor names/shapes.
@@ -234,6 +243,9 @@ The current POC does **not** prove:
 - Performance competitiveness against NCCL Reshard, CheckpointEngine, Mooncake,
   or TorchStore-style systems beyond the committed CPU byte/cost simulator.
 - A measured Level-5 timing table against NCCL Reshard and CheckpointEngine.
+  Existing Qwen3 timing jobs are partial evidence only; a Level-5 row still
+  needs a real checksum/allclose gate and normalized byte/timing fields for
+  MX/NIXL, NCCL Reshard, and CheckpointEngine.
 
 ## Proof Levels
 

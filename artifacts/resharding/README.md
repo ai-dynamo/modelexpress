@@ -128,10 +128,16 @@ Files:
   `10 Insufficient nvidia.com/gpu`, and autoscaler max node group size reached.
   This block is superseded by the later checksum-backed
   `nscale-crossnode-one-pod-per-source-rank-target.json` run.
-- `nscale-level5-timing-capacity-block.json`: honest block for the requested
-  real Level-5 timing table. MX/NIXL, NCCL Reshard, and CheckpointEngine
-  measured timings were not run because the required multi-GPU nscale capacity
-  was unavailable.
+- `nscale-level5-timing-capacity-block.json`: honest block for a dedicated
+  normalized Level-5 timing table. Comparable checksum-backed MX/NIXL, NCCL
+  Reshard, and CheckpointEngine timings were not run in that pass because the
+  required multi-GPU nscale capacity was unavailable.
+- `nscale-level5-existing-job-evidence-audit.json`: audit of existing nscale
+  timing jobs that looked close to Level-5 evidence. It banks real Qwen3 BF16
+  full-model/vLLM timing context for MX live refit, NCCL, and
+  CheckpointEngine, but marks the Level-5 claim as failed because those rows
+  use live output-change validation instead of allclose/checksum and do not
+  share a normalized registration/publish/planner/read/install timing schema.
 - `qwen3-30b-a3b-moe-manifest.json.gz` and
   `qwen3-30b-a3b-moe-manifest.summary.json`: real Qwen/Qwen3-30B-A3B
   safetensors-header coverage artifact generated through HTTP range reads over
@@ -154,5 +160,6 @@ The NIXL JSON is the primary Level 2 same-node proof artifact. The cross-node
 live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
 artifacts, with the one-pod-per-source-rank target JSON as the strictest
 cross-node claim. The NCCL distributed JSON remains the Level 1 comparison
-artifact. Real Level-5 timing remains blocked/unproven until comparable
+artifact. Existing Qwen3 timing jobs are now banked as partial competitive
+context, but real Level-5 timing remains unproven until comparable
 checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine runs are completed.

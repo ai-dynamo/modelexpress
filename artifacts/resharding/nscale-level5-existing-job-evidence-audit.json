@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-06-04",
+  "nscale_context": "nv-prd-dgxc.teleport.sh-dynamo-nscale-dev-cluster",
+  "namespace": "anish-dynamo",
+  "verdict": {
+    "level5_real_timing_table_pass": false,
+    "level5_checksum_or_allclose_gate_present_for_all_rows": false,
+    "level5_common_metric_schema_present_for_all_rows": false,
+    "level5_claim_allowed": false,
+    "reason": "Existing nscale jobs provide useful real full-model timing context, but they do not meet the requested Level-5 gate because the Qwen3 MX, NCCL, and CheckpointEngine rows validate by live vLLM output-change rather than allclose/checksum and do not expose a common registration/publish/planner/read/install metric schema."
+  },
+  "strict_proof_boundary": {
+    "checksum_backed_crossnode_one_pod_per_source_rank": {
+      "artifact": "nscale-crossnode-one-pod-per-source-rank-target.json",
+      "mode": "nixl-crossnode-one-pod-per-source-rank",
+      "cross_node": true,
+      "gpu_count": 4,
+      "source_endpoint_count": 3,
+      "distinct_source_agent_count": 3,
+      "allclose": true,
+      "checksum": 556224.0,
+      "expected_checksum": 556224.0,
+      "trainer_to_inference_bytes": 64,
+      "raw_nixl_read_duration_ms": 13.304431922733784,
+      "claim_scope": "Level-3 synthetic cross-node MX/NIXL segment-read proof only; not a full-model Level-5 competitive timing row."
+    }
+  },
+  "audited_real_qwen3_bf16_jobs": [
+    {
+      "name": "MX live refit partial timing",
+      "job": "mx-qwen3-moe-bf16-fsdp-source-mx-matrix",
+      "backend": "modelexpress",
+      "model_variant": "Qwen/Qwen3-30B-A3B",
+      "source_kind": "verl_training_worker_fsdp",
+      "target_runtime": "vLLM",
+      "cross_node": true,
+      "sample_count": 5,
+      "payload_bytes": 61064245248,
+      "tensor_count": 18867,
+      "expert_tensor_count": 18432,
+      "validation_kind": "live_vllm_output_change",
+      "checksum_or_allclose_gate": false,
+      "target_receive_report_present": true,
+      "target_bytes_transferred": 61064245248,
+      "retry_count": 0,
+      "rediscovery_count": 0,
+      "sample_run_ids": [
+        "mx-qwen3-moe-bf16-fsdp-source-mx-matrix-measured-1",
+        "mx-qwen3-moe-bf16-fsdp-source-mx-matrix-measured-2",
+        "mx-qwen3-moe-bf16-fsdp-source-mx-matrix-measured-3",
+        "mx-qwen3-moe-bf16-fsdp-source-mx-matrix-measured-4",
+        "mx-qwen3-moe-bf16-fsdp-source-mx-matrix-measured-5"
+      ],
+      "measured_seconds": {
+        "manager_update": {
+          "min": 35.533789334003814,
+          "median": 37.74778750096448,
+          "mean": 39.58786164361518,
+          "max": 45.22285133902915
+        },
+        "target_transfer": {
+          "min": 2.247798917000182,
+          "median": 2.250151425949298,
+          "mean": 2.2504761853953825,
+          "max": 2.254754444002174
+        },
+        "source_registration": {
+          "min": 2.6261001939419657,
+          "median": 3.170011181035079,
+          "mean": 3.106229888810776,
+          "max": 3.5481872090604156
+        },
+        "source_publish_tensors": {
+          "min": 4.978455015923828,
+          "median": 5.568007649038918,
+          "mean": 5.4720598860178145,
+          "max": 5.8095833620755
+        },
+        "source_send_weights": {
+          "min": 13.898237941903062,
+          "median": 15.206698533031158,
+          "mean": 17.263254031189717,
+          "max": 22.94846102700103
+        }
+      },
+      "effective_gbps": {
+        "min": 10.802369764827118,
+        "median": 12.941525697937083,
+        "mean": 12.442456507740992,
+        "max": 13.747871283643818
+      },
+      "level5_gap": "Real full-model timing exists, but the gate is output-change, not checksum/allclose, and install/read/planner timing is not aligned with NCCL and CheckpointEngine rows."
+    },
+    {
+      "name": "NCCL refit partial timing",
+      "job": "mx-qwen3-moe-bf16-fsdp-source-nccl-matrix",
+      "backend": "nccl",
+      "model_variant": "Qwen/Qwen3-30B-A3B",
+      "source_kind": "verl_training_worker_fsdp",
+      "target_runtime": "vLLM",
+      "cross_node": true,
+      "sample_count": 5,
+      "payload_bytes": 61064245248,
+      "tensor_count": 18867,
+      "expert_tensor_count": 18432,
+      "validation_kind": "live_vllm_output_change",
+      "checksum_or_allclose_gate": false,
+      "target_receive_report_present": false,
+      "target_bytes_transferred": null,
+      "sample_run_ids": [
+        "mx-qwen3-moe-bf16-fsdp-source-nccl-matrix-measured-1",
+        "mx-qwen3-moe-bf16-fsdp-source-nccl-matrix-measured-2",
+        "mx-qwen3-moe-bf16-fsdp-source-nccl-matrix-measured-3",
+        "mx-qwen3-moe-bf16-fsdp-source-nccl-matrix-measured-4",
+        "mx-qwen3-moe-bf16-fsdp-source-nccl-matrix-measured-5"
+      ],
+      "measured_seconds": {
+        "manager_update": {
+          "min": 18.881906441994943,
+          "median": 19.362527741934173,
+          "mean": 19.382621099986135,
+          "max": 20.040270562982187
+        },
+        "source_send_weights": {
+          "min": 9.7958698120201,
+          "median": 9.873628280940466,
+          "mean": 10.093012680788524,
+          "max": 11.074660632992163
+        },
+        "target_transfer": {
+          "reported_value": 0.0,
+          "interpretation": "Not a measured target receive duration; target_receive_report was empty."
+        }
+      },
+      "effective_gbps": {
+        "min": 24.376615098519128,
+        "median": 25.229865051452272,
+        "mean": 25.213474760285838,
+        "max": 25.872067711208654
+      },
+      "level5_gap": "Real full-model timing exists, but there is no checksum/allclose gate and no target receive byte/timing report for the requested Level-5 table."
+    },
+    {
+      "name": "CheckpointEngine partial timing",
+      "job": "mx-qwen3-moe-bf16-ce-matrix",
+      "backend": "checkpoint-engine",
+      "checkpoint_engine_package": "checkpoint-engine==0.4.0",
+      "model_variant": "Qwen/Qwen3-30B-A3B",
+      "source_kind": "indexed_safetensors_overlay",
+      "target_runtime": "vLLM",
+      "sample_count": 5,
+      "payload_bytes": 61064245248,
+      "tensor_count": 18867,
+      "expert_tensor_count": 18432,
+      "validation_kind": "live_vllm_output_change",
+      "checksum_or_allclose_gate": false,
+      "target_receive_report_present": false,
+      "sample_run_ids": [
+        "mx-qwen3-moe-bf16-ce-matrix-measured-1",
+        "mx-qwen3-moe-bf16-ce-matrix-measured-2",
+        "mx-qwen3-moe-bf16-ce-matrix-measured-3",
+        "mx-qwen3-moe-bf16-ce-matrix-measured-4",
+        "mx-qwen3-moe-bf16-ce-matrix-measured-5"
+      ],
+      "measured_seconds": {
+        "manager_update": {
+          "min": 32.88672188692726,
+          "median": 34.5085489860503,
+          "mean": 34.3190826524049,
+          "max": 35.06568097602576
+        }
+      },
+      "effective_gbps": {
+        "min": 13.931398118804386,
+        "median": 14.15631709642374,
+        "mean": 14.241392351336346,
+        "max": 14.854443798431252
+      },
+      "level5_gap": "Actual CheckpointEngine package timing exists, but it lacks checksum/allclose validation and does not expose the same read/install/planner metrics as the MX/NIXL synthetic proof."
+    }
+  ],
+  "audited_tiny_verl_comparison": {
+    "job": "mx-verl-tiny-nccl-mx-comparison-a628e45",
+    "model_variant": "tiny_qwen2",
+    "sample_count": 5,
+    "modelexpress_bytes_transferred": 9408,
+    "modelexpress_transfer_seconds_mean": 0.01457331320270896,
+    "modelexpress_update_seconds_mean": 6.901664559007623,
+    "nccl_update_seconds_mean": 5.593025023420341,
+    "nccl_bytes_transferred": 0,
+    "nccl_receive_success": false,
+    "level5_gap": "This tiny veRL comparison is not a valid Level-5 baseline because the NCCL row recorded zero transferred bytes and receive_success=false."
+  },
+  "required_next_evidence_for_level5": [
+    "Run MX/NIXL, NCCL Reshard, and CheckpointEngine under one harness or a normalized artifact schema.",
+    "Use the same tensor payload and target installation contract for every row.",
+    "Gate every row on allclose and checksum, not only live generation output changes.",
+    "Report trainer-to-inference bytes, redundant-byte factor, registration/publish/planner/read/install timings, retries, rediscovery count, and checksum.",
+    "Keep same-node, cross-node, one-pod-per-rank, and full-model runtime claims separate."
+  ],
+  "source_log_commands": [
+    "kubectl --context nv-prd-dgxc.teleport.sh-dynamo-nscale-dev-cluster -n anish-dynamo logs job/mx-qwen3-moe-bf16-fsdp-source-mx-matrix",
+    "kubectl --context nv-prd-dgxc.teleport.sh-dynamo-nscale-dev-cluster -n anish-dynamo logs job/mx-qwen3-moe-bf16-fsdp-source-nccl-matrix",
+    "kubectl --context nv-prd-dgxc.teleport.sh-dynamo-nscale-dev-cluster -n anish-dynamo logs job/mx-qwen3-moe-bf16-ce-matrix",
+    "kubectl --context nv-prd-dgxc.teleport.sh-dynamo-nscale-dev-cluster -n anish-dynamo logs job/mx-verl-tiny-nccl-mx-comparison-a628e45"
+  ]
+}
