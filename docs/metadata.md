@@ -341,14 +341,16 @@ sequenceDiagram
     MX-->>W: [SourceInstanceRef, ...]
     W->>W: Filter by worker_rank, shuffle for load balancing
     W->>W: Load dummy weights, initialize NIXL agent
-    loop For each candidate (max MAX_SOURCE_RETRIES)
+    loop For each candidate (max MAX_SOURCE_RETRIES) until metadata found
         W->>MX: GetMetadata(mx_source_id, worker_id)
         MX-->>W: WorkerMetadata (tensors, nixl_metadata)
-        W->>W: Add remote NIXL agent
-        W->>W: Execute RDMA transfers
-        alt Transfer fails (SourceTransferError)
+        alt Metadata missing or fetch error
             W->>W: Try next candidate
         end
+    end
+    W->>W: Add remote NIXL agent, execute RDMA transfers
+    alt Transfer fails (SourceTransferError / ManifestMismatchError)
+        W->>W: Abandon RDMA, fall through to next strategy (GDS, disk)
     end
     W->>W: process_weights_after_loading()
     W->>W: Register and publish own metadata (become a source)

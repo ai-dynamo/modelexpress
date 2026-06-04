@@ -20,7 +20,7 @@ SPDX-License-Identifier: Apache-2.0
 
 <p align="center">
   <a href="#features">Features</a> •
-  <a href="#dynamo-modelexpress-architecture">Architecture</a> •
+  <a href="#modelexpress-architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#deployment">Deployment</a> •
   <a href="#documentation">Docs</a> •
@@ -116,7 +116,8 @@ cd modelexpress
 docker run -d --name redis -p 6379:6379 redis:8-alpine
 
 cargo build
-MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server
+# REDIS_URL is required; the server does not fall back to localhost:6379.
+REDIS_URL=redis://localhost:6379 MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server
 ```
 
 Server listens on `0.0.0.0:8001`. In another terminal:
@@ -130,7 +131,7 @@ modelexpress-cli health
 ```
 
 **Without shared storage:** use `--no-shared-storage` for gRPC streaming.  
-**Air-gapped:** `HF_HUB_OFFLINE=1 modelexpress-cli model get <model-id>`.
+**Air-gapped:** with the model already in the local HF cache, `HF_HUB_OFFLINE=1 modelexpress-cli model download <model-id>` resolves it without network access.
 
 ---
 
@@ -177,7 +178,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
 | `MX_METADATA_BACKEND` | (required) | `redis` \| `kubernetes` |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (`redis` backend only) |
+| `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 
