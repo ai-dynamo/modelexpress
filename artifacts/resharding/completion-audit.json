@@ -166,6 +166,55 @@
   "one_pod_per_source_rank_trainer_side_inference_layout_conversion_used": false,
   "one_pod_per_source_rank_torch_distributed_nixl_metadata_exchange_used": false,
   "one_pod_per_source_rank_scheduler_message": "Superseded previous capacity block; later run scheduled three source-rank GPU pods on cluster-0967a26d-pool-14bee067-prctr-9c2x7 and one target GPU pod on cluster-0967a26d-pool-14bee067-prctr-g2j7h.",
+  "stale_source_recovery_crossnode_run_pass": true,
+  "stale_source_recovery_crossnode_artifact": "nscale-crossnode-stale-source-recovery-target.json",
+  "stale_source_recovery_crossnode_summary_artifact": "nscale-crossnode-stale-source-recovery-summary.json",
+  "stale_source_recovery_crossnode_source_artifacts": [
+    "nscale-crossnode-stale-source-recovery-source-rank0.json",
+    "nscale-crossnode-stale-source-recovery-source-rank1.json",
+    "nscale-crossnode-stale-source-recovery-source-rank2-alt.json"
+  ],
+  "stale_source_recovery_run_id": "stale-20260604-184226",
+  "stale_source_recovery_source_pods": [
+    "mx-stale-src0-stale-20260604-184226",
+    "mx-stale-src1-stale-20260604-184226",
+    "mx-stale-src2-stale-20260604-184226"
+  ],
+  "stale_source_recovery_target_pod": "mx-stale-target-stale-20260604-184226",
+  "stale_source_recovery_source_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+  "stale_source_recovery_target_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+  "stale_source_recovery_cross_node": true,
+  "stale_source_recovery_discovered_source_ids": [
+    "trainer-rank0",
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "stale_source_recovery_readable_source_ids": [
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "stale_source_recovery_read_source_ids": [
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "stale_source_recovery_stale_source_ids": [
+    "trainer-rank0"
+  ],
+  "stale_source_recovery_stale_source_ids_excluded_from_nixl_reads": true,
+  "stale_source_recovery_used": true,
+  "stale_source_recovery_allclose": true,
+  "stale_source_recovery_checksum_matches": true,
+  "stale_source_recovery_checksum": 556224.0,
+  "stale_source_recovery_expected_checksum": 556224.0,
+  "stale_source_recovery_trainer_to_inference_bytes": 64,
+  "stale_source_recovery_raw_read_duration_ms": 15.527020092122257,
+  "stale_source_recovery_metadata_query_duration_ms": 40.11980595532805,
+  "stale_source_recovery_planner_duration_ms": 0.1710839569568634,
+  "stale_source_recovery_registration_duration_ms": 5.374368978664279,
+  "stale_source_recovery_add_remote_agent_duration_ms": 4.877370898611844,
+  "stale_source_recovery_ucx_tls": "rc_x,rc,tcp,cuda_copy",
+  "stale_source_recovery_target_ucx_net_devices": "mlx5_1:1",
+  "stale_source_recovery_mid_read_kill_proven": false,
   "level5_real_timing_table_pass": false,
   "level5_real_timing_table_blocked": true,
   "level5_real_timing_table_blocked_reason": "No normalized checksum/allclose Level-5 harness has been run. Existing Qwen3 timing jobs are partial live-vLLM output-change evidence only.",

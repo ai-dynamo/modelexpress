@@ -113,6 +113,24 @@ Files:
   `cluster-0967a26d-pool-14bee067-prctr-g2j7h`.
 - `nscale-crossnode-one-pod-per-source-rank.log`: nscale-generated summary log
   for the one-pod-per-source-rank target gate.
+- `nscale-crossnode-stale-source-recovery-target.json`: completed
+  one-pod-per-source-rank cross-node stale-source recovery proof. Rank0
+  published a source endpoint and exited; MX then reported
+  `trainer-rank0` as `SOURCE_STATUS_STALE`. The target discovered all three
+  source endpoints through MX with `status_filter=None`, added/read only READY
+  `trainer-rank1` and `trainer-rank2-alt`, replanned the stale rank0 segment
+  from the alternate holder, and validated checksum/allclose. The artifact
+  records `stale_source_recovery_used=true`,
+  `stale_source_ids_excluded_from_nixl_reads=true`,
+  `trainer_to_inference_bytes=64`, and
+  `raw_nixl_read_duration_ms=15.527020092122257`. This proves
+  stale-before-read recovery, not a mid-read pod kill.
+- `nscale-crossnode-stale-source-recovery-source-rank0.json`,
+  `nscale-crossnode-stale-source-recovery-source-rank1.json`, and
+  `nscale-crossnode-stale-source-recovery-source-rank2-alt.json`:
+  source-side publication artifacts for the stale-source recovery proof.
+- `nscale-crossnode-stale-source-recovery-summary.json`: compact summary of
+  the stale-source recovery target/source artifacts and key metrics.
 - `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
   pytest run inside the nscale target pod after the cross-node patch
   (`8 passed`). It covers the MX refit endpoint helper path, including legacy
@@ -158,8 +176,8 @@ Files:
 
 The NIXL JSON is the primary Level 2 same-node proof artifact. The cross-node
 live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
-artifacts, with the one-pod-per-source-rank target JSON as the strictest
-cross-node claim. The NCCL distributed JSON remains the Level 1 comparison
+artifacts, with the one-pod-per-source-rank and stale-source recovery target JSONs as
+the strictest cross-node claims. The NCCL distributed JSON remains the Level 1 comparison
 artifact. Existing Qwen3 timing jobs are now banked as partial competitive
 context, but real Level-5 timing remains unproven until comparable
 checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine runs are completed.

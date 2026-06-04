@@ -34,7 +34,6 @@ from modelexpress.resharding_control_plane import (
     slice_request_to_proto,
 )
 
-
 MODEL_NAME = "qwen3-moe-refit-poc"
 MODEL_VERSION = "trainer-step-000001"
 TENSOR_NAME = "model.layers.0.mlp.experts.w1.weight"
@@ -55,7 +54,9 @@ class InMemoryMxClient:
         return source_id
 
     def list_sources(self, identity=None, status_filter=None):
-        source_id_filter = compute_mx_source_id(identity) if identity is not None else None
+        source_id_filter = (
+            compute_mx_source_id(identity) if identity is not None else None
+        )
         refs = []
         for (source_id, worker_id), record in sorted(self._workers.items()):
             worker = record["worker"]
@@ -288,7 +289,13 @@ def test_publish_and_plan_refit_nixl_endpoints_from_mx_metadata():
     assert rank0_endpoint.agent_name == "mx-refit-rank0"
     assert rank0_endpoint.nixl_metadata == b"nixl-metadata-0"
     assert rank0_endpoint.tensor.addr == 0xABC000
-    assert rank0_endpoint.to_nixl_source_info()["addr"] == 0xABC000
+    assert rank0_endpoint.status == p2p_pb2.SOURCE_STATUS_READY
+    assert rank0_endpoint.updated_at == 0
+    rank0_source_info = rank0_endpoint.to_nixl_source_info()
+    assert rank0_source_info["addr"] == 0xABC000
+    assert rank0_source_info["status"] == p2p_pb2.SOURCE_STATUS_READY
+    assert rank0_source_info["updated_at"] == 0
+    assert rank0_endpoint.to_dict()["status"] == p2p_pb2.SOURCE_STATUS_READY
 
     plans, endpoints_by_source_id = plan_from_mx_refit_endpoints(
         client,
@@ -299,6 +306,49 @@ def test_publish_and_plan_refit_nixl_endpoints_from_mx_metadata():
     assert sorted(endpoints_by_source_id) == ["trainer-rank0", "trainer-rank1"]
     assert "trainer-rank-unused" not in endpoints_by_source_id
     assert endpoints_by_source_id["trainer-rank1"].tensor.device_id == 1
+
+
+def test_refit_nixl_endpoint_status_filter_can_discover_stale_endpoints():
+    client = InMemoryMxClient()
+    identity = _identity()
+    ownership = _ownerships()[0]
+
+    source_id = publish_refit_nixl_endpoint(
+        client,
+        identity=identity,
+        ownership=ownership,
+        tensor=TensorDescriptor(
+            name=ownership.tensor_name,
+            addr=0xABC000,
+            size=128,
+            device_id=0,
+            dtype=ownership.dtype,
+        ),
+        agent_name="mx-refit-rank0",
+        nixl_metadata=b"nixl-metadata-0",
+        worker_id=ownership.worker_id,
+        worker_rank=ownership.worker_rank,
+    )
+    assert client.update_status(
+        source_id,
+        ownership.worker_id,
+        ownership.worker_rank,
+        p2p_pb2.SOURCE_STATUS_STALE,
+    )
+
+    assert list_refit_nixl_endpoints(client, identity=identity) == []
+
+    endpoints = list_refit_nixl_endpoints(
+        client,
+        identity=identity,
+        status_filter=None,
+    )
+
+    assert len(endpoints) == 1
+    endpoint = endpoints[0]
+    assert endpoint.source_id == "trainer-rank0"
+    assert endpoint.status == p2p_pb2.SOURCE_STATUS_STALE
+    assert endpoint.to_dict()["status"] == p2p_pb2.SOURCE_STATUS_STALE
 
 
 def test_refit_nixl_endpoint_recovers_ownership_from_legacy_sidecar():

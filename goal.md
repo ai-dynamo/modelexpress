@@ -155,6 +155,18 @@ Artifacts under `artifacts/resharding/` prove:
   `mode=nixl-crossnode-one-pod-per-source-rank`, `gpu_count=4`,
   `one_nixl_agent_per_source_rank=true`, and no trainer all-gather or
   trainer-side inference-layout conversion.
+- A source-churn/stale-source variant now proves the one-pod-per-source-rank
+  path can recover when a source rank has published an MX/NIXL endpoint and
+  then becomes STALE before the target reads:
+  `artifacts/resharding/nscale-crossnode-stale-source-recovery-target.json`.
+  Rank0 ran in `mx-stale-src0-stale-20260604-184226` and exited after publish;
+  MX reported `trainer-rank0` as `SOURCE_STATUS_STALE`. The target pod
+  `mx-stale-target-stale-20260604-184226` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`, discovered all three endpoints
+  from MX, added/read only READY `trainer-rank1` and `trainer-rank2-alt`,
+  replanned the stale rank0 segment from the alternate holder, and validated
+  `allclose=true` with checksum `556224.0`. This is stale-before-read
+  recovery; it does not prove a hard pod kill during an in-flight NIXL read.
 - The live nscale server image used for that cross-node run drops the newer
   `slice_ownerships` proto field even though tensor/NIXL fields survive. The
   source now dual-writes ownership into the new proto field and a prefixed
@@ -232,8 +244,9 @@ The current POC does **not** prove:
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
   post-load/refit lifecycle.
-- One-pod-per-source-rank refit under real source pod churn or a real pod kill
-  during an in-flight read.
+- A hard source pod kill during an in-flight NIXL read. The current
+  stale-source proof covers a source that published and became STALE before
+  the target read.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
 - Runtime fallback installation of real quantized Qwen tensors after
@@ -374,13 +387,10 @@ Current evidence:
 
 Remaining gap:
 
-- Split the source holders into independent source pods/processes so primary
-  and alternate holders can churn independently. The current cross-node proof
-  uses one source pod on node A publishing all source endpoint records and one
-  target pod on node B. The first nscale attempt to schedule three independent
-  source-rank GPU pods was blocked by current GPU capacity:
-  `artifacts/resharding/nscale-one-pod-per-source-capacity-block.log`. Then
-  repeat the proof against real trainer-owned and runtime-owned tensors.
+- Repeat the stale-source recovery proof against real trainer-owned and
+  runtime-owned tensors, and add a hard kill during an in-flight NIXL read.
+  The current synthetic cross-node proof covers independent source pods and
+  recovery after a published source becomes STALE before the target read.
 
 ### Level 4: Real Runtime Refit
 

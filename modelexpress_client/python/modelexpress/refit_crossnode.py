@@ -96,6 +96,26 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _source_status_name(status: int) -> str:
+    try:
+        return p2p_pb2.SourceStatus.Name(int(status))
+    except ValueError:
+        return f"SOURCE_STATUS_{int(status)}"
+
+
+def _source_statuses_by_source_id(
+    endpoints_by_source_id,
+) -> dict[str, dict[str, int | str]]:
+    return {
+        source_id: {
+            "status": int(endpoint.status),
+            "status_name": _source_status_name(endpoint.status),
+            "updated_at": int(endpoint.updated_at),
+        }
+        for source_id, endpoint in sorted(endpoints_by_source_id.items())
+    }
+
+
 def _run_ownerships(run_id: str) -> list[SliceOwnership]:
     model_version = _run_model_version(run_id)
     return [
@@ -135,7 +155,9 @@ def _target_expected(request: SliceRequest, device):
 def _checksum(tensor) -> float:
     torch = _import_torch()
     flat = tensor.float().reshape(-1)
-    weights = torch.arange(1, flat.numel() + 1, device=tensor.device, dtype=torch.float32)
+    weights = torch.arange(
+        1, flat.numel() + 1, device=tensor.device, dtype=torch.float32
+    )
     return float((flat * weights).sum().item())
 
 
@@ -157,10 +179,17 @@ def _plan_context_for_endpoints(
     request: SliceRequest,
     metadata_query_duration_ms: float,
     planner_duration_ms: float,
+    failed_source_ids: set[str] | None = None,
+    stale_source_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    failed_source_ids = set(failed_source_ids or FAILED_PRIMARY_SOURCE_IDS)
+    stale_source_ids = set(stale_source_ids or ())
+    unreadable_source_ids = failed_source_ids | stale_source_ids
     endpoints_by_source_id = {
         endpoint.source_id: endpoint
-        for endpoint in sorted(endpoints, key=lambda item: (item.source_id, item.worker_id))
+        for endpoint in sorted(
+            endpoints, key=lambda item: (item.source_id, item.worker_id)
+        )
     }
     primary_owners = [
         endpoints_by_source_id[source_id].ownership for source_id in PRIMARY_SOURCE_IDS
@@ -172,10 +201,14 @@ def _plan_context_for_endpoints(
     ]
     primary_plans = plan_segments(primary_owners, [request])
     failed_primary_plans = [
-        plan for plan in primary_plans if plan.source_id in FAILED_PRIMARY_SOURCE_IDS
+        plan for plan in primary_plans if plan.source_id in unreadable_source_ids
     ]
     recovery_requests = [
-        replace(request, requested_range=plan.target_range, target_shape=_range_extents(plan.target_range))
+        replace(
+            request,
+            requested_range=plan.target_range,
+            target_shape=_range_extents(plan.target_range),
+        )
         for plan in failed_primary_plans
     ]
     recovery_plans = plan_segments(alternate_owners, recovery_requests)
@@ -191,6 +224,10 @@ def _plan_context_for_endpoints(
             endpoint.ownership for endpoint in endpoints_by_source_id.values()
         ],
         "source_endpoints_by_id": endpoints_by_source_id,
+        "source_statuses_by_id": _source_statuses_by_source_id(endpoints_by_source_id),
+        "failed_source_ids": sorted(failed_source_ids),
+        "stale_source_ids": sorted(stale_source_ids),
+        "unreadable_source_ids": sorted(unreadable_source_ids),
         "metadata_query_duration_ms": metadata_query_duration_ms,
         "planner_duration_ms": planner_duration_ms,
     }
@@ -206,7 +243,15 @@ def _wait_for_endpoints(
     request: SliceRequest,
     expected_source_ids: set[str],
     timeout_seconds: float,
+    failed_source_ids: set[str] | None = None,
+    stale_source_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    failed_source_ids = set(failed_source_ids or FAILED_PRIMARY_SOURCE_IDS)
+    stale_source_ids = set(stale_source_ids or ())
+    expected_source_ids = set(expected_source_ids) | stale_source_ids
+    expected_ready_source_ids = expected_source_ids - stale_source_ids
+    status_filter = None if stale_source_ids else p2p_pb2.SOURCE_STATUS_READY
+
     mx_client = MxClient()
     try:
         identity = _run_identity(run_id)
@@ -214,20 +259,39 @@ def _wait_for_endpoints(
         metadata_query_start = time.perf_counter()
         endpoints = []
         while True:
-            endpoints = list_refit_nixl_endpoints(mx_client, identity=identity)
+            endpoints = list_refit_nixl_endpoints(
+                mx_client,
+                identity=identity,
+                status_filter=status_filter,
+            )
             present = {endpoint.source_id for endpoint in endpoints}
-            if expected_source_ids.issubset(present):
+            ready = {
+                endpoint.source_id
+                for endpoint in endpoints
+                if int(endpoint.status) == p2p_pb2.SOURCE_STATUS_READY
+            }
+            stale = {
+                endpoint.source_id
+                for endpoint in endpoints
+                if int(endpoint.status) == p2p_pb2.SOURCE_STATUS_STALE
+            }
+            if (
+                expected_source_ids.issubset(present)
+                and expected_ready_source_ids.issubset(ready)
+                and stale_source_ids.issubset(stale)
+            ):
                 break
             if time.time() >= deadline:
-                missing = sorted(expected_source_ids - present)
                 raise RuntimeError(
                     "timed out waiting for cross-node MX NIXL endpoints "
-                    f"(run_id={run_id}, missing={missing}, present={sorted(present)})"
+                    f"(run_id={run_id}, "
+                    f"missing={sorted(expected_source_ids - present)}, "
+                    f"missing_ready={sorted(expected_ready_source_ids - ready)}, "
+                    f"missing_stale={sorted(stale_source_ids - stale)}, "
+                    f"present={sorted(present)}, ready={sorted(ready)}, stale={sorted(stale)})"
                 )
             time.sleep(0.25)
-        metadata_query_duration_ms = (
-            time.perf_counter() - metadata_query_start
-        ) * 1000
+        metadata_query_duration_ms = (time.perf_counter() - metadata_query_start) * 1000
 
         planner_start = time.perf_counter()
         plan_context = _plan_context_for_endpoints(
@@ -235,8 +299,12 @@ def _wait_for_endpoints(
             request=request,
             metadata_query_duration_ms=metadata_query_duration_ms,
             planner_duration_ms=0.0,
+            failed_source_ids=failed_source_ids,
+            stale_source_ids=stale_source_ids,
         )
-        plan_context["planner_duration_ms"] = (time.perf_counter() - planner_start) * 1000
+        plan_context["planner_duration_ms"] = (
+            time.perf_counter() - planner_start
+        ) * 1000
         plan_context["server_url"] = getattr(mx_client, "server_url", "")
         return plan_context
     finally:
@@ -260,9 +328,7 @@ def _filter_ownerships(
         filtered = [owner for owner in filtered if owner.source_id == source_id]
     if worker_rank is not None:
         filtered = [
-            owner
-            for owner in filtered
-            if int(owner.worker_rank or 0) == worker_rank
+            owner for owner in filtered if int(owner.worker_rank or 0) == worker_rank
         ]
     if not filtered:
         available = [
@@ -422,10 +488,16 @@ def run_target(
     target_pod: str,
     target_node: str,
     gpu_count: int,
+    failed_source_ids: set[str] | None = None,
+    stale_source_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     torch = _import_torch()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for cross-node target reads")
+
+    failed_source_ids = set(failed_source_ids or FAILED_PRIMARY_SOURCE_IDS)
+    stale_source_ids = set(stale_source_ids or ())
+    unreadable_source_ids = failed_source_ids | stale_source_ids
 
     device_index, gpu_reuse_used = select_cuda_device(local_rank)
     torch.cuda.set_device(device_index)
@@ -441,17 +513,22 @@ def run_target(
         "target.wait_for_mx_endpoints.start",
         run_id=run_id,
         expected_source_ids=sorted(expected_source_ids),
+        failed_source_ids=sorted(failed_source_ids),
+        stale_source_ids=sorted(stale_source_ids),
     )
     plan_context = _wait_for_endpoints(
         run_id=run_id,
         request=request,
         expected_source_ids=expected_source_ids,
         timeout_seconds=timeout_seconds,
+        failed_source_ids=failed_source_ids,
+        stale_source_ids=stale_source_ids,
     )
     _trace(
         "target.wait_for_mx_endpoints.done",
         run_id=run_id,
         source_ids=sorted(plan_context["source_endpoints_by_id"]),
+        source_statuses=plan_context["source_statuses_by_id"],
         metadata_query_duration_ms=plan_context["metadata_query_duration_ms"],
         planner_duration_ms=plan_context["planner_duration_ms"],
     )
@@ -484,15 +561,21 @@ def run_target(
     )
 
     endpoint_by_source_id = plan_context["source_endpoints_by_id"]
+    readable_endpoint_by_source_id = {
+        source_id: endpoint
+        for source_id, endpoint in endpoint_by_source_id.items()
+        if source_id not in unreadable_source_ids
+        and int(endpoint.status) == p2p_pb2.SOURCE_STATUS_READY
+    }
     sources_by_id = {
         source_id: endpoint.to_nixl_source_info()
-        for source_id, endpoint in endpoint_by_source_id.items()
+        for source_id, endpoint in readable_endpoint_by_source_id.items()
     }
 
     remote_agent_cache: dict[str, str] = {}
     add_remote_timings: dict[str, float] = {}
     remote_agent_names: dict[str, str] = {}
-    for source_id, endpoint in sorted(endpoint_by_source_id.items()):
+    for source_id, endpoint in sorted(readable_endpoint_by_source_id.items()):
         cache_key = endpoint.agent_name
         if cache_key not in remote_agent_cache:
             _trace(
@@ -517,12 +600,25 @@ def run_target(
     primary_read_plans = [
         plan
         for plan in plan_context["primary_plans"]
-        if plan.source_id not in FAILED_PRIMARY_SOURCE_IDS
+        if plan.source_id not in unreadable_source_ids
     ]
+    planned_read_source_ids = {
+        plan.source_id
+        for plan in [*primary_read_plans, *plan_context["recovery_plans"]]
+    }
+    missing_readable_sources = sorted(planned_read_source_ids - set(sources_by_id))
+    if missing_readable_sources:
+        raise RuntimeError(
+            "planned NIXL reads reference non-ready or failed MX sources "
+            f"(missing_readable_sources={missing_readable_sources}, "
+            f"source_statuses={plan_context['source_statuses_by_id']})"
+        )
+
     _trace(
         "target.read_segments.start",
         primary_segment_count=len(primary_read_plans),
         recovery_segment_count=len(plan_context["recovery_plans"]),
+        readable_source_ids=sorted(sources_by_id),
     )
     transfer_start = time.perf_counter()
     primary_reads = read_segment_groups(
@@ -549,15 +645,30 @@ def run_target(
     )
     validation = _validate_target(target, request)
     _trace("target.validation.done", **validation)
-    copied_bytes = sum(read["bytes"] for read in [*primary_reads, *recovery_reads])
-    source_agent_names = {
+    all_reads = [*primary_reads, *recovery_reads]
+    copied_bytes = sum(read["bytes"] for read in all_reads)
+    read_source_ids = {read["source_id"] for read in all_reads}
+    discovered_source_agent_names = {
         source_id: endpoint.agent_name
         for source_id, endpoint in sorted(endpoint_by_source_id.items())
     }
-    distinct_source_agent_count = len(set(source_agent_names.values()))
+    readable_source_agent_names = {
+        source_id: endpoint.agent_name
+        for source_id, endpoint in sorted(readable_endpoint_by_source_id.items())
+    }
+    distinct_source_agent_count = len(set(readable_source_agent_names.values()))
     source_endpoint_count = len(sources_by_id)
     one_agent_per_source_rank = distinct_source_agent_count == source_endpoint_count
     multipod_source_mode = one_agent_per_source_rank and source_endpoint_count > 1
+    stale_primary_planned = stale_source_ids.intersection(
+        plan.source_id for plan in plan_context["primary_plans"]
+    )
+    stale_source_recovery_used = (
+        bool(stale_primary_planned)
+        and bool(recovery_reads)
+        and validation["allclose"]
+        and stale_source_ids.isdisjoint(read_source_ids)
+    )
 
     result = artifact_base(
         mode=(
@@ -575,8 +686,12 @@ def run_target(
     result["proof"].update(
         {
             "actual_nixl_reads_used": True,
-            "cross_node_pods": bool(source_node and target_node and source_node != target_node),
-            "source_pod_separate_from_target_pod": bool(source_pod and target_pod and source_pod != target_pod),
+            "cross_node_pods": bool(
+                source_node and target_node and source_node != target_node
+            ),
+            "source_pod_separate_from_target_pod": bool(
+                source_pod and target_pod and source_pod != target_pod
+            ),
             "nixl_source_endpoints_from_mx": True,
             "torch_distributed_control_plane_used": False,
             "torch_distributed_data_transfer_used": False,
@@ -594,7 +709,22 @@ def run_target(
             ),
             "one_nixl_agent_per_source_rank": one_agent_per_source_rank,
             "source_endpoint_count": source_endpoint_count,
+            "readable_source_endpoint_count": source_endpoint_count,
+            "discovered_source_endpoint_count": len(endpoint_by_source_id),
             "distinct_source_agent_count": distinct_source_agent_count,
+            "failed_source_ids": sorted(failed_source_ids),
+            "stale_source_ids": sorted(stale_source_ids),
+            "unreadable_source_ids": sorted(unreadable_source_ids),
+            "readable_source_ids": sorted(sources_by_id),
+            "read_source_ids": sorted(read_source_ids),
+            "stale_source_endpoint_statuses": {
+                source_id: plan_context["source_statuses_by_id"].get(source_id)
+                for source_id in sorted(stale_source_ids)
+            },
+            "stale_source_ids_excluded_from_nixl_reads": stale_source_ids.isdisjoint(
+                read_source_ids
+            ),
+            "stale_source_recovery_used": stale_source_recovery_used,
         }
     )
     result["distributed"] = {
@@ -605,9 +735,12 @@ def run_target(
         "source_node": source_node,
         "target_node": target_node,
         "cross_node": bool(source_node and target_node and source_node != target_node),
-        "source_ids": list(sources_by_id),
-        "source_roles_in_source_pod": list(sources_by_id),
-        "source_agent_names_by_source_id": source_agent_names,
+        "source_ids": sorted(sources_by_id),
+        "readable_source_ids": sorted(sources_by_id),
+        "discovered_source_ids": sorted(endpoint_by_source_id),
+        "source_roles_in_source_pod": sorted(sources_by_id),
+        "source_agent_names_by_source_id": readable_source_agent_names,
+        "discovered_source_agent_names_by_source_id": discovered_source_agent_names,
         "target_agent_name": agent_name,
         "gpu_reuse_used": gpu_reuse_used,
     }
@@ -617,6 +750,7 @@ def run_target(
         "source_endpoints_from_control_plane": [
             endpoint.to_dict() for endpoint in endpoint_by_source_id.values()
         ],
+        "source_statuses_by_id": plan_context["source_statuses_by_id"],
         "metadata_query_duration_ms": plan_context["metadata_query_duration_ms"],
         "planner_duration_ms": plan_context["planner_duration_ms"],
     }
@@ -626,8 +760,10 @@ def run_target(
         "ucx": _ucx_env_snapshot(),
         "source_metadata": {
             source_id: {
-                "agent_name": endpoint_by_source_id[source_id].agent_name,
-                "metadata_bytes": len(endpoint_by_source_id[source_id].nixl_metadata),
+                "agent_name": readable_endpoint_by_source_id[source_id].agent_name,
+                "metadata_bytes": len(
+                    readable_endpoint_by_source_id[source_id].nixl_metadata
+                ),
                 "source_range": sources_by_id[source_id]["source_range"],
                 "registered_bytes": sources_by_id[source_id]["registered_bytes"],
                 "device_id": sources_by_id[source_id]["device_id"],
@@ -647,14 +783,16 @@ def run_target(
             "nixl_registration_duration_ms": registration_duration_ms,
             "nixl_add_remote_agent_duration_ms": sum(add_remote_timings.values()),
             "nixl_prep_duration_ms": sum(
-                read["prep_duration_ms"] for read in [*primary_reads, *recovery_reads]
+                read["prep_duration_ms"] for read in all_reads
             ),
-            "nixl_read_group_count": len(primary_reads) + len(recovery_reads),
-            "successful_nixl_source_count": len(
-                {read["source_id"] for read in [*primary_reads, *recovery_reads]}
-            ),
+            "nixl_read_group_count": len(all_reads),
+            "successful_nixl_source_count": len(read_source_ids),
             "metadata_query_duration_ms": plan_context["metadata_query_duration_ms"],
             "planner_duration_ms": plan_context["planner_duration_ms"],
+            "discovered_source_endpoint_count": len(endpoint_by_source_id),
+            "readable_source_endpoint_count": source_endpoint_count,
+            "failed_source_count": len(failed_source_ids),
+            "stale_source_count": len(stale_source_ids),
         }
     )
     write_artifact(result, artifact_path)
@@ -697,7 +835,21 @@ def main() -> None:
     parser.add_argument("--source-node", default=os.environ.get("SOURCE_NODE", ""))
     parser.add_argument("--target-pod", default=os.environ.get("POD_NAME", ""))
     parser.add_argument("--target-node", default=os.environ.get("NODE_NAME", ""))
-    parser.add_argument("--gpu-count", type=int, default=int(os.environ.get("GPU_COUNT", "2")))
+    parser.add_argument(
+        "--gpu-count", type=int, default=int(os.environ.get("GPU_COUNT", "2"))
+    )
+    parser.add_argument(
+        "--failed-source-id",
+        action="append",
+        default=[],
+        help="Additional source id to plan around without reading.",
+    )
+    parser.add_argument(
+        "--stale-source-id",
+        action="append",
+        default=[],
+        help="Source id expected to be STALE in MX before target reads.",
+    )
     args = parser.parse_args()
 
     if args.role == "source":
@@ -722,6 +874,13 @@ def main() -> None:
             target_pod=args.target_pod,
             target_node=args.target_node,
             gpu_count=args.gpu_count,
+            failed_source_ids={
+                *FAILED_PRIMARY_SOURCE_IDS,
+                *{source_id for source_id in args.failed_source_id if source_id},
+            },
+            stale_source_ids={
+                source_id for source_id in args.stale_source_id if source_id
+            },
         )
 
 

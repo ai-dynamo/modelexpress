@@ -35,6 +35,8 @@ class RefitNixlEndpoint:
     nixl_metadata: bytes
     metadata_endpoint: str = ""
     worker_grpc_endpoint: str = ""
+    status: int = p2p_pb2.SOURCE_STATUS_READY
+    updated_at: int = 0
 
     @property
     def source_id(self) -> str:
@@ -49,6 +51,8 @@ class RefitNixlEndpoint:
             "source_id": self.source_id,
             "worker_id": self.worker_id,
             "source_range": self.ownership.source_range,
+            "status": self.status,
+            "updated_at": self.updated_at,
             "addr": self.tensor.addr,
             "device_id": self.tensor.device_id,
             "tensor_bytes": self.tensor.size,
@@ -68,6 +72,8 @@ class RefitNixlEndpoint:
             "metadata_bytes": len(self.nixl_metadata),
             "metadata_endpoint": self.metadata_endpoint,
             "worker_grpc_endpoint": self.worker_grpc_endpoint,
+            "status": self.status,
+            "updated_at": self.updated_at,
             "tensor": {
                 "name": self.tensor.name,
                 "addr": self.tensor.addr,
@@ -163,9 +169,9 @@ def slice_ownership_from_proto(
         source_lease=descriptor.source_lease,
         nixl_descriptor_id=descriptor.nixl_descriptor_id,
         storage_offset_bytes=int(descriptor.storage_offset_bytes),
-        strides=tuple(int(s) for s in descriptor.strides)
-        if descriptor.strides
-        else None,
+        strides=(
+            tuple(int(s) for s in descriptor.strides) if descriptor.strides else None
+        ),
         contiguous=bool(descriptor.contiguous),
         layout_tags=_layout_tags_from_proto(descriptor.layout_tags),
         quantization_scope=descriptor.quantization_scope or "absent",
@@ -210,9 +216,11 @@ def slice_request_from_proto(
         target_shape=tuple(int(dim) for dim in descriptor.target_shape),
         dtype=descriptor.dtype,
         target_offset_bytes=int(descriptor.target_offset_bytes),
-        destination_strides=tuple(int(s) for s in descriptor.destination_strides)
-        if descriptor.destination_strides
-        else None,
+        destination_strides=(
+            tuple(int(s) for s in descriptor.destination_strides)
+            if descriptor.destination_strides
+            else None
+        ),
         target_id=descriptor.target_id,
         runtime_framework=descriptor.runtime_framework,
         layout_tags=_layout_tags_from_proto(descriptor.layout_tags),
@@ -340,9 +348,7 @@ def publish_refit_nixl_endpoint(
 
     resolved_worker_id = worker_id or ownership.worker_id
     resolved_worker_rank = (
-        int(worker_rank)
-        if worker_rank is not None
-        else int(ownership.worker_rank or 0)
+        int(worker_rank) if worker_rank is not None else int(ownership.worker_rank or 0)
     )
     encoded_metadata_endpoint = _encode_refit_ownership_sidecar(
         ownership=ownership,
@@ -393,7 +399,7 @@ def list_refit_nixl_endpoints(
     identity: p2p_pb2.SourceIdentity,
     status_filter: int | None = p2p_pb2.SOURCE_STATUS_READY,
 ) -> list[RefitNixlEndpoint]:
-    """Query MX for READY source workers and return NIXL refit endpoints."""
+    """Query MX source workers and return NIXL refit endpoints."""
 
     response = mx_client.list_sources(identity, status_filter=status_filter)
     endpoints: list[RefitNixlEndpoint] = []
@@ -421,7 +427,9 @@ def list_refit_nixl_endpoints(
         if not ownerships and sidecar is not None:
             ownerships = [sidecar[0]]
 
-        metadata_endpoint = sidecar[1] if sidecar is not None else worker.metadata_endpoint
+        metadata_endpoint = (
+            sidecar[1] if sidecar is not None else worker.metadata_endpoint
+        )
         for ownership in ownerships:
             tensor = tensors_by_name.get(ownership.tensor_name)
             if tensor is None and len(tensors) == 1:
@@ -439,6 +447,8 @@ def list_refit_nixl_endpoints(
                     nixl_metadata=bytes(worker.nixl_metadata),
                     metadata_endpoint=metadata_endpoint,
                     worker_grpc_endpoint=worker.worker_grpc_endpoint,
+                    status=int(worker.status),
+                    updated_at=int(worker.updated_at),
                 )
             )
     return endpoints
@@ -529,9 +539,7 @@ def _decode_refit_ownership_sidecar(
 ) -> tuple[SliceOwnership, str] | None:
     if not metadata_endpoint.startswith(_REFIT_OWNERSHIP_SIDECAR_PREFIX):
         return None
-    payload = json.loads(
-        metadata_endpoint[len(_REFIT_OWNERSHIP_SIDECAR_PREFIX) :]
-    )
+    payload = json.loads(metadata_endpoint[len(_REFIT_OWNERSHIP_SIDECAR_PREFIX) :])
     return (
         SliceOwnership.from_dict(payload["ownership"]),
         str(payload.get("metadata_endpoint", "")),

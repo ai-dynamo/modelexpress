@@ -1,0 +1,964 @@
+{
+  "control_plane": {
+    "metadata_query_duration_ms": 40.11980595532805,
+    "mode": "live-mx-cross-node",
+    "planner_duration_ms": 0.1710839569568634,
+    "server_url": "mx-server-rl:8001",
+    "source_endpoints_from_control_plane": [
+      {
+        "agent_name": "mx-crossnode-source-stale-20260604-184226-trainer-rank0",
+        "metadata_bytes": 434,
+        "metadata_endpoint": "",
+        "mx_source_id": "6dcdb671c7d15c0e",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": null,
+          "global_shape": [
+            8,
+            4
+          ],
+          "layout_tags": {
+            "moe_expert_axis": 0,
+            "storage_layout": "row-major",
+            "tp": 1,
+            "trainer_layout": "fsdp"
+          },
+          "model_name": "qwen3-moe-refit-poc",
+          "model_version": "trainer-step-000001-stale-20260604-184226",
+          "nixl_descriptor_id": "nixl-rank0-primary",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank0",
+          "source_lease": "lease-rank0-primary",
+          "source_range": [
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+          "worker_id": "rank0",
+          "worker_rank": 0
+        },
+        "source_id": "trainer-rank0",
+        "status": 3,
+        "tensor": {
+          "addr": 135666558043648,
+          "device_id": 0,
+          "dtype": "float32",
+          "name": "model.layers.0.mlp.experts.w1.weight",
+          "size": 48
+        },
+        "updated_at": 1780591497818,
+        "worker_grpc_endpoint": "",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "agent_name": "mx-crossnode-source-stale-20260604-184226-trainer-rank1",
+        "metadata_bytes": 434,
+        "metadata_endpoint": "",
+        "mx_source_id": "6dcdb671c7d15c0e",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": null,
+          "global_shape": [
+            8,
+            4
+          ],
+          "layout_tags": {
+            "moe_expert_axis": 0,
+            "storage_layout": "row-major",
+            "tp": 1,
+            "trainer_layout": "fsdp"
+          },
+          "model_name": "qwen3-moe-refit-poc",
+          "model_version": "trainer-step-000001-stale-20260604-184226",
+          "nixl_descriptor_id": "nixl-rank1-primary",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank1",
+          "source_lease": "lease-rank1-primary",
+          "source_range": [
+            [
+              3,
+              8
+            ],
+            [
+              0,
+              4
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+          "worker_id": "rank1",
+          "worker_rank": 1
+        },
+        "source_id": "trainer-rank1",
+        "status": 2,
+        "tensor": {
+          "addr": 125512852702720,
+          "device_id": 0,
+          "dtype": "float32",
+          "name": "model.layers.0.mlp.experts.w1.weight",
+          "size": 80
+        },
+        "updated_at": 1780591525849,
+        "worker_grpc_endpoint": "",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      },
+      {
+        "agent_name": "mx-crossnode-source-stale-20260604-184226-trainer-rank2-alt",
+        "metadata_bytes": 438,
+        "metadata_endpoint": "",
+        "mx_source_id": "6dcdb671c7d15c0e",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": null,
+          "global_shape": [
+            8,
+            4
+          ],
+          "layout_tags": {
+            "moe_expert_axis": 0,
+            "storage_layout": "row-major",
+            "tp": 1,
+            "trainer_layout": "fsdp-replica"
+          },
+          "model_name": "qwen3-moe-refit-poc",
+          "model_version": "trainer-step-000001-stale-20260604-184226",
+          "nixl_descriptor_id": "nixl-rank2-alt",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank2-alt",
+          "source_lease": "lease-rank2-alt",
+          "source_range": [
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+          "worker_id": "rank2",
+          "worker_rank": 2
+        },
+        "source_id": "trainer-rank2-alt",
+        "status": 2,
+        "tensor": {
+          "addr": 128378132760064,
+          "device_id": 0,
+          "dtype": "float32",
+          "name": "model.layers.0.mlp.experts.w1.weight",
+          "size": 48
+        },
+        "updated_at": 1780591525790,
+        "worker_grpc_endpoint": "",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "source_statuses_by_id": {
+      "trainer-rank0": {
+        "status": 3,
+        "status_name": "SOURCE_STATUS_STALE",
+        "updated_at": 1780591497818
+      },
+      "trainer-rank1": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780591525849
+      },
+      "trainer-rank2-alt": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780591525790
+      }
+    }
+  },
+  "distributed": {
+    "backend": "nixl-read+mx-endpoint-control+no-torch-distributed",
+    "cross_node": true,
+    "discovered_source_agent_names_by_source_id": {
+      "trainer-rank0": "mx-crossnode-source-stale-20260604-184226-trainer-rank0",
+      "trainer-rank1": "mx-crossnode-source-stale-20260604-184226-trainer-rank1",
+      "trainer-rank2-alt": "mx-crossnode-source-stale-20260604-184226-trainer-rank2-alt"
+    },
+    "discovered_source_ids": [
+      "trainer-rank0",
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "gpu_reuse_used": false,
+    "readable_source_ids": [
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "source_agent_names_by_source_id": {
+      "trainer-rank1": "mx-crossnode-source-stale-20260604-184226-trainer-rank1",
+      "trainer-rank2-alt": "mx-crossnode-source-stale-20260604-184226-trainer-rank2-alt"
+    },
+    "source_ids": [
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "source_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+    "source_pod": "mx-stale-src0-stale-20260604-184226,mx-stale-src1-stale-20260604-184226,mx-stale-src2-stale-20260604-184226",
+    "source_roles_in_source_pod": [
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "target_agent_name": "mx-crossnode-target-stale-20260604-184226",
+    "target_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+    "target_pod": "mx-stale-target-stale-20260604-184226",
+    "world_size": 4
+  },
+  "gpu_count": 4,
+  "metadata_smokes": {
+    "cross_framework_compatible_requests": {
+      "frameworks": [
+        "vllm",
+        "sglang"
+      ],
+      "passed": true,
+      "same_source_publication": true
+    },
+    "qwen_moe_expert_axis": {
+      "passed": true,
+      "sglang_segment_count": 2,
+      "source_ids": [
+        "moe-source-0",
+        "moe-source-1"
+      ],
+      "vllm_segment_count": 2
+    },
+    "tensor_family_classification": {
+      "model.layers.0.mlp.experts.w1.weight": "moe-expert-axis-shard",
+      "model.layers.0.mlp.experts.w1.weight_scale_inv": "quantization-global-required-fallback",
+      "model.rotary_emb.inv_freq": "generated-on-target"
+    }
+  },
+  "metrics": {
+    "activation_install_duration_ms": 0.0,
+    "discovered_source_endpoint_count": 3,
+    "failed_source_count": 1,
+    "gpu_copy_duration_ms": 0.0,
+    "inference_side_fanout_bytes": 0,
+    "metadata_query_duration_ms": 40.11980595532805,
+    "nixl_add_remote_agent_duration_ms": 4.877370898611844,
+    "nixl_prep_duration_ms": 0.046459026634693146,
+    "nixl_read_group_count": 2,
+    "nixl_registration_duration_ms": 5.374368978664279,
+    "planner_duration_ms": 0.1710839569568634,
+    "publish_duration_ms": 0.0,
+    "raw_nixl_read_duration_ms": 15.527020092122257,
+    "readable_source_endpoint_count": 2,
+    "recovery_segment_count": 1,
+    "rediscovery_count": 1,
+    "redundant_cross_boundary_factor": 1.0,
+    "registration_duration_ms": 0.0,
+    "retry_count": 1,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "inference-crossnode-target": 2
+    },
+    "stale_source_count": 1,
+    "successful_nixl_source_count": 2,
+    "trainer_to_inference_bytes": 64
+  },
+  "mode": "nixl-crossnode-one-pod-per-source-rank",
+  "model_name": "qwen3-moe-refit-poc",
+  "model_version": "trainer-step-000001",
+  "nixl": {
+    "add_remote_agent_duration_ms": {
+      "mx-crossnode-source-stale-20260604-184226-trainer-rank1": 2.7581648901104927,
+      "mx-crossnode-source-stale-20260604-184226-trainer-rank2-alt": 2.119206008501351
+    },
+    "nixl_backends": [
+      "UCX"
+    ],
+    "primary_reads": [
+      {
+        "backend": "UCX",
+        "bytes": 48,
+        "prep_duration_ms": 0.03271002788096666,
+        "read_duration_ms": 11.715398984961212,
+        "segment_count": 1,
+        "segments": [
+          {
+            "bytes": 48,
+            "lease_version": "lease-rank1-primary",
+            "nixl_descriptor_id": "nixl-rank1-primary",
+            "retry_policy": "replan-from-alternate-holder",
+            "source_byte_offset": 0,
+            "source_id": "trainer-rank1",
+            "source_range": [
+              [
+                3,
+                6
+              ],
+              [
+                0,
+                4
+              ]
+            ],
+            "target_byte_offset": 16,
+            "target_id": "inference-crossnode-target",
+            "target_range": [
+              [
+                3,
+                6
+              ],
+              [
+                0,
+                4
+              ]
+            ],
+            "target_runtime": "vllm",
+            "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+            "worker_id": "rank1",
+            "worker_rank": 1
+          }
+        ],
+        "source_id": "trainer-rank1",
+        "source_rank": 1,
+        "telemetry": null
+      }
+    ],
+    "recovery_reads": [
+      {
+        "backend": "UCX",
+        "bytes": 16,
+        "prep_duration_ms": 0.013748998753726482,
+        "read_duration_ms": 3.470615018159151,
+        "segment_count": 1,
+        "segments": [
+          {
+            "bytes": 16,
+            "lease_version": "lease-rank2-alt",
+            "nixl_descriptor_id": "nixl-rank2-alt",
+            "retry_policy": "replan-from-alternate-holder",
+            "source_byte_offset": 32,
+            "source_id": "trainer-rank2-alt",
+            "source_range": [
+              [
+                2,
+                3
+              ],
+              [
+                0,
+                4
+              ]
+            ],
+            "target_byte_offset": 0,
+            "target_id": "inference-crossnode-target",
+            "target_range": [
+              [
+                2,
+                3
+              ],
+              [
+                0,
+                4
+              ]
+            ],
+            "target_runtime": "vllm",
+            "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+            "worker_id": "rank2",
+            "worker_rank": 2
+          }
+        ],
+        "source_id": "trainer-rank2-alt",
+        "source_rank": 2,
+        "telemetry": null
+      }
+    ],
+    "remote_agent_names": {
+      "trainer-rank1": {
+        "bytes": 55,
+        "hex_prefix": "6d782d63726f73736e6f64652d736f75"
+      },
+      "trainer-rank2-alt": {
+        "bytes": 59,
+        "hex_prefix": "6d782d63726f73736e6f64652d736f75"
+      }
+    },
+    "source_metadata": {
+      "trainer-rank1": {
+        "agent_name": "mx-crossnode-source-stale-20260604-184226-trainer-rank1",
+        "device_id": 0,
+        "metadata_bytes": 434,
+        "registered_bytes": 80,
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "worker_rank": 1
+      },
+      "trainer-rank2-alt": {
+        "agent_name": "mx-crossnode-source-stale-20260604-184226-trainer-rank2-alt",
+        "device_id": 0,
+        "metadata_bytes": 438,
+        "registered_bytes": 48,
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "worker_rank": 2
+      }
+    },
+    "target_agent_name": "mx-crossnode-target-stale-20260604-184226",
+    "ucx": {
+      "MX_NIXL_BACKEND": "UCX",
+      "MX_RDMA_NIC_PIN": "auto",
+      "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "",
+      "UCX_IB_DEVICES": "",
+      "UCX_MAX_RNDV_RAILS": "",
+      "UCX_NET_DEVICES": "mlx5_1:1",
+      "UCX_RNDV_SCHEME": "get_zcopy",
+      "UCX_RNDV_THRESH": "0",
+      "UCX_TLS": "rc_x,rc,tcp,cuda_copy"
+    }
+  },
+  "planner": {
+    "alternate_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp-replica"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-stale-20260604-184226",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank2-alt",
+        "source_lease": "lease-rank2-alt",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "control_plane_mode": "live-mx-cross-node",
+    "discovered_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-stale-20260604-184226",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank0",
+        "source_lease": "lease-rank0-primary",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-stale-20260604-184226",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank1",
+        "source_lease": "lease-rank1-primary",
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp-replica"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-stale-20260604-184226",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank2-alt",
+        "source_lease": "lease-rank2-alt",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "plan_source": "live-mx-server",
+    "primary_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-stale-20260604-184226",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank0",
+        "source_lease": "lease-rank0-primary",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-stale-20260604-184226",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank1",
+        "source_lease": "lease-rank1-primary",
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "primary_segment_plans": [
+      {
+        "bytes": 16,
+        "lease_version": "lease-rank0-primary",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 32,
+        "source_id": "trainer-rank0",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "bytes": 48,
+        "lease_version": "lease-rank1-primary",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 0,
+        "source_id": "trainer-rank1",
+        "source_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 16,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "primary_segment_plans_json": [
+      {
+        "bytes": 16,
+        "lease_version": "lease-rank0-primary",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 32,
+        "source_id": "trainer-rank0",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "bytes": 48,
+        "lease_version": "lease-rank1-primary",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 0,
+        "source_id": "trainer-rank1",
+        "source_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 16,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "recovery_segment_plans": [
+      {
+        "bytes": 16,
+        "lease_version": "lease-rank2-alt",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 32,
+        "source_id": "trainer-rank2-alt",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "request": {
+      "destination_strides": null,
+      "dtype": "float32",
+      "element_size_bytes": null,
+      "layout_tags": {
+        "ep": 2,
+        "moe_expert_axis": 0,
+        "storage_layout": "row-major",
+        "target_layout": "tp2-ep2",
+        "tp": 2
+      },
+      "model_name": "qwen3-moe-refit-poc",
+      "model_version": "trainer-step-000001-stale-20260604-184226",
+      "quantization_scope": "absent",
+      "requested_range": [
+        [
+          2,
+          6
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "runtime_framework": "vllm",
+      "target_id": "inference-crossnode-target",
+      "target_offset_bytes": 0,
+      "target_shape": [
+        4,
+        4
+      ],
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight"
+    },
+    "simulation": {
+      "inference_side_fanout_bytes": 0,
+      "planner_duration_ms": null,
+      "predicted_bottleneck": "trainer-to-inference",
+      "preferred_strategy": "direct-bipartite-p2p",
+      "redundant_cross_boundary_factor": 1.0,
+      "segment_count": 2,
+      "source_balance_bytes": {
+        "trainer-rank0": 16,
+        "trainer-rank1": 48
+      },
+      "source_count_per_target_tensor": {
+        "inference-crossnode-target": 2
+      },
+      "target_balance_bytes": {
+        "inference-crossnode-target": 64
+      },
+      "trainer_to_inference_bytes": 64,
+      "uncovered_ranges": []
+    }
+  },
+  "proof": {
+    "actual_nixl_reads_used": true,
+    "cross_node_pods": true,
+    "discovered_source_endpoint_count": 3,
+    "distinct_source_agent_count": 2,
+    "failed_source_ids": [
+      "trainer-rank0"
+    ],
+    "failed_then_succeeded": true,
+    "gpu_target_assembly_succeeded": true,
+    "host_side_torch_cat_used": false,
+    "live_mx_returned_metadata_used_for_nixl_plan": true,
+    "mlx5_bond_excluded_from_ucx_devices": true,
+    "nixl_reads_land_at_segment_offsets": true,
+    "nixl_source_endpoints_from_mx": true,
+    "one_nixl_agent_per_source_rank": true,
+    "read_source_ids": [
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "readable_source_endpoint_count": 2,
+    "readable_source_ids": [
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "replanned_only_failed_segments": true,
+    "source_endpoint_count": 2,
+    "source_pod_separate_from_target_pod": true,
+    "stale_source_endpoint_statuses": {
+      "trainer-rank0": {
+        "status": 3,
+        "status_name": "SOURCE_STATUS_STALE",
+        "updated_at": 1780591497818
+      }
+    },
+    "stale_source_ids": [
+      "trainer-rank0"
+    ],
+    "stale_source_ids_excluded_from_nixl_reads": true,
+    "stale_source_recovery_used": true,
+    "target_buffer_preallocated": true,
+    "target_slice_spans_multiple_trainers": true,
+    "torch_distributed_control_plane_used": false,
+    "torch_distributed_data_transfer_used": false,
+    "torch_distributed_nixl_metadata_exchange_used": false,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false,
+    "ucx_ib_rc_requested": true,
+    "unreadable_source_ids": [
+      "trainer-rank0"
+    ]
+  },
+  "result": "pass",
+  "schema_version": 1,
+  "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+  "validation": {
+    "allclose": true,
+    "checksum": 556224.0,
+    "expected_checksum": 556224.0,
+    "max_abs_error": 0.0
+  }
+}

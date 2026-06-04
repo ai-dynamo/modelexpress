@@ -1,0 +1,60 @@
+{
+  "actual_nixl_reads_used": true,
+  "allclose": true,
+  "checksum": 556224.0,
+  "claim": "one-pod-per-source-rank cross-node stale-source recovery before target read",
+  "cross_node": true,
+  "discovered_source_ids": [
+    "trainer-rank0",
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "expected_checksum": 556224.0,
+  "metadata_query_duration_ms": 40.11980595532805,
+  "mid_read_kill_proven": false,
+  "nixl_add_remote_agent_duration_ms": 4.877370898611844,
+  "nixl_registration_duration_ms": 5.374368978664279,
+  "notes": "trainer-rank0 published a NIXL endpoint, exited, and was observed as SOURCE_STATUS_STALE before the target read. The target discovered the stale endpoint through MX but added/read only READY rank1 and rank2-alt endpoints.",
+  "planner_duration_ms": 0.1710839569568634,
+  "raw_nixl_read_duration_ms": 15.527020092122257,
+  "read_source_ids": [
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "readable_source_ids": [
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "result": "pass",
+  "run_id": "stale-20260604-184226",
+  "schema_version": 1,
+  "source_artifacts": [
+    "nscale-crossnode-stale-source-recovery-source-rank0.json",
+    "nscale-crossnode-stale-source-recovery-source-rank1.json",
+    "nscale-crossnode-stale-source-recovery-source-rank2-alt.json"
+  ],
+  "source_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+  "source_pods": [
+    "mx-stale-src0-stale-20260604-184226",
+    "mx-stale-src1-stale-20260604-184226",
+    "mx-stale-src2-stale-20260604-184226"
+  ],
+  "stale_source_endpoint_statuses": {
+    "trainer-rank0": {
+      "status": 3,
+      "status_name": "SOURCE_STATUS_STALE",
+      "updated_at": 1780591497818
+    }
+  },
+  "stale_source_ids": [
+    "trainer-rank0"
+  ],
+  "stale_source_ids_excluded_from_nixl_reads": true,
+  "stale_source_recovery_used": true,
+  "target_artifact": "nscale-crossnode-stale-source-recovery-target.json",
+  "target_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+  "target_pod": "mx-stale-target-stale-20260604-184226",
+  "target_ucx_net_devices": "mlx5_1:1",
+  "trainer_to_inference_bytes": 64,
+  "ucx_tls": "rc_x,rc,tcp,cuda_copy"
+}
