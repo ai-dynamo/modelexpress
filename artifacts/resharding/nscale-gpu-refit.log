@@ -1,0 +1,934 @@
++ python3 --version
+Python 3.12.13
++ python3 -
+torch 2.10.0+cu129
+cuda_available True
+cuda_device_count 4
+device 0 NVIDIA B200
+device 1 NVIDIA B200
+device 2 NVIDIA B200
+device 3 NVIDIA B200
++ python3 /work/refit_poc.py --mode single-gpu --artifact /tmp/mx-refit-artifacts/single-gpu.json
+{"gpu_count": 1, "metadata_smokes": {"cross_framework_compatible_requests": {"frameworks": ["vllm", "sglang"], "passed": true, "same_source_publication": true}, "qwen_moe_expert_axis": {"passed": true, "sglang_segment_count": 2, "source_ids": ["moe-source-0", "moe-source-1"], "vllm_segment_count": 2}, "tensor_family_classification": {"model.layers.0.mlp.experts.w1.weight": "moe-expert-axis-shard", "model.layers.0.mlp.experts.w1.weight_scale_inv": "quantization-global-required-fallback", "model.rotary_emb.inv_freq": "generated-on-target"}}, "metrics": {"activation_install_duration_ms": 0.0, "gpu_copy_duration_ms": 0.23570400662720203, "inference_side_fanout_bytes": 0, "planner_duration_ms": null, "publish_duration_ms": 0.0, "recovery_segment_count": 1, "rediscovery_count": 1, "redundant_cross_boundary_factor": 1.0, "registration_duration_ms": 0.0, "retry_count": 1, "segment_count": 2, "source_count_per_target_tensor": {"inference-rank3": 2}, "trainer_to_inference_bytes": 64}, "mode": "single-gpu", "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "planner": {"alternate_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp-replica"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl_descriptor_id": "nixl-rank2-alt", "quantization_scope": "absent", "source_id": "trainer-rank2-alt", "source_lease": "lease-rank2-alt", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "primary_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl_descriptor_id": "nixl-rank0-primary", "quantization_scope": "absent", "source_id": "trainer-rank0", "source_lease": "lease-rank0-primary", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl_descriptor_id": "nixl-rank1-primary", "quantization_scope": "absent", "source_id": "trainer-rank1", "source_lease": "lease-rank1-primary", "source_range": [[3, 8], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "primary_segment_plans": [{"bytes": 16, "lease_version": "lease-rank0-primary", "nixl_descriptor_id": "nixl-rank0-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank0", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-rank3", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-rank3", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "primary_segment_plans_json": [{"bytes": 16, "lease_version": "lease-rank0-primary", "nixl_descriptor_id": "nixl-rank0-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank0", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-rank3", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-rank3", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "recovery_segment_plans": [{"bytes": 16, "lease_version": "lease-rank2-alt", "nixl_descriptor_id": "nixl-rank2-alt", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank2-alt", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-rank3", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "request": {"destination_strides": null, "dtype": "float32", "element_size_bytes": null, "layout_tags": {"ep": 2, "moe_expert_axis": 0, "storage_layout": "row-major", "target_layout": "tp2-ep2", "tp": 2}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "quantization_scope": "absent", "requested_range": [[2, 6], [0, 4]], "runtime_framework": "vllm", "target_id": "inference-rank3", "target_offset_bytes": 0, "target_shape": [4, 4], "tensor_name": "model.layers.0.mlp.experts.w1.weight"}, "simulation": {"inference_side_fanout_bytes": 0, "planner_duration_ms": null, "predicted_bottleneck": "trainer-to-inference", "preferred_strategy": "direct-bipartite-p2p", "redundant_cross_boundary_factor": 1.0, "segment_count": 2, "source_balance_bytes": {"trainer-rank0": 16, "trainer-rank1": 48}, "source_count_per_target_tensor": {"inference-rank3": 2}, "target_balance_bytes": {"inference-rank3": 64}, "trainer_to_inference_bytes": 64, "uncovered_ranges": []}}, "proof": {"failed_source_ids": ["trainer-rank0"], "failed_then_succeeded": true, "gpu_target_assembly_succeeded": true, "host_side_torch_cat_used": false, "replanned_only_failed_segments": true, "target_slice_spans_multiple_trainers": true, "trainer_full_all_gather_used": false, "trainer_side_inference_layout_conversion_used": false}, "result": "pass", "schema_version": 1, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "validation": {"allclose": true, "checksum": 556224.0, "expected_checksum": 556224.0, "max_abs_error": 0.0}}
++ python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=4 /work/refit_poc.py --mode distributed --artifact /tmp/mx-refit-artifacts/distributed.json
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+*****************************************
+/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W604 10:18:51.082418959 ProcessGroupNCCL.cpp:5138] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+mx-reshard-gpu-poc-1780568177:486:486 [0] NCCL INFO Bootstrap: Using eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:486:486 [0] NCCL INFO cudaDriverVersion 13020
+mx-reshard-gpu-poc-1780568177:486:486 [0] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-reshard-gpu-poc-1780568177:486:486 [0] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO cudaDriverVersion 13020
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO Bootstrap: Using eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO cudaDriverVersion 13020
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO cudaDriverVersion 13020
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO Bootstrap: Using eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO Bootstrap: Using eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB [2]mlx5_2:1/IB [3]mlx5_3:1/IB [4]mlx5_4:1/IB [5]mlx5_5:1/IB [6]mlx5_6:1/IB [7]mlx5_7:1/IB [8]mlx5_8:1/IB [9]mlx5_bond_0:1/RoCE [10]mlx5_9:1/IB [11]mlx5_10:1/IB [12]mlx5_11:1/IB [RO]; OOB eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Initialized NET plugin IB
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB [2]mlx5_2:1/IB [3]mlx5_3:1/IB [4]mlx5_4:1/IB [5]mlx5_5:1/IB [6]mlx5_6:1/IB [7]mlx5_7:1/IB [8]mlx5_8:1/IB [9]mlx5_bond_0:1/RoCE [10]mlx5_9:1/IB [11]mlx5_10:1/IB [12]mlx5_11:1/IB [RO]; OOB eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Initialized NET plugin IB
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO DMA-BUF is available on GPU device 0
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO DMA-BUF is available on GPU device 3
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO ncclCommInitRankConfig comm 0x3c2222b0 rank 3 nranks 4 cudaDev 3 nvmlDev 3 busId 4b000 commId 0xa0401dae69001fa6 - Init START
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO ncclCommInitRankConfig comm 0x22abea30 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId 18000 commId 0xa0401dae69001fa6 - Init START
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB [2]mlx5_2:1/IB [3]mlx5_3:1/IB [4]mlx5_4:1/IB [5]mlx5_5:1/IB [6]mlx5_6:1/IB [7]mlx5_7:1/IB [8]mlx5_8:1/IB [9]mlx5_bond_0:1/RoCE [10]mlx5_9:1/IB [11]mlx5_10:1/IB [12]mlx5_11:1/IB [RO]; OOB eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Initialized NET plugin IB
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB [2]mlx5_2:1/IB [3]mlx5_3:1/IB [4]mlx5_4:1/IB [5]mlx5_5:1/IB [6]mlx5_6:1/IB [7]mlx5_7:1/IB [8]mlx5_8:1/IB [9]mlx5_bond_0:1/RoCE [10]mlx5_9:1/IB [11]mlx5_10:1/IB [12]mlx5_11:1/IB [RO]; OOB eth0:10.0.20.203<0>
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Initialized NET plugin IB
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO DMA-BUF is available on GPU device 1
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO DMA-BUF is available on GPU device 2
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO ncclCommInitRankConfig comm 0x46aaf250 rank 1 nranks 4 cudaDev 1 nvmlDev 1 busId 29000 commId 0xa0401dae69001fa6 - Init START
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO ncclCommInitRankConfig comm 0x14ce4170 rank 2 nranks 4 cudaDev 2 nvmlDev 2 busId 3a000 commId 0xa0401dae69001fa6 - Init START
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO RAS client listening socket at ::1<28028>
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO RAS client listening socket at ::1<28028>
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO RAS client listening socket at ::1<28028>
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO RAS client listening socket at ::1<28028>
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Bootstrap timings total 0.000709 (create 0.000023, send 0.000060, recv 0.000267, ring 0.000083, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Bootstrap timings total 0.000766 (create 0.000023, send 0.000057, recv 0.000289, ring 0.000094, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Bootstrap timings total 0.071513 (create 0.000027, send 0.000065, recv 0.070981, ring 0.000103, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Bootstrap timings total 0.071691 (create 0.000027, send 0.000066, recv 0.000250, ring 0.000045, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO MNNVL busId 0x3a000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO MNNVL busId 0x29000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO MNNVL busId 0x18000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO MNNVL busId 0x4b000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Setting affinity for GPU 2 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Setting affinity for GPU 0 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO NVLS multicast support is available on dev 0 (NVLS_NCHANNELS 24)
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Setting affinity for GPU 1 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO NVLS multicast support is available on dev 1 (NVLS_NCHANNELS 24)
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO NVLS multicast support is available on dev 2 (NVLS_NCHANNELS 24)
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Setting affinity for GPU 3 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO NVLS multicast support is available on dev 3 (NVLS_NCHANNELS 24)
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO comm 0x14ce4170 rank 2 nRanks 4 nNodes 1 localRanks 4 localRank 2 MNNVL 0
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO comm 0x22abea30 rank 0 nRanks 4 nNodes 1 localRanks 4 localRank 0 MNNVL 0
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO comm 0x3c2222b0 rank 3 nRanks 4 nNodes 1 localRanks 4 localRank 3 MNNVL 0
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO comm 0x46aaf250 rank 1 nRanks 4 nNodes 1 localRanks 4 localRank 1 MNNVL 0
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 00/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 01/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 02/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 03/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 04/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 05/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 06/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Trees [0] -1/-1/-1->3->2 [1] -1/-1/-1->3->2 [2] -1/-1/-1->3->2 [3] -1/-1/-1->3->2 [4] -1/-1/-1->3->2 [5] -1/-1/-1->3->2 [6] -1/-1/-1->3->2 [7] -1/-1/-1->3->2 [8] -1/-1/-1->3->2 [9] -1/-1/-1->3->2 [10] 0/-1/-1->3->2 [11] 0/-1/-1->3->2 [12] 0/-1/-1->3->2 [13] 0/-1/-1->3->2 [14] 0/-1/-1->3->-1 [15] 0/-1/-1->3->-1 [16] -1/-1/-1->3->2 [17] -1/-1/-1->3->2 [18] -1/-1/-1->3->2 [19] -1/-1/-1->3->2 [20] -1/-1/-1->3->2 [21] -1/-1/-1->3->2 [22] -1/-1/-1->3->2 [23] -1/-1/-1->3->2 [24] -1/-1/-1->3->2 [25] -1/-1/-1->3->2 [26] 0/-1/-1->3->2 [27] 0/-1/-1->3->2 [28] 0/-1/-1->3->2 [29] 0/-1/-1->3->2 [30] 0/-1/-1->3->-1 [31] 0/-1/-1->3->-1
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Trees [0] 3/-1/-1->2->1 [1] 3/-1/-1->2->1 [2] 3/-1/-1->2->1 [3] 3/-1/-1->2->1 [4] 3/-1/-1->2->1 [5] 3/-1/-1->2->1 [6] 3/-1/-1->2->1 [7] 3/-1/-1->2->1 [8] 3/-1/-1->2->1 [9] 3/-1/-1->2->1 [10] 3/-1/-1->2->1 [11] 3/-1/-1->2->1 [12] 3/-1/-1->2->-1 [13] 3/-1/-1->2->-1 [14] -1/-1/-1->2->1 [15] -1/-1/-1->2->1 [16] 3/-1/-1->2->1 [17] 3/-1/-1->2->1 [18] 3/-1/-1->2->1 [19] 3/-1/-1->2->1 [20] 3/-1/-1->2->1 [21] 3/-1/-1->2->1 [22] 3/-1/-1->2->1 [23] 3/-1/-1->2->1 [24] 3/-1/-1->2->1 [25] 3/-1/-1->2->1 [26] 3/-1/-1->2->1 [27] 3/-1/-1->2->1 [28] 3/-1/-1->2->-1 [29] 3/-1/-1->2->-1 [30] -1/-1/-1->2->1 [31] -1/-1/-1->2->1
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 07/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Trees [0] 2/-1/-1->1->0 [1] 2/-1/-1->1->0 [2] 2/-1/-1->1->0 [3] 2/-1/-1->1->0 [4] 2/-1/-1->1->0 [5] 2/-1/-1->1->0 [6] 2/-1/-1->1->0 [7] 2/-1/-1->1->0 [8] 2/-1/-1->1->0 [9] 2/-1/-1->1->0 [10] 2/-1/-1->1->-1 [11] 2/-1/-1->1->-1 [12] -1/-1/-1->1->0 [13] -1/-1/-1->1->0 [14] 2/-1/-1->1->0 [15] 2/-1/-1->1->0 [16] 2/-1/-1->1->0 [17] 2/-1/-1->1->0 [18] 2/-1/-1->1->0 [19] 2/-1/-1->1->0 [20] 2/-1/-1->1->0 [21] 2/-1/-1->1->0 [22] 2/-1/-1->1->0 [23] 2/-1/-1->1->0 [24] 2/-1/-1->1->0 [25] 2/-1/-1->1->0 [26] 2/-1/-1->1->-1 [27] 2/-1/-1->1->-1 [28] -1/-1/-1->1->0 [29] -1/-1/-1->1->0 [30] 2/-1/-1->1->0 [31] 2/-1/-1->1->0
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 08/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 09/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 10/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 11/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 12/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 13/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 14/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 15/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 16/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 17/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 18/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 19/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 20/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 21/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 22/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 23/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 24/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 25/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 26/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 27/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 28/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 29/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 30/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Channel 31/32 : 0 1 2 3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] 1/-1/-1->0->-1 [7] 1/-1/-1->0->-1 [8] 1/-1/-1->0->-1 [9] 1/-1/-1->0->-1 [10] -1/-1/-1->0->3 [11] -1/-1/-1->0->3 [12] 1/-1/-1->0->3 [13] 1/-1/-1->0->3 [14] 1/-1/-1->0->3 [15] 1/-1/-1->0->3 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] 1/-1/-1->0->-1 [19] 1/-1/-1->0->-1 [20] 1/-1/-1->0->-1 [21] 1/-1/-1->0->-1 [22] 1/-1/-1->0->-1 [23] 1/-1/-1->0->-1 [24] 1/-1/-1->0->-1 [25] 1/-1/-1->0->-1 [26] -1/-1/-1->0->3 [27] -1/-1/-1->0->3 [28] 1/-1/-1->0->3 [29] 1/-1/-1->0->3 [30] 1/-1/-1->0->3 [31] 1/-1/-1->0->3
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+mx-reshard-gpu-poc-1780568177:488:577 [2] NCCL INFO [Proxy Service UDS] Device 2 CPU core 97
+mx-reshard-gpu-poc-1780568177:486:576 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 1
+mx-reshard-gpu-poc-1780568177:487:578 [1] NCCL INFO [Proxy Service UDS] Device 1 CPU core 21
+mx-reshard-gpu-poc-1780568177:487:573 [1] NCCL INFO [Proxy Service] Device 1 CPU core 97
+mx-reshard-gpu-poc-1780568177:488:574 [2] NCCL INFO [Proxy Service] Device 2 CPU core 19
+mx-reshard-gpu-poc-1780568177:489:571 [3] NCCL INFO [Proxy Service] Device 3 CPU core 138
+mx-reshard-gpu-poc-1780568177:489:575 [3] NCCL INFO [Proxy Service UDS] Device 3 CPU core 39
+mx-reshard-gpu-poc-1780568177:486:572 [0] NCCL INFO [Proxy Service] Device 0 CPU core 98
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO CC Off, workFifoBytes 1048576
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO ncclCommInitRankConfig comm 0x22abea30 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId 18000 commId 0xa0401dae69001fa6 - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO ncclCommInitRankConfig comm 0x46aaf250 rank 1 nranks 4 cudaDev 1 nvmlDev 1 busId 29000 commId 0xa0401dae69001fa6 - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO ncclCommInitRankConfig comm 0x3c2222b0 rank 3 nranks 4 cudaDev 3 nvmlDev 3 busId 4b000 commId 0xa0401dae69001fa6 - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO ncclCommInitRankConfig comm 0x14ce4170 rank 2 nranks 4 cudaDev 2 nvmlDev 2 busId 3a000 commId 0xa0401dae69001fa6 - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:487:513 [1] NCCL INFO Init timings - ncclCommInitRankConfig: rank 1 nranks 4 total 0.67 (kernels 0.23, alloc 0.12, bootstrap 0.00, allgathers 0.00, topo 0.08, graphs 0.01, connections 0.23, rest 0.00)
+mx-reshard-gpu-poc-1780568177:489:508 [3] NCCL INFO Init timings - ncclCommInitRankConfig: rank 3 nranks 4 total 0.73 (kernels 0.23, alloc 0.11, bootstrap 0.07, allgathers 0.00, topo 0.08, graphs 0.01, connections 0.23, rest 0.00)
+mx-reshard-gpu-poc-1780568177:486:507 [0] NCCL INFO Init timings - ncclCommInitRankConfig: rank 0 nranks 4 total 0.74 (kernels 0.23, alloc 0.11, bootstrap 0.07, allgathers 0.00, topo 0.08, graphs 0.01, connections 0.23, rest 0.00)
+mx-reshard-gpu-poc-1780568177:488:514 [2] NCCL INFO Init timings - ncclCommInitRankConfig: rank 2 nranks 4 total 0.67 (kernels 0.23, alloc 0.12, bootstrap 0.00, allgathers 0.00, topo 0.08, graphs 0.01, connections 0.23, rest 0.00)
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 00/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 00/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 01/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 01/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 02/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 02/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 02/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 03/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 03/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 03/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 04/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 04/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 04/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 05/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 05/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 06/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 05/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 06/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 07/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 06/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 07/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 00/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 08/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 08/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 07/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 08/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 09/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 01/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 09/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 09/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 02/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 10/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 10/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 10/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 11/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 11/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 11/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 03/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 12/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 12/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 12/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 13/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 04/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 13/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 13/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 14/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 05/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 14/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 14/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 15/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 06/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 15/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 15/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 16/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 16/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 07/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 16/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 17/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 17/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 17/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 08/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 18/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 18/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 18/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 09/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 19/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 19/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 19/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 10/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 20/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 20/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 20/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 11/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 12/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 21/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 21/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 21/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 22/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 22/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 22/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 13/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 23/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 14/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 23/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 23/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 24/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 24/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 24/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 15/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 25/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 25/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 25/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 16/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 26/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 26/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 26/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 17/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 27/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 27/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 28/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 27/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 18/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 28/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 28/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 29/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 19/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 30/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 29/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 29/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 20/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Channel 31/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 30/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 30/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 21/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 22/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Channel 31/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Channel 31/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 23/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 24/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 25/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 26/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 27/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 28/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 29/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 30/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Channel 31/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:580 [1] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-reshard-gpu-poc-1780568177:486:581 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-reshard-gpu-poc-1780568177:488:579 [2] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-reshard-gpu-poc-1780568177:489:582 [3] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+[rank3]:[W604 10:18:52.272550719 ProcessGroupNCCL.cpp:4068] Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup with size 4.  In lazy initialization mode, this will result in a new 2-rank NCCL communicator to be created. (function operator())
+[rank1]:[W604 10:18:52.297630351 ProcessGroupNCCL.cpp:4068] Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup with size 4.  In lazy initialization mode, this will result in a new 2-rank NCCL communicator to be created. (function operator())
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO DMA-BUF is available on GPU device 1
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO ncclCommInitRankConfig comm 0x49f973d0 rank 0 nranks 2 cudaDev 1 nvmlDev 1 busId 29000 commId 0x9d49371fbe0557ac - Init START
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO DMA-BUF is available on GPU device 3
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO ncclCommInitRankConfig comm 0x3c502ed0 rank 1 nranks 2 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x9d49371fbe0557ac - Init START
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO Bootstrap timings total 0.000531 (create 0.000024, send 0.000058, recv 0.000345, ring 0.000024, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Bootstrap timings total 0.001081 (create 0.000027, send 0.000075, recv 0.000860, ring 0.000018, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO MNNVL busId 0x4b000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO MNNVL busId 0x29000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO Setting affinity for GPU 3 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Setting affinity for GPU 1 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO comm 0x3c502ed0 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO comm 0x49f973d0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 00/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 01/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 02/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 03/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 04/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 05/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 06/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 07/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 08/32 : 0 1
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0 [2] -1/-1/-1->1->0 [3] -1/-1/-1->1->0 [4] -1/-1/-1->1->0 [5] -1/-1/-1->1->0 [6] -1/-1/-1->1->0 [7] -1/-1/-1->1->0 [8] 0/-1/-1->1->-1 [9] 0/-1/-1->1->-1 [10] 0/-1/-1->1->-1 [11] 0/-1/-1->1->-1 [12] 0/-1/-1->1->-1 [13] 0/-1/-1->1->-1 [14] 0/-1/-1->1->-1 [15] 0/-1/-1->1->-1 [16] -1/-1/-1->1->0 [17] -1/-1/-1->1->0 [18] -1/-1/-1->1->0 [19] -1/-1/-1->1->0 [20] -1/-1/-1->1->0 [21] -1/-1/-1->1->0 [22] -1/-1/-1->1->0 [23] -1/-1/-1->1->0 [24] 0/-1/-1->1->-1 [25] 0/-1/-1->1->-1 [26] 0/-1/-1->1->-1 [27] 0/-1/-1->1->-1 [28] 0/-1/-1->1->-1 [29] 0/-1/-1->1->-1 [30] 0/-1/-1->1->-1 [31] 0/-1/-1->1->-1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 09/32 : 0 1
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 10/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 11/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 12/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 13/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 14/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 15/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 16/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 17/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 18/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 19/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 20/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 21/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 22/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 23/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 24/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 25/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 26/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 27/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 28/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 29/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 30/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Channel 31/32 : 0 1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] 1/-1/-1->0->-1 [7] 1/-1/-1->0->-1 [8] -1/-1/-1->0->1 [9] -1/-1/-1->0->1 [10] -1/-1/-1->0->1 [11] -1/-1/-1->0->1 [12] -1/-1/-1->0->1 [13] -1/-1/-1->0->1 [14] -1/-1/-1->0->1 [15] -1/-1/-1->0->1 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] 1/-1/-1->0->-1 [19] 1/-1/-1->0->-1 [20] 1/-1/-1->0->-1 [21] 1/-1/-1->0->-1 [22] 1/-1/-1->0->-1 [23] 1/-1/-1->0->-1 [24] -1/-1/-1->0->1 [25] -1/-1/-1->0->1 [26] -1/-1/-1->0->1 [27] -1/-1/-1->0->1 [28] -1/-1/-1->0->1 [29] -1/-1/-1->0->1 [30] -1/-1/-1->0->1 [31] -1/-1/-1->0->1
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+mx-reshard-gpu-poc-1780568177:487:587 [1] NCCL INFO [Proxy Service] Device 1 CPU core 42
+mx-reshard-gpu-poc-1780568177:489:586 [3] NCCL INFO [Proxy Service] Device 3 CPU core 40
+mx-reshard-gpu-poc-1780568177:489:588 [3] NCCL INFO [Proxy Service UDS] Device 3 CPU core 1
+mx-reshard-gpu-poc-1780568177:487:589 [1] NCCL INFO [Proxy Service UDS] Device 1 CPU core 13
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO CC Off, workFifoBytes 1048576
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO ncclCommInitRankConfig comm 0x3c502ed0 rank 1 nranks 2 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x9d49371fbe0557ac - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO ncclCommInitRankConfig comm 0x49f973d0 rank 0 nranks 2 cudaDev 1 nvmlDev 1 busId 29000 commId 0x9d49371fbe0557ac - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:489:585 [3] NCCL INFO Init timings - ncclCommInitRankConfig: rank 1 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.01, rest 0.00)
+mx-reshard-gpu-poc-1780568177:487:584 [1] NCCL INFO Init timings - ncclCommInitRankConfig: rank 0 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.01, rest 0.00)
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 00/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 01/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 02/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 03/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 04/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 05/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 06/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 07/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 08/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 09/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 10/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 11/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 12/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 13/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 14/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 15/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 16/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 17/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 18/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 19/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 20/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 21/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 22/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 23/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 24/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 25/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 26/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 27/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 28/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 29/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 30/1 : 0[1] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:487:591 [1] NCCL INFO Channel 31/1 : 0[1] -> 1[3] via P2P/CUMEM
+[rank2]:[W604 10:18:53.481966765 ProcessGroupNCCL.cpp:4068] Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup with size 4.  In lazy initialization mode, this will result in a new 2-rank NCCL communicator to be created. (function operator())
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO Comm config Blocking set to 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO DMA-BUF is available on GPU device 2
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO Assigned NET plugin IB to comm
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO Using network IB
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO DMA-BUF is available on GPU device 3
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO ncclCommInitRankConfig comm 0x181ccc30 rank 0 nranks 2 cudaDev 2 nvmlDev 2 busId 3a000 commId 0x7d033fbe3e2c3bd - Init START
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO ncclCommInitRankConfig comm 0x3c61d660 rank 1 nranks 2 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x7d033fbe3e2c3bd - Init START
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO Bootstrap timings total 0.000330 (create 0.000026, send 0.000074, recv 0.000121, ring 0.000020, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Bootstrap timings total 0.000577 (create 0.000024, send 0.000068, recv 0.000356, ring 0.000026, delay 0.000000)
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO MNNVL busId 0x4b000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO MNNVL busId 0x3a000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Setting affinity for GPU 2 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO Setting affinity for GPU 3 to 0-47,96-143
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO comm 0x181ccc30 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO comm 0x3c61d660 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 00/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 01/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 02/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 03/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 04/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 05/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 06/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 07/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 08/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 09/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 10/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 11/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 12/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 13/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 14/32 : 0 1
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0 [2] -1/-1/-1->1->0 [3] -1/-1/-1->1->0 [4] -1/-1/-1->1->0 [5] -1/-1/-1->1->0 [6] -1/-1/-1->1->0 [7] -1/-1/-1->1->0 [8] 0/-1/-1->1->-1 [9] 0/-1/-1->1->-1 [10] 0/-1/-1->1->-1 [11] 0/-1/-1->1->-1 [12] 0/-1/-1->1->-1 [13] 0/-1/-1->1->-1 [14] 0/-1/-1->1->-1 [15] 0/-1/-1->1->-1 [16] -1/-1/-1->1->0 [17] -1/-1/-1->1->0 [18] -1/-1/-1->1->0 [19] -1/-1/-1->1->0 [20] -1/-1/-1->1->0 [21] -1/-1/-1->1->0 [22] -1/-1/-1->1->0 [23] -1/-1/-1->1->0 [24] 0/-1/-1->1->-1 [25] 0/-1/-1->1->-1 [26] 0/-1/-1->1->-1 [27] 0/-1/-1->1->-1 [28] 0/-1/-1->1->-1 [29] 0/-1/-1->1->-1 [30] 0/-1/-1->1->-1 [31] 0/-1/-1->1->-1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 15/32 : 0 1
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 16/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 17/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 18/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 19/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 20/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 21/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 22/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 23/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 24/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 25/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 26/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 27/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 28/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 29/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 30/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Channel 31/32 : 0 1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] 1/-1/-1->0->-1 [7] 1/-1/-1->0->-1 [8] -1/-1/-1->0->1 [9] -1/-1/-1->0->1 [10] -1/-1/-1->0->1 [11] -1/-1/-1->0->1 [12] -1/-1/-1->0->1 [13] -1/-1/-1->0->1 [14] -1/-1/-1->0->1 [15] -1/-1/-1->0->1 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] 1/-1/-1->0->-1 [19] 1/-1/-1->0->-1 [20] 1/-1/-1->0->-1 [21] 1/-1/-1->0->-1 [22] 1/-1/-1->0->-1 [23] 1/-1/-1->0->-1 [24] -1/-1/-1->0->1 [25] -1/-1/-1->0->1 [26] -1/-1/-1->0->1 [27] -1/-1/-1->0->1 [28] -1/-1/-1->0->1 [29] -1/-1/-1->0->1 [30] -1/-1/-1->0->1 [31] -1/-1/-1->0->1
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO P2P Chunksize set to 524288
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+mx-reshard-gpu-poc-1780568177:489:595 [3] NCCL INFO [Proxy Service] Device 3 CPU core 19
+mx-reshard-gpu-poc-1780568177:488:596 [2] NCCL INFO [Proxy Service] Device 2 CPU core 97
+mx-reshard-gpu-poc-1780568177:488:598 [2] NCCL INFO [Proxy Service UDS] Device 2 CPU core 112
+mx-reshard-gpu-poc-1780568177:489:597 [3] NCCL INFO [Proxy Service UDS] Device 3 CPU core 109
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO CC Off, workFifoBytes 1048576
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO ncclCommInitRankConfig comm 0x3c61d660 rank 1 nranks 2 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x7d033fbe3e2c3bd - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:489:594 [3] NCCL INFO Init timings - ncclCommInitRankConfig: rank 1 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.01, rest 0.00)
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO ncclCommInitRankConfig comm 0x181ccc30 rank 0 nranks 2 cudaDev 2 nvmlDev 2 busId 3a000 commId 0x7d033fbe3e2c3bd - Init COMPLETE
+mx-reshard-gpu-poc-1780568177:488:593 [2] NCCL INFO Init timings - ncclCommInitRankConfig: rank 0 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.01, rest 0.00)
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 00/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 01/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 02/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 03/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 04/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 05/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 06/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 07/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 08/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 09/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 10/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 11/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 12/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 13/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 14/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 15/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 16/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 17/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 18/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 19/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 20/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 21/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 22/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 23/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 24/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 25/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 26/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 27/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 28/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 29/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 30/1 : 0[2] -> 1[3] via P2P/CUMEM
+mx-reshard-gpu-poc-1780568177:488:600 [2] NCCL INFO Channel 31/1 : 0[2] -> 1[3] via P2P/CUMEM
+{"distributed": {"alternate_source_ranks": [2], "backend": "nccl", "primary_source_ranks": [0, 1], "target_rank": 3, "world_size": 4}, "gpu_count": 4, "metadata_smokes": {"cross_framework_compatible_requests": {"frameworks": ["vllm", "sglang"], "passed": true, "same_source_publication": true}, "qwen_moe_expert_axis": {"passed": true, "sglang_segment_count": 2, "source_ids": ["moe-source-0", "moe-source-1"], "vllm_segment_count": 2}, "tensor_family_classification": {"model.layers.0.mlp.experts.w1.weight": "moe-expert-axis-shard", "model.layers.0.mlp.experts.w1.weight_scale_inv": "quantization-global-required-fallback", "model.rotary_emb.inv_freq": "generated-on-target"}}, "metrics": {"activation_install_duration_ms": 0.0, "gpu_copy_duration_ms": 395.1060129329562, "inference_side_fanout_bytes": 0, "planner_duration_ms": null, "publish_duration_ms": 0.0, "recovery_segment_count": 1, "rediscovery_count": 1, "redundant_cross_boundary_factor": 1.0, "registration_duration_ms": 0.0, "retry_count": 1, "segment_count": 2, "source_count_per_target_tensor": {"inference-rank3": 2}, "trainer_to_inference_bytes": 64}, "mode": "distributed-4rank", "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "planner": {"alternate_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp-replica"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl_descriptor_id": "nixl-rank2-alt", "quantization_scope": "absent", "source_id": "trainer-rank2-alt", "source_lease": "lease-rank2-alt", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "primary_ownerships": [{"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl_descriptor_id": "nixl-rank0-primary", "quantization_scope": "absent", "source_id": "trainer-rank0", "source_lease": "lease-rank0-primary", "source_range": [[0, 3], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"contiguous": true, "dtype": "float32", "element_size_bytes": null, "global_shape": [8, 4], "layout_tags": {"moe_expert_axis": 0, "storage_layout": "row-major", "tp": 1, "trainer_layout": "fsdp"}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "nixl_descriptor_id": "nixl-rank1-primary", "quantization_scope": "absent", "source_id": "trainer-rank1", "source_lease": "lease-rank1-primary", "source_range": [[3, 8], [0, 4]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "primary_segment_plans": [{"bytes": 16, "lease_version": "lease-rank0-primary", "nixl_descriptor_id": "nixl-rank0-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank0", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-rank3", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-rank3", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "primary_segment_plans_json": [{"bytes": 16, "lease_version": "lease-rank0-primary", "nixl_descriptor_id": "nixl-rank0-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank0", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-rank3", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank0", "worker_rank": 0}, {"bytes": 48, "lease_version": "lease-rank1-primary", "nixl_descriptor_id": "nixl-rank1-primary", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[3, 6], [0, 4]], "target_byte_offset": 16, "target_id": "inference-rank3", "target_range": [[3, 6], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank1", "worker_rank": 1}], "recovery_segment_plans": [{"bytes": 16, "lease_version": "lease-rank2-alt", "nixl_descriptor_id": "nixl-rank2-alt", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 32, "source_id": "trainer-rank2-alt", "source_range": [[2, 3], [0, 4]], "target_byte_offset": 0, "target_id": "inference-rank3", "target_range": [[2, 3], [0, 4]], "target_runtime": "vllm", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "worker_id": "rank2", "worker_rank": 2}], "request": {"destination_strides": null, "dtype": "float32", "element_size_bytes": null, "layout_tags": {"ep": 2, "moe_expert_axis": 0, "storage_layout": "row-major", "target_layout": "tp2-ep2", "tp": 2}, "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "quantization_scope": "absent", "requested_range": [[2, 6], [0, 4]], "runtime_framework": "vllm", "target_id": "inference-rank3", "target_offset_bytes": 0, "target_shape": [4, 4], "tensor_name": "model.layers.0.mlp.experts.w1.weight"}, "simulation": {"inference_side_fanout_bytes": 0, "planner_duration_ms": null, "predicted_bottleneck": "trainer-to-inference", "preferred_strategy": "direct-bipartite-p2p", "redundant_cross_boundary_factor": 1.0, "segment_count": 2, "source_balance_bytes": {"trainer-rank0": 16, "trainer-rank1": 48}, "source_count_per_target_tensor": {"inference-rank3": 2}, "target_balance_bytes": {"inference-rank3": 64}, "trainer_to_inference_bytes": 64, "uncovered_ranges": []}}, "proof": {"failed_source_ids": ["trainer-rank0"], "failed_then_succeeded": true, "gpu_target_assembly_succeeded": true, "host_side_torch_cat_used": false, "replanned_only_failed_segments": true, "target_slice_spans_multiple_trainers": true, "trainer_full_all_gather_used": false, "trainer_side_inference_layout_conversion_used": false}, "result": "pass", "schema_version": 1, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "validation": {"allclose": true, "checksum": 556224.0, "expected_checksum": 556224.0, "max_abs_error": 0.0}}
+mx-reshard-gpu-poc-1780568177:486:486 [0] NCCL INFO comm 0x22abea30 rank 0 nranks 4 cudaDev 0 busId 18000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO comm 0x49f973d0 rank 0 nranks 2 cudaDev 1 busId 29000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO comm 0x3c502ed0 rank 1 nranks 2 cudaDev 3 busId 4b000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:487:487 [1] NCCL INFO comm 0x46aaf250 rank 1 nranks 4 cudaDev 1 busId 29000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO comm 0x3c61d660 rank 1 nranks 2 cudaDev 3 busId 4b000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO comm 0x181ccc30 rank 0 nranks 2 cudaDev 2 busId 3a000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:489:489 [3] NCCL INFO comm 0x3c2222b0 rank 3 nranks 4 cudaDev 3 busId 4b000 - Destroy COMPLETE
+mx-reshard-gpu-poc-1780568177:488:488 [2] NCCL INFO comm 0x14ce4170 rank 2 nranks 4 cudaDev 2 busId 3a000 - Destroy COMPLETE
++ ls -l /tmp/mx-refit-artifacts
+total 24
+-rw-r--r-- 1 root root 10365 Jun  4 10:18 distributed.json
+-rw-r--r-- 1 root root 10170 Jun  4 10:18 single-gpu.json
++ cat /tmp/mx-refit-artifacts/distributed.json
+{
+  "distributed": {
+    "alternate_source_ranks": [
+      2
+    ],
+    "backend": "nccl",
+    "primary_source_ranks": [
+      0,
+      1
+    ],
+    "target_rank": 3,
+    "world_size": 4
+  },
+  "gpu_count": 4,
+  "metadata_smokes": {
+    "cross_framework_compatible_requests": {
+      "frameworks": [
+        "vllm",
+        "sglang"
+      ],
+      "passed": true,
+      "same_source_publication": true
+    },
+    "qwen_moe_expert_axis": {
+      "passed": true,
+      "sglang_segment_count": 2,
+      "source_ids": [
+        "moe-source-0",
+        "moe-source-1"
+      ],
+      "vllm_segment_count": 2
+    },
+    "tensor_family_classification": {
+      "model.layers.0.mlp.experts.w1.weight": "moe-expert-axis-shard",
+      "model.layers.0.mlp.experts.w1.weight_scale_inv": "quantization-global-required-fallback",
+      "model.rotary_emb.inv_freq": "generated-on-target"
+    }
+  },
+  "metrics": {
+    "activation_install_duration_ms": 0.0,
+    "gpu_copy_duration_ms": 395.1060129329562,
+    "inference_side_fanout_bytes": 0,
+    "planner_duration_ms": null,
+    "publish_duration_ms": 0.0,
+    "recovery_segment_count": 1,
+    "rediscovery_count": 1,
+    "redundant_cross_boundary_factor": 1.0,
+    "registration_duration_ms": 0.0,
+    "retry_count": 1,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "inference-rank3": 2
+    },
+    "trainer_to_inference_bytes": 64
+  },
+  "mode": "distributed-4rank",
+  "model_name": "qwen3-moe-refit-poc",
+  "model_version": "trainer-step-000001",
+  "planner": {
+    "alternate_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp-replica"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank2-alt",
+        "source_lease": "lease-rank2-alt",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "primary_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank0",
+        "source_lease": "lease-rank0-primary",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          4
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank1",
+        "source_lease": "lease-rank1-primary",
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "primary_segment_plans": [
+      {
+        "bytes": 16,
+        "lease_version": "lease-rank0-primary",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 32,
+        "source_id": "trainer-rank0",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-rank3",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "bytes": 48,
+        "lease_version": "lease-rank1-primary",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 0,
+        "source_id": "trainer-rank1",
+        "source_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 16,
+        "target_id": "inference-rank3",
+        "target_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "primary_segment_plans_json": [
+      {
+        "bytes": 16,
+        "lease_version": "lease-rank0-primary",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 32,
+        "source_id": "trainer-rank0",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-rank3",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "bytes": 48,
+        "lease_version": "lease-rank1-primary",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 0,
+        "source_id": "trainer-rank1",
+        "source_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 16,
+        "target_id": "inference-rank3",
+        "target_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "recovery_segment_plans": [
+      {
+        "bytes": 16,
+        "lease_version": "lease-rank2-alt",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 32,
+        "source_id": "trainer-rank2-alt",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-rank3",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            4
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "request": {
+      "destination_strides": null,
+      "dtype": "float32",
+      "element_size_bytes": null,
+      "layout_tags": {
+        "ep": 2,
+        "moe_expert_axis": 0,
+        "storage_layout": "row-major",
+        "target_layout": "tp2-ep2",
+        "tp": 2
+      },
+      "model_name": "qwen3-moe-refit-poc",
+      "model_version": "trainer-step-000001",
+      "quantization_scope": "absent",
+      "requested_range": [
+        [
+          2,
+          6
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "runtime_framework": "vllm",
+      "target_id": "inference-rank3",
+      "target_offset_bytes": 0,
+      "target_shape": [
+        4,
+        4
+      ],
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight"
+    },
+    "simulation": {
+      "inference_side_fanout_bytes": 0,
+      "planner_duration_ms": null,
+      "predicted_bottleneck": "trainer-to-inference",
+      "preferred_strategy": "direct-bipartite-p2p",
+      "redundant_cross_boundary_factor": 1.0,
+      "segment_count": 2,
+      "source_balance_bytes": {
+        "trainer-rank0": 16,
+        "trainer-rank1": 48
+      },
+      "source_count_per_target_tensor": {
+        "inference-rank3": 2
+      },
+      "target_balance_bytes": {
+        "inference-rank3": 64
+      },
+      "trainer_to_inference_bytes": 64,
+      "uncovered_ranges": []
+    }
+  },
+  "proof": {
+    "failed_source_ids": [
+      "trainer-rank0"
+    ],
+    "failed_then_succeeded": true,
+    "gpu_target_assembly_succeeded": true,
+    "host_side_torch_cat_used": false,
+    "replanned_only_failed_segments": true,
+    "target_slice_spans_multiple_trainers": true,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false
+  },
+  "result": "pass",
+  "schema_version": 1,
+  "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+  "validation": {
+    "allclose": true,
+    "checksum": 556224.0,
+    "expected_checksum": 556224.0,
+    "max_abs_error": 0.0
+  }
+}

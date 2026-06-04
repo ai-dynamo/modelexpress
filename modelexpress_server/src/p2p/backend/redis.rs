@@ -14,7 +14,10 @@
 //! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
 //! to enumerate source index keys without a separate secondary index.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{
+    MetadataBackend, MetadataResult, ModelMetadataRecord, SliceOwnershipRecord, TensorAxisRangeRecord,
+    TensorRecord, WorkerRecord,
+};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
@@ -189,6 +192,130 @@ impl From<TensorRecordJson> for TensorRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TensorAxisRangeJson {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl From<TensorAxisRangeRecord> for TensorAxisRangeJson {
+    fn from(record: TensorAxisRangeRecord) -> Self {
+        Self {
+            start: record.start,
+            end: record.end,
+        }
+    }
+}
+
+impl From<TensorAxisRangeJson> for TensorAxisRangeRecord {
+    fn from(json: TensorAxisRangeJson) -> Self {
+        Self {
+            start: json.start,
+            end: json.end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SliceOwnershipRecordJson {
+    #[serde(default)]
+    pub model_name: String,
+    #[serde(default)]
+    pub model_version: String,
+    pub tensor_name: String,
+    #[serde(default)]
+    pub global_shape: Vec<u64>,
+    pub dtype: String,
+    #[serde(default)]
+    pub source_range: Vec<TensorAxisRangeJson>,
+    #[serde(default)]
+    pub storage_offset_bytes: u64,
+    #[serde(default)]
+    pub strides: Vec<i64>,
+    #[serde(default = "default_true")]
+    pub contiguous: bool,
+    #[serde(default)]
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_rank: u32,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default)]
+    pub source_lease: String,
+    #[serde(default)]
+    pub nixl_descriptor_id: String,
+    #[serde(default)]
+    pub layout_tags: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub quantization_scope: String,
+    #[serde(default)]
+    pub element_size_bytes: Option<u32>,
+    #[serde(default)]
+    pub tensor_family: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl From<SliceOwnershipRecord> for SliceOwnershipRecordJson {
+    fn from(record: SliceOwnershipRecord) -> Self {
+        Self {
+            model_name: record.model_name,
+            model_version: record.model_version,
+            tensor_name: record.tensor_name,
+            global_shape: record.global_shape,
+            dtype: record.dtype,
+            source_range: record
+                .source_range
+                .into_iter()
+                .map(TensorAxisRangeJson::from)
+                .collect(),
+            storage_offset_bytes: record.storage_offset_bytes,
+            strides: record.strides,
+            contiguous: record.contiguous,
+            worker_id: record.worker_id,
+            worker_rank: record.worker_rank,
+            source_id: record.source_id,
+            source_lease: record.source_lease,
+            nixl_descriptor_id: record.nixl_descriptor_id,
+            layout_tags: record.layout_tags,
+            quantization_scope: record.quantization_scope,
+            element_size_bytes: record.element_size_bytes,
+            tensor_family: record.tensor_family,
+        }
+    }
+}
+
+impl From<SliceOwnershipRecordJson> for SliceOwnershipRecord {
+    fn from(json: SliceOwnershipRecordJson) -> Self {
+        Self {
+            model_name: json.model_name,
+            model_version: json.model_version,
+            tensor_name: json.tensor_name,
+            global_shape: json.global_shape,
+            dtype: json.dtype,
+            source_range: json
+                .source_range
+                .into_iter()
+                .map(TensorAxisRangeRecord::from)
+                .collect(),
+            storage_offset_bytes: json.storage_offset_bytes,
+            strides: json.strides,
+            contiguous: json.contiguous,
+            worker_id: json.worker_id,
+            worker_rank: json.worker_rank,
+            source_id: json.source_id,
+            source_lease: json.source_lease,
+            nixl_descriptor_id: json.nixl_descriptor_id,
+            layout_tags: json.layout_tags,
+            quantization_scope: json.quantization_scope,
+            element_size_bytes: json.element_size_bytes,
+            tensor_family: json.tensor_family,
+        }
+    }
+}
+
 /// Serializable version of WorkerRecord stored as a hash field value
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerRecordJson {
@@ -201,6 +328,8 @@ struct WorkerRecordJson {
     #[serde(default)]
     pub transfer_engine_session_id: Option<String>,
     pub tensors: Vec<TensorRecordJson>,
+    #[serde(default)]
+    pub slice_ownerships: Vec<SliceOwnershipRecordJson>,
     #[serde(default)]
     pub status: i32,
     #[serde(default)]
@@ -234,6 +363,11 @@ impl WorkerRecordJson {
                 .into_iter()
                 .map(TensorRecordJson::from)
                 .collect(),
+            slice_ownerships: record
+                .slice_ownerships
+                .into_iter()
+                .map(SliceOwnershipRecordJson::from)
+                .collect(),
             status: record.status,
             updated_at: record.updated_at,
             metadata_endpoint: record.metadata_endpoint,
@@ -253,6 +387,11 @@ impl From<WorkerRecordJson> for WorkerRecord {
                 json.backend_type.as_deref(),
             ),
             tensors: json.tensors.into_iter().map(TensorRecord::from).collect(),
+            slice_ownerships: json
+                .slice_ownerships
+                .into_iter()
+                .map(SliceOwnershipRecord::from)
+                .collect(),
             status: json.status,
             updated_at: json.updated_at,
             metadata_endpoint: json.metadata_endpoint,
@@ -649,6 +788,31 @@ mod tests {
                 device_id: 2,
                 dtype: "float16".to_string(),
             }],
+            slice_ownerships: vec![SliceOwnershipRecord {
+                model_name: "qwen3-moe-refit-poc".to_string(),
+                model_version: "trainer-step-000001".to_string(),
+                tensor_name: "model.layers.0.mlp.experts.w1.weight".to_string(),
+                global_shape: vec![8, 4],
+                dtype: "float32".to_string(),
+                source_range: vec![
+                    TensorAxisRangeRecord { start: 0, end: 3 },
+                    TensorAxisRangeRecord { start: 0, end: 4 },
+                ],
+                storage_offset_bytes: 0,
+                strides: vec![4, 1],
+                contiguous: true,
+                worker_id: "rank0".to_string(),
+                worker_rank: 0,
+                source_id: "trainer-rank0".to_string(),
+                source_lease: "lease-rank0-primary".to_string(),
+                nixl_descriptor_id: "nixl-rank0-primary".to_string(),
+                layout_tags: [("trainer_layout".to_string(), "fsdp".to_string())]
+                    .into_iter()
+                    .collect(),
+                quantization_scope: "absent".to_string(),
+                element_size_bytes: Some(4),
+                tensor_family: "moe-expert-axis-shard".to_string(),
+            }],
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,
             metadata_endpoint: String::new(),
@@ -666,6 +830,12 @@ mod tests {
         assert_eq!(back.status, record.status);
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
+        assert_eq!(back.slice_ownerships.len(), 1);
+        assert_eq!(back.slice_ownerships[0].source_id, "trainer-rank0");
+        assert_eq!(
+            back.slice_ownerships[0].layout_tags["trainer_layout"],
+            "fsdp"
+        );
     }
 
     #[test]
@@ -676,6 +846,7 @@ mod tests {
         let parsed: WorkerRecordJson = serde_json::from_str(json).expect("parse legacy");
         assert_eq!(parsed.status, 0);
         assert_eq!(parsed.updated_at, 0);
+        assert!(parsed.slice_ownerships.is_empty());
     }
 
     // ── SourceAttributesJson ────────────────────────────────────────────────

@@ -1,0 +1,14 @@
+Command:
+docker run --rm -v "$PWD":/workspace -w /workspace rust:1.88-bookworm bash -lc 'export PATH=/usr/local/cargo/bin:$PATH; apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null && cargo test -p modelexpress-server p2p:: --lib'
+
+Result:
+Finished `test` profile and ran modelexpress-server p2p unit tests.
+
+Summary:
+running 79 tests
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.01s
+
+New coverage included:
+- p2p::state::tests::test_worker_record_slice_ownership_roundtrip
+- p2p::backend::redis::tests::test_worker_record_json_roundtrip_with_status
+- p2p::service::tests::test_get_metadata_found

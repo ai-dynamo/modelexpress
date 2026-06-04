@@ -5,8 +5,14 @@
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
-use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use super::{
+    MetadataBackend, MetadataResult, ModelMetadataRecord, SliceOwnershipRecord,
+    TensorAxisRangeRecord, TensorRecord, WorkerRecord,
+};
+use crate::p2p::k8s_types::{
+    ModelMetadata, ModelMetadataSpec, SliceOwnershipJson, TensorAxisRangeJson,
+    TensorDescriptorJson, WorkerStatus,
+};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -54,6 +60,7 @@ impl KubernetesBackend {
         worker_id: &str,
         worker_rank: u32,
         tensors: &[TensorRecord],
+        slice_ownerships: &[SliceOwnershipRecord],
         owner_name: Option<&str>,
         owner_uid: Option<&str>,
     ) -> MetadataResult<String> {
@@ -76,6 +83,40 @@ impl KubernetesBackend {
 
         let mut data = BTreeMap::new();
         data.insert("tensors.json".to_string(), tensors_data);
+        let slice_json: Vec<SliceOwnershipJson> = slice_ownerships
+            .iter()
+            .map(|ownership| SliceOwnershipJson {
+                model_name: ownership.model_name.clone(),
+                model_version: ownership.model_version.clone(),
+                tensor_name: ownership.tensor_name.clone(),
+                global_shape: ownership.global_shape.clone(),
+                dtype: ownership.dtype.clone(),
+                source_range: ownership
+                    .source_range
+                    .iter()
+                    .map(|range| TensorAxisRangeJson {
+                        start: range.start,
+                        end: range.end,
+                    })
+                    .collect(),
+                storage_offset_bytes: ownership.storage_offset_bytes,
+                strides: ownership.strides.clone(),
+                contiguous: ownership.contiguous,
+                worker_id: ownership.worker_id.clone(),
+                worker_rank: ownership.worker_rank,
+                source_id: ownership.source_id.clone(),
+                source_lease: ownership.source_lease.clone(),
+                nixl_descriptor_id: ownership.nixl_descriptor_id.clone(),
+                layout_tags: ownership.layout_tags.clone(),
+                quantization_scope: ownership.quantization_scope.clone(),
+                element_size_bytes: ownership.element_size_bytes,
+                tensor_family: ownership.tensor_family.clone(),
+            })
+            .collect();
+        data.insert(
+            "slice_ownerships.json".to_string(),
+            serde_json::to_string_pretty(&slice_json)?,
+        );
 
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -165,6 +206,53 @@ impl KubernetesBackend {
 
         Ok(tensors)
     }
+
+    /// Read slice ownership descriptors from a ConfigMap.
+    async fn read_slice_ownership_configmap(
+        &self,
+        cm_name: &str,
+    ) -> MetadataResult<Vec<SliceOwnershipRecord>> {
+        let api = self.configmap_api();
+        let cm = api.get(cm_name).await?;
+
+        let Some(slice_ownerships_json) =
+            cm.data.and_then(|d| d.get("slice_ownerships.json").cloned())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let slice_descs: Vec<SliceOwnershipJson> = serde_json::from_str(&slice_ownerships_json)?;
+        Ok(slice_descs
+            .into_iter()
+            .map(|s| SliceOwnershipRecord {
+                model_name: s.model_name,
+                model_version: s.model_version,
+                tensor_name: s.tensor_name,
+                global_shape: s.global_shape,
+                dtype: s.dtype,
+                source_range: s
+                    .source_range
+                    .into_iter()
+                    .map(|range| TensorAxisRangeRecord {
+                        start: range.start,
+                        end: range.end,
+                    })
+                    .collect(),
+                storage_offset_bytes: s.storage_offset_bytes,
+                strides: s.strides,
+                contiguous: s.contiguous,
+                worker_id: s.worker_id,
+                worker_rank: s.worker_rank,
+                source_id: s.source_id,
+                source_lease: s.source_lease,
+                nixl_descriptor_id: s.nixl_descriptor_id,
+                layout_tags: s.layout_tags,
+                quantization_scope: s.quantization_scope,
+                element_size_bytes: s.element_size_bytes,
+                tensor_family: s.tensor_family,
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -248,6 +336,7 @@ impl MetadataBackend for KubernetesBackend {
                 worker_id,
                 worker_record.worker_rank,
                 &worker_record.tensors,
+                &worker_record.slice_ownerships,
                 owner_name,
                 owner_uid,
             )
@@ -269,7 +358,9 @@ impl MetadataBackend for KubernetesBackend {
             nixl_metadata,
             transfer_engine_session_id,
             tensor_count: worker_record.tensors.len() as i32,
-            tensor_config_map: Some(cm_name),
+            tensor_config_map: Some(cm_name.clone()),
+            slice_ownership_count: worker_record.slice_ownerships.len() as i32,
+            slice_ownership_config_map: Some(cm_name),
             status: WorkerStatus::status_name_from_proto(worker_record.status),
             updated_at: Some(now.clone()),
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
@@ -403,6 +494,20 @@ impl MetadataBackend for KubernetesBackend {
                 Vec::new()
             };
 
+            let slice_ownerships = if let Some(cm_name) =
+                &worker_status.slice_ownership_config_map
+            {
+                match self.read_slice_ownership_configmap(cm_name).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("Failed to read slice ownership ConfigMap '{}': {}", cm_name, e);
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
             let status = WorkerStatus::status_proto_from_name(&worker_status.status);
             let updated_at = worker_status
                 .updated_at
@@ -415,6 +520,7 @@ impl MetadataBackend for KubernetesBackend {
                 worker_rank: worker_status.worker_rank as u32,
                 backend_metadata,
                 tensors,
+                slice_ownerships,
                 status,
                 updated_at,
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),

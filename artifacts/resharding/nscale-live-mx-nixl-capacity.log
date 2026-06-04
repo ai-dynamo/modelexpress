@@ -1,0 +1,81 @@
+Live MX NIXL GPU verification attempt
+Date: 2026-06-04
+Namespace: anish-dynamo
+Image: docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f
+Attempted pod name: mx-reshard-live-nixl-poc
+
+Result: not run. nscale could not schedule a GPU pod.
+
+Attempts:
+- 4-GPU pod for normal 4-rank/4-GPU NIXL live-MX refit: Pending, insufficient nvidia.com/gpu.
+- 2-GPU pod with explicit MX_REFIT_ALLOW_GPU_REUSE fallback planned: Pending, insufficient nvidia.com/gpu.
+- 1-GPU pod with explicit MX_REFIT_ALLOW_GPU_REUSE fallback planned: Pending, insufficient nvidia.com/gpu.
+
+Last scheduler evidence follows.
+
+Name:             mx-reshard-live-nixl-poc
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           app=mx-reshard-live-nixl-poc
+Annotations:      <none>
+Status:           Pending
+IP:
+IPs:              <none>
+Containers:
+  mx:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-1e2212f
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      sh
+      -lc
+      sleep 3600
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-745vr (ro)
+  redis:
+    Image:      redis:7-alpine
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      redis-server
+      --save
+
+      --appendonly
+      no
+    Environment:  <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-745vr (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False
+Volumes:
+  kube-api-access-745vr:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age   From                Message
+  ----     ------             ----  ----                -------
+  Warning  FailedScheduling   65s   default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  62s   cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached
+
+Fresh 1-GPU reprobe on 2026-06-04:
+
+- Probe pod: mx-reshard-gpu-probe-1780574063
+- Result: Pending until timeout, then deleted.
+- Scheduler evidence:
+  - FailedScheduling: 0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  - NotTriggerScaleUp: pod did not trigger scale-up because max node group size was reached.

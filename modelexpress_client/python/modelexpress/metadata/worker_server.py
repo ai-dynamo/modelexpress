@@ -30,11 +30,13 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
+        slice_ownership_protos: list[p2p_pb2.SliceOwnershipDescriptor] | None = None,
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
     ):
         self._tensor_protos = tensor_protos
+        self._slice_ownership_protos = slice_ownership_protos or []
         self._mx_source_id = mx_source_id
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
@@ -49,6 +51,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             )
         response = p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
+            slice_ownerships=self._slice_ownership_protos,
             mx_source_id=self._mx_source_id,
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
@@ -56,6 +59,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         )
         logger.info(
             f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
+            f"{len(self._slice_ownership_protos)} slice ownerships, "
             f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
         )
         return response
@@ -68,12 +72,14 @@ class WorkerGrpcServer:
         self,
         tensor_protos: list[p2p_pb2.TensorDescriptor],
         mx_source_id: str,
+        slice_ownership_protos: list[p2p_pb2.SliceOwnershipDescriptor] | None = None,
         port: int = 0,
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
     ):
         self._tensor_protos = tensor_protos
+        self._slice_ownership_protos = slice_ownership_protos or []
         self._mx_source_id = mx_source_id
         self._requested_port = port
         self._metadata_endpoint = metadata_endpoint
@@ -92,6 +98,7 @@ class WorkerGrpcServer:
         servicer = WorkerServiceServicer(
             tensor_protos=self._tensor_protos,
             mx_source_id=self._mx_source_id,
+            slice_ownership_protos=self._slice_ownership_protos,
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
@@ -107,7 +114,8 @@ class WorkerGrpcServer:
         logger.info(
             f"WorkerGrpcServer started on port {self._port} "
             f"(mx_source_id={self._mx_source_id}, "
-            f"{len(self._tensor_protos)} tensors)"
+            f"{len(self._tensor_protos)} tensors, "
+            f"{len(self._slice_ownership_protos)} slice ownerships)"
         )
         return self._port
 

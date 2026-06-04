@@ -6,7 +6,9 @@ This document describes the metadata storage and coordination layers for ModelEx
 
 ModelExpress stores two related classes of metadata:
 
-1. **P2P source metadata**: source workers publish tensor descriptors and transfer-engine metadata so target workers can receive weights over RDMA.
+1. **P2P source metadata**: source workers publish tensor descriptors, optional
+   slice ownership descriptors, and transfer-engine metadata so target workers
+   can receive weights over RDMA.
 2. **Model-cache lifecycle metadata**: the server tracks model download state (`DOWNLOADING`, `DOWNLOADED`, `ERROR`) so replicas coordinate downloads and LRU eviction.
 
 Both layers are selected by `MX_METADATA_BACKEND`, but they use separate storage namespaces:
@@ -19,7 +21,9 @@ Both layers are selected by `MX_METADATA_BACKEND`, but they use separate storage
 For P2P transfers, coordination between source and target GPU workers works as follows:
 
 1. **Source** loads model weights, registers tensors with a transfer backend (NIXL or Mooncake), and publishes metadata to the MX server.
-2. **Target** queries the MX server for available sources, fetches tensor metadata on demand, and executes RDMA transfers.
+2. **Target** queries the MX server for available sources, fetches tensor and
+   optional slice ownership metadata on demand, plans any receiver-side
+   intersections needed for refit, and executes RDMA transfers.
 3. **Status** transitions (`INITIALIZING` -> `READY` -> `STALE`) signal when sources are available for transfers.
 
 ## Key Concepts
@@ -40,6 +44,11 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 | `dtype` | `"bfloat16"` | Weight data type |
 | `quantization` | `"fp8"`, `""` | Quantization method |
 | `extra_parameters` | `{}` | Framework-specific config |
+
+For cross-parallelism refit POCs, trainer-side publishers can use
+`backend_framework=UNKNOWN` and stamp `extra_parameters.mx_refit_schema` to
+identify slice-ownership metadata without pretending the trainer is a vLLM or
+SGLang source.
 
 The server computes `mx_source_id = SHA256(canonical_json(identity))[:16]` -- a 16-char hex key used to address all metadata for sources with identical configuration. This is content-addressed: two sources with the same identity hash to the same `mx_source_id`, enabling automatic peer discovery.
 
@@ -225,6 +234,28 @@ mx:model:deepseek-ai/DeepSeek-V3
       "size": "134217728",
       "device_id": 0,
       "dtype": "bfloat16"
+    }
+  ],
+  "slice_ownerships": [
+    {
+      "model_name": "qwen3-moe-refit-poc",
+      "model_version": "trainer-step-000001",
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+      "global_shape": [8, 4],
+      "dtype": "float32",
+      "source_range": [{"start": 0, "end": 3}, {"start": 0, "end": 4}],
+      "storage_offset_bytes": 0,
+      "strides": [4, 1],
+      "contiguous": true,
+      "worker_id": "rank0",
+      "worker_rank": 0,
+      "source_id": "trainer-rank0",
+      "source_lease": "lease-rank0-primary",
+      "nixl_descriptor_id": "nixl-rank0-primary",
+      "layout_tags": {"storage_layout": "row-major", "moe_expert_axis": 0},
+      "quantization_scope": "absent",
+      "element_size_bytes": 4,
+      "tensor_family": "moe-expert-axis-shard"
     }
   ],
   "status": 2,

@@ -194,7 +194,8 @@ mod tests {
     use crate::p2p::backend::MockMetadataBackend;
     use mockall::predicate::eq;
     use modelexpress_common::grpc::p2p::{
-        MxSourceType, SourceIdentity, SourceStatus, TensorDescriptor,
+        MxSourceType, SliceOwnershipDescriptor, SourceIdentity, SourceStatus, TensorAxisRange,
+        TensorDescriptor,
     };
 
     fn test_identity() -> SourceIdentity {
@@ -264,6 +265,52 @@ mod tests {
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
         assert_eq!(back.backend_metadata, meta.backend_metadata);
+        assert!(back.slice_ownerships.is_empty());
+    }
+
+    #[test]
+    fn test_worker_record_slice_ownership_roundtrip() {
+        let ownership = SliceOwnershipDescriptor {
+            model_name: "qwen3-moe-refit-poc".to_string(),
+            model_version: "trainer-step-000001".to_string(),
+            tensor_name: "model.layers.0.mlp.experts.w1.weight".to_string(),
+            global_shape: vec![8, 4],
+            dtype: "float32".to_string(),
+            source_range: vec![
+                TensorAxisRange { start: 0, end: 3 },
+                TensorAxisRange { start: 0, end: 4 },
+            ],
+            storage_offset_bytes: 0,
+            strides: vec![4, 1],
+            contiguous: true,
+            worker_id: "rank0".to_string(),
+            worker_rank: 0,
+            source_id: "trainer-rank0".to_string(),
+            source_lease: "lease-rank0-primary".to_string(),
+            nixl_descriptor_id: "nixl-rank0-primary".to_string(),
+            layout_tags: [("trainer_layout".to_string(), "fsdp".to_string())]
+                .into_iter()
+                .collect(),
+            quantization_scope: "absent".to_string(),
+            element_size_bytes: Some(4),
+            tensor_family: "moe-expert-axis-shard".to_string(),
+        };
+        let meta = WorkerMetadata {
+            worker_rank: 0,
+            slice_ownerships: vec![ownership.clone()],
+            ..Default::default()
+        };
+
+        let record = WorkerRecord::from(meta);
+        assert_eq!(record.slice_ownerships.len(), 1);
+        assert_eq!(record.slice_ownerships[0].source_range[0].end, 3);
+        assert_eq!(
+            record.slice_ownerships[0].layout_tags["trainer_layout"],
+            "fsdp"
+        );
+
+        let back: WorkerMetadata = record.into();
+        assert_eq!(back.slice_ownerships, vec![ownership]);
     }
 
     #[test]
@@ -351,6 +398,7 @@ mod tests {
                         device_id: 0,
                         dtype: "bfloat16".to_string(),
                     }],
+                    slice_ownerships: vec![],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     metadata_endpoint: String::new(),
@@ -367,6 +415,7 @@ mod tests {
                         device_id: 1,
                         dtype: "bfloat16".to_string(),
                     }],
+                    slice_ownerships: vec![],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     metadata_endpoint: String::new(),

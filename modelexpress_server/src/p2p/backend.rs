@@ -10,7 +10,10 @@
 //! Select the backend via `MX_METADATA_BACKEND=redis` or `MX_METADATA_BACKEND=kubernetes`.
 
 use async_trait::async_trait;
-use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
+use modelexpress_common::grpc::p2p::{
+    SliceOwnershipDescriptor, SourceIdentity, SourceStatus, TensorAxisRange, WorkerMetadata,
+};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod kubernetes;
@@ -107,6 +110,7 @@ pub struct WorkerRecord {
     pub worker_rank: u32,
     pub backend_metadata: BackendMetadataRecord,
     pub tensors: Vec<TensorRecord>,
+    pub slice_ownerships: Vec<SliceOwnershipRecord>,
     /// Worker lifecycle status (maps to `SourceStatus` proto enum)
     pub status: i32,
     /// Timestamp of last status update (unix millis)
@@ -129,6 +133,36 @@ pub struct TensorRecord {
     pub dtype: String,
 }
 
+/// Half-open logical tensor range for one axis: [start, end).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorAxisRangeRecord {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Source-published slice ownership for cross-parallelism refit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceOwnershipRecord {
+    pub model_name: String,
+    pub model_version: String,
+    pub tensor_name: String,
+    pub global_shape: Vec<u64>,
+    pub dtype: String,
+    pub source_range: Vec<TensorAxisRangeRecord>,
+    pub storage_offset_bytes: u64,
+    pub strides: Vec<i64>,
+    pub contiguous: bool,
+    pub worker_id: String,
+    pub worker_rank: u32,
+    pub source_id: String,
+    pub source_lease: String,
+    pub nixl_descriptor_id: String,
+    pub layout_tags: BTreeMap<String, String>,
+    pub quantization_scope: String,
+    pub element_size_bytes: Option<u32>,
+    pub tensor_family: String,
+}
+
 // Conversions from gRPC types
 impl From<WorkerMetadata> for WorkerRecord {
     fn from(meta: WorkerMetadata) -> Self {
@@ -144,6 +178,11 @@ impl From<WorkerMetadata> for WorkerRecord {
             worker_rank: meta.worker_rank,
             backend_metadata,
             tensors: meta.tensors.into_iter().map(TensorRecord::from).collect(),
+            slice_ownerships: meta
+                .slice_ownerships
+                .into_iter()
+                .map(SliceOwnershipRecord::from)
+                .collect(),
             status: meta.status,
             updated_at: meta.updated_at,
             metadata_endpoint: meta.metadata_endpoint,
@@ -161,6 +200,44 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+        }
+    }
+}
+
+impl From<TensorAxisRange> for TensorAxisRangeRecord {
+    fn from(range: TensorAxisRange) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+impl From<SliceOwnershipDescriptor> for SliceOwnershipRecord {
+    fn from(desc: SliceOwnershipDescriptor) -> Self {
+        Self {
+            model_name: desc.model_name,
+            model_version: desc.model_version,
+            tensor_name: desc.tensor_name,
+            global_shape: desc.global_shape,
+            dtype: desc.dtype,
+            source_range: desc
+                .source_range
+                .into_iter()
+                .map(TensorAxisRangeRecord::from)
+                .collect(),
+            storage_offset_bytes: desc.storage_offset_bytes,
+            strides: desc.strides,
+            contiguous: desc.contiguous,
+            worker_id: desc.worker_id,
+            worker_rank: desc.worker_rank,
+            source_id: desc.source_id,
+            source_lease: desc.source_lease,
+            nixl_descriptor_id: desc.nixl_descriptor_id,
+            layout_tags: desc.layout_tags.into_iter().collect(),
+            quantization_scope: desc.quantization_scope,
+            element_size_bytes: desc.element_size_bytes,
+            tensor_family: desc.tensor_family,
         }
     }
 }
@@ -184,6 +261,11 @@ impl From<WorkerRecord> for WorkerMetadata {
                 .into_iter()
                 .map(modelexpress_common::grpc::p2p::TensorDescriptor::from)
                 .collect(),
+            slice_ownerships: record
+                .slice_ownerships
+                .into_iter()
+                .map(SliceOwnershipDescriptor::from)
+                .collect(),
             status: record.status,
             updated_at: record.updated_at,
             metadata_endpoint: record.metadata_endpoint,
@@ -201,6 +283,44 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+        }
+    }
+}
+
+impl From<TensorAxisRangeRecord> for TensorAxisRange {
+    fn from(record: TensorAxisRangeRecord) -> Self {
+        Self {
+            start: record.start,
+            end: record.end,
+        }
+    }
+}
+
+impl From<SliceOwnershipRecord> for SliceOwnershipDescriptor {
+    fn from(record: SliceOwnershipRecord) -> Self {
+        Self {
+            model_name: record.model_name,
+            model_version: record.model_version,
+            tensor_name: record.tensor_name,
+            global_shape: record.global_shape,
+            dtype: record.dtype,
+            source_range: record
+                .source_range
+                .into_iter()
+                .map(TensorAxisRange::from)
+                .collect(),
+            storage_offset_bytes: record.storage_offset_bytes,
+            strides: record.strides,
+            contiguous: record.contiguous,
+            worker_id: record.worker_id,
+            worker_rank: record.worker_rank,
+            source_id: record.source_id,
+            source_lease: record.source_lease,
+            nixl_descriptor_id: record.nixl_descriptor_id,
+            layout_tags: record.layout_tags.into_iter().collect(),
+            quantization_scope: record.quantization_scope,
+            element_size_bytes: record.element_size_bytes,
+            tensor_family: record.tensor_family,
         }
     }
 }

@@ -109,6 +109,73 @@ message TensorDescriptor {
   string dtype = 5;
 }
 
+// Half-open logical tensor range for one axis: [start, end).
+message TensorAxisRange {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+// Source-published slice ownership for cross-parallelism refit.
+// This is finer-grained than TensorDescriptor: a worker may register one
+// contiguous allocation but own only a logical slice of the global tensor.
+message SliceOwnershipDescriptor {
+  string model_name = 1;
+  string model_version = 2;
+  string tensor_name = 3;
+  repeated uint64 global_shape = 4;
+  string dtype = 5;
+  repeated TensorAxisRange source_range = 6;
+  uint64 storage_offset_bytes = 7;
+  repeated int64 strides = 8;
+  bool contiguous = 9;
+  string worker_id = 10;
+  uint32 worker_rank = 11;
+  string source_id = 12;
+  string source_lease = 13;
+  string nixl_descriptor_id = 14;
+  map<string, string> layout_tags = 15;
+  string quantization_scope = 16;
+  optional uint32 element_size_bytes = 17;
+  string tensor_family = 18;
+}
+
+// Receiver-side request for a global tensor range. Stored here as part of the
+// public P2P contract; initial Level 3 POCs construct requests client-side and
+// plan from SliceOwnershipDescriptor records returned by GetMetadata.
+message SliceRequestDescriptor {
+  string model_name = 1;
+  string model_version = 2;
+  string tensor_name = 3;
+  repeated TensorAxisRange requested_range = 4;
+  repeated uint64 target_shape = 5;
+  string dtype = 6;
+  uint64 target_offset_bytes = 7;
+  repeated int64 destination_strides = 8;
+  string target_id = 9;
+  string runtime_framework = 10;
+  map<string, string> layout_tags = 11;
+  string quantization_scope = 12;
+  optional uint32 element_size_bytes = 13;
+}
+
+// Planned segment mapping from one source-owned slice to a target buffer range.
+message SegmentPlanDescriptor {
+  string source_id = 1;
+  string worker_id = 2;
+  string tensor_name = 3;
+  repeated TensorAxisRange source_range = 4;
+  repeated TensorAxisRange target_range = 5;
+  uint64 source_byte_offset = 6;
+  uint64 target_byte_offset = 7;
+  uint64 bytes = 8;
+  string lease_version = 9;
+  string retry_policy = 10;
+  string nixl_descriptor_id = 11;
+  string target_id = 12;
+  string target_runtime = 13;
+  uint32 worker_rank = 14;
+}
+
 // ============================================================================
 // Worker Metadata
 // ============================================================================
@@ -135,6 +202,10 @@ message WorkerMetadata {
 
   // Tensor descriptors for this worker's GPU
   repeated TensorDescriptor tensors = 3;
+
+  // Optional source-published tensor slice ownerships for cross-parallelism
+  // refit. Empty for legacy rank-matched full-tensor transfers.
+  repeated SliceOwnershipDescriptor slice_ownerships = 9;
 
   // Worker lifecycle status
   SourceStatus status = 4;
@@ -175,6 +246,7 @@ message GetTensorManifestRequest {
 
 message GetTensorManifestResponse {
   repeated TensorDescriptor tensors = 1;
+  repeated SliceOwnershipDescriptor slice_ownerships = 6;
   // Echoed mx_source_id for confirmation
   string mx_source_id = 2;
 

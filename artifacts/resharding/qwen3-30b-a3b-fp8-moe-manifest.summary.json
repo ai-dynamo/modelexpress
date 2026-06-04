@@ -1,0 +1,33 @@
+{
+  "artifact": "qwen3-30b-a3b-fp8-moe-manifest.json.gz",
+  "payload_downloaded": false,
+  "raw_json_size_bytes": 27816629,
+  "source": {
+    "files": "all safetensors files",
+    "kind": "huggingface",
+    "repo_id": "Qwen/Qwen3-30B-A3B-FP8",
+    "revision": null
+  },
+  "summary": {
+    "quantization_scope_counts": {
+      "absent": 18867,
+      "global-required": 18624
+    },
+    "requires_special_handling_count": 37056,
+    "source_file_counts": {
+      "model-00001-of-00007.safetensors": 4693,
+      "model-00002-of-00007.safetensors": 6248,
+      "model-00003-of-00007.safetensors": 6248,
+      "model-00004-of-00007.safetensors": 6248,
+      "model-00005-of-00007.safetensors": 6248,
+      "model-00006-of-00007.safetensors": 6248,
+      "model-00007-of-00007.safetensors": 1558
+    },
+    "tensor_count": 37491,
+    "tensor_family_counts": {
+      "layout-sensitive-slice": 435,
+      "moe-expert-axis-shard": 18432,
+      "quantization-global-required-fallback": 18624
+    }
+  }
+}

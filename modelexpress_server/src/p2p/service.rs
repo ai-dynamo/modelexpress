@@ -287,7 +287,8 @@ impl P2pService for P2pServiceImpl {
 mod tests {
     use super::*;
     use crate::p2p::backend::{
-        BackendMetadataRecord, MockMetadataBackend, ModelMetadataRecord, WorkerRecord,
+        BackendMetadataRecord, MockMetadataBackend, ModelMetadataRecord, SliceOwnershipRecord,
+        TensorAxisRangeRecord, WorkerRecord,
     };
     use crate::p2p::state::P2pStateManager;
     use modelexpress_common::grpc::p2p::{MxSourceType, SourceIdentity, SourceStatus};
@@ -454,6 +455,31 @@ mod tests {
                         worker_rank: 0,
                         backend_metadata: BackendMetadataRecord::None,
                         tensors: vec![],
+                        slice_ownerships: vec![SliceOwnershipRecord {
+                            model_name: "qwen3-moe-refit-poc".to_string(),
+                            model_version: "trainer-step-000001".to_string(),
+                            tensor_name: "model.layers.0.mlp.experts.w1.weight".to_string(),
+                            global_shape: vec![8, 4],
+                            dtype: "float32".to_string(),
+                            source_range: vec![
+                                TensorAxisRangeRecord { start: 0, end: 3 },
+                                TensorAxisRangeRecord { start: 0, end: 4 },
+                            ],
+                            storage_offset_bytes: 0,
+                            strides: vec![4, 1],
+                            contiguous: true,
+                            worker_id: "rank0".to_string(),
+                            worker_rank: 0,
+                            source_id: "trainer-rank0".to_string(),
+                            source_lease: "lease-rank0-primary".to_string(),
+                            nixl_descriptor_id: "nixl-rank0-primary".to_string(),
+                            layout_tags: [("trainer_layout".to_string(), "fsdp".to_string())]
+                                .into_iter()
+                                .collect(),
+                            quantization_scope: "absent".to_string(),
+                            element_size_bytes: Some(4),
+                            tensor_family: "moe-expert-axis-shard".to_string(),
+                        }],
                         status: SourceStatus::Ready as i32,
                         updated_at: 1234567890000,
                         metadata_endpoint: String::new(),
@@ -475,10 +501,10 @@ mod tests {
             .into_inner();
         assert!(resp.found);
         assert!(resp.worker.is_some());
-        assert_eq!(
-            resp.worker.expect("worker should be present").status,
-            SourceStatus::Ready as i32
-        );
+        let worker = resp.worker.expect("worker should be present");
+        assert_eq!(worker.status, SourceStatus::Ready as i32);
+        assert_eq!(worker.slice_ownerships.len(), 1);
+        assert_eq!(worker.slice_ownerships[0].source_id, "trainer-rank0");
         assert_eq!(resp.mx_source_id, "abc123def456abcd");
         assert_eq!(resp.worker_id, "worker-uuid-1");
     }

@@ -115,10 +115,13 @@ def publish_metadata_and_ready(
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
+    slice_ownerships: list["p2p_pb2.SliceOwnershipDescriptor"] | None = None,
 ) -> None:
     """Publish tensor metadata and ready flag to the ModelExpress server."""
+    slice_ownerships = slice_ownerships or []
     logger.info(
-        f"[Worker {worker_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {worker_rank}] Publishing {len(tensors)} tensors and "
+        f"{len(slice_ownerships)} slice ownerships for model '{identity.model_name}'"
     )
 
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
@@ -136,6 +139,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint="",
+            slice_ownerships=slice_ownerships,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,
@@ -148,6 +152,7 @@ def publish_metadata_and_ready(
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
             mx_source_id=mx_source_id,
+            slice_ownership_protos=slice_ownerships,
             port=worker_grpc_port,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
@@ -161,6 +166,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
+            slice_ownerships=slice_ownerships,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,
@@ -178,6 +184,7 @@ def publish_metadata_and_ready(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensors=tensor_protos,
+            slice_ownerships=slice_ownerships,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,

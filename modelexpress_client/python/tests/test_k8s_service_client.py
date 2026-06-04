@@ -246,6 +246,23 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
         return p2p_pb2.GetTensorManifestResponse(
             mx_source_id=self._mx_source_id,
             tensors=[p2p_pb2.TensorDescriptor(name="t0", size=16, device_id=0)],
+            slice_ownerships=[
+                p2p_pb2.SliceOwnershipDescriptor(
+                    model_name="qwen3-moe-refit-poc",
+                    model_version="trainer-step-000001",
+                    tensor_name="model.layers.0.mlp.experts.w1.weight",
+                    global_shape=[8, 4],
+                    dtype="float32",
+                    source_range=[
+                        p2p_pb2.TensorAxisRange(start=0, end=3),
+                        p2p_pb2.TensorAxisRange(start=0, end=4),
+                    ],
+                    worker_id="rank0",
+                    worker_rank=self._worker_rank,
+                    source_id="trainer-rank0",
+                    layout_tags={"storage_layout": "\"row-major\""},
+                )
+            ],
             metadata_endpoint="10.0.0.1:5555",
             agent_name="fake-agent",
             worker_rank=self._worker_rank,
@@ -279,6 +296,8 @@ def test_get_metadata_success_builds_synthetic_response():
         assert resp.worker.status == p2p_pb2.SOURCE_STATUS_READY
         assert len(resp.worker.tensors) == 1
         assert resp.worker.tensors[0].name == "t0"
+        assert len(resp.worker.slice_ownerships) == 1
+        assert resp.worker.slice_ownerships[0].source_id == "trainer-rank0"
         # worker_grpc_endpoint must be populated: rdma_strategy gates
         # the P2P branch (which pulls NIXL metadata from the source's
         # listen thread) on bool(worker.worker_grpc_endpoint). An empty

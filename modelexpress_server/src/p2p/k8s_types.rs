@@ -74,6 +74,14 @@ pub struct WorkerStatus {
     #[serde(rename = "tensorConfigMap", default)]
     pub tensor_config_map: Option<String>,
 
+    /// Number of slice ownership descriptors registered by this worker
+    #[serde(rename = "sliceOwnershipCount", default)]
+    pub slice_ownership_count: i32,
+
+    /// Name of ConfigMap containing slice ownership descriptors
+    #[serde(rename = "sliceOwnershipConfigMap", default)]
+    pub slice_ownership_config_map: Option<String>,
+
     /// Worker lifecycle status (Initializing, Ready, Stale)
     #[serde(default)]
     pub status: String,
@@ -194,6 +202,55 @@ pub struct TensorDescriptorJson {
     pub size: String,
     pub device_id: u32,
     pub dtype: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TensorAxisRangeJson {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// Slice ownership descriptor stored in ConfigMap
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SliceOwnershipJson {
+    #[serde(default)]
+    pub model_name: String,
+    #[serde(default)]
+    pub model_version: String,
+    pub tensor_name: String,
+    #[serde(default)]
+    pub global_shape: Vec<u64>,
+    pub dtype: String,
+    #[serde(default)]
+    pub source_range: Vec<TensorAxisRangeJson>,
+    #[serde(default)]
+    pub storage_offset_bytes: u64,
+    #[serde(default)]
+    pub strides: Vec<i64>,
+    #[serde(default = "default_true")]
+    pub contiguous: bool,
+    #[serde(default)]
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_rank: u32,
+    #[serde(default)]
+    pub source_id: String,
+    #[serde(default)]
+    pub source_lease: String,
+    #[serde(default)]
+    pub nixl_descriptor_id: String,
+    #[serde(default)]
+    pub layout_tags: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub quantization_scope: String,
+    #[serde(default)]
+    pub element_size_bytes: Option<u32>,
+    #[serde(default)]
+    pub tensor_family: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Sanitize model name to be a valid Kubernetes resource name

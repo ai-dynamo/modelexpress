@@ -5,7 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Architecture
 
-Detailed reference document for the ModelExpress codebase. For deployment and configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage, see [`CLI.md`](CLI.md). For GCS provider internals, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
+Detailed reference document for the ModelExpress codebase. For deployment and
+configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution
+guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For
+coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage,
+see [`CLI.md`](CLI.md). For GCS provider internals, see
+[`GCS_PROVIDER.md`](GCS_PROVIDER.md). For the cross-parallelism resharding POC,
+see [`RESHARDING.md`](RESHARDING.md).
 
 ## Project Overview
 
@@ -155,6 +161,11 @@ ModelExpress/
 │       │       └── loader.py           # MxModelLoader for remote_instance backend
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
+│       ├── resharding.py               # Cross-parallelism slice planner/simulator
+│       ├── resharding_control_plane.py # Slice ownership proto conversion + MX metadata planning helpers
+│       ├── resharding_manifest.py      # Qwen-style tensor family / quantization-scope manifest extraction
+│       ├── resharding_receiver.py      # Receiver-side runtime tensor request/install helpers
+│       ├── refit_poc.py                # Standalone trainer-to-inference GPU/NIXL refit POC runner
 │       ├── rank_utils.py               # Rank detection utilities
 │       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
@@ -298,7 +309,7 @@ Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downl
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Fetch full tensor metadata for one specific worker (MB-scale, on demand) |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Update per-worker lifecycle status (Initializing/Ready/Stale) |
 
-Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility), `WorkerMetadata` (rank, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing).
+Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility), `WorkerMetadata` (rank, oneof backend_metadata, tensors, optional slice ownerships, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype), `SliceOwnershipDescriptor` / `SliceRequestDescriptor` / `SegmentPlanDescriptor` (cross-parallelism refit metadata), `SourceInstanceRef` (lightweight worker reference for listing).
 
 ### p2p.proto - WorkerService (P2P, opt-in)
 
@@ -517,6 +528,11 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
+| `resharding.py` | Pure planner/simulator for cross-parallelism slice ownership, receiver requests, and segment plans |
+| `resharding_control_plane.py` | Proto conversion and MX-client-shaped publish/list/get planning helpers for slice ownership metadata |
+| `resharding_manifest.py` | Qwen-style MoE manifest extraction for tensor family, expert-axis, and quantization-scope classification |
+| `resharding_receiver.py` | Receiver-side helpers that build `SliceRequest`s from runtime-owned tensors and install planned segment payloads into target tensor slices |
+| `refit_poc.py` | Standalone GPU POC runner for single-GPU and distributed trainer-to-inference segment assembly/recovery; `--control-plane live-mx` plans NIXL reads from MX-returned slice ownership metadata |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |

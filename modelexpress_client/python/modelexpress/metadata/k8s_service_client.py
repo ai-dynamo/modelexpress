@@ -245,15 +245,16 @@ class MxK8sServiceClient(MxClientBase):
                     metadata_endpoint=resp.metadata_endpoint,
                     agent_name=resp.agent_name,
                     tensors=list(resp.tensors),
+                    slice_ownerships=list(resp.slice_ownerships),
                     status=p2p_pb2.SOURCE_STATUS_READY,
                     worker_grpc_endpoint=endpoint,
                 )
                 logger.info(
                     "MxK8sServiceClient.get_metadata: fetched "
                     "manifest from %s (mx_source_id=%s, rank=%d, "
-                    "%d tensors, attempt=%d)",
+                    "%d tensors, %d slice ownerships, attempt=%d)",
                     endpoint, resp.mx_source_id, resp.worker_rank,
-                    len(resp.tensors), attempt,
+                    len(resp.tensors), len(resp.slice_ownerships), attempt,
                 )
                 return p2p_pb2.GetMetadataResponse(
                     found=True,
