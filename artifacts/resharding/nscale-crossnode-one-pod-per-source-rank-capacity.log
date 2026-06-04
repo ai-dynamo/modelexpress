@@ -1,0 +1,299 @@
+NAME                READY   STATUS    RESTARTS   AGE   IP            NODE                                         NOMINATED NODE   READINESS GATES
+mx-rankpod-src0     1/1     Running   0          10m   10.0.12.84    cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-rankpod-src1     1/1     Running   0          10m   10.0.12.59    cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-rankpod-src2     1/1     Running   0          10m   10.0.12.95    cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-rankpod-target   1/1     Running   0          10m   10.0.20.211   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+Name:             mx-rankpod-src0
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Thu, 04 Jun 2026 18:02:27 +0200
+Labels:           app=mx-rankpod-refit-proof
+                  gpu-reaper.nvidia.com/status=idle
+                  role=source
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 414
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-04T16:03:46Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 28
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.12.84
+IPs:
+  IP:  10.0.12.84
+Containers:
+  hold:
+    Container ID:  containerd://fb93d8933ae43003ce36c7e51d1a6ff38ab3f958db02e8d216fcc006e7a4128b
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:179b43c8557cca55ed9bf13162cf4519313f2d4604a9f0364e1a2f08bc86c1bc
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+    Args:
+      nvidia-smi && sleep 1200
+    State:          Running
+      Started:      Thu, 04 Jun 2026 18:02:28 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             2
+      memory:          16Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             1
+      memory:          8Gi
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-xnkvh (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-xnkvh:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              kubernetes.io/hostname=cluster-0967a26d-pool-14bee067-prctr-9c2x7
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved=anish-20260601:NoSchedule
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  10m   default-scheduler  Successfully assigned anish-dynamo/mx-rankpod-src0 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     10m   kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d" already present on machine
+  Normal  Created    10m   kubelet            Created container: hold
+  Normal  Started    10m   kubelet            Started container hold
+
+
+Name:             mx-rankpod-src1
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Thu, 04 Jun 2026 18:02:28 +0200
+Labels:           app=mx-rankpod-refit-proof
+                  gpu-reaper.nvidia.com/status=idle
+                  role=source
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 413
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-04T16:03:46Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 44
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.12.59
+IPs:
+  IP:  10.0.12.59
+Containers:
+  hold:
+    Container ID:  containerd://1cc4ae847eca80c6cba459d1fc2f0d0fd8c9c1a196fe694a89391f44ab041166
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:179b43c8557cca55ed9bf13162cf4519313f2d4604a9f0364e1a2f08bc86c1bc
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+    Args:
+      nvidia-smi && sleep 1200
+    State:          Running
+      Started:      Thu, 04 Jun 2026 18:02:29 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             2
+      memory:          16Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             1
+      memory:          8Gi
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-ps5rc (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-ps5rc:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              kubernetes.io/hostname=cluster-0967a26d-pool-14bee067-prctr-9c2x7
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved=anish-20260601:NoSchedule
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  10m   default-scheduler  Successfully assigned anish-dynamo/mx-rankpod-src1 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     10m   kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d" already present on machine
+  Normal  Created    10m   kubelet            Created container: hold
+  Normal  Started    10m   kubelet            Started container hold
+
+
+Name:             mx-rankpod-src2
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Thu, 04 Jun 2026 18:02:29 +0200
+Labels:           app=mx-rankpod-refit-proof
+                  gpu-reaper.nvidia.com/status=idle
+                  role=source
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 424
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-04T16:03:46Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 46
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.12.95
+IPs:
+  IP:  10.0.12.95
+Containers:
+  hold:
+    Container ID:  containerd://f94df0c4f87bba1132d81fec0418cad127189018563cbd134e60f8b93b44b53d
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:179b43c8557cca55ed9bf13162cf4519313f2d4604a9f0364e1a2f08bc86c1bc
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+    Args:
+      nvidia-smi && sleep 1200
+    State:          Running
+      Started:      Thu, 04 Jun 2026 18:02:30 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             2
+      memory:          16Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             1
+      memory:          8Gi
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-6cxfv (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-6cxfv:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              kubernetes.io/hostname=cluster-0967a26d-pool-14bee067-prctr-9c2x7
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved=anish-20260601:NoSchedule
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  10m   default-scheduler  Successfully assigned anish-dynamo/mx-rankpod-src2 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     10m   kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d" already present on machine
+  Normal  Created    10m   kubelet            Created container: hold
+  Normal  Started    10m   kubelet            Started container hold
+
+
+Name:             mx-rankpod-target
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Thu, 04 Jun 2026 18:02:31 +0200
+Labels:           app=mx-rankpod-refit-proof
+                  gpu-reaper.nvidia.com/status=idle
+                  role=target
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 23
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-04T16:03:46Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 65
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.20.211
+IPs:
+  IP:  10.0.20.211
+Containers:
+  hold:
+    Container ID:  containerd://54af1f07a493577cde17b6b46042b6daa4ba1c72c754bfe6b95d519e143d4645
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:179b43c8557cca55ed9bf13162cf4519313f2d4604a9f0364e1a2f08bc86c1bc
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+    Args:
+      nvidia-smi && sleep 1200
+    State:          Running
+      Started:      Thu, 04 Jun 2026 18:02:31 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             2
+      memory:          16Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             1
+      memory:          8Gi
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-wtxs6 (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-wtxs6:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              kubernetes.io/hostname=cluster-0967a26d-pool-14bee067-prctr-g2j7h
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved=anish-20260601:NoSchedule
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  10m   default-scheduler  Successfully assigned anish-dynamo/mx-rankpod-target to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+  Normal  Pulled     10m   kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-adc1b2d" already present on machine
+  Normal  Created    10m   kubelet            Created container: hold
+  Normal  Started    10m   kubelet            Started container hold

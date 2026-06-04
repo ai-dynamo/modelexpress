@@ -243,12 +243,50 @@ def _wait_for_endpoints(
         mx_client.close()
 
 
+def _source_agent_name(run_id: str, ownerships: list[SliceOwnership]) -> str:
+    if len(ownerships) == 1:
+        return f"mx-crossnode-source-{run_id}-{ownerships[0].source_id}"
+    return f"mx-crossnode-source-{run_id}"
+
+
+def _filter_ownerships(
+    ownerships: list[SliceOwnership],
+    *,
+    source_id: str,
+    worker_rank: int | None,
+) -> list[SliceOwnership]:
+    filtered = ownerships
+    if source_id:
+        filtered = [owner for owner in filtered if owner.source_id == source_id]
+    if worker_rank is not None:
+        filtered = [
+            owner
+            for owner in filtered
+            if int(owner.worker_rank or 0) == worker_rank
+        ]
+    if not filtered:
+        available = [
+            {
+                "source_id": owner.source_id,
+                "worker_rank": int(owner.worker_rank or 0),
+            }
+            for owner in ownerships
+        ]
+        raise ValueError(
+            "source ownership filter matched no ownerships "
+            f"(source_id={source_id!r}, worker_rank={worker_rank!r}, available={available})"
+        )
+    return filtered
+
+
 def run_source(
     *,
     run_id: str,
     hold_seconds: float,
     local_rank: int,
     artifact_path: Path | None,
+    source_id: str = "",
+    source_worker_rank: int | None = None,
 ) -> dict[str, Any]:
     torch = _import_torch()
     if not torch.cuda.is_available():
@@ -259,9 +297,13 @@ def run_source(
     device = torch.device(f"cuda:{device_index}")
     apply_nixl_ucx_pin(device_index)
 
-    agent_name = f"mx-crossnode-source-{run_id}"
+    ownerships = _filter_ownerships(
+        _run_ownerships(run_id),
+        source_id=source_id,
+        worker_rank=source_worker_rank,
+    )
+    agent_name = _source_agent_name(run_id, ownerships)
     adapter = NixlAdapter(agent_name)
-    ownerships = _run_ownerships(run_id)
     source_tensors = {
         owner.source_id: _materialize_range(owner.source_range, device).contiguous()
         for owner in ownerships
@@ -337,6 +379,12 @@ def run_source(
             "pod_name": os.environ.get("POD_NAME", ""),
             "node_name": os.environ.get("NODE_NAME", ""),
             "agent_name": agent_name,
+            "single_source_ownership_mode": len(ownerships) == 1,
+            "source_ownership_count": len(ownerships),
+            "source_filter": {
+                "source_id": source_id,
+                "source_worker_rank": source_worker_rank,
+            },
             "gpu_reuse_used": gpu_reuse_used,
             "cuda_device": device_index,
             "nixl_backends": adapter.backends,
@@ -373,6 +421,7 @@ def run_target(
     source_node: str,
     target_pod: str,
     target_node: str,
+    gpu_count: int,
 ) -> dict[str, Any]:
     torch = _import_torch()
     if not torch.cuda.is_available():
@@ -501,10 +550,22 @@ def run_target(
     validation = _validate_target(target, request)
     _trace("target.validation.done", **validation)
     copied_bytes = sum(read["bytes"] for read in [*primary_reads, *recovery_reads])
+    source_agent_names = {
+        source_id: endpoint.agent_name
+        for source_id, endpoint in sorted(endpoint_by_source_id.items())
+    }
+    distinct_source_agent_count = len(set(source_agent_names.values()))
+    source_endpoint_count = len(sources_by_id)
+    one_agent_per_source_rank = distinct_source_agent_count == source_endpoint_count
+    multipod_source_mode = one_agent_per_source_rank and source_endpoint_count > 1
 
     result = artifact_base(
-        mode="nixl-crossnode-2pod",
-        gpu_count=2,
+        mode=(
+            "nixl-crossnode-one-pod-per-source-rank"
+            if multipod_source_mode
+            else "nixl-crossnode-2pod"
+        ),
+        gpu_count=gpu_count,
         copied_bytes=copied_bytes,
         copy_duration_ms=raw_nixl_read_duration_ms,
         validation=validation,
@@ -531,17 +592,22 @@ def run_target(
                 "bond" not in os.environ.get("UCX_NET_DEVICES", "")
                 and "bond" not in os.environ.get("UCX_IB_DEVICES", "")
             ),
+            "one_nixl_agent_per_source_rank": one_agent_per_source_rank,
+            "source_endpoint_count": source_endpoint_count,
+            "distinct_source_agent_count": distinct_source_agent_count,
         }
     )
     result["distributed"] = {
         "backend": "nixl-read+mx-endpoint-control+no-torch-distributed",
-        "world_size": 2,
+        "world_size": gpu_count,
         "source_pod": source_pod,
         "target_pod": target_pod,
         "source_node": source_node,
         "target_node": target_node,
         "cross_node": bool(source_node and target_node and source_node != target_node),
+        "source_ids": list(sources_by_id),
         "source_roles_in_source_pod": list(sources_by_id),
+        "source_agent_names_by_source_id": source_agent_names,
         "target_agent_name": agent_name,
         "gpu_reuse_used": gpu_reuse_used,
     }
@@ -625,10 +691,13 @@ def main() -> None:
     parser.add_argument("--hold-seconds", type=float, default=300.0)
     parser.add_argument("--local-rank", type=int, default=0)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--source-id", default=os.environ.get("SOURCE_ID", ""))
+    parser.add_argument("--source-worker-rank", type=int)
     parser.add_argument("--source-pod", default=os.environ.get("SOURCE_POD", ""))
     parser.add_argument("--source-node", default=os.environ.get("SOURCE_NODE", ""))
     parser.add_argument("--target-pod", default=os.environ.get("POD_NAME", ""))
     parser.add_argument("--target-node", default=os.environ.get("NODE_NAME", ""))
+    parser.add_argument("--gpu-count", type=int, default=int(os.environ.get("GPU_COUNT", "2")))
     args = parser.parse_args()
 
     if args.role == "source":
@@ -637,6 +706,8 @@ def main() -> None:
             hold_seconds=args.hold_seconds,
             local_rank=args.local_rank,
             artifact_path=args.artifact,
+            source_id=args.source_id,
+            source_worker_rank=args.source_worker_rank,
         )
     else:
         if args.artifact is None:
@@ -650,6 +721,7 @@ def main() -> None:
             source_node=args.source_node,
             target_pod=args.target_pod,
             target_node=args.target_node,
+            gpu_count=args.gpu_count,
         )
 
 

@@ -104,6 +104,22 @@ source agent, forms UCX rc lanes over `mlx5_3:1` with
 `UCX_TLS=rc_x,rc,tcp,cuda_copy`, excludes bonded NICs, performs planned
 one-sided READs into the target buffer, and validates allclose/checksum.
 
+The stricter one-pod-per-source-rank cross-node proof is
+`artifacts/resharding/nscale-crossnode-one-pod-per-source-rank-target.json`,
+with source publication artifacts in
+`nscale-crossnode-one-pod-per-source-rank-source-rank0.json`,
+`nscale-crossnode-one-pod-per-source-rank-source-rank1.json`, and
+`nscale-crossnode-one-pod-per-source-rank-source-rank2-alt.json`. It runs three
+independent source-rank pods on
+`cluster-0967a26d-pool-14bee067-prctr-9c2x7` and one target pod on
+`cluster-0967a26d-pool-14bee067-prctr-g2j7h`. Each source pod publishes exactly
+one ownership and one distinct NIXL source agent; the target discovers all
+three endpoints from MX, performs cross-node UCX/IB rc NIXL reads from the
+needed source ranks, replans the failed primary segment to the alternate holder,
+and validates allclose/checksum. This proves independent source-pod fan-in for
+the synthetic MX/NIXL refit path. It does not yet prove real trainer pod churn
+or real runtime-owned vLLM/SGLang refit.
+
 Qwen-style MoE manifest classification lives in
 `modelexpress.resharding_manifest`. It emits tensor family,
 quantization-scope, expert-axis, and layout-sensitive tags for synthetic
@@ -179,14 +195,16 @@ drives the NIXL data plane in a completed GPU run. The stronger endpoint proof
 is `nscale-live-mx-nixl-endpoint-refit.json`: source NIXL agent metadata and
 remote CUDA tensor descriptors are discovered through MX worker metadata, and
 the artifact records `torch_distributed_nixl_metadata_exchange_used=false`.
-The current cross-node proof is `nscale-crossnode-mx-nixl-refit.json`: source
-and target pods run on distinct GPU nodes and the target validates UCX/IB rc
-NIXL segment reads from MX-discovered endpoints. Independent source-pod fan-in
-and real runtime-owned refit are still future gates. The first nscale attempt
-to schedule independent source-rank pods is recorded as a capacity block in
+The current cross-node proof set includes `nscale-crossnode-mx-nixl-refit.json`
+for the two-pod source/target case and
+`nscale-crossnode-one-pod-per-source-rank-target.json` for independent
+source-rank pods feeding one target across nodes. Real source pod churn and
+real runtime-owned refit are still future gates. The first nscale attempt to
+schedule independent source-rank pods is recorded as a superseded capacity
+block in
 `nscale-one-pod-per-source-capacity-block.log` and
-`nscale-one-pod-per-source-capacity-block.json`; it does not create a
-one-pod-per-source checksum claim.
+`nscale-one-pod-per-source-capacity-block.json`; the later one-pod-per-source
+artifact is the checksum-backed claim.
 The Level 3 control-plane evidence is in `nscale-control-plane-pytest.log`,
 `nscale-refit-endpoint-control-plane-pytest.log`, `docker-rust-p2p-tests.log`,
 `nscale-live-control-plane.log`, `nscale-live-mx-nixl-refit.log`,

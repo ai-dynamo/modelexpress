@@ -139,18 +139,34 @@ Artifacts under `artifacts/resharding/` prove:
   `UCX_NET_DEVICES=mlx5_3:1`, excluded `mlx5_bond_0`, performed actual NIXL
   READs for 64 bytes across two source holders, and validated
   `allclose=true` with checksum `556224.0`.
+- A stricter one-pod-per-source-rank cross-node B200 live-MX NIXL endpoint run
+  proves independent source-rank pods can publish separate source endpoints and
+  be consumed by one target on another GPU node:
+  `artifacts/resharding/nscale-crossnode-one-pod-per-source-rank-target.json`.
+  Three source pods (`mx-rankpod-src0`, `mx-rankpod-src1`, and
+  `mx-rankpod-src2`) ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`; the target pod
+  `mx-rankpod-target` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`. The target discovered three
+  MX source endpoints, added three distinct source NIXL agents, performed
+  actual cross-node NIXL READs from `trainer-rank1` and
+  `trainer-rank2-alt`, and validated `allclose=true` with checksum
+  `556224.0`. The artifact records
+  `mode=nixl-crossnode-one-pod-per-source-rank`, `gpu_count=4`,
+  `one_nixl_agent_per_source_rank=true`, and no trainer all-gather or
+  trainer-side inference-layout conversion.
 - The live nscale server image used for that cross-node run drops the newer
   `slice_ownerships` proto field even though tensor/NIXL fields survive. The
   source now dual-writes ownership into the new proto field and a prefixed
   legacy string sidecar so older MX server deployments can still return
   ownership for endpoint planning. This is a compatibility bridge, not a
   replacement for the production schema.
-- A one-pod-per-source-rank cross-node proof was capacity-probed but not run:
+- An earlier one-pod-per-source-rank cross-node attempt was capacity-blocked:
   `artifacts/resharding/nscale-one-pod-per-source-capacity-block.log` and
   `.json` record three independent source-rank GPU pods Pending with
   `0/29 nodes are available`, `10 Insufficient nvidia.com/gpu`, and
-  autoscaler max node group size reached. No target pod was created and no
-  one-pod-per-source-rank checksum claim is made.
+  autoscaler max node group size reached. That block is now superseded by the
+  later checksum-backed one-pod-per-source-rank run above.
 - A Level-5 real timing table was also not run in this pass:
   `artifacts/resharding/nscale-level5-timing-capacity-block.json` records that
   MX/NIXL, NCCL Reshard, and CheckpointEngine measured baselines remain
@@ -196,9 +212,9 @@ Artifacts under `artifacts/resharding/` prove:
 This is a **Level 3 cross-node synthetic proof**, not a production refit
 implementation. Level 3 control-plane metadata lifecycle support is proven
 through a live central MX server smoke, and live MX-returned ownership plus
-source endpoint metadata now drives completed same-node and two-pod cross-node
-NIXL GPU data-plane runs. Real runtime-owned trainer/inference refit is still
-unproven.
+source endpoint metadata now drives completed same-node, two-pod cross-node,
+and one-pod-per-source-rank cross-node NIXL GPU data-plane runs. Real
+runtime-owned trainer/inference refit is still unproven.
 
 ## What Is Not Proven Yet
 
@@ -207,7 +223,8 @@ The current POC does **not** prove:
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
   post-load/refit lifecycle.
-- One-pod-per-source-rank cross-node refit with independent source pod churn.
+- One-pod-per-source-rank refit under real source pod churn or a real pod kill
+  during an in-flight read.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
 - Runtime fallback installation of real quantized Qwen tensors after

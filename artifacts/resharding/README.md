@@ -93,6 +93,26 @@ Files:
 - `nscale-crossnode-mx-nixl-refit.log`: target-side UCX/NIXL debug log for the
   completed cross-node proof, including endpoint wait, NIXL agent construction,
   remote-agent add, inter-node rc lane setup, segment READs, and validation.
+- `nscale-crossnode-one-pod-per-source-rank-target.json`: completed
+  one-pod-per-source-rank cross-node live-MX NIXL endpoint proof. Three
+  independent source-rank pods publish one source endpoint and one distinct
+  NIXL source agent each; a target pod on a different GPU node discovers those
+  endpoints from MX, performs planned NIXL READs from the needed source ranks,
+  and validates checksum/allclose. The artifact records
+  `mode=nixl-crossnode-one-pod-per-source-rank`, `gpu_count=4`,
+  `source_endpoint_count=3`, `distinct_source_agent_count=3`,
+  `one_nixl_agent_per_source_rank=true`, `trainer_to_inference_bytes=64`, and
+  `raw_nixl_read_duration_ms=13.304431922733784`.
+- `nscale-crossnode-one-pod-per-source-rank-source-rank0.json`,
+  `nscale-crossnode-one-pod-per-source-rank-source-rank1.json`, and
+  `nscale-crossnode-one-pod-per-source-rank-source-rank2-alt.json`:
+  source-side publication artifacts for the one-pod-per-source-rank proof.
+- `nscale-crossnode-one-pod-per-source-rank-capacity.log`: placement evidence
+  for the one-pod-per-source-rank proof. It records three source pods on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7` and the target pod on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`.
+- `nscale-crossnode-one-pod-per-source-rank.log`: nscale-generated summary log
+  for the one-pod-per-source-rank target gate.
 - `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
   pytest run inside the nscale target pod after the cross-node patch
   (`8 passed`). It covers the MX refit endpoint helper path, including legacy
@@ -102,11 +122,12 @@ Files:
   the cross-node and capacity-block JSON artifacts, and reruns the focused
   control-plane pytest (`8 passed`).
 - `nscale-one-pod-per-source-capacity-block.log` and
-  `nscale-one-pod-per-source-capacity-block.json`: honest capacity block for
-  the stricter one-pod-per-source-rank proof. Three independent source-rank GPU
-  pods remained Pending with `0/29 nodes`, `10 Insufficient nvidia.com/gpu`,
-  and autoscaler max node group size reached. No target pod was created and no
-  checksum claim is made.
+  `nscale-one-pod-per-source-capacity-block.json`: earlier honest capacity
+  block for the stricter one-pod-per-source-rank proof. Three independent
+  source-rank GPU pods remained Pending with `0/29 nodes`,
+  `10 Insufficient nvidia.com/gpu`, and autoscaler max node group size reached.
+  This block is superseded by the later checksum-backed
+  `nscale-crossnode-one-pod-per-source-rank-target.json` run.
 - `nscale-level5-timing-capacity-block.json`: honest block for the requested
   real Level-5 timing table. MX/NIXL, NCCL Reshard, and CheckpointEngine
   measured timings were not run because the required multi-GPU nscale capacity
@@ -130,7 +151,8 @@ Files:
   shared-expert tensors.
 
 The NIXL JSON is the primary Level 2 same-node proof artifact. The cross-node
-live-MX NIXL endpoint JSON is the strongest current Level 3 synthetic proof
-artifact. The NCCL distributed JSON remains the Level 1 comparison artifact.
-One-pod-per-source-rank and real Level-5 timing remain blocked/unproven until
-fresh capacity allows checksum-backed runs.
+live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
+artifacts, with the one-pod-per-source-rank target JSON as the strictest
+cross-node claim. The NCCL distributed JSON remains the Level 1 comparison
+artifact. Real Level-5 timing remains blocked/unproven until comparable
+checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine runs are completed.

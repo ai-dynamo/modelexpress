@@ -1,0 +1,51 @@
+{
+  "agent_name": "mx-crossnode-source-rankpod-20260604-1820-trainer-rank2-alt",
+  "cuda_device": 0,
+  "gpu_reuse_used": false,
+  "metrics": {
+    "nixl_metadata_duration_ms": 0.011386931873857975,
+    "nixl_registration_duration_ms": 1.7428590217605233,
+    "publish_duration_ms": 29.455142095685005
+  },
+  "mode": "nixl-crossnode-source",
+  "nixl_backends": [
+    "UCX"
+  ],
+  "node_name": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+  "pod_name": "mx-rankpod-src2",
+  "result": "source-ready",
+  "role": "source",
+  "run_id": "rankpod-20260604-1820",
+  "schema_version": 1,
+  "single_source_ownership_mode": true,
+  "source_filter": {
+    "source_id": "trainer-rank2-alt",
+    "source_worker_rank": null
+  },
+  "source_ownership_count": 1,
+  "source_publications": [
+    {
+      "agent_name": "mx-crossnode-source-rankpod-20260604-1820-trainer-rank2-alt",
+      "metadata_bytes": 438,
+      "mx_source_id": "8ea5db40aa37dd58",
+      "publish_duration_ms": 29.455142095685005,
+      "source_id": "trainer-rank2-alt",
+      "tensor_addr": 130734526301696,
+      "tensor_bytes": 48,
+      "tensor_device_id": 0,
+      "worker_id": "rank2",
+      "worker_rank": 2
+    }
+  ],
+  "ucx": {
+    "MX_NIXL_BACKEND": "UCX",
+    "MX_RDMA_NIC_PIN": "auto",
+    "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "",
+    "UCX_IB_DEVICES": "",
+    "UCX_MAX_RNDV_RAILS": "",
+    "UCX_NET_DEVICES": "mlx5_2:1",
+    "UCX_RNDV_SCHEME": "get_zcopy",
+    "UCX_RNDV_THRESH": "0",
+    "UCX_TLS": "rc_x,rc,tcp,cuda_copy"
+  }
+}
