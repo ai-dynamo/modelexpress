@@ -1,0 +1,5 @@
+Server:           mx-server-rl:8001
+Namespace:        anish-dynamo
+Purpose:          Live MX trainer-step source publication round trip
+Result:           blocked by legacy server metadata drop
+mx-server-rl accepted PublishMetadata for trainer-step source publication, but GetMetadata returned only SOURCE_STATUS_INITIALIZING and dropped both worker.slice_ownerships and metadata_endpoint legacy sidecar.

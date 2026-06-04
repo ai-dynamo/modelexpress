@@ -256,13 +256,20 @@ Artifacts under `artifacts/resharding/` prove:
   small synthetic objective. `TrainerStepSourcePublication` now carries the
   post-step source tensor, annotated `SliceOwnership`, source lease/descriptor
   identity, and provenance together. The nscale CPU artifacts
-  `artifacts/resharding/nscale-trainer-step-runtime-source-smoke-20260605.json`
-  and `artifacts/resharding/nscale-trainer-step-source-publication-smoke-20260605.json`,
+  `artifacts/resharding/nscale-trainer-step-runtime-source-smoke-20260605.json`,
+  `artifacts/resharding/nscale-trainer-step-source-publication-smoke-20260605.json`,
+  and `artifacts/resharding/nscale-trainer-step-mx-publication-smoke-20260605.json`,
   plus pytest logs, prove source-owned ranges reconstruct the post-step target
-  tensor and that vLLM/SGLang source-rank paths now expose optimizer-step
-  publication metadata. A live vLLM GPU rerun of this updated path was
-  attempted but 1-GPU nscale scheduling was blocked:
-  `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`.
+  tensor, source-publication metadata can be published/listed/planned through
+  the MX metadata client path, and vLLM/SGLang source-rank paths now expose
+  optimizer-step publication metadata. A live vLLM GPU rerun of this updated
+  path was attempted but 1-GPU nscale scheduling was blocked:
+  `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`
+  and `artifacts/resharding/nscale-1gpu-capacity-probe-block-20260605.json`.
+  A live `mx-server-rl` trainer-step publication attempt was also banked as a
+  server compatibility block because that deployed server dropped both the new
+  ownership field and the legacy sidecar:
+  `artifacts/resharding/nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json`.
 - Target-side runtime read-failure recovery logic now exists in the cross-node
   harness. A nscale unit test simulates a READY primary source failing during
   its read group, verifies that only that failed source range is replanned from
@@ -554,13 +561,20 @@ Current partial evidence:
   `static_replacement_formula_used=false`). `TrainerStepSourcePublication`
   carries the source tensor, annotated `SliceOwnership`, source lease/descriptor
   identity, and artifact metadata together so future MX publication can use one
-  contract. nscale CPU evidence:
+  contract. The in-memory MX metadata path now publishes trainer-step
+  source publications, lists them back, and plans receiver slices from the
+  returned ownership metadata. nscale CPU/control-plane evidence:
   `artifacts/resharding/nscale-trainer-step-runtime-source-smoke-20260605.json`,
   `artifacts/resharding/nscale-trainer-step-source-publication-smoke-20260605.json`,
-  and `artifacts/resharding/nscale-trainer-step-source-publication-pytest-20260605.log`
-  (`15 passed`). A live vLLM GPU rerun of the updated path was attempted but
-  blocked by 1-GPU nscale capacity:
+  `artifacts/resharding/nscale-trainer-step-mx-publication-smoke-20260605.json`,
+  and `artifacts/resharding/nscale-trainer-step-mx-publication-pytest-20260605.log`
+  (`7 passed, 1 skipped` for the live-server compatibility block). A live vLLM
+  GPU rerun of the updated path was attempted but blocked by 1-GPU nscale
+  capacity:
   `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`.
+  A live `mx-server-rl` trainer-step publication attempt was blocked by the
+  deployed server dropping ownership metadata:
+  `artifacts/resharding/nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json`.
 - `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
   SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
   `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the

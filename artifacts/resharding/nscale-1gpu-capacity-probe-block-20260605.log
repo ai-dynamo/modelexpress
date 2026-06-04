@@ -1,0 +1,9 @@
+Name:             mx-gpu-capacity-probe-20260605-010957
+Namespace:        anish-dynamo
+Status:           Pending until deleted after scheduler block
+Requested GPUs:   1
+Purpose:          Check whether live vLLM/SGLang trainer-step runtime rerun can schedule
+
+Events:
+Warning FailedScheduling 0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+Normal NotTriggerScaleUp pod didn't trigger scale-up: 1 max node group size reached

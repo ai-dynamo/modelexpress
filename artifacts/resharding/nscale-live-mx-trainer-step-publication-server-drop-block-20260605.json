@@ -1,0 +1,17 @@
+{
+  "block_type": "live-mx-server-metadata-drop",
+  "blocked": true,
+  "client_code_path_evidence": "nscale-trainer-step-mx-publication-pytest-20260605.log",
+  "get_metadata_found_worker": true,
+  "legacy_sidecar_returned": false,
+  "local_session_date": "2026-06-05",
+  "log_artifact": "nscale-live-mx-trainer-step-publication-server-drop-block-20260605.log",
+  "message": "mx-server-rl accepted PublishMetadata for trainer-step source publication, but GetMetadata returned only SOURCE_STATUS_INITIALIZING and dropped both worker.slice_ownerships and metadata_endpoint legacy sidecar.",
+  "namespace": "anish-dynamo",
+  "publish_metadata_accepted": true,
+  "purpose": "Run live MX trainer-step source publication metadata round trip.",
+  "result": "blocked",
+  "schema_version": 1,
+  "server_url": "mx-server-rl:8001",
+  "slice_ownerships_returned": false
+}

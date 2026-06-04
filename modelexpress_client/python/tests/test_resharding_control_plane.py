@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import torch
+
 from modelexpress import p2p_pb2
 from modelexpress.metadata.source_id import compute_mx_source_id
 from modelexpress.refit_poc import (
@@ -16,6 +18,7 @@ from modelexpress.refit_poc import (
     refit_source_identity,
 )
 from modelexpress.refit_poc_artifacts import artifact_base, build_planner_artifacts
+from modelexpress.refit_trainer_step import publish_trainer_step_source
 from modelexpress.types import TensorDescriptor
 from modelexpress.resharding import SliceOwnership, SliceRequest
 from modelexpress.resharding_control_plane import (
@@ -243,6 +246,71 @@ def test_publish_list_get_status_and_plan_from_mx_metadata():
     assert [plan.bytes for plan in plans] == [16, 48]
     assert plans[0].target_range == ((2, 3), (0, 4))
     assert plans[1].target_range == ((3, 6), (0, 4))
+
+
+def test_trainer_step_publications_roundtrip_through_mx_metadata():
+    client = InMemoryMxClient()
+    identity = _identity()
+    source_publications = [
+        publish_trainer_step_source(
+            ownership,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            step_count=2,
+            learning_rate=0.25,
+        )
+        for ownership in _ownerships()
+    ]
+
+    source_id = None
+    for publication in source_publications:
+        ownership = publication.ownership
+        source_id = publish_slice_ownerships(
+            client,
+            identity=identity,
+            ownerships=[ownership],
+            worker_id=ownership.worker_id,
+            worker_rank=ownership.worker_rank,
+        )
+        assert client.update_status(
+            source_id,
+            ownership.worker_id,
+            ownership.worker_rank,
+            p2p_pb2.SOURCE_STATUS_READY,
+        )
+
+    discovered = list_slice_ownerships(client, identity=identity)
+    assert [owner.source_id for owner in discovered] == [
+        "trainer-rank0",
+        "trainer-rank1",
+    ]
+    assert all(
+        owner.layout_tags["trainer_update_source"] == "torch.optim.SGD-step-publisher"
+        for owner in discovered
+    )
+    assert all(owner.layout_tags["optimizer_step_count"] == 2 for owner in discovered)
+    assert all(
+        owner.layout_tags["optimizer_step_publisher"] is True for owner in discovered
+    )
+    assert all(owner.source_lease for owner in discovered)
+    assert all(owner.nixl_descriptor_id for owner in discovered)
+
+    plans = plan_from_mx_metadata(
+        client,
+        identity=identity,
+        requests=[_request()],
+    )
+    assert [plan.source_id for plan in plans] == ["trainer-rank0", "trainer-rank1"]
+    assert [plan.lease_version for plan in plans] == [
+        discovered[0].source_lease,
+        discovered[1].source_lease,
+    ]
+    assert (
+        source_publications[0].to_artifact_metadata()["ownership"]["layout_tags"][
+            "optimizer_step_publisher"
+        ]
+        is True
+    )
 
 
 def test_publish_and_plan_refit_nixl_endpoints_from_mx_metadata():

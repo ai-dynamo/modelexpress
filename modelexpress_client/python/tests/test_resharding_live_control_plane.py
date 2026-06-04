@@ -9,9 +9,11 @@ import uuid
 
 import grpc
 import pytest
+import torch
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
+from modelexpress.refit_trainer_step import publish_trainer_step_source
 from modelexpress.resharding import SliceOwnership, SliceRequest
 from modelexpress.resharding_control_plane import (
     build_refit_source_identity,
@@ -19,7 +21,6 @@ from modelexpress.resharding_control_plane import (
     plan_from_mx_metadata,
     publish_slice_ownerships,
 )
-
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("MX_LIVE_SERVER_URL"),
@@ -79,8 +80,7 @@ def test_live_mx_server_slice_ownership_lifecycle():
 
         discovered = list_slice_ownerships(client, identity=identity)
         assert {
-            tuple(axis for axis in ownership.source_range)
-            for ownership in discovered
+            tuple(axis for axis in ownership.source_range) for ownership in discovered
         } == {
             ((0, 3), (0, 4)),
             ((3, 8), (0, 4)),
@@ -101,6 +101,87 @@ def test_live_mx_server_slice_ownership_lifecycle():
         assert plan_by_source["trainer-rank1"].bytes == 48
         assert plan_by_source["trainer-rank0"].target_range == ((2, 3), (0, 4))
         assert plan_by_source["trainer-rank1"].target_range == ((3, 6), (0, 4))
+    finally:
+        client.close()
+
+
+def test_live_mx_server_trainer_step_publication_lifecycle():
+    server_url = os.environ["MX_LIVE_SERVER_URL"]
+    model_version = f"trainer-step-publication-{uuid.uuid4().hex}"
+    identity = build_refit_source_identity(
+        model_name=MODEL_NAME,
+        model_version=model_version,
+        dtype="float32",
+        trainer_framework="synthetic-fsdp",
+        trainer_layout="fsdp",
+    )
+    client = MxClient(server_url=server_url)
+    try:
+        _wait_for_server(client)
+        publications = [
+            publish_trainer_step_source(
+                ownership,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+                step_count=2,
+                learning_rate=0.25,
+            )
+            for ownership in _ownerships(model_version)
+        ]
+
+        source_ids = []
+        for publication in publications:
+            ownership = publication.ownership
+            source_id = publish_slice_ownerships(
+                client,
+                identity=identity,
+                ownerships=[ownership],
+                worker_id=ownership.worker_id,
+                worker_rank=ownership.worker_rank,
+            )
+            source_ids.append(source_id)
+            response = client.get_metadata(source_id, ownership.worker_id)
+            assert response.found
+            if (
+                not response.worker.slice_ownerships
+                and not response.worker.metadata_endpoint
+            ):
+                pytest.skip(
+                    "live MX server dropped slice ownership metadata and legacy sidecar"
+                )
+            if response.worker.metadata_endpoint:
+                assert response.worker.metadata_endpoint.startswith(
+                    "mx-refit-ownership-v1:"
+                )
+            assert client.update_status(
+                source_id,
+                ownership.worker_id,
+                ownership.worker_rank,
+                p2p_pb2.SOURCE_STATUS_READY,
+            )
+        assert len(set(source_ids)) == 1
+
+        discovered = list_slice_ownerships(client, identity=identity)
+        assert {ownership.source_id for ownership in discovered} == {
+            "trainer-rank0",
+            "trainer-rank1",
+        }
+        assert all(
+            ownership.layout_tags["optimizer_step_publisher"] is True
+            for ownership in discovered
+        )
+        assert all(ownership.source_lease for ownership in discovered)
+        assert all(ownership.nixl_descriptor_id for ownership in discovered)
+
+        plans = plan_from_mx_metadata(
+            client,
+            identity=identity,
+            requests=[_request(model_version)],
+        )
+        plan_by_source = {plan.source_id: plan for plan in plans}
+        assert set(plan_by_source) == {"trainer-rank0", "trainer-rank1"}
+        assert plan_by_source["trainer-rank0"].lease_version
+        assert plan_by_source["trainer-rank1"].lease_version
     finally:
         client.close()
 

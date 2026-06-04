@@ -1,0 +1,19 @@
+{
+  "autoscaler_message": "pod did not trigger scale-up: 1 max node group size reached",
+  "block_type": "nscale-1gpu-capacity",
+  "blocked": true,
+  "live_gpu_runtime_rerun_possible": false,
+  "local_session_date": "2026-06-05",
+  "log_artifact": "nscale-1gpu-capacity-probe-block-20260605.log",
+  "log_excerpt": [
+    "Warning FailedScheduling 0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+    "Normal NotTriggerScaleUp pod didn't trigger scale-up: 1 max node group size reached"
+  ],
+  "namespace": "anish-dynamo",
+  "pod": "mx-gpu-capacity-probe-20260605-010957",
+  "purpose": "Check whether live vLLM/SGLang trainer-step runtime rerun can schedule.",
+  "requested_gpus": 1,
+  "result": "blocked",
+  "scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+  "schema_version": 1
+}

@@ -322,12 +322,27 @@ Files:
   NIXL descriptor identity, and source-update provenance together, and the
   vLLM/SGLang source-rank paths now emit `source_publication` metadata (`15
   passed`). This is code-path evidence only; it is not a live GPU runtime rerun.
+- `nscale-trainer-step-mx-publication-smoke-20260605.json` and
+  `nscale-trainer-step-mx-publication-pytest-20260605.log`: nscale CPU/control
+  plane evidence that trainer-step source publications can be published through
+  the MX metadata client path, listed back as `SliceOwnership`s, and used for
+  receiver-side `SegmentPlan`s. The focused gate records `7 passed, 1 skipped`;
+  the skip is the current live `mx-server-rl` compatibility block below.
+- `nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json` and
+  `.log`: honest live-server compatibility block. `mx-server-rl:8001` accepted
+  `PublishMetadata` but `GetMetadata` returned only status and dropped both the
+  new `slice_ownerships` field and the legacy sidecar, so this deployed server
+  cannot prove trainer-step publication round-trip for the current client path.
 - `nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json` and
   `.log`: honest block for the attempted live vLLM+NIXL runtime GPU rerun using
   the optimizer-step source publisher patch. The 1-GPU pod stayed Pending with
   `0/29 nodes`, `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and
   autoscaler max node group size reached, so no new vLLM GPU runtime claim is
   made.
+- `nscale-1gpu-capacity-probe-block-20260605.json` and `.log`: fresh 1-GPU
+  nscale capacity probe for the next live runtime rerun. It hit the same
+  scheduler/autoscaler block, so no GPU runtime rerun was attempted in that
+  pass.
 - `nscale-sglang-receiver-smoke.json` and
   `nscale-sglang-receiver-smoke.log`: SGLang-shaped module-owned receiver smoke
   using `modelexpress.refit_sglang_receiver_smoke`. It builds an SGLang
@@ -396,9 +411,10 @@ hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
 claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
 artifacts, but both committed GPU artifacts remain one-pod/GPU-reuse proofs
 with deterministic trainer-like source values and staging-copy runtime APIs.
-The current branch has CPU-tested optimizer-step source-publisher and
-source-publication metadata code for the runtime bridges, with a live vLLM GPU
-rerun capacity-blocked on 2026-06-05. The
+The current branch has CPU-tested optimizer-step source-publisher,
+source-publication metadata, and MX metadata publication code for the runtime
+bridges, with live vLLM GPU reruns capacity-blocked on 2026-06-05 and the
+current live `mx-server-rl` blocked by metadata-drop compatibility. The
 NCCL distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 normalizer/baseline harness now exists, but real Level-5 timing remains unproven
