@@ -113,6 +113,13 @@ Artifacts under `artifacts/resharding/` prove:
 - `modelexpress.refit_poc --mode nixl-distributed --control-plane live-mx`
   now publishes source-rank ownerships through MX and has the target rank plan
   NIXL reads from MX-returned metadata.
+- A completed 4-rank/4-B200 live-MX NIXL run on nscale proves that
+  MX-returned slice ownership metadata drives the NIXL refit POC:
+  `artifacts/resharding/nscale-live-mx-nixl-refit.json`. The run used source
+  publications through a live Redis-backed central MX server, target-side
+  planning from returned metadata, actual one-sided NIXL reads into planned
+  target offsets, and segment-level replan from an alternate holder after a
+  failed source segment.
 - A Qwen-style MoE manifest extractor now classifies expert-axis tensors,
   layout-sensitive shared-expert tensors, global quantization metadata, and
   generated-on-target tensors from tensor names/shapes.
@@ -151,18 +158,16 @@ Artifacts under `artifacts/resharding/` prove:
   requested slice once across the trainer/inference boundary and is preferred
   under the declared assumptions.
 
-This is a **Level 2 same-node synthetic proof**, not a production refit
-implementation. Level 3 control-plane metadata lifecycle support is now proven
-through a live central MX server smoke, and the live-MX NIXL planning path is
-implemented. The live-MX NIXL GPU run is not yet proven because nscale had no
-schedulable GPU capacity during the attempt.
+This is a **Level 3 same-node synthetic proof**, not a production refit
+implementation. Level 3 control-plane metadata lifecycle support is proven
+through a live central MX server smoke, and live MX-returned metadata now drives
+a completed same-node NIXL GPU data-plane run. Multi-pod, cross-node, and real
+runtime-owned trainer/inference refit are still unproven.
 
 ## What Is Not Proven Yet
 
 The current POC does **not** prove:
 
-- Completed GPU run where live MX-returned slice ownership metadata drives the
-  NIXL refit POC.
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
   post-load/refit lifecycle.
@@ -237,8 +242,8 @@ Acceptance evidence:
 
 ### Level 3: MX Control Plane Integration
 
-Status: partially implemented; live metadata lifecycle proven; live-MX NIXL
-planning path implemented but not GPU-verified.
+Status: implemented for same-node synthetic live-MX NIXL refit; production
+runtime and multi-pod integration remain pending.
 
 Goal:
 
@@ -267,7 +272,13 @@ Current evidence:
   `artifacts/resharding/nscale-live-control-plane.log` (`1 passed`).
 - `modelexpress.refit_poc` live-MX NIXL path:
   `--mode nixl-distributed --control-plane live-mx`.
-- GPU verification attempted on nscale but capacity blocked:
+- Completed live-MX NIXL nscale GPU run:
+  `artifacts/resharding/nscale-live-mx-nixl-refit.json`.
+- Full proof log:
+  `artifacts/resharding/nscale-live-mx-nixl-refit.log`.
+- Live central-server log from that proof:
+  `artifacts/resharding/nscale-live-mx-nixl-server.log`.
+- Earlier capacity-blocked attempt, superseded by the completed run:
   `artifacts/resharding/nscale-live-mx-nixl-capacity.log`.
 - Qwen MoE manifest extractor in `modelexpress.resharding_manifest`.
 - Real Qwen3-30B-A3B safetensors-header coverage artifact:
@@ -279,10 +290,9 @@ Current evidence:
 
 Remaining gap:
 
-- Rerun the live-MX NIXL path on nscale when GPU capacity is available and emit
-  the completed JSON artifact. Prefer the normal 4-rank/4-GPU run; an explicit
-  `MX_REFIT_ALLOW_GPU_REUSE=1` fallback exists only for capacity-constrained
-  smoke testing.
+- Run the live-MX NIXL path across multiple pods/nodes with distinct source,
+  target, and alternate-holder processes, then repeat the proof against real
+  trainer-owned and runtime-owned tensors.
 
 ### Level 4: Real Runtime Refit
 
@@ -352,19 +362,17 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Rerun `refit_poc.py --mode nixl-distributed --control-plane live-mx` on
-   nscale when GPU capacity is available and save the completed JSON artifact.
-2. Add a multi-pod nscale test: two source pods, one target pod, one alternate
+1. Add a multi-pod nscale test: two source pods, one target pod, one alternate
    source pod.
-3. Promote the receiver tensor install smoke into live vLLM and SGLang process
+2. Promote the receiver tensor install smoke into live vLLM and SGLang process
    integration with each engine's post-load/refit lifecycle.
-4. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
+3. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
    the cold-load path is stable.
-5. Implement the actual quantized Qwen fallback install path after
+4. Implement the actual quantized Qwen fallback install path after
    `GLOBAL_REQUIRED` metadata is detected.
-6. Add an nscale fanout microbenchmark for rollout replicas using the simulator
+5. Add an nscale fanout microbenchmark for rollout replicas using the simulator
    scenario as the shape contract.
-7. Run a first competitive timing table against a baseline all-gather/cat path
+6. Run a first competitive timing table against a baseline all-gather/cat path
    and a direct NCCL P2P path.
 
 ## Current Claim We Can Safely Make
@@ -375,12 +383,13 @@ Safe claim:
 > ownership plus receiver-side slice requests can drive multi-source GPU
 > assembly, same-node NIXL one-sided segment reads, and segment-level recovery
 > without trainer full all-gather. The same slice ownership metadata now
-> round-trips through a live Redis-backed central MX server on nscale and can be
-> used by the target planner. The metadata side also covers real Qwen3 MoE and
-> Qwen3 FP8 safetensors headers, including real global-required quantization
-> metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes.
-> A CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard,
-> and CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
+> round-trips through a live Redis-backed central MX server on nscale and has
+> driven a completed 4-B200 live-MX NIXL refit POC where the target plans from
+> MX-returned metadata. The metadata side also covers real Qwen3 MoE and Qwen3
+> FP8 safetensors headers, including real global-required quantization metadata,
+> plus CPU runtime-shaped vLLM/SGLang target tensor install smokes. A CPU
+> competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
+> CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
 > scenario.
 
 Unsafe claim:

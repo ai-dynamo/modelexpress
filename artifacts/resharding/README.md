@@ -45,10 +45,20 @@ Files:
   `PublishMetadata`, serves `GetMetadata`, accepts `UpdateStatus`, returns READY
   workers through `ListSources`, and lets the target planner build a multi-source
   `SegmentPlan`.
-- `nscale-live-mx-nixl-capacity.log`: attempted live-MX NIXL GPU verification.
-  The code path is implemented, but nscale could not schedule 4-, 2-, or 1-GPU
-  pods during this run (`Insufficient nvidia.com/gpu`; autoscaler max size
-  reached).
+- `nscale-live-mx-nixl-refit.json`: completed 4-rank/4-B200 live-MX NIXL proof.
+  Source ranks publish slice ownerships through a live Redis-backed central MX
+  server, the target rank plans from MX-returned metadata, actual NIXL READs
+  land at planned target offsets, and a failed source segment is replanned from
+  an alternate holder.
+- `nscale-live-mx-nixl-refit.log`: full torchrun log for the completed live-MX
+  NIXL GPU proof, including CUDA inventory, NIXL setup, source publications,
+  target metadata query, and emitted JSON artifact.
+- `nscale-live-mx-nixl-server.log`: live Rust server log from the completed
+  live-MX NIXL GPU proof.
+- `nscale-live-mx-nixl-capacity.log`: earlier attempted live-MX NIXL GPU
+  verification that was capacity-blocked (`Insufficient nvidia.com/gpu`;
+  autoscaler max size reached). It is superseded by
+  `nscale-live-mx-nixl-refit.json`.
 - `qwen3-30b-a3b-moe-manifest.json.gz` and
   `qwen3-30b-a3b-moe-manifest.summary.json`: real Qwen/Qwen3-30B-A3B
   safetensors-header coverage artifact generated through HTTP range reads over
@@ -67,5 +77,6 @@ Files:
   quantization metadata, generated-on-target tensors, and layout-sensitive
   shared-expert tensors.
 
-The NIXL JSON is the primary Level 2 proof artifact. The NCCL distributed JSON
-remains the Level 1 comparison artifact.
+The NIXL JSON is the primary Level 2 proof artifact. The live-MX NIXL JSON is
+the primary Level 3 same-node proof artifact. The NCCL distributed JSON remains
+the Level 1 comparison artifact.

@@ -70,9 +70,13 @@ metadata returned by MX-client-shaped APIs. The live central-server lifecycle is
 covered by the nscale Redis-backed smoke in
 `artifacts/resharding/nscale-live-control-plane.log`. The NIXL POC now has a
 `--control-plane live-mx` path that publishes source-rank ownerships through MX
-and plans target reads from returned READY metadata. GPU verification of that
-path still needs a schedulable nscale GPU slot; the failed scheduling attempt is
-recorded in `artifacts/resharding/nscale-live-mx-nixl-capacity.log`.
+and plans target reads from returned READY metadata. The completed nscale
+same-node 4-B200 proof is
+`artifacts/resharding/nscale-live-mx-nixl-refit.json`, with the full torchrun
+log in `artifacts/resharding/nscale-live-mx-nixl-refit.log` and live server log
+in `artifacts/resharding/nscale-live-mx-nixl-server.log`. The earlier
+capacity-blocked attempt remains recorded in
+`artifacts/resharding/nscale-live-mx-nixl-capacity.log`.
 
 Qwen-style MoE manifest classification lives in
 `modelexpress.resharding_manifest`. It emits tensor family,
@@ -143,15 +147,16 @@ The current POC artifacts are stored under `artifacts/resharding/`. The primary
 Level 2 proof artifact is `nscale-nixl-distributed-refit.json`, with the full
 pod log in `nscale-nixl-gpu-refit.log` and the machine-readable completion
 audit in `completion-audit.json`. It proves same-node cross-GPU NIXL READs into
-planned target offsets; multi-pod cross-node refit and live MX metadata driving
-the NIXL data plane in a completed GPU run are still future gates. The partial
-Level 3 control-plane evidence is in `nscale-control-plane-pytest.log`,
-`docker-rust-p2p-tests.log`, `nscale-live-control-plane.log`, and
-`nscale-live-mx-nixl-capacity.log`. Qwen BF16/FP8 safetensors-header extraction,
+planned target offsets. The primary Level 3 same-node proof is
+`nscale-live-mx-nixl-refit.json`: live MX-returned slice ownership metadata
+drives the NIXL data plane in a completed GPU run. Multi-pod cross-node refit
+and real runtime-owned refit are still future gates. The Level 3 control-plane
+evidence is in `nscale-control-plane-pytest.log`, `docker-rust-p2p-tests.log`,
+`nscale-live-control-plane.log`, `nscale-live-mx-nixl-refit.log`, and
+`nscale-live-mx-nixl-server.log`. Qwen BF16/FP8 safetensors-header extraction,
 real FP8 zero-copy fallback, and receiver-side runtime tensor install smokes
-are covered by
-`nscale-python-full-pytest.log`. The partial Level 5 simulator evidence is
-`competitive-refit-simulation.json`.
+are covered by `nscale-python-full-pytest.log`. The partial Level 5 simulator
+evidence is `competitive-refit-simulation.json`.
 
 ## Metrics
 
