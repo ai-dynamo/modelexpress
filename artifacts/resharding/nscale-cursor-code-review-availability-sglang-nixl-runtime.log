@@ -1,0 +1,5 @@
+cursor-code-review availability check for SGLang NIXL runtime bridge
+Thu Jun  4 21:35:18 UTC 2026
+PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+command -v cursor-code-review:
+search /workspace and /root:

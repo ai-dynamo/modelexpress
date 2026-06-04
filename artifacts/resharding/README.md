@@ -313,6 +313,27 @@ Files:
   `sglang_engine_update_weights_from_tensor_used=true`,
   `actual_nixl_reads_used=false`, and
   `synthetic_trainer_payloads_used=true`.
+- `nscale-live-sglang-nixl-runtime-refit-smoke-20260604.json` and `.log`:
+  completed same-node, one-pod, 3-rank SGLang+NIXL runtime bridge proof on
+  nscale. Source ranks own CUDA trainer-like shard tensors, the target rank
+  starts a live SGLang `Engine`, builds the receiver request from
+  `lm_head.weight`, reads two UCX/NIXL source segments into a CUDA staging
+  tensor, installs the assembled tensor through
+  `Engine.update_weights_from_tensor`, validates staging allclose, runtime
+  allclose, checksum match, and restores the original weight. The artifact
+  records `actual_nixl_reads_used=true`, `real_runtime_engine_used=true`,
+  `source_rank_owned_trainer_tensors_used=true`, 16,384 trainer-to-inference
+  bytes, about 1.24 ms raw NIXL read duration, and about 28.0 ms activation
+  install duration. Scope boundary: this is same-node/one-pod evidence with
+  GPU reuse; it is not cross-node, not direct NIXL landing into SGLang-owned
+  storage, and not a live trainer optimizer loop. The paired block logs
+  `nscale-live-sglang-nixl-runtime-refit-smoke-20260604-outer-dist-before-sglang-block.log`
+  and `nscale-live-sglang-nixl-runtime-refit-smoke-20260604-old-runner-copy-block.log`
+  capture earlier SGLang startup-order hangs before the target-first runtime
+  startup fix.
+- `nscale-python-full-pytest-sglang-nixl-runtime-20260604.log`: full nscale
+  Python verification after adding the SGLang+NIXL runtime bridge (`311 passed,
+  19 skipped`).
 - `nscale-cursor-code-review-availability-vllm-smoke.log`: nscale availability
   check for `cursor-code-review`. The command was not found in the pod PATH or
   searched nscale directories, so review was not run rather than using the local

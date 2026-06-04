@@ -438,7 +438,7 @@ Remaining gap:
 
 ### Level 4: Real Runtime Refit
 
-Status: not implemented; CPU receiver-install plus tiny live vLLM/SGLang engine smokes implemented.
+Status: partially implemented; CPU receiver-install, tiny live vLLM/SGLang engine smokes, and a same-node SGLang+NIXL runtime bridge are implemented.
 
 Goal:
 
@@ -508,6 +508,30 @@ Current partial evidence:
   checksum/allclose through SGLang, and restores the original weight. This is
   live SGLang engine-owned weight evidence, not real trainer/NIXL data-plane
   evidence.
+- `modelexpress.refit_sglang_nixl_runtime_smoke` now bridges the proven
+  NIXL segment-read data plane into the live SGLang Engine update path. The
+  nscale artifact
+  `artifacts/resharding/nscale-live-sglang-nixl-runtime-refit-smoke-20260604.json`
+  and `.log` prove a same-node, one-pod, 3-rank run on one GPU with explicit
+  GPU reuse: source ranks 0/1 own CUDA trainer-like shard tensors, target rank
+  2 starts a live SGLang `Engine`, builds a receiver-side `SliceRequest` from
+  `lm_head.weight`, reads 16,384 bytes from the two source ranks over UCX/NIXL
+  into a preallocated CUDA staging tensor, installs that assembled tensor via
+  `Engine.update_weights_from_tensor`, validates NIXL staging allclose, runtime
+  allclose, checksum match, and restores the original weight. The artifact
+  records `actual_nixl_reads_used=true`, `real_runtime_engine_used=true`,
+  `source_rank_owned_trainer_tensors_used=true`,
+  `nixl_reads_land_directly_in_runtime_tensor=false`, and
+  `real_training_loop_used=false`. This is real NIXL-to-live-SGLang runtime
+  evidence, but it is not cross-node, not direct zero-copy into SGLang-owned
+  storage, and not a live trainer/optimizer loop. The block logs
+  `nscale-live-sglang-nixl-runtime-refit-smoke-20260604-outer-dist-before-sglang-block.log`
+  and `nscale-live-sglang-nixl-runtime-refit-smoke-20260604-old-runner-copy-block.log`
+  bank the earlier SGLang startup-order hangs that were fixed by starting
+  SGLang before the outer Gloo process group on the target rank. The matching
+  nscale Python gate is
+  `artifacts/resharding/nscale-python-full-pytest-sglang-nixl-runtime-20260604.log`
+  (`311 passed, 19 skipped`).
 - SGLang runtime availability is now separately banked.
   `artifacts/resharding/nscale-sglang-runtime-import-probe.json` verifies
   `torch`, `sglang`, and `sglang.srt` import in the nscale SGLang runtime
