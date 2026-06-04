@@ -1,0 +1,44 @@
+{
+  "actual_nixl_reads_used": true,
+  "allclose": true,
+  "checksum": 1.3098182687131505e+24,
+  "cross_node_pods": true,
+  "expected_checksum": 1.3098182687131505e+24,
+  "hard_pod_kill_inflight_nixl_read_proven": true,
+  "max_abs_error": 0.0,
+  "mode": "nixl-crossnode-hard-kill-inflight-recovery",
+  "one_nixl_agent_per_source_rank": true,
+  "payload_columns": 67108864,
+  "post_submit_marker_bytes": 268435456,
+  "post_submit_marker_seen": true,
+  "post_submit_marker_source_id": "trainer-rank0",
+  "raw_nixl_read_duration_ms": 75069.50956501532,
+  "read_failure_count": 1,
+  "read_failure_recovery_used": true,
+  "read_failure_source_ids": [
+    "trainer-rank0"
+  ],
+  "read_failure_sources_excluded_from_successful_reads": true,
+  "read_source_ids": [
+    "trainer-rank1",
+    "trainer-rank2-alt"
+  ],
+  "replanned_only_failed_segments": true,
+  "result": "pass",
+  "run_id": "hardkillgpu2-20260604-190228",
+  "runtime_recovery_segment_count": 1,
+  "schema_version": 1,
+  "source_artifacts": [
+    "nscale-hard-kill-gpu-inflight-recovery-source-rank1.json",
+    "nscale-hard-kill-gpu-inflight-recovery-source-rank2-alt.json"
+  ],
+  "source_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+  "source_rank0_force_deleted_after_marker": true,
+  "summary_log_artifact": "nscale-hard-kill-gpu-inflight-recovery-summary.log",
+  "target_artifact": "nscale-hard-kill-gpu-inflight-recovery-target.json",
+  "target_log_artifact": "nscale-hard-kill-gpu-inflight-recovery-target.log",
+  "target_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+  "trainer_to_inference_bytes": 1073741824,
+  "ucx_net_devices": "mlx5_10:1",
+  "ucx_tls": "rc_x,rc,tcp,cuda_copy"
+}

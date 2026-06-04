@@ -1,0 +1,52 @@
+{
+  "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt",
+  "cuda_device": 0,
+  "gpu_reuse_used": false,
+  "metrics": {
+    "nixl_metadata_duration_ms": 0.012589036487042904,
+    "nixl_registration_duration_ms": 3.800121950916946,
+    "publish_duration_ms": 19.116910989396274
+  },
+  "mode": "nixl-crossnode-source",
+  "nixl_backends": [
+    "UCX"
+  ],
+  "node_name": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+  "payload_columns": 67108864,
+  "pod_name": "mx-hardkill-src2-hardkillgpu2-20260604-190228",
+  "result": "source-ready",
+  "role": "source",
+  "run_id": "hardkillgpu2-20260604-190228",
+  "schema_version": 1,
+  "single_source_ownership_mode": true,
+  "source_filter": {
+    "source_id": "trainer-rank2-alt",
+    "source_worker_rank": 2
+  },
+  "source_ownership_count": 1,
+  "source_publications": [
+    {
+      "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt",
+      "metadata_bytes": 445,
+      "mx_source_id": "c084a826bb080948",
+      "publish_duration_ms": 19.116910989396274,
+      "source_id": "trainer-rank2-alt",
+      "tensor_addr": 123926113943552,
+      "tensor_bytes": 805306368,
+      "tensor_device_id": 0,
+      "worker_id": "rank2",
+      "worker_rank": 2
+    }
+  ],
+  "ucx": {
+    "MX_NIXL_BACKEND": "UCX",
+    "MX_RDMA_NIC_PIN": "auto",
+    "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "",
+    "UCX_IB_DEVICES": "",
+    "UCX_MAX_RNDV_RAILS": "",
+    "UCX_NET_DEVICES": "mlx5_5:1",
+    "UCX_RNDV_SCHEME": "get_zcopy",
+    "UCX_RNDV_THRESH": "0",
+    "UCX_TLS": "rc_x,rc,tcp,cuda_copy"
+  }
+}

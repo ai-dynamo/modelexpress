@@ -1,0 +1,1009 @@
+{
+  "control_plane": {
+    "metadata_query_duration_ms": 22.68285700120032,
+    "mode": "live-mx-cross-node",
+    "planner_duration_ms": 0.21555495914071798,
+    "server_url": "mx-server-rl:8001",
+    "source_endpoints_from_control_plane": [
+      {
+        "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank0",
+        "metadata_bytes": 441,
+        "metadata_endpoint": "",
+        "mx_source_id": "c084a826bb080948",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": null,
+          "global_shape": [
+            8,
+            67108864
+          ],
+          "layout_tags": {
+            "moe_expert_axis": 0,
+            "storage_layout": "row-major",
+            "tp": 1,
+            "trainer_layout": "fsdp"
+          },
+          "model_name": "qwen3-moe-refit-poc",
+          "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+          "nixl_descriptor_id": "nixl-rank0-primary",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank0",
+          "source_lease": "lease-rank0-primary",
+          "source_range": [
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              67108864
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+          "worker_id": "rank0",
+          "worker_rank": 0
+        },
+        "source_id": "trainer-rank0",
+        "status": 2,
+        "tensor": {
+          "addr": 131126291070976,
+          "device_id": 0,
+          "dtype": "float32",
+          "name": "model.layers.0.mlp.experts.w1.weight",
+          "size": 805306368
+        },
+        "updated_at": 1780599763511,
+        "worker_grpc_endpoint": "",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank1",
+        "metadata_bytes": 441,
+        "metadata_endpoint": "",
+        "mx_source_id": "c084a826bb080948",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": null,
+          "global_shape": [
+            8,
+            67108864
+          ],
+          "layout_tags": {
+            "moe_expert_axis": 0,
+            "storage_layout": "row-major",
+            "tp": 1,
+            "trainer_layout": "fsdp"
+          },
+          "model_name": "qwen3-moe-refit-poc",
+          "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+          "nixl_descriptor_id": "nixl-rank1-primary",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank1",
+          "source_lease": "lease-rank1-primary",
+          "source_range": [
+            [
+              3,
+              8
+            ],
+            [
+              0,
+              67108864
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+          "worker_id": "rank1",
+          "worker_rank": 1
+        },
+        "source_id": "trainer-rank1",
+        "status": 2,
+        "tensor": {
+          "addr": 136998182453248,
+          "device_id": 0,
+          "dtype": "float32",
+          "name": "model.layers.0.mlp.experts.w1.weight",
+          "size": 1342177280
+        },
+        "updated_at": 1780599765053,
+        "worker_grpc_endpoint": "",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      },
+      {
+        "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt",
+        "metadata_bytes": 445,
+        "metadata_endpoint": "",
+        "mx_source_id": "c084a826bb080948",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": null,
+          "global_shape": [
+            8,
+            67108864
+          ],
+          "layout_tags": {
+            "moe_expert_axis": 0,
+            "storage_layout": "row-major",
+            "tp": 1,
+            "trainer_layout": "fsdp-replica"
+          },
+          "model_name": "qwen3-moe-refit-poc",
+          "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+          "nixl_descriptor_id": "nixl-rank2-alt",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank2-alt",
+          "source_lease": "lease-rank2-alt",
+          "source_range": [
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              67108864
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+          "worker_id": "rank2",
+          "worker_rank": 2
+        },
+        "source_id": "trainer-rank2-alt",
+        "status": 2,
+        "tensor": {
+          "addr": 123926113943552,
+          "device_id": 0,
+          "dtype": "float32",
+          "name": "model.layers.0.mlp.experts.w1.weight",
+          "size": 805306368
+        },
+        "updated_at": 1780599765115,
+        "worker_grpc_endpoint": "",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "source_statuses_by_id": {
+      "trainer-rank0": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780599763511
+      },
+      "trainer-rank1": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780599765053
+      },
+      "trainer-rank2-alt": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780599765115
+      }
+    }
+  },
+  "distributed": {
+    "backend": "nixl-read+mx-endpoint-control+no-torch-distributed",
+    "cross_node": true,
+    "discovered_source_agent_names_by_source_id": {
+      "trainer-rank0": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank0",
+      "trainer-rank1": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank1",
+      "trainer-rank2-alt": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt"
+    },
+    "discovered_source_ids": [
+      "trainer-rank0",
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "gpu_reuse_used": false,
+    "payload_columns": 67108864,
+    "readable_source_ids": [
+      "trainer-rank0",
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "source_agent_names_by_source_id": {
+      "trainer-rank0": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank0",
+      "trainer-rank1": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank1",
+      "trainer-rank2-alt": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt"
+    },
+    "source_ids": [
+      "trainer-rank0",
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "source_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+    "source_pod": "mx-hardkill-src0-hardkillgpu2-20260604-190228,mx-hardkill-src1-hardkillgpu2-20260604-190228,mx-hardkill-src2-hardkillgpu2-20260604-190228",
+    "source_roles_in_source_pod": [
+      "trainer-rank0",
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "target_agent_name": "mx-crossnode-target-hardkillgpu2-20260604-190228",
+    "target_node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+    "target_pod": "mx-hardkill-target-hardkillgpu2-20260604-190228",
+    "world_size": 4
+  },
+  "gpu_count": 4,
+  "metadata_smokes": {
+    "cross_framework_compatible_requests": {
+      "frameworks": [
+        "vllm",
+        "sglang"
+      ],
+      "passed": true,
+      "same_source_publication": true
+    },
+    "qwen_moe_expert_axis": {
+      "passed": true,
+      "sglang_segment_count": 2,
+      "source_ids": [
+        "moe-source-0",
+        "moe-source-1"
+      ],
+      "vllm_segment_count": 2
+    },
+    "tensor_family_classification": {
+      "model.layers.0.mlp.experts.w1.weight": "moe-expert-axis-shard",
+      "model.layers.0.mlp.experts.w1.weight_scale_inv": "quantization-global-required-fallback",
+      "model.rotary_emb.inv_freq": "generated-on-target"
+    }
+  },
+  "metrics": {
+    "activation_install_duration_ms": 0.0,
+    "discovered_source_endpoint_count": 3,
+    "failed_source_count": 0,
+    "gpu_copy_duration_ms": 0.0,
+    "inference_side_fanout_bytes": 0,
+    "metadata_query_duration_ms": 22.68285700120032,
+    "nixl_add_remote_agent_duration_ms": 12.734635965898633,
+    "nixl_prep_duration_ms": 0.16674993094056845,
+    "nixl_read_group_count": 2,
+    "nixl_registration_duration_ms": 9.136634063906968,
+    "planner_duration_ms": 0.21555495914071798,
+    "publish_duration_ms": 0.0,
+    "raw_nixl_read_duration_ms": 75069.50956501532,
+    "read_failure_count": 1,
+    "readable_source_endpoint_count": 3,
+    "recovery_segment_count": 0,
+    "rediscovery_count": 0,
+    "redundant_cross_boundary_factor": 1.0,
+    "registration_duration_ms": 0.0,
+    "retry_count": 0,
+    "runtime_recovery_segment_count": 1,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "inference-crossnode-target": 2
+    },
+    "stale_source_count": 0,
+    "successful_nixl_source_count": 2,
+    "trainer_to_inference_bytes": 1073741824
+  },
+  "mode": "nixl-crossnode-one-pod-per-source-rank",
+  "model_name": "qwen3-moe-refit-poc",
+  "model_version": "trainer-step-000001",
+  "nixl": {
+    "add_remote_agent_duration_ms": {
+      "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank0": 2.453887020237744,
+      "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank1": 2.7377429651096463,
+      "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt": 7.543005980551243
+    },
+    "nixl_backends": [
+      "UCX"
+    ],
+    "primary_reads": [
+      {
+        "backend": "UCX",
+        "bytes": 805306368,
+        "prep_duration_ms": 0.12129498645663261,
+        "read_duration_ms": 30.587834073230624,
+        "segment_count": 1,
+        "segments": [
+          {
+            "bytes": 805306368,
+            "lease_version": "lease-rank1-primary",
+            "nixl_descriptor_id": "nixl-rank1-primary",
+            "retry_policy": "replan-from-alternate-holder",
+            "source_byte_offset": 0,
+            "source_id": "trainer-rank1",
+            "source_range": [
+              [
+                3,
+                6
+              ],
+              [
+                0,
+                67108864
+              ]
+            ],
+            "target_byte_offset": 268435456,
+            "target_id": "inference-crossnode-target",
+            "target_range": [
+              [
+                3,
+                6
+              ],
+              [
+                0,
+                67108864
+              ]
+            ],
+            "target_runtime": "vllm",
+            "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+            "worker_id": "rank1",
+            "worker_rank": 1
+          }
+        ],
+        "source_id": "trainer-rank1",
+        "source_rank": 1,
+        "telemetry": null
+      }
+    ],
+    "read_failures": [
+      {
+        "error": "NIXL_ERR_REMOTE_DISCONNECT",
+        "segment_count": 1,
+        "source_id": "trainer-rank0",
+        "target_ranges": [
+          [
+            [
+              2,
+              3
+            ],
+            [
+              0,
+              67108864
+            ]
+          ]
+        ]
+      }
+    ],
+    "recovery_reads": [
+      {
+        "backend": "UCX",
+        "bytes": 268435456,
+        "prep_duration_ms": 0.04545494448393583,
+        "read_duration_ms": 11.012163013219833,
+        "segment_count": 1,
+        "segments": [
+          {
+            "bytes": 268435456,
+            "lease_version": "lease-rank2-alt",
+            "nixl_descriptor_id": "nixl-rank2-alt",
+            "retry_policy": "replan-from-alternate-holder",
+            "source_byte_offset": 536870912,
+            "source_id": "trainer-rank2-alt",
+            "source_range": [
+              [
+                2,
+                3
+              ],
+              [
+                0,
+                67108864
+              ]
+            ],
+            "target_byte_offset": 0,
+            "target_id": "inference-crossnode-target",
+            "target_range": [
+              [
+                2,
+                3
+              ],
+              [
+                0,
+                67108864
+              ]
+            ],
+            "target_runtime": "vllm",
+            "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+            "worker_id": "rank2",
+            "worker_rank": 2
+          }
+        ],
+        "source_id": "trainer-rank2-alt",
+        "source_rank": 2,
+        "telemetry": null
+      }
+    ],
+    "remote_agent_names": {
+      "trainer-rank0": {
+        "bytes": 62,
+        "hex_prefix": "6d782d63726f73736e6f64652d736f75"
+      },
+      "trainer-rank1": {
+        "bytes": 62,
+        "hex_prefix": "6d782d63726f73736e6f64652d736f75"
+      },
+      "trainer-rank2-alt": {
+        "bytes": 66,
+        "hex_prefix": "6d782d63726f73736e6f64652d736f75"
+      }
+    },
+    "runtime_recovery_segment_plans": [
+      {
+        "bytes": 268435456,
+        "lease_version": "lease-rank2-alt",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 536870912,
+        "source_id": "trainer-rank2-alt",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "source_metadata": {
+      "trainer-rank0": {
+        "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank0",
+        "device_id": 0,
+        "metadata_bytes": 441,
+        "registered_bytes": 805306368,
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "worker_rank": 0
+      },
+      "trainer-rank1": {
+        "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank1",
+        "device_id": 0,
+        "metadata_bytes": 441,
+        "registered_bytes": 1342177280,
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "worker_rank": 1
+      },
+      "trainer-rank2-alt": {
+        "agent_name": "mx-crossnode-source-hardkillgpu2-20260604-190228-trainer-rank2-alt",
+        "device_id": 0,
+        "metadata_bytes": 445,
+        "registered_bytes": 805306368,
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "worker_rank": 2
+      }
+    },
+    "target_agent_name": "mx-crossnode-target-hardkillgpu2-20260604-190228",
+    "ucx": {
+      "MX_NIXL_BACKEND": "UCX",
+      "MX_RDMA_NIC_PIN": "auto",
+      "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": "",
+      "UCX_IB_DEVICES": "",
+      "UCX_MAX_RNDV_RAILS": "",
+      "UCX_NET_DEVICES": "mlx5_10:1",
+      "UCX_RNDV_SCHEME": "get_zcopy",
+      "UCX_RNDV_THRESH": "0",
+      "UCX_TLS": "rc_x,rc,tcp,cuda_copy"
+    }
+  },
+  "planner": {
+    "alternate_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          67108864
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp-replica"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank2-alt",
+        "source_lease": "lease-rank2-alt",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "control_plane_mode": "live-mx-cross-node",
+    "discovered_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          67108864
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank0",
+        "source_lease": "lease-rank0-primary",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          67108864
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank1",
+        "source_lease": "lease-rank1-primary",
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          67108864
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp-replica"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+        "nixl_descriptor_id": "nixl-rank2-alt",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank2-alt",
+        "source_lease": "lease-rank2-alt",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank2",
+        "worker_rank": 2
+      }
+    ],
+    "plan_source": "live-mx-server",
+    "primary_ownerships": [
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          67108864
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank0",
+        "source_lease": "lease-rank0-primary",
+        "source_range": [
+          [
+            0,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "contiguous": true,
+        "dtype": "float32",
+        "element_size_bytes": null,
+        "global_shape": [
+          8,
+          67108864
+        ],
+        "layout_tags": {
+          "moe_expert_axis": 0,
+          "storage_layout": "row-major",
+          "tp": 1,
+          "trainer_layout": "fsdp"
+        },
+        "model_name": "qwen3-moe-refit-poc",
+        "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "quantization_scope": "absent",
+        "source_id": "trainer-rank1",
+        "source_lease": "lease-rank1-primary",
+        "source_range": [
+          [
+            3,
+            8
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "storage_offset_bytes": 0,
+        "strides": null,
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "primary_segment_plans": [
+      {
+        "bytes": 268435456,
+        "lease_version": "lease-rank0-primary",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 536870912,
+        "source_id": "trainer-rank0",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "bytes": 805306368,
+        "lease_version": "lease-rank1-primary",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 0,
+        "source_id": "trainer-rank1",
+        "source_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_byte_offset": 268435456,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "primary_segment_plans_json": [
+      {
+        "bytes": 268435456,
+        "lease_version": "lease-rank0-primary",
+        "nixl_descriptor_id": "nixl-rank0-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 536870912,
+        "source_id": "trainer-rank0",
+        "source_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_byte_offset": 0,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            2,
+            3
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank0",
+        "worker_rank": 0
+      },
+      {
+        "bytes": 805306368,
+        "lease_version": "lease-rank1-primary",
+        "nixl_descriptor_id": "nixl-rank1-primary",
+        "retry_policy": "replan-from-alternate-holder",
+        "source_byte_offset": 0,
+        "source_id": "trainer-rank1",
+        "source_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_byte_offset": 268435456,
+        "target_id": "inference-crossnode-target",
+        "target_range": [
+          [
+            3,
+            6
+          ],
+          [
+            0,
+            67108864
+          ]
+        ],
+        "target_runtime": "vllm",
+        "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+        "worker_id": "rank1",
+        "worker_rank": 1
+      }
+    ],
+    "recovery_segment_plans": [],
+    "request": {
+      "destination_strides": null,
+      "dtype": "float32",
+      "element_size_bytes": null,
+      "layout_tags": {
+        "ep": 2,
+        "moe_expert_axis": 0,
+        "storage_layout": "row-major",
+        "target_layout": "tp2-ep2",
+        "tp": 2
+      },
+      "model_name": "qwen3-moe-refit-poc",
+      "model_version": "trainer-step-000001-hardkillgpu2-20260604-190228",
+      "quantization_scope": "absent",
+      "requested_range": [
+        [
+          2,
+          6
+        ],
+        [
+          0,
+          67108864
+        ]
+      ],
+      "runtime_framework": "vllm",
+      "target_id": "inference-crossnode-target",
+      "target_offset_bytes": 0,
+      "target_shape": [
+        4,
+        67108864
+      ],
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight"
+    },
+    "simulation": {
+      "inference_side_fanout_bytes": 0,
+      "planner_duration_ms": null,
+      "predicted_bottleneck": "trainer-to-inference",
+      "preferred_strategy": "direct-bipartite-p2p",
+      "redundant_cross_boundary_factor": 1.0,
+      "segment_count": 2,
+      "source_balance_bytes": {
+        "trainer-rank0": 268435456,
+        "trainer-rank1": 805306368
+      },
+      "source_count_per_target_tensor": {
+        "inference-crossnode-target": 2
+      },
+      "target_balance_bytes": {
+        "inference-crossnode-target": 1073741824
+      },
+      "trainer_to_inference_bytes": 1073741824,
+      "uncovered_ranges": []
+    }
+  },
+  "proof": {
+    "actual_nixl_reads_used": true,
+    "cross_node_pods": true,
+    "discovered_source_endpoint_count": 3,
+    "distinct_source_agent_count": 3,
+    "failed_source_ids": [],
+    "failed_then_succeeded": false,
+    "gpu_target_assembly_succeeded": true,
+    "host_side_torch_cat_used": false,
+    "live_mx_returned_metadata_used_for_nixl_plan": true,
+    "mlx5_bond_excluded_from_ucx_devices": true,
+    "nixl_reads_land_at_segment_offsets": true,
+    "nixl_source_endpoints_from_mx": true,
+    "one_nixl_agent_per_source_rank": true,
+    "payload_columns": 67108864,
+    "read_failure_count": 1,
+    "read_failure_recovery_used": true,
+    "read_failure_source_ids": [
+      "trainer-rank0"
+    ],
+    "read_failure_sources_excluded_from_successful_reads": true,
+    "read_source_ids": [
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "readable_source_endpoint_count": 3,
+    "readable_source_ids": [
+      "trainer-rank0",
+      "trainer-rank1",
+      "trainer-rank2-alt"
+    ],
+    "replanned_only_failed_segments": false,
+    "source_endpoint_count": 3,
+    "source_pod_separate_from_target_pod": true,
+    "stale_source_endpoint_statuses": {},
+    "stale_source_ids": [],
+    "stale_source_ids_excluded_from_nixl_reads": true,
+    "stale_source_recovery_used": false,
+    "target_buffer_preallocated": true,
+    "target_slice_spans_multiple_trainers": true,
+    "torch_distributed_control_plane_used": false,
+    "torch_distributed_data_transfer_used": false,
+    "torch_distributed_nixl_metadata_exchange_used": false,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false,
+    "ucx_ib_rc_requested": true,
+    "unreadable_source_ids": []
+  },
+  "result": "pass",
+  "schema_version": 1,
+  "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+  "validation": {
+    "allclose": true,
+    "checksum": 1.3098182687131505e+24,
+    "expected_checksum": 1.3098182687131505e+24,
+    "max_abs_error": 0.0
+  }
+}

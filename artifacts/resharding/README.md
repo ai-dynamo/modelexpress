@@ -140,9 +140,9 @@ Files:
 - `nscale-hard-kill-harness-support-smoke.json` and
   `nscale-hard-kill-harness-pytest.log`: nscale CPU evidence that the
   cross-node harness can widen synthetic payload columns and emit a NIXL
-  post-submit marker/sleep hook for a later hard source-pod kill proof
-  (`4 passed`). This is harness-readiness evidence only; it records
-  `hard_pod_kill_inflight_proven=false`.
+  post-submit marker/sleep hook for hard source-pod kill orchestration
+  (`4 passed`). This records harness readiness; the later GPU hard-kill proof is
+  banked separately below.
 - `nscale-hard-kill-gpu-attempt-json-serialization-block.json` and
   `nscale-hard-kill-gpu-attempt-json-serialization-block.log`: honest GPU
   attempt artifact for `hardkillgpu-20260604-185555`. Four GPU pods scheduled
@@ -150,6 +150,38 @@ Files:
   but the run stopped before the kill marker because the post-submit probe
   tried to JSON-serialize byte-valued remote agent metadata. This is a
   software-block artifact, not a hard-kill proof.
+- `nscale-hard-kill-gpu-inflight-recovery-summary.json`: compact proof summary
+  for `hardkillgpu2-20260604-190228`. Three independent source-rank GPU pods ran
+  on `cluster-0967a26d-pool-14bee067-prctr-9c2x7`, one target GPU pod ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`, the target emitted a
+  post-submit marker for the 256 MiB rank0 NIXL READ, rank0 was force-deleted,
+  NIXL reported `NIXL_ERR_REMOTE_DISCONNECT`, recovery read from
+  `trainer-rank2-alt`, and the final 1 GiB target validated allclose/checksum.
+  The summary records `hard_pod_kill_inflight_nixl_read_proven=true`,
+  `read_failure_recovery_used=true`, and `replanned_only_failed_segments=true`.
+- `nscale-hard-kill-gpu-inflight-recovery-target.json` and
+  `nscale-hard-kill-gpu-inflight-recovery-target.log`: raw target artifact/log
+  for the hard-kill run. The raw target JSON was emitted before the proof-field
+  fix, so its high-level `failed_then_succeeded` and
+  `replanned_only_failed_segments` booleans are stale; use its
+  `read_failure_recovery_used=true`, read-failure/recovery segment records, and
+  the compact summary above for the hard-kill claim.
+- `nscale-hard-kill-gpu-inflight-recovery-source-rank1.json` and
+  `nscale-hard-kill-gpu-inflight-recovery-source-rank2-alt.json`: surviving
+  source-side publication artifacts from the hard-kill run. There is no rank0
+  source artifact because that pod was deliberately force-deleted after the
+  target's post-submit marker.
+- `nscale-hard-kill-gpu-inflight-recovery-summary.log`: orchestration summary
+  recording the target marker, rank0 force-delete, target completion, and key
+  checksum/timing fields.
+- `nscale-hard-kill-inflight-recovery-final-verify.log`: final nscale focused
+  verification after banking the hard-kill proof and fixing future target proof
+  fields. It records Black checks, focused pytest (`47 passed`), JSON artifact
+  validation, and `git diff --check`.
+- `nscale-cursor-code-review-availability-hardkill.log`: nscale availability
+  check for `cursor-code-review`. The command was not found in the pod PATH or
+  searched nscale directories, so review was not run rather than using the local
+  laptop.
 - `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
   pytest run inside the nscale target pod after the cross-node patch
   (`8 passed`). It covers the MX refit endpoint helper path, including legacy
@@ -225,9 +257,10 @@ Files:
 
 The NIXL JSON is the primary Level 2 same-node proof artifact. The cross-node
 live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
-artifacts, with the one-pod-per-source-rank and stale-source recovery target JSONs as
-the strictest cross-node claims. The NCCL distributed JSON remains the Level 1 comparison
-artifact. Existing Qwen3 timing jobs are now banked as partial competitive
-context. The Level-5 normalizer/baseline harness now exists, but real Level-5
-timing remains unproven until comparable checksum-backed MX/NIXL, NCCL
-Reshard, and CheckpointEngine rows are completed in the same placement scope.
+artifacts, with the one-pod-per-source-rank, stale-source recovery, and
+hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
+claims. The NCCL distributed JSON remains the Level 1 comparison artifact.
+Existing Qwen3 timing jobs are now banked as partial competitive context. The
+Level-5 normalizer/baseline harness now exists, but real Level-5 timing remains
+unproven until comparable checksum-backed MX/NIXL, NCCL Reshard, and
+CheckpointEngine rows are completed in the same placement scope.

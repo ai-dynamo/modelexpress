@@ -1,0 +1,18 @@
+# nscale hard-kill GPU in-flight recovery proof
+run_id=hardkillgpu2-20260604-190228
+timestamp_utc=2026-06-04T19:06:11Z
+source_rank0_force_deleted_after_marker=true
+
+## pod status
+NAME                                              READY   STATUS      RESTARTS   AGE     IP            NODE                                         NOMINATED NODE   READINESS GATES
+mx-hardkill-src1-hardkillgpu2-20260604-190228     1/1     Running     0          3m39s   10.0.12.27    cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-hardkill-src2-hardkillgpu2-20260604-190228     1/1     Running     0          3m38s   10.0.12.189   cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-hardkill-target-hardkillgpu2-20260604-190228   0/1     Completed   0          3m37s   10.0.20.17    cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+
+## target marker/read-failure/recovery lines
+[mx-refit-nixl] {"bytes": 268435456, "local_desc_count": 1, "phase": "nixl.read_submitted", "remote_agent_name": {"bytes": 62, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "remote_desc_count": 1, "sleep_seconds": 20.0, "timestamp_ns": 1780599765902126968, "trace_label": "trainer-rank0"}
+[mx-refit-crossnode] {"error": "NIXL_ERR_REMOTE_DISCONNECT", "phase": "target.read_segments.primary_source_failed", "segment_count": 1, "source_id": "trainer-rank0"}
+[mx-refit-nixl] {"bytes": 805306368, "local_desc_count": 1, "phase": "nixl.read_submitted", "remote_agent_name": {"bytes": 62, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "remote_desc_count": 1, "sleep_seconds": 20.0, "timestamp_ns": 1780599800928198450, "trace_label": "trainer-rank1"}
+[mx-refit-nixl] {"bytes": 268435456, "local_desc_count": 1, "phase": "nixl.read_submitted", "remote_agent_name": {"bytes": 66, "hex_prefix": "6d782d63726f73736e6f64652d736f75"}, "remote_desc_count": 1, "sleep_seconds": 20.0, "timestamp_ns": 1780599820959946355, "trace_label": "trainer-rank2-alt"}
+[mx-refit-crossnode] {"phase": "target.read_segments.done", "raw_nixl_read_duration_ms": 75069.50956501532}
+[mx-refit-crossnode] {"allclose": true, "checksum": 1.3098182687131505e+24, "expected_checksum": 1.3098182687131505e+24, "max_abs_error": 0.0, "phase": "target.validation.done"}

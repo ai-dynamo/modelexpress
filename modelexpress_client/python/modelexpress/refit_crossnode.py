@@ -384,6 +384,36 @@ def _read_plans_with_runtime_recovery(
     return primary_reads, recovery_reads, runtime_recovery_plans, read_failures
 
 
+def _canonical_range(tensor_range) -> tuple[tuple[int, int], ...]:
+    return tuple((int(start), int(end)) for start, end in tensor_range)
+
+
+def _target_ranges_from_plans(plans) -> set[tuple[tuple[int, int], ...]]:
+    return {_canonical_range(plan.target_range) for plan in plans}
+
+
+def _target_ranges_from_read_failures(
+    read_failures: list[dict[str, Any]],
+) -> set[tuple[tuple[int, int], ...]]:
+    return {
+        _canonical_range(target_range)
+        for failure in read_failures
+        for target_range in failure.get("target_ranges", [])
+    }
+
+
+def _runtime_recovery_replanned_only_failed_segments(
+    *,
+    runtime_recovery_plans,
+    read_failures: list[dict[str, Any]],
+) -> bool:
+    if not runtime_recovery_plans or not read_failures:
+        return False
+    return _target_ranges_from_plans(
+        runtime_recovery_plans
+    ) == _target_ranges_from_read_failures(read_failures)
+
+
 def _wait_for_endpoints(
     *,
     run_id: str,
@@ -832,6 +862,12 @@ def run_target(
             read_source_ids
         )
     )
+    runtime_replanned_only_failed_segments = (
+        _runtime_recovery_replanned_only_failed_segments(
+            runtime_recovery_plans=runtime_recovery_plans,
+            read_failures=read_failures,
+        )
+    )
 
     result = artifact_base(
         mode=(
@@ -889,6 +925,18 @@ def run_target(
             ),
             "stale_source_recovery_used": stale_source_recovery_used,
             "read_failure_recovery_used": read_failure_recovery_used,
+            "failed_then_succeeded": (
+                result["proof"].get("failed_then_succeeded", False)
+                or stale_source_recovery_used
+                or read_failure_recovery_used
+            ),
+            "replanned_only_failed_segments": (
+                result["proof"].get("replanned_only_failed_segments", False)
+                or runtime_replanned_only_failed_segments
+            ),
+            "runtime_replanned_only_failed_segments": (
+                runtime_replanned_only_failed_segments
+            ),
             "read_failure_count": len(read_failures),
             "read_failure_source_ids": sorted(
                 {failure["source_id"] for failure in read_failures}

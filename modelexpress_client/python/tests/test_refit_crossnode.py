@@ -7,6 +7,7 @@ from modelexpress import p2p_pb2
 from modelexpress.refit_crossnode import (
     _plan_context_for_endpoints,
     _read_plans_with_runtime_recovery,
+    _runtime_recovery_replanned_only_failed_segments,
     _run_ownerships,
     _run_ownerships_for_payload,
     _run_request,
@@ -136,6 +137,14 @@ def test_crossnode_runtime_read_failure_replans_only_failed_source_segments():
     assert [plan.source_id for plan in runtime_recovery_plans] == ["trainer-rank2-alt"]
     assert runtime_recovery_plans[0].target_range == ((2, 3), (0, 4))
     assert runtime_recovery_plans[0].bytes == 16
+    assert _runtime_recovery_replanned_only_failed_segments(
+        runtime_recovery_plans=runtime_recovery_plans,
+        read_failures=read_failures,
+    )
+    assert not _runtime_recovery_replanned_only_failed_segments(
+        runtime_recovery_plans=[],
+        read_failures=read_failures,
+    )
 
 
 def test_crossnode_scaled_payload_preserves_exact_recovery_ranges():

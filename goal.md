@@ -167,6 +167,25 @@ Artifacts under `artifacts/resharding/` prove:
   replanned the stale rank0 segment from the alternate holder, and validated
   `allclose=true` with checksum `556224.0`. This is stale-before-read
   recovery; it does not prove a hard pod kill during an in-flight NIXL read.
+- A synthetic one-pod-per-source-rank cross-node hard-kill run now proves
+  segment-level recovery when a source pod dies after the target submits an
+  in-flight NIXL READ:
+  `artifacts/resharding/nscale-hard-kill-gpu-inflight-recovery-summary.json`,
+  `artifacts/resharding/nscale-hard-kill-gpu-inflight-recovery-target.json`,
+  and `artifacts/resharding/nscale-hard-kill-gpu-inflight-recovery-target.log`.
+  Run `hardkillgpu2-20260604-190228` scheduled three independent source GPU
+  pods on `cluster-0967a26d-pool-14bee067-prctr-9c2x7` and one target GPU pod
+  on `cluster-0967a26d-pool-14bee067-prctr-g2j7h` with
+  `UCX_TLS=rc_x,rc,tcp,cuda_copy` and `UCX_NET_DEVICES=mlx5_10:1`. The target
+  emitted a post-submit marker for the 256 MiB `trainer-rank0` READ, rank0 was
+  force-deleted, NIXL returned `NIXL_ERR_REMOTE_DISCONNECT`, the target
+  replanned only the failed rank0 target range from `trainer-rank2-alt`, and the
+  final 1 GiB target validated with `allclose=true` and matching checksum
+  `1.3098182687131505e+24`. The raw target artifact was emitted before the
+  proof-field fix, so the hard-kill claim is backed by
+  `read_failure_recovery_used=true`, the read-failure/recovery segment records,
+  and the derived summary artifact; future target artifacts set
+  `failed_then_succeeded` and `replanned_only_failed_segments` directly.
 - The live nscale server image used for that cross-node run drops the newer
   `slice_ownerships` proto field even though tensor/NIXL fields survive. The
   source now dual-writes ownership into the new proto field and a prefixed
@@ -227,18 +246,17 @@ Artifacts under `artifacts/resharding/` prove:
   its read group, verifies that only that failed source range is replanned from
   `trainer-rank2-alt`, and preserves existing stale-source behavior:
   `artifacts/resharding/nscale-runtime-read-failure-recovery-pytest.log`.
-- Hard-kill proof harness support now exposes scaled cross-node payloads and a
+- Hard-kill proof harness support exposes scaled cross-node payloads and a
   NIXL post-submit marker/sleep hook so orchestration can delete a source pod
   after the target submits a READ:
   `artifacts/resharding/nscale-hard-kill-harness-support-smoke.json` and
-  `artifacts/resharding/nscale-hard-kill-harness-pytest.log` (`4 passed`).
-  This is harness readiness only; it is not a hard GPU in-flight pod-kill
-  proof. A first GPU attempt scheduled the source/target pods and reached
-  target NIXL setup, but was blocked before the kill marker by byte-valued
-  NIXL remote agent metadata in the post-submit probe:
+  `artifacts/resharding/nscale-hard-kill-harness-pytest.log` (`4 passed`). A
+  first GPU attempt scheduled the source/target pods and reached target NIXL
+  setup, but was blocked before the kill marker by byte-valued NIXL remote agent
+  metadata in the post-submit probe:
   `artifacts/resharding/nscale-hard-kill-gpu-attempt-json-serialization-block.json`.
-  The probe now serializes byte metadata safely; the actual hard-kill proof
-  still requires a rerun with `read_failure_recovery_used=true`.
+  The probe now serializes byte metadata safely, and the later hard-kill run
+  above supersedes the block for synthetic in-flight GPU source-pod kill proof.
 - A competitive refit simulator now compares MX direct bipartite P2P,
   MX primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
   movement, and CheckpointEngine-style full gather/apply. The committed nscale
@@ -251,8 +269,8 @@ This is a **Level 3 cross-node synthetic proof**, not a production refit
 implementation. Level 3 control-plane metadata lifecycle support is proven
 through a live central MX server smoke, and live MX-returned ownership plus
 source endpoint metadata now drives completed same-node, two-pod cross-node,
-and one-pod-per-source-rank cross-node NIXL GPU data-plane runs. Real
-runtime-owned trainer/inference refit is still unproven.
+one-pod-per-source-rank cross-node, and synthetic hard-kill recovery NIXL GPU
+data-plane runs. Real runtime-owned trainer/inference refit is still unproven.
 
 ## What Is Not Proven Yet
 
@@ -261,10 +279,10 @@ The current POC does **not** prove:
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
   post-load/refit lifecycle.
-- A hard source pod kill during an in-flight NIXL read. The current
-  stale-source proof covers a source that published and became STALE before
-  the target read; the runtime read-failure fallback and post-submit kill
-  harness are unit-tested but not GPU-kill-proven.
+- A hard source pod kill during an in-flight NIXL read against real
+  trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
+  now proves the segment-level recovery mechanism under a forced source pod
+  deletion, but it is not real trainer/runtime integration.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
 - End-to-end runtime fallback installation using real Qwen FP8 payload bytes
@@ -341,7 +359,8 @@ Acceptance evidence:
   `artifacts/resharding/nscale-crossnode-mx-nixl-refit.json`.
 - Captures NIXL registration duration, metadata blob size/identity,
   `add_remote_agent`, prep duration, raw read duration, and checksum.
-- Independent source-pod fan-in remains the next Level 2 extension.
+- Independent source-pod fan-in and synthetic hard-kill recovery are now
+  covered by Level 3 artifacts; real runtime-owned tensors remain future work.
 
 ### Level 3: MX Control Plane Integration
 
@@ -409,13 +428,11 @@ Current evidence:
 
 Remaining gap:
 
-- Repeat the stale-source recovery proof against real trainer-owned and
-  runtime-owned tensors, and turn the unit-tested runtime read-failure fallback
-  into a hard kill during an in-flight NIXL read. The current synthetic
-  cross-node proof covers independent source pods and recovery after a
-  published source becomes STALE before the target read. The harness can now
-  widen synthetic payloads and emit a NIXL post-submit marker/sleep hook, but
-  that still needs a checksum-backed GPU pod-kill run.
+- Repeat stale-source and hard in-flight source-kill recovery against real
+  trainer-owned and runtime-owned tensors. The current synthetic cross-node
+  proof covers independent source pods, stale-before-read recovery, and forced
+  source pod deletion after a target NIXL READ is submitted, but not real engine
+  ownership or full-model install.
 
 ### Level 4: Real Runtime Refit
 
@@ -523,13 +540,11 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Run the new hard-kill harness on nscale GPUs: three independent source pods
-   plus one target pod, widened payloads, target post-submit marker/sleep,
-   force-delete the selected primary source pod while its READ is outstanding,
-   and gate the result on allclose/checksum plus
-   `read_failure_recovery_used=true`.
-2. Promote the receiver tensor install smoke into live vLLM and SGLang process
-   integration with each engine's post-load/refit lifecycle.
+1. Promote the receiver tensor install smoke into live vLLM and SGLang process
+   integration with each engine's post-load/refit lifecycle, using the same
+   source-published ownership and receiver-side request path.
+2. Repeat stale-before-read and hard in-flight source-kill recovery against
+   real trainer-owned/runtime-owned tensors once live receiver ownership exists.
 3. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
    the cold-load path is stable.
 4. Extend the quantized Qwen fallback from helper-level runtime tensor install
@@ -550,19 +565,20 @@ Safe claim:
 
 > MX now has a planner and synthetic GPU POC showing that source-published slice
 > ownership plus receiver-side slice requests can drive multi-source GPU
-> assembly, same-node and two-pod cross-node NIXL one-sided segment reads, and
+> assembly, same-node and cross-node NIXL one-sided segment reads, and
 > segment-level recovery without trainer full all-gather. The same slice
-> ownership metadata now
-> round-trips through a live Redis-backed central MX server on nscale and has
-> driven a completed 4-B200 live-MX NIXL refit POC where the target plans from
-> MX-returned metadata and gets source NIXL endpoint handles from MX worker
-> metadata rather than torch object gather. The cross-node run uses two pods on
-> two GPU nodes over UCX/IB rc and validates checksum/allclose. The metadata
-> side also covers real Qwen3 MoE and Qwen3 FP8 safetensors headers, including
-> real global-required quantization metadata, plus CPU runtime-shaped
-> vLLM/SGLang target tensor install smokes. A CPU competitive simulator now
-> records MX direct, MX fanout, NCCL Reshard, and CheckpointEngine-style
-> byte/cost comparisons for a two-step RL rollout scenario.
+> ownership metadata now round-trips through a live Redis-backed central MX
+> server on nscale and has driven completed 4-B200 live-MX NIXL refit POCs where
+> the target plans from MX-returned metadata and gets source NIXL endpoint
+> handles from MX worker metadata rather than torch object gather. The
+> cross-node evidence includes two-pod, one-pod-per-source-rank, stale-source,
+> and synthetic in-flight source-pod hard-kill recovery runs over UCX/IB rc, each
+> gated by checksum/allclose. The metadata side also covers real Qwen3 MoE and
+> Qwen3 FP8 safetensors headers, including real global-required quantization
+> metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes. A
+> CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
+> CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
+> scenario.
 
 Unsafe claim:
 
