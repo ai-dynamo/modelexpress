@@ -374,5 +374,15 @@
   "level5_baseline_capacity_pod": "mx-level5-baseline-1780593197",
   "level5_baseline_capacity_scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
   "level5_baseline_capacity_autoscaler_message": "pod did not trigger scale-up: 1 max node group size reached",
-  "level5_mx_nixl_measured_scope": "same-node synthetic MX/NIXL artifact normalized by modelexpress.refit_level5"
+  "level5_mx_nixl_measured_scope": "same-node synthetic MX/NIXL artifact normalized by modelexpress.refit_level5",
+  "qwen_fp8_runtime_fallback_install_added": true,
+  "qwen_fp8_runtime_fallback_install_artifact": "qwen3-30b-a3b-fp8-runtime-fallback-install-smoke.json",
+  "qwen_fp8_runtime_fallback_install_pytest_artifact": "nscale-qwen-fp8-runtime-fallback-install-pytest.log",
+  "qwen_fp8_runtime_fallback_install_pytest_passed": 17,
+  "qwen_fp8_runtime_fallback_install_real_manifest_entry": true,
+  "qwen_fp8_runtime_fallback_install_real_payload_bytes": false,
+  "qwen_fp8_runtime_fallback_install_allclose": true,
+  "qwen_fp8_runtime_fallback_install_checksum_matches": true,
+  "qwen_fp8_runtime_fallback_install_zero_copy_plan_created": false,
+  "qwen_fp8_runtime_fallback_trainer_side_inference_layout_conversion_used": false
 }

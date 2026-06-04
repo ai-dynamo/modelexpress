@@ -189,6 +189,15 @@ Files:
 - `qwen3-30b-a3b-fp8-zero-copy-fallback-smoke.json`: real FP8 manifest smoke
   showing a `global-required` `weight_scale_inv` entry raises
   `QuantizationMetadataError` and no zero-copy segment plan is created.
+- `qwen3-30b-a3b-fp8-runtime-fallback-install-smoke.json`: receiver-side
+  runtime fallback install smoke for a real Qwen3 FP8 global-required
+  `weight_scale_inv` manifest entry. It installs a materialized synthetic
+  payload into a runtime-owned vLLM-shaped target tensor, validates
+  allclose/checksum, records `zero_copy_plan_created=false`, and does not
+  claim real Qwen payload transfer.
+- `nscale-qwen-fp8-runtime-fallback-install-pytest.log`: focused nscale
+  Python gate for receiver fallback install and Qwen manifest handling
+  (`17 passed`).
 - Qwen MoE manifest extraction is covered by the Python gate. It classifies
   stacked expert-axis tensors, per-expert tensor-name layouts, global
   quantization metadata, generated-on-target tensors, and layout-sensitive

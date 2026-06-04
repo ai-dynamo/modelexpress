@@ -1,0 +1,54 @@
+{
+  "fallback_install_path_used": true,
+  "installed": [
+    {
+      "bytes": 384,
+      "dtype": "float32",
+      "quantization_scope": "global-required",
+      "runtime_framework": "vllm",
+      "shape": [
+        16,
+        6
+      ],
+      "target_key": "vllm:model.layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+      "tensor_family": "quantization-global-required-fallback",
+      "tensor_name": "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"
+    }
+  ],
+  "mode": "qwen-fp8-global-required-runtime-fallback-install-smoke",
+  "result": "pass",
+  "runtime_framework": "vllm",
+  "schema_version": 1,
+  "selected_tensor": {
+    "dtype": "float32",
+    "global_shape": [
+      16,
+      6
+    ],
+    "layout_tags": {
+      "expert_storage": "per-expert-tensor",
+      "model_family": "qwen-moe",
+      "moe_expert_index": 0,
+      "source_file": "model-00001-of-00007.safetensors",
+      "storage_layout": "row-major",
+      "tensor_role": "expert-quant-metadata"
+    },
+    "model_name": "qwen3-30b-a3b-fp8",
+    "model_version": "hf-main",
+    "quantization_scope": "global-required",
+    "reason": "global quantization metadata required before zero-copy refit",
+    "requires_special_handling": true,
+    "tensor_family": "quantization-global-required-fallback",
+    "tensor_name": "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"
+  },
+  "source_manifest": "artifacts/resharding/qwen3-30b-a3b-fp8-moe-manifest.json.gz",
+  "target_key": "vllm:model.layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+  "trainer_side_inference_layout_conversion_used": false,
+  "validation": {
+    "allclose": true,
+    "checksum": 4560.0,
+    "expected_checksum": 4560.0,
+    "max_abs_error": 0.0
+  },
+  "zero_copy_plan_created": false
+}

@@ -3,13 +3,22 @@
 
 from __future__ import annotations
 
+import gzip
+import json
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn as nn
 
-from modelexpress.resharding import SliceOwnership, plan_segments
+from modelexpress.resharding import QuantizationScope, SliceOwnership, plan_segments
+from modelexpress.resharding_manifest import (
+    TensorManifestEntry,
+    classify_qwen_moe_tensor,
+)
 from modelexpress.resharding_receiver import (
     build_receiver_requests_from_runtime_tensors,
+    install_global_required_quantization_payloads_into_runtime_tensors,
     install_segment_payloads_into_runtime_tensors,
 )
 
@@ -104,3 +113,105 @@ def test_receiver_rejects_payload_dtype_mismatch_without_explicit_cast():
             [(plans[0], torch.ones((1, 4), dtype=torch.float16))],
             target,
         )
+
+
+def test_receiver_installs_global_required_quantization_fallback_tensor():
+    tensor_name = "model.layers.0.mlp.experts.w1.weight_scale_inv"
+    entry = classify_qwen_moe_tensor(
+        tensor_name,
+        {"shape": (2, 3), "dtype": "float32"},
+        model_name="qwen3-moe-fp8",
+        model_version="step-7",
+    )
+    target_key = f"vllm:{tensor_name}"
+    target_tensors = {target_key: torch.empty((2, 3), dtype=torch.float32)}
+    payload = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    installed = install_global_required_quantization_payloads_into_runtime_tensors(
+        [(entry, payload)],
+        target_tensors,
+        runtime_framework="vllm",
+    )
+
+    assert len(installed) == 1
+    assert installed[0].tensor_name == tensor_name
+    assert installed[0].target_key == target_key
+    assert installed[0].quantization_scope == QuantizationScope.GLOBAL_REQUIRED
+    assert installed[0].tensor_family == "quantization-global-required-fallback"
+    assert installed[0].runtime_framework == "vllm"
+    torch.testing.assert_close(target_tensors[target_key], payload)
+
+
+def test_receiver_rejects_non_global_required_quantization_fallback_tensor():
+    entry = classify_qwen_moe_tensor(
+        "model.layers.0.mlp.experts.w1.weight",
+        {"shape": (2, 3), "dtype": "float32"},
+        model_name="qwen3-moe",
+        model_version="step-7",
+    )
+
+    with pytest.raises(ValueError, match="expected global-required"):
+        install_global_required_quantization_payloads_into_runtime_tensors(
+            [(entry, torch.ones((2, 3), dtype=torch.float32))],
+            {entry.tensor_name: torch.empty((2, 3), dtype=torch.float32)},
+        )
+
+
+def test_receiver_rejects_quantization_fallback_target_dtype_mismatch():
+    tensor_name = "model.layers.0.mlp.experts.w1.weight_scale_inv"
+    entry = classify_qwen_moe_tensor(
+        tensor_name,
+        {"shape": (2, 3), "dtype": "float32"},
+        model_name="qwen3-moe-fp8",
+        model_version="step-7",
+    )
+
+    with pytest.raises(TypeError, match="expected manifest dtype float32"):
+        install_global_required_quantization_payloads_into_runtime_tensors(
+            [(entry, torch.ones((2, 3), dtype=torch.float32))],
+            {entry.tensor_name: torch.empty((2, 3), dtype=torch.float16)},
+        )
+
+
+def test_receiver_installs_real_qwen_fp8_global_required_manifest_entry():
+    artifact = _find_repo_artifact(
+        "artifacts/resharding/qwen3-30b-a3b-fp8-moe-manifest.json.gz"
+    )
+    if artifact is None:
+        pytest.skip("real Qwen FP8 manifest artifact is not available")
+
+    with gzip.open(artifact, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    entry = next(
+        TensorManifestEntry.from_dict(raw_entry)
+        for raw_entry in payload["entries"]
+        if raw_entry["quantization_scope"] == QuantizationScope.GLOBAL_REQUIRED.value
+    )
+    target_key = f"sglang:{entry.tensor_name}"
+    target_tensors = {target_key: torch.empty(entry.global_shape, dtype=torch.float32)}
+    fallback_payload = torch.arange(
+        target_tensors[target_key].numel(),
+        dtype=torch.float32,
+    ).reshape(entry.global_shape)
+
+    installed = install_global_required_quantization_payloads_into_runtime_tensors(
+        [(entry, fallback_payload)],
+        target_tensors,
+        runtime_framework="sglang",
+    )
+
+    assert installed[0].tensor_name == entry.tensor_name
+    assert installed[0].target_key == target_key
+    assert installed[0].shape == entry.global_shape
+    assert installed[0].bytes == target_tensors[target_key].numel() * 4
+    assert installed[0].runtime_framework == "sglang"
+    torch.testing.assert_close(target_tensors[target_key], fallback_payload)
+
+
+def _find_repo_artifact(relative_path: str) -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / relative_path
+        if candidate.exists():
+            return candidate
+    return None

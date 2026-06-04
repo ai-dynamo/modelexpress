@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from .resharding import (
+    QuantizationScope,
     SegmentPlan,
     SliceRequest,
     TensorRange,
@@ -28,6 +29,20 @@ class InstalledSegment:
     target_range: TensorRange
     bytes: int
     source_id: str
+
+
+@dataclass(frozen=True)
+class InstalledQuantizationFallback:
+    """A fallback-installed global quantization metadata tensor."""
+
+    tensor_name: str
+    target_key: str
+    tensor_family: str
+    quantization_scope: QuantizationScope
+    shape: tuple[int, ...]
+    dtype: str
+    bytes: int
+    runtime_framework: str
 
 
 def build_receiver_requests_from_runtime_tensors(
@@ -127,6 +142,83 @@ def install_segment_payloads_into_runtime_tensors(
     return installed
 
 
+def install_global_required_quantization_payloads_into_runtime_tensors(
+    fallback_payloads: Iterable[tuple[object, torch.Tensor]],
+    target_tensors: Mapping[str, torch.Tensor],
+    *,
+    target_key_by_tensor: Mapping[str, str] | None = None,
+    allow_dtype_cast: bool = False,
+    runtime_framework: str = "",
+) -> list[InstalledQuantizationFallback]:
+    """Install global-required quantization metadata into runtime tensors.
+
+    ``GLOBAL_REQUIRED`` tensors are intentionally rejected by the zero-copy
+    segment planner because their correctness depends on global quantization
+    context. This helper is the receiver-side fallback: after another path has
+    materialized the complete metadata payload, copy it into the framework-owned
+    runtime tensor without trainer-side inference-layout conversion.
+    """
+
+    installed: list[InstalledQuantizationFallback] = []
+    for manifest_entry, payload in fallback_payloads:
+        tensor_name = _manifest_attr(manifest_entry, "tensor_name")
+        tensor_family = _manifest_attr(manifest_entry, "tensor_family", default="")
+        quantization_scope = QuantizationScope(
+            _manifest_attr(manifest_entry, "quantization_scope")
+        )
+        if quantization_scope != QuantizationScope.GLOBAL_REQUIRED:
+            raise ValueError(
+                f"{tensor_name!r} is {quantization_scope.value}; expected "
+                f"{QuantizationScope.GLOBAL_REQUIRED.value} fallback metadata"
+            )
+
+        target_key, target = _resolve_manifest_target_tensor(
+            tensor_name,
+            target_tensors,
+            target_key_by_tensor=target_key_by_tensor,
+        )
+        expected_shape = tuple(
+            int(dim) for dim in _manifest_attr(manifest_entry, "global_shape")
+        )
+        if tuple(int(dim) for dim in target.shape) != expected_shape:
+            raise ValueError(
+                f"target tensor for {tensor_name!r} has shape "
+                f"{tuple(int(dim) for dim in target.shape)}, expected {expected_shape}"
+            )
+        expected_dtype = _normalize_dtype_name(
+            str(_manifest_attr(manifest_entry, "dtype"))
+        )
+        target_dtype = _normalize_dtype_name(_torch_dtype_name(target.dtype))
+        if target_dtype != expected_dtype:
+            raise TypeError(
+                f"target tensor for {tensor_name!r} has dtype {target_dtype}, "
+                f"expected manifest dtype {expected_dtype}"
+            )
+        prepared_payload = _prepare_payload(
+            payload,
+            target=target,
+            expected_shape=expected_shape,
+            allow_dtype_cast=allow_dtype_cast,
+        )
+
+        with torch.no_grad():
+            target.copy_(prepared_payload)
+
+        installed.append(
+            InstalledQuantizationFallback(
+                tensor_name=tensor_name,
+                target_key=target_key,
+                tensor_family=tensor_family,
+                quantization_scope=quantization_scope,
+                shape=expected_shape,
+                dtype=_torch_dtype_name(target.dtype),
+                bytes=int(target.numel() * target.element_size()),
+                runtime_framework=runtime_framework,
+            )
+        )
+    return installed
+
+
 def _requested_range_for_tensor(
     tensor_name: str,
     tensor: torch.Tensor,
@@ -160,6 +252,19 @@ def _torch_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def _normalize_dtype_name(dtype: str) -> str:
+    normalized = dtype.removeprefix("torch.").lower()
+    if normalized == "bf16":
+        return "bfloat16"
+    if normalized in {"f16", "half"}:
+        return "float16"
+    if normalized in {"f32", "float"}:
+        return "float32"
+    if normalized in {"f64", "double"}:
+        return "float64"
+    return normalized
+
+
 def _resolve_target_tensor(
     plan: SegmentPlan,
     target_tensors: Mapping[str, torch.Tensor],
@@ -172,6 +277,54 @@ def _resolve_target_tensor(
         f"no target tensor for plan target_id={plan.target_id!r} "
         f"tensor_name={plan.tensor_name!r}"
     )
+
+
+def _resolve_manifest_target_tensor(
+    tensor_name: str,
+    target_tensors: Mapping[str, torch.Tensor],
+    *,
+    target_key_by_tensor: Mapping[str, str] | None,
+) -> tuple[str, torch.Tensor]:
+    if target_key_by_tensor and tensor_name in target_key_by_tensor:
+        target_key = target_key_by_tensor[tensor_name]
+        if target_key not in target_tensors:
+            raise KeyError(
+                f"target_key_by_tensor maps {tensor_name!r} to missing "
+                f"target key {target_key!r}"
+            )
+        return target_key, target_tensors[target_key]
+
+    if tensor_name in target_tensors:
+        return tensor_name, target_tensors[tensor_name]
+
+    suffix = f":{tensor_name}"
+    matching_keys = [key for key in target_tensors if key.endswith(suffix)]
+    if len(matching_keys) == 1:
+        target_key = matching_keys[0]
+        return target_key, target_tensors[target_key]
+    if matching_keys:
+        raise KeyError(
+            f"multiple runtime target tensors match {tensor_name!r}: {matching_keys}"
+        )
+    raise KeyError(
+        f"no runtime target tensor for quantization metadata {tensor_name!r}"
+    )
+
+
+def _manifest_attr(
+    manifest_entry: object, name: str, *, default: object = None
+) -> object:
+    if isinstance(manifest_entry, Mapping):
+        if name in manifest_entry:
+            return manifest_entry[name]
+        if default is not None:
+            return default
+        raise KeyError(name)
+    if hasattr(manifest_entry, name):
+        return getattr(manifest_entry, name)
+    if default is not None:
+        return default
+    raise AttributeError(name)
 
 
 def _target_base_range(
@@ -191,7 +344,9 @@ def _target_base_range(
     return tuple((0, int(dim)) for dim in target.shape)
 
 
-def _local_slices(target_range: TensorRange, base_range: TensorRange) -> tuple[slice, ...]:
+def _local_slices(
+    target_range: TensorRange, base_range: TensorRange
+) -> tuple[slice, ...]:
     target_range = normalize_range(target_range)
     base_range = normalize_range(base_range)
     if len(target_range) != len(base_range):

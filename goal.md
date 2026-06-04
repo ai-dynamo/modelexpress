@@ -256,8 +256,10 @@ The current POC does **not** prove:
   GPU-kill-proven.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
-- Runtime fallback installation of real quantized Qwen tensors after
-  `global-required` metadata is detected.
+- End-to-end runtime fallback installation using real Qwen FP8 payload bytes
+  and real runtime-owned model tensors after `global-required` metadata is
+  detected. The helper path is implemented and tested with a real manifest
+  entry, but payload bytes are still synthetic.
 - Hierarchical fanout to many rollout replicas.
 - Versioned rollback using multiple GPU-resident training steps.
 - Performance competitiveness against NCCL Reshard, CheckpointEngine, Mooncake,
@@ -420,9 +422,18 @@ Acceptance evidence:
 Current partial evidence:
 
 - `modelexpress.resharding_receiver` builds receiver requests from runtime-owned
-  torch tensors and installs planned segment payloads into target tensor slices.
+  torch tensors, installs planned segment payloads into target tensor slices,
+  and installs global-required quantization fallback payloads into
+  runtime-owned metadata tensors.
 - `modelexpress_client/python/tests/test_resharding_receiver.py` covers
-  vLLM-shaped and SGLang-shaped runtime tensor install smokes on nscale.
+  vLLM-shaped and SGLang-shaped runtime tensor install smokes on nscale,
+  including a real Qwen3 FP8 `weight_scale_inv` manifest entry for the
+  fallback install path.
+- Focused nscale fallback-install gate:
+  `artifacts/resharding/nscale-qwen-fp8-runtime-fallback-install-pytest.log`
+  (`17 passed`).
+- Runtime fallback install artifact:
+  `artifacts/resharding/qwen3-30b-a3b-fp8-runtime-fallback-install-smoke.json`.
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
@@ -495,8 +506,8 @@ These are the next useful things to do, in order:
    integration with each engine's post-load/refit lifecycle.
 3. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
    the cold-load path is stable.
-4. Implement the actual quantized Qwen fallback install path after
-   `GLOBAL_REQUIRED` metadata is detected.
+4. Extend the quantized Qwen fallback from helper-level runtime tensor install
+   to real Qwen FP8 payload bytes and real engine-owned model tensors.
 5. Add an nscale fanout microbenchmark for rollout replicas using the simulator
    scenario as the shape contract.
 6. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
