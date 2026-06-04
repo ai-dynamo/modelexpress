@@ -241,6 +241,15 @@ Artifacts under `artifacts/resharding/` prove:
   tensors and install planned segment payloads into those tensors. nscale CPU
   tests cover compatible vLLM-shaped and SGLang-shaped runtime requests whose
   target slice spans two trainer holders.
+- Same-node, one-pod live runtime bridge artifacts now connect actual UCX/NIXL
+  segment reads into live SGLang and vLLM runtime-owned weights. The SGLang
+  artifact reads 16,384 bytes from two trainer-like source ranks into CUDA
+  staging, installs via `Engine.update_weights_from_tensor`, and validates
+  allclose/checksum. The vLLM artifact reads 4,096 bytes from two trainer-like
+  source ranks into CUDA staging, installs/restores through `LLM.apply_model`,
+  and validates allclose/checksum. Both artifacts use deterministic source
+  values and staging-copy runtime APIs; they do not prove direct NIXL writes
+  into runtime-owned storage or a live trainer optimizer loop.
 - Target-side runtime read-failure recovery logic now exists in the cross-node
   harness. A nscale unit test simulates a READY primary source failing during
   its read group, verifies that only that failed source range is replanned from
@@ -265,22 +274,27 @@ Artifacts under `artifacts/resharding/` prove:
   requested slice once across the trainer/inference boundary and is preferred
   under the declared assumptions.
 
-This is a **Level 3 cross-node synthetic proof**, not a production refit
-implementation. Level 3 control-plane metadata lifecycle support is proven
-through a live central MX server smoke, and live MX-returned ownership plus
-source endpoint metadata now drives completed same-node, two-pod cross-node,
-one-pod-per-source-rank cross-node, and synthetic hard-kill recovery NIXL GPU
-data-plane runs. Real runtime-owned trainer/inference refit is still unproven.
+The cross-node endpoint and hard-kill artifacts are **Level 3 cross-node
+synthetic proof**, not production refit implementation. Level 3 control-plane
+metadata lifecycle support is proven through a live central MX server smoke, and
+live MX-returned ownership plus source endpoint metadata now drives completed
+same-node, two-pod cross-node, one-pod-per-source-rank cross-node, and synthetic
+hard-kill recovery NIXL GPU data-plane runs. Level 4 now has same-node,
+one-pod live vLLM and SGLang runtime bridge proofs where NIXL reads from
+trainer-like source ranks feed runtime-owned weights through engine APIs. Full
+production real trainer/inference refit remains unproven.
 
 ## What Is Not Proven Yet
 
 The current POC does **not** prove:
 
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
-- Full live vLLM or SGLang process integration with real trainer-owned payloads
-  and the production post-load/refit lifecycle. Tiny live vLLM V1 and
-  SGLang Engine-owned tensor/weight smokes are now proven, but both still
-  use synthetic trainer payloads and do not use NIXL.
+- Full live vLLM or SGLang process integration with real trainer-process
+  payloads, cross-node runtime placement, direct runtime-buffer NIXL landing,
+  and the production post-load/refit lifecycle. Tiny live vLLM V1 and SGLang
+  Engine-owned tensor/weight smokes are proven, and same-node vLLM/SGLang
+  NIXL-to-runtime bridges are proven, but those bridges still use deterministic
+  trainer-like source values and staging-copy engine APIs.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -438,7 +452,9 @@ Remaining gap:
 
 ### Level 4: Real Runtime Refit
 
-Status: partially implemented; CPU receiver-install, tiny live vLLM/SGLang engine smokes, and a same-node SGLang+NIXL runtime bridge are implemented.
+Status: partially implemented; CPU receiver-install, tiny live vLLM/SGLang
+engine smokes, and same-node SGLang+NIXL and vLLM+NIXL runtime bridges are
+implemented.
 
 Goal:
 
@@ -494,6 +510,25 @@ Current partial evidence:
   `nscale-live-vllm-receiver-v0-env-unsupported-block-20260604.log` explain why
   the V1 path uses `LLM.apply_model` instead of parent-process module traversal
   or `VLLM_USE_V1=0`.
+- `modelexpress.refit_vllm_nixl_runtime_smoke` now bridges the proven NIXL
+  segment-read data plane into the live vLLM V1 worker update path. The nscale
+  artifact
+  `artifacts/resharding/nscale-live-vllm-nixl-runtime-refit-smoke-20260604.json`
+  and `.log` prove a same-node, one-pod, 3-rank run on one GPU with explicit
+  GPU reuse: source ranks 0/1 own CUDA trainer-like shard tensors, target rank
+  2 starts a live vLLM `LLM`, builds a receiver-side `SliceRequest` from the
+  worker-owned `lm_head.weight`, reads 4,096 bytes from the two source ranks
+  over UCX/NIXL into a preallocated CUDA staging tensor, installs/restores the
+  assembled tensor through `LLM.apply_model`, validates NIXL staging allclose,
+  runtime allclose, checksum match, and restores the original weight. The
+  artifact records `actual_nixl_reads_used=true`,
+  `real_runtime_engine_used=true`,
+  `source_rank_owned_trainer_tensors_used=true`,
+  `nixl_reads_land_directly_in_runtime_tensor=false`,
+  `runtime_update_payload_copied_through_apply_model=true`, and
+  `real_training_loop_used=false`. This is real NIXL-to-live-vLLM runtime
+  evidence, but it is not cross-node, not direct zero-copy into vLLM-owned
+  storage, and not a live trainer/optimizer loop.
 - `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
   SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
   `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the
@@ -607,26 +642,30 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Attach the live vLLM and SGLang receiver-owned tensor/weight paths to real
-   trainer-owned/NIXL payloads instead of synthetic trainer payloads.
-2. Promote the receiver tensor install smokes into full live vLLM and SGLang
-   process integration with each engine's post-load/refit lifecycle, using the
-   same source-published ownership and receiver-side request path.
-3. Repeat stale-before-read and hard in-flight source-kill recovery against
+1. Replace deterministic trainer-like source tensors in the vLLM/SGLang NIXL
+   runtime bridges with a real trainer process or optimizer-step publisher that
+   owns the source tensors and publishes the same MX/NIXL descriptors.
+2. Move the live vLLM/SGLang NIXL runtime bridges out of same-node, one-pod
+   GPU-reuse scope into cross-node, one-pod-per-source-rank placement while
+   keeping the allclose/checksum gates.
+3. Promote the runtime bridges into each engine's production post-load/refit
+   lifecycle, using the same source-published ownership and receiver-side
+   request path.
+4. Repeat stale-before-read and hard in-flight source-kill recovery against
    real trainer-owned/runtime-owned tensors once live receiver ownership exists.
-4. Scale the vLLM and SGLang receiver artifacts beyond tiny single-tensor
+5. Scale the vLLM and SGLang receiver artifacts beyond tiny single-tensor
    smokes after the cold-load path is stable.
-5. Extend the quantized Qwen fallback from helper-level runtime tensor install
+6. Extend the quantized Qwen fallback from helper-level runtime tensor install
    to real Qwen FP8 payload bytes and real engine-owned model tensors.
-6. Extend versioned rollback from CPU/runtime-tensor transaction semantics
+7. Extend versioned rollback from CPU/runtime-tensor transaction semantics
    to GPU-resident rollback across multiple training steps.
-7. Add an nscale fanout microbenchmark for rollout replicas using the simulator
+8. Add an nscale fanout microbenchmark for rollout replicas using the simulator
    scenario as the shape contract.
-8. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
+9. Re-run the synthetic same-node Level-5 baseline pod when 4 GPUs are
    schedulable, then generate a passing normalized table only if MX/NIXL,
    NCCL Reshard, and CheckpointEngine rows all have checksum/allclose gates.
-9. After the synthetic table passes, repeat the same schema for real Qwen/full
-   runtime rows before making any competitive Level-5 claim.
+10. After the synthetic table passes, repeat the same schema for real Qwen/full
+    runtime rows before making any competitive Level-5 claim.
 
 ## Current Claim We Can Safely Make
 
@@ -647,12 +686,14 @@ Safe claim:
 > metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes. A
 > CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
 > CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
-> scenario. A tiny live vLLM V1 engine-owned tensor smoke now passes through
-> `LLM.apply_model` with checksum/allclose on `cuda:0`; a tiny live SGLang
-> Engine-owned weight smoke now passes through `Engine.get_weights_by_name`
-> and `Engine.update_weights_from_tensor` with checksum/allclose and restore.
-> Both runtime smokes still use synthetic trainer payloads and do not prove
-> real trainer/NIXL refit.
+> scenario. Tiny live vLLM and SGLang engine-owned smokes prove receiver-owned
+> install/restore through `LLM.apply_model` and
+> `Engine.update_weights_from_tensor`. Same-node, one-pod vLLM+NIXL and
+> SGLang+NIXL runtime bridges now prove trainer-like source-rank CUDA shards can
+> be NIXL-read into staging and installed through engine APIs with
+> allclose/checksum. They still use deterministic source values, staging-copy
+> runtime APIs, GPU reuse, and no live trainer optimizer loop; they do not prove
+> production real trainer/runtime refit or cross-node runtime bridging.
 
 Unsafe claim:
 

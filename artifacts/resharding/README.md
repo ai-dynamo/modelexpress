@@ -285,6 +285,22 @@ Files:
   `vllm_apply_model_used=true`, `vllm_worker_owned_target_tensor=true`,
   `real_runtime_engine_used=true`, `actual_nixl_reads_used=false`, and
   `synthetic_trainer_payloads_used=true`.
+- `nscale-live-vllm-nixl-runtime-refit-smoke-20260604.json` and `.log`:
+  completed same-node, one-pod, 3-rank vLLM+NIXL runtime bridge proof on
+  nscale. Source ranks own CUDA trainer-like shard tensors, the target rank
+  starts a live vLLM 0.17.1 V1 `LLM`, builds the receiver request from the
+  worker-owned `lm_head.weight`, reads two UCX/NIXL source segments into a CUDA
+  staging tensor, installs/restores the assembled tensor through
+  `LLM.apply_model`, validates staging allclose, runtime allclose, checksum
+  match, and restores the original weight. The artifact records
+  `actual_nixl_reads_used=true`, `real_runtime_engine_used=true`,
+  `source_rank_owned_trainer_tensors_used=true`, 4,096 trainer-to-inference
+  bytes, about 0.94 ms raw NIXL read duration, about 0.18 ms in-worker
+  activation install duration, and about 84.3 ms end-to-end `apply_model`
+  install duration. Scope boundary: this is same-node/one-pod evidence with GPU
+  reuse; NIXL lands in staging and is copied through `apply_model`, so it is not
+  cross-node, not direct NIXL landing into vLLM-owned storage, and not a live
+  trainer optimizer loop.
 - `nscale-sglang-receiver-smoke.json` and
   `nscale-sglang-receiver-smoke.log`: SGLang-shaped module-owned receiver smoke
   using `modelexpress.refit_sglang_receiver_smoke`. It builds an SGLang
@@ -334,6 +350,9 @@ Files:
 - `nscale-python-full-pytest-sglang-nixl-runtime-20260604.log`: full nscale
   Python verification after adding the SGLang+NIXL runtime bridge (`311 passed,
   19 skipped`).
+- `nscale-python-full-pytest-vllm-nixl-runtime-20260604.log`: full nscale
+  Python verification after adding the vLLM+NIXL runtime bridge (`316 passed,
+  19 skipped`).
 - `nscale-cursor-code-review-availability-vllm-smoke.log`: nscale availability
   check for `cursor-code-review`. The command was not found in the pod PATH or
   searched nscale directories, so review was not run rather than using the local
@@ -347,8 +366,11 @@ The NIXL JSON is the primary Level 2 same-node proof artifact. The cross-node
 live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
 artifacts, with the one-pod-per-source-rank, stale-source recovery, and
 hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
-claims. The NCCL distributed JSON remains the Level 1 comparison artifact.
-Existing Qwen3 timing jobs are now banked as partial competitive context. The
-Level-5 normalizer/baseline harness now exists, but real Level-5 timing remains
-unproven until comparable checksum-backed MX/NIXL, NCCL Reshard, and
-CheckpointEngine rows are completed in the same placement scope.
+claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
+artifacts, but both remain one-pod/GPU-reuse proofs with deterministic
+trainer-like source values and staging-copy runtime APIs. The NCCL distributed
+JSON remains the Level 1 comparison artifact. Existing Qwen3 timing jobs are now
+banked as partial competitive context. The Level-5 normalizer/baseline harness
+now exists, but real Level-5 timing remains unproven until comparable
+checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine rows are completed
+in the same placement scope.

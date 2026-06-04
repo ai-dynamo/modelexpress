@@ -1,0 +1,19 @@
+........................................................................ [ 21%]
+........................................................................ [ 42%]
+...................s..................................................ss [ 64%]
+....sss.ss............sss.................................ssss.......... [ 85%]
+......................................ssss.....                          [100%]
+=============================== warnings summary ===============================
+tests/test_vllm_loader.py::TestAbstractMethodCompleteness::test_instantiation_succeeds
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+
+tests/test_vllm_loader.py::TestAbstractMethodCompleteness::test_instantiation_succeeds
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+
+tests/test_vllm_loader.py: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+316 passed, 19 skipped, 16 warnings in 21.81s
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
