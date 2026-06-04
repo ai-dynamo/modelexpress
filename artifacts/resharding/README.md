@@ -315,6 +315,13 @@ Files:
   `optimizer_step_publisher_used=true` plus
   `static_replacement_formula_used=false` (`13 passed`). This is code-path
   evidence only; it is not a live GPU runtime rerun.
+- `nscale-trainer-step-source-publication-smoke-20260605.json` and
+  `nscale-trainer-step-source-publication-pytest-20260605.log`: nscale CPU
+  evidence for `TrainerStepSourcePublication`. The publication object carries
+  the post-step source tensor, annotated `SliceOwnership`, source lease,
+  NIXL descriptor identity, and source-update provenance together, and the
+  vLLM/SGLang source-rank paths now emit `source_publication` metadata (`15
+  passed`). This is code-path evidence only; it is not a live GPU runtime rerun.
 - `nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json` and
   `.log`: honest block for the attempted live vLLM+NIXL runtime GPU rerun using
   the optimizer-step source publisher patch. The 1-GPU pod stayed Pending with
@@ -389,8 +396,9 @@ hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
 claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
 artifacts, but both committed GPU artifacts remain one-pod/GPU-reuse proofs
 with deterministic trainer-like source values and staging-copy runtime APIs.
-The current branch has CPU-tested optimizer-step source-publisher code for the
-runtime bridges, with a live vLLM GPU rerun capacity-blocked on 2026-06-05. The
+The current branch has CPU-tested optimizer-step source-publisher and
+source-publication metadata code for the runtime bridges, with a live vLLM GPU
+rerun capacity-blocked on 2026-06-05. The
 NCCL distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 normalizer/baseline harness now exists, but real Level-5 timing remains unproven

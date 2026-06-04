@@ -1,0 +1,79 @@
+{
+  "local_session_date": "2026-06-05",
+  "mode": "trainer-step-source-publication-smoke",
+  "proof": {
+    "gpu_runtime_smoke": false,
+    "nixl_descriptor_id_filled": true,
+    "slice_ownership_annotated_with_optimizer_step_metadata": true,
+    "source_lease_filled": true,
+    "source_publication_object_used": true,
+    "static_replacement_formula_source_values_used": false,
+    "synthetic_training_objective_used": true,
+    "trainer_optimizer_step_publisher_used": true,
+    "trainer_owned_parameter_tensor_used": true
+  },
+  "publication": {
+    "ownership": {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": 4,
+      "global_shape": [
+        8,
+        4
+      ],
+      "layout_tags": {
+        "learning_rate": "0.25",
+        "optimizer": "SGD",
+        "optimizer_step_count": 3,
+        "optimizer_step_publisher": true,
+        "source_payload_generator": "torch.optim.SGD",
+        "static_replacement_formula": false,
+        "synthetic_training_objective": true,
+        "trainer_layout": "fsdp-row-shard-poc",
+        "trainer_update_source": "torch.optim.SGD-step-publisher"
+      },
+      "model_name": "tiny-trainer-step",
+      "model_version": "step-29",
+      "nixl_descriptor_id": "trainer-rank5-step-29-optimizer-step-3",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank5",
+      "source_lease": "trainer-rank5-step-29-optimizer-step-3",
+      "source_range": [
+        [
+          2,
+          7
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank5-worker",
+      "worker_rank": 5
+    },
+    "source_payload_provenance": {
+      "learning_rate": 0.25,
+      "optimizer": "SGD",
+      "optimizer_step_count": 3,
+      "optimizer_step_publisher_used": true,
+      "real_rl_training_loop_used": false,
+      "source_payload_generator": "torch.optim.SGD",
+      "static_replacement_formula_used": false,
+      "synthetic_training_objective_used": true,
+      "trainer_owned_parameter_tensor_used": true
+    },
+    "tensor_bytes": 80,
+    "tensor_device": "cpu",
+    "tensor_dtype": "float32",
+    "tensor_shape": [
+      5,
+      4
+    ]
+  },
+  "range_matches_full_post_step_tensor": true,
+  "result": "pass",
+  "schema_version": 1
+}

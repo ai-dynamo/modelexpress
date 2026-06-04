@@ -12,6 +12,7 @@ the older static replacement formula from the runtime bridge proofs.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
@@ -21,6 +22,91 @@ from .resharding import SliceOwnership, TensorRange
 
 DEFAULT_TRAINER_STEP_COUNT = 1
 DEFAULT_TRAINER_LR = 0.125
+
+
+@dataclass(frozen=True)
+class TrainerStepSourcePublication:
+    """Post-step source tensor plus the metadata a trainer rank publishes."""
+
+    ownership: SliceOwnership
+    tensor: torch.Tensor
+    provenance: dict[str, Any]
+
+    def to_artifact_metadata(self) -> dict[str, Any]:
+        return {
+            "ownership": self.ownership.to_dict(),
+            "source_payload_provenance": dict(self.provenance),
+            "tensor_shape": [int(dim) for dim in self.tensor.shape],
+            "tensor_dtype": str(self.tensor.dtype).removeprefix("torch."),
+            "tensor_device": str(self.tensor.device),
+            "tensor_bytes": int(self.tensor.numel() * self.tensor.element_size()),
+        }
+
+
+def publish_trainer_step_source(
+    owner: SliceOwnership,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    step_count: int = DEFAULT_TRAINER_STEP_COUNT,
+    learning_rate: float = DEFAULT_TRAINER_LR,
+) -> TrainerStepSourcePublication:
+    """Publish a source-owned post-step shard and its ownership metadata."""
+
+    published_owner = annotate_trainer_step_ownership(
+        owner,
+        step_count=step_count,
+        learning_rate=learning_rate,
+    )
+    tensor = materialize_trainer_step_source_tensor(
+        published_owner,
+        dtype=dtype,
+        device=device,
+        step_count=step_count,
+        learning_rate=learning_rate,
+    )
+    return TrainerStepSourcePublication(
+        ownership=published_owner,
+        tensor=tensor,
+        provenance=trainer_step_source_provenance(
+            step_count=step_count,
+            learning_rate=learning_rate,
+        ),
+    )
+
+
+def annotate_trainer_step_ownership(
+    owner: SliceOwnership,
+    *,
+    step_count: int = DEFAULT_TRAINER_STEP_COUNT,
+    learning_rate: float = DEFAULT_TRAINER_LR,
+) -> SliceOwnership:
+    """Attach optimizer-step publisher metadata to a source ownership record."""
+
+    source_id = owner.source_id or owner.worker_id
+    source_lease = owner.source_lease or (
+        f"{source_id}-{owner.model_version}-optimizer-step-{int(step_count)}"
+    )
+    nixl_descriptor_id = owner.nixl_descriptor_id or source_lease
+    layout_tags = dict(owner.layout_tags)
+    layout_tags.update(
+        {
+            "trainer_update_source": "torch.optim.SGD-step-publisher",
+            "source_payload_generator": "torch.optim.SGD",
+            "optimizer": "SGD",
+            "optimizer_step_count": int(step_count),
+            "learning_rate": str(float(learning_rate)),
+            "optimizer_step_publisher": True,
+            "synthetic_training_objective": True,
+            "static_replacement_formula": False,
+        }
+    )
+    return replace(
+        owner,
+        source_lease=source_lease,
+        nixl_descriptor_id=nixl_descriptor_id,
+        layout_tags=layout_tags,
+    )
 
 
 def trainer_step_source_provenance(

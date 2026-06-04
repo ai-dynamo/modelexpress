@@ -37,7 +37,7 @@ from .refit_nixl import (
     select_cuda_device,
 )
 from .refit_trainer_step import (
-    materialize_trainer_step_source_tensor,
+    publish_trainer_step_source,
     trainer_step_replacement_tensor,
     trainer_step_source_provenance,
 )
@@ -234,11 +234,11 @@ def materialize_vllm_nixl_source_tensor(
 ) -> torch.Tensor:
     """Create the rank-owned trainer payload for one source range."""
 
-    return materialize_trainer_step_source_tensor(
+    return publish_trainer_step_source(
         owner,
         dtype=dtype,
         device=device,
-    )
+    ).tensor
 
 
 def _inspect_vllm_worker_model(
@@ -700,15 +700,17 @@ def run_vllm_nixl_runtime_refit_distributed(
 
         adapter = NixlAdapter(f"mx-vllm-nixl-runtime-rank{rank}")
         source_tensor = None
+        source_publication = None
         target_staging = None
         registered_bytes = 0
         register_start = time.perf_counter()
         if rank in owner_by_rank:
-            source_tensor = materialize_vllm_nixl_source_tensor(
+            source_publication = publish_trainer_step_source(
                 owner_by_rank[rank],
                 dtype=dtype_obj,
                 device=device,
             )
+            source_tensor = source_publication.tensor
             adapter.register_tensor(source_tensor)
             registered_bytes = int(source_tensor.numel() * source_tensor.element_size())
         elif rank == target_rank:
@@ -755,7 +757,8 @@ def run_vllm_nixl_runtime_refit_distributed(
                     "tensor_bytes": int(
                         source_tensor.numel() * source_tensor.element_size()
                     ),
-                    "source_payload_provenance": trainer_step_source_provenance(),
+                    "source_payload_provenance": source_publication.provenance,
+                    "source_publication": source_publication.to_artifact_metadata(),
                 }
             )
         elif rank == target_rank:
@@ -871,6 +874,7 @@ def run_vllm_nixl_runtime_refit_distributed(
                         "source_payload_provenance": info.get(
                             "source_payload_provenance", {}
                         ),
+                        "source_publication": info.get("source_publication", {}),
                     }
                     for source_id, info in sorted(sources_by_id.items())
                 },
