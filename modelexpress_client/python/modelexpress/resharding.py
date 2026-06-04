@@ -45,6 +45,15 @@ class TransferStrategy(str, Enum):
     PRIMARY_REPLICA_FANOUT = "primary-replica-fanout"
 
 
+class CompetitiveStrategy(str, Enum):
+    """Strategies compared in the broader refit simulator."""
+
+    MX_DIRECT_BIPARTITE = "mx-direct-bipartite-p2p"
+    MX_PRIMARY_REPLICA_FANOUT = "mx-primary-replica-fanout"
+    NCCL_RESHARD = "nccl-reshard-fixed-membership"
+    CHECKPOINT_ENGINE_FULL_GATHER = "checkpoint-engine-full-gather-apply"
+
+
 class ReshardingPlanError(ValueError):
     """Base class for resharding planner failures."""
 
@@ -393,6 +402,42 @@ class BandwidthAssumptions:
 
 
 @dataclass(frozen=True)
+class CompetitiveAssumptions:
+    """Bandwidth and latency values for competitive refit comparisons."""
+
+    trainer_to_inference_gbps: float
+    inference_to_inference_gbps: float
+    nccl_reshard_gbps: float
+    checkpoint_storage_gbps: float
+    per_segment_latency_us: float = 0.0
+    planner_duration_ms: float = 0.0
+    publish_duration_ms: float = 0.0
+    activation_install_duration_ms: float = 0.0
+    nccl_fixed_overhead_ms: float = 0.0
+    checkpoint_fixed_overhead_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "trainer_to_inference_gbps",
+            "inference_to_inference_gbps",
+            "nccl_reshard_gbps",
+            "checkpoint_storage_gbps",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"{field_name} must be positive")
+        for field_name in (
+            "per_segment_latency_us",
+            "planner_duration_ms",
+            "publish_duration_ms",
+            "activation_install_duration_ms",
+            "nccl_fixed_overhead_ms",
+            "checkpoint_fixed_overhead_ms",
+        ):
+            if getattr(self, field_name) < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+
+
+@dataclass(frozen=True)
 class SimulationResult:
     """Stable simulator output suitable for committed JSON artifacts."""
 
@@ -455,6 +500,124 @@ class SimulationResult:
             uncovered_ranges=[normalize_range(r) for r in data["uncovered_ranges"]],
             predicted_bottleneck=data["predicted_bottleneck"],
             planner_duration_ms=data.get("planner_duration_ms"),
+        )
+
+
+@dataclass(frozen=True)
+class StrategyCost:
+    """Estimated cost for one refit strategy."""
+
+    strategy: CompetitiveStrategy | str
+    trainer_to_inference_bytes: int
+    inference_side_fanout_bytes: int
+    trainer_collective_bytes: int
+    checkpoint_storage_bytes: int
+    segment_count: int
+    redundant_cross_boundary_factor: float
+    estimated_duration_ms: float
+    predicted_bottleneck: str
+    notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "strategy", CompetitiveStrategy(self.strategy))
+        object.__setattr__(self, "notes", tuple(str(note) for note in self.notes))
+
+    @property
+    def total_network_bytes(self) -> int:
+        return (
+            self.trainer_to_inference_bytes
+            + self.inference_side_fanout_bytes
+            + self.trainer_collective_bytes
+            + self.checkpoint_storage_bytes
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy.value,
+            "trainer_to_inference_bytes": self.trainer_to_inference_bytes,
+            "inference_side_fanout_bytes": self.inference_side_fanout_bytes,
+            "trainer_collective_bytes": self.trainer_collective_bytes,
+            "checkpoint_storage_bytes": self.checkpoint_storage_bytes,
+            "segment_count": self.segment_count,
+            "redundant_cross_boundary_factor": self.redundant_cross_boundary_factor,
+            "estimated_duration_ms": self.estimated_duration_ms,
+            "predicted_bottleneck": self.predicted_bottleneck,
+            "total_network_bytes": self.total_network_bytes,
+            "notes": list(self.notes),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "StrategyCost":
+        return cls(
+            strategy=data["strategy"],
+            trainer_to_inference_bytes=int(data["trainer_to_inference_bytes"]),
+            inference_side_fanout_bytes=int(data["inference_side_fanout_bytes"]),
+            trainer_collective_bytes=int(data["trainer_collective_bytes"]),
+            checkpoint_storage_bytes=int(data["checkpoint_storage_bytes"]),
+            segment_count=int(data["segment_count"]),
+            redundant_cross_boundary_factor=float(
+                data["redundant_cross_boundary_factor"]
+            ),
+            estimated_duration_ms=float(data["estimated_duration_ms"]),
+            predicted_bottleneck=data["predicted_bottleneck"],
+            notes=tuple(data.get("notes", ())),
+        )
+
+
+@dataclass(frozen=True)
+class CompetitiveSimulationResult:
+    """Comparison across MX, NCCL-style, and checkpoint-engine refit paths."""
+
+    preferred_strategy: CompetitiveStrategy | str
+    costs: tuple[StrategyCost, ...]
+    unique_requested_bytes: int
+    unique_full_tensor_bytes: int
+    target_request_count: int
+    trainer_source_count: int
+    segment_count: int
+    source_count_per_target_tensor: dict[str, int]
+    source_balance_bytes: dict[str, int]
+    target_balance_bytes: dict[str, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "preferred_strategy",
+            CompetitiveStrategy(self.preferred_strategy),
+        )
+        object.__setattr__(self, "costs", tuple(self.costs))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "preferred_strategy": self.preferred_strategy.value,
+            "costs": [cost.to_dict() for cost in self.costs],
+            "unique_requested_bytes": self.unique_requested_bytes,
+            "unique_full_tensor_bytes": self.unique_full_tensor_bytes,
+            "target_request_count": self.target_request_count,
+            "trainer_source_count": self.trainer_source_count,
+            "segment_count": self.segment_count,
+            "source_count_per_target_tensor": dict(self.source_count_per_target_tensor),
+            "source_balance_bytes": dict(self.source_balance_bytes),
+            "target_balance_bytes": dict(self.target_balance_bytes),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CompetitiveSimulationResult":
+        return cls(
+            preferred_strategy=data["preferred_strategy"],
+            costs=tuple(StrategyCost.from_dict(item) for item in data["costs"]),
+            unique_requested_bytes=int(data["unique_requested_bytes"]),
+            unique_full_tensor_bytes=int(data["unique_full_tensor_bytes"]),
+            target_request_count=int(data["target_request_count"]),
+            trainer_source_count=int(data["trainer_source_count"]),
+            segment_count=int(data["segment_count"]),
+            source_count_per_target_tensor=dict(data["source_count_per_target_tensor"]),
+            source_balance_bytes={
+                str(k): int(v) for k, v in data["source_balance_bytes"].items()
+            },
+            target_balance_bytes={
+                str(k): int(v) for k, v in data["target_balance_bytes"].items()
+            },
         )
 
 
@@ -686,6 +849,181 @@ def simulate_resharding(
     )
 
 
+def simulate_competitive_refit(
+    ownerships: Sequence[SliceOwnership],
+    requests: Sequence[SliceRequest],
+    assumptions: CompetitiveAssumptions,
+) -> CompetitiveSimulationResult:
+    """Compare MX/NIXL slice planning against broader refit baselines.
+
+    The NCCL-style and checkpoint-engine baselines intentionally model full
+    tensor materialization. That is the conservative comparison point for MX's
+    slice-overlap path: if requested ranges are narrow or replicated, MX should
+    avoid moving full tensors across the trainer/inference boundary.
+    """
+
+    plans = plan_segments(ownerships, requests)
+    direct_cross_bytes = sum(plan.bytes for plan in plans)
+    unique_requested_bytes = _unique_requested_bytes(requests)
+    unique_full_tensor_bytes = _unique_full_tensor_bytes(ownerships, requests)
+    inference_fanout_bytes = max(0, direct_cross_bytes - unique_requested_bytes)
+    source_balance, target_balance, target_sources = _balance_metrics(plans)
+    trainer_source_count = len({owner.stable_source_id for owner in ownerships})
+    target_request_count = len(requests)
+
+    mx_direct_duration = _duration_ms(
+        trainer_to_inference_bytes=direct_cross_bytes,
+        inference_side_fanout_bytes=0,
+        trainer_collective_bytes=0,
+        checkpoint_storage_bytes=0,
+        segment_count=len(plans),
+        assumptions=assumptions,
+        fixed_overhead_ms=(
+            assumptions.publish_duration_ms
+            + assumptions.planner_duration_ms
+            + assumptions.activation_install_duration_ms
+        ),
+    )
+    mx_fanout_duration = _duration_ms(
+        trainer_to_inference_bytes=unique_requested_bytes,
+        inference_side_fanout_bytes=inference_fanout_bytes,
+        trainer_collective_bytes=0,
+        checkpoint_storage_bytes=0,
+        segment_count=len(plans),
+        assumptions=assumptions,
+        fixed_overhead_ms=(
+            assumptions.publish_duration_ms
+            + assumptions.planner_duration_ms
+            + assumptions.activation_install_duration_ms
+        ),
+    )
+
+    nccl_bytes = unique_full_tensor_bytes * max(1, target_request_count)
+    nccl_collective_bytes = unique_full_tensor_bytes * max(
+        0,
+        trainer_source_count - 1,
+    )
+    checkpoint_storage_bytes = unique_full_tensor_bytes * (1 + target_request_count)
+
+    costs = (
+        StrategyCost(
+            strategy=CompetitiveStrategy.MX_DIRECT_BIPARTITE,
+            trainer_to_inference_bytes=direct_cross_bytes,
+            inference_side_fanout_bytes=0,
+            trainer_collective_bytes=0,
+            checkpoint_storage_bytes=0,
+            segment_count=len(plans),
+            redundant_cross_boundary_factor=_ratio(
+                direct_cross_bytes,
+                unique_requested_bytes,
+            ),
+            estimated_duration_ms=mx_direct_duration,
+            predicted_bottleneck=_predict_competitive_bottleneck(
+                trainer_to_inference_bytes=direct_cross_bytes,
+                inference_side_fanout_bytes=0,
+                trainer_collective_bytes=0,
+                checkpoint_storage_bytes=0,
+                assumptions=assumptions,
+            ),
+            notes=(
+                "one trainer-to-inference transfer per target request segment",
+                "elastic MX leases/versioning remain available",
+            ),
+        ),
+        StrategyCost(
+            strategy=CompetitiveStrategy.MX_PRIMARY_REPLICA_FANOUT,
+            trainer_to_inference_bytes=unique_requested_bytes,
+            inference_side_fanout_bytes=inference_fanout_bytes,
+            trainer_collective_bytes=0,
+            checkpoint_storage_bytes=0,
+            segment_count=len(plans),
+            redundant_cross_boundary_factor=_ratio(
+                unique_requested_bytes + inference_fanout_bytes,
+                unique_requested_bytes,
+            ),
+            estimated_duration_ms=mx_fanout_duration,
+            predicted_bottleneck=_predict_competitive_bottleneck(
+                trainer_to_inference_bytes=unique_requested_bytes,
+                inference_side_fanout_bytes=inference_fanout_bytes,
+                trainer_collective_bytes=0,
+                checkpoint_storage_bytes=0,
+                assumptions=assumptions,
+            ),
+            notes=(
+                "trainer sends each unique requested slice once",
+                "rollout replicas receive inference-side fanout",
+            ),
+        ),
+        StrategyCost(
+            strategy=CompetitiveStrategy.NCCL_RESHARD,
+            trainer_to_inference_bytes=nccl_bytes,
+            inference_side_fanout_bytes=0,
+            trainer_collective_bytes=nccl_collective_bytes,
+            checkpoint_storage_bytes=0,
+            segment_count=target_request_count,
+            redundant_cross_boundary_factor=_ratio(nccl_bytes, unique_requested_bytes),
+            estimated_duration_ms=(
+                _bytes_to_seconds(
+                    nccl_bytes + nccl_collective_bytes,
+                    assumptions.nccl_reshard_gbps,
+                )
+                * 1000
+                + assumptions.nccl_fixed_overhead_ms
+            ),
+            predicted_bottleneck="fixed-membership-collective",
+            notes=(
+                "models fixed-membership homogeneous collective reshaping",
+                "full tensor materialization baseline",
+            ),
+        ),
+        StrategyCost(
+            strategy=CompetitiveStrategy.CHECKPOINT_ENGINE_FULL_GATHER,
+            trainer_to_inference_bytes=0,
+            inference_side_fanout_bytes=0,
+            trainer_collective_bytes=unique_full_tensor_bytes,
+            checkpoint_storage_bytes=checkpoint_storage_bytes,
+            segment_count=target_request_count,
+            redundant_cross_boundary_factor=_ratio(
+                checkpoint_storage_bytes,
+                unique_requested_bytes,
+            ),
+            estimated_duration_ms=(
+                _bytes_to_seconds(
+                    checkpoint_storage_bytes,
+                    assumptions.checkpoint_storage_gbps,
+                )
+                * 1000
+                + _bytes_to_seconds(
+                    unique_full_tensor_bytes,
+                    assumptions.nccl_reshard_gbps,
+                )
+                * 1000
+                + assumptions.checkpoint_fixed_overhead_ms
+            ),
+            predicted_bottleneck="checkpoint-storage",
+            notes=(
+                "models trainer full gather plus inference-side apply",
+                "no trainer-side inference-layout coupling required",
+            ),
+        ),
+    )
+    preferred = min(costs, key=lambda cost: cost.estimated_duration_ms).strategy
+    return CompetitiveSimulationResult(
+        preferred_strategy=preferred,
+        costs=costs,
+        unique_requested_bytes=unique_requested_bytes,
+        unique_full_tensor_bytes=unique_full_tensor_bytes,
+        target_request_count=target_request_count,
+        trainer_source_count=trainer_source_count,
+        segment_count=len(plans),
+        source_count_per_target_tensor={
+            key: len(value) for key, value in sorted(target_sources.items())
+        },
+        source_balance_bytes=dict(sorted(source_balance.items())),
+        target_balance_bytes=dict(sorted(target_balance.items())),
+    )
+
+
 def segment_plans_to_json(plans: Sequence[SegmentPlan]) -> str:
     """Serialize segment plans as stable JSON."""
 
@@ -703,12 +1041,17 @@ def segment_plans_from_json(payload: str) -> list[SegmentPlan]:
 
 
 def write_json_artifact(
-    data: SegmentPlan | SimulationResult | Sequence[SegmentPlan],
+    data: (
+        SegmentPlan
+        | SimulationResult
+        | CompetitiveSimulationResult
+        | Sequence[SegmentPlan]
+    ),
     path: str | Path,
 ) -> None:
     """Write a stable JSON artifact for planner or simulator output."""
 
-    if isinstance(data, SimulationResult):
+    if isinstance(data, (SimulationResult, CompetitiveSimulationResult)):
         payload: Any = data.to_dict()
     elif isinstance(data, SegmentPlan):
         payload = data.to_dict()
@@ -719,6 +1062,148 @@ def write_json_artifact(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _unique_requested_bytes(requests: Sequence[SliceRequest]) -> int:
+    unique_request_keys = {
+        (
+            req.model_name,
+            req.model_version,
+            req.tensor_name,
+            req.requested_range,
+            req.dtype,
+            req.element_size_bytes,
+        )
+        for req in requests
+    }
+    total = 0
+    for _, _, _, requested_range, dtype, element_size_bytes in unique_request_keys:
+        total += range_volume(requested_range) * dtype_itemsize(
+            dtype,
+            element_size_bytes,
+        )
+    return total
+
+
+def _unique_full_tensor_bytes(
+    ownerships: Sequence[SliceOwnership],
+    requests: Sequence[SliceRequest],
+) -> int:
+    tensor_keys: dict[tuple[str, str, str, str, int | None], tuple[int, ...]] = {}
+    for owner in ownerships:
+        if not any(
+            request.tensor_name == owner.tensor_name
+            and (not request.model_name or request.model_name == owner.model_name)
+            and (
+                not request.model_version
+                or request.model_version == owner.model_version
+            )
+            for request in requests
+        ):
+            continue
+        key = (
+            owner.model_name,
+            owner.model_version,
+            owner.tensor_name,
+            owner.dtype,
+            owner.element_size_bytes,
+        )
+        existing_shape = tensor_keys.get(key)
+        if existing_shape is not None and existing_shape != owner.global_shape:
+            raise IncompatibleManifestError(
+                f"tensor {owner.tensor_name!r} has inconsistent global_shape "
+                f"{existing_shape} vs {owner.global_shape}"
+            )
+        tensor_keys[key] = owner.global_shape
+
+    total = 0
+    for (_, _, _, dtype, element_size_bytes), global_shape in tensor_keys.items():
+        full_range = tuple((0, dim) for dim in global_shape)
+        total += range_volume(full_range) * dtype_itemsize(dtype, element_size_bytes)
+    return total
+
+
+def _balance_metrics(
+    plans: Sequence[SegmentPlan],
+) -> tuple[dict[str, int], dict[str, int], dict[str, set[str]]]:
+    source_balance: dict[str, int] = {}
+    target_balance: dict[str, int] = {}
+    target_sources: dict[str, set[str]] = {}
+    for plan in plans:
+        source_balance[plan.source_id] = source_balance.get(plan.source_id, 0) + plan.bytes
+        target_key = plan.target_id or plan.tensor_name
+        target_balance[target_key] = target_balance.get(target_key, 0) + plan.bytes
+        target_sources.setdefault(target_key, set()).add(plan.source_id)
+    return source_balance, target_balance, target_sources
+
+
+def _duration_ms(
+    *,
+    trainer_to_inference_bytes: int,
+    inference_side_fanout_bytes: int,
+    trainer_collective_bytes: int,
+    checkpoint_storage_bytes: int,
+    segment_count: int,
+    assumptions: CompetitiveAssumptions,
+    fixed_overhead_ms: float,
+) -> float:
+    transfer_seconds = 0.0
+    transfer_seconds += _bytes_to_seconds(
+        trainer_to_inference_bytes,
+        assumptions.trainer_to_inference_gbps,
+    )
+    transfer_seconds += _bytes_to_seconds(
+        inference_side_fanout_bytes,
+        assumptions.inference_to_inference_gbps,
+    )
+    transfer_seconds += _bytes_to_seconds(
+        trainer_collective_bytes,
+        assumptions.nccl_reshard_gbps,
+    )
+    transfer_seconds += _bytes_to_seconds(
+        checkpoint_storage_bytes,
+        assumptions.checkpoint_storage_gbps,
+    )
+    latency_ms = (segment_count * assumptions.per_segment_latency_us) / 1000.0
+    return round((transfer_seconds * 1000) + latency_ms + fixed_overhead_ms, 6)
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 1.0
+    return round(numerator / denominator, 6)
+
+
+def _predict_competitive_bottleneck(
+    *,
+    trainer_to_inference_bytes: int,
+    inference_side_fanout_bytes: int,
+    trainer_collective_bytes: int,
+    checkpoint_storage_bytes: int,
+    assumptions: CompetitiveAssumptions,
+) -> str:
+    components = {
+        "trainer-to-inference": _bytes_to_seconds(
+            trainer_to_inference_bytes,
+            assumptions.trainer_to_inference_gbps,
+        ),
+        "inference-side-fanout": _bytes_to_seconds(
+            inference_side_fanout_bytes,
+            assumptions.inference_to_inference_gbps,
+        ),
+        "trainer-collective": _bytes_to_seconds(
+            trainer_collective_bytes,
+            assumptions.nccl_reshard_gbps,
+        ),
+        "checkpoint-storage": _bytes_to_seconds(
+            checkpoint_storage_bytes,
+            assumptions.checkpoint_storage_gbps,
+        ),
+    }
+    bottleneck, seconds = max(components.items(), key=lambda item: item[1])
+    if seconds == 0:
+        return "fixed-overhead"
+    return bottleneck
 
 
 def _validate_request_compatibility(

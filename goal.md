@@ -143,6 +143,13 @@ Artifacts under `artifacts/resharding/` prove:
   tensors and install planned segment payloads into those tensors. nscale CPU
   tests cover compatible vLLM-shaped and SGLang-shaped runtime requests whose
   target slice spans two trainer holders.
+- A competitive refit simulator now compares MX direct bipartite P2P,
+  MX primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
+  movement, and CheckpointEngine-style full gather/apply. The committed nscale
+  artifact `artifacts/resharding/competitive-refit-simulation.json` shows a
+  two-step RL rollout case where MX primary/replica fanout moves each unique
+  requested slice once across the trainer/inference boundary and is preferred
+  under the declared assumptions.
 
 This is a **Level 2 same-node synthetic proof**, not a production refit
 implementation. Level 3 control-plane metadata lifecycle support is now proven
@@ -167,7 +174,7 @@ The current POC does **not** prove:
 - Hierarchical fanout to many rollout replicas.
 - Versioned rollback using multiple GPU-resident training steps.
 - Performance competitiveness against NCCL Reshard, CheckpointEngine, Mooncake,
-  or TorchStore-style systems.
+  or TorchStore-style systems beyond the committed CPU byte/cost simulator.
 
 ## Proof Levels
 
@@ -302,11 +309,12 @@ Current partial evidence:
   vLLM-shaped and SGLang-shaped runtime tensor install smokes on nscale.
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
-  (`272 passed, 19 skipped`).
+  (`275 passed, 19 skipped`).
 
 ### Level 5: Competitive Benchmark
 
-Status: not implemented.
+Status: partially implemented; CPU competitive simulator implemented, real
+timing benchmark not implemented.
 
 Goal:
 
@@ -325,6 +333,21 @@ Acceptance metrics:
 - retry/rediscovery count
 - correctness checksum
 
+Current partial evidence:
+
+- `modelexpress.resharding.simulate_competitive_refit` compares MX direct P2P,
+  MX primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
+  movement, and CheckpointEngine-style full gather/apply.
+- `artifacts/resharding/competitive-refit-simulation.json` records a two-step
+  RL rollout case with four compatible receiver requests spanning two trainer
+  holders. It reports trainer-to-inference bytes, inference-side fanout bytes,
+  trainer collective bytes, checkpoint storage bytes, redundant byte factors,
+  segment count, source/target balance, source count per target tensor, and
+  predicted bottlenecks.
+- nscale full Python gate:
+  `artifacts/resharding/nscale-python-full-pytest.log`
+  (`275 passed, 19 skipped`).
+
 ## Near-Term Achievable Work
 
 These are the next useful things to do, in order:
@@ -339,7 +362,8 @@ These are the next useful things to do, in order:
    the cold-load path is stable.
 5. Implement the actual quantized Qwen fallback install path after
    `GLOBAL_REQUIRED` metadata is detected.
-6. Add a fanout simulator and nscale fanout microbenchmark for rollout replicas.
+6. Add an nscale fanout microbenchmark for rollout replicas using the simulator
+   scenario as the shape contract.
 7. Run a first competitive timing table against a baseline all-gather/cat path
    and a direct NCCL P2P path.
 
@@ -355,6 +379,9 @@ Safe claim:
 > used by the target planner. The metadata side also covers real Qwen3 MoE and
 > Qwen3 FP8 safetensors headers, including real global-required quantization
 > metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes.
+> A CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard,
+> and CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
+> scenario.
 
 Unsafe claim:
 

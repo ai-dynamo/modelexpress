@@ -1,0 +1,90 @@
+{
+  "costs": [
+    {
+      "checkpoint_storage_bytes": 0,
+      "estimated_duration_ms": 0.640102,
+      "inference_side_fanout_bytes": 0,
+      "notes": [
+        "one trainer-to-inference transfer per target request segment",
+        "elastic MX leases/versioning remain available"
+      ],
+      "predicted_bottleneck": "trainer-to-inference",
+      "redundant_cross_boundary_factor": 4.0,
+      "segment_count": 8,
+      "strategy": "mx-direct-bipartite-p2p",
+      "total_network_bytes": 128,
+      "trainer_collective_bytes": 0,
+      "trainer_to_inference_bytes": 128
+    },
+    {
+      "checkpoint_storage_bytes": 0,
+      "estimated_duration_ms": 0.640033,
+      "inference_side_fanout_bytes": 96,
+      "notes": [
+        "trainer sends each unique requested slice once",
+        "rollout replicas receive inference-side fanout"
+      ],
+      "predicted_bottleneck": "trainer-to-inference",
+      "redundant_cross_boundary_factor": 4.0,
+      "segment_count": 8,
+      "strategy": "mx-primary-replica-fanout",
+      "total_network_bytes": 128,
+      "trainer_collective_bytes": 0,
+      "trainer_to_inference_bytes": 32
+    },
+    {
+      "checkpoint_storage_bytes": 0,
+      "estimated_duration_ms": 1.000128,
+      "inference_side_fanout_bytes": 0,
+      "notes": [
+        "models fixed-membership homogeneous collective reshaping",
+        "full tensor materialization baseline"
+      ],
+      "predicted_bottleneck": "fixed-membership-collective",
+      "redundant_cross_boundary_factor": 8.0,
+      "segment_count": 4,
+      "strategy": "nccl-reshard-fixed-membership",
+      "total_network_bytes": 320,
+      "trainer_collective_bytes": 64,
+      "trainer_to_inference_bytes": 256
+    },
+    {
+      "checkpoint_storage_bytes": 320,
+      "estimated_duration_ms": 1.0005376,
+      "inference_side_fanout_bytes": 0,
+      "notes": [
+        "models trainer full gather plus inference-side apply",
+        "no trainer-side inference-layout coupling required"
+      ],
+      "predicted_bottleneck": "checkpoint-storage",
+      "redundant_cross_boundary_factor": 10.0,
+      "segment_count": 4,
+      "strategy": "checkpoint-engine-full-gather-apply",
+      "total_network_bytes": 384,
+      "trainer_collective_bytes": 64,
+      "trainer_to_inference_bytes": 0
+    }
+  ],
+  "preferred_strategy": "mx-primary-replica-fanout",
+  "segment_count": 8,
+  "source_balance_bytes": {
+    "source-0": 64,
+    "source-1": 64
+  },
+  "source_count_per_target_tensor": {
+    "rollout-0": 2,
+    "rollout-1": 2,
+    "rollout-2": 2,
+    "rollout-3": 2
+  },
+  "target_balance_bytes": {
+    "rollout-0": 32,
+    "rollout-1": 32,
+    "rollout-2": 32,
+    "rollout-3": 32
+  },
+  "target_request_count": 4,
+  "trainer_source_count": 2,
+  "unique_full_tensor_bytes": 64,
+  "unique_requested_bytes": 32
+}

@@ -27,8 +27,14 @@ Files:
   gate covering planner, control-plane helpers, live-control-plane opt-in skip,
   and Qwen/safetensors manifest extraction (`24 passed, 1 skipped`).
 - `nscale-python-full-pytest.log`: full nscale Python 3.12 package test tree
-  after the safetensors/Qwen BF16+FP8 manifest, FP8 zero-copy fallback, and
-  receiver-install smoke changes (`272 passed, 19 skipped`).
+  after the safetensors/Qwen BF16+FP8 manifest, FP8 zero-copy fallback,
+  receiver-install smoke, and competitive simulator changes
+  (`275 passed, 19 skipped`).
+- `competitive-refit-simulation.json`: CPU byte/cost simulator artifact for a
+  two-step RL rollout shape. It compares MX direct bipartite P2P, MX
+  primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
+  movement, and CheckpointEngine-style full gather/apply; under the declared
+  assumptions it prefers MX primary/replica fanout.
 - `nscale-qwen-fp8-fallback-pytest.log`: focused nscale Python 3.12 gate for
   Qwen manifest extraction plus the real FP8 zero-copy fallback smoke
   (`10 passed`).

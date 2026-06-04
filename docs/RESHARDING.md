@@ -96,6 +96,17 @@ into `SliceRequest`s and install planned segment payloads into target tensor
 slices. The current smoke covers vLLM-shaped and SGLang-shaped requests on CPU;
 live vLLM/SGLang process integration remains future work.
 
+The competitive refit simulator also lives in `modelexpress.resharding`. It
+compares MX direct bipartite P2P, MX primary/replica fanout, NCCL Reshard-style
+fixed-membership full-tensor movement, and CheckpointEngine-style full
+gather/apply. The committed artifact
+`artifacts/resharding/competitive-refit-simulation.json` records a two-step RL
+rollout case where four receiver requests span two trainer holders; the
+simulator reports cross-boundary bytes, inference-side fanout bytes, trainer
+collective bytes, checkpoint storage bytes, redundant byte factors, segment
+count, source/target balance, source count per target tensor, and predicted
+bottlenecks. This is a byte/cost simulator, not a real performance benchmark.
+
 ## Planner Gate
 
 The planner gate is local and should pass before cluster work:
@@ -139,7 +150,8 @@ Level 3 control-plane evidence is in `nscale-control-plane-pytest.log`,
 `nscale-live-mx-nixl-capacity.log`. Qwen BF16/FP8 safetensors-header extraction,
 real FP8 zero-copy fallback, and receiver-side runtime tensor install smokes
 are covered by
-`nscale-python-full-pytest.log`.
+`nscale-python-full-pytest.log`. The partial Level 5 simulator evidence is
+`competitive-refit-simulation.json`.
 
 ## Metrics
 

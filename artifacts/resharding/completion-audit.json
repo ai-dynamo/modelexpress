@@ -1,5 +1,16 @@
 {
   "checksum_matches": true,
+  "competitive_refit_simulator_added": true,
+  "competitive_refit_simulator_artifact": "competitive-refit-simulation.json",
+  "competitive_refit_simulator_python_tests_pass": true,
+  "competitive_refit_simulator_preferred_strategy": "mx-primary-replica-fanout",
+  "competitive_refit_simulator_strategies": [
+    "mx-direct-bipartite-p2p",
+    "mx-primary-replica-fanout",
+    "nccl-reshard-fixed-membership",
+    "checkpoint-engine-full-gather-apply"
+  ],
+  "competitive_refit_simulator_real_timing_benchmark_pass": false,
   "cpu_planner_tests_pass": true,
   "cross_framework_smoke_pass": true,
   "cross_frameworks": [
@@ -102,7 +113,7 @@
   "qwen_fp8_fallback_python_tests_pass": true,
   "qwen_fp8_fallback_python_tests_passed": 10,
   "full_python_tests_pass": true,
-  "full_python_tests_passed": 272,
+  "full_python_tests_passed": 275,
   "full_python_tests_skipped": 19,
   "receiver_runtime_tensor_request_helper_added": true,
   "receiver_vllm_runtime_tensor_install_smoke_pass": true,

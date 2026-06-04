@@ -9,6 +9,9 @@ import pytest
 
 from modelexpress.resharding import (
     BandwidthAssumptions,
+    CompetitiveAssumptions,
+    CompetitiveSimulationResult,
+    CompetitiveStrategy,
     CoverageError,
     IncompatibleManifestError,
     QuantizationMetadataError,
@@ -24,6 +27,7 @@ from modelexpress.resharding import (
     range_volume,
     segment_plans_from_json,
     segment_plans_to_json,
+    simulate_competitive_refit,
     simulate_resharding,
     write_json_artifact,
 )
@@ -300,3 +304,150 @@ def test_simulator_prefers_replica_fanout_when_inference_fabric_is_fast(tmp_path
     parsed = json.loads(artifact.read_text())
     assert SimulationResult.from_dict(parsed) == result
     assert parsed["preferred_strategy"] == "primary-replica-fanout"
+
+
+def test_competitive_simulator_models_mx_fanout_and_full_tensor_baselines(tmp_path):
+    owners = [
+        _owner(
+            source_range=((0, 4), (0, 4)),
+            worker_id="w0",
+            source_id="s0",
+            global_shape=(8, 4),
+        ),
+        _owner(
+            source_range=((4, 8), (0, 4)),
+            worker_id="w1",
+            source_id="s1",
+            global_shape=(8, 4),
+        ),
+    ]
+    requests = [
+        _request(requested_range=((2, 6), (0, 4)), target_id=f"rollout-{idx}")
+        for idx in range(4)
+    ]
+
+    result = simulate_competitive_refit(
+        owners,
+        requests,
+        CompetitiveAssumptions(
+            trainer_to_inference_gbps=10,
+            inference_to_inference_gbps=100,
+            nccl_reshard_gbps=20,
+            checkpoint_storage_gbps=5,
+            per_segment_latency_us=5,
+            planner_duration_ms=0.1,
+            publish_duration_ms=0.2,
+            activation_install_duration_ms=0.3,
+            nccl_fixed_overhead_ms=1.0,
+            checkpoint_fixed_overhead_ms=1.0,
+        ),
+    )
+
+    by_strategy = {cost.strategy: cost for cost in result.costs}
+    assert result.unique_requested_bytes == 32
+    assert result.unique_full_tensor_bytes == 64
+    assert result.target_request_count == 4
+    assert result.trainer_source_count == 2
+    assert result.segment_count == 8
+    assert result.preferred_strategy == CompetitiveStrategy.MX_PRIMARY_REPLICA_FANOUT
+    assert (
+        by_strategy[CompetitiveStrategy.MX_DIRECT_BIPARTITE]
+        .trainer_to_inference_bytes
+        == 128
+    )
+    assert (
+        by_strategy[CompetitiveStrategy.MX_PRIMARY_REPLICA_FANOUT]
+        .trainer_to_inference_bytes
+        == 32
+    )
+    assert (
+        by_strategy[CompetitiveStrategy.MX_PRIMARY_REPLICA_FANOUT]
+        .inference_side_fanout_bytes
+        == 96
+    )
+    assert by_strategy[CompetitiveStrategy.NCCL_RESHARD].trainer_to_inference_bytes == 256
+    assert by_strategy[CompetitiveStrategy.NCCL_RESHARD].trainer_collective_bytes == 64
+    assert (
+        by_strategy[CompetitiveStrategy.CHECKPOINT_ENGINE_FULL_GATHER]
+        .checkpoint_storage_bytes
+        == 320
+    )
+    assert (
+        by_strategy[CompetitiveStrategy.NCCL_RESHARD]
+        .redundant_cross_boundary_factor
+        == 8.0
+    )
+
+    artifact = tmp_path / "competitive-refit.json"
+    write_json_artifact(result, artifact)
+    parsed = json.loads(artifact.read_text(encoding="utf-8"))
+    assert CompetitiveSimulationResult.from_dict(parsed) == result
+
+
+def test_competitive_simulator_can_identify_nccl_fixed_membership_win():
+    owners = [
+        _owner(
+            source_range=((0, 4), (0, 4)),
+            worker_id="w0",
+            source_id="s0",
+            global_shape=(4, 4),
+        )
+    ]
+    requests = [_request(requested_range=((0, 4), (0, 4)), target_id="rollout-0")]
+
+    result = simulate_competitive_refit(
+        owners,
+        requests,
+        CompetitiveAssumptions(
+            trainer_to_inference_gbps=5,
+            inference_to_inference_gbps=5,
+            nccl_reshard_gbps=500,
+            checkpoint_storage_gbps=5,
+            per_segment_latency_us=1000,
+        ),
+    )
+
+    assert result.preferred_strategy == CompetitiveStrategy.NCCL_RESHARD
+    by_strategy = {cost.strategy: cost for cost in result.costs}
+    assert (
+        by_strategy[CompetitiveStrategy.NCCL_RESHARD].estimated_duration_ms
+        < by_strategy[CompetitiveStrategy.MX_DIRECT_BIPARTITE].estimated_duration_ms
+    )
+    assert by_strategy[CompetitiveStrategy.NCCL_RESHARD].notes == (
+        "models fixed-membership homogeneous collective reshaping",
+        "full tensor materialization baseline",
+    )
+
+
+def test_competitive_simulator_blank_receiver_model_matches_owner_manifest():
+    owners = [
+        _owner(
+            source_range=((0, 4), (0, 4)),
+            worker_id="w0",
+            source_id="s0",
+            global_shape=(4, 4),
+        )
+    ]
+    requests = [
+        SliceRequest(
+            tensor_name="layers.0.mlp.weight",
+            requested_range=((0, 4), (0, 4)),
+            target_shape=(4, 4),
+            dtype="bfloat16",
+            target_id="rollout-0",
+        )
+    ]
+
+    result = simulate_competitive_refit(
+        owners,
+        requests,
+        CompetitiveAssumptions(
+            trainer_to_inference_gbps=5,
+            inference_to_inference_gbps=5,
+            nccl_reshard_gbps=5,
+            checkpoint_storage_gbps=5,
+        ),
+    )
+
+    assert result.unique_requested_bytes == 32
+    assert result.unique_full_tensor_bytes == 32

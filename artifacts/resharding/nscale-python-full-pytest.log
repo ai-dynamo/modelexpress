@@ -1,8 +1,8 @@
 ........................................................................ [ 24%]
-.......................................................s................ [ 49%]
-..........................ss....sss.ss............sss................... [ 74%]
-..............ssss................................................ssss.. [ 98%]
-...                                                                      [100%]
+..........................................................s............. [ 48%]
+.............................ss....sss.ss............sss................ [ 73%]
+.................ssss................................................sss [ 97%]
+s.....                                                                   [100%]
 =============================== warnings summary ===============================
 tests/test_vllm_loader.py::TestAbstractMethodCompleteness::test_instantiation_succeeds
   <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
@@ -15,4 +15,4 @@ tests/test_vllm_loader.py: 14 warnings
     warnings.warn(
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-272 passed, 19 skipped, 16 warnings in 19.21s
+275 passed, 19 skipped, 16 warnings in 19.09s
