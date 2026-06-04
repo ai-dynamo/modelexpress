@@ -131,6 +131,12 @@ Files:
   source-side publication artifacts for the stale-source recovery proof.
 - `nscale-crossnode-stale-source-recovery-summary.json`: compact summary of
   the stale-source recovery target/source artifacts and key metrics.
+- `nscale-runtime-read-failure-recovery-pytest.log`: nscale Python gate for
+  target-side runtime read-failure recovery logic (`40 passed, 1 skipped`). It
+  simulates a READY primary source failing during its read group, verifies the
+  target replans only that failed source range from an alternate holder, and
+  preserves the existing stale-source/control-plane tests. This is code-path
+  evidence only; it is not a hard GPU in-flight pod-kill proof.
 - `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
   pytest run inside the nscale target pod after the cross-node patch
   (`8 passed`). It covers the MX refit endpoint helper path, including legacy

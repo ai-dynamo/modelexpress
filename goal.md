@@ -222,6 +222,12 @@ Artifacts under `artifacts/resharding/` prove:
   tensors and install planned segment payloads into those tensors. nscale CPU
   tests cover compatible vLLM-shaped and SGLang-shaped runtime requests whose
   target slice spans two trainer holders.
+- Target-side runtime read-failure recovery logic now exists in the cross-node
+  harness. A nscale unit test simulates a READY primary source failing during
+  its read group, verifies that only that failed source range is replanned from
+  `trainer-rank2-alt`, and preserves existing stale-source behavior:
+  `artifacts/resharding/nscale-runtime-read-failure-recovery-pytest.log`. This
+  is a code-path test, not a hard GPU in-flight pod-kill proof.
 - A competitive refit simulator now compares MX direct bipartite P2P,
   MX primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
   movement, and CheckpointEngine-style full gather/apply. The committed nscale
@@ -246,7 +252,8 @@ The current POC does **not** prove:
   post-load/refit lifecycle.
 - A hard source pod kill during an in-flight NIXL read. The current
   stale-source proof covers a source that published and became STALE before
-  the target read.
+  the target read; the runtime read-failure fallback is unit-tested but not
+  GPU-kill-proven.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
 - Runtime fallback installation of real quantized Qwen tensors after
@@ -388,9 +395,10 @@ Current evidence:
 Remaining gap:
 
 - Repeat the stale-source recovery proof against real trainer-owned and
-  runtime-owned tensors, and add a hard kill during an in-flight NIXL read.
-  The current synthetic cross-node proof covers independent source pods and
-  recovery after a published source becomes STALE before the target read.
+  runtime-owned tensors, and turn the unit-tested runtime read-failure fallback
+  into a hard kill during an in-flight NIXL read. The current synthetic
+  cross-node proof covers independent source pods and recovery after a
+  published source becomes STALE before the target read.
 
 ### Level 4: Real Runtime Refit
 

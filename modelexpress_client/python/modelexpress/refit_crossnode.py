@@ -17,7 +17,7 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 
 from . import p2p_pb2
 from .client import MxClient
@@ -182,7 +182,9 @@ def _plan_context_for_endpoints(
     failed_source_ids: set[str] | None = None,
     stale_source_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    failed_source_ids = set(failed_source_ids or FAILED_PRIMARY_SOURCE_IDS)
+    failed_source_ids = set(
+        FAILED_PRIMARY_SOURCE_IDS if failed_source_ids is None else failed_source_ids
+    )
     stale_source_ids = set(stale_source_ids or ())
     unreadable_source_ids = failed_source_ids | stale_source_ids
     endpoints_by_source_id = {
@@ -237,6 +239,100 @@ def _range_extents(tensor_range):
     return tuple(int(end) - int(start) for start, end in tensor_range)
 
 
+ReadSegmentGroupsFn = Callable[..., list[dict[str, Any]]]
+
+
+def _group_plans_by_source(plans) -> dict[str, list[Any]]:
+    grouped: dict[str, list[Any]] = {}
+    for plan in plans:
+        grouped.setdefault(plan.source_id, []).append(plan)
+    return grouped
+
+
+def _recovery_requests_for_plans(request: SliceRequest, plans) -> list[SliceRequest]:
+    return [
+        replace(
+            request,
+            requested_range=plan.target_range,
+            target_shape=_range_extents(plan.target_range),
+        )
+        for plan in plans
+    ]
+
+
+def _read_plans_with_runtime_recovery(
+    *,
+    adapter,
+    target,
+    sources_by_id: dict[str, dict[str, Any]],
+    remote_agent_names: dict[str, str],
+    primary_plans,
+    planned_recovery_plans,
+    alternate_ownerships,
+    request: SliceRequest,
+    timeout_seconds: float,
+    read_fn: ReadSegmentGroupsFn = read_segment_groups,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[Any], list[dict[str, Any]]]:
+    """Read primary segments and replan failed source groups from alternates.
+
+    Planned failed/stale recovery still happens before this helper is called.
+    This helper covers a different case: a source that was READY and selected for
+    a primary read fails while the target is issuing that source's read group.
+    """
+
+    primary_reads: list[dict[str, Any]] = []
+    read_failures: list[dict[str, Any]] = []
+    failed_primary_plans = []
+    for source_id, source_plans in sorted(
+        _group_plans_by_source(primary_plans).items()
+    ):
+        try:
+            primary_reads.extend(
+                read_fn(
+                    adapter=adapter,
+                    target=target,
+                    sources_by_id=sources_by_id,
+                    remote_agent_names=remote_agent_names,
+                    plans=source_plans,
+                    timeout_seconds=timeout_seconds,
+                )
+            )
+        except Exception as exc:
+            _trace(
+                "target.read_segments.primary_source_failed",
+                source_id=source_id,
+                segment_count=len(source_plans),
+                error=str(exc),
+            )
+            read_failures.append(
+                {
+                    "source_id": source_id,
+                    "segment_count": len(source_plans),
+                    "target_ranges": [plan.target_range for plan in source_plans],
+                    "error": str(exc),
+                }
+            )
+            failed_primary_plans.extend(source_plans)
+
+    runtime_recovery_plans = []
+    if failed_primary_plans:
+        runtime_recovery_plans = plan_segments(
+            alternate_ownerships,
+            _recovery_requests_for_plans(request, failed_primary_plans),
+        )
+
+    recovery_plans = [*planned_recovery_plans, *runtime_recovery_plans]
+    recovery_reads = read_fn(
+        adapter=adapter,
+        target=target,
+        sources_by_id=sources_by_id,
+        remote_agent_names=remote_agent_names,
+        plans=recovery_plans,
+        timeout_seconds=timeout_seconds,
+    )
+    return primary_reads, recovery_reads, runtime_recovery_plans, read_failures
+
+
 def _wait_for_endpoints(
     *,
     run_id: str,
@@ -246,7 +342,9 @@ def _wait_for_endpoints(
     failed_source_ids: set[str] | None = None,
     stale_source_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    failed_source_ids = set(failed_source_ids or FAILED_PRIMARY_SOURCE_IDS)
+    failed_source_ids = set(
+        FAILED_PRIMARY_SOURCE_IDS if failed_source_ids is None else failed_source_ids
+    )
     stale_source_ids = set(stale_source_ids or ())
     expected_source_ids = set(expected_source_ids) | stale_source_ids
     expected_ready_source_ids = expected_source_ids - stale_source_ids
@@ -495,7 +593,9 @@ def run_target(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for cross-node target reads")
 
-    failed_source_ids = set(failed_source_ids or FAILED_PRIMARY_SOURCE_IDS)
+    failed_source_ids = set(
+        FAILED_PRIMARY_SOURCE_IDS if failed_source_ids is None else failed_source_ids
+    )
     stale_source_ids = set(stale_source_ids or ())
     unreadable_source_ids = failed_source_ids | stale_source_ids
 
@@ -621,20 +721,20 @@ def run_target(
         readable_source_ids=sorted(sources_by_id),
     )
     transfer_start = time.perf_counter()
-    primary_reads = read_segment_groups(
+    (
+        primary_reads,
+        recovery_reads,
+        runtime_recovery_plans,
+        read_failures,
+    ) = _read_plans_with_runtime_recovery(
         adapter=adapter,
         target=target,
         sources_by_id=sources_by_id,
         remote_agent_names=remote_agent_names,
-        plans=primary_read_plans,
-        timeout_seconds=timeout_seconds,
-    )
-    recovery_reads = read_segment_groups(
-        adapter=adapter,
-        target=target,
-        sources_by_id=sources_by_id,
-        remote_agent_names=remote_agent_names,
-        plans=plan_context["recovery_plans"],
+        primary_plans=primary_read_plans,
+        planned_recovery_plans=plan_context["recovery_plans"],
+        alternate_ownerships=plan_context["alternate_ownerships"],
+        request=request,
         timeout_seconds=timeout_seconds,
     )
     torch.cuda.synchronize(device)
@@ -668,6 +768,13 @@ def run_target(
         and bool(recovery_reads)
         and validation["allclose"]
         and stale_source_ids.isdisjoint(read_source_ids)
+    )
+    read_failure_recovery_used = (
+        bool(runtime_recovery_plans)
+        and validation["allclose"]
+        and {failure["source_id"] for failure in read_failures}.isdisjoint(
+            read_source_ids
+        )
     )
 
     result = artifact_base(
@@ -725,6 +832,16 @@ def run_target(
                 read_source_ids
             ),
             "stale_source_recovery_used": stale_source_recovery_used,
+            "read_failure_recovery_used": read_failure_recovery_used,
+            "read_failure_count": len(read_failures),
+            "read_failure_source_ids": sorted(
+                {failure["source_id"] for failure in read_failures}
+            ),
+            "read_failure_sources_excluded_from_successful_reads": (
+                {failure["source_id"] for failure in read_failures}.isdisjoint(
+                    read_source_ids
+                )
+            ),
         }
     )
     result["distributed"] = {
@@ -775,6 +892,10 @@ def run_target(
         "add_remote_agent_duration_ms": add_remote_timings,
         "primary_reads": primary_reads,
         "recovery_reads": recovery_reads,
+        "runtime_recovery_segment_plans": [
+            plan.to_dict() for plan in runtime_recovery_plans
+        ],
+        "read_failures": _json_safe(read_failures),
     }
     result["metrics"].update(
         {
@@ -793,6 +914,8 @@ def run_target(
             "readable_source_endpoint_count": source_endpoint_count,
             "failed_source_count": len(failed_source_ids),
             "stale_source_count": len(stale_source_ids),
+            "read_failure_count": len(read_failures),
+            "runtime_recovery_segment_count": len(runtime_recovery_plans),
         }
     )
     write_artifact(result, artifact_path)
@@ -850,6 +973,14 @@ def main() -> None:
         default=[],
         help="Source id expected to be STALE in MX before target reads.",
     )
+    parser.add_argument(
+        "--disable-default-failed-source",
+        action="store_true",
+        help=(
+            "Attempt the default primary source instead of preplanning around it; "
+            "useful for read-failure recovery proofs."
+        ),
+    )
     args = parser.parse_args()
 
     if args.role == "source":
@@ -875,7 +1006,11 @@ def main() -> None:
             target_node=args.target_node,
             gpu_count=args.gpu_count,
             failed_source_ids={
-                *FAILED_PRIMARY_SOURCE_IDS,
+                *(
+                    ()
+                    if args.disable_default_failed_source
+                    else FAILED_PRIMARY_SOURCE_IDS
+                ),
                 *{source_id for source_id in args.failed_source_id if source_id},
             },
             stale_source_ids={
