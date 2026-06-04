@@ -1,0 +1,33 @@
+{
+  "fallback_required": true,
+  "global_required_entry_count": 18624,
+  "passed": true,
+  "payload_downloaded": false,
+  "planner_error": "tensor 'model.layers.0.mlp.experts.0.down_proj.weight_scale_inv' requires global quantization metadata; use a fallback path instead of zero-copy resharding",
+  "runtime_framework": "vllm",
+  "selected_tensor": {
+    "dtype": "float32",
+    "global_shape": [
+      16,
+      6
+    ],
+    "layout_tags": {
+      "expert_storage": "per-expert-tensor",
+      "model_family": "qwen-moe",
+      "moe_expert_index": 0,
+      "source_file": "model-00001-of-00007.safetensors",
+      "storage_layout": "row-major",
+      "tensor_role": "expert-quant-metadata"
+    },
+    "model_name": "qwen3-30b-a3b-fp8",
+    "model_version": "hf-main",
+    "quantization_scope": "global-required",
+    "reason": "global quantization metadata required before zero-copy refit",
+    "requires_special_handling": true,
+    "tensor_family": "quantization-global-required-fallback",
+    "tensor_name": "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"
+  },
+  "source_manifest_artifact": "qwen3-30b-a3b-fp8-moe-manifest.json.gz",
+  "source_repo": "Qwen/Qwen3-30B-A3B-FP8",
+  "zero_copy_plan_created": false
+}

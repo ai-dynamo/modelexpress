@@ -14,7 +14,14 @@ import struct
 from typing import Any, Iterable, Mapping
 import urllib.request
 
-from .resharding import QuantizationScope, classify_tensor_family
+from .resharding import (
+    QuantizationMetadataError,
+    QuantizationScope,
+    SliceOwnership,
+    SliceRequest,
+    classify_tensor_family,
+    plan_segments,
+)
 
 DEFAULT_REMOTE_HEADER_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
@@ -60,6 +67,26 @@ class TensorManifestEntry:
             "requires_special_handling": self.requires_special_handling,
             "reason": self.reason,
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TensorManifestEntry":
+        return cls(
+            model_name=str(data["model_name"]),
+            model_version=str(data["model_version"]),
+            tensor_name=str(data["tensor_name"]),
+            global_shape=tuple(int(dim) for dim in data["global_shape"]),
+            dtype=str(data["dtype"]),
+            tensor_family=str(data["tensor_family"]),
+            quantization_scope=data.get(
+                "quantization_scope",
+                QuantizationScope.ABSENT,
+            ),
+            layout_tags=dict(data.get("layout_tags", {})),
+            requires_special_handling=bool(
+                data.get("requires_special_handling", False)
+            ),
+            reason=str(data.get("reason", "")),
+        )
 
 
 def extract_qwen_moe_manifest(
@@ -374,6 +401,65 @@ def write_manifest_coverage_artifact(
     )
 
 
+def verify_global_required_zero_copy_fallback(
+    manifest: Iterable[TensorManifestEntry],
+    *,
+    runtime_framework: str = "vllm",
+    tensor_name: str | None = None,
+) -> dict[str, Any]:
+    """Verify real quantization metadata is rejected for zero-copy planning."""
+
+    selected = _select_global_required_entry(manifest, tensor_name=tensor_name)
+    tensor_range = tuple((0, int(dim)) for dim in selected.global_shape)
+    ownership = SliceOwnership(
+        model_name=selected.model_name,
+        model_version=selected.model_version,
+        tensor_name=selected.tensor_name,
+        global_shape=selected.global_shape,
+        dtype=selected.dtype,
+        source_range=tensor_range,
+        worker_id="qwen-fp8-source-worker",
+        source_id="qwen-fp8-source",
+        source_lease="qwen-fp8-lease",
+        nixl_descriptor_id="qwen-fp8-desc",
+        layout_tags=dict(selected.layout_tags),
+        quantization_scope=selected.quantization_scope,
+    )
+    request = SliceRequest(
+        tensor_name=selected.tensor_name,
+        requested_range=tensor_range,
+        target_shape=selected.global_shape,
+        dtype=selected.dtype,
+        target_id=f"{runtime_framework}:{selected.tensor_name}",
+        model_name=selected.model_name,
+        model_version=selected.model_version,
+        runtime_framework=runtime_framework,
+        layout_tags=dict(selected.layout_tags),
+        quantization_scope=QuantizationScope.ABSENT,
+    )
+
+    try:
+        plans = plan_segments([ownership], [request])
+    except QuantizationMetadataError as exc:
+        return {
+            "passed": True,
+            "fallback_required": True,
+            "zero_copy_plan_created": False,
+            "runtime_framework": runtime_framework,
+            "selected_tensor": selected.to_dict(),
+            "planner_error": str(exc),
+        }
+
+    return {
+        "passed": False,
+        "fallback_required": False,
+        "zero_copy_plan_created": True,
+        "runtime_framework": runtime_framework,
+        "selected_tensor": selected.to_dict(),
+        "segment_count": len(plans),
+    }
+
+
 def _shape_and_dtype(value: Any, *, default_dtype: str) -> tuple[tuple[int, ...], str]:
     if isinstance(value, Mapping):
         raw_shape = value.get("global_shape", value.get("shape", ()))
@@ -412,6 +498,23 @@ def _count_by(
             key = str(value)
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _select_global_required_entry(
+    manifest: Iterable[TensorManifestEntry],
+    *,
+    tensor_name: str | None,
+) -> TensorManifestEntry:
+    entries = list(manifest)
+    for entry in entries:
+        if tensor_name is not None and entry.tensor_name != tensor_name:
+            continue
+        if entry.quantization_scope == QuantizationScope.GLOBAL_REQUIRED:
+            return entry
+
+    if tensor_name is not None:
+        raise ValueError(f"{tensor_name!r} is not global-required quantization metadata")
+    raise ValueError("manifest contains no global-required quantization metadata")
 
 
 def _count_source_files(entries: Iterable[TensorManifestEntry]) -> dict[str, int]:

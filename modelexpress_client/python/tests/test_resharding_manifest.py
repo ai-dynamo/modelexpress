@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+from pathlib import Path
 import struct
+
+import pytest
 
 from modelexpress.resharding import QuantizationScope
 from modelexpress.resharding_manifest import (
+    TensorManifestEntry,
     classify_qwen_moe_tensor,
     extract_qwen_moe_manifest,
     extract_qwen_moe_manifest_from_safetensors_files,
@@ -15,6 +20,7 @@ from modelexpress.resharding_manifest import (
     manifest_coverage_summary,
     read_safetensors_header,
     safetensors_header_to_tensor_metadata,
+    verify_global_required_zero_copy_fallback,
     write_manifest_coverage_artifact,
     write_manifest_artifact,
 )
@@ -77,6 +83,23 @@ def test_qwen_per_expert_quantization_metadata_preserves_expert_index():
     assert entry.layout_tags["expert_storage"] == "per-expert-tensor"
     assert entry.layout_tags["moe_expert_index"] == 127
     assert entry.layout_tags["tensor_role"] == "expert-quant-metadata"
+
+
+def test_global_required_quantization_metadata_rejects_zero_copy_plan():
+    entry = classify_qwen_moe_tensor(
+        "model.layers.0.mlp.experts.127.down_proj.weight_scale_inv",
+        {"shape": (1,), "dtype": "float32"},
+        model_name="qwen3-moe-fp8",
+        model_version="step-1",
+    )
+
+    result = verify_global_required_zero_copy_fallback([entry])
+
+    assert result["passed"] is True
+    assert result["fallback_required"] is True
+    assert result["zero_copy_plan_created"] is False
+    assert result["selected_tensor"]["tensor_name"] == entry.tensor_name
+    assert "requires global quantization metadata" in result["planner_error"]
 
 
 def test_qwen_generated_tensor_is_classified_for_target_generation():
@@ -227,3 +250,44 @@ def test_local_safetensors_header_read_and_coverage_artifact(tmp_path):
     assert payload["source"] == {"kind": "local-safetensors"}
     assert payload["summary"]["tensor_count"] == 2
     assert len(payload["entries"]) == 2
+
+
+def test_real_qwen_fp8_manifest_global_required_entry_rejects_zero_copy():
+    artifact = _find_repo_artifact(
+        "artifacts/resharding/qwen3-30b-a3b-fp8-moe-manifest.json.gz"
+    )
+    if artifact is None:
+        pytest.skip("real Qwen FP8 manifest artifact is not available")
+
+    with gzip.open(artifact, "rt", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    global_required_entries = [
+        TensorManifestEntry.from_dict(entry)
+        for entry in payload["entries"]
+        if entry["quantization_scope"] == QuantizationScope.GLOBAL_REQUIRED.value
+    ]
+    assert global_required_entries
+
+    result = verify_global_required_zero_copy_fallback(global_required_entries)
+
+    assert result["passed"] is True
+    assert result["zero_copy_plan_created"] is False
+    assert result["selected_tensor"]["tensor_name"].endswith("weight_scale_inv")
+    assert (
+        result["selected_tensor"]["tensor_family"]
+        == "quantization-global-required-fallback"
+    )
+    assert (
+        result["selected_tensor"]["quantization_scope"]
+        == QuantizationScope.GLOBAL_REQUIRED.value
+    )
+
+
+def _find_repo_artifact(relative_path: str) -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / relative_path
+        if candidate.exists():
+            return candidate
+    return None

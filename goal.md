@@ -132,6 +132,11 @@ Artifacts under `artifacts/resharding/` prove:
   37,491 tensors across 7 shards, including 18,624 real
   `global-required` quantization metadata tensors classified as fallback
   required.
+- A real Qwen3 FP8 fallback smoke proves that a `global-required`
+  `weight_scale_inv` entry from the manifest is rejected by the zero-copy
+  segment planner with `QuantizationMetadataError`, rather than silently
+  producing a NIXL segment plan:
+  `artifacts/resharding/qwen3-30b-a3b-fp8-zero-copy-fallback-smoke.json`.
 - Qwen-style MoE metadata and compatible vLLM/SGLang request metadata are
   represented in planner smoke tests.
 - Receiver-side helpers now build `SliceRequest`s from runtime-owned torch
@@ -157,7 +162,8 @@ The current POC does **not** prove:
 - Multi-pod cross-node refit.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
-- Real quantized Qwen tensor installation when global metadata is required.
+- Runtime fallback installation of real quantized Qwen tensors after
+  `global-required` metadata is detected.
 - Hierarchical fanout to many rollout replicas.
 - Versioned rollback using multiple GPU-resident training steps.
 - Performance competitiveness against NCCL Reshard, CheckpointEngine, Mooncake,
@@ -261,6 +267,8 @@ Current evidence:
   `artifacts/resharding/qwen3-30b-a3b-moe-manifest.json.gz`.
 - Real Qwen3-30B-A3B-FP8 safetensors-header coverage artifact:
   `artifacts/resharding/qwen3-30b-a3b-fp8-moe-manifest.json.gz`.
+- Real Qwen3-30B-A3B-FP8 zero-copy fallback smoke:
+  `artifacts/resharding/qwen3-30b-a3b-fp8-zero-copy-fallback-smoke.json`.
 
 Remaining gap:
 
@@ -294,7 +302,7 @@ Current partial evidence:
   vLLM-shaped and SGLang-shaped runtime tensor install smokes on nscale.
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
-  (`269 passed, 19 skipped`).
+  (`272 passed, 19 skipped`).
 
 ### Level 5: Competitive Benchmark
 
@@ -329,8 +337,8 @@ These are the next useful things to do, in order:
    integration with each engine's post-load/refit lifecycle.
 4. Add a real vLLM receiver artifact and a real SGLang receiver artifact after
    the cold-load path is stable.
-5. Add a quantized Qwen install fallback smoke that proves real
-   `GLOBAL_REQUIRED` metadata triggers fallback rather than zero-copy.
+5. Implement the actual quantized Qwen fallback install path after
+   `GLOBAL_REQUIRED` metadata is detected.
 6. Add a fanout simulator and nscale fanout microbenchmark for rollout replicas.
 7. Run a first competitive timing table against a baseline all-gather/cat path
    and a direct NCCL P2P path.

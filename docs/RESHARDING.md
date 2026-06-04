@@ -85,6 +85,10 @@ coverage artifact is
 `artifacts/resharding/qwen3-30b-a3b-fp8-moe-manifest.json.gz`, generated from
 `Qwen/Qwen3-30B-A3B-FP8` headers across all 7 shards; it includes real
 `weight_scale_inv` tensors classified as `global-required` fallback metadata.
+The artifact `qwen3-30b-a3b-fp8-zero-copy-fallback-smoke.json` verifies that a
+real `global-required` `weight_scale_inv` tensor is rejected by the zero-copy
+planner with `QuantizationMetadataError`; the runtime fallback install path is
+still future work.
 
 Receiver-side runtime tensor helpers live in
 `modelexpress.resharding_receiver`. They convert framework-owned torch tensors
@@ -132,8 +136,9 @@ planned target offsets; multi-pod cross-node refit and live MX metadata driving
 the NIXL data plane in a completed GPU run are still future gates. The partial
 Level 3 control-plane evidence is in `nscale-control-plane-pytest.log`,
 `docker-rust-p2p-tests.log`, `nscale-live-control-plane.log`, and
-`nscale-live-mx-nixl-capacity.log`. Qwen BF16/FP8 safetensors-header extraction
-and receiver-side runtime tensor install smokes are covered by
+`nscale-live-mx-nixl-capacity.log`. Qwen BF16/FP8 safetensors-header extraction,
+real FP8 zero-copy fallback, and receiver-side runtime tensor install smokes
+are covered by
 `nscale-python-full-pytest.log`.
 
 ## Metrics

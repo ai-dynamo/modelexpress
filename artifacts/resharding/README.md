@@ -27,8 +27,11 @@ Files:
   gate covering planner, control-plane helpers, live-control-plane opt-in skip,
   and Qwen/safetensors manifest extraction (`24 passed, 1 skipped`).
 - `nscale-python-full-pytest.log`: full nscale Python 3.12 package test tree
-  after the safetensors/Qwen BF16+FP8 manifest and receiver-install smoke
-  changes (`270 passed, 19 skipped`).
+  after the safetensors/Qwen BF16+FP8 manifest, FP8 zero-copy fallback, and
+  receiver-install smoke changes (`272 passed, 19 skipped`).
+- `nscale-qwen-fp8-fallback-pytest.log`: focused nscale Python 3.12 gate for
+  Qwen manifest extraction plus the real FP8 zero-copy fallback smoke
+  (`10 passed`).
 - `docker-rust-p2p-tests.log`: Dockerized Rust server p2p unit-test summary
   covering proto/backend/service slice ownership round trips.
 - `nscale-live-control-plane.log`: nscale live central MX server smoke. A
@@ -50,6 +53,9 @@ Files:
   Qwen/Qwen3-30B-A3B-FP8 safetensors-header coverage artifact generated through
   HTTP range reads over all 7 checkpoint shards. It covers 37,491 tensors,
   including 18,624 real `global-required` quantization metadata tensors.
+- `qwen3-30b-a3b-fp8-zero-copy-fallback-smoke.json`: real FP8 manifest smoke
+  showing a `global-required` `weight_scale_inv` entry raises
+  `QuantizationMetadataError` and no zero-copy segment plan is created.
 - Qwen MoE manifest extraction is covered by the Python gate. It classifies
   stacked expert-axis tensors, per-expert tensor-name layouts, global
   quantization metadata, generated-on-target tensors, and layout-sensitive
