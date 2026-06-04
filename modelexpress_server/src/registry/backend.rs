@@ -12,6 +12,8 @@ use modelexpress_common::models::{ModelProvider, ModelStatus};
 use std::sync::Arc;
 
 pub mod kubernetes;
+#[cfg(feature = "memory-backend")]
+pub mod memory;
 pub mod redis;
 
 /// Result type for registry operations. Errors are boxed so backend-specific error types
@@ -116,6 +118,12 @@ pub async fn create_registry_backend(
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesRegistryBackend::new(&namespace).await?;
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn RegistryBackend>)
+        }
+        #[cfg(feature = "memory-backend")]
+        BackendConfig::Memory => {
+            let backend = memory::InMemoryRegistryBackend::new();
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn RegistryBackend>)
         }

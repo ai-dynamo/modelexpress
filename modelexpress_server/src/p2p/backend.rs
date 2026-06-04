@@ -3,17 +3,21 @@
 
 //! Metadata backend abstraction for P2P model metadata.
 //!
-//! Supports two persistent backends:
+//! Backends:
 //! - **Redis**: Persistent storage via Redis keys + atomic Lua merge
 //! - **Kubernetes**: CRDs and ConfigMaps for native K8s integration
+//! - **Memory** (`memory-backend` feature): non-persistent, single-process, for tests
+//!   and local dev
 //!
-//! Select the backend via `MX_METADATA_BACKEND=redis` or `MX_METADATA_BACKEND=kubernetes`.
+//! Select the backend via `MX_METADATA_BACKEND=redis`, `=kubernetes`, or `=memory`.
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus, WorkerMetadata};
 use std::sync::Arc;
 
 pub mod kubernetes;
+#[cfg(feature = "memory-backend")]
+pub mod memory;
 pub mod redis;
 
 /// Result type for metadata operations
@@ -232,7 +236,8 @@ pub trait MetadataBackend: Send + Sync {
 
     /// List available workers, optionally filtered by source_id and status.
     /// `source_id`: if `Some`, return only workers for that source; if `None`, all sources.
-    /// `status_filter`: if `Some(s)`, return only workers where all workers have status `s`.
+    /// `status_filter`: if `Some(s)`, return only workers where at least one rank has
+    /// status `s`.
     async fn list_workers(
         &self,
         source_id: Option<String>,
@@ -272,6 +277,12 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
         }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesBackend::new(&namespace).await?;
+            backend.connect().await?;
+            Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
+        }
+        #[cfg(feature = "memory-backend")]
+        BackendConfig::Memory => {
+            let backend = memory::InMemoryMetadataBackend::new();
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }

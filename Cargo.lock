@@ -2458,6 +2458,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "mockall 0.14.0",
+ "modelexpress-client",
  "modelexpress-common",
  "once_cell",
  "prost 0.13.5",

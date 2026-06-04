@@ -82,6 +82,9 @@ jobs:
     - name: Run unit tests
       run: cargo test --verbose --lib
 
+    - name: Run server memory-backend unit tests
+      run: cargo test -p modelexpress-server --features memory-backend --lib
+
     - name: Build release
       run: cargo build --release --verbose
 
