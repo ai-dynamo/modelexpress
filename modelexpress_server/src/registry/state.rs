@@ -18,20 +18,7 @@ pub struct RegistryManager {
     config: Option<BackendConfig>,
 }
 
-impl Default for RegistryManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RegistryManager {
-    pub fn new() -> Self {
-        Self {
-            backend: Arc::new(RwLock::new(None)),
-            config: BackendConfig::from_env().ok(),
-        }
-    }
-
     pub fn with_config(config: BackendConfig) -> Self {
         Self {
             backend: Arc::new(RwLock::new(None)),

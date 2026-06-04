@@ -15,6 +15,7 @@ use modelexpress_common::grpc::{
 use tonic::transport::Server;
 use tracing::{error, info};
 
+use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
 use crate::config::ServerConfig;
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
@@ -33,9 +34,11 @@ const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 /// caller's responsibility: install a subscriber before calling this.
 ///
 /// All server state (registry, download tracker, P2P) is instance-scoped, so this
-/// can be called multiple times in one process, including concurrently.
+/// can be called multiple times in one process, including concurrently. The metadata
+/// `backend` is injected by the caller, so this never reads process env itself.
 pub async fn run_server(
     config: ServerConfig,
+    backend: BackendConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting ModelExpress server...");
@@ -48,10 +51,10 @@ pub async fn run_server(
     })?;
 
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
-    // MX_METADATA_BACKEND selector with the P2P state manager below.
-    let registry = Arc::new(RegistryManager::new());
+    // injected backend with the P2P state manager below.
+    let registry = Arc::new(RegistryManager::with_config(backend.clone()));
     match tokio::time::timeout(std::time::Duration::from_secs(10), registry.connect()).await {
-        Ok(Ok(backend)) => info!("Model registry connected (backend: {backend})"),
+        Ok(Ok(backend_name)) => info!("Model registry connected (backend: {backend_name})"),
         Ok(Err(e)) => {
             error!("Failed to connect to model registry backend: {}", e);
             return Err(e.to_string().into());
@@ -109,10 +112,10 @@ pub async fn run_server(
         .await;
 
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
-    let p2p_state = Arc::new(P2pStateManager::new());
+    let p2p_state = Arc::new(P2pStateManager::with_config(backend));
 
     match tokio::time::timeout(std::time::Duration::from_secs(10), p2p_state.connect()).await {
-        Ok(Ok(backend)) => info!("P2P state manager connected (backend: {backend})"),
+        Ok(Ok(backend_name)) => info!("P2P state manager connected (backend: {backend_name})"),
         Ok(Err(e)) => {
             error!("Failed to connect to P2P metadata backend: {}", e);
             return Err(e);

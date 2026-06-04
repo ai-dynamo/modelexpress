@@ -28,24 +28,7 @@ pub struct P2pStateManager {
     config: Option<BackendConfig>,
 }
 
-impl Default for P2pStateManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl P2pStateManager {
-    /// Create a new state manager, resolving backend config from the environment.
-    ///
-    /// Configure via `MX_METADATA_BACKEND` (required) and `REDIS_URL` /
-    /// `MX_REDIS_HOST` / `MX_REDIS_PORT` (for Redis).
-    pub fn new() -> Self {
-        Self {
-            backend: Arc::new(RwLock::new(None)),
-            config: BackendConfig::from_env().ok(),
-        }
-    }
-
     /// Create a new state manager with an explicit backend configuration.
     pub fn with_config(config: BackendConfig) -> Self {
         Self {
