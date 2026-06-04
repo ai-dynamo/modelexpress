@@ -1,0 +1,45 @@
+Name:             mx-vllm-receiver-live-1780602014
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           run=mx-vllm-receiver-live-1780602014
+Annotations:      <none>
+Status:           Pending
+IP:               
+IPs:              <none>
+Containers:
+  smoke:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      bash
+      -lc
+      set -euo pipefail; nvidia-smi; if ! command -v git >/dev/null 2>&1; then apt-get update && apt-get install -y --no-install-recommends git ca-certificates; fi; rm -rf /tmp/modelexpress; git clone --branch mx-rl-resharding-planner-poc --single-branch https://github.com/ai-dynamo/modelexpress.git /tmp/modelexpress; cd /tmp/modelexpress; git rev-parse HEAD; PYTHONPATH=modelexpress_client/python python3 -m modelexpress.refit_vllm_receiver_smoke --artifact-path /tmp/nscale-live-vllm-receiver-smoke.json --model-name mx-live-vllm-receiver-smoke --model-version step-live-vllm-receiver; echo MX_VLLM_RECEIVER_ARTIFACT_START; cat /tmp/nscale-live-vllm-receiver-smoke.json; echo MX_VLLM_RECEIVER_ARTIFACT_END
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-4q4pr (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False 
+Volumes:
+  kube-api-access-4q4pr:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age   From                Message
+  ----     ------             ----  ----                -------
+  Warning  FailedScheduling   76s   default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  66s   cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached

@@ -1,0 +1,1 @@
+MX_SGLANG_RECEIVER_SMOKE_RESULT {"allclose": true, "checksum_matches": true, "real_runtime_engine_used": false, "result": "pass", "runtime_framework": "sglang", "segment_count": 2, "target_tensor_name": "model.embed_tokens.weight", "trainer_to_inference_bytes": 128}

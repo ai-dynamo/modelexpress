@@ -1,0 +1,22 @@
+{
+  "autoscaler_message": "pod didn't trigger scale-up: 1 max node group size reached",
+  "branch": "mx-rl-resharding-planner-poc",
+  "capacity_blocked": true,
+  "claim_scope": "Current-branch live vLLM receiver smoke remains unproven because this submitted 1-GPU pod did not schedule and no checksum/allclose artifact was produced. A later SGLang GPU import probe with the nvidia.com/gpu toleration did schedule, so this artifact must not be generalized as a cluster-wide 1-GPU capacity outage.",
+  "cluster_wide_gpu_capacity_claim": false,
+  "commit": "0421d6e68f15c395544a555455c47a3ae4610b7b",
+  "image": "docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a",
+  "later_sglang_gpu_import_probe_with_gpu_toleration_scheduled": true,
+  "live_vllm_receiver_gpu_smoke_pass": false,
+  "log_artifact": "nscale-live-vllm-receiver-smoke-capacity-block-20260604.log",
+  "mode": "live-vllm-receiver-owned-tensor-smoke-current-branch-gpu-probe",
+  "namespace": "anish-dynamo",
+  "pod": "mx-vllm-receiver-live-1780602014",
+  "requested_gpus": 1,
+  "result": "blocked",
+  "run_id": "mx-vllm-receiver-live-1780602014",
+  "scheduler_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+  "schema_version": 1,
+  "submitted_gpu_toleration_nvidia_gpu": false,
+  "supersedes_previous_capacity_probe": "nscale-vllm-receiver-smoke-capacity-block.json"
+}

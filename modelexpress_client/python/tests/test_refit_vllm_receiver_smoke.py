@@ -41,12 +41,21 @@ def test_vllm_receiver_smoke_installs_and_restores_runtime_owned_tensor(tmp_path
 
     assert result["result"] == "pass"
     assert result["runtime_framework"] == "vllm"
+    assert result["framework_version"] == "unit-test"
     assert result["target_tensor_name"] == "lm_head.weight"
+    assert result["target_key"] == "vllm:lm_head.weight"
+    assert result["request"]["runtime_framework"] == "vllm"
+    assert result["request"]["layout_tags"]["runtime_module_path"] == "unit.llm.model"
+    assert result["request"]["layout_tags"]["vllm_tensor_name"] == "lm_head.weight"
     assert result["proof"]["vllm_owned_target_tensor"] is True
+    assert result["proof"]["runtime_owned_target_tensor"] is True
     assert result["proof"]["receiver_request_from_runtime_owned_tensor"] is True
     assert result["proof"]["target_slice_spans_multiple_trainers"] is True
     assert result["proof"]["receiver_installed_into_vllm_owned_tensor"] is True
+    assert result["proof"]["receiver_installed_into_runtime_owned_tensor"] is True
     assert result["proof"]["restored_original_tensor"] is True
+    assert result["proof"]["runtime_imported"] is False
+    assert result["proof"]["real_runtime_engine_used"] is False
     assert result["proof"]["actual_nixl_reads_used"] is False
     assert result["proof"]["synthetic_trainer_payloads_used"] is True
     assert [plan["source_id"] for plan in result["segment_plans"]] == [

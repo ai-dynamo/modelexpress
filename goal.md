@@ -278,9 +278,10 @@ The current POC does **not** prove:
 
 - Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
 - Live vLLM or SGLang process integration where the real engine owns the
-  post-load/refit lifecycle. A current-branch vLLM receiver smoke CLI now exists,
-  but the first 1-GPU live-vLLM probe was capacity-blocked and did not produce a
-  live runtime checksum artifact.
+  post-load/refit lifecycle. The current-branch vLLM receiver smoke CLI exists,
+  but the live vLLM pod attempt did not produce a checksum/allclose artifact.
+  SGLang now has receiver-shaped module proof plus CUDA import proof, but no
+  live SGLang engine-owned refit artifact.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -480,18 +481,35 @@ Current partial evidence:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
 - `modelexpress.refit_vllm_receiver_smoke` now provides a current-branch vLLM
-  receiver-owned tensor smoke CLI. It loads or creates a tiny vLLM-compatible
-  model, locates an in-process vLLM `torch.nn.Module`, builds a receiver-side
-  `SliceRequest` from a live parameter tensor, plans two synthetic trainer-held
-  source ranges, installs planned payloads into that vLLM-owned tensor, validates
-  checksum/allclose, and restores the original tensor. Focused nscale tests:
-  `artifacts/resharding/nscale-vllm-receiver-smoke-pytest.log` (`4 passed`).
-  This is code-path and module-owned tensor evidence, not a live GPU vLLM proof.
-- A 1-GPU live vLLM receiver smoke probe was attempted but capacity-blocked:
-  `artifacts/resharding/nscale-vllm-receiver-smoke-capacity-block.json` and
-  `.log` record `0/29 nodes`, `10 Insufficient nvidia.com/gpu`, `19` untolerated
-  taints, and autoscaler max node group size reached. The live vLLM receiver
-  checksum artifact remains unproven.
+  receiver-owned tensor smoke CLI and a framework-explicit module helper. The
+  live vLLM entrypoint loads or creates a tiny vLLM-compatible model, locates an
+  in-process vLLM `torch.nn.Module`, builds a receiver-side `SliceRequest` from
+  a live parameter tensor, plans two synthetic trainer-held source ranges,
+  installs planned payloads into that vLLM-owned tensor, validates
+  checksum/allclose, and restores the original tensor. Existing focused nscale
+  tests: `artifacts/resharding/nscale-vllm-receiver-smoke-pytest.log`. This is
+  code-path and module-owned tensor evidence until a live GPU vLLM checksum
+  artifact is banked.
+- `modelexpress.refit_sglang_receiver_smoke` wraps the same helper with SGLang
+  runtime metadata. `artifacts/resharding/nscale-sglang-receiver-smoke.json`
+  proves an SGLang-shaped module-owned tensor path: the receiver request is
+  tagged `runtime_framework=sglang`, the target slice spans two synthetic
+  trainer holders, install validates checksum/allclose, and the original tensor
+  is restored. It records `real_runtime_engine_used=false`, so it is not a live
+  SGLang engine-owned refit proof.
+- SGLang runtime availability is now separately banked.
+  `artifacts/resharding/nscale-sglang-runtime-import-probe.json` verifies
+  `torch`, `sglang`, and `sglang.srt` import in the nscale SGLang runtime
+  builder pod. `artifacts/resharding/nscale-sglang-gpu-import-smoke.json` uses
+  the Docker-published SGLang image in a 1-GPU nscale pod, sees CUDA with one
+  device, and imports SGLang. This is availability evidence only.
+- A current-branch 1-GPU live vLLM receiver smoke pod was attempted under its
+  submitted spec and did not schedule:
+  `artifacts/resharding/nscale-live-vllm-receiver-smoke-capacity-block-20260604.json`
+  and `.log`. Because the later SGLang GPU import probe used the
+  `nvidia.com/gpu` toleration and did schedule, this vLLM block is scoped to the
+  submitted pod spec and must not be generalized as cluster-wide 1-GPU capacity
+  exhaustion. The live vLLM receiver checksum artifact remains unproven.
 
 ### Level 5: Competitive Benchmark
 
@@ -555,9 +573,10 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Re-run `modelexpress.refit_vllm_receiver_smoke` when a 1-GPU nscale slot is
-   schedulable and bank a live vLLM receiver checksum/allclose artifact, then
-   replicate the same receiver-owned tensor shape against an SGLang image.
+1. Re-run `modelexpress.refit_vllm_receiver_smoke` with the correct GPU
+   toleration/scheduling spec and bank a live vLLM receiver checksum/allclose
+   artifact, then wire the SGLang wrapper to a real SGLang engine-owned module
+   instead of the current SGLang-shaped module smoke.
 2. Promote the receiver tensor install smoke into full live vLLM and SGLang
    process integration with each engine's post-load/refit lifecycle, using the
    same source-published ownership and receiver-side request path.
@@ -596,7 +615,8 @@ Safe claim:
 > metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes. A
 > CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
 > CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
-> scenario.
+> scenario. SGLang has module-shaped receiver install evidence and a separate
+> one-GPU CUDA import smoke, but no live SGLang engine-owned refit claim.
 
 Unsafe claim:
 

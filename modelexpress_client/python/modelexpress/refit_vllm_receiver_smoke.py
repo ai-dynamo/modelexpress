@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Live vLLM receiver-owned tensor refit smoke.
+"""Receiver-owned tensor refit smoke helpers.
 
-The Level-4 goal is a real trainer-to-vLLM/SGLang refit path. This module is a
-small vLLM-side proof step: load a vLLM-owned model module, build receiver-side
-``SliceRequest`` metadata from one live parameter tensor, plan two synthetic
-trainer-held source ranges, install the planned payloads into the vLLM-owned
-tensor, validate checksum/allclose, and restore the original tensor.
+The Level-4 goal is a real trainer-to-vLLM/SGLang refit path. This module keeps
+the live vLLM entrypoint and exposes a framework-explicit module helper used by
+SGLang-shaped tests: build receiver-side ``SliceRequest`` metadata from one
+runtime-owned parameter tensor, plan two synthetic trainer-held source ranges,
+install the planned payloads into that runtime-owned tensor, validate
+checksum/allclose, and restore the original tensor.
 
 It intentionally does not claim NIXL data-plane transfer or trainer integration;
 those are covered by separate Level-2/3 synthetic proofs and remain future
@@ -92,17 +93,21 @@ def _source_ownerships_for_tensor(
     tensor: torch.Tensor,
     model_name: str,
     model_version: str,
+    runtime_framework: str = "vllm",
 ) -> list[SliceOwnership]:
     if tensor.ndim < 2:
-        raise ValueError("vLLM receiver smoke needs a rank-2-or-higher tensor")
+        raise ValueError(
+            f"{runtime_framework} receiver smoke needs a rank-2-or-higher tensor"
+        )
     rows = int(tensor.shape[0])
     if rows < 2:
-        raise ValueError("vLLM receiver smoke needs at least two rows")
+        raise ValueError(f"{runtime_framework} receiver smoke needs at least two rows")
 
     split = max(1, rows // 2)
     full_shape = _shape(tensor)
     trailing_ranges = tuple((0, int(dim)) for dim in full_shape[1:])
     dtype = _torch_dtype_name(tensor.dtype)
+    mode_slug = runtime_framework.replace("_", "-")
     return [
         SliceOwnership(
             model_name=model_name,
@@ -114,8 +119,8 @@ def _source_ownerships_for_tensor(
             worker_id="trainer-rank0-worker",
             source_id="trainer-rank0",
             worker_rank=0,
-            source_lease="trainer-rank0-live-vllm-receiver-smoke",
-            nixl_descriptor_id="trainer-rank0-live-vllm-receiver-smoke",
+            source_lease=f"trainer-rank0-live-{mode_slug}-receiver-smoke",
+            nixl_descriptor_id=f"trainer-rank0-live-{mode_slug}-receiver-smoke",
             layout_tags={
                 "trainer_layout": "synthetic-fsdp",
                 "storage_layout": "row-major",
@@ -132,8 +137,8 @@ def _source_ownerships_for_tensor(
             worker_id="trainer-rank1-worker",
             source_id="trainer-rank1",
             worker_rank=1,
-            source_lease="trainer-rank1-live-vllm-receiver-smoke",
-            nixl_descriptor_id="trainer-rank1-live-vllm-receiver-smoke",
+            source_lease=f"trainer-rank1-live-{mode_slug}-receiver-smoke",
+            nixl_descriptor_id=f"trainer-rank1-live-{mode_slug}-receiver-smoke",
             layout_tags={
                 "trainer_layout": "synthetic-fsdp",
                 "storage_layout": "row-major",
@@ -312,12 +317,24 @@ def run_receiver_refit_on_module(
     model_name: str,
     model_version: str,
     module_path: str,
-    vllm_version: str,
+    vllm_version: str = "",
+    runtime_framework: str = "vllm",
+    framework_version: str | None = None,
+    runtime_imported: bool = False,
+    real_runtime_engine_used: bool = False,
     preferred_tensor_name: str = "",
     artifact_path: str | Path | None = None,
     mode: str = "live-vllm-receiver-owned-tensor-smoke",
     model_path: str = "",
 ) -> dict[str, Any]:
+    runtime_framework = runtime_framework.strip().lower()
+    if not runtime_framework:
+        raise ValueError("runtime_framework is required")
+    if framework_version is None:
+        framework_version = vllm_version if runtime_framework == "vllm" else ""
+    if not framework_version:
+        framework_version = "unknown"
+
     tensor_name, target_tensor = _select_refit_tensor(
         module.named_parameters(),
         preferred_name=preferred_tensor_name,
@@ -332,12 +349,14 @@ def run_receiver_refit_on_module(
         {tensor_name: target_tensor},
         model_name=model_name,
         model_version=model_version,
-        runtime_framework="vllm",
-        target_id_prefix="vllm",
+        runtime_framework=runtime_framework,
+        target_id_prefix=runtime_framework,
         layout_tags_by_tensor={
             tensor_name: {
-                "vllm_module_path": module_path,
-                "vllm_tensor_name": tensor_name,
+                "runtime_module_path": module_path,
+                "runtime_tensor_name": tensor_name,
+                f"{runtime_framework}_module_path": module_path,
+                f"{runtime_framework}_tensor_name": tensor_name,
                 "runtime_lifecycle": "post-load-refit-smoke",
             }
         },
@@ -350,6 +369,7 @@ def run_receiver_refit_on_module(
         tensor=target_tensor,
         model_name=model_name,
         model_version=model_version,
+        runtime_framework=runtime_framework,
     )
     plans = plan_segments(owners, requests)
     planner_duration_ms = (time.perf_counter() - planner_start) * 1000
@@ -386,14 +406,39 @@ def run_receiver_refit_on_module(
     restore_duration_ms = (time.perf_counter() - restore_start) * 1000
     restored_original = _tensor_close(target_tensor, original)
 
+    proof = {
+        f"{runtime_framework}_imported": bool(runtime_imported),
+        f"{runtime_framework}_owned_target_tensor": True,
+        f"receiver_installed_into_{runtime_framework}_owned_tensor": allclose,
+        "runtime_imported": bool(runtime_imported),
+        "runtime_owned_target_tensor": True,
+        "receiver_request_from_runtime_owned_tensor": True,
+        "target_slice_spans_multiple_trainers": len({plan.source_id for plan in plans})
+        >= 2,
+        "receiver_installed_into_runtime_owned_tensor": allclose,
+        "checksum_gate": checksum_matches,
+        "allclose": allclose,
+        "restored_original_tensor": restored_original,
+        "trainer_full_all_gather_used": False,
+        "trainer_side_inference_layout_conversion_used": False,
+        "host_side_torch_cat_used": False,
+        "actual_nixl_reads_used": False,
+        "synthetic_trainer_payloads_used": True,
+        "real_trainer_process_used": False,
+        "real_runtime_engine_used": bool(real_runtime_engine_used),
+    }
+
     result = {
         "schema_version": 1,
         "result": (
             "pass" if allclose and checksum_matches and restored_original else "fail"
         ),
         "mode": mode,
-        "runtime_framework": "vllm",
-        "vllm_version": vllm_version,
+        "runtime_framework": runtime_framework,
+        "framework_version": framework_version,
+        "vllm_version": (
+            framework_version if runtime_framework == "vllm" else vllm_version
+        ),
         "model_name": model_name,
         "model_version": model_version,
         "model_path": model_path,
@@ -408,25 +453,7 @@ def run_receiver_refit_on_module(
         "source_ownerships": [owner.to_dict() for owner in owners],
         "segment_plans": [plan.to_dict() for plan in plans],
         "installed_segments": [segment.__dict__ for segment in installed],
-        "proof": {
-            "vllm_imported": True,
-            "vllm_owned_target_tensor": True,
-            "receiver_request_from_runtime_owned_tensor": True,
-            "target_slice_spans_multiple_trainers": len(
-                {plan.source_id for plan in plans}
-            )
-            >= 2,
-            "receiver_installed_into_vllm_owned_tensor": allclose,
-            "checksum_gate": checksum_matches,
-            "allclose": allclose,
-            "restored_original_tensor": restored_original,
-            "trainer_full_all_gather_used": False,
-            "trainer_side_inference_layout_conversion_used": False,
-            "host_side_torch_cat_used": False,
-            "actual_nixl_reads_used": False,
-            "synthetic_trainer_payloads_used": True,
-            "real_trainer_process_used": False,
-        },
+        "proof": proof,
         "validation": {
             "allclose": allclose,
             "checksum": checksum,
@@ -450,11 +477,14 @@ def run_receiver_refit_on_module(
             "target_tensor_bytes": _nbytes(target_tensor),
         },
     }
+    if runtime_framework != "vllm":
+        result[f"{runtime_framework}_version"] = framework_version
     if artifact_path is not None:
         _write_artifact(result, artifact_path)
     if result["result"] != "pass":
         raise RuntimeError(
-            f"vLLM receiver smoke failed: {json.dumps(result, default=_json_default)}"
+            f"{runtime_framework} receiver smoke failed: "
+            f"{json.dumps(result, default=_json_default)}"
         )
     return result
 
@@ -498,6 +528,10 @@ def main() -> None:
         model_version=args.model_version,
         module_path=module_path,
         vllm_version=getattr(vllm, "__version__", "unknown"),
+        runtime_framework="vllm",
+        framework_version=getattr(vllm, "__version__", "unknown"),
+        runtime_imported=True,
+        real_runtime_engine_used=True,
         preferred_tensor_name=args.preferred_tensor_name,
         artifact_path=args.artifact_path,
         model_path=model_path,

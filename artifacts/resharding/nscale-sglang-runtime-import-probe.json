@@ -1,0 +1,22 @@
+{
+  "branch": "mx-rl-resharding-planner-poc",
+  "claim_scope": "SGLang package import is available in the nscale SGLang runtime image; this is not a live SGLang engine-owned refit artifact.",
+  "commit": "0421d6e68f15c395544a555455c47a3ae4610b7b",
+  "gpu_requested": false,
+  "image": "dynamoci.azurecr.io/ai-dynamo/dynamo:9390098fc50066b5715f7441e5b914db95a65451-sglang-runtime-cuda13",
+  "live_sglang_engine_refit_proven": false,
+  "log_artifact": "nscale-sglang-runtime-import-probe.log",
+  "mode": "sglang-runtime-import-probe",
+  "namespace": "anish-dynamo",
+  "pod": "sgl-gr-builder",
+  "python_version_line": "Python 3.12.3",
+  "receiver_owned_tensor_refit_proven_by": "modelexpress.refit_sglang_receiver_smoke unit smoke",
+  "result": "pass",
+  "schema_version": 1,
+  "sglang_import_pass": true,
+  "sglang_srt_import_pass": true,
+  "sglang_srt_version": "0.5.11",
+  "sglang_version": "0.5.11",
+  "torch_import_pass": true,
+  "torch_version": "2.11.0+cu130"
+}

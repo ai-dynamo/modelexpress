@@ -1,0 +1,88 @@
+NAME                              READY   STATUS      RESTARTS   AGE    IP            NODE                                         NOMINATED NODE   READINESS GATES
+mx-sglang-gpu-import-1780602673   0/1     Completed   0          3m3s   10.0.20.189   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+--- describe ---
+Name:             mx-sglang-gpu-import-1780602673
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Thu, 04 Jun 2026 21:51:17 +0200
+Labels:           app=mx-sglang-gpu-import
+Annotations:      <none>
+Status:           Succeeded
+IP:               10.0.20.189
+IPs:
+  IP:  10.0.20.189
+Containers:
+  smoke:
+    Container ID:  containerd://02cdc05f860e6ea0072cdc3c374b8307b675b466383973757414327d4abf0422
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      bash
+      -lc
+    Args:
+      set -euo pipefail
+      python3 - <<'PY'
+      import json
+      import torch
+      import sglang
+      import sglang.srt
+      payload = {
+          "result": "pass",
+          "torch_version": getattr(torch, "__version__", "unknown"),
+          "sglang_version": getattr(sglang, "__version__", "unknown"),
+          "sglang_srt_version": getattr(sglang.srt, "__version__", getattr(sglang, "__version__", "unknown")),
+          "cuda_available": bool(torch.cuda.is_available()),
+          "cuda_device_count": int(torch.cuda.device_count()),
+      }
+      print("MX_SGLANG_GPU_IMPORT " + json.dumps(payload, sort_keys=True), flush=True)
+      PY
+      
+    State:          Terminated
+      Reason:       Completed
+      Exit Code:    0
+      Started:      Thu, 04 Jun 2026 21:53:39 +0200
+      Finished:     Thu, 04 Jun 2026 21:53:50 +0200
+    Ready:          False
+    Restart Count:  0
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:       <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-7qt9s (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   False 
+  Initialized                 True 
+  Ready                       False 
+  ContainersReady             False 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-7qt9s:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  3m5s  default-scheduler  Successfully assigned anish-dynamo/mx-sglang-gpu-import-1780602673 to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+  Normal  Pulling    3m4s  kubelet            Pulling image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90"
+  Normal  Pulled     43s   kubelet            Successfully pulled image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" in 2m21.05s (2m21.05s including waiting). Image size: 13089678644 bytes.
+  Normal  Created    43s   kubelet            Created container: smoke
+  Normal  Started    43s   kubelet            Started container smoke
+--- logs ---
+/usr/local/lib/python3.12/dist-packages/torchao/quantization/quant_api.py:1731: SyntaxWarning: invalid escape sequence '\.'
+  """Configuration class for applying different quantization configs to modules or parameters based on their fully qualified names (FQNs).
+MX_SGLANG_GPU_IMPORT {"cuda_available": true, "cuda_device_count": 1, "result": "pass", "sglang_srt_version": "0.0.0.dev1+g229cadec0", "sglang_version": "0.0.0.dev1+g229cadec0", "torch_version": "2.11.0+cu130"}

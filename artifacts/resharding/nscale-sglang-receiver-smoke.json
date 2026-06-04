@@ -1,0 +1,277 @@
+{
+  "framework_version": "unit-shaped-smoke",
+  "installed_segments": [
+    {
+      "bytes": 64,
+      "source_id": "trainer-rank0",
+      "target_key": "sglang:model.embed_tokens.weight",
+      "target_range": [
+        [
+          0,
+          4
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "tensor_name": "model.embed_tokens.weight"
+    },
+    {
+      "bytes": 64,
+      "source_id": "trainer-rank1",
+      "target_key": "sglang:model.embed_tokens.weight",
+      "target_range": [
+        [
+          4,
+          8
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "tensor_name": "model.embed_tokens.weight"
+    }
+  ],
+  "metrics": {
+    "activation_install_duration_ms": 0.04828255623579025,
+    "planner_duration_ms": 0.12551341205835342,
+    "request_build_duration_ms": 0.042848289012908936,
+    "restore_duration_ms": 0.006787478923797607,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "model.embed_tokens.weight": 2
+    },
+    "target_tensor_bytes": 128,
+    "trainer_to_inference_bytes": 128
+  },
+  "mode": "sglang-receiver-owned-tensor-smoke",
+  "model_name": "mx-sglang-receiver-shaped-smoke",
+  "model_path": "",
+  "model_version": "step-sglang-receiver-shaped",
+  "module_class": "TinySglangOwnedModule",
+  "module_path": "artifact.sglang.model",
+  "proof": {
+    "actual_nixl_reads_used": false,
+    "allclose": true,
+    "checksum_gate": true,
+    "host_side_torch_cat_used": false,
+    "real_runtime_engine_used": false,
+    "real_trainer_process_used": false,
+    "receiver_installed_into_runtime_owned_tensor": true,
+    "receiver_installed_into_sglang_owned_tensor": true,
+    "receiver_request_from_runtime_owned_tensor": true,
+    "restored_original_tensor": true,
+    "runtime_imported": false,
+    "runtime_owned_target_tensor": true,
+    "sglang_imported": false,
+    "sglang_owned_target_tensor": true,
+    "synthetic_trainer_payloads_used": true,
+    "target_slice_spans_multiple_trainers": true,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false
+  },
+  "request": {
+    "destination_strides": [
+      4,
+      1
+    ],
+    "dtype": "float32",
+    "element_size_bytes": 4,
+    "layout_tags": {
+      "runtime_framework": "sglang",
+      "runtime_lifecycle": "post-load-refit-smoke",
+      "runtime_module_path": "artifact.sglang.model",
+      "runtime_tensor_name": "model.embed_tokens.weight",
+      "sglang_module_path": "artifact.sglang.model",
+      "sglang_tensor_name": "model.embed_tokens.weight",
+      "storage_layout": "row-major",
+      "target_contiguous": true
+    },
+    "model_name": "mx-sglang-receiver-shaped-smoke",
+    "model_version": "step-sglang-receiver-shaped",
+    "quantization_scope": "absent",
+    "requested_range": [
+      [
+        0,
+        8
+      ],
+      [
+        0,
+        4
+      ]
+    ],
+    "runtime_framework": "sglang",
+    "target_id": "sglang:model.embed_tokens.weight",
+    "target_offset_bytes": 0,
+    "target_shape": [
+      8,
+      4
+    ],
+    "tensor_name": "model.embed_tokens.weight"
+  },
+  "result": "pass",
+  "runtime_framework": "sglang",
+  "schema_version": 1,
+  "segment_plans": [
+    {
+      "bytes": 64,
+      "lease_version": "trainer-rank0-live-sglang-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank0-live-sglang-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank0",
+      "source_range": [
+        [
+          0,
+          4
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_byte_offset": 0,
+      "target_id": "sglang:model.embed_tokens.weight",
+      "target_range": [
+        [
+          0,
+          4
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_runtime": "sglang",
+      "tensor_name": "model.embed_tokens.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "bytes": 64,
+      "lease_version": "trainer-rank1-live-sglang-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank1-live-sglang-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank1",
+      "source_range": [
+        [
+          4,
+          8
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_byte_offset": 64,
+      "target_id": "sglang:model.embed_tokens.weight",
+      "target_range": [
+        [
+          4,
+          8
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_runtime": "sglang",
+      "tensor_name": "model.embed_tokens.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "sglang_version": "unit-shaped-smoke",
+  "source_ownerships": [
+    {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": 4,
+      "global_shape": [
+        8,
+        4
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-sglang-receiver-shaped-smoke",
+      "model_version": "step-sglang-receiver-shaped",
+      "nixl_descriptor_id": "trainer-rank0-live-sglang-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank0",
+      "source_lease": "trainer-rank0-live-sglang-receiver-smoke",
+      "source_range": [
+        [
+          0,
+          4
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "model.embed_tokens.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": 4,
+      "global_shape": [
+        8,
+        4
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-sglang-receiver-shaped-smoke",
+      "model_version": "step-sglang-receiver-shaped",
+      "nixl_descriptor_id": "trainer-rank1-live-sglang-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank1",
+      "source_lease": "trainer-rank1-live-sglang-receiver-smoke",
+      "source_range": [
+        [
+          4,
+          8
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "model.embed_tokens.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "target_device": "cpu",
+  "target_dtype": "float32",
+  "target_key": "sglang:model.embed_tokens.weight",
+  "target_shape": [
+    8,
+    4
+  ],
+  "target_tensor_name": "model.embed_tokens.weight",
+  "validation": {
+    "allclose": true,
+    "checksum": -450.0,
+    "checksum_matches": true,
+    "expected_checksum": -450.0,
+    "max_abs_error": 0.0,
+    "original_checksum": 496.0,
+    "restored_checksum": 496.0,
+    "restored_original": true
+  },
+  "vllm_version": ""
+}

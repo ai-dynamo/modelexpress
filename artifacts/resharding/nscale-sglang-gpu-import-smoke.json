@@ -1,0 +1,23 @@
+{
+  "branch": "mx-rl-resharding-planner-poc",
+  "claim_scope": "A 1-GPU nscale pod can import SGLang with CUDA available. This is runtime availability evidence, not a live SGLang engine-owned refit artifact.",
+  "commit": "0421d6e68f15c395544a555455c47a3ae4610b7b",
+  "cuda_available": true,
+  "cuda_device_count": 1,
+  "gpu_import_pass": true,
+  "image": "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90",
+  "live_sglang_engine_refit_proven": false,
+  "log_artifact": "nscale-sglang-gpu-import-smoke.log",
+  "mode": "sglang-gpu-runtime-import-smoke",
+  "namespace": "anish-dynamo",
+  "node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+  "pod": "mx-sglang-gpu-import-1780602673",
+  "receiver_owned_tensor_refit_proven_by": "modelexpress.refit_sglang_receiver_smoke unit smoke",
+  "requested_gpus": 1,
+  "result": "pass",
+  "scheduled": true,
+  "schema_version": 1,
+  "sglang_srt_version": "0.0.0.dev1+g229cadec0",
+  "sglang_version": "0.0.0.dev1+g229cadec0",
+  "torch_version": "2.11.0+cu130"
+}

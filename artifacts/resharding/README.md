@@ -263,6 +263,29 @@ Files:
 - `nscale-vllm-receiver-smoke-final-verify.log`: final focused nscale gate for
   this vLLM receiver-smoke change. It records Black checks, focused pytest
   (`52 passed`), JSON validation, and `git diff --check`.
+- `nscale-live-vllm-receiver-smoke-capacity-block-20260604.json` and
+  `nscale-live-vllm-receiver-smoke-capacity-block-20260604.log`: current-branch
+  repro of the live vLLM receiver smoke attempt. The submitted pod did not
+  schedule and produced no checksum/allclose artifact. Because the later
+  SGLang GPU import smoke used the `nvidia.com/gpu` toleration and did schedule,
+  this vLLM artifact is scoped to that submitted pod spec, not a cluster-wide
+  1-GPU capacity claim.
+- `nscale-sglang-receiver-smoke.json` and
+  `nscale-sglang-receiver-smoke.log`: SGLang-shaped module-owned receiver smoke
+  using `modelexpress.refit_sglang_receiver_smoke`. It builds an SGLang
+  `SliceRequest`, plans two synthetic trainer-held ranges, installs into the
+  runtime-owned tensor, validates checksum/allclose, restores the original
+  tensor, and records `real_runtime_engine_used=false`.
+- `nscale-sglang-runtime-import-probe.json` and
+  `nscale-sglang-runtime-import-probe.log`: import probe from the long-running
+  nscale SGLang runtime builder pod. It verifies `torch`, `sglang`, and
+  `sglang.srt` import in that image, but does not request a GPU or prove engine
+  refit.
+- `nscale-sglang-gpu-import-smoke.json` and
+  `nscale-sglang-gpu-import-smoke.log`: one-GPU nscale SGLang runtime import
+  smoke using the Docker-published SGLang image. The pod scheduled on a GPU
+  node, imported SGLang, and saw CUDA with one device. This is runtime
+  availability evidence, not a live SGLang engine-owned refit artifact.
 - `nscale-cursor-code-review-availability-vllm-smoke.log`: nscale availability
   check for `cursor-code-review`. The command was not found in the pod PATH or
   searched nscale directories, so review was not run rather than using the local
