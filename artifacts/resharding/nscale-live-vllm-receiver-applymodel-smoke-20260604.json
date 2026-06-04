@@ -1,0 +1,281 @@
+{
+  "framework_version": "0.17.1",
+  "installed_segments": [
+    {
+      "bytes": 2048,
+      "source_id": "trainer-rank0",
+      "target_key": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "tensor_name": "lm_head.weight"
+    },
+    {
+      "bytes": 2048,
+      "source_id": "trainer-rank1",
+      "target_key": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "tensor_name": "lm_head.weight"
+    }
+  ],
+  "metrics": {
+    "activation_install_duration_ms": 0.21260802168399096,
+    "planner_duration_ms": 0.1410499680787325,
+    "request_build_duration_ms": 0.06443599704653025,
+    "restore_duration_ms": 0.07978698704391718,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "lm_head.weight": 2
+    },
+    "target_tensor_bytes": 4096,
+    "trainer_to_inference_bytes": 4096
+  },
+  "mode": "live-vllm-receiver-owned-tensor-smoke",
+  "model_name": "mx-live-vllm-receiver-smoke",
+  "model_path": "/tmp/mx-vllm-receiver-model-nlrsx0ps",
+  "model_version": "step-live-vllm-receiver-applymodel",
+  "module_class": "Qwen2ForCausalLM",
+  "module_path": "llm.apply_model.worker_model",
+  "proof": {
+    "actual_nixl_reads_used": false,
+    "allclose": true,
+    "checksum_gate": true,
+    "host_side_torch_cat_used": false,
+    "real_runtime_engine_used": true,
+    "real_trainer_process_used": false,
+    "receiver_installed_into_runtime_owned_tensor": true,
+    "receiver_installed_into_vllm_owned_tensor": true,
+    "receiver_request_from_runtime_owned_tensor": true,
+    "restored_original_tensor": true,
+    "runtime_imported": true,
+    "runtime_owned_target_tensor": true,
+    "synthetic_trainer_payloads_used": true,
+    "target_slice_spans_multiple_trainers": true,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false,
+    "vllm_apply_model_insecure_serialization_enabled": true,
+    "vllm_apply_model_used": true,
+    "vllm_imported": true,
+    "vllm_owned_target_tensor": true,
+    "vllm_worker_owned_target_tensor": true
+  },
+  "request": {
+    "destination_strides": [
+      32,
+      1
+    ],
+    "dtype": "bfloat16",
+    "element_size_bytes": 2,
+    "layout_tags": {
+      "runtime_framework": "vllm",
+      "runtime_lifecycle": "post-load-refit-smoke",
+      "runtime_module_path": "llm.apply_model.worker_model",
+      "runtime_tensor_name": "lm_head.weight",
+      "storage_layout": "row-major",
+      "target_contiguous": true,
+      "vllm_module_path": "llm.apply_model.worker_model",
+      "vllm_tensor_name": "lm_head.weight"
+    },
+    "model_name": "mx-live-vllm-receiver-smoke",
+    "model_version": "step-live-vllm-receiver-applymodel",
+    "quantization_scope": "absent",
+    "requested_range": [
+      [
+        0,
+        64
+      ],
+      [
+        0,
+        32
+      ]
+    ],
+    "runtime_framework": "vllm",
+    "target_id": "vllm:lm_head.weight",
+    "target_offset_bytes": 0,
+    "target_shape": [
+      64,
+      32
+    ],
+    "tensor_name": "lm_head.weight"
+  },
+  "result": "pass",
+  "runtime_framework": "vllm",
+  "runtime_module_discovery_path": "vllm.apply_model",
+  "schema_version": 1,
+  "segment_plans": [
+    {
+      "bytes": 2048,
+      "lease_version": "trainer-rank0-live-vllm-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank0-live-vllm-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank0",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_byte_offset": 0,
+      "target_id": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "bytes": 2048,
+      "lease_version": "trainer-rank1-live-vllm-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank1-live-vllm-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank1",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_byte_offset": 2048,
+      "target_id": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "source_ownerships": [
+    {
+      "contiguous": true,
+      "dtype": "bfloat16",
+      "element_size_bytes": 2,
+      "global_shape": [
+        64,
+        32
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-live-vllm-receiver-smoke",
+      "model_version": "step-live-vllm-receiver-applymodel",
+      "nixl_descriptor_id": "trainer-rank0-live-vllm-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank0",
+      "source_lease": "trainer-rank0-live-vllm-receiver-smoke",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "contiguous": true,
+      "dtype": "bfloat16",
+      "element_size_bytes": 2,
+      "global_shape": [
+        64,
+        32
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-live-vllm-receiver-smoke",
+      "model_version": "step-live-vllm-receiver-applymodel",
+      "nixl_descriptor_id": "trainer-rank1-live-vllm-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank1",
+      "source_lease": "trainer-rank1-live-vllm-receiver-smoke",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "target_device": "cuda:0",
+  "target_dtype": "bfloat16",
+  "target_key": "vllm:lm_head.weight",
+  "target_shape": [
+    64,
+    32
+  ],
+  "target_tensor_name": "lm_head.weight",
+  "validation": {
+    "allclose": true,
+    "checksum": -124.5,
+    "checksum_matches": true,
+    "expected_checksum": -124.5,
+    "max_abs_error": 0.0,
+    "original_checksum": -0.5221611261367798,
+    "restored_checksum": -0.5221611261367798,
+    "restored_original": true
+  },
+  "vllm_version": "0.17.1",
+  "worker_result_count": 1
+}

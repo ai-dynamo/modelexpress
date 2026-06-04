@@ -1,0 +1,152 @@
+Get:1 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  InRelease [1581 B]
+Get:2 http://archive.ubuntu.com/ubuntu jammy InRelease [270 kB]
+Get:3 http://security.ubuntu.com/ubuntu jammy-security InRelease [129 kB]
+Get:4 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy InRelease [18.1 kB]
+Get:5 https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64  Packages [2705 kB]
+Get:6 https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy/main amd64 Packages [38.9 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy-updates InRelease [128 kB]
+Get:8 http://archive.ubuntu.com/ubuntu jammy-backports InRelease [127 kB]
+Get:9 http://security.ubuntu.com/ubuntu jammy-security/universe amd64 Packages [1299 kB]
+Get:10 http://archive.ubuntu.com/ubuntu jammy/main amd64 Packages [1792 kB]
+Get:11 http://archive.ubuntu.com/ubuntu jammy/restricted amd64 Packages [164 kB]
+Get:12 http://archive.ubuntu.com/ubuntu jammy/universe amd64 Packages [17.5 MB]
+Get:13 http://security.ubuntu.com/ubuntu jammy-security/restricted amd64 Packages [7129 kB]
+Get:14 http://security.ubuntu.com/ubuntu jammy-security/multiverse amd64 Packages [77.8 kB]
+Get:15 http://archive.ubuntu.com/ubuntu jammy/multiverse amd64 Packages [266 kB]
+Get:16 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 Packages [7451 kB]
+Get:17 http://security.ubuntu.com/ubuntu jammy-security/main amd64 Packages [3974 kB]
+Get:18 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 Packages [4344 kB]
+Get:19 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1607 kB]
+Get:20 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [86.4 kB]
+Get:21 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [82.8 kB]
+Get:22 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [35.6 kB]
+Fetched 49.2 MB in 2s (27.4 MB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20240203~22.04.1).
+The following additional packages will be installed:
+  git-man less libcbor0.8 liberror-perl libfido2-1 libxmuu1 openssh-client
+  xauth
+Suggested packages:
+  gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+  gitk gitweb git-cvs git-mediawiki git-svn keychain libpam-ssh monkeysphere
+  ssh-askpass
+The following NEW packages will be installed:
+  git git-man less libcbor0.8 liberror-perl libfido2-1 libxmuu1 openssh-client
+  xauth
+0 upgraded, 9 newly installed, 0 to remove and 72 not upgraded.
+Need to get 5345 kB of archives.
+After this operation, 24.9 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 less amd64 590-1ubuntu0.22.04.3 [142 kB]
+Get:2 http://archive.ubuntu.com/ubuntu jammy/main amd64 libcbor0.8 amd64 0.8.0-2ubuntu1 [24.6 kB]
+Get:3 http://archive.ubuntu.com/ubuntu jammy/main amd64 libfido2-1 amd64 1.10.0-1 [82.8 kB]
+Get:4 http://archive.ubuntu.com/ubuntu jammy/main amd64 libxmuu1 amd64 2:1.1.3-3 [10.2 kB]
+Get:5 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 openssh-client amd64 1:8.9p1-3ubuntu0.15 [904 kB]
+Get:6 http://archive.ubuntu.com/ubuntu jammy/main amd64 xauth amd64 1:1.1-1build2 [27.5 kB]
+Get:7 http://archive.ubuntu.com/ubuntu jammy/main amd64 liberror-perl all 0.17029-1 [26.5 kB]
+Get:8 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git-man all 1:2.34.1-1ubuntu1.17 [954 kB]
+Get:9 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 git amd64 1:2.34.1-1ubuntu1.17 [3174 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 5345 kB in 0s (21.0 MB/s)
+Selecting previously unselected package less.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 23674 files and directories currently installed.)
+Preparing to unpack .../0-less_590-1ubuntu0.22.04.3_amd64.deb ...
+Unpacking less (590-1ubuntu0.22.04.3) ...
+Selecting previously unselected package libcbor0.8:amd64.
+Preparing to unpack .../1-libcbor0.8_0.8.0-2ubuntu1_amd64.deb ...
+Unpacking libcbor0.8:amd64 (0.8.0-2ubuntu1) ...
+Selecting previously unselected package libfido2-1:amd64.
+Preparing to unpack .../2-libfido2-1_1.10.0-1_amd64.deb ...
+Unpacking libfido2-1:amd64 (1.10.0-1) ...
+Selecting previously unselected package libxmuu1:amd64.
+Preparing to unpack .../3-libxmuu1_2%3a1.1.3-3_amd64.deb ...
+Unpacking libxmuu1:amd64 (2:1.1.3-3) ...
+Selecting previously unselected package openssh-client.
+Preparing to unpack .../4-openssh-client_1%3a8.9p1-3ubuntu0.15_amd64.deb ...
+Unpacking openssh-client (1:8.9p1-3ubuntu0.15) ...
+Selecting previously unselected package xauth.
+Preparing to unpack .../5-xauth_1%3a1.1-1build2_amd64.deb ...
+Unpacking xauth (1:1.1-1build2) ...
+Selecting previously unselected package liberror-perl.
+Preparing to unpack .../6-liberror-perl_0.17029-1_all.deb ...
+Unpacking liberror-perl (0.17029-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../7-git-man_1%3a2.34.1-1ubuntu1.17_all.deb ...
+Unpacking git-man (1:2.34.1-1ubuntu1.17) ...
+Selecting previously unselected package git.
+Preparing to unpack .../8-git_1%3a2.34.1-1ubuntu1.17_amd64.deb ...
+Unpacking git (1:2.34.1-1ubuntu1.17) ...
+Setting up libcbor0.8:amd64 (0.8.0-2ubuntu1) ...
+Setting up less (590-1ubuntu0.22.04.3) ...
+Setting up liberror-perl (0.17029-1) ...
+Setting up git-man (1:2.34.1-1ubuntu1.17) ...
+Setting up libfido2-1:amd64 (1.10.0-1) ...
+Setting up libxmuu1:amd64 (2:1.1.3-3) ...
+Setting up openssh-client (1:8.9p1-3ubuntu0.15) ...
+update-alternatives: using /usr/bin/ssh to provide /usr/bin/rsh (rsh) in auto mode
+update-alternatives: warning: skip creation of /usr/share/man/man1/rsh.1.gz because associated file /usr/share/man/man1/ssh.1.gz (of link group rsh) doesn't exist
+update-alternatives: using /usr/bin/slogin to provide /usr/bin/rlogin (rlogin) in auto mode
+update-alternatives: warning: skip creation of /usr/share/man/man1/rlogin.1.gz because associated file /usr/share/man/man1/slogin.1.gz (of link group rlogin) doesn't exist
+update-alternatives: using /usr/bin/scp to provide /usr/bin/rcp (rcp) in auto mode
+update-alternatives: warning: skip creation of /usr/share/man/man1/rcp.1.gz because associated file /usr/share/man/man1/scp.1.gz (of link group rcp) doesn't exist
+Setting up git (1:2.34.1-1ubuntu1.17) ...
+Setting up xauth (1:1.1-1build2) ...
+Processing triggers for libc-bin (2.35-0ubuntu3.10) ...
+Processing triggers for mailcap (3.70+nmu1ubuntu1) ...
+Cloning into 'modelexpress'...
+/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/chat_completion/protocol.py:346: SyntaxWarning: invalid escape sequence '\e'
+  "(e.g. 'abcdabcdabcd...' or '\emoji \emoji \emoji ...'). This feature "
+/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/protocol.py:176: SyntaxWarning: invalid escape sequence '\e'
+  "(e.g. 'abcdabcdabcd...' or '\emoji \emoji \emoji ...'). This feature "
+INFO 06-04 20:04:09 [__init__.py:108] Registered model loader `<class 'modelexpress.engines.vllm.loader.MxModelLoader'>` with load format `mx`
+INFO 06-04 20:04:09 [utils.py:238] non-default args: {'skip_tokenizer_init': True, 'dtype': 'bfloat16', 'max_model_len': 64, 'distributed_executor_backend': 'uni', 'gpu_memory_utilization': 0.2, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/tmp/mx-vllm-receiver-model-48gf_cc6'}
+INFO 06-04 20:04:13 [model.py:531] Resolved architecture: Qwen2ForCausalLM
+INFO 06-04 20:04:13 [model.py:1889] Downcasting torch.float32 to torch.bfloat16.
+INFO 06-04 20:04:13 [model.py:1554] Using max model len 64
+INFO 06-04 20:04:13 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 06-04 20:04:13 [vllm.py:747] Asynchronous scheduling is enabled.
+WARNING 06-04 20:04:13 [vllm.py:781] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 06-04 20:04:13 [vllm.py:792] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 06-04 20:04:13 [vllm.py:957] Cudagraph is disabled under eager mode
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:17 [__init__.py:108] Registered model loader `<class 'modelexpress.engines.vllm.loader.MxModelLoader'>` with load format `mx`
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:17 [core.py:101] Initializing a V1 LLM engine (v0.17.1) with config: model='/tmp/mx-vllm-receiver-model-48gf_cc6', speculative_config=None, tokenizer='/tmp/mx-vllm-receiver-model-48gf_cc6', skip_tokenizer_init=True, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=64, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/tmp/mx-vllm-receiver-model-48gf_cc6, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:18 [parallel_state.py:1393] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.0.20.128:60599 backend=nccl
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:18 [parallel_state.py:1715] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:18 [base.py:106] Offloader set to NoopOffloader
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:18 [gpu_model_runner.py:4281] Starting to load model /tmp/mx-vllm-receiver-model-48gf_cc6...
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:19 [cuda.py:405] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLEX_ATTENTION'].
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:19 [flash_attn.py:587] Using FlashAttention version 4
+(EngineCore_DP0 pid=1176) Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+(EngineCore_DP0 pid=1176) Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00, 814.74it/s]
+(EngineCore_DP0 pid=1176) 
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:19 [default_loader.py:293] Loading weights took 0.00 seconds
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:19 [gpu_model_runner.py:4364] Model loading took 0.0 GiB memory and 0.341598 seconds
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:23 [gpu_worker.py:424] Available KV cache memory: 35.52 GiB
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:23 [kv_cache_utils.py:1314] GPU KV cache size: 297,940,608 tokens
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:23 [kv_cache_utils.py:1319] Maximum concurrency for 64 tokens per request: 4655322.00x
+(EngineCore_DP0 pid=1176) 2026-06-04 20:04:23,376 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore_DP0 pid=1176) 2026-06-04 20:04:23,379 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:23 [core.py:282] init engine (profile, create kv cache, warmup model) took 3.94 seconds
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:36 [vllm.py:747] Asynchronous scheduling is enabled.
+(EngineCore_DP0 pid=1176) WARNING 06-04 20:04:36 [vllm.py:781] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore_DP0 pid=1176) WARNING 06-04 20:04:36 [vllm.py:792] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore_DP0 pid=1176) INFO 06-04 20:04:36 [vllm.py:957] Cudagraph is disabled under eager mode
+INFO 06-04 20:04:36 [llm.py:388] Supported tasks: ['generate']
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/tmp/modelexpress/modelexpress_client/python/modelexpress/refit_vllm_receiver_smoke.py", line 547, in <module>
+    main()
+  File "/tmp/modelexpress/modelexpress_client/python/modelexpress/refit_vllm_receiver_smoke.py", line 518, in main
+    _llm, module_path, module = load_vllm_module(
+                                ^^^^^^^^^^^^^^^^^
+  File "/tmp/modelexpress/modelexpress_client/python/modelexpress/refit_vllm_receiver_smoke.py", line 310, in load_vllm_module
+    module_path, module = _find_vllm_module(llm)
+                          ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/modelexpress/modelexpress_client/python/modelexpress/refit_vllm_receiver_smoke.py", line 260, in _find_vllm_module
+    raise RuntimeError(
+RuntimeError: could not find an in-process vLLM torch.nn.Module; rerun with --distributed-executor-backend=uni or use a vLLM build that exposes the driver worker model in process
+[rank0]:[W604 20:04:36.701834913 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+ERROR 06-04 20:04:36 [core_client.py:691] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.

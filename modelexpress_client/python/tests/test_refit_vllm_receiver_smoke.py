@@ -14,6 +14,7 @@ from modelexpress.refit_vllm_receiver_smoke import (
     _select_refit_tensor,
     _source_ownerships_for_tensor,
     run_receiver_refit_on_module,
+    run_receiver_refit_on_vllm_llm,
 )
 
 
@@ -68,6 +69,48 @@ def test_vllm_receiver_smoke_installs_and_restores_runtime_owned_tensor(tmp_path
     assert payload["validation"]["checksum_matches"] is True
     assert payload["metrics"]["trainer_to_inference_bytes"] == 96
     assert payload["metrics"]["segment_count"] == 2
+
+
+def test_vllm_receiver_smoke_uses_apply_model_for_worker_owned_tensor(tmp_path):
+    module = TinyVllmOwnedModule()
+    with torch.no_grad():
+        module.lm_head.weight.copy_(torch.arange(24, dtype=torch.float32).reshape(6, 4))
+    original = module.lm_head.weight.detach().clone()
+
+    class FakeVllmLLM:
+        def __init__(self, worker_module):
+            self.worker_module = worker_module
+            self.apply_model_calls = 0
+
+        def apply_model(self, func):
+            self.apply_model_calls += 1
+            return [func(self.worker_module)]
+
+    llm = FakeVllmLLM(module)
+    artifact_path = tmp_path / "vllm-apply-model-receiver-smoke.json"
+
+    result = run_receiver_refit_on_vllm_llm(
+        llm,
+        model_name="tiny-vllm",
+        model_version="step-apply-model",
+        vllm_version="unit-test",
+        artifact_path=artifact_path,
+    )
+
+    assert llm.apply_model_calls == 1
+    assert result["result"] == "pass"
+    assert result["runtime_module_discovery_path"] == "vllm.apply_model"
+    assert result["worker_result_count"] == 1
+    assert result["proof"]["vllm_apply_model_used"] is True
+    assert result["proof"]["vllm_worker_owned_target_tensor"] is True
+    assert result["proof"]["real_runtime_engine_used"] is True
+    assert result["proof"]["vllm_apply_model_insecure_serialization_enabled"] is False
+    assert result["validation"]["checksum_matches"] is True
+    assert result["validation"]["restored_original"] is True
+    torch.testing.assert_close(module.lm_head.weight, original)
+
+    payload = json.loads(artifact_path.read_text())
+    assert payload["proof"]["vllm_apply_model_used"] is True
 
 
 def test_vllm_receiver_smoke_source_ownerships_split_rows_exactly():

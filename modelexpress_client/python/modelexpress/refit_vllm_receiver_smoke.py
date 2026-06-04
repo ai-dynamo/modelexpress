@@ -5,10 +5,13 @@
 
 The Level-4 goal is a real trainer-to-vLLM/SGLang refit path. This module keeps
 the live vLLM entrypoint and exposes a framework-explicit module helper used by
-SGLang-shaped tests: build receiver-side ``SliceRequest`` metadata from one
-runtime-owned parameter tensor, plan two synthetic trainer-held source ranges,
-install the planned payloads into that runtime-owned tensor, validate
-checksum/allclose, and restore the original tensor.
+SGLang-shaped tests. For modern vLLM V1 engines, the live entrypoint uses
+``LLM.apply_model`` so the refit logic runs inside the worker against an
+engine-owned model tensor. The helper builds receiver-side ``SliceRequest``
+metadata from one runtime-owned parameter tensor, plans two synthetic
+trainer-held source ranges, installs the planned payloads into that
+runtime-owned tensor, validates checksum/allclose, and restores the original
+tensor.
 
 It intentionally does not claim NIXL data-plane transfer or trainer integration;
 those are covered by separate Level-2/3 synthetic proofs and remain future
@@ -19,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from functools import partial
 import json
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -79,6 +84,16 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, torch.device):
         return str(value)
     return repr(value)
+
+
+def _run_receiver_refit_on_worker_model(
+    model: torch.nn.Module,
+    *,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the receiver smoke inside a vLLM worker via ``LLM.apply_model``."""
+
+    return run_receiver_refit_on_module(model, **kwargs)
 
 
 def _replacement_payload_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -287,6 +302,31 @@ def create_tiny_qwen2_checkpoint(path: str | Path) -> Path:
     return checkpoint_path
 
 
+def load_vllm_llm(
+    *,
+    model_path: str,
+    dtype: str,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    distributed_executor_backend: str,
+) -> Any:
+    # vLLM V1's apply_model control RPC serializes the callable with pickle.
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    from vllm import LLM
+
+    return LLM(
+        model=model_path,
+        skip_tokenizer_init=True,
+        dtype=dtype,
+        enforce_eager=True,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        tensor_parallel_size=1,
+        distributed_executor_backend=distributed_executor_backend,
+    )
+
+
 def load_vllm_module(
     *,
     model_path: str,
@@ -295,16 +335,11 @@ def load_vllm_module(
     gpu_memory_utilization: float,
     distributed_executor_backend: str,
 ) -> tuple[Any, str, torch.nn.Module]:
-    from vllm import LLM
-
-    llm = LLM(
-        model=model_path,
-        skip_tokenizer_init=True,
+    llm = load_vllm_llm(
+        model_path=model_path,
         dtype=dtype,
-        enforce_eager=True,
-        gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
-        tensor_parallel_size=1,
+        gpu_memory_utilization=gpu_memory_utilization,
         distributed_executor_backend=distributed_executor_backend,
     )
     module_path, module = _find_vllm_module(llm)
@@ -489,6 +524,76 @@ def run_receiver_refit_on_module(
     return result
 
 
+def run_receiver_refit_on_vllm_llm(
+    llm: Any,
+    *,
+    model_name: str,
+    model_version: str,
+    vllm_version: str,
+    preferred_tensor_name: str = "",
+    artifact_path: str | Path | None = None,
+    mode: str = "live-vllm-receiver-owned-tensor-smoke",
+    model_path: str = "",
+) -> dict[str, Any]:
+    """Run receiver refit against a live vLLM engine-owned model when possible."""
+
+    apply_model = getattr(llm, "apply_model", None)
+    if callable(apply_model):
+        worker_kwargs = {
+            "model_name": model_name,
+            "model_version": model_version,
+            "module_path": "llm.apply_model.worker_model",
+            "vllm_version": vllm_version,
+            "runtime_framework": "vllm",
+            "framework_version": vllm_version,
+            "runtime_imported": True,
+            "real_runtime_engine_used": True,
+            "preferred_tensor_name": preferred_tensor_name,
+            "artifact_path": None,
+            "mode": mode,
+            "model_path": model_path,
+        }
+        results = apply_model(
+            partial(_run_receiver_refit_on_worker_model, kwargs=worker_kwargs)
+        )
+        if not results:
+            raise RuntimeError("vLLM apply_model returned no worker results")
+        result = results[0]
+        result["worker_result_count"] = len(results)
+        result["runtime_module_discovery_path"] = "vllm.apply_model"
+        result["proof"]["vllm_apply_model_used"] = True
+        result["proof"]["vllm_worker_owned_target_tensor"] = True
+        result["proof"]["real_runtime_engine_used"] = True
+        result["proof"]["vllm_apply_model_insecure_serialization_enabled"] = (
+            os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") == "1"
+        )
+        if artifact_path is not None:
+            _write_artifact(result, artifact_path)
+        if result["result"] != "pass":
+            raise RuntimeError(
+                "vLLM apply_model receiver smoke failed: "
+                f"{json.dumps(result, default=_json_default)}"
+            )
+        return result
+
+    module_path, module = _find_vllm_module(llm)
+    return run_receiver_refit_on_module(
+        module,
+        model_name=model_name,
+        model_version=model_version,
+        module_path=module_path,
+        vllm_version=vllm_version,
+        runtime_framework="vllm",
+        framework_version=vllm_version,
+        runtime_imported=True,
+        real_runtime_engine_used=True,
+        preferred_tensor_name=preferred_tensor_name,
+        artifact_path=artifact_path,
+        mode=mode,
+        model_path=model_path,
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-path", required=True)
@@ -515,23 +620,18 @@ def main() -> None:
             )
         )
 
-    _llm, module_path, module = load_vllm_module(
+    llm = load_vllm_llm(
         model_path=model_path,
         dtype=args.dtype,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         distributed_executor_backend=args.distributed_executor_backend,
     )
-    result = run_receiver_refit_on_module(
-        module,
+    result = run_receiver_refit_on_vllm_llm(
+        llm,
         model_name=args.model_name,
         model_version=args.model_version,
-        module_path=module_path,
         vllm_version=getattr(vllm, "__version__", "unknown"),
-        runtime_framework="vllm",
-        framework_version=getattr(vllm, "__version__", "unknown"),
-        runtime_imported=True,
-        real_runtime_engine_used=True,
         preferred_tensor_name=args.preferred_tensor_name,
         artifact_path=args.artifact_path,
         model_path=model_path,

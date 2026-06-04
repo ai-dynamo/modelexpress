@@ -256,20 +256,35 @@ Files:
   install into that tensor, checksum/allclose validation, and original tensor
   restore. This is not a live GPU vLLM artifact.
 - `nscale-vllm-receiver-smoke-capacity-block.json` and
-  `nscale-vllm-receiver-smoke-capacity-block.log`: honest block for the first
-  1-GPU live vLLM receiver smoke probe. The pod stayed Pending with `0/29 nodes`,
-  `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler max
-  node group size reached, so no live vLLM checksum artifact was produced.
+  `nscale-vllm-receiver-smoke-capacity-block.log`: earlier honest block for the
+  first 1-GPU live vLLM receiver smoke probe. It is superseded by the later
+  checksum-backed `nscale-live-vllm-receiver-applymodel-smoke-20260604.json`
+  run below.
 - `nscale-vllm-receiver-smoke-final-verify.log`: final focused nscale gate for
-  this vLLM receiver-smoke change. It records Black checks, focused pytest
+  the first vLLM receiver-smoke change. It records Black checks, focused pytest
   (`52 passed`), JSON validation, and `git diff --check`.
 - `nscale-live-vllm-receiver-smoke-capacity-block-20260604.json` and
   `nscale-live-vllm-receiver-smoke-capacity-block-20260604.log`: current-branch
-  repro of the live vLLM receiver smoke attempt. The submitted pod did not
-  schedule and produced no checksum/allclose artifact. Because the later
-  SGLang GPU import smoke used the `nvidia.com/gpu` toleration and did schedule,
-  this vLLM artifact is scoped to that submitted pod spec, not a cluster-wide
-  1-GPU capacity claim.
+  repro of the original live vLLM receiver smoke pod spec. The submitted pod did
+  not schedule and produced no checksum/allclose artifact. Because later GPU
+  probes used the `nvidia.com/gpu` toleration and did schedule, this artifact is
+  scoped to that submitted pod spec, not a cluster-wide 1-GPU capacity claim.
+- `nscale-live-vllm-receiver-v1-module-discovery-block-20260604.log`: scheduled
+  1-GPU vLLM 0.17.1 attempt showing the original parent-process module traversal
+  failed after the V1 engine loaded because the model lives in `EngineCore_DP0`.
+- `nscale-live-vllm-receiver-v0-env-unsupported-block-20260604.log`: scheduled
+  1-GPU retry showing `VLLM_USE_V1` is not a supported override in this vLLM
+  build, so forcing V0 is not the right path.
+- `nscale-live-vllm-receiver-applymodel-smoke-20260604.json`, `.log`, and
+  `-placement.log`: completed 1-GPU live vLLM V1 receiver-owned tensor smoke.
+  The CLI creates a tiny Qwen2 checkpoint, starts a real vLLM 0.17.1 V1 engine,
+  uses `LLM.apply_model` to run inside the worker-owned `Qwen2ForCausalLM`,
+  builds a vLLM `SliceRequest` from `lm_head.weight` on `cuda:0`, plans two
+  synthetic trainer-held ranges, installs into that vLLM-owned tensor, validates
+  checksum/allclose, and restores the original tensor. The artifact records
+  `vllm_apply_model_used=true`, `vllm_worker_owned_target_tensor=true`,
+  `real_runtime_engine_used=true`, `actual_nixl_reads_used=false`, and
+  `synthetic_trainer_payloads_used=true`.
 - `nscale-sglang-receiver-smoke.json` and
   `nscale-sglang-receiver-smoke.log`: SGLang-shaped module-owned receiver smoke
   using `modelexpress.refit_sglang_receiver_smoke`. It builds an SGLang

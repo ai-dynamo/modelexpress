@@ -1,0 +1,70 @@
+NAME                                     READY   STATUS    RESTARTS   AGE     IP            NODE                                         NOMINATED NODE   READINESS GATES
+mx-vllm-receiver-applymodel-1780603742   1/1     Running   0          4m42s   10.0.20.128   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+--- describe ---
+Name:             mx-vllm-receiver-applymodel-1780603742
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Thu, 04 Jun 2026 22:09:06 +0200
+Labels:           app=mx-vllm-receiver-applymodel
+Annotations:      <none>
+Status:           Running
+IP:               10.0.20.128
+IPs:
+  IP:  10.0.20.128
+Containers:
+  smoke:
+    Container ID:  containerd://bb30dce75dc2a96e142066ba6fb8c899e9564c4b9e5ff5425e4ae09028e83dc1
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:036d63833b32418154b4ad79b95867c4780e9adb824a42b570b01524ac39b3b6
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      bash
+      -lc
+      sleep 4h
+    State:          Running
+      Started:      Thu, 04 Jun 2026 22:09:06 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:
+      PYTHONUNBUFFERED:              1
+      VLLM_WORKER_MULTIPROC_METHOD:  spawn
+    Mounts:
+      /dev/shm from dshm (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-ds7x5 (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  dshm:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     Memory
+    SizeLimit:  8Gi
+  kube-api-access-ds7x5:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  4m42s  default-scheduler  Successfully assigned anish-dynamo/mx-vllm-receiver-applymodel-1780603742 to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+  Normal  Pulled     4m41s  kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a" already present on machine
+  Normal  Created    4m41s  kubelet            Created container: smoke
+  Normal  Started    4m41s  kubelet            Started container smoke

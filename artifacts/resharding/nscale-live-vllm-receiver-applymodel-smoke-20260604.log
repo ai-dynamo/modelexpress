@@ -1,0 +1,320 @@
+INFO 06-04 20:12:55 [__init__.py:108] Registered model loader `<class 'modelexpress.engines.vllm.loader.MxModelLoader'>` with load format `mx`
+INFO 06-04 20:12:55 [utils.py:238] non-default args: {'skip_tokenizer_init': True, 'dtype': 'bfloat16', 'max_model_len': 64, 'distributed_executor_backend': 'uni', 'gpu_memory_utilization': 0.2, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/tmp/mx-vllm-receiver-model-nlrsx0ps'}
+INFO 06-04 20:12:55 [model.py:531] Resolved architecture: Qwen2ForCausalLM
+INFO 06-04 20:12:55 [model.py:1889] Downcasting torch.float32 to torch.bfloat16.
+INFO 06-04 20:12:55 [model.py:1554] Using max model len 64
+INFO 06-04 20:12:55 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=16384.
+INFO 06-04 20:12:55 [vllm.py:747] Asynchronous scheduling is enabled.
+WARNING 06-04 20:12:55 [vllm.py:781] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 06-04 20:12:55 [vllm.py:792] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 06-04 20:12:55 [vllm.py:957] Cudagraph is disabled under eager mode
+WARNING 06-04 20:12:55 [serial_utils.py:57] Allowing insecure serialization using pickle due to VLLM_ALLOW_INSECURE_SERIALIZATION=1
+(EngineCore_DP0 pid=2917) INFO 06-04 20:12:59 [__init__.py:108] Registered model loader `<class 'modelexpress.engines.vllm.loader.MxModelLoader'>` with load format `mx`
+(EngineCore_DP0 pid=2917) INFO 06-04 20:12:59 [core.py:101] Initializing a V1 LLM engine (v0.17.1) with config: model='/tmp/mx-vllm-receiver-model-nlrsx0ps', speculative_config=None, tokenizer='/tmp/mx-vllm-receiver-model-nlrsx0ps', skip_tokenizer_init=True, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=64, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/tmp/mx-vllm-receiver-model-nlrsx0ps, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore_DP0 pid=2917) INFO 06-04 20:12:59 [parallel_state.py:1393] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://10.0.20.128:37969 backend=nccl
+(EngineCore_DP0 pid=2917) INFO 06-04 20:12:59 [parallel_state.py:1715] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:00 [base.py:106] Offloader set to NoopOffloader
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:00 [gpu_model_runner.py:4281] Starting to load model /tmp/mx-vllm-receiver-model-nlrsx0ps...
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:00 [cuda.py:405] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLEX_ATTENTION'].
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:00 [flash_attn.py:587] Using FlashAttention version 4
+(EngineCore_DP0 pid=2917) Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+(EngineCore_DP0 pid=2917) Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00, 848.02it/s]
+(EngineCore_DP0 pid=2917) 
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:00 [default_loader.py:293] Loading weights took 0.00 seconds
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:00 [gpu_model_runner.py:4364] Model loading took 0.0 GiB memory and 0.316843 seconds
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:01 [gpu_worker.py:424] Available KV cache memory: 35.52 GiB
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:01 [kv_cache_utils.py:1314] GPU KV cache size: 297,940,608 tokens
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:01 [kv_cache_utils.py:1319] Maximum concurrency for 64 tokens per request: 4655322.00x
+(EngineCore_DP0 pid=2917) 2026-06-04 20:13:01,525 - INFO - autotuner.py:256 - flashinfer.jit: [Autotuner]: Autotuning process starts ...
+(EngineCore_DP0 pid=2917) 2026-06-04 20:13:01,528 - INFO - autotuner.py:262 - flashinfer.jit: [Autotuner]: Autotuning process ends
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:01 [core.py:282] init engine (profile, create kv cache, warmup model) took 0.83 seconds
+(EngineCore_DP0 pid=2917) WARNING 06-04 20:13:14 [serial_utils.py:57] Allowing insecure serialization using pickle due to VLLM_ALLOW_INSECURE_SERIALIZATION=1
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:14 [vllm.py:747] Asynchronous scheduling is enabled.
+(EngineCore_DP0 pid=2917) WARNING 06-04 20:13:14 [vllm.py:781] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore_DP0 pid=2917) WARNING 06-04 20:13:14 [vllm.py:792] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore_DP0 pid=2917) INFO 06-04 20:13:14 [vllm.py:957] Cudagraph is disabled under eager mode
+INFO 06-04 20:13:14 [llm.py:388] Supported tasks: ('generate',)
+MX_VLLM_RECEIVER_SMOKE_RESULT {"framework_version": "0.17.1", "installed_segments": [{"bytes": 2048, "source_id": "trainer-rank0", "target_key": "vllm:lm_head.weight", "target_range": [[0, 32], [0, 32]], "tensor_name": "lm_head.weight"}, {"bytes": 2048, "source_id": "trainer-rank1", "target_key": "vllm:lm_head.weight", "target_range": [[32, 64], [0, 32]], "tensor_name": "lm_head.weight"}], "metrics": {"activation_install_duration_ms": 0.21260802168399096, "planner_duration_ms": 0.1410499680787325, "request_build_duration_ms": 0.06443599704653025, "restore_duration_ms": 0.07978698704391718, "segment_count": 2, "source_count_per_target_tensor": {"lm_head.weight": 2}, "target_tensor_bytes": 4096, "trainer_to_inference_bytes": 4096}, "mode": "live-vllm-receiver-owned-tensor-smoke", "model_name": "mx-live-vllm-receiver-smoke", "model_path": "/tmp/mx-vllm-receiver-model-nlrsx0ps", "model_version": "step-live-vllm-receiver-applymodel", "module_class": "Qwen2ForCausalLM", "module_path": "llm.apply_model.worker_model", "proof": {"actual_nixl_reads_used": false, "allclose": true, "checksum_gate": true, "host_side_torch_cat_used": false, "real_runtime_engine_used": true, "real_trainer_process_used": false, "receiver_installed_into_runtime_owned_tensor": true, "receiver_installed_into_vllm_owned_tensor": true, "receiver_request_from_runtime_owned_tensor": true, "restored_original_tensor": true, "runtime_imported": true, "runtime_owned_target_tensor": true, "synthetic_trainer_payloads_used": true, "target_slice_spans_multiple_trainers": true, "trainer_full_all_gather_used": false, "trainer_side_inference_layout_conversion_used": false, "vllm_apply_model_insecure_serialization_enabled": true, "vllm_apply_model_used": true, "vllm_imported": true, "vllm_owned_target_tensor": true, "vllm_worker_owned_target_tensor": true}, "request": {"destination_strides": [32, 1], "dtype": "bfloat16", "element_size_bytes": 2, "layout_tags": {"runtime_framework": "vllm", "runtime_lifecycle": "post-load-refit-smoke", "runtime_module_path": "llm.apply_model.worker_model", "runtime_tensor_name": "lm_head.weight", "storage_layout": "row-major", "target_contiguous": true, "vllm_module_path": "llm.apply_model.worker_model", "vllm_tensor_name": "lm_head.weight"}, "model_name": "mx-live-vllm-receiver-smoke", "model_version": "step-live-vllm-receiver-applymodel", "quantization_scope": "absent", "requested_range": [[0, 64], [0, 32]], "runtime_framework": "vllm", "target_id": "vllm:lm_head.weight", "target_offset_bytes": 0, "target_shape": [64, 32], "tensor_name": "lm_head.weight"}, "result": "pass", "runtime_framework": "vllm", "runtime_module_discovery_path": "vllm.apply_model", "schema_version": 1, "segment_plans": [{"bytes": 2048, "lease_version": "trainer-rank0-live-vllm-receiver-smoke", "nixl_descriptor_id": "trainer-rank0-live-vllm-receiver-smoke", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank0", "source_range": [[0, 32], [0, 32]], "target_byte_offset": 0, "target_id": "vllm:lm_head.weight", "target_range": [[0, 32], [0, 32]], "target_runtime": "vllm", "tensor_name": "lm_head.weight", "worker_id": "trainer-rank0-worker", "worker_rank": 0}, {"bytes": 2048, "lease_version": "trainer-rank1-live-vllm-receiver-smoke", "nixl_descriptor_id": "trainer-rank1-live-vllm-receiver-smoke", "retry_policy": "replan-from-alternate-holder", "source_byte_offset": 0, "source_id": "trainer-rank1", "source_range": [[32, 64], [0, 32]], "target_byte_offset": 2048, "target_id": "vllm:lm_head.weight", "target_range": [[32, 64], [0, 32]], "target_runtime": "vllm", "tensor_name": "lm_head.weight", "worker_id": "trainer-rank1-worker", "worker_rank": 1}], "source_ownerships": [{"contiguous": true, "dtype": "bfloat16", "element_size_bytes": 2, "global_shape": [64, 32], "layout_tags": {"storage_layout": "row-major", "trainer_layout": "synthetic-fsdp"}, "model_name": "mx-live-vllm-receiver-smoke", "model_version": "step-live-vllm-receiver-applymodel", "nixl_descriptor_id": "trainer-rank0-live-vllm-receiver-smoke", "quantization_scope": "absent", "source_id": "trainer-rank0", "source_lease": "trainer-rank0-live-vllm-receiver-smoke", "source_range": [[0, 32], [0, 32]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "lm_head.weight", "worker_id": "trainer-rank0-worker", "worker_rank": 0}, {"contiguous": true, "dtype": "bfloat16", "element_size_bytes": 2, "global_shape": [64, 32], "layout_tags": {"storage_layout": "row-major", "trainer_layout": "synthetic-fsdp"}, "model_name": "mx-live-vllm-receiver-smoke", "model_version": "step-live-vllm-receiver-applymodel", "nixl_descriptor_id": "trainer-rank1-live-vllm-receiver-smoke", "quantization_scope": "absent", "source_id": "trainer-rank1", "source_lease": "trainer-rank1-live-vllm-receiver-smoke", "source_range": [[32, 64], [0, 32]], "storage_offset_bytes": 0, "strides": null, "tensor_name": "lm_head.weight", "worker_id": "trainer-rank1-worker", "worker_rank": 1}], "target_device": "cuda:0", "target_dtype": "bfloat16", "target_key": "vllm:lm_head.weight", "target_shape": [64, 32], "target_tensor_name": "lm_head.weight", "validation": {"allclose": true, "checksum": -124.5, "checksum_matches": true, "expected_checksum": -124.5, "max_abs_error": 0.0, "original_checksum": -0.5221611261367798, "restored_checksum": -0.5221611261367798, "restored_original": true}, "vllm_version": "0.17.1", "worker_result_count": 1}
+[rank0]:[W604 20:13:14.948276717 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+---MX_VLLM_RECEIVER_ARTIFACT---
+{
+  "framework_version": "0.17.1",
+  "installed_segments": [
+    {
+      "bytes": 2048,
+      "source_id": "trainer-rank0",
+      "target_key": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "tensor_name": "lm_head.weight"
+    },
+    {
+      "bytes": 2048,
+      "source_id": "trainer-rank1",
+      "target_key": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "tensor_name": "lm_head.weight"
+    }
+  ],
+  "metrics": {
+    "activation_install_duration_ms": 0.21260802168399096,
+    "planner_duration_ms": 0.1410499680787325,
+    "request_build_duration_ms": 0.06443599704653025,
+    "restore_duration_ms": 0.07978698704391718,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "lm_head.weight": 2
+    },
+    "target_tensor_bytes": 4096,
+    "trainer_to_inference_bytes": 4096
+  },
+  "mode": "live-vllm-receiver-owned-tensor-smoke",
+  "model_name": "mx-live-vllm-receiver-smoke",
+  "model_path": "/tmp/mx-vllm-receiver-model-nlrsx0ps",
+  "model_version": "step-live-vllm-receiver-applymodel",
+  "module_class": "Qwen2ForCausalLM",
+  "module_path": "llm.apply_model.worker_model",
+  "proof": {
+    "actual_nixl_reads_used": false,
+    "allclose": true,
+    "checksum_gate": true,
+    "host_side_torch_cat_used": false,
+    "real_runtime_engine_used": true,
+    "real_trainer_process_used": false,
+    "receiver_installed_into_runtime_owned_tensor": true,
+    "receiver_installed_into_vllm_owned_tensor": true,
+    "receiver_request_from_runtime_owned_tensor": true,
+    "restored_original_tensor": true,
+    "runtime_imported": true,
+    "runtime_owned_target_tensor": true,
+    "synthetic_trainer_payloads_used": true,
+    "target_slice_spans_multiple_trainers": true,
+    "trainer_full_all_gather_used": false,
+    "trainer_side_inference_layout_conversion_used": false,
+    "vllm_apply_model_insecure_serialization_enabled": true,
+    "vllm_apply_model_used": true,
+    "vllm_imported": true,
+    "vllm_owned_target_tensor": true,
+    "vllm_worker_owned_target_tensor": true
+  },
+  "request": {
+    "destination_strides": [
+      32,
+      1
+    ],
+    "dtype": "bfloat16",
+    "element_size_bytes": 2,
+    "layout_tags": {
+      "runtime_framework": "vllm",
+      "runtime_lifecycle": "post-load-refit-smoke",
+      "runtime_module_path": "llm.apply_model.worker_model",
+      "runtime_tensor_name": "lm_head.weight",
+      "storage_layout": "row-major",
+      "target_contiguous": true,
+      "vllm_module_path": "llm.apply_model.worker_model",
+      "vllm_tensor_name": "lm_head.weight"
+    },
+    "model_name": "mx-live-vllm-receiver-smoke",
+    "model_version": "step-live-vllm-receiver-applymodel",
+    "quantization_scope": "absent",
+    "requested_range": [
+      [
+        0,
+        64
+      ],
+      [
+        0,
+        32
+      ]
+    ],
+    "runtime_framework": "vllm",
+    "target_id": "vllm:lm_head.weight",
+    "target_offset_bytes": 0,
+    "target_shape": [
+      64,
+      32
+    ],
+    "tensor_name": "lm_head.weight"
+  },
+  "result": "pass",
+  "runtime_framework": "vllm",
+  "runtime_module_discovery_path": "vllm.apply_model",
+  "schema_version": 1,
+  "segment_plans": [
+    {
+      "bytes": 2048,
+      "lease_version": "trainer-rank0-live-vllm-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank0-live-vllm-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank0",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_byte_offset": 0,
+      "target_id": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "bytes": 2048,
+      "lease_version": "trainer-rank1-live-vllm-receiver-smoke",
+      "nixl_descriptor_id": "trainer-rank1-live-vllm-receiver-smoke",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank1",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_byte_offset": 2048,
+      "target_id": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "source_ownerships": [
+    {
+      "contiguous": true,
+      "dtype": "bfloat16",
+      "element_size_bytes": 2,
+      "global_shape": [
+        64,
+        32
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-live-vllm-receiver-smoke",
+      "model_version": "step-live-vllm-receiver-applymodel",
+      "nixl_descriptor_id": "trainer-rank0-live-vllm-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank0",
+      "source_lease": "trainer-rank0-live-vllm-receiver-smoke",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "contiguous": true,
+      "dtype": "bfloat16",
+      "element_size_bytes": 2,
+      "global_shape": [
+        64,
+        32
+      ],
+      "layout_tags": {
+        "storage_layout": "row-major",
+        "trainer_layout": "synthetic-fsdp"
+      },
+      "model_name": "mx-live-vllm-receiver-smoke",
+      "model_version": "step-live-vllm-receiver-applymodel",
+      "nixl_descriptor_id": "trainer-rank1-live-vllm-receiver-smoke",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank1",
+      "source_lease": "trainer-rank1-live-vllm-receiver-smoke",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "target_device": "cuda:0",
+  "target_dtype": "bfloat16",
+  "target_key": "vllm:lm_head.weight",
+  "target_shape": [
+    64,
+    32
+  ],
+  "target_tensor_name": "lm_head.weight",
+  "validation": {
+    "allclose": true,
+    "checksum": -124.5,
+    "checksum_matches": true,
+    "expected_checksum": -124.5,
+    "max_abs_error": 0.0,
+    "original_checksum": -0.5221611261367798,
+    "restored_checksum": -0.5221611261367798,
+    "restored_original": true
+  },
+  "vllm_version": "0.17.1",
+  "worker_result_count": 1
+}

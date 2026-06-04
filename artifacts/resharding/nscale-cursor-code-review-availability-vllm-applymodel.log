@@ -1,0 +1,7 @@
++ command -v cursor-code-review
++ true
++ find /workspace /root /opt -maxdepth 5 -type f -name cursor-code-review
++ head -20
++ command -v cursor-code-review
++ echo 'cursor-code-review not found in nscale pod PATH or searched directories; local laptop review intentionally not run'
+cursor-code-review not found in nscale pod PATH or searched directories; local laptop review intentionally not run
