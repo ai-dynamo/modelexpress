@@ -663,6 +663,31 @@ class MxV2RefitReceiver:
         successfully received a version, we publish ourselves as an
         ``inference_replica`` source so that any rank N receiver who hasn't
         yet pulled can pull from us instead of contending on the trainer.
+
+        Emits v2 metadata via all three transports the trainer's
+        :meth:`MxV2TrainingPublisher.publish` uses, in parallel:
+
+        1. ``identity.extra_parameters`` — clean path; works once the
+           Rust server round-trips ``SourceIdentity`` on
+           ``GetMetadataResponse`` (server PR #162571f and later).
+        2. A ``__mx_v2_meta__`` synthetic ``TensorDescriptor``
+           (``size=0``, JSON payload in ``dtype``) — the path that
+           survives the older Rust server's identity-strip behaviour.
+        3. A ``mx_v2|<role>|rank=N|version=K|orig=...`` ``agent_name``
+           marker on the outgoing ``WorkerMetadata`` — legacy fallback
+           if the sidecar is missing.
+
+        Earlier versions of this method emitted only transport #1, which
+        meant replicas were invisible to ``discover_v2_sources`` on any
+        server that strips ``identity.extra_parameters``. Emitting all
+        three matches the trainer's own publish path and makes
+        receiver-to-receiver tree fan-out actually discoverable.
+
+        Returns:
+            The ``mx_source_id`` of the published replica entry, or
+            ``None`` if the receiver isn't initialized / has no
+            registered buffers. Server-side errors are re-raised so
+            silent failures don't mask a broken catalog.
         """
         if not self._registered_buffers:
             logger.warning(
@@ -677,7 +702,21 @@ class MxV2RefitReceiver:
             )
             return None
 
-        # Build a lightweight identity declaring ourselves as a replica.
+        # Transport #2 sidecar payload. shape_registry / world_layout are
+        # intentionally omitted — the trainer's registry is authoritative;
+        # receivers don't republish a different one.
+        sidecar_payload = json.dumps(
+            {
+                "mx_v2": "1",
+                "role": ROLE_INFERENCE_REPLICA,
+                "worker_rank": int(self._worker_rank),
+                "training_step": int(version),
+                "framework": "nemo_rl",
+            },
+            separators=(",", ":"),
+        )
+
+        # Transport #1: identity.extra_parameters.
         identity = p2p_pb2.SourceIdentity(
             model_name=model_name,
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
@@ -696,40 +735,72 @@ class MxV2RefitReceiver:
             },
         )
 
-        # Build a tensor-descriptor list from our already-registered buffers.
-        from .types import TensorDescriptor
+        # Transport #2: append a __mx_v2_meta__ sidecar TensorDescriptor.
+        descriptors = nixl.tensor_descriptors  # populated at register time
+        tensor_protos = [
+            p2p_pb2.TensorDescriptor(
+                name=d.name,
+                addr=d.addr,
+                size=d.size,
+                device_id=d.device_id,
+                dtype=d.dtype,
+            )
+            for d in descriptors
+        ]
+        tensor_protos.append(
+            p2p_pb2.TensorDescriptor(
+                name=_V2_SIDECAR_NAME,
+                addr=0,
+                size=0,
+                device_id=0,
+                dtype=sidecar_payload,
+            )
+        )
 
-        descriptors = nixl.tensor_descriptors  # already populated at register time
+        # Transport #3: mx_v2|... marker on the outgoing agent_name.
+        agent_name_marker = (
+            f"mx_v2|{ROLE_INFERENCE_REPLICA}|rank={self._worker_rank}|"
+            f"version={int(version)}|orig={self._receiver._agent_name}"
+        )
+
         worker_meta = p2p_pb2.WorkerMetadata(
             worker_rank=self._worker_rank,
             nixl_metadata=nixl.nixl_metadata,
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name=d.name,
-                    addr=d.addr,
-                    size=d.size,
-                    device_id=d.device_id,
-                    dtype=d.dtype,
-                )
-                for d in descriptors
-            ],
+            tensors=tensor_protos,
             status=p2p_pb2.SOURCE_STATUS_READY,
-            agent_name=self._receiver._agent_name,
+            agent_name=agent_name_marker,
+        )
+
+        # MxRefitReceiver.initialize assigns _worker_id eagerly, so this
+        # is always populated. The hasattr-fallback is retained for
+        # forward compatibility with caller-provided receivers that
+        # might not run through initialize().
+        worker_id = (
+            self._receiver._worker_id
+            if hasattr(self._receiver, "_worker_id") and self._receiver._worker_id
+            else f"{self._receiver._agent_name}-replica-{int(version)}"
         )
 
         try:
             mx_source_id = client.publish_metadata(
                 identity=identity,
                 worker=worker_meta,
-                worker_id=self._receiver._worker_id
-                if hasattr(self._receiver, "_worker_id")
-                else "",
+                worker_id=worker_id,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "publish_self_as_source failed: %s", e, exc_info=True
+        except Exception:
+            # Re-raise rather than silently returning None. Earlier
+            # versions swallowed this; the result was that
+            # ``publish_self_as_source`` looked like it was succeeding
+            # (returning a str-ish from the caller's perspective) while
+            # the catalog stayed empty. Surfacing the exception lets
+            # the caller's retry logic handle it explicitly.
+            logger.error(
+                "publish_self_as_source failed for rank=%d version=%d",
+                self._worker_rank,
+                version,
+                exc_info=True,
             )
-            return None
+            raise
         logger.info(
             "Published self as inference_replica: rank=%d version=%d mx_source_id=%s",
             self._worker_rank,

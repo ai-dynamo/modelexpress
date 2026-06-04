@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -89,6 +90,12 @@ class MxRefitReceiver:
         self._client: MxClient | None = None
         self._initialized = False
         self._current_step = -1
+        # Stable per-instance worker_id consumed by publish flows that
+        # require a non-empty worker_id (e.g.
+        # MxV2RefitReceiver.publish_self_as_source).  Assigned eagerly
+        # so the attribute exists even before initialize() runs;
+        # initialize() refreshes it after the NIXL agent boots.
+        self._worker_id = f"{self._agent_name}-{uuid.uuid4().hex[:12]}"
 
     @property
     def current_step(self) -> int:
