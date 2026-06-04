@@ -229,7 +229,6 @@ impl From<WorkerRecord> for WorkerMetadata {
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             tensors: legacy_tensors,
             source_payload: Some(source_payload),
-            ..Default::default()
         }
     }
 }
