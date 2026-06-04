@@ -226,8 +226,14 @@ Artifacts under `artifacts/resharding/` prove:
   harness. A nscale unit test simulates a READY primary source failing during
   its read group, verifies that only that failed source range is replanned from
   `trainer-rank2-alt`, and preserves existing stale-source behavior:
-  `artifacts/resharding/nscale-runtime-read-failure-recovery-pytest.log`. This
-  is a code-path test, not a hard GPU in-flight pod-kill proof.
+  `artifacts/resharding/nscale-runtime-read-failure-recovery-pytest.log`.
+- Hard-kill proof harness support now exposes scaled cross-node payloads and a
+  NIXL post-submit marker/sleep hook so orchestration can delete a source pod
+  after the target submits a READ:
+  `artifacts/resharding/nscale-hard-kill-harness-support-smoke.json` and
+  `artifacts/resharding/nscale-hard-kill-harness-pytest.log` (`4 passed`).
+  This is harness readiness only; it is not a hard GPU in-flight pod-kill
+  proof.
 - A competitive refit simulator now compares MX direct bipartite P2P,
   MX primary/replica fanout, NCCL Reshard-style fixed-membership full-tensor
   movement, and CheckpointEngine-style full gather/apply. The committed nscale
@@ -252,8 +258,8 @@ The current POC does **not** prove:
   post-load/refit lifecycle.
 - A hard source pod kill during an in-flight NIXL read. The current
   stale-source proof covers a source that published and became STALE before
-  the target read; the runtime read-failure fallback is unit-tested but not
-  GPU-kill-proven.
+  the target read; the runtime read-failure fallback and post-submit kill
+  harness are unit-tested but not GPU-kill-proven.
 - Full-model or multi-layer refit.
 - Runtime installation of real Qwen MoE model tensors.
 - End-to-end runtime fallback installation using real Qwen FP8 payload bytes
@@ -402,7 +408,9 @@ Remaining gap:
   runtime-owned tensors, and turn the unit-tested runtime read-failure fallback
   into a hard kill during an in-flight NIXL read. The current synthetic
   cross-node proof covers independent source pods and recovery after a
-  published source becomes STALE before the target read.
+  published source becomes STALE before the target read. The harness can now
+  widen synthetic payloads and emit a NIXL post-submit marker/sleep hook, but
+  that still needs a checksum-backed GPU pod-kill run.
 
 ### Level 4: Real Runtime Refit
 
@@ -510,8 +518,11 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Add a multi-source-pod nscale test: two source pods, one target pod, one
-   alternate source pod, with independent source-pod failure/recovery.
+1. Run the new hard-kill harness on nscale GPUs: three independent source pods
+   plus one target pod, widened payloads, target post-submit marker/sleep,
+   force-delete the selected primary source pod while its READ is outstanding,
+   and gate the result on allclose/checksum plus
+   `read_failure_recovery_used=true`.
 2. Promote the receiver tensor install smoke into live vLLM and SGLang process
    integration with each engine's post-load/refit lifecycle.
 3. Add a real vLLM receiver artifact and a real SGLang receiver artifact after

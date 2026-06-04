@@ -31,6 +31,7 @@ from .refit_nixl import (
 from .refit_poc_artifacts import artifact_base, write_artifact
 from .refit_poc_scenario import (
     FAILED_PRIMARY_SOURCE_IDS,
+    GLOBAL_SHAPE,
     MODEL_NAME,
     MODEL_VERSION,
     PRIMARY_SOURCE_IDS,
@@ -117,17 +118,67 @@ def _source_statuses_by_source_id(
 
 
 def _run_ownerships(run_id: str) -> list[SliceOwnership]:
+    return _run_ownerships_for_payload(run_id, payload_columns=GLOBAL_SHAPE[1])
+
+
+def _run_ownerships_for_payload(
+    run_id: str, *, payload_columns: int
+) -> list[SliceOwnership]:
     model_version = _run_model_version(run_id)
     return [
-        replace(owner, model_version=model_version)
+        _ownership_for_payload(
+            replace(owner, model_version=model_version),
+            payload_columns=payload_columns,
+        )
         for owner in [*primary_ownerships(), *alternate_ownerships()]
     ]
 
 
 def _run_request(run_id: str) -> SliceRequest:
+    return _run_request_for_payload(run_id, payload_columns=GLOBAL_SHAPE[1])
+
+
+def _run_request_for_payload(run_id: str, *, payload_columns: int) -> SliceRequest:
+    return _request_for_payload(
+        replace(
+            inference_request(target_id="inference-crossnode-target"),
+            model_version=_run_model_version(run_id),
+        ),
+        payload_columns=payload_columns,
+    )
+
+
+def _normalize_payload_columns(payload_columns: int) -> int:
+    payload_columns = int(payload_columns)
+    if payload_columns < GLOBAL_SHAPE[1]:
+        raise ValueError(
+            f"payload_columns must be >= {GLOBAL_SHAPE[1]}, got {payload_columns}"
+        )
+    return payload_columns
+
+
+def _ownership_for_payload(
+    owner: SliceOwnership, *, payload_columns: int
+) -> SliceOwnership:
+    payload_columns = _normalize_payload_columns(payload_columns)
+    row_range = owner.source_range[0]
     return replace(
-        inference_request(target_id="inference-crossnode-target"),
-        model_version=_run_model_version(run_id),
+        owner,
+        global_shape=(owner.global_shape[0], payload_columns),
+        source_range=(row_range, (0, payload_columns)),
+    )
+
+
+def _request_for_payload(
+    request: SliceRequest, *, payload_columns: int
+) -> SliceRequest:
+    payload_columns = _normalize_payload_columns(payload_columns)
+    row_range = request.requested_range[0]
+    requested_range = (row_range, (0, payload_columns))
+    return replace(
+        request,
+        requested_range=requested_range,
+        target_shape=_range_extents(requested_range),
     )
 
 
@@ -451,6 +502,7 @@ def run_source(
     artifact_path: Path | None,
     source_id: str = "",
     source_worker_rank: int | None = None,
+    payload_columns: int = GLOBAL_SHAPE[1],
 ) -> dict[str, Any]:
     torch = _import_torch()
     if not torch.cuda.is_available():
@@ -461,8 +513,9 @@ def run_source(
     device = torch.device(f"cuda:{device_index}")
     apply_nixl_ucx_pin(device_index)
 
+    payload_columns = _normalize_payload_columns(payload_columns)
     ownerships = _filter_ownerships(
-        _run_ownerships(run_id),
+        _run_ownerships_for_payload(run_id, payload_columns=payload_columns),
         source_id=source_id,
         worker_rank=source_worker_rank,
     )
@@ -549,6 +602,7 @@ def run_source(
                 "source_id": source_id,
                 "source_worker_rank": source_worker_rank,
             },
+            "payload_columns": payload_columns,
             "gpu_reuse_used": gpu_reuse_used,
             "cuda_device": device_index,
             "nixl_backends": adapter.backends,
@@ -588,6 +642,7 @@ def run_target(
     gpu_count: int,
     failed_source_ids: set[str] | None = None,
     stale_source_ids: set[str] | None = None,
+    payload_columns: int = GLOBAL_SHAPE[1],
 ) -> dict[str, Any]:
     torch = _import_torch()
     if not torch.cuda.is_available():
@@ -604,7 +659,8 @@ def run_target(
     device = torch.device(f"cuda:{device_index}")
     apply_nixl_ucx_pin(device_index)
 
-    request = _run_request(run_id)
+    payload_columns = _normalize_payload_columns(payload_columns)
+    request = _run_request_for_payload(run_id, payload_columns=payload_columns)
     expected_source_ids = {
         *PRIMARY_SOURCE_IDS,
         *{owner.source_id for owner in alternate_ownerships()},
@@ -842,6 +898,7 @@ def run_target(
                     read_source_ids
                 )
             ),
+            "payload_columns": payload_columns,
         }
     )
     result["distributed"] = {
@@ -860,6 +917,7 @@ def run_target(
         "discovered_source_agent_names_by_source_id": discovered_source_agent_names,
         "target_agent_name": agent_name,
         "gpu_reuse_used": gpu_reuse_used,
+        "payload_columns": payload_columns,
     }
     result["control_plane"] = {
         "mode": "live-mx-cross-node",
@@ -962,6 +1020,16 @@ def main() -> None:
         "--gpu-count", type=int, default=int(os.environ.get("GPU_COUNT", "2"))
     )
     parser.add_argument(
+        "--payload-columns",
+        type=int,
+        default=int(os.environ.get("MX_REFIT_PAYLOAD_COLUMNS", str(GLOBAL_SHAPE[1]))),
+        help=(
+            "Column count for the synthetic tensor payload. Values larger than "
+            "the default widen each source and target slice so hard-kill NIXL "
+            "proofs can keep reads in flight long enough for pod deletion."
+        ),
+    )
+    parser.add_argument(
         "--failed-source-id",
         action="append",
         default=[],
@@ -991,6 +1059,7 @@ def main() -> None:
             artifact_path=args.artifact,
             source_id=args.source_id,
             source_worker_rank=args.source_worker_rank,
+            payload_columns=args.payload_columns,
         )
     else:
         if args.artifact is None:
@@ -1016,6 +1085,7 @@ def main() -> None:
             stale_source_ids={
                 source_id for source_id in args.stale_source_id if source_id
             },
+            payload_columns=args.payload_columns,
         )
 
 

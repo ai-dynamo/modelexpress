@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import time
@@ -37,6 +38,7 @@ class NixlAdapter:
         remote_descs: list[tuple[int, int, int]],
         local_descs: list[tuple[int, int, int]],
         timeout_seconds: float,
+        trace_label: str = "",
     ) -> dict[str, Any]:
         prep_start = time.perf_counter()
         remote_side = _nixl_prep_xfer(
@@ -55,6 +57,12 @@ class NixlAdapter:
             indices,
             remote_side,
             self.backends,
+        )
+        _post_submit_probe(
+            trace_label=trace_label,
+            remote_agent_name=remote_agent_name,
+            remote_descs=remote_descs,
+            local_descs=local_descs,
         )
         read_duration_ms, backend, telemetry = _nixl_wait_for_read(
             self.agent,
@@ -107,6 +115,7 @@ def read_segment_groups(
             remote_descs=remote_descs,
             local_descs=local_descs,
             timeout_seconds=timeout_seconds,
+            trace_label=source_id,
         )
         torch.cuda.synchronize(target.device)
         reads.append(
@@ -119,9 +128,7 @@ def read_segment_groups(
                 "read_duration_ms": read["read_duration_ms"],
                 "backend": read["backend"],
                 "telemetry": (
-                    str(read["telemetry"])
-                    if read["telemetry"] is not None
-                    else None
+                    str(read["telemetry"]) if read["telemetry"] is not None else None
                 ),
                 "segments": [plan.to_dict() for plan in source_plans],
             }
@@ -147,6 +154,57 @@ def _import_torch():
 
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw!r}") from exc
+
+
+def _post_submit_probe(
+    *,
+    trace_label: str,
+    remote_agent_name: str,
+    remote_descs: list[tuple[int, int, int]],
+    local_descs: list[tuple[int, int, int]],
+) -> None:
+    """Expose a deterministic hook after a NIXL READ has been submitted.
+
+    Hard-kill proofs need to delete a source pod after the target has issued a
+    READ, not before endpoint discovery. The environment-controlled marker and
+    sleep keep the default path untouched while giving nscale orchestration a
+    precise point to kill one source during an outstanding transfer.
+    """
+
+    marker_path = os.environ.get("MX_REFIT_NIXL_POST_SUBMIT_MARKER", "").strip()
+    sleep_seconds = _env_float("MX_REFIT_NIXL_POST_SUBMIT_SLEEP_SECONDS", 0.0)
+    if not marker_path and sleep_seconds <= 0.0:
+        return
+
+    payload = {
+        "phase": "nixl.read_submitted",
+        "trace_label": trace_label,
+        "remote_agent_name": remote_agent_name,
+        "remote_desc_count": len(remote_descs),
+        "local_desc_count": len(local_descs),
+        "bytes": sum(int(desc[1]) for desc in remote_descs),
+        "sleep_seconds": sleep_seconds,
+        "timestamp_ns": time.time_ns(),
+    }
+    print(f"[mx-refit-nixl] {json.dumps(payload, sort_keys=True)}", flush=True)
+
+    if marker_path:
+        marker = Path(marker_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+    if sleep_seconds > 0.0:
+        time.sleep(sleep_seconds)
 
 
 def select_cuda_device(local_rank: int) -> tuple[int, bool]:

@@ -1,0 +1,65 @@
+{
+  "default_payload_columns": 4,
+  "gpu_proof": false,
+  "hard_pod_kill_inflight_proven": false,
+  "mode": "hard-kill-harness-support-cpu-smoke",
+  "nscale": true,
+  "payload_columns": 16,
+  "post_submit_probe_env": {
+    "marker": "MX_REFIT_NIXL_POST_SUBMIT_MARKER",
+    "sleep_seconds": "MX_REFIT_NIXL_POST_SUBMIT_SLEEP_SECONDS"
+  },
+  "post_submit_probe_validated_by": "modelexpress_client/python/tests/test_refit_nixl.py::test_post_submit_probe_writes_marker_without_sleep",
+  "primary_source_ids": [
+    "trainer-rank0",
+    "trainer-rank1"
+  ],
+  "purpose": "Expose deterministic harness controls for later GPU hard-kill NIXL proof without claiming the proof is complete.",
+  "pytest_artifact": "nscale-hard-kill-harness-pytest.log",
+  "recovery_bytes": 64,
+  "recovery_ranges": [
+    [
+      [
+        2,
+        3
+      ],
+      [
+        0,
+        16
+      ]
+    ]
+  ],
+  "recovery_source_ids": [
+    "trainer-rank2-alt"
+  ],
+  "request_range": [
+    [
+      2,
+      6
+    ],
+    [
+      0,
+      16
+    ]
+  ],
+  "request_target_shape": [
+    4,
+    16
+  ],
+  "result": "pass",
+  "schema_version": 1,
+  "source_global_shapes": {
+    "trainer-rank0": [
+      8,
+      16
+    ],
+    "trainer-rank1": [
+      8,
+      16
+    ],
+    "trainer-rank2-alt": [
+      8,
+      16
+    ]
+  }
+}

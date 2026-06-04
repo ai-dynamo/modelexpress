@@ -8,7 +8,9 @@ from modelexpress.refit_crossnode import (
     _plan_context_for_endpoints,
     _read_plans_with_runtime_recovery,
     _run_ownerships,
+    _run_ownerships_for_payload,
     _run_request,
+    _run_request_for_payload,
 )
 from modelexpress.resharding_control_plane import RefitNixlEndpoint
 from modelexpress.types import TensorDescriptor
@@ -134,6 +136,34 @@ def test_crossnode_runtime_read_failure_replans_only_failed_source_segments():
     assert [plan.source_id for plan in runtime_recovery_plans] == ["trainer-rank2-alt"]
     assert runtime_recovery_plans[0].target_range == ((2, 3), (0, 4))
     assert runtime_recovery_plans[0].bytes == 16
+
+
+def test_crossnode_scaled_payload_preserves_exact_recovery_ranges():
+    run_id = "unit-scaled-payload"
+    request = _run_request_for_payload(run_id, payload_columns=16)
+    endpoints = [
+        _endpoint(owner, status=p2p_pb2.SOURCE_STATUS_READY)
+        for owner in _run_ownerships_for_payload(run_id, payload_columns=16)
+    ]
+
+    context = _plan_context_for_endpoints(
+        endpoints=endpoints,
+        request=request,
+        metadata_query_duration_ms=1.0,
+        planner_duration_ms=0.0,
+        failed_source_ids={"trainer-rank0"},
+        stale_source_ids=set(),
+    )
+
+    assert request.requested_range == ((2, 6), (0, 16))
+    assert request.target_shape == (4, 16)
+    assert all(endpoint.ownership.global_shape == (8, 16) for endpoint in endpoints)
+    assert [plan.source_id for plan in context["recovery_plans"]] == [
+        "trainer-rank2-alt"
+    ]
+    assert context["recovery_plans"][0].source_range == ((2, 3), (0, 16))
+    assert context["recovery_plans"][0].target_range == ((2, 3), (0, 16))
+    assert context["recovery_plans"][0].bytes == 64
 
 
 def _endpoint(owner, *, status: int) -> RefitNixlEndpoint:

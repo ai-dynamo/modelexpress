@@ -137,6 +137,12 @@ Files:
   target replans only that failed source range from an alternate holder, and
   preserves the existing stale-source/control-plane tests. This is code-path
   evidence only; it is not a hard GPU in-flight pod-kill proof.
+- `nscale-hard-kill-harness-support-smoke.json` and
+  `nscale-hard-kill-harness-pytest.log`: nscale CPU evidence that the
+  cross-node harness can widen synthetic payload columns and emit a NIXL
+  post-submit marker/sleep hook for a later hard source-pod kill proof
+  (`4 passed`). This is harness-readiness evidence only; it records
+  `hard_pod_kill_inflight_proven=false`.
 - `nscale-crossnode-control-plane-pytest.log`: focused Python control-plane
   pytest run inside the nscale target pod after the cross-node patch
   (`8 passed`). It covers the MX refit endpoint helper path, including legacy
