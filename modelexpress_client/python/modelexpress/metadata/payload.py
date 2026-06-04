@@ -17,8 +17,11 @@ def tensor_source_metadata(
 
 
 def worker_tensor_descriptors(worker: p2p_pb2.WorkerMetadata):
-    if worker.WhichOneof("source_payload") == "tensor_source":
+    payload = worker.WhichOneof("source_payload")
+    if payload == "tensor_source":
         return worker.tensor_source.tensors
+    if payload == "artifact_source":
+        return []
     return worker.tensors
 
 

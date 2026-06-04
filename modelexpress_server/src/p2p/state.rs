@@ -283,7 +283,8 @@ mod tests {
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
         assert_eq!(back.backend_metadata, meta.backend_metadata);
-        assert!(back.tensors.is_empty());
+        assert_eq!(back.tensors.len(), 1);
+        assert_eq!(back.tensors[0].name, "test.from_payload");
         assert!(matches!(
             back.source_payload,
             Some(SourcePayload::TensorSource(ref tensor_source))

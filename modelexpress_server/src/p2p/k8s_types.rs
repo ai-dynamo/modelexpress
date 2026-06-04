@@ -7,6 +7,7 @@
 //! alternative to Redis for storing P2P metadata.
 
 use kube::CustomResource;
+use modelexpress_common::grpc::p2p::MxSourceType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -38,13 +39,13 @@ fn default_source_type() -> String {
 impl ModelMetadataSpec {
     /// Convert an `MxSourceType` proto enum value (i32) to the CRD source type string.
     pub fn source_type_name_from_proto(mx_source_type: i32) -> String {
-        match mx_source_type {
-            0 => "weights",
-            1 => "lora",
-            2 => "cuda_graph",
-            3 => "torch_compile_cache",
-            4 => "triton_cache",
-            _ => "unknown",
+        match MxSourceType::try_from(mx_source_type) {
+            Ok(MxSourceType::Weights) => "weights",
+            Ok(MxSourceType::Lora) => "lora",
+            Ok(MxSourceType::CudaGraph) => "cuda_graph",
+            Ok(MxSourceType::TorchCompileCache) => "torch_compile_cache",
+            Ok(MxSourceType::TritonCache) => "triton_cache",
+            Err(_) => "unknown",
         }
         .to_string()
     }

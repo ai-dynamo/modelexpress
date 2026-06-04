@@ -109,6 +109,37 @@ fn artifact_payload_does_not_publish_weight_tensors() {
 }
 
 #[test]
+fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
+    let worker = WorkerMetadata {
+        worker_rank: 0,
+        source_payload: Some(SourcePayload::TensorSource(
+            modelexpress_common::grpc::p2p::TensorSourceMetadata {
+                tensors: vec![TensorDescriptor {
+                    name: "model.layers.0.weight".to_string(),
+                    addr: 0x1000,
+                    size: 4096,
+                    device_id: 0,
+                    dtype: "bfloat16".to_string(),
+                }],
+            },
+        )),
+        ..Default::default()
+    };
+
+    let record = WorkerRecord::from(worker);
+    let back: WorkerMetadata = record.into();
+
+    assert_eq!(back.tensors.len(), 1);
+    assert_eq!(back.tensors[0].name, "model.layers.0.weight");
+    assert!(matches!(
+        back.source_payload,
+        Some(SourcePayload::TensorSource(ref tensor_source))
+            if tensor_source.tensors.len() == 1
+                && tensor_source.tensors[0].name == "model.layers.0.weight"
+    ));
+}
+
+#[test]
 fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
     assert_eq!(
         ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TorchCompileCache as i32),

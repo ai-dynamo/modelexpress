@@ -52,6 +52,8 @@ echo "Generating Go protobuf and gRPC bindings from ${PROTO_DIR}..."
         "${PROTO_FILES[@]}"
 )
 
+# Work over the generated file set explicitly so normalization/header steps
+# apply only to files protoc produced in this run.
 generated_files=()
 while IFS= read -r -d '' file; do
     generated_files+=("${file}")

@@ -122,6 +122,22 @@ class TestWorkerMetadata:
         assert len(tensors) == 1
         assert tensors[0].name == "legacy"
 
+    def test_worker_tensor_descriptors_returns_empty_for_artifact_source(self):
+        legacy = p2p_pb2.TensorDescriptor(name="legacy", addr=1, size=1)
+        worker = p2p_pb2.WorkerMetadata(
+            tensors=[legacy],
+            artifact_source=p2p_pb2.ArtifactSourceMetadata(
+                artifact_id="sha256:artifact",
+                total_size=128,
+                file_count=1,
+                chunk_count=1,
+            ),
+        )
+
+        tensors = worker_tensor_descriptors(worker)
+
+        assert len(tensors) == 0
+
 
 class TestGetMetadataResponse:
     """Tests for GetMetadataResponse dataclass."""

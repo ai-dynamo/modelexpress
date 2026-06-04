@@ -191,6 +191,7 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
 
 // Conversions back to gRPC types
 impl From<WorkerRecord> for WorkerMetadata {
+    #[allow(deprecated)]
     fn from(record: WorkerRecord) -> Self {
         use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
         use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
@@ -199,13 +200,17 @@ impl From<WorkerRecord> for WorkerMetadata {
             .into_iter()
             .map(modelexpress_common::grpc::p2p::TensorDescriptor::from)
             .collect();
-        let source_payload = match record.artifact_source {
-            Some(artifact) => Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata::from(
-                artifact,
-            ))),
-            None => Some(SourcePayload::TensorSource(TensorSourceMetadata {
-                tensors: tensors.clone(),
-            })),
+        let (legacy_tensors, source_payload) = match record.artifact_source {
+            Some(artifact) => (
+                Vec::new(),
+                SourcePayload::ArtifactSource(ArtifactSourceMetadata::from(artifact)),
+            ),
+            None => (
+                tensors.clone(),
+                SourcePayload::TensorSource(TensorSourceMetadata {
+                    tensors: tensors.clone(),
+                }),
+            ),
         };
         let backend_metadata = match record.backend_metadata {
             BackendMetadataRecord::Nixl(data) => Some(BackendMetadata::NixlMetadata(data)),
@@ -222,7 +227,8 @@ impl From<WorkerRecord> for WorkerMetadata {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
-            source_payload,
+            tensors: legacy_tensors,
+            source_payload: Some(source_payload),
             ..Default::default()
         }
     }
