@@ -125,6 +125,16 @@ def _replacement_tensor(
     return trainer_step_replacement_tensor(shape, dtype=dtype, device=device)
 
 
+def _runtime_storage_expected_tensor(
+    expected: torch.Tensor,
+    *,
+    runtime_storage_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    if runtime_storage_dtype is None or runtime_storage_dtype == expected.dtype:
+        return expected
+    return expected.to(dtype=runtime_storage_dtype).to(dtype=expected.dtype)
+
+
 def _range_slices(tensor_range: TensorRange) -> tuple[slice, ...]:
     return tuple(slice(start, end) for start, end in tensor_range)
 
@@ -263,6 +273,7 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
     nixl_metrics: dict[str, Any] | None = None,
     distributed: dict[str, Any] | None = None,
     actual_nixl_reads_used: bool = True,
+    runtime_storage_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """Install a NIXL-assembled staging tensor into a live SGLang Engine."""
 
@@ -306,10 +317,16 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
         name=tensor_name,
     )
     validate_fetch_duration_ms = (time.perf_counter() - validate_fetch_start) * 1000
-    allclose = _tensor_close(updated, expected)
+    runtime_expected = _runtime_storage_expected_tensor(
+        expected,
+        runtime_storage_dtype=runtime_storage_dtype,
+    )
+    runtime_expected_checksum = _tensor_checksum(runtime_expected)
+    allclose = _tensor_close(updated, runtime_expected)
     checksum = _tensor_checksum(updated)
-    checksum_matches = checksum == expected_checksum
-    max_abs_error = _tensor_max_abs_error(updated, expected)
+    checksum_matches = checksum == runtime_expected_checksum
+    max_abs_error = _tensor_max_abs_error(updated, runtime_expected)
+    full_precision_max_abs_error = _tensor_max_abs_error(updated, expected)
 
     restore_start = time.perf_counter()
     restore_result = engine.update_weights_from_tensor(
@@ -411,9 +428,16 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
             "nixl_staging_checksum_matches": staging_checksum_matches,
             "allclose": allclose,
             "checksum": checksum,
-            "expected_checksum": expected_checksum,
+            "expected_checksum": runtime_expected_checksum,
+            "full_precision_expected_checksum": expected_checksum,
             "checksum_matches": checksum_matches,
             "max_abs_error": max_abs_error,
+            "full_precision_max_abs_error": full_precision_max_abs_error,
+            "runtime_storage_dtype": (
+                _torch_dtype_name(runtime_storage_dtype)
+                if runtime_storage_dtype is not None
+                else _torch_dtype_name(original.dtype)
+            ),
             "original_checksum": _tensor_checksum(original),
             "restored_checksum": _tensor_checksum(restored),
             "restored_original": restored_original,
@@ -774,6 +798,7 @@ def run_sglang_nixl_runtime_refit_distributed(
             nixl_metrics=nixl_metrics,
             distributed=distributed,
             actual_nixl_reads_used=True,
+            runtime_storage_dtype=_torch_dtype_from_name(dtype),
         )
         result["nixl"].update(
             {

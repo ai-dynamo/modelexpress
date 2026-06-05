@@ -46,6 +46,21 @@ class FakeSglangEngine:
         return True, "Success"
 
 
+class Bfloat16StorageFakeSglangEngine(FakeSglangEngine):
+    def update_weights_from_tensor(
+        self,
+        named_tensors,
+        load_format=None,
+        flush_cache=True,
+    ):
+        assert load_format == "direct"
+        assert flush_cache is True
+        self.update_weight_calls += 1
+        for name, tensor in named_tensors:
+            self.weights[name] = tensor.detach().to(torch.bfloat16).to(torch.float32)
+        return True, "Success"
+
+
 def test_sglang_nixl_runtime_clears_torchrun_env_for_engine(monkeypatch):
     monkeypatch.setenv("RANK", "2")
     monkeypatch.setenv("WORLD_SIZE", "3")
@@ -178,3 +193,38 @@ def test_sglang_nixl_runtime_refit_installs_and_restores_engine_weight(tmp_path)
     payload = json.loads(artifact_path.read_text())
     assert payload["proof"]["actual_nixl_reads_used"] is True
     assert payload["distributed"] == {"world_size": 3, "target_rank": 2}
+
+
+def test_sglang_nixl_runtime_refit_accepts_runtime_bfloat16_roundtrip(tmp_path):
+    original = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    engine = Bfloat16StorageFakeSglangEngine(original)
+    request, owners, plans = build_sglang_runtime_nixl_plan(
+        original,
+        tensor_name="lm_head.weight",
+        model_name="tiny-sglang-nixl",
+        model_version="step-24",
+    )
+    assembled = _replacement_tensor(original.shape, dtype=original.dtype, device="cpu")
+
+    result = run_sglang_receiver_refit_from_nixl_staging_tensor(
+        engine,
+        tensor_name="lm_head.weight",
+        original=original,
+        assembled=assembled,
+        request=request,
+        source_ownerships=owners,
+        segment_plans=plans,
+        model_name="tiny-sglang-nixl",
+        model_version="step-24",
+        sglang_version="unit-test",
+        artifact_path=tmp_path / "sglang-bf16-runtime-smoke.json",
+        model_path="unit-tiny-llama",
+        runtime_storage_dtype=torch.bfloat16,
+    )
+
+    assert result["result"] == "pass"
+    assert result["validation"]["runtime_storage_dtype"] == "bfloat16"
+    assert result["validation"]["checksum_matches"] is True
+    assert result["validation"]["full_precision_max_abs_error"] > 0
+    assert result["proof"]["runtime_update_from_nixl_staging_tensor"] is True
+    assert engine.update_weight_calls == 2
