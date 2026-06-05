@@ -26,6 +26,7 @@ from typing import Any, Optional
 import torch
 
 from .client import MxClient
+from .metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from . import p2p_pb2
 
 logger = logging.getLogger("modelexpress.trtllm_live_transfer")
@@ -128,7 +129,7 @@ def publish_model_params(torch_model: Any) -> None:
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
-        tensors=tensor_protos,
+        tensor_source=tensor_source_metadata(tensor_protos),
     )
 
     identity = _build_trtllm_identity(model_name=model_name)
@@ -244,7 +245,7 @@ def publish_from_worker(worker: Any) -> None:
     my_worker = p2p_pb2.WorkerMetadata(
         worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
-        tensors=tensor_protos,
+        tensor_source=tensor_source_metadata(tensor_protos),
     )
 
     identity = _build_trtllm_identity(model_name=model_name)
@@ -342,7 +343,7 @@ class MxLiveWeightLoader:
         )
 
         # 3. Build source name→descriptor map
-        source_descs = {t.name: t for t in source_worker.tensors}
+        source_descs = {t.name: t for t in worker_tensor_descriptors(source_worker)}
 
         # 4. Match source and target by name
         matched = []
@@ -510,7 +511,7 @@ class MxLiveWeightLoader:
                             mx_source_id=inst.mx_source_id,
                             worker_id=inst.worker_id,
                         )
-                        if meta_resp.found and meta_resp.worker.tensors:
+                        if meta_resp.found and worker_tensor_descriptors(meta_resp.worker):
                             workers.append(meta_resp.worker)
 
                     if workers:

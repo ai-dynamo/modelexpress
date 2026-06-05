@@ -42,6 +42,9 @@ spec:
                 modelName:
                   type: string
                   description: Full model name (e.g., meta-llama/Llama-3.1-405B-Instruct)
+                sourceType:
+                  type: string
+                  description: Source type from SourceIdentity (e.g., weights, torch_compile_cache)
             status:
               type: object
               properties:
@@ -82,6 +85,26 @@ spec:
                     workerGrpcEndpoint:
                       type: string
                       description: P2P worker gRPC endpoint for tensor manifest (host:port)
+                    artifactSource:
+                      type: object
+                      description: Small discovery summary for file-backed artifact sources
+                      properties:
+                        artifactId:
+                          type: string
+                          description: Digest of the canonical sealed artifact manifest
+                        totalSize:
+                          type: integer
+                          format: int64
+                          minimum: 0
+                          description: Total artifact bytes across all manifest files
+                        fileCount:
+                          type: integer
+                          minimum: 0
+                          description: Number of files in the sealed artifact manifest
+                        chunkCount:
+                          type: integer
+                          minimum: 0
+                          description: Number of transfer chunks in the sealed artifact manifest
                     status:
                       type: string
                       description: Worker lifecycle status
@@ -137,6 +160,10 @@ spec:
           type: string
           description: Model name
           jsonPath: .spec.modelName
+        - name: Type
+          type: string
+          description: Source type
+          jsonPath: .spec.sourceType
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp

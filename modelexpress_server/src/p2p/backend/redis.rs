@@ -14,7 +14,10 @@
 //! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
 //! to enumerate source index keys without a separate secondary index.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
+use super::{
+    ArtifactSourceMetadataRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
+    TensorRecord, WorkerRecord,
+};
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::WorkerMetadata;
 use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
@@ -54,6 +57,20 @@ struct SourceAttributesJson {
     pub dtype: String,
     #[serde(default)]
     pub quantization: String,
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default)]
+    pub backend_framework_version: String,
+    #[serde(default)]
+    pub torch_version: String,
+    #[serde(default)]
+    pub cuda_version: String,
+    #[serde(default)]
+    pub triton_version: String,
+    #[serde(default)]
+    pub gpu_arch: String,
+    #[serde(default)]
+    pub compile_config_digest: String,
 }
 
 impl From<&SourceIdentity> for SourceAttributesJson {
@@ -68,6 +85,13 @@ impl From<&SourceIdentity> for SourceAttributesJson {
             expert_parallel_size: id.expert_parallel_size,
             dtype: id.dtype.clone(),
             quantization: id.quantization.clone(),
+            revision: id.revision.clone(),
+            backend_framework_version: id.backend_framework_version.clone(),
+            torch_version: id.torch_version.clone(),
+            cuda_version: id.cuda_version.clone(),
+            triton_version: id.triton_version.clone(),
+            gpu_arch: id.gpu_arch.clone(),
+            compile_config_digest: id.compile_config_digest.clone(),
         }
     }
 }
@@ -214,6 +238,22 @@ struct WorkerRecordJson {
     /// P2P: Worker gRPC endpoint for tensor manifest
     #[serde(default)]
     pub worker_grpc_endpoint: String,
+    /// Small discovery summary for file-backed artifact sources.
+    #[serde(default)]
+    pub artifact_source: Option<ArtifactSourceMetadataJson>,
+}
+
+/// Serializable artifact source summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ArtifactSourceMetadataJson {
+    pub artifact_id: String,
+    #[serde(
+        serialize_with = "serialize_u64_as_string",
+        deserialize_with = "deserialize_u64_from_any"
+    )]
+    pub total_size: u64,
+    pub file_count: u32,
+    pub chunk_count: u32,
 }
 
 impl WorkerRecordJson {
@@ -239,6 +279,7 @@ impl WorkerRecordJson {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
 }
@@ -258,6 +299,29 @@ impl From<WorkerRecordJson> for WorkerRecord {
             metadata_endpoint: json.metadata_endpoint,
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
+            artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
+        }
+    }
+}
+
+impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadataJson {
+    fn from(record: ArtifactSourceMetadataRecord) -> Self {
+        Self {
+            artifact_id: record.artifact_id,
+            total_size: record.total_size,
+            file_count: record.file_count,
+            chunk_count: record.chunk_count,
+        }
+    }
+}
+
+impl From<ArtifactSourceMetadataJson> for ArtifactSourceMetadataRecord {
+    fn from(json: ArtifactSourceMetadataJson) -> Self {
+        Self {
+            artifact_id: json.artifact_id,
+            total_size: json.total_size,
+            file_count: json.file_count,
+            chunk_count: json.chunk_count,
         }
     }
 }
@@ -654,6 +718,12 @@ mod tests {
             metadata_endpoint: String::new(),
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
+            artifact_source: Some(ArtifactSourceMetadataRecord {
+                artifact_id: "artifact123".to_string(),
+                total_size: 1_099_511_627_776,
+                file_count: 7,
+                chunk_count: 128,
+            }),
         };
 
         let json_record = WorkerRecordJson::from_worker_record(record.clone());
@@ -666,6 +736,11 @@ mod tests {
         assert_eq!(back.status, record.status);
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
+        assert_eq!(back.artifact_source, record.artifact_source);
+        assert!(
+            json.contains(r#""total_size":"#),
+            "large artifact byte counts must serialize as strings"
+        );
     }
 
     #[test]
@@ -676,6 +751,7 @@ mod tests {
         let parsed: WorkerRecordJson = serde_json::from_str(json).expect("parse legacy");
         assert_eq!(parsed.status, 0);
         assert_eq!(parsed.updated_at, 0);
+        assert_eq!(parsed.artifact_source, None);
     }
 
     // ── SourceAttributesJson ────────────────────────────────────────────────
@@ -693,6 +769,12 @@ mod tests {
             quantization: "fp8".to_string(),
             extra_parameters: Default::default(),
             revision: String::new(),
+            backend_framework_version: String::new(),
+            torch_version: String::new(),
+            cuda_version: String::new(),
+            triton_version: String::new(),
+            gpu_arch: String::new(),
+            compile_config_digest: String::new(),
         }
     }
 
@@ -709,6 +791,28 @@ mod tests {
         assert_eq!(attr.dtype, "bfloat16");
         assert_eq!(attr.quantization, "fp8");
         assert_eq!(attr.backend_framework, 1);
+    }
+
+    #[test]
+    fn test_source_attributes_include_artifact_identity_fields() {
+        let mut id = test_identity();
+        id.revision = "abc123".to_string();
+        id.backend_framework_version = "0.10.0".to_string();
+        id.torch_version = "2.8.0+cu128".to_string();
+        id.cuda_version = "12.8".to_string();
+        id.triton_version = "3.4.0".to_string();
+        id.gpu_arch = "sm90".to_string();
+        id.compile_config_digest = "digest".to_string();
+
+        let attr = SourceAttributesJson::from(&id);
+
+        assert_eq!(attr.revision, "abc123");
+        assert_eq!(attr.backend_framework_version, "0.10.0");
+        assert_eq!(attr.torch_version, "2.8.0+cu128");
+        assert_eq!(attr.cuda_version, "12.8");
+        assert_eq!(attr.triton_version, "3.4.0");
+        assert_eq!(attr.gpu_arch, "sm90");
+        assert_eq!(attr.compile_config_digest, "digest");
     }
 
     #[test]

@@ -171,6 +171,7 @@ impl P2pStateManager {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
@@ -193,6 +194,12 @@ mod tests {
             quantization: String::new(),
             extra_parameters: Default::default(),
             revision: String::new(),
+            backend_framework_version: String::new(),
+            torch_version: String::new(),
+            cuda_version: String::new(),
+            triton_version: String::new(),
+            gpu_arch: String::new(),
+            compile_config_digest: String::new(),
         }
     }
 
@@ -217,7 +224,8 @@ mod tests {
 
     #[test]
     fn test_worker_record_conversion() {
-        use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
+        use modelexpress_common::grpc::p2p::TensorSourceMetadata;
+        use modelexpress_common::grpc::p2p::worker_metadata::{BackendMetadata, SourcePayload};
 
         let meta = WorkerMetadata {
             worker_rank: 3,
@@ -231,6 +239,15 @@ mod tests {
             }],
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
+            source_payload: Some(SourcePayload::TensorSource(TensorSourceMetadata {
+                tensors: vec![TensorDescriptor {
+                    name: "test.from_payload".to_string(),
+                    addr: 0x2000,
+                    size: 8192,
+                    device_id: 3,
+                    dtype: "float16".to_string(),
+                }],
+            })),
             ..Default::default()
         };
 
@@ -241,12 +258,75 @@ mod tests {
             BackendMetadataRecord::Nixl(d) if d == &vec![1, 2, 3, 4, 5]
         ));
         assert_eq!(record.tensors.len(), 1);
+        assert_eq!(record.tensors[0].name, "test.from_payload");
         assert_eq!(record.status, SourceStatus::Initializing as i32);
         assert_eq!(record.updated_at, 1234567890000);
+        assert_eq!(record.artifact_source, None);
 
         let back: WorkerMetadata = record.into();
         assert_eq!(back.worker_rank, meta.worker_rank);
         assert_eq!(back.backend_metadata, meta.backend_metadata);
+        assert_eq!(back.tensors.len(), 1);
+        assert_eq!(back.tensors[0].name, "test.from_payload");
+        assert!(matches!(
+            back.source_payload,
+            Some(SourcePayload::TensorSource(ref tensor_source))
+                if tensor_source.tensors.len() == 1
+                    && tensor_source.tensors[0].name == "test.from_payload"
+        ));
+    }
+
+    #[test]
+    fn test_worker_record_conversion_falls_back_to_legacy_tensors() {
+        let meta = WorkerMetadata {
+            worker_rank: 3,
+            tensors: vec![TensorDescriptor {
+                name: "test.legacy".to_string(),
+                addr: 0x1000,
+                size: 4096,
+                device_id: 3,
+                dtype: "float16".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let record = WorkerRecord::from(meta);
+
+        assert_eq!(record.tensors.len(), 1);
+        assert_eq!(record.tensors[0].name, "test.legacy");
+    }
+
+    #[test]
+    fn test_worker_record_conversion_preserves_artifact_payload() {
+        use modelexpress_common::grpc::p2p::ArtifactSourceMetadata;
+        use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
+
+        let meta = WorkerMetadata {
+            worker_rank: 0,
+            source_payload: Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata {
+                artifact_id: "artifact123".to_string(),
+                total_size: 1024,
+                file_count: 2,
+                chunk_count: 4,
+            })),
+            ..Default::default()
+        };
+
+        let record = WorkerRecord::from(meta);
+        assert_eq!(
+            record
+                .artifact_source
+                .as_ref()
+                .map(|a| a.artifact_id.as_str()),
+            Some("artifact123")
+        );
+
+        let back: WorkerMetadata = record.into();
+        assert!(matches!(
+            back.source_payload,
+            Some(SourcePayload::ArtifactSource(ref artifact))
+                if artifact.artifact_id == "artifact123"
+        ));
     }
 
     #[test]
@@ -339,6 +419,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    artifact_source: None,
                 },
                 WorkerRecord {
                     worker_rank: 1,
@@ -355,6 +436,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    artifact_source: None,
                 },
             ],
             published_at: 1234567890,

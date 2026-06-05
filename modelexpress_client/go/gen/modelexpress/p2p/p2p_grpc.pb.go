@@ -267,7 +267,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Per-worker gRPC service for direct tensor manifest retrieval.
+// Per-worker gRPC service for direct tensor manifest retrieval. Artifact
+// manifest retrieval is not part of this service yet.
 // Sources start this service when MX_P2P_METADATA=1. Targets call
 // GetTensorManifest to fetch tensor descriptors directly from the
 // source worker instead of from the central metadata server.
@@ -297,7 +298,8 @@ func (c *workerServiceClient) GetTensorManifest(ctx context.Context, in *GetTens
 // All implementations must embed UnimplementedWorkerServiceServer
 // for forward compatibility.
 //
-// Per-worker gRPC service for direct tensor manifest retrieval.
+// Per-worker gRPC service for direct tensor manifest retrieval. Artifact
+// manifest retrieval is not part of this service yet.
 // Sources start this service when MX_P2P_METADATA=1. Targets call
 // GetTensorManifest to fetch tensor descriptors directly from the
 // source worker instead of from the central metadata server.

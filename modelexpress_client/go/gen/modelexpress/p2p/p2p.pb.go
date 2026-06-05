@@ -77,13 +77,15 @@ func (BackendFramework) EnumDescriptor() ([]byte, []int) {
 	return file_p2p_proto_rawDescGZIP(), []int{0}
 }
 
-// Type of tensors the source is serving
+// Type of reusable material the source is serving.
 type MxSourceType int32
 
 const (
-	MxSourceType_MX_SOURCE_TYPE_WEIGHTS    MxSourceType = 0 // Base model weights (default)
-	MxSourceType_MX_SOURCE_TYPE_LORA       MxSourceType = 1 // LoRA adapter weights
-	MxSourceType_MX_SOURCE_TYPE_CUDA_GRAPH MxSourceType = 2 // CUDA graph artifacts
+	MxSourceType_MX_SOURCE_TYPE_WEIGHTS             MxSourceType = 0 // Base model weights (default)
+	MxSourceType_MX_SOURCE_TYPE_LORA                MxSourceType = 1 // LoRA adapter weights
+	MxSourceType_MX_SOURCE_TYPE_CUDA_GRAPH          MxSourceType = 2 // CUDA graph artifacts
+	MxSourceType_MX_SOURCE_TYPE_TORCH_COMPILE_CACHE MxSourceType = 3 // torch.compile cache files
+	MxSourceType_MX_SOURCE_TYPE_TRITON_CACHE        MxSourceType = 4 // Triton cache files
 )
 
 // Enum value maps for MxSourceType.
@@ -92,11 +94,15 @@ var (
 		0: "MX_SOURCE_TYPE_WEIGHTS",
 		1: "MX_SOURCE_TYPE_LORA",
 		2: "MX_SOURCE_TYPE_CUDA_GRAPH",
+		3: "MX_SOURCE_TYPE_TORCH_COMPILE_CACHE",
+		4: "MX_SOURCE_TYPE_TRITON_CACHE",
 	}
 	MxSourceType_value = map[string]int32{
-		"MX_SOURCE_TYPE_WEIGHTS":    0,
-		"MX_SOURCE_TYPE_LORA":       1,
-		"MX_SOURCE_TYPE_CUDA_GRAPH": 2,
+		"MX_SOURCE_TYPE_WEIGHTS":             0,
+		"MX_SOURCE_TYPE_LORA":                1,
+		"MX_SOURCE_TYPE_CUDA_GRAPH":          2,
+		"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE": 3,
+		"MX_SOURCE_TYPE_TRITON_CACHE":        4,
 	}
 )
 
@@ -180,7 +186,9 @@ func (SourceStatus) EnumDescriptor() ([]byte, []int) {
 	return file_p2p_proto_rawDescGZIP(), []int{2}
 }
 
-// All fields that affect weight tensor layout and transfer compatibility.
+// All fields that affect source compatibility for reusable model material.
+// Source-type-specific fields are populated only by the source types that need
+// them; empty optional fields are ignored by current source-id canonicalization.
 // The server computes SHA256(canonical_json(identity)) and takes the first
 // 16 hex chars as the mx_source_id used to key metadata storage.
 type SourceIdentity struct {
@@ -212,9 +220,22 @@ type SourceIdentity struct {
 	// decentralized modes (no central coordinator) use mx_source_id as a
 	// full content check. Empty string means "unknown revision" and is
 	// compatible with older publishers that pre-date this field.
-	Revision      string `protobuf:"bytes,11,opt,name=revision,proto3" json:"revision,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Revision string `protobuf:"bytes,11,opt,name=revision,proto3" json:"revision,omitempty"`
+	// Backend framework version (for example vLLM, SGLang, or TRT-LLM version).
+	BackendFrameworkVersion string `protobuf:"bytes,12,opt,name=backend_framework_version,json=backendFrameworkVersion,proto3" json:"backend_framework_version,omitempty"`
+	// PyTorch version used to produce framework cache artifacts.
+	TorchVersion string `protobuf:"bytes,13,opt,name=torch_version,json=torchVersion,proto3" json:"torch_version,omitempty"`
+	// CUDA toolkit/runtime version relevant to generated cache artifacts.
+	CudaVersion string `protobuf:"bytes,14,opt,name=cuda_version,json=cudaVersion,proto3" json:"cuda_version,omitempty"`
+	// Triton compiler/runtime version relevant to Triton cache artifacts.
+	TritonVersion string `protobuf:"bytes,15,opt,name=triton_version,json=tritonVersion,proto3" json:"triton_version,omitempty"`
+	// GPU architecture or capability (for example "sm90" or "9.0").
+	GpuArch string `protobuf:"bytes,16,opt,name=gpu_arch,json=gpuArch,proto3" json:"gpu_arch,omitempty"`
+	// Digest of source-type-specific compile/cache configuration not otherwise
+	// represented by explicit fields.
+	CompileConfigDigest string `protobuf:"bytes,17,opt,name=compile_config_digest,json=compileConfigDigest,proto3" json:"compile_config_digest,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *SourceIdentity) Reset() {
@@ -324,6 +345,48 @@ func (x *SourceIdentity) GetRevision() string {
 	return ""
 }
 
+func (x *SourceIdentity) GetBackendFrameworkVersion() string {
+	if x != nil {
+		return x.BackendFrameworkVersion
+	}
+	return ""
+}
+
+func (x *SourceIdentity) GetTorchVersion() string {
+	if x != nil {
+		return x.TorchVersion
+	}
+	return ""
+}
+
+func (x *SourceIdentity) GetCudaVersion() string {
+	if x != nil {
+		return x.CudaVersion
+	}
+	return ""
+}
+
+func (x *SourceIdentity) GetTritonVersion() string {
+	if x != nil {
+		return x.TritonVersion
+	}
+	return ""
+}
+
+func (x *SourceIdentity) GetGpuArch() string {
+	if x != nil {
+		return x.GpuArch
+	}
+	return ""
+}
+
+func (x *SourceIdentity) GetCompileConfigDigest() string {
+	if x != nil {
+		return x.CompileConfigDigest
+	}
+	return ""
+}
+
 type TensorDescriptor struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
@@ -405,6 +468,127 @@ func (x *TensorDescriptor) GetDtype() string {
 	return ""
 }
 
+// Small discovery summary for file-backed artifact sources. This does not carry
+// full file or chunk manifests; artifact manifest and transfer RPCs are future
+// work outside this contract.
+type ArtifactSourceMetadata struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Digest of the canonical sealed artifact manifest.
+	ArtifactId string `protobuf:"bytes,1,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	// Total artifact bytes across all manifest files.
+	TotalSize uint64 `protobuf:"varint,2,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
+	// Number of files in the sealed artifact manifest.
+	FileCount uint32 `protobuf:"varint,3,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
+	// Number of transfer chunks in the sealed artifact manifest.
+	ChunkCount    uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ArtifactSourceMetadata) Reset() {
+	*x = ArtifactSourceMetadata{}
+	mi := &file_p2p_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ArtifactSourceMetadata) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ArtifactSourceMetadata) ProtoMessage() {}
+
+func (x *ArtifactSourceMetadata) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ArtifactSourceMetadata.ProtoReflect.Descriptor instead.
+func (*ArtifactSourceMetadata) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ArtifactSourceMetadata) GetArtifactId() string {
+	if x != nil {
+		return x.ArtifactId
+	}
+	return ""
+}
+
+func (x *ArtifactSourceMetadata) GetTotalSize() uint64 {
+	if x != nil {
+		return x.TotalSize
+	}
+	return 0
+}
+
+func (x *ArtifactSourceMetadata) GetFileCount() uint32 {
+	if x != nil {
+		return x.FileCount
+	}
+	return 0
+}
+
+func (x *ArtifactSourceMetadata) GetChunkCount() uint32 {
+	if x != nil {
+		return x.ChunkCount
+	}
+	return 0
+}
+
+// Tensor source payload for the source_payload migration. Writers populate this
+// field; readers fall back to WorkerMetadata.tensors for old metadata.
+type TensorSourceMetadata struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tensors       []*TensorDescriptor    `protobuf:"bytes,1,rep,name=tensors,proto3" json:"tensors,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TensorSourceMetadata) Reset() {
+	*x = TensorSourceMetadata{}
+	mi := &file_p2p_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TensorSourceMetadata) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TensorSourceMetadata) ProtoMessage() {}
+
+func (x *TensorSourceMetadata) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TensorSourceMetadata.ProtoReflect.Descriptor instead.
+func (*TensorSourceMetadata) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *TensorSourceMetadata) GetTensors() []*TensorDescriptor {
+	if x != nil {
+		return x.Tensors
+	}
+	return nil
+}
+
 type WorkerMetadata struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Worker rank (GPU index within the instance)
@@ -418,7 +602,10 @@ type WorkerMetadata struct {
 	//	*WorkerMetadata_NixlMetadata
 	//	*WorkerMetadata_TransferEngineSessionId
 	BackendMetadata isWorkerMetadata_BackendMetadata `protobuf_oneof:"backend_metadata"`
-	// Tensor descriptors for this worker's GPU
+	// Deprecated: use source_payload.tensor_source. Readers keep this only as a
+	// fallback for metadata published by old writers.
+	//
+	// Deprecated: Marked as deprecated in p2p.proto.
 	Tensors []*TensorDescriptor `protobuf:"bytes,3,rep,name=tensors,proto3" json:"tensors,omitempty"`
 	// Worker lifecycle status
 	Status SourceStatus `protobuf:"varint,4,opt,name=status,proto3,enum=model_express.p2p.SourceStatus" json:"status,omitempty"`
@@ -428,15 +615,27 @@ type WorkerMetadata struct {
 	MetadataEndpoint string `protobuf:"bytes,6,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
 	// NIXL agent name (used by targets to identify the remote agent)
 	AgentName string `protobuf:"bytes,7,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
-	// host:port for the worker's gRPC WorkerService (tensor manifest)
+	// host:port for the worker's gRPC WorkerService, used today for tensor
+	// manifests. Artifact source payloads do not define a transfer endpoint in
+	// this contract.
 	WorkerGrpcEndpoint string `protobuf:"bytes,8,opt,name=worker_grpc_endpoint,json=workerGrpcEndpoint,proto3" json:"worker_grpc_endpoint,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Source-type-specific bounded metadata. This selects the metadata payload
+	// shape, not a transfer endpoint. Readers should prefer tensor_source over
+	// deprecated tensors when both are present, and fall back to tensors for old
+	// writers.
+	//
+	// Types that are valid to be assigned to SourcePayload:
+	//
+	//	*WorkerMetadata_TensorSource
+	//	*WorkerMetadata_ArtifactSource
+	SourcePayload isWorkerMetadata_SourcePayload `protobuf_oneof:"source_payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WorkerMetadata) Reset() {
 	*x = WorkerMetadata{}
-	mi := &file_p2p_proto_msgTypes[2]
+	mi := &file_p2p_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -448,7 +647,7 @@ func (x *WorkerMetadata) String() string {
 func (*WorkerMetadata) ProtoMessage() {}
 
 func (x *WorkerMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[2]
+	mi := &file_p2p_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -461,7 +660,7 @@ func (x *WorkerMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerMetadata.ProtoReflect.Descriptor instead.
 func (*WorkerMetadata) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{2}
+	return file_p2p_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *WorkerMetadata) GetWorkerRank() uint32 {
@@ -496,6 +695,7 @@ func (x *WorkerMetadata) GetTransferEngineSessionId() string {
 	return ""
 }
 
+// Deprecated: Marked as deprecated in p2p.proto.
 func (x *WorkerMetadata) GetTensors() []*TensorDescriptor {
 	if x != nil {
 		return x.Tensors
@@ -538,6 +738,31 @@ func (x *WorkerMetadata) GetWorkerGrpcEndpoint() string {
 	return ""
 }
 
+func (x *WorkerMetadata) GetSourcePayload() isWorkerMetadata_SourcePayload {
+	if x != nil {
+		return x.SourcePayload
+	}
+	return nil
+}
+
+func (x *WorkerMetadata) GetTensorSource() *TensorSourceMetadata {
+	if x != nil {
+		if x, ok := x.SourcePayload.(*WorkerMetadata_TensorSource); ok {
+			return x.TensorSource
+		}
+	}
+	return nil
+}
+
+func (x *WorkerMetadata) GetArtifactSource() *ArtifactSourceMetadata {
+	if x != nil {
+		if x, ok := x.SourcePayload.(*WorkerMetadata_ArtifactSource); ok {
+			return x.ArtifactSource
+		}
+	}
+	return nil
+}
+
 type isWorkerMetadata_BackendMetadata interface {
 	isWorkerMetadata_BackendMetadata()
 }
@@ -554,6 +779,22 @@ func (*WorkerMetadata_NixlMetadata) isWorkerMetadata_BackendMetadata() {}
 
 func (*WorkerMetadata_TransferEngineSessionId) isWorkerMetadata_BackendMetadata() {}
 
+type isWorkerMetadata_SourcePayload interface {
+	isWorkerMetadata_SourcePayload()
+}
+
+type WorkerMetadata_TensorSource struct {
+	TensorSource *TensorSourceMetadata `protobuf:"bytes,20,opt,name=tensor_source,json=tensorSource,proto3,oneof"`
+}
+
+type WorkerMetadata_ArtifactSource struct {
+	ArtifactSource *ArtifactSourceMetadata `protobuf:"bytes,21,opt,name=artifact_source,json=artifactSource,proto3,oneof"`
+}
+
+func (*WorkerMetadata_TensorSource) isWorkerMetadata_SourcePayload() {}
+
+func (*WorkerMetadata_ArtifactSource) isWorkerMetadata_SourcePayload() {}
+
 type GetTensorManifestRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// mx_source_id for validation (catches stale discovery)
@@ -564,7 +805,7 @@ type GetTensorManifestRequest struct {
 
 func (x *GetTensorManifestRequest) Reset() {
 	*x = GetTensorManifestRequest{}
-	mi := &file_p2p_proto_msgTypes[3]
+	mi := &file_p2p_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -576,7 +817,7 @@ func (x *GetTensorManifestRequest) String() string {
 func (*GetTensorManifestRequest) ProtoMessage() {}
 
 func (x *GetTensorManifestRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[3]
+	mi := &file_p2p_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -589,7 +830,7 @@ func (x *GetTensorManifestRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTensorManifestRequest.ProtoReflect.Descriptor instead.
 func (*GetTensorManifestRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{3}
+	return file_p2p_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GetTensorManifestRequest) GetMxSourceId() string {
@@ -616,7 +857,7 @@ type GetTensorManifestResponse struct {
 
 func (x *GetTensorManifestResponse) Reset() {
 	*x = GetTensorManifestResponse{}
-	mi := &file_p2p_proto_msgTypes[4]
+	mi := &file_p2p_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -628,7 +869,7 @@ func (x *GetTensorManifestResponse) String() string {
 func (*GetTensorManifestResponse) ProtoMessage() {}
 
 func (x *GetTensorManifestResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[4]
+	mi := &file_p2p_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -641,7 +882,7 @@ func (x *GetTensorManifestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTensorManifestResponse.ProtoReflect.Descriptor instead.
 func (*GetTensorManifestResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{4}
+	return file_p2p_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetTensorManifestResponse) GetTensors() []*TensorDescriptor {
@@ -695,7 +936,7 @@ type PublishMetadataRequest struct {
 
 func (x *PublishMetadataRequest) Reset() {
 	*x = PublishMetadataRequest{}
-	mi := &file_p2p_proto_msgTypes[5]
+	mi := &file_p2p_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -707,7 +948,7 @@ func (x *PublishMetadataRequest) String() string {
 func (*PublishMetadataRequest) ProtoMessage() {}
 
 func (x *PublishMetadataRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[5]
+	mi := &file_p2p_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -720,7 +961,7 @@ func (x *PublishMetadataRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishMetadataRequest.ProtoReflect.Descriptor instead.
 func (*PublishMetadataRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{5}
+	return file_p2p_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *PublishMetadataRequest) GetIdentity() *SourceIdentity {
@@ -758,7 +999,7 @@ type PublishMetadataResponse struct {
 
 func (x *PublishMetadataResponse) Reset() {
 	*x = PublishMetadataResponse{}
-	mi := &file_p2p_proto_msgTypes[6]
+	mi := &file_p2p_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -770,7 +1011,7 @@ func (x *PublishMetadataResponse) String() string {
 func (*PublishMetadataResponse) ProtoMessage() {}
 
 func (x *PublishMetadataResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[6]
+	mi := &file_p2p_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -783,7 +1024,7 @@ func (x *PublishMetadataResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishMetadataResponse.ProtoReflect.Descriptor instead.
 func (*PublishMetadataResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{6}
+	return file_p2p_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PublishMetadataResponse) GetSuccess() bool {
@@ -833,7 +1074,7 @@ type SourceInstanceRef struct {
 
 func (x *SourceInstanceRef) Reset() {
 	*x = SourceInstanceRef{}
-	mi := &file_p2p_proto_msgTypes[7]
+	mi := &file_p2p_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -845,7 +1086,7 @@ func (x *SourceInstanceRef) String() string {
 func (*SourceInstanceRef) ProtoMessage() {}
 
 func (x *SourceInstanceRef) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[7]
+	mi := &file_p2p_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -858,7 +1099,7 @@ func (x *SourceInstanceRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SourceInstanceRef.ProtoReflect.Descriptor instead.
 func (*SourceInstanceRef) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{7}
+	return file_p2p_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SourceInstanceRef) GetMxSourceId() string {
@@ -902,7 +1143,7 @@ type ListSourcesRequest struct {
 
 func (x *ListSourcesRequest) Reset() {
 	*x = ListSourcesRequest{}
-	mi := &file_p2p_proto_msgTypes[8]
+	mi := &file_p2p_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -914,7 +1155,7 @@ func (x *ListSourcesRequest) String() string {
 func (*ListSourcesRequest) ProtoMessage() {}
 
 func (x *ListSourcesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[8]
+	mi := &file_p2p_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -927,7 +1168,7 @@ func (x *ListSourcesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSourcesRequest.ProtoReflect.Descriptor instead.
 func (*ListSourcesRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{8}
+	return file_p2p_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListSourcesRequest) GetIdentity() *SourceIdentity {
@@ -953,7 +1194,7 @@ type ListSourcesResponse struct {
 
 func (x *ListSourcesResponse) Reset() {
 	*x = ListSourcesResponse{}
-	mi := &file_p2p_proto_msgTypes[9]
+	mi := &file_p2p_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -965,7 +1206,7 @@ func (x *ListSourcesResponse) String() string {
 func (*ListSourcesResponse) ProtoMessage() {}
 
 func (x *ListSourcesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[9]
+	mi := &file_p2p_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -978,7 +1219,7 @@ func (x *ListSourcesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSourcesResponse.ProtoReflect.Descriptor instead.
 func (*ListSourcesResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{9}
+	return file_p2p_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ListSourcesResponse) GetInstances() []*SourceInstanceRef {
@@ -1000,7 +1241,7 @@ type GetMetadataRequest struct {
 
 func (x *GetMetadataRequest) Reset() {
 	*x = GetMetadataRequest{}
-	mi := &file_p2p_proto_msgTypes[10]
+	mi := &file_p2p_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1012,7 +1253,7 @@ func (x *GetMetadataRequest) String() string {
 func (*GetMetadataRequest) ProtoMessage() {}
 
 func (x *GetMetadataRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[10]
+	mi := &file_p2p_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1025,7 +1266,7 @@ func (x *GetMetadataRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMetadataRequest.ProtoReflect.Descriptor instead.
 func (*GetMetadataRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{10}
+	return file_p2p_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GetMetadataRequest) GetMxSourceId() string {
@@ -1058,7 +1299,7 @@ type GetMetadataResponse struct {
 
 func (x *GetMetadataResponse) Reset() {
 	*x = GetMetadataResponse{}
-	mi := &file_p2p_proto_msgTypes[11]
+	mi := &file_p2p_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1070,7 +1311,7 @@ func (x *GetMetadataResponse) String() string {
 func (*GetMetadataResponse) ProtoMessage() {}
 
 func (x *GetMetadataResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[11]
+	mi := &file_p2p_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1083,7 +1324,7 @@ func (x *GetMetadataResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMetadataResponse.ProtoReflect.Descriptor instead.
 func (*GetMetadataResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{11}
+	return file_p2p_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GetMetadataResponse) GetFound() bool {
@@ -1130,7 +1371,7 @@ type UpdateStatusRequest struct {
 
 func (x *UpdateStatusRequest) Reset() {
 	*x = UpdateStatusRequest{}
-	mi := &file_p2p_proto_msgTypes[12]
+	mi := &file_p2p_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1142,7 +1383,7 @@ func (x *UpdateStatusRequest) String() string {
 func (*UpdateStatusRequest) ProtoMessage() {}
 
 func (x *UpdateStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[12]
+	mi := &file_p2p_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1155,7 +1396,7 @@ func (x *UpdateStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateStatusRequest.ProtoReflect.Descriptor instead.
 func (*UpdateStatusRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{12}
+	return file_p2p_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *UpdateStatusRequest) GetMxSourceId() string {
@@ -1196,7 +1437,7 @@ type UpdateStatusResponse struct {
 
 func (x *UpdateStatusResponse) Reset() {
 	*x = UpdateStatusResponse{}
-	mi := &file_p2p_proto_msgTypes[13]
+	mi := &file_p2p_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1208,7 +1449,7 @@ func (x *UpdateStatusResponse) String() string {
 func (*UpdateStatusResponse) ProtoMessage() {}
 
 func (x *UpdateStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[13]
+	mi := &file_p2p_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1221,7 +1462,7 @@ func (x *UpdateStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdateStatusResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{13}
+	return file_p2p_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *UpdateStatusResponse) GetSuccess() bool {
@@ -1242,7 +1483,7 @@ var File_p2p_proto protoreflect.FileDescriptor
 
 const file_p2p_proto_rawDesc = "" +
 	"\n" +
-	"\tp2p.proto\x12\x11model_express.p2p\"\xfe\x04\n" +
+	"\tp2p.proto\x12\x11model_express.p2p\"\xf8\x06\n" +
 	"\x0eSourceIdentity\x12\x1d\n" +
 	"\n" +
 	"mx_version\x18\x01 \x01(\tR\tmxVersion\x12E\n" +
@@ -1257,7 +1498,13 @@ const file_p2p_proto_rawDesc = "" +
 	"\fquantization\x18\t \x01(\tR\fquantization\x12a\n" +
 	"\x10extra_parameters\x18\n" +
 	" \x03(\v26.model_express.p2p.SourceIdentity.ExtraParametersEntryR\x0fextraParameters\x12\x1a\n" +
-	"\brevision\x18\v \x01(\tR\brevision\x1aB\n" +
+	"\brevision\x18\v \x01(\tR\brevision\x12:\n" +
+	"\x19backend_framework_version\x18\f \x01(\tR\x17backendFrameworkVersion\x12#\n" +
+	"\rtorch_version\x18\r \x01(\tR\ftorchVersion\x12!\n" +
+	"\fcuda_version\x18\x0e \x01(\tR\vcudaVersion\x12%\n" +
+	"\x0etriton_version\x18\x0f \x01(\tR\rtritonVersion\x12\x19\n" +
+	"\bgpu_arch\x18\x10 \x01(\tR\agpuArch\x122\n" +
+	"\x15compile_config_digest\x18\x11 \x01(\tR\x13compileConfigDigest\x1aB\n" +
 	"\x14ExtraParametersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x81\x01\n" +
@@ -1266,22 +1513,36 @@ const file_p2p_proto_rawDesc = "" +
 	"\x04addr\x18\x02 \x01(\x04R\x04addr\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x04R\x04size\x12\x1b\n" +
 	"\tdevice_id\x18\x04 \x01(\rR\bdeviceId\x12\x14\n" +
-	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\xc0\x03\n" +
+	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\x98\x01\n" +
+	"\x16ArtifactSourceMetadata\x12\x1f\n" +
+	"\vartifact_id\x18\x01 \x01(\tR\n" +
+	"artifactId\x12\x1d\n" +
+	"\n" +
+	"total_size\x18\x02 \x01(\x04R\ttotalSize\x12\x1d\n" +
+	"\n" +
+	"file_count\x18\x03 \x01(\rR\tfileCount\x12\x1f\n" +
+	"\vchunk_count\x18\x04 \x01(\rR\n" +
+	"chunkCount\"U\n" +
+	"\x14TensorSourceMetadata\x12=\n" +
+	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\"\xfc\x04\n" +
 	"\x0eWorkerMetadata\x12\x1f\n" +
 	"\vworker_rank\x18\x01 \x01(\rR\n" +
 	"workerRank\x12%\n" +
 	"\rnixl_metadata\x18\x02 \x01(\fH\x00R\fnixlMetadata\x12=\n" +
 	"\x1atransfer_engine_session_id\x18\n" +
-	" \x01(\tH\x00R\x17transferEngineSessionId\x12=\n" +
-	"\atensors\x18\x03 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\x127\n" +
+	" \x01(\tH\x00R\x17transferEngineSessionId\x12A\n" +
+	"\atensors\x18\x03 \x03(\v2#.model_express.p2p.TensorDescriptorB\x02\x18\x01R\atensors\x127\n" +
 	"\x06status\x18\x04 \x01(\x0e2\x1f.model_express.p2p.SourceStatusR\x06status\x12\x1d\n" +
 	"\n" +
 	"updated_at\x18\x05 \x01(\x03R\tupdatedAt\x12+\n" +
 	"\x11metadata_endpoint\x18\x06 \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\a \x01(\tR\tagentName\x120\n" +
-	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpointB\x12\n" +
-	"\x10backend_metadata\"<\n" +
+	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpoint\x12N\n" +
+	"\rtensor_source\x18\x14 \x01(\v2'.model_express.p2p.TensorSourceMetadataH\x01R\ftensorSource\x12T\n" +
+	"\x0fartifact_source\x18\x15 \x01(\v2).model_express.p2p.ArtifactSourceMetadataH\x01R\x0eartifactSourceB\x12\n" +
+	"\x10backend_metadataB\x10\n" +
+	"\x0esource_payload\"<\n" +
 	"\x18GetTensorManifestRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\"\xe9\x01\n" +
@@ -1342,11 +1603,13 @@ const file_p2p_proto_rawDesc = "" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
 	"\x18BACKEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n" +
-	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*b\n" +
+	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xab\x01\n" +
 	"\fMxSourceType\x12\x1a\n" +
 	"\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n" +
 	"\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n" +
-	"\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02*{\n" +
+	"\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02\x12&\n" +
+	"\"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE\x10\x03\x12\x1f\n" +
+	"\x1bMX_SOURCE_TYPE_TRITON_CACHE\x10\x04*{\n" +
 	"\fSourceStatus\x12\x19\n" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +
@@ -1374,56 +1637,61 @@ func file_p2p_proto_rawDescGZIP() []byte {
 }
 
 var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_p2p_proto_goTypes = []any{
 	(BackendFramework)(0),             // 0: model_express.p2p.BackendFramework
 	(MxSourceType)(0),                 // 1: model_express.p2p.MxSourceType
 	(SourceStatus)(0),                 // 2: model_express.p2p.SourceStatus
 	(*SourceIdentity)(nil),            // 3: model_express.p2p.SourceIdentity
 	(*TensorDescriptor)(nil),          // 4: model_express.p2p.TensorDescriptor
-	(*WorkerMetadata)(nil),            // 5: model_express.p2p.WorkerMetadata
-	(*GetTensorManifestRequest)(nil),  // 6: model_express.p2p.GetTensorManifestRequest
-	(*GetTensorManifestResponse)(nil), // 7: model_express.p2p.GetTensorManifestResponse
-	(*PublishMetadataRequest)(nil),    // 8: model_express.p2p.PublishMetadataRequest
-	(*PublishMetadataResponse)(nil),   // 9: model_express.p2p.PublishMetadataResponse
-	(*SourceInstanceRef)(nil),         // 10: model_express.p2p.SourceInstanceRef
-	(*ListSourcesRequest)(nil),        // 11: model_express.p2p.ListSourcesRequest
-	(*ListSourcesResponse)(nil),       // 12: model_express.p2p.ListSourcesResponse
-	(*GetMetadataRequest)(nil),        // 13: model_express.p2p.GetMetadataRequest
-	(*GetMetadataResponse)(nil),       // 14: model_express.p2p.GetMetadataResponse
-	(*UpdateStatusRequest)(nil),       // 15: model_express.p2p.UpdateStatusRequest
-	(*UpdateStatusResponse)(nil),      // 16: model_express.p2p.UpdateStatusResponse
-	nil,                               // 17: model_express.p2p.SourceIdentity.ExtraParametersEntry
+	(*ArtifactSourceMetadata)(nil),    // 5: model_express.p2p.ArtifactSourceMetadata
+	(*TensorSourceMetadata)(nil),      // 6: model_express.p2p.TensorSourceMetadata
+	(*WorkerMetadata)(nil),            // 7: model_express.p2p.WorkerMetadata
+	(*GetTensorManifestRequest)(nil),  // 8: model_express.p2p.GetTensorManifestRequest
+	(*GetTensorManifestResponse)(nil), // 9: model_express.p2p.GetTensorManifestResponse
+	(*PublishMetadataRequest)(nil),    // 10: model_express.p2p.PublishMetadataRequest
+	(*PublishMetadataResponse)(nil),   // 11: model_express.p2p.PublishMetadataResponse
+	(*SourceInstanceRef)(nil),         // 12: model_express.p2p.SourceInstanceRef
+	(*ListSourcesRequest)(nil),        // 13: model_express.p2p.ListSourcesRequest
+	(*ListSourcesResponse)(nil),       // 14: model_express.p2p.ListSourcesResponse
+	(*GetMetadataRequest)(nil),        // 15: model_express.p2p.GetMetadataRequest
+	(*GetMetadataResponse)(nil),       // 16: model_express.p2p.GetMetadataResponse
+	(*UpdateStatusRequest)(nil),       // 17: model_express.p2p.UpdateStatusRequest
+	(*UpdateStatusResponse)(nil),      // 18: model_express.p2p.UpdateStatusResponse
+	nil,                               // 19: model_express.p2p.SourceIdentity.ExtraParametersEntry
 }
 var file_p2p_proto_depIdxs = []int32{
 	1,  // 0: model_express.p2p.SourceIdentity.mx_source_type:type_name -> model_express.p2p.MxSourceType
 	0,  // 1: model_express.p2p.SourceIdentity.backend_framework:type_name -> model_express.p2p.BackendFramework
-	17, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
-	4,  // 3: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
-	2,  // 4: model_express.p2p.WorkerMetadata.status:type_name -> model_express.p2p.SourceStatus
-	4,  // 5: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
-	3,  // 6: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	5,  // 7: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 8: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	2,  // 9: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
-	10, // 10: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
-	5,  // 11: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	2,  // 12: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	8,  // 13: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	11, // 14: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	13, // 15: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	15, // 16: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	6,  // 17: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	9,  // 18: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	12, // 19: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	14, // 20: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	16, // 21: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	7,  // 22: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	18, // [18:23] is the sub-list for method output_type
-	13, // [13:18] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	19, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
+	4,  // 3: model_express.p2p.TensorSourceMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
+	4,  // 4: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
+	2,  // 5: model_express.p2p.WorkerMetadata.status:type_name -> model_express.p2p.SourceStatus
+	6,  // 6: model_express.p2p.WorkerMetadata.tensor_source:type_name -> model_express.p2p.TensorSourceMetadata
+	5,  // 7: model_express.p2p.WorkerMetadata.artifact_source:type_name -> model_express.p2p.ArtifactSourceMetadata
+	4,  // 8: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
+	3,  // 9: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	7,  // 10: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
+	3,  // 11: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 12: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
+	12, // 13: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
+	7,  // 14: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
+	2,  // 15: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
+	10, // 16: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	13, // 17: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	15, // 18: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	17, // 19: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	8,  // 20: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	11, // 21: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	14, // 22: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	16, // 23: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	18, // 24: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	9,  // 25: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	21, // [21:26] is the sub-list for method output_type
+	16, // [16:21] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }
@@ -1431,18 +1699,20 @@ func file_p2p_proto_init() {
 	if File_p2p_proto != nil {
 		return
 	}
-	file_p2p_proto_msgTypes[2].OneofWrappers = []any{
+	file_p2p_proto_msgTypes[4].OneofWrappers = []any{
 		(*WorkerMetadata_NixlMetadata)(nil),
 		(*WorkerMetadata_TransferEngineSessionId)(nil),
+		(*WorkerMetadata_TensorSource)(nil),
+		(*WorkerMetadata_ArtifactSource)(nil),
 	}
-	file_p2p_proto_msgTypes[8].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[10].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_p2p_proto_rawDesc), len(file_p2p_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   15,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

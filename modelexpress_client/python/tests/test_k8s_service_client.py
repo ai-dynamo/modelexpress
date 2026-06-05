@@ -16,6 +16,7 @@ from modelexpress import p2p_pb2_grpc
 from modelexpress.client import MxClient
 from modelexpress.metadata.client_factory import create_metadata_client
 from modelexpress.metadata.k8s_service_client import MxK8sServiceClient
+from modelexpress.metadata.payload import worker_tensor_descriptors
 from modelexpress.metadata.publish import _is_p2p_metadata_enabled
 from modelexpress.metadata.source_id import compute_mx_source_id
 
@@ -277,8 +278,9 @@ def test_get_metadata_success_builds_synthetic_response():
         assert resp.worker.metadata_endpoint == "10.0.0.1:5555"
         assert resp.worker.agent_name == "fake-agent"
         assert resp.worker.status == p2p_pb2.SOURCE_STATUS_READY
-        assert len(resp.worker.tensors) == 1
-        assert resp.worker.tensors[0].name == "t0"
+        tensors = worker_tensor_descriptors(resp.worker)
+        assert len(tensors) == 1
+        assert tensors[0].name == "t0"
         # worker_grpc_endpoint must be populated: rdma_strategy gates
         # the P2P branch (which pulls NIXL metadata from the source's
         # listen thread) on bool(worker.worker_grpc_endpoint). An empty

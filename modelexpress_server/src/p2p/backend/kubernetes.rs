@@ -5,8 +5,13 @@
 //!
 //! Uses ModelMetadata CRD and ConfigMaps for tensor descriptors.
 
-use super::{MetadataBackend, MetadataResult, ModelMetadataRecord, TensorRecord, WorkerRecord};
-use crate::p2p::k8s_types::{ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus};
+use super::{
+    ArtifactSourceMetadataRecord, MetadataBackend, MetadataResult, ModelMetadataRecord,
+    TensorRecord, WorkerRecord,
+};
+use crate::p2p::k8s_types::{
+    ArtifactSourceStatus, ModelMetadata, ModelMetadataSpec, TensorDescriptorJson, WorkerStatus,
+};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -219,6 +224,9 @@ impl MetadataBackend for KubernetesBackend {
                 },
                 spec: ModelMetadataSpec {
                     model_name: model_name.to_string(),
+                    source_type: ModelMetadataSpec::source_type_name_from_proto(
+                        identity.mx_source_type,
+                    ),
                 },
                 status: None,
             };
@@ -275,6 +283,11 @@ impl MetadataBackend for KubernetesBackend {
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            artifact_source: worker_record
+                .artifact_source
+                .clone()
+                .map(ArtifactSourceStatus::try_from)
+                .transpose()?,
         };
 
         let max_retries: u32 = 5;
@@ -420,6 +433,11 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                artifact_source: worker_status
+                    .artifact_source
+                    .clone()
+                    .map(ArtifactSourceMetadataRecord::try_from)
+                    .transpose()?,
             });
         }
 
@@ -703,5 +721,80 @@ impl MetadataBackend for KubernetesBackend {
             source_id, worker_id, worker_rank, max_retries
         )
         .into())
+    }
+}
+
+impl TryFrom<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
+    type Error = std::io::Error;
+
+    fn try_from(record: ArtifactSourceMetadataRecord) -> Result<Self, Self::Error> {
+        let total_size = i64::try_from(record.total_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact total_size {} exceeds Kubernetes int64 range",
+                    record.total_size
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            artifact_id: record.artifact_id,
+            total_size,
+            file_count: record.file_count,
+            chunk_count: record.chunk_count,
+        })
+    }
+}
+
+impl TryFrom<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
+    type Error = std::io::Error;
+
+    fn try_from(status: ArtifactSourceStatus) -> Result<Self, Self::Error> {
+        let total_size = u64::try_from(status.total_size).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "artifact totalSize {} from Kubernetes is negative",
+                    status.total_size
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            artifact_id: status.artifact_id,
+            total_size,
+            file_count: status.file_count,
+            chunk_count: status.chunk_count,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_status_rejects_total_size_above_k8s_int64() {
+        let record = ArtifactSourceMetadataRecord {
+            artifact_id: "artifact".to_string(),
+            total_size: i64::MAX as u64 + 1,
+            file_count: 1,
+            chunk_count: 1,
+        };
+
+        assert!(ArtifactSourceStatus::try_from(record).is_err());
+    }
+
+    #[test]
+    fn artifact_record_rejects_negative_k8s_total_size() {
+        let status = ArtifactSourceStatus {
+            artifact_id: "artifact".to_string(),
+            total_size: -1,
+            file_count: 1,
+            chunk_count: 1,
+        };
+
+        assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
     }
 }

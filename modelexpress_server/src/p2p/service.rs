@@ -30,6 +30,20 @@ impl P2pServiceImpl {
     }
 }
 
+fn worker_tensor_count(worker: &WorkerMetadata) -> usize {
+    use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
+
+    match &worker.source_payload {
+        Some(SourcePayload::TensorSource(tensor_source)) => tensor_source.tensors.len(),
+        _ => legacy_worker_tensor_count(worker),
+    }
+}
+
+#[allow(deprecated)]
+fn legacy_worker_tensor_count(worker: &WorkerMetadata) -> usize {
+    worker.tensors.len()
+}
+
 #[tonic::async_trait]
 impl P2pService for P2pServiceImpl {
     async fn publish_metadata(
@@ -84,7 +98,7 @@ impl P2pService for P2pServiceImpl {
         let worker_id = req.worker_id.clone();
         let model_name = identity.model_name.clone();
         let worker_rank = worker.worker_rank;
-        let tensor_count = worker.tensors.len();
+        let tensor_count = worker_tensor_count(&worker);
 
         match self
             .state
@@ -196,7 +210,7 @@ impl P2pService for P2pServiceImpl {
                     record.model_name,
                     req.mx_source_id,
                     req.worker_id,
-                    worker.as_ref().map_or(0, |w| w.tensors.len()),
+                    worker.as_ref().map_or(0, worker_tensor_count),
                 );
                 Ok(Response::new(GetMetadataResponse {
                     found,
@@ -283,6 +297,7 @@ impl P2pService for P2pServiceImpl {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
@@ -290,10 +305,19 @@ mod tests {
         BackendMetadataRecord, MockMetadataBackend, ModelMetadataRecord, WorkerRecord,
     };
     use crate::p2p::state::P2pStateManager;
-    use modelexpress_common::grpc::p2p::{MxSourceType, SourceIdentity, SourceStatus};
+    use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
+    use modelexpress_common::grpc::p2p::{
+        MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
+    };
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))
+    }
+
+    fn empty_tensor_source() -> Option<SourcePayload> {
+        Some(SourcePayload::TensorSource(TensorSourceMetadata {
+            tensors: vec![],
+        }))
     }
 
     fn test_identity() -> SourceIdentity {
@@ -309,6 +333,12 @@ mod tests {
             quantization: String::new(),
             extra_parameters: Default::default(),
             revision: String::new(),
+            backend_framework_version: String::new(),
+            torch_version: String::new(),
+            cuda_version: String::new(),
+            triton_version: String::new(),
+            gpu_arch: String::new(),
+            compile_config_digest: String::new(),
         }
     }
 
@@ -379,7 +409,7 @@ mod tests {
                     backend_metadata: Some(
                         modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata::NixlMetadata(vec![1, 2, 3]),
                     ),
-                    tensors: vec![],
+                    source_payload: empty_tensor_source(),
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
                     ..Default::default()
@@ -409,7 +439,7 @@ mod tests {
                 worker: Some(WorkerMetadata {
                     worker_rank: 0,
                     backend_metadata: None,
-                    tensors: vec![],
+                    source_payload: empty_tensor_source(),
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
                     ..Default::default()
@@ -459,6 +489,7 @@ mod tests {
                         metadata_endpoint: String::new(),
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
+                        artifact_source: None,
                     }],
                     published_at: 1234567890,
                 }))
