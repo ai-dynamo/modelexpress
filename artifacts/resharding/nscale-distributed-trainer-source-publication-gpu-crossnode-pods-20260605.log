@@ -1,0 +1,5 @@
+kaniko-mx-server-rl-d168542-mfmqn                           0/1     Completed   0               4d7h    10.0.10.28    cluster-0967a26d-pool-14bee067-prctr-xmhbj   <none>           <none>
+mx-dev-goal-20260605                                        1/1     Running     0               19h     10.0.21.215   cluster-0967a26d-pool-1f83edbe-mj5s4-gnsf4   <none>           <none>
+mx-dist-trainer-src0-20260605                               1/1     Running     0               3m36s   10.0.20.143   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+mx-dist-trainer-src1-20260605                               1/1     Running     0               3m34s   10.0.12.153   cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>
+mx-server-rl-76b6854487-8zx79                               1/1     Running     0               4d7h    10.0.29.139   cluster-0967a26d-pool-1f83edbe-mj5s4-bf5w2   <none>           <none>

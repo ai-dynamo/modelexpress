@@ -32,6 +32,10 @@ import torch
 from . import p2p_pb2
 from .client import MxClient
 from .metadata.heartbeat import HeartbeatThread
+from .refit_trainer_step import (
+    destroy_distributed_trainer_process_group,
+    ensure_distributed_trainer_process_group,
+)
 from .refit_nixl import (
     NixlAdapter,
     apply_nixl_ucx_pin,
@@ -39,13 +43,18 @@ from .refit_nixl import (
     select_cuda_device,
 )
 from .refit_mx_runtime_common import (
+    SOURCE_PUBLISHER_CHOICES,
+    SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
+    SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
     effective_model_version as _effective_model_version,
     filter_source_ownerships as _filter_source_ownerships,
-    materialize_trainer_loop_publication as _materialize_trainer_loop_publication,
+    materialize_runtime_source_publication as _materialize_runtime_source_publication,
+    normalize_source_publisher as _normalize_source_publisher,
     parse_csv as _parse_csv,
     parse_shape as _parse_shape,
     scenario_with_mx_endpoint_plan as _common_scenario_with_mx_endpoint_plan,
     source_status_name as _source_status_name,
+    trainer_framework_for_source_publisher as _trainer_framework_for_source_publisher,
     trainer_loop_runtime_model_version as _trainer_loop_runtime_model_version,
 )
 from .refit_vllm_nixl_runtime_smoke import (
@@ -88,12 +97,18 @@ def _trace(phase: str, **fields: Any) -> None:
     )
 
 
-def _refit_identity(*, model_name: str, model_version: str, dtype: str):
+def _refit_identity(
+    *,
+    model_name: str,
+    model_version: str,
+    dtype: str,
+    source_publisher: str = SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
+):
     return build_refit_source_identity(
         model_name=model_name,
         model_version=model_version,
         dtype=dtype,
-        trainer_framework="torch.optim.SGD-trainer-loop-smoke",
+        trainer_framework=_trainer_framework_for_source_publisher(source_publisher),
         trainer_layout="fsdp-row-shard-vllm-runtime",
     )
 
@@ -130,16 +145,20 @@ def materialize_vllm_mx_runtime_source_publications(
     device: torch.device,
     trainer_step_index: int = DEFAULT_TRAINER_STEP_INDEX,
     model_version: str | None = None,
+    source_publisher: str = SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
+    synchronize_distributed: bool = True,
 ):
     """Create trainer-loop source publications for MX endpoint publishing."""
 
     return list(
-        _materialize_trainer_loop_publication(
+        _materialize_runtime_source_publication(
             ownerships,
             dtype=dtype,
             device=device,
             trainer_step_index=trainer_step_index,
             model_version=model_version,
+            source_publisher=source_publisher,
+            synchronize_distributed=synchronize_distributed,
         ).source_publications
     )
 
@@ -166,12 +185,16 @@ def _wait_for_mx_endpoints(
     model_name: str,
     model_version: str,
     dtype: str,
+    source_publisher: str,
     scenario: dict[str, Any],
     expected_source_ids: set[str],
     timeout_seconds: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     identity = _refit_identity(
-        model_name=model_name, model_version=model_version, dtype=dtype
+        model_name=model_name,
+        model_version=model_version,
+        dtype=dtype,
+        source_publisher=source_publisher,
     )
     mx_client = MxClient()
     try:
@@ -226,6 +249,8 @@ def run_source(
     source_worker_rank: int | None = None,
     local_rank: int = 0,
     trainer_step_index: int = DEFAULT_TRAINER_STEP_INDEX,
+    source_publisher: str = SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
+    distributed_trainer_backend: str = "gloo",
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for vLLM MX runtime source publishing")
@@ -241,6 +266,7 @@ def run_source(
     device = torch.device(f"cuda:{device_index}")
     apply_nixl_ucx_pin(device_index)
 
+    source_publisher = _normalize_source_publisher(source_publisher)
     dtype_obj = _torch_dtype_from_name(dtype)
     ownerships = _filter_source_ownerships(
         build_vllm_mx_runtime_source_ownerships(
@@ -253,14 +279,29 @@ def run_source(
         source_id=source_id,
         worker_rank=source_worker_rank,
     )
+    distributed_context = None
+    distributed_process_group_created = False
+    if source_publisher == SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP:
+        distributed_context, distributed_process_group_created = (
+            ensure_distributed_trainer_process_group(
+                backend=distributed_trainer_backend
+            )
+        )
+
     adapter = NixlAdapter(_source_agent_name(run_id, ownerships))
-    trainer_loop_publication = _materialize_trainer_loop_publication(
-        ownerships,
-        dtype=dtype_obj,
-        device=device,
-        trainer_step_index=trainer_step_index,
-        model_version=effective_model_version,
-    )
+    try:
+        trainer_loop_publication = _materialize_runtime_source_publication(
+            ownerships,
+            dtype=dtype_obj,
+            device=device,
+            trainer_step_index=trainer_step_index,
+            model_version=effective_model_version,
+            source_publisher=source_publisher,
+            distributed_context=distributed_context,
+        )
+    finally:
+        if distributed_process_group_created:
+            destroy_distributed_trainer_process_group()
     source_publications = list(trainer_loop_publication.source_publications)
     source_tensors = {
         publication.ownership.source_id: publication.tensor
@@ -285,6 +326,7 @@ def run_source(
             model_name=model_name,
             model_version=effective_model_version,
             dtype=_torch_dtype_name(dtype_obj),
+            source_publisher=source_publisher,
         )
         for publication in source_publications:
             owner = publication.ownership
@@ -346,6 +388,8 @@ def run_source(
             "model_version_base": model_version,
             "model_version_runtime_base": runtime_base_model_version,
             "trainer_step_index": int(trainer_step_index),
+            "source_publisher": source_publisher,
+            "distributed_trainer_backend": distributed_trainer_backend,
             "target_tensor_name": tensor_name,
             "target_shape": list(target_shape),
             "target_dtype": _torch_dtype_name(dtype_obj),
@@ -376,8 +420,21 @@ def run_source(
             "proof": {
                 "trainer_loop_source_publication_used": True,
                 "trainer_loop_publisher_used": True,
-                "synthetic_trainer_loop_smoke_used": True,
-                "real_distributed_trainer_loop_used": False,
+                "synthetic_trainer_loop_smoke_used": bool(
+                    trainer_loop_publication.provenance.get(
+                        "synthetic_trainer_loop_smoke_used"
+                    )
+                ),
+                "real_distributed_trainer_loop_used": bool(
+                    trainer_loop_publication.provenance.get(
+                        "real_distributed_trainer_loop_used"
+                    )
+                ),
+                "torch_distributed_process_group_used": bool(
+                    trainer_loop_publication.provenance.get(
+                        "torch_distributed_process_group_used"
+                    )
+                ),
                 "real_rl_training_loop_used": False,
             },
         }
@@ -414,6 +471,7 @@ def run_target(
     target_pod: str = "",
     target_node: str = "",
     trainer_step_index: int = DEFAULT_TRAINER_STEP_INDEX,
+    source_publisher: str = SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
 ) -> dict[str, Any]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for vLLM MX runtime target reads")
@@ -427,6 +485,7 @@ def run_target(
     expected_source_ids = set(
         SOURCE_IDS if expected_source_ids is None else expected_source_ids
     )
+    source_publisher = _normalize_source_publisher(source_publisher)
 
     device_index, gpu_reuse_used = select_cuda_device(local_rank)
     torch.cuda.set_device(device_index)
@@ -488,6 +547,7 @@ def run_target(
             model_name=model_name,
             model_version=effective_model_version,
             dtype=runtime_dtype,
+            source_publisher=source_publisher,
             scenario=scenario,
             expected_source_ids=expected_source_ids,
             timeout_seconds=timeout_seconds,
@@ -618,12 +678,22 @@ def run_target(
         result["model_version_base"] = model_version
         result["model_version_runtime_base"] = runtime_base_model_version
         result["trainer_step_index"] = int(trainer_step_index)
+        result["source_publisher"] = source_publisher
         trainer_loop_sources_used = all(
             endpoint.ownership.layout_tags.get("trainer_loop_publisher") is True
             for endpoint in endpoint_by_source_id.values()
         )
+        distributed_trainer_sources_used = all(
+            endpoint.ownership.layout_tags.get("real_distributed_trainer_loop") is True
+            for endpoint in endpoint_by_source_id.values()
+        )
+        synthetic_trainer_sources_used = all(
+            endpoint.ownership.layout_tags.get("synthetic_trainer_loop_smoke") is True
+            for endpoint in endpoint_by_source_id.values()
+        )
         result["proof"].update(
             {
+                "source_publisher": source_publisher,
                 "cross_node_pods": cross_node,
                 "source_pod_separate_from_target_pod": bool(
                     target_pod and source_pods and target_pod not in set(source_pods)
@@ -643,8 +713,8 @@ def run_target(
                 "trainer_loop_source_publication_used": trainer_loop_sources_used,
                 "trainer_loop_runtime_model_version_used": True,
                 "trainer_loop_step_index": int(trainer_step_index),
-                "synthetic_trainer_loop_smoke_used": trainer_loop_sources_used,
-                "real_distributed_trainer_loop_used": False,
+                "synthetic_trainer_loop_smoke_used": synthetic_trainer_sources_used,
+                "real_distributed_trainer_loop_used": distributed_trainer_sources_used,
                 "real_rl_training_loop_used": False,
             }
         )
@@ -728,6 +798,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trainer-step-index", type=int, default=DEFAULT_TRAINER_STEP_INDEX
     )
+    parser.add_argument(
+        "--source-publisher",
+        choices=SOURCE_PUBLISHER_CHOICES,
+        default=os.environ.get(
+            "MX_REFIT_SOURCE_PUBLISHER", SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE
+        ),
+    )
+    parser.add_argument(
+        "--distributed-trainer-backend",
+        default=os.environ.get("MX_DISTRIBUTED_TRAINER_BACKEND", "gloo"),
+    )
     parser.add_argument("--source-id", default=os.environ.get("SOURCE_ID", ""))
     parser.add_argument("--source-worker-rank", type=int)
     parser.add_argument("--expected-source-id", action="append", default=[])
@@ -756,6 +837,8 @@ def main() -> None:
             source_worker_rank=args.source_worker_rank,
             local_rank=args.local_rank,
             trainer_step_index=args.trainer_step_index,
+            source_publisher=args.source_publisher,
+            distributed_trainer_backend=args.distributed_trainer_backend,
         )
     else:
         source_pods = [*args.source_pod, *_parse_csv(args.source_pods)]
@@ -779,6 +862,7 @@ def main() -> None:
             target_pod=args.target_pod,
             target_node=args.target_node,
             trainer_step_index=args.trainer_step_index,
+            source_publisher=args.source_publisher,
         )
     print(
         "MX_VLLM_MX_RUNTIME_REFIT "

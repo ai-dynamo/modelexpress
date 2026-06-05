@@ -454,14 +454,20 @@ both runtime bridges have same-node GPU reruns whose source ranks publish
 optimizer-step shards instead of deterministic replacement values. vLLM and
 SGLang also have checksum-backed cross-node, one-pod-per-source-rank MX-endpoint
 runtime bridges with staging-copy install, plus trainer-loop-metadata
-cross-node GPU reruns for both runtimes. Full production real
+cross-node GPU reruns for both runtimes. A source-side-only two-pod,
+two-node GPU smoke now proves real `torch.distributed` trainer ranks can own,
+optimize, validate, and publish MX-compatible row-shard ownership metadata
+without using torch distributed tensor payload gather. Full production real
 trainer/inference refit remains unproven.
 
 ## What Is Not Proven Yet
 
 The current POC does **not** prove:
 
-- Real trainer process integration with FSDP, TP, PP, EP, or RL training loop.
+- Real FSDP, TP, PP, EP, or RL training loop integration. A tiny
+  `torch.distributed` row-shard trainer source-publication smoke is proven on
+  two cross-node B200 pods, but it is not FSDP/TP/PP/EP/RL and it is not yet
+  wired through the live vLLM/SGLang runtime bridge.
 - Full live vLLM or SGLang process integration with real trainer-process
   payloads, direct runtime-buffer NIXL landing, and the production
   post-load/refit lifecycle. Tiny live vLLM V1 and SGLang Engine-owned
@@ -631,7 +637,9 @@ Remaining gap:
 Status: partially implemented; CPU receiver-install, tiny live vLLM/SGLang
 engine smokes, same-node SGLang+NIXL and vLLM+NIXL runtime bridges, and
 cross-node one-pod-per-source-rank vLLM/SGLang+NIXL MX-endpoint runtime bridges
-are implemented.
+are implemented. Source-side real `torch.distributed` trainer publication is
+implemented and proven in a two-node GPU smoke, but not yet connected to the
+runtime NIXL bridge target.
 
 Goal:
 
@@ -672,6 +680,20 @@ Current partial evidence:
 - Full nscale Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
+- `modelexpress.refit_distributed_trainer_publication_smoke` proves the
+  source-publisher side with a real initialized `torch.distributed` process
+  group. CPU artifact
+  `artifacts/resharding/nscale-distributed-trainer-source-publication-smoke-20260605.json`
+  and cross-node GPU artifact
+  `artifacts/resharding/nscale-distributed-trainer-source-publication-gpu-crossnode-20260605.json`
+  both report `result=pass`, two trainer ranks, full row-shard coverage,
+  validated optimizer-step shards, `real_distributed_trainer_loop_used=true`,
+  and `torch_distributed_tensor_payload_gather_used=false`. Supporting GPU
+  placement/device logs are
+  `nscale-distributed-trainer-source-publication-gpu-crossnode-pods-20260605.log`,
+  `...-pod-describe-20260605.log`, `...-src0-device-20260605.log`, and
+  `...-src1-device-20260605.log`. This is source-side publication evidence,
+  not runtime install or NIXL transfer evidence.
 - `modelexpress.refit_vllm_receiver_smoke` now provides a live vLLM V1
   receiver-owned tensor smoke through `LLM.apply_model`, plus a
   framework-explicit module helper. The live entrypoint creates a tiny Qwen2
@@ -889,14 +911,15 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Continue replacing the synthetic optimizer-step publisher in the vLLM/SGLang
-   NIXL runtime bridges with real trainer-loop integration. The current branch
-   now has CPU tests, versioned trainer-loop publication smoke, vLLM/SGLang
-   bridge source paths wired to trainer-loop publication metadata, same-node
-   vLLM/SGLang GPU reruns, and cross-node one-pod-per-source-rank runtime
-   evidence for both runtimes; the next source-side step is real FSDP/TP/PP/EP
-   or RL trainer ownership publication and a GPU rerun of the loop-published
-   runtime bridge path.
+1. Wire the proven `torch.distributed` source publisher into the vLLM/SGLang
+   NIXL runtime bridges and rerun the cross-node one-pod-per-source-rank path.
+   The current branch now has CPU tests, versioned trainer-loop publication
+   smoke, vLLM/SGLang bridge source paths wired to selectable source-publisher
+   identity metadata, same-node vLLM/SGLang GPU reruns, cross-node
+   one-pod-per-source-rank runtime evidence for both runtimes, and a separate
+   two-node GPU `torch.distributed` source-publication proof. The missing link
+   is a single artifact where the live runtime target reads shards published by
+   those real distributed trainer source processes.
 2. Extend the runtime bridge placement work beyond tiny single-tensor vLLM and
    SGLang targets while keeping the allclose/checksum gates.
 3. Promote the runtime bridges into each engine's production post-load/refit
@@ -944,11 +967,14 @@ Safe claim:
 > be NIXL-read into staging and installed through engine APIs with
 > allclose/checksum, and both have same-node optimizer-step source reruns. vLLM
 > and SGLang now also have cross-node, one-pod-per-source-rank MX-endpoint
-> runtime bridges over UCX/IB rc with checksum/allclose. These runtime artifacts
-> still use tiny single-tensor payloads, staging-copy runtime APIs, synthetic
-> optimizer objectives, and no live RL trainer loop; direct runtime-buffer NIXL
-> landing, full-model refit, and production real trainer/runtime refit remain
-> unproven.
+> runtime bridges over UCX/IB rc with checksum/allclose. A separate source-side
+> GPU smoke now proves real `torch.distributed` trainer ranks on two B200 nodes
+> can publish validated MX-compatible source ownership without torch distributed
+> tensor payload gather. These runtime artifacts still use tiny single-tensor
+> payloads, staging-copy runtime APIs, synthetic optimizer objectives, and no
+> live RL trainer loop; the new distributed trainer source proof is not yet
+> wired through a live runtime target. Direct runtime-buffer NIXL landing,
+> full-model refit, and production real trainer/runtime refit remain unproven.
 
 Unsafe claim:
 

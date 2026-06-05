@@ -1,0 +1,44 @@
+cursor-code-review artifact: distributed trainer source publication
+Date: 2026-06-05
+Branch: mx-rl-resharding-planner-poc
+
+Tool availability:
+- `cursor-code-review` is not present in PATH.
+- `/Users/amaddipoti/Desktop/repos/a3sh-dotfiles/agents/IMPORTS.md` states
+  `cursor-code-review` was inspected but not imported into the default agent
+  setup. Applied the same review rubric manually.
+
+Scope reviewed:
+- modelexpress.refit_trainer_step distributed trainer publication helpers.
+- modelexpress.refit_mx_runtime_common source-publisher selector.
+- vLLM/SGLang MX runtime bridge source-publisher identity wiring.
+- modelexpress.refit_distributed_trainer_publication_smoke.
+- goal.md and the new nscale proof artifacts.
+
+Findings:
+- Blockers: none.
+- Default behavior is preserved: vLLM/SGLang runtime bridges still default to
+  `trainer-loop-smoke`; the real distributed trainer publisher is opt-in via
+  `--source-publisher distributed-trainer-loop`.
+- MX endpoint identity changes are explicit and receiver/source symmetric:
+  both source and target use `trainer_framework_for_source_publisher`.
+- The new distributed trainer proof is scoped honestly: it proves source-side
+  torch.distributed trainer ownership publication, not runtime install, NIXL
+  transfer, FSDP/TP/PP/EP, or RL training.
+- The GPU proof patched an older temporary runtime image with current branch
+  modules before execution; this is acceptable for an artifact smoke but should
+  be replaced with a rebuilt image before repeating the runtime bridge proof.
+
+Verification:
+- nscale focused pytest:
+  `24 passed in 0.12s`
+- nscale artifact assertions:
+  `distributed trainer artifacts ok`
+- nscale whitespace gate:
+  `git diff --check` passed
+- CPU source smoke:
+  `artifacts/resharding/nscale-distributed-trainer-source-publication-smoke-20260605.json`
+- Cross-node GPU source smoke:
+  `artifacts/resharding/nscale-distributed-trainer-source-publication-gpu-crossnode-20260605.json`
+  with `result=pass`, two source ranks, CUDA payload devices, full row-shard
+  coverage, and `torch_distributed_tensor_payload_gather_used=false`.

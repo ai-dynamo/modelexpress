@@ -1,0 +1,138 @@
+Name:             mx-dist-trainer-src0-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Fri, 05 Jun 2026 20:15:16 +0200
+Labels:           app=mx-dist-trainer-gpu
+                  modelexpress.nvidia.com/run=dist-trainer-source-20260605
+Annotations:      <none>
+Status:           Running
+IP:               10.0.20.143
+IPs:
+  IP:  10.0.20.143
+Containers:
+  main:
+    Container ID:  containerd://bc6cab1c31434baaf07181087edac4f2f93e194feb052bdaa89cfca818f77533
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:15:17 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             4
+      memory:          32Gi
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:   mx-dist-trainer-src0-20260605 (v1:metadata.name)
+      NODE_NAME:   (v1:spec.nodeName)
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-qg9js (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-qg9js:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              <none>
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved:NoSchedule op=Exists
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  3m35s  default-scheduler  Successfully assigned anish-dynamo/mx-dist-trainer-src0-20260605 to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+  Normal  Pulled     3m33s  kubelet            Container image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" already present on machine
+  Normal  Created    3m33s  kubelet            Created container: main
+  Normal  Started    3m33s  kubelet            Started container main
+
+
+Name:             mx-dist-trainer-src1-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Fri, 05 Jun 2026 20:15:17 +0200
+Labels:           app=mx-dist-trainer-gpu
+                  modelexpress.nvidia.com/run=dist-trainer-source-20260605
+Annotations:      <none>
+Status:           Running
+IP:               10.0.12.153
+IPs:
+  IP:  10.0.12.153
+Containers:
+  main:
+    Container ID:  containerd://7b81cff3adfbbd0a1c64dde9fc8e23518edd6885ca5009ba41be2a7d1866a5a6
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:15:18 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             4
+      memory:          32Gi
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:   mx-dist-trainer-src1-20260605 (v1:metadata.name)
+      NODE_NAME:   (v1:spec.nodeName)
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-pctnm (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True 
+  Initialized                 True 
+  Ready                       True 
+  ContainersReady             True 
+  PodScheduled                True 
+Volumes:
+  kube-api-access-pctnm:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              <none>
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved:NoSchedule op=Exists
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  3m34s  default-scheduler  Successfully assigned anish-dynamo/mx-dist-trainer-src1-20260605 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     3m34s  kubelet            Container image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" already present on machine
+  Normal  Created    3m34s  kubelet            Created container: main
+  Normal  Started    3m33s  kubelet            Started container main

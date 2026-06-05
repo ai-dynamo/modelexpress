@@ -11,12 +11,21 @@ import torch
 
 from . import p2p_pb2
 from .refit_trainer_step import (
+    DistributedTrainerContext,
     TrainerLoopStepPublication,
+    publish_distributed_trainer_loop_step,
     publish_trainer_loop_step,
     trainer_loop_model_version,
 )
 from .resharding import SliceOwnership, SliceRequest, plan_segments
 from .resharding_control_plane import RefitNixlEndpoint
+
+SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE = "trainer-loop-smoke"
+SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP = "distributed-trainer-loop"
+SOURCE_PUBLISHER_CHOICES = (
+    SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
+    SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
+)
 
 
 def effective_model_version(model_version: str, run_id: str) -> str:
@@ -53,6 +62,60 @@ def materialize_trainer_loop_publication(
         step_index=trainer_step_index,
         model_version=model_version,
     )
+
+
+def materialize_runtime_source_publication(
+    ownerships: Sequence[SliceOwnership],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    trainer_step_index: int,
+    model_version: str | None = None,
+    source_publisher: str = SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
+    distributed_context: DistributedTrainerContext | None = None,
+    synchronize_distributed: bool = True,
+) -> TrainerLoopStepPublication:
+    """Create source publications for the selected runtime bridge publisher."""
+
+    source_publisher = normalize_source_publisher(source_publisher)
+    if source_publisher == SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP:
+        return publish_distributed_trainer_loop_step(
+            ownerships,
+            dtype=dtype,
+            device=device,
+            step_index=trainer_step_index,
+            model_version=model_version,
+            distributed_context=distributed_context,
+            synchronize_distributed=synchronize_distributed,
+        )
+    return materialize_trainer_loop_publication(
+        ownerships,
+        dtype=dtype,
+        device=device,
+        trainer_step_index=trainer_step_index,
+        model_version=model_version,
+    )
+
+
+def normalize_source_publisher(source_publisher: str) -> str:
+    """Validate and normalize a runtime source-publisher name."""
+
+    source_publisher = str(source_publisher or SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE)
+    if source_publisher not in SOURCE_PUBLISHER_CHOICES:
+        raise ValueError(
+            f"unsupported source publisher {source_publisher!r}; "
+            f"expected one of {SOURCE_PUBLISHER_CHOICES}"
+        )
+    return source_publisher
+
+
+def trainer_framework_for_source_publisher(source_publisher: str) -> str:
+    """Return the MX endpoint identity framework for a source publisher."""
+
+    source_publisher = normalize_source_publisher(source_publisher)
+    if source_publisher == SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP:
+        return "torch.distributed+torch.optim.SGD-trainer-loop"
+    return "torch.optim.SGD-trainer-loop-smoke"
 
 
 def parse_shape(value: str | Sequence[int]) -> tuple[int, ...]:

@@ -9,10 +9,14 @@ from modelexpress import p2p_pb2
 from modelexpress.refit_sglang_mx_runtime import (
     _effective_model_version,
     _filter_source_ownerships,
+    _refit_identity,
     _trainer_loop_runtime_model_version,
     build_sglang_mx_runtime_source_ownerships,
     materialize_sglang_mx_runtime_source_publications,
     scenario_with_mx_endpoint_plan,
+)
+from modelexpress.refit_mx_runtime_common import (
+    SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
 )
 from modelexpress.refit_sglang_nixl_runtime_smoke import build_sglang_runtime_nixl_plan
 from modelexpress.resharding_control_plane import RefitNixlEndpoint
@@ -87,6 +91,22 @@ def test_sglang_mx_runtime_source_publications_keep_metadata():
     assert all(
         publication.provenance["trainer_loop_publisher_used"]
         for publication in publications
+    )
+
+
+def test_sglang_mx_runtime_identity_can_select_distributed_trainer_publisher():
+    identity = _refit_identity(
+        model_name="mx-sglang-mx-unit",
+        model_version="step-9",
+        dtype="float32",
+        source_publisher=SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
+    )
+
+    assert identity.extra_parameters["trainer_framework"] == (
+        "torch.distributed+torch.optim.SGD-trainer-loop"
+    )
+    assert identity.extra_parameters["trainer_layout"] == (
+        "fsdp-row-shard-sglang-runtime"
     )
 
 

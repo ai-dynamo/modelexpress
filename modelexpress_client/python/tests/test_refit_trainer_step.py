@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from modelexpress.refit_trainer_step import (
+    DistributedTrainerContext,
     annotate_trainer_step_ownership,
+    publish_distributed_trainer_loop_step,
+    publish_distributed_trainer_step_source,
     publish_trainer_loop_step,
     publish_trainer_step_source,
     trainer_loop_model_version,
@@ -17,6 +20,11 @@ from modelexpress.refit_trainer_step import (
     trainer_step_source_provenance,
     trainer_step_tensor_for_range,
     trainer_update_parameters_from_ownerships,
+)
+from modelexpress.refit_distributed_trainer_publication_smoke import (
+    _covers_full_rows,
+    _ownership_for_rank,
+    _row_shard,
 )
 from modelexpress.resharding import SliceOwnership
 
@@ -158,6 +166,139 @@ def test_trainer_step_publication_carries_tensor_ownership_and_artifact_metadata
     assert metadata["tensor_shape"] == [4, 4]
     assert metadata["tensor_dtype"] == "float32"
     assert metadata["tensor_bytes"] == 64
+
+
+def test_distributed_trainer_step_publication_marks_real_trainer_process():
+    owner = _loop_ownerships()[0]
+    context = DistributedTrainerContext(
+        backend="gloo",
+        rank=0,
+        world_size=2,
+        local_rank=0,
+    )
+    expected = trainer_step_replacement_tensor(
+        owner.global_shape,
+        dtype=torch.float32,
+        device="cpu",
+        step_count=2,
+        learning_rate=0.25,
+    )
+
+    publication = publish_distributed_trainer_step_source(
+        owner,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_count=2,
+        learning_rate=0.25,
+        distributed_context=context,
+        synchronize_distributed=False,
+    )
+
+    torch.testing.assert_close(
+        publication.tensor,
+        expected[_range_slices(owner.source_range)],
+    )
+    assert publication.ownership.layout_tags["trainer_update_source"] == (
+        "torch.distributed+torch.optim.SGD-trainer-loop"
+    )
+    assert publication.ownership.layout_tags["real_distributed_trainer_loop"] is True
+    assert publication.ownership.layout_tags["synthetic_trainer_loop_smoke"] is False
+    assert publication.ownership.layout_tags["distributed_trainer_backend"] == "gloo"
+    assert publication.ownership.layout_tags["distributed_trainer_rank"] == 0
+    assert publication.provenance["real_distributed_trainer_loop_used"] is True
+    assert publication.provenance["synthetic_trainer_loop_smoke_used"] is False
+    assert publication.provenance["torch_distributed_data_transfer_used"] is False
+    assert publication.provenance["trainer_tensor_payload_transfer"] == "mx-nixl"
+
+
+def test_distributed_trainer_loop_publication_is_rank_scoped():
+    owner = _loop_ownerships()[1]
+    context = DistributedTrainerContext(
+        backend="gloo",
+        rank=1,
+        world_size=2,
+        local_rank=0,
+    )
+
+    loop_step = publish_distributed_trainer_loop_step(
+        [owner],
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_index=3,
+        learning_rate=0.25,
+        distributed_context=context,
+        synchronize_distributed=False,
+    )
+
+    publication = loop_step.source_publications[0]
+    assert loop_step.model_version == trainer_loop_model_version("base-step", 3)
+    assert loop_step.provenance["real_distributed_trainer_loop_used"] is True
+    assert loop_step.provenance["synthetic_trainer_loop_smoke_used"] is False
+    assert loop_step.provenance["torch_distributed_world_size"] == 2
+    assert loop_step.provenance["torch_distributed_rank"] == 1
+    assert publication.ownership.source_id == "trainer-rank1"
+    assert publication.ownership.layout_tags["trainer_loop_publisher"] is True
+    assert publication.ownership.layout_tags["trainer_loop_step_index"] == 3
+    assert publication.ownership.layout_tags["real_distributed_trainer_loop"] is True
+    assert publication.ownership.layout_tags["synthetic_trainer_loop_smoke"] is False
+
+
+def test_distributed_trainer_publication_rejects_wrong_rank_owner():
+    owner = _loop_ownerships()[1]
+    context = DistributedTrainerContext(
+        backend="gloo",
+        rank=0,
+        world_size=2,
+        local_rank=0,
+    )
+
+    with pytest.raises(ValueError, match="worker_rank must match"):
+        publish_distributed_trainer_step_source(
+            owner,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            distributed_context=context,
+            synchronize_distributed=False,
+        )
+
+
+def test_distributed_trainer_smoke_row_shards_cover_full_tensor():
+    payloads = [
+        {
+            "source_range": [
+                [_row_shard(rank, 3, 8)[0], _row_shard(rank, 3, 8)[1]],
+                [0, 4],
+            ]
+        }
+        for rank in range(3)
+    ]
+
+    assert [_row_shard(rank, 3, 8) for rank in range(3)] == [
+        (0, 3),
+        (3, 6),
+        (6, 8),
+    ]
+    assert _covers_full_rows(payloads, (8, 4)) is True
+
+
+def test_distributed_trainer_smoke_ownership_marks_rank_owner():
+    owner = _ownership_for_rank(
+        model_name="mx-dist-unit",
+        model_version="base",
+        tensor_name="lm_head.weight",
+        shape=(8, 4),
+        dtype=torch.float32,
+        rank=1,
+        world_size=2,
+    )
+
+    assert owner.source_id == "trainer-rank1"
+    assert owner.worker_rank == 1
+    assert owner.source_range == ((4, 8), (0, 4))
+    assert owner.layout_tags["trainer_layout"] == "torch-distributed-row-shard-poc"
+    assert owner.layout_tags["source_tensor_owner"] == (
+        "torch.distributed-trainer-rank"
+    )
 
 
 def test_trainer_update_parameters_are_inferred_from_source_ownership_metadata():
