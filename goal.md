@@ -262,16 +262,21 @@ Artifacts under `artifacts/resharding/` prove:
   plus pytest logs, prove source-owned ranges reconstruct the post-step target
   tensor, source-publication metadata can be published/listed/planned through
   the MX metadata client path, and vLLM/SGLang source-rank paths now expose
-  optimizer-step publication metadata. A live same-node, one-pod vLLM+NIXL GPU
-  rerun of this updated path is now banked in
+  optimizer-step publication metadata. Live same-node, one-pod vLLM+NIXL and
+  SGLang+NIXL GPU reruns of this updated path are now banked in
   `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-20260605.json`
-  and summary JSON. It uses two source ranks publishing post-`torch.optim.SGD`
-  source shards, actual UCX/NIXL reads into CUDA staging, `LLM.apply_model`
-  install/restore, and allclose/checksum gates. This supersedes the earlier
-  1-GPU capacity block for same-node vLLM trainer-step scope, but remains a
-  same-node/one-pod GPU-reuse proof over a synthetic objective, not cross-node
-  runtime placement, direct NIXL landing into vLLM-owned storage, or a real RL
-  trainer loop.
+  and
+  `artifacts/resharding/nscale-live-sglang-nixl-runtime-trainer-step-20260605.json`,
+  plus summary JSONs. Both use two source ranks publishing
+  post-`torch.optim.SGD` source shards, actual UCX/NIXL reads into CUDA staging,
+  runtime engine install/restore APIs, and allclose/checksum gates. The SGLang
+  rerun explicitly pins `UCX_NET_DEVICES=mlx5_10:1` to avoid the known
+  `mlx5_bond_0` UCX failure and validates runtime readback against the BF16
+  storage round-trip while keeping the NIXL staging gate full precision. These
+  supersede the earlier same-node trainer-step GPU capacity/runtime blocks for
+  vLLM and SGLang scope, but remain same-node/one-pod GPU-reuse proofs over a
+  synthetic objective, not cross-node runtime placement, direct NIXL landing
+  into runtime-owned storage, or a real RL trainer loop.
   A live `mx-server-rl` trainer-step publication pass is now banked in
   `artifacts/resharding/nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json`
   and `.log`: the deployed server still drops the new repeated ownership field,
@@ -309,9 +314,9 @@ same-node, two-pod cross-node, one-pod-per-source-rank cross-node, and synthetic
 hard-kill recovery NIXL GPU data-plane runs. Level 4 now has same-node,
 one-pod live vLLM and SGLang runtime bridge proofs where NIXL reads from
 trainer-like source ranks feed runtime-owned weights through engine APIs, and
-vLLM has a same-node GPU rerun whose source ranks publish optimizer-step shards
-instead of deterministic replacement values. Full production real trainer/
-inference refit remains unproven.
+both runtime bridges have same-node GPU reruns whose source ranks publish
+optimizer-step shards instead of deterministic replacement values. Full
+production real trainer/inference refit remains unproven.
 
 ## What Is Not Proven Yet
 
@@ -322,11 +327,10 @@ The current POC does **not** prove:
   payloads, cross-node runtime placement, direct runtime-buffer NIXL landing,
   and the production post-load/refit lifecycle. Tiny live vLLM V1 and SGLang
   Engine-owned tensor/weight smokes are proven, same-node vLLM/SGLang
-  NIXL-to-runtime bridges are proven, and vLLM now has a same-node GPU rerun
-  using optimizer-step source publications instead of deterministic source
-  values. SGLang still needs the same optimizer-step GPU rerun, and neither
-  runtime bridge proves cross-node runtime placement, direct NIXL landing into
-  runtime-owned storage, or a real RL trainer loop.
+  NIXL-to-runtime bridges are proven, and both runtimes now have same-node GPU
+  reruns using optimizer-step source publications instead of deterministic
+  source values. Neither runtime bridge proves cross-node runtime placement,
+  direct NIXL landing into runtime-owned storage, or a real RL trainer loop.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -621,6 +625,18 @@ Current partial evidence:
   nscale Python gate is
   `artifacts/resharding/nscale-python-full-pytest-sglang-nixl-runtime-20260604.log`
   (`311 passed, 19 skipped`).
+- `artifacts/resharding/nscale-live-sglang-nixl-runtime-trainer-step-20260605.json`
+  and summary JSON now prove the same SGLang bridge with optimizer-step source
+  publications instead of deterministic source values. The run cloned commit
+  `58b37adc7e3a3a5d8a1893ac6fcc34f9f5cdca92`, pinned
+  `UCX_NET_DEVICES=mlx5_10:1`, performed two actual UCX/NIXL reads for
+  16,384 trainer-to-inference bytes, installed/restored through
+  `Engine.update_weights_from_tensor`, and validated NIXL staging allclose,
+  runtime allclose, and checksum. It records
+  `trainer_optimizer_step_publisher_used=true`,
+  `synthetic_source_values_used=false`, `runtime_storage_dtype=bfloat16`, and
+  a 0.03125 full-precision-to-BF16 readback delta. Scope remains same-node,
+  one-pod, GPU-reuse evidence over a synthetic optimizer objective.
 - SGLang runtime availability is now separately banked.
   `artifacts/resharding/nscale-sglang-runtime-import-probe.json` verifies
   `torch`, `sglang`, and `sglang.srt` import in the nscale SGLang runtime

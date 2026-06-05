@@ -355,6 +355,25 @@ Files:
   and a synthetic optimizer objective; it is not cross-node runtime placement,
   not one-pod-per-source-rank runtime placement, not direct NIXL landing into
   vLLM-owned storage, and not a real RL trainer loop.
+- `nscale-live-sglang-nixl-runtime-trainer-step-20260605.json` and
+  `nscale-live-sglang-nixl-runtime-trainer-step-summary-20260605.json`:
+  completed same-node, one-pod, 3-rank SGLang+NIXL runtime bridge rerun using
+  the optimizer-step source publisher. Two source ranks publish post-step
+  `torch.optim.SGD` CUDA shards plus source-publication provenance, the target
+  starts live SGLang `0.0.0.dev1+g229cadec0`, reads two UCX/NIXL segments into
+  CUDA staging with `UCX_NET_DEVICES=mlx5_10:1`, installs/restores through
+  `Engine.update_weights_from_tensor`, and validates staging allclose, runtime
+  allclose, and checksum. The artifact records
+  `trainer_optimizer_step_publisher_used=true`,
+  `synthetic_source_values_used=false`, `runtime_storage_dtype=bfloat16`,
+  `trainer_to_inference_bytes=16384`,
+  `raw_nixl_read_duration_ms=5.667333956807852`, and `run_rc=0` in the
+  summary. The BF16 runtime readback is modeled explicitly; the full-precision
+  staging gate still passes before runtime install. Scope boundary: this is
+  same-node/one-pod evidence with GPU reuse and a synthetic optimizer
+  objective; it is not cross-node runtime placement, not one-pod-per-source-rank
+  runtime placement, not direct NIXL landing into SGLang-owned storage, and not
+  a real RL trainer loop.
 - `nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json` and
   `.log`: live `mx-server-rl:8001` pass. The deployed server accepted
   `PublishMetadata`, returned `metadata_endpoint` sidecars while still dropping
@@ -444,16 +463,11 @@ live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
 artifacts, with the one-pod-per-source-rank, stale-source recovery, and
 hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
 claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
-artifacts, but both committed GPU artifacts remain one-pod/GPU-reuse proofs
-with deterministic trainer-like source values and staging-copy runtime APIs.
-The current branch has CPU-tested optimizer-step source-publisher,
-source-publication metadata, and MX metadata publication code for the runtime
-bridges, plus a live `mx-server-rl` trainer-step publication pass through the
-metadata sidecar compatibility path. The vLLM same-node GPU runtime bridge now
-has a checksum-backed optimizer-step rerun; SGLang still needs the same updated
-source-publisher rerun, and cross-node/one-pod-per-source-rank runtime bridge
-claims remain unproven. The NCCL distributed JSON remains the Level 1
-comparison artifact. Existing Qwen3
+artifacts, plus checksum-backed same-node optimizer-step reruns for both
+runtimes. These remain one-pod/GPU-reuse proofs with staging-copy runtime APIs;
+cross-node/one-pod-per-source-rank runtime bridge claims, direct runtime-buffer
+NIXL landing, and real RL trainer-loop claims remain unproven. The NCCL
+distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 synthetic same-node table now has comparable checksum-backed MX/NIXL, NCCL
 Reshard-style, and CheckpointEngine-style rows in one placement scope and passes

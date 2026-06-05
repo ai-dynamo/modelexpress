@@ -1,0 +1,24 @@
+cursor-code-review artifact: nscale-sglang-trainer-step-rerun-20260605
+
+Review source:
+- Requested regular cursor-code-review cadence.
+- /workspace/a3sh-dotfiles was checked earlier and does not contain a cursor-code-review skill.
+- Applied the available cursor-code-review rubric from /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review/SKILL.md inside nscale.
+
+Scope reviewed:
+- Commit 58b37adc7e3a3a5d8a1893ac6fcc34f9f5cdca92: SGLang BF16 runtime readback modeling.
+- Current documentation/artifact diff for the SGLang trainer-step GPU rerun.
+- File-size check: refit_sglang_nixl_runtime_smoke.py is 882 lines after the change; test file is 230 lines.
+
+Findings:
+- None.
+
+Reasoning:
+- The code change keeps the full-precision NIXL staging gate intact and scopes BF16 tolerance to the SGLang runtime readback boundary, where the engine was explicitly launched with dtype=bfloat16.
+- The helper `_runtime_storage_expected_tensor` makes the precision boundary explicit instead of relaxing allclose/checksum globally or hiding the mismatch behind broad tolerances.
+- The call site passes the configured runtime dtype from the distributed SGLang runner, so the behavior remains exact for unit tests and non-BF16 runtimes.
+- The docs preserve the proof boundary: same-node, one-pod, GPU reuse, staging-copy runtime API, synthetic optimizer objective; no cross-node runtime, direct runtime-buffer landing, or real RL trainer-loop claim is added.
+
+Residual risks:
+- The SGLang live proof remains a tiny-model same-node runtime bridge.
+- Cross-node runtime placement and one-pod-per-source-rank runtime placement remain unproven.

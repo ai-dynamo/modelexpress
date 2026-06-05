@@ -1,0 +1,156 @@
+Name:             mx-sglang-trainerstep-20260605-1345
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Fri, 05 Jun 2026 14:59:09 +0200
+Labels:           app=mx-sglang-trainerstep
+                  modelexpress.nvidia.com/run=rl-resharding-20260605
+Annotations:      <none>
+Status:           Running
+IP:               10.0.20.82
+IPs:
+  IP:  10.0.20.82
+Containers:
+  sglang:
+    Container ID:  containerd://5858692616ce0de4afee82c4e70d47509af99350bf9a306116557e71b7d17d7f
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      bash
+      -lc
+      set -uo pipefail
+      ART=/workspace/artifacts
+      mkdir -p "$ART"
+      MAIN_LOG="$ART/nscale-live-sglang-nixl-runtime-trainer-step-20260605.log"
+      RUN_ART="$ART/nscale-live-sglang-nixl-runtime-trainer-step-20260605.json"
+      SUMMARY="$ART/nscale-live-sglang-nixl-runtime-trainer-step-summary-20260605.json"
+      COMMIT="58b37adc7e3a3a5d8a1893ac6fcc34f9f5cdca92"
+      BRANCH="mx-rl-resharding-planner-poc"
+      IMAGE="docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90"
+      GIT_RC=127
+      RUN_RC=127
+      exec > >(tee "$MAIN_LOG") 2>&1
+      echo "[mx-sglang-trainer-step] started $(date -Is)"
+      echo "[mx-sglang-trainer-step] pod=$HOSTNAME image=$IMAGE branch=$BRANCH commit=$COMMIT"
+      nvidia-smi || true
+      if ! command -v git >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y --no-install-recommends git ca-certificates
+      fi
+      rm -rf /workspace/mx
+      git clone --branch "$BRANCH" "https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/ai-dynamo/modelexpress.git" /workspace/mx
+      GIT_RC=$?
+      if [ "$GIT_RC" -eq 0 ]; then
+        cd /workspace/mx
+        git checkout "$COMMIT"
+        GIT_RC=$?
+        git rev-parse HEAD
+      fi
+      if [ "$GIT_RC" -eq 0 ]; then
+        cd /workspace/mx
+        export PYTHONPATH=/workspace/mx/modelexpress_client/python:${PYTHONPATH:-}
+        export PYTHONUNBUFFERED=1
+        export MX_REFIT_ALLOW_GPU_REUSE=1
+        export MX_REFIT_DIST_TIMEOUT_MINUTES=10
+        export NIXL_LOG_LEVEL=INFO
+        export UCX_LOG_LEVEL=warn
+        export UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp,self,sm
+        export UCX_NET_DEVICES=mlx5_10:1
+        export UCX_RNDV_SCHEME=get_zcopy
+        export UCX_RNDV_THRESH=0
+        python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+          -m modelexpress.refit_sglang_nixl_runtime_smoke \
+          --artifact-path "$RUN_ART" \
+          --context-length 64 \
+          --mem-fraction-static 0.2 \
+          --log-level info
+        RUN_RC=$?
+        echo "[mx-sglang-trainer-step] run_rc=$RUN_RC"
+      fi
+      nvidia-smi > "$ART/nscale-live-sglang-nixl-runtime-trainer-step-nvidia-smi-20260605.log" || true
+      python3 - <<PY
+      import json, pathlib, time
+      art = pathlib.Path("/workspace/artifacts")
+      run_art = art / "nscale-live-sglang-nixl-runtime-trainer-step-20260605.json"
+      result = json.loads(run_art.read_text()) if run_art.exists() else {}
+      payload = {
+          "schema_version": 1,
+          "run_id": "nscale-live-sglang-nixl-runtime-trainer-step-20260605",
+          "pod": "mx-sglang-trainerstep-20260605-1345",
+          "node": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+          "image": "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90",
+          "branch": "mx-rl-resharding-planner-poc",
+          "commit": "58b37adc7e3a3a5d8a1893ac6fcc34f9f5cdca92",
+          "requested_gpus": 1,
+          "world_size": 3,
+          "same_node": True,
+          "one_pod_per_source_rank": False,
+          "mx_refit_allow_gpu_reuse": True,
+          "ucx_net_devices": "mlx5_10:1",
+          "git_rc": int("$GIT_RC"),
+          "run_rc": int("$RUN_RC"),
+          "artifact_written": run_art.exists(),
+          "result": result.get("result"),
+          "checksum_matches": result.get("validation", {}).get("checksum_matches"),
+          "allclose": result.get("validation", {}).get("allclose"),
+          "nixl_staging_allclose": result.get("validation", {}).get("nixl_staging_allclose"),
+          "trainer_optimizer_step_publisher_used": result.get("proof", {}).get("trainer_optimizer_step_publisher_used"),
+          "synthetic_source_values_used": result.get("proof", {}).get("synthetic_source_values_used"),
+          "runtime_storage_dtype": result.get("validation", {}).get("runtime_storage_dtype"),
+          "full_precision_max_abs_error": result.get("validation", {}).get("full_precision_max_abs_error"),
+          "trainer_to_inference_bytes": result.get("metrics", {}).get("trainer_to_inference_bytes"),
+          "raw_nixl_read_duration_ms": result.get("metrics", {}).get("raw_nixl_read_duration_ms"),
+          "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          "artifacts": [p.name for p in sorted(art.iterdir())],
+      }
+      pathlib.Path("$SUMMARY").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+      PY
+      echo "[mx-sglang-trainer-step] sleeping for artifact collection"
+      sleep 1800
+
+    State:          Running
+      Started:      Fri, 05 Jun 2026 14:59:10 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             16
+      memory:          128Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Environment:
+      GIT_USERNAME:  <set to the key 'GIT_USERNAME' in secret 'kaniko-git'>  Optional: false
+      GIT_PASSWORD:  <set to the key 'GIT_PASSWORD' in secret 'kaniko-git'>  Optional: false
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-6grpp (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  kube-api-access-6grpp:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              kubernetes.io/hostname=cluster-0967a26d-pool-14bee067-prctr-g2j7h
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  45s   default-scheduler  Successfully assigned anish-dynamo/mx-sglang-trainerstep-20260605-1345 to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+  Normal  Pulled     45s   kubelet            Container image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" already present on machine
+  Normal  Created    45s   kubelet            Created container: sglang
+  Normal  Started    44s   kubelet            Started container sglang
