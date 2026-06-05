@@ -1,0 +1,21 @@
+{
+  "artifacts": [
+    "nscale-level5-baseline-nvidia-smi-20260605.log",
+    "nscale-level5-baseline-pip-20260605.log",
+    "nscale-level5-checkpoint-engine-baseline-20260605.json",
+    "nscale-level5-checkpoint-engine-baseline-20260605.log",
+    "nscale-level5-nccl-reshard-baseline-20260605.json",
+    "nscale-level5-nccl-reshard-baseline-20260605.log",
+    "nscale-level5-same-node-synthetic-table-20260605.json",
+    "nscale-level5-same-node-synthetic-table-20260605.log"
+  ],
+  "checkpoint_engine_return_code": 0,
+  "commit": "24f0b0e867f67f0b9a77b880f52eac6de188ba24",
+  "local_session_date": "2026-06-05",
+  "mode": "level5-baseline-pod-summary",
+  "nccl_return_code": 0,
+  "pod": "mx-level5-baseline-20260605-1228",
+  "requested_gpus": 4,
+  "schema_version": 1,
+  "table_return_code": 0
+}

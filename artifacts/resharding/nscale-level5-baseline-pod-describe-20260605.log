@@ -1,0 +1,160 @@
+Name:             mx-level5-baseline-20260605-1228
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Fri, 05 Jun 2026 14:27:33 +0200
+Labels:           app=mx-level5-baseline
+                  modelexpress.nvidia.com/run=rl-resharding-level5-20260605
+Annotations:      <none>
+Status:           Running
+IP:               10.0.12.111
+IPs:
+  IP:  10.0.12.111
+Init Containers:
+  clone:
+    Container ID:  containerd://46d7b871afc32ed6ae2c61ebf4b95d1d3017af903c6b6ebb90abd8e95f31519b
+    Image:         alpine/git:2.49.1
+    Image ID:      docker.io/alpine/git@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/sh
+      -lc
+    Args:
+      set -euo pipefail
+      git clone "https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/ai-dynamo/modelexpress.git" /workspace/mx
+      cd /workspace/mx
+      git checkout mx-rl-resharding-planner-poc
+      git reset --hard 24f0b0e867f67f0b9a77b880f52eac6de188ba24
+
+    State:          Terminated
+      Reason:       Completed
+      Exit Code:    0
+      Started:      Fri, 05 Jun 2026 14:27:35 +0200
+      Finished:     Fri, 05 Jun 2026 14:27:36 +0200
+    Ready:          True
+    Restart Count:  0
+    Environment:
+      GIT_USERNAME:  <set to the key 'GIT_USERNAME' in secret 'kaniko-git'>  Optional: false
+      GIT_PASSWORD:  <set to the key 'GIT_PASSWORD' in secret 'kaniko-git'>  Optional: false
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-gsz47 (ro)
+      /workspace from workspace (rw)
+Containers:
+  level5:
+    Container ID:  containerd://92b371dca02e59e48bfe9ef6c910425b43eaddadb2ac00dd56c78ff6543a7dfa
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-d168542
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:10530fa7a16a3d3dc2597d15debfaa7c163acfb8c0b2885933c96a818ecec678
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+    Args:
+      set -uo pipefail
+      mkdir -p /workspace/artifacts
+      echo "LEVEL5_POD_START $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "COMMIT $(git -C /workspace/mx rev-parse HEAD)"
+      nvidia-smi | tee /workspace/artifacts/nscale-level5-baseline-nvidia-smi-20260605.log
+      python3 -m pip install -q '.[dev]' 2>&1 | tee /workspace/artifacts/nscale-level5-baseline-pip-20260605.log
+      export PYTHONPATH=/workspace/mx/modelexpress_client/python:${PYTHONPATH:-}
+      export NCCL_DEBUG=INFO
+      export NCCL_IB_DISABLE=1
+      export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+      python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=4 -m modelexpress.refit_level5 baseline \
+        --strategy nccl-reshard-fixed-membership \
+        --artifact /workspace/artifacts/nscale-level5-nccl-reshard-baseline-20260605.json \
+        2>&1 | tee /workspace/artifacts/nscale-level5-nccl-reshard-baseline-20260605.log
+      NCCL_RC=${PIPESTATUS[0]}
+      python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=4 -m modelexpress.refit_level5 baseline \
+        --strategy checkpoint-engine-full-gather-apply \
+        --artifact /workspace/artifacts/nscale-level5-checkpoint-engine-baseline-20260605.json \
+        2>&1 | tee /workspace/artifacts/nscale-level5-checkpoint-engine-baseline-20260605.log
+      CE_RC=${PIPESTATUS[0]}
+      if [ "$NCCL_RC" -eq 0 ] && [ "$CE_RC" -eq 0 ]; then
+        python3 -m modelexpress.refit_level5 table \
+          --mx-artifact /workspace/mx/artifacts/resharding/nscale-nixl-distributed-refit.json \
+          --nccl-artifact /workspace/artifacts/nscale-level5-nccl-reshard-baseline-20260605.json \
+          --checkpoint-artifact /workspace/artifacts/nscale-level5-checkpoint-engine-baseline-20260605.json \
+          --claim-scope synthetic-same-node-smoke \
+          --artifact /workspace/artifacts/nscale-level5-same-node-synthetic-table-20260605.json \
+          2>&1 | tee /workspace/artifacts/nscale-level5-same-node-synthetic-table-20260605.log
+        TABLE_RC=${PIPESTATUS[0]}
+      else
+        TABLE_RC=99
+      fi
+      python3 - <<PY
+      import json, pathlib, time
+      summary = {
+          "schema_version": 1,
+          "local_session_date": "2026-06-05",
+          "mode": "level5-baseline-pod-summary",
+          "pod": "mx-level5-baseline-20260605-1228",
+          "commit": "24f0b0e867f67f0b9a77b880f52eac6de188ba24",
+          "requested_gpus": 4,
+          "nccl_return_code": int("$NCCL_RC"),
+          "checkpoint_engine_return_code": int("$CE_RC"),
+          "table_return_code": int("$TABLE_RC"),
+          "artifacts": sorted(p.name for p in pathlib.Path('/workspace/artifacts').glob('nscale-level5-*20260605*')),
+      }
+      pathlib.Path('/workspace/artifacts/nscale-level5-baseline-summary-20260605.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+      print('LEVEL5_BASELINE_SUMMARY', json.dumps(summary, sort_keys=True))
+      PY
+      echo "LEVEL5_POD_DONE $(date -u +%Y-%m-%dT%H:%M:%SZ) rc_nccl=${NCCL_RC} rc_ce=${CE_RC} rc_table=${TABLE_RC}"
+      sleep 1800
+      exit 0
+
+    State:          Running
+      Started:      Fri, 05 Jun 2026 14:27:37 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             32
+      memory:          256Gi
+      nvidia.com/gpu:  4
+    Requests:
+      cpu:             16
+      memory:          128Gi
+      nvidia.com/gpu:  4
+    Environment:
+      PYTHONUNBUFFERED:             1
+      CUDA_DEVICE_MAX_CONNECTIONS:  1
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-gsz47 (ro)
+      /workspace from workspace (rw)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  workspace:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:
+    SizeLimit:  <unset>
+  kube-api-access-gsz47:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              modelexpress.nvidia.com/rl-ce-role=primary
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved=anish-20260601:NoSchedule
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  3m35s  default-scheduler  Successfully assigned anish-dynamo/mx-level5-baseline-20260605-1228 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     3m34s  kubelet            Container image "alpine/git:2.49.1" already present on machine
+  Normal  Created    3m34s  kubelet            Created container: clone
+  Normal  Started    3m33s  kubelet            Started container clone
+  Normal  Pulling    3m32s  kubelet            Pulling image "docker.io/amaddipoti439/modelexpress:vllm-rl-d168542"
+  Normal  Pulled     3m31s  kubelet            Successfully pulled image "docker.io/amaddipoti439/modelexpress:vllm-rl-d168542" in 723ms (723ms including waiting). Image size: 9289597744 bytes.
+  Normal  Created    3m31s  kubelet            Created container: level5
+  Normal  Started    3m31s  kubelet            Started container level5

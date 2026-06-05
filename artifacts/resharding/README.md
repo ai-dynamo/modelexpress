@@ -201,24 +201,37 @@ Files:
   normalized Level-5 timing table. Comparable checksum-backed MX/NIXL, NCCL
   Reshard, and CheckpointEngine timings were not run in that pass because the
   required multi-GPU nscale capacity was unavailable.
-- `nscale-level5-normalizer-pytest.log`: focused nscale Python gate for the
-  checksum-gated Level-5 timing normalizer and existing refit control-plane
-  paths (`18 passed`).
-- `nscale-level5-same-node-synthetic-table-missing-baselines.json`: normalized
-  synthetic same-node Level-5 table generated from the existing same-node
-  MX/NIXL checksum-backed artifact. The MX row passes, the NCCL Reshard and
-  CheckpointEngine rows are explicitly unmeasured, and the table result is
-  correctly `fail`.
-- `nscale-level5-baseline-capacity-block.json` and
-  `nscale-level5-baseline-capacity-block.log`: honest block for the new
-  synthetic same-node NCCL Reshard and CheckpointEngine baseline runners. The
-  4-GPU pod stayed Pending with `0/29 nodes`,
-  `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler
-  max node group size reached.
-- `nscale-level5-baseline-capacity-block-20260605.json` and
-  `nscale-level5-baseline-capacity-block-20260605.log`: fresh 2026-06-05
-  rerun of the same 4-GPU checksum-backed Level-5 baseline pod. It hit the same
-  scheduler/autoscaler block, so the normalized Level-5 table remains unproven.
+- `nscale-level5-normalizer-pytest-20260605.log`: focused nscale Python gate
+  for the checksum-gated Level-5 timing normalizer and existing refit
+  control-plane paths (`19 passed`).
+- `nscale-level5-same-node-synthetic-table-missing-baselines.json`: historical
+  normalized synthetic same-node table where NCCL Reshard and CheckpointEngine
+  rows were explicitly unmeasured; superseded by the passing 2026-06-05 table.
+- `nscale-level5-nccl-reshard-baseline-20260605.json` and `.log`: real
+  measured 4-GPU B200 same-node NCCL Reshard-style baseline row. It is
+  checksum/allclose gated, records `trainer_full_all_gather_used=true`,
+  `trainer_to_inference_bytes=128`, `trainer_collective_bytes=160`,
+  `redundant_cross_boundary_factor=2.0`, and passes.
+- `nscale-level5-checkpoint-engine-baseline-20260605.json` and `.log`: real
+  measured 4-GPU B200 same-node CheckpointEngine-style baseline row. It is
+  checksum/allclose gated, records `checkpoint_storage_used=true`,
+  `checkpoint_storage_bytes=256`, `trainer_collective_bytes=160`,
+  `redundant_cross_boundary_factor=4.0`, and passes.
+- `nscale-level5-same-node-synthetic-table-20260605.json` and `.log`: passing
+  normalized Level-5 synthetic same-node table with measured MX/NIXL, NCCL
+  Reshard-style, and CheckpointEngine-style rows in the same placement scope.
+  It records `level5_synthetic_smoke_pass=true`,
+  `production_competitive_claim_safe=false`, and
+  `level5_full_model_claim_safe=false`.
+- `nscale-level5-baseline-summary-20260605.json` and
+  `nscale-level5-baseline-nvidia-smi-20260605.log`: pod summary and B200 GPU
+  inventory for `mx-level5-baseline-20260605-1228`; all three return codes were
+  zero.
+- `nscale-level5-baseline-capacity-block.json`, `.log`,
+  `nscale-level5-baseline-capacity-block-20260605.json`, and
+  `nscale-level5-baseline-capacity-block-20260605.log`: historical 4-GPU
+  scheduler blocks retained for provenance; superseded for synthetic same-node
+  scope by the passing 2026-06-05 run.
 - `nscale-level5-existing-job-evidence-audit.json`: audit of existing nscale
   timing jobs that looked close to Level-5 evidence. It banks real Qwen3 BF16
   full-model/vLLM timing context for MX live refit, NCCL, and
@@ -426,6 +439,7 @@ metadata sidecar compatibility path. Live vLLM GPU reruns remain
 capacity-blocked on 2026-06-05. The NCCL distributed JSON remains the Level 1
 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
-normalizer/baseline harness now exists, but real Level-5 timing remains unproven
-until comparable checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine
-rows are completed in the same placement scope.
+synthetic same-node table now has comparable checksum-backed MX/NIXL, NCCL
+Reshard-style, and CheckpointEngine-style rows in one placement scope and passes
+for `synthetic-same-node-smoke`; full-model, cross-node, and production
+competitive Level-5 claims remain unproven.

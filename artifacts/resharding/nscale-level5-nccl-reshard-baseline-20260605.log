@@ -1,0 +1,522 @@
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+*****************************************
+/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+[rank0]:[W605 12:27:46.566054212 ProcessGroupNCCL.cpp:5138] Guessing device ID based on global rank. This can cause a hang if rank to GPU mapping is heterogeneous. You can specify device_id in init_process_group()
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO Bootstrap: Using eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO cudaDriverVersion 13020
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO cudaDriverVersion 13020
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO Bootstrap: Using eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:423:423 [2] NCCL INFO cudaDriverVersion 13020
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO cudaDriverVersion 13020
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO Bootstrap: Using eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:423:423 [2] NCCL INFO Bootstrap: Using eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:423:423 [2] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO NCCL version 2.27.5+cuda12.9
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:423:423 [2] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO NCCL_IB_DISABLE set by environment to 1.
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO NET/Socket : Using [0]eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Initialized NET plugin Socket
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO ncclCommInitRankConfig comm 0x11237620 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId 18000 commId 0x6323826c5f3b6bd0 - Init START
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO NCCL_IB_DISABLE set by environment to 1.
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO NET/Socket : Using [0]eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Initialized NET plugin Socket
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO ncclCommInitRankConfig comm 0x1534ab70 rank 3 nranks 4 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x6323826c5f3b6bd0 - Init START
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO NCCL_IB_DISABLE set by environment to 1.
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO NET/Socket : Using [0]eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Initialized NET plugin Socket
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO NCCL_IB_DISABLE set by environment to 1.
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO NET/Socket : Using [0]eth0:10.0.12.111<0>
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Initialized NET plugin Socket
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO ncclCommInitRankConfig comm 0x405a8420 rank 1 nranks 4 cudaDev 1 nvmlDev 1 busId 29000 commId 0x6323826c5f3b6bd0 - Init START
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO ncclCommInitRankConfig comm 0x3286cfe0 rank 2 nranks 4 cudaDev 2 nvmlDev 2 busId 3a000 commId 0x6323826c5f3b6bd0 - Init START
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO RAS client listening socket at ::1<28028>
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO RAS client listening socket at ::1<28028>
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO RAS client listening socket at ::1<28028>
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO RAS client listening socket at ::1<28028>
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Bootstrap timings total 0.095119 (create 0.000025, send 0.000068, recv 0.000207, ring 0.000052, delay 0.000000)
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Bootstrap timings total 0.001811 (create 0.000025, send 0.000063, recv 0.000338, ring 0.001115, delay 0.000000)
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Bootstrap timings total 0.166093 (create 0.000022, send 0.000066, recv 0.164505, ring 0.000213, delay 0.000000)
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Bootstrap timings total 0.001855 (create 0.000024, send 0.000063, recv 0.000319, ring 0.001125, delay 0.000000)
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO MNNVL busId 0x4b000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO MNNVL busId 0x29000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO MNNVL busId 0x3a000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO MNNVL busId 0x18000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Setting affinity for GPU 3 to 0-47,96-143
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO NVLS multicast support is available on dev 3 (NVLS_NCHANNELS 24)
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Setting affinity for GPU 2 to 0-47,96-143
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO NVLS multicast support is available on dev 2 (NVLS_NCHANNELS 24)
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Setting affinity for GPU 1 to 0-47,96-143
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO NVLS multicast support is available on dev 1 (NVLS_NCHANNELS 24)
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Setting affinity for GPU 0 to 0-47,96-143
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO NVLS multicast support is available on dev 0 (NVLS_NCHANNELS 24)
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO comm 0x3286cfe0 rank 2 nRanks 4 nNodes 1 localRanks 4 localRank 2 MNNVL 0
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO comm 0x1534ab70 rank 3 nRanks 4 nNodes 1 localRanks 4 localRank 3 MNNVL 0
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO comm 0x405a8420 rank 1 nRanks 4 nNodes 1 localRanks 4 localRank 1 MNNVL 0
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO comm 0x11237620 rank 0 nRanks 4 nNodes 1 localRanks 4 localRank 0 MNNVL 0
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 00/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 01/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 02/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 03/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 04/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 05/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 06/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Trees [0] 3/-1/-1->2->1 [1] 3/-1/-1->2->1 [2] 3/-1/-1->2->1 [3] 3/-1/-1->2->1 [4] 3/-1/-1->2->1 [5] 3/-1/-1->2->1 [6] 3/-1/-1->2->1 [7] 3/-1/-1->2->1 [8] 3/-1/-1->2->1 [9] 3/-1/-1->2->1 [10] 3/-1/-1->2->1 [11] 3/-1/-1->2->1 [12] 3/-1/-1->2->-1 [13] 3/-1/-1->2->-1 [14] -1/-1/-1->2->1 [15] -1/-1/-1->2->1 [16] 3/-1/-1->2->1 [17] 3/-1/-1->2->1 [18] 3/-1/-1->2->1 [19] 3/-1/-1->2->1 [20] 3/-1/-1->2->1 [21] 3/-1/-1->2->1 [22] 3/-1/-1->2->1 [23] 3/-1/-1->2->1 [24] 3/-1/-1->2->1 [25] 3/-1/-1->2->1 [26] 3/-1/-1->2->1 [27] 3/-1/-1->2->1 [28] 3/-1/-1->2->-1 [29] 3/-1/-1->2->-1 [30] -1/-1/-1->2->1 [31] -1/-1/-1->2->1
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 07/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 08/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 09/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Trees [0] -1/-1/-1->3->2 [1] -1/-1/-1->3->2 [2] -1/-1/-1->3->2 [3] -1/-1/-1->3->2 [4] -1/-1/-1->3->2 [5] -1/-1/-1->3->2 [6] -1/-1/-1->3->2 [7] -1/-1/-1->3->2 [8] -1/-1/-1->3->2 [9] -1/-1/-1->3->2 [10] 0/-1/-1->3->2 [11] 0/-1/-1->3->2 [12] 0/-1/-1->3->2 [13] 0/-1/-1->3->2 [14] 0/-1/-1->3->-1 [15] 0/-1/-1->3->-1 [16] -1/-1/-1->3->2 [17] -1/-1/-1->3->2 [18] -1/-1/-1->3->2 [19] -1/-1/-1->3->2 [20] -1/-1/-1->3->2 [21] -1/-1/-1->3->2 [22] -1/-1/-1->3->2 [23] -1/-1/-1->3->2 [24] -1/-1/-1->3->2 [25] -1/-1/-1->3->2 [26] 0/-1/-1->3->2 [27] 0/-1/-1->3->2 [28] 0/-1/-1->3->2 [29] 0/-1/-1->3->2 [30] 0/-1/-1->3->-1 [31] 0/-1/-1->3->-1
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 10/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 11/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Trees [0] 2/-1/-1->1->0 [1] 2/-1/-1->1->0 [2] 2/-1/-1->1->0 [3] 2/-1/-1->1->0 [4] 2/-1/-1->1->0 [5] 2/-1/-1->1->0 [6] 2/-1/-1->1->0 [7] 2/-1/-1->1->0 [8] 2/-1/-1->1->0 [9] 2/-1/-1->1->0 [10] 2/-1/-1->1->-1 [11] 2/-1/-1->1->-1 [12] -1/-1/-1->1->0 [13] -1/-1/-1->1->0 [14] 2/-1/-1->1->0 [15] 2/-1/-1->1->0 [16] 2/-1/-1->1->0 [17] 2/-1/-1->1->0 [18] 2/-1/-1->1->0 [19] 2/-1/-1->1->0 [20] 2/-1/-1->1->0 [21] 2/-1/-1->1->0 [22] 2/-1/-1->1->0 [23] 2/-1/-1->1->0 [24] 2/-1/-1->1->0 [25] 2/-1/-1->1->0 [26] 2/-1/-1->1->-1 [27] 2/-1/-1->1->-1 [28] -1/-1/-1->1->0 [29] -1/-1/-1->1->0 [30] 2/-1/-1->1->0 [31] 2/-1/-1->1->0
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 12/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 13/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 14/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 15/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 16/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 17/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 18/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 19/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 20/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 21/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 22/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 23/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 24/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 25/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 26/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 27/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 28/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 29/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 30/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Channel 31/32 : 0 1 2 3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] 1/-1/-1->0->-1 [7] 1/-1/-1->0->-1 [8] 1/-1/-1->0->-1 [9] 1/-1/-1->0->-1 [10] -1/-1/-1->0->3 [11] -1/-1/-1->0->3 [12] 1/-1/-1->0->3 [13] 1/-1/-1->0->3 [14] 1/-1/-1->0->3 [15] 1/-1/-1->0->3 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] 1/-1/-1->0->-1 [19] 1/-1/-1->0->-1 [20] 1/-1/-1->0->-1 [21] 1/-1/-1->0->-1 [22] 1/-1/-1->0->-1 [23] 1/-1/-1->0->-1 [24] 1/-1/-1->0->-1 [25] 1/-1/-1->0->-1 [26] -1/-1/-1->0->3 [27] -1/-1/-1->0->3 [28] 1/-1/-1->0->3 [29] 1/-1/-1->0->3 [30] 1/-1/-1->0->3 [31] 1/-1/-1->0->3
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO PROFILER/Plugin: Could not find: libnccl-profiler.so.
+mx-level5-baseline-20260605-1228:423:458 [2] NCCL INFO [Proxy Service] Device 2 CPU core 134
+mx-level5-baseline-20260605-1228:424:462 [3] NCCL INFO [Proxy Service UDS] Device 3 CPU core 29
+mx-level5-baseline-20260605-1228:424:459 [3] NCCL INFO [Proxy Service] Device 3 CPU core 27
+mx-level5-baseline-20260605-1228:423:461 [2] NCCL INFO [Proxy Service UDS] Device 2 CPU core 137
+mx-level5-baseline-20260605-1228:421:463 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 99
+mx-level5-baseline-20260605-1228:421:460 [0] NCCL INFO [Proxy Service] Device 0 CPU core 2
+mx-level5-baseline-20260605-1228:422:464 [1] NCCL INFO [Proxy Service] Device 1 CPU core 15
+mx-level5-baseline-20260605-1228:422:465 [1] NCCL INFO [Proxy Service UDS] Device 1 CPU core 114
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO CC Off, workFifoBytes 1048576
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO threadThresholds 8/8/64 | 32/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO 32 coll channels, 32 collnet channels, 24 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO ncclCommInitRankConfig comm 0x405a8420 rank 1 nranks 4 cudaDev 1 nvmlDev 1 busId 29000 commId 0x6323826c5f3b6bd0 - Init COMPLETE
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO ncclCommInitRankConfig comm 0x1534ab70 rank 3 nranks 4 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x6323826c5f3b6bd0 - Init COMPLETE
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO ncclCommInitRankConfig comm 0x3286cfe0 rank 2 nranks 4 cudaDev 2 nvmlDev 2 busId 3a000 commId 0x6323826c5f3b6bd0 - Init COMPLETE
+mx-level5-baseline-20260605-1228:422:452 [1] NCCL INFO Init timings - ncclCommInitRankConfig: rank 1 nranks 4 total 0.61 (kernels 0.24, alloc 0.04, bootstrap 0.00, allgathers 0.00, topo 0.07, graphs 0.01, connections 0.25, rest 0.00)
+mx-level5-baseline-20260605-1228:424:445 [3] NCCL INFO Init timings - ncclCommInitRankConfig: rank 3 nranks 4 total 0.68 (kernels 0.23, alloc 0.02, bootstrap 0.10, allgathers 0.00, topo 0.07, graphs 0.01, connections 0.25, rest 0.00)
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO TUNER/Plugin: Could not find: libnccl-tuner.so. Using internal tuner plugin.
+mx-level5-baseline-20260605-1228:423:453 [2] NCCL INFO Init timings - ncclCommInitRankConfig: rank 2 nranks 4 total 0.61 (kernels 0.23, alloc 0.04, bootstrap 0.00, allgathers 0.00, topo 0.07, graphs 0.01, connections 0.25, rest 0.00)
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO ncclCommInitRankConfig comm 0x11237620 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId 18000 commId 0x6323826c5f3b6bd0 - Init COMPLETE
+mx-level5-baseline-20260605-1228:421:440 [0] NCCL INFO Init timings - ncclCommInitRankConfig: rank 0 nranks 4 total 0.72 (kernels 0.20, alloc 0.02, bootstrap 0.17, allgathers 0.00, topo 0.07, graphs 0.01, connections 0.25, rest 0.00)
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 00/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 00/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 01/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 02/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 01/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 02/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 03/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 02/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 03/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 04/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 04/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 05/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 05/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 06/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 06/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 07/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 00/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 03/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 04/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 07/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 01/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 08/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 09/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 08/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 05/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 02/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 03/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 09/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 06/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 10/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 10/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 04/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 07/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 11/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 11/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 05/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 08/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 12/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 12/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 06/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 09/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 13/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 13/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 07/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 10/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 14/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 14/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 08/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 11/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 15/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 15/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 09/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 12/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 16/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 16/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 10/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 13/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 17/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 17/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 11/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 14/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 18/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 18/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 12/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 15/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 19/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 20/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 19/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 13/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 16/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 17/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 20/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 21/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 14/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 21/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 18/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 22/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 15/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 22/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 19/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 23/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 24/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 23/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 16/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 20/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 21/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 24/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 25/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 17/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 18/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 25/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 22/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 26/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 26/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 19/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 23/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 27/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 27/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 20/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 21/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 28/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 24/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 28/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 29/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 22/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 25/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 29/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 23/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 30/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Channel 31/0 : 3[3] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 26/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 30/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 24/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 25/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 27/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Channel 31/0 : 1[1] -> 2[2] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 26/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 28/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 29/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 27/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 30/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 28/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Channel 31/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 29/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 30/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Channel 31/0 : 2[2] -> 3[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:423:468 [2] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-level5-baseline-20260605-1228:421:466 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-level5-baseline-20260605-1228:422:467 [1] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-level5-baseline-20260605-1228:424:469 [3] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO ncclCommInitRankConfig comm 0x14720230 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 18000 commId 0xc1499537e45058ea - Init START
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO ncclCommInitRankConfig comm 0x43a90ad0 rank 1 nranks 2 cudaDev 1 nvmlDev 1 busId 29000 commId 0xc1499537e45058ea - Init START
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Bootstrap timings total 0.000571 (create 0.000018, send 0.000055, recv 0.000374, ring 0.000019, delay 0.000000)
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO Bootstrap timings total 0.000262 (create 0.000024, send 0.000075, recv 0.000074, ring 0.000013, delay 0.000000)
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO MNNVL busId 0x29000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO MNNVL busId 0x18000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO Setting affinity for GPU 1 to 0-47,96-143
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Setting affinity for GPU 0 to 0-47,96-143
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO comm 0x43a90ad0 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO comm 0x14720230 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 00/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 01/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 02/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 03/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 04/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 05/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 06/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 07/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 08/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 09/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 10/32 : 0 1
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0 [2] -1/-1/-1->1->0 [3] -1/-1/-1->1->0 [4] -1/-1/-1->1->0 [5] -1/-1/-1->1->0 [6] -1/-1/-1->1->0 [7] -1/-1/-1->1->0 [8] 0/-1/-1->1->-1 [9] 0/-1/-1->1->-1 [10] 0/-1/-1->1->-1 [11] 0/-1/-1->1->-1 [12] 0/-1/-1->1->-1 [13] 0/-1/-1->1->-1 [14] 0/-1/-1->1->-1 [15] 0/-1/-1->1->-1 [16] -1/-1/-1->1->0 [17] -1/-1/-1->1->0 [18] -1/-1/-1->1->0 [19] -1/-1/-1->1->0 [20] -1/-1/-1->1->0 [21] -1/-1/-1->1->0 [22] -1/-1/-1->1->0 [23] -1/-1/-1->1->0 [24] 0/-1/-1->1->-1 [25] 0/-1/-1->1->-1 [26] 0/-1/-1->1->-1 [27] 0/-1/-1->1->-1 [28] 0/-1/-1->1->-1 [29] 0/-1/-1->1->-1 [30] 0/-1/-1->1->-1 [31] 0/-1/-1->1->-1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 11/32 : 0 1
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 12/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 13/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 14/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 15/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 16/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 17/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 18/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 19/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 20/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 21/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 22/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 23/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 24/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 25/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 26/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 27/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 28/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 29/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 30/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Channel 31/32 : 0 1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] 1/-1/-1->0->-1 [7] 1/-1/-1->0->-1 [8] -1/-1/-1->0->1 [9] -1/-1/-1->0->1 [10] -1/-1/-1->0->1 [11] -1/-1/-1->0->1 [12] -1/-1/-1->0->1 [13] -1/-1/-1->0->1 [14] -1/-1/-1->0->1 [15] -1/-1/-1->0->1 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] 1/-1/-1->0->-1 [19] 1/-1/-1->0->-1 [20] 1/-1/-1->0->-1 [21] 1/-1/-1->0->-1 [22] 1/-1/-1->0->-1 [23] 1/-1/-1->0->-1 [24] -1/-1/-1->0->1 [25] -1/-1/-1->0->1 [26] -1/-1/-1->0->1 [27] -1/-1/-1->0->1 [28] -1/-1/-1->0->1 [29] -1/-1/-1->0->1 [30] -1/-1/-1->0->1 [31] -1/-1/-1->0->1
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+mx-level5-baseline-20260605-1228:421:474 [0] NCCL INFO [Proxy Service] Device 0 CPU core 30
+mx-level5-baseline-20260605-1228:422:473 [1] NCCL INFO [Proxy Service] Device 1 CPU core 19
+mx-level5-baseline-20260605-1228:421:476 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 31
+mx-level5-baseline-20260605-1228:422:475 [1] NCCL INFO [Proxy Service UDS] Device 1 CPU core 23
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO CC Off, workFifoBytes 1048576
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO ncclCommInitRankConfig comm 0x14720230 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 18000 commId 0xc1499537e45058ea - Init COMPLETE
+mx-level5-baseline-20260605-1228:421:471 [0] NCCL INFO Init timings - ncclCommInitRankConfig: rank 0 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.02, rest 0.00)
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO ncclCommInitRankConfig comm 0x43a90ad0 rank 1 nranks 2 cudaDev 1 nvmlDev 1 busId 29000 commId 0xc1499537e45058ea - Init COMPLETE
+mx-level5-baseline-20260605-1228:422:472 [1] NCCL INFO Init timings - ncclCommInitRankConfig: rank 1 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.02, rest 0.00)
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 02/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 00/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 03/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 01/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 04/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 02/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 05/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 03/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 04/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 06/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 05/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 07/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 06/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 07/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 08/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 08/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 09/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 09/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 10/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 11/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 10/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 12/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 11/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 13/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 12/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 14/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 13/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 15/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 16/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 14/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 17/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 15/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 18/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 16/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 19/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 17/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 20/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 18/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 21/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 19/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 22/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 20/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 23/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 21/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 24/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 22/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 25/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 23/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 26/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 24/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 27/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 25/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 28/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 26/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 29/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 27/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 30/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 28/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Channel 31/0 : 1[1] -> 0[0] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 29/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 30/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Channel 31/0 : 0[0] -> 1[1] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:477 [0] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+mx-level5-baseline-20260605-1228:422:478 [1] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
+[rank0]:[W605 12:27:47.042334590 ProcessGroupNCCL.cpp:4068] Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup with size 4.  In lazy initialization mode, this will result in a new 2-rank NCCL communicator to be created. (function operator())
+[rank3]:[W605 12:27:47.042419485 ProcessGroupNCCL.cpp:4068] Warning: An unbatched P2P op (send/recv) was called on this ProcessGroup with size 4.  In lazy initialization mode, this will result in a new 2-rank NCCL communicator to be created. (function operator())
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO Comm config Blocking set to 1
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO Assigned NET plugin Socket to comm
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO Using network Socket
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO ncclCommInitRankConfig comm 0x1562a6d0 rank 1 nranks 2 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x72df44dbd70af0e7 - Init START
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO ncclCommInitRankConfig comm 0x1483acf0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 18000 commId 0x72df44dbd70af0e7 - Init START
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO Bootstrap timings total 0.000432 (create 0.000019, send 0.000059, recv 0.000242, ring 0.000009, delay 0.000000)
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Bootstrap timings total 0.000404 (create 0.000020, send 0.000057, recv 0.000244, ring 0.000012, delay 0.000000)
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO MNNVL busId 0x18000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO MNNVL busId 0x4b000 fabric UUID 0.0 cliqueId 0x0 state 3 healthMask 0x80
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Setting affinity for GPU 0 to 0-47,96-143
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO Setting affinity for GPU 3 to 0-47,96-143
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO comm 0x1562a6d0 rank 1 nRanks 2 nNodes 1 localRanks 2 localRank 1 MNNVL 0
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO comm 0x1483acf0 rank 0 nRanks 2 nNodes 1 localRanks 2 localRank 0 MNNVL 0
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 00/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 01/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 02/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 03/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 04/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 05/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 06/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 07/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 08/32 : 0 1
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO Trees [0] -1/-1/-1->1->0 [1] -1/-1/-1->1->0 [2] -1/-1/-1->1->0 [3] -1/-1/-1->1->0 [4] -1/-1/-1->1->0 [5] -1/-1/-1->1->0 [6] -1/-1/-1->1->0 [7] -1/-1/-1->1->0 [8] 0/-1/-1->1->-1 [9] 0/-1/-1->1->-1 [10] 0/-1/-1->1->-1 [11] 0/-1/-1->1->-1 [12] 0/-1/-1->1->-1 [13] 0/-1/-1->1->-1 [14] 0/-1/-1->1->-1 [15] 0/-1/-1->1->-1 [16] -1/-1/-1->1->0 [17] -1/-1/-1->1->0 [18] -1/-1/-1->1->0 [19] -1/-1/-1->1->0 [20] -1/-1/-1->1->0 [21] -1/-1/-1->1->0 [22] -1/-1/-1->1->0 [23] -1/-1/-1->1->0 [24] 0/-1/-1->1->-1 [25] 0/-1/-1->1->-1 [26] 0/-1/-1->1->-1 [27] 0/-1/-1->1->-1 [28] 0/-1/-1->1->-1 [29] 0/-1/-1->1->-1 [30] 0/-1/-1->1->-1 [31] 0/-1/-1->1->-1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 09/32 : 0 1
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 10/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 11/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 12/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 13/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 14/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 15/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 16/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 17/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 18/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 19/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 20/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 21/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 22/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 23/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 24/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 25/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 26/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 27/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 28/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 29/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 30/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Channel 31/32 : 0 1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Trees [0] 1/-1/-1->0->-1 [1] 1/-1/-1->0->-1 [2] 1/-1/-1->0->-1 [3] 1/-1/-1->0->-1 [4] 1/-1/-1->0->-1 [5] 1/-1/-1->0->-1 [6] 1/-1/-1->0->-1 [7] 1/-1/-1->0->-1 [8] -1/-1/-1->0->1 [9] -1/-1/-1->0->1 [10] -1/-1/-1->0->1 [11] -1/-1/-1->0->1 [12] -1/-1/-1->0->1 [13] -1/-1/-1->0->1 [14] -1/-1/-1->0->1 [15] -1/-1/-1->0->1 [16] 1/-1/-1->0->-1 [17] 1/-1/-1->0->-1 [18] 1/-1/-1->0->-1 [19] 1/-1/-1->0->-1 [20] 1/-1/-1->0->-1 [21] 1/-1/-1->0->-1 [22] 1/-1/-1->0->-1 [23] 1/-1/-1->0->-1 [24] -1/-1/-1->0->1 [25] -1/-1/-1->0->1 [26] -1/-1/-1->0->1 [27] -1/-1/-1->0->1 [28] -1/-1/-1->0->1 [29] -1/-1/-1->0->1 [30] -1/-1/-1->0->1 [31] -1/-1/-1->0->1
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO P2P Chunksize set to 524288
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Check P2P Type isAllDirectP2p 1 directMode 0
+mx-level5-baseline-20260605-1228:424:482 [3] NCCL INFO [Proxy Service] Device 3 CPU core 112
+mx-level5-baseline-20260605-1228:421:483 [0] NCCL INFO [Proxy Service] Device 0 CPU core 32
+mx-level5-baseline-20260605-1228:424:484 [3] NCCL INFO [Proxy Service UDS] Device 3 CPU core 24
+mx-level5-baseline-20260605-1228:421:485 [0] NCCL INFO [Proxy Service UDS] Device 0 CPU core 33
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO threadThresholds 8/8/64 | 16/8/64 | 512 | 512
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO 32 coll channels, 32 collnet channels, 0 nvls channels, 32 p2p channels, 32 p2p channels per peer
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO CC Off, workFifoBytes 1048576
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO ncclCommInitRankConfig comm 0x1562a6d0 rank 1 nranks 2 cudaDev 3 nvmlDev 3 busId 4b000 commId 0x72df44dbd70af0e7 - Init COMPLETE
+mx-level5-baseline-20260605-1228:424:481 [3] NCCL INFO Init timings - ncclCommInitRankConfig: rank 1 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.02, rest 0.00)
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO ncclCommInitRankConfig comm 0x1483acf0 rank 0 nranks 2 cudaDev 0 nvmlDev 0 busId 18000 commId 0x72df44dbd70af0e7 - Init COMPLETE
+mx-level5-baseline-20260605-1228:421:480 [0] NCCL INFO Init timings - ncclCommInitRankConfig: rank 0 nranks 2 total 0.06 (kernels 0.00, alloc 0.00, bootstrap 0.00, allgathers 0.00, topo 0.04, graphs 0.00, connections 0.02, rest 0.00)
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 00/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 01/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 02/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 03/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 04/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 05/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 06/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 07/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 08/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 09/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 10/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 11/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 12/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 13/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 14/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 15/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 16/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 17/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 18/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 19/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 20/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 21/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 22/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 23/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 24/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 25/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 26/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 27/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 28/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 29/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 30/1 : 0[0] -> 1[3] via P2P/CUMEM
+mx-level5-baseline-20260605-1228:421:487 [0] NCCL INFO Channel 31/1 : 0[0] -> 1[3] via P2P/CUMEM
+{"level5_row": {"activation_install_duration_ms": 0.09292003232985735, "allclose": true, "block_reason": "", "checkpoint_storage_bytes": 0, "checksum": 556224.0, "checksum_matches": true, "expected_checksum": 556224.0, "inference_side_fanout_bytes": 0, "max_abs_error": 0.0, "measured": true, "metadata_query_duration_ms": 0.0, "missing_timing_fields": [], "mode": "level5-nccl-reshard-synthetic-same-node", "pass": true, "placement_scope": "same-node-single-pod", "planner_duration_ms": 0.0, "proof_flags": {"actual_nixl_reads_used": false, "checksum_gate": true, "full_tensor_materialized_before_target_apply": true, "host_side_torch_cat_used": false, "real_measured": true, "torch_distributed_data_transfer_used": true, "trainer_full_all_gather_used": true, "trainer_side_inference_layout_conversion_used": false}, "publish_duration_ms": 0.0, "read_duration_ms": 165.60702701099217, "rediscovery_count": 0, "redundant_cross_boundary_factor": 2.0, "registration_duration_ms": 0.0, "result": "pass", "retry_count": 0, "segment_count": 1, "source_artifact": "", "source_count_per_target_tensor": {"model.layers.0.mlp.experts.w1.weight": 2}, "strategy": "nccl-reshard-fixed-membership", "trainer_collective_bytes": 160, "trainer_to_inference_bytes": 128}, "metrics": {"activation_install_duration_ms": 0.09292003232985735, "checkpoint_storage_bytes": 0, "full_tensor_materialize_duration_ms": 0.13921898789703846, "inference_side_fanout_bytes": 0, "metadata_query_duration_ms": 0.0, "planner_duration_ms": 0.0, "publish_duration_ms": 0.0, "raw_read_duration_ms": 165.60702701099217, "read_duration_ms": 165.60702701099217, "redundant_cross_boundary_factor": 2.0, "registration_duration_ms": 0.0, "segment_count": 1, "source_count_per_target_tensor": {"model.layers.0.mlp.experts.w1.weight": 2}, "trainer_collective_bytes": 160, "trainer_collective_duration_ms": 263.828883995302, "trainer_collective_padding_bytes": 32, "trainer_to_inference_bytes": 128, "trainer_to_inference_send_duration_ms": 165.71549093350768}, "mode": "level5-nccl-reshard-synthetic-same-node", "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "placement_scope": "same-node-single-pod", "proof": {"actual_nixl_reads_used": false, "checksum_gate": true, "full_tensor_materialized_before_target_apply": true, "host_side_torch_cat_used": false, "real_measured": true, "torch_distributed_data_transfer_used": true, "trainer_full_all_gather_used": true, "trainer_side_inference_layout_conversion_used": false}, "result": "pass", "scenario": {"dtype": "float32", "full_tensor_bytes": 128, "global_shape": [8, 4], "model_name": "qwen3-moe-refit-poc", "model_version": "trainer-step-000001", "requested_bytes": 64, "requested_range": [[2, 6], [0, 4]], "synthetic_contract": true, "target_request_count": 1, "tensor_name": "model.layers.0.mlp.experts.w1.weight", "trainer_source_count": 2}, "schema_version": 1, "strategy": "nccl-reshard-fixed-membership", "tensor_name": "model.layers.0.mlp.experts.w1.weight", "validation": {"allclose": true, "checksum": 556224.0, "expected_checksum": 556224.0, "max_abs_error": 0.0}}
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO comm 0x14720230 rank 0 nranks 2 cudaDev 0 busId 18000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO comm 0x43a90ad0 rank 1 nranks 2 cudaDev 1 busId 29000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO comm 0x1562a6d0 rank 1 nranks 2 cudaDev 3 busId 4b000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO comm 0x1483acf0 rank 0 nranks 2 cudaDev 0 busId 18000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:421:421 [0] NCCL INFO comm 0x11237620 rank 0 nranks 4 cudaDev 0 busId 18000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:423:423 [2] NCCL INFO comm 0x3286cfe0 rank 2 nranks 4 cudaDev 2 busId 3a000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:424:424 [3] NCCL INFO comm 0x1534ab70 rank 3 nranks 4 cudaDev 3 busId 4b000 - Destroy COMPLETE
+mx-level5-baseline-20260605-1228:422:422 [1] NCCL INFO comm 0x405a8420 rank 1 nranks 4 cudaDev 1 busId 29000 - Destroy COMPLETE

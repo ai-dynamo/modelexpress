@@ -629,11 +629,12 @@ Current partial evidence:
 
 ### Level 5: Competitive Benchmark
 
-Status: partially implemented; CPU competitive simulator plus a checksum-gated
-Level-5 timing normalizer and synthetic same-node baseline runner are
-implemented. Real NCCL Reshard and CheckpointEngine baseline rows are still
-not measured because the first 4-GPU nscale baseline pod was capacity-blocked,
-not because a successful benchmark result exists.
+Status: synthetic same-node measured benchmark pass. The current branch now
+has checksum/allclose-gated, real measured rows for MX/NIXL, NCCL
+Reshard-style, and CheckpointEngine-style refit in the same 4-GPU B200
+same-node/single-pod synthetic placement. This is not a full-model,
+cross-node, or production competitiveness claim; those Level-5 variants remain
+unproven.
 
 Goal:
 
@@ -666,28 +667,35 @@ Current partial evidence:
 - nscale full Python gate:
   `artifacts/resharding/nscale-python-full-pytest.log`
   (`276 passed, 19 skipped`).
-- Capacity block artifact for the real measured timing table:
-  `artifacts/resharding/nscale-level5-timing-capacity-block.json`.
-- `modelexpress.refit_level5` now provides a checksum/allclose-gated
+- `modelexpress.refit_level5` provides the checksum/allclose-gated
   normalized timing-table schema and synthetic same-node GPU baseline runners
   for NCCL Reshard-style full-tensor movement and CheckpointEngine-style
-  full-gather/write/read/apply. This is harness support, not a completed
-  Level-5 benchmark.
+  full-gather/write/read/apply.
+- `artifacts/resharding/nscale-level5-same-node-synthetic-table-20260605.json`
+  is the first measured Level-5 table with all required strategies present in
+  the same placement scope. It reports `result=pass`,
+  `level5_synthetic_smoke_pass=true`, `production_competitive_claim_safe=false`,
+  and `level5_full_model_claim_safe=false`. Rows are real measured and
+  checksum/allclose gated: MX/NIXL reads move 64 trainer-to-inference bytes
+  with redundant factor 1.0, NCCL Reshard-style moves 128 bytes with redundant
+  factor 2.0, and CheckpointEngine-style records 256 checkpoint-storage bytes
+  with redundant factor 4.0.
+- `artifacts/resharding/nscale-level5-nccl-reshard-baseline-20260605.json` and
+  `artifacts/resharding/nscale-level5-checkpoint-engine-baseline-20260605.json`
+  are the 4-GPU B200 same-node baseline rows that replaced the earlier capacity
+  block. `artifacts/resharding/nscale-level5-baseline-summary-20260605.json`
+  records `nccl_return_code=0`, `checkpoint_engine_return_code=0`, and
+  `table_return_code=0` for pod `mx-level5-baseline-20260605-1228`.
 - Focused nscale Python gate for the Level-5 normalizer and existing refit
-  control-plane paths: `artifacts/resharding/nscale-level5-normalizer-pytest.log`
-  (`18 passed`).
+  control-plane paths: `artifacts/resharding/nscale-level5-normalizer-pytest-20260605.log`
+  (`19 passed`).
 - `artifacts/resharding/nscale-level5-same-node-synthetic-table-missing-baselines.json`
-  normalizes the existing same-node MX/NIXL checksum-backed row and marks the
-  NCCL Reshard and CheckpointEngine rows as missing, so the table result is
-  correctly `fail`.
-- `artifacts/resharding/nscale-level5-baseline-capacity-block.json` and `.log`
-  bank the failed 4-GPU nscale baseline scheduling attempt: `0/29 nodes`,
-  `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and autoscaler
-  max node group size reached.
-- `artifacts/resharding/nscale-level5-baseline-capacity-block-20260605.json`
-  and `.log` bank the fresh 2026-06-05 rerun attempt for the same 4-GPU
-  checksum-backed Level-5 NCCL/CheckpointEngine baseline pod. It hit the same
-  scheduler/autoscaler block, so no new Level-5 timing row is claimed.
+  remains the historical missing-baseline table and is superseded by
+  `artifacts/resharding/nscale-level5-same-node-synthetic-table-20260605.json`.
+- `artifacts/resharding/nscale-level5-baseline-capacity-block.json` and
+  `artifacts/resharding/nscale-level5-baseline-capacity-block-20260605.json`
+  remain historical scheduler blocks. They are superseded for the synthetic
+  same-node baseline scope by the successful 4-GPU B200 run above.
 
 ## Near-Term Achievable Work
 
