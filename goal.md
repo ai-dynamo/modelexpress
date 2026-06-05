@@ -262,10 +262,16 @@ Artifacts under `artifacts/resharding/` prove:
   plus pytest logs, prove source-owned ranges reconstruct the post-step target
   tensor, source-publication metadata can be published/listed/planned through
   the MX metadata client path, and vLLM/SGLang source-rank paths now expose
-  optimizer-step publication metadata. A live vLLM GPU rerun of this updated
-  path was attempted but 1-GPU nscale scheduling was blocked:
-  `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`
-  and `artifacts/resharding/nscale-1gpu-capacity-probe-block-20260605.json`.
+  optimizer-step publication metadata. A live same-node, one-pod vLLM+NIXL GPU
+  rerun of this updated path is now banked in
+  `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-20260605.json`
+  and summary JSON. It uses two source ranks publishing post-`torch.optim.SGD`
+  source shards, actual UCX/NIXL reads into CUDA staging, `LLM.apply_model`
+  install/restore, and allclose/checksum gates. This supersedes the earlier
+  1-GPU capacity block for same-node vLLM trainer-step scope, but remains a
+  same-node/one-pod GPU-reuse proof over a synthetic objective, not cross-node
+  runtime placement, direct NIXL landing into vLLM-owned storage, or a real RL
+  trainer loop.
   A live `mx-server-rl` trainer-step publication pass is now banked in
   `artifacts/resharding/nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json`
   and `.log`: the deployed server still drops the new repeated ownership field,
@@ -302,8 +308,10 @@ live MX-returned ownership plus source endpoint metadata now drives completed
 same-node, two-pod cross-node, one-pod-per-source-rank cross-node, and synthetic
 hard-kill recovery NIXL GPU data-plane runs. Level 4 now has same-node,
 one-pod live vLLM and SGLang runtime bridge proofs where NIXL reads from
-trainer-like source ranks feed runtime-owned weights through engine APIs. Full
-production real trainer/inference refit remains unproven.
+trainer-like source ranks feed runtime-owned weights through engine APIs, and
+vLLM has a same-node GPU rerun whose source ranks publish optimizer-step shards
+instead of deterministic replacement values. Full production real trainer/
+inference refit remains unproven.
 
 ## What Is Not Proven Yet
 
@@ -313,13 +321,12 @@ The current POC does **not** prove:
 - Full live vLLM or SGLang process integration with real trainer-process
   payloads, cross-node runtime placement, direct runtime-buffer NIXL landing,
   and the production post-load/refit lifecycle. Tiny live vLLM V1 and SGLang
-  Engine-owned tensor/weight smokes are proven, and same-node vLLM/SGLang
-  NIXL-to-runtime bridges are proven, but the committed GPU bridge artifacts
-  still use deterministic trainer-like source values and staging-copy engine
-  APIs. The current branch has CPU-tested optimizer-step source publishers and
-  a `TrainerStepSourcePublication` object that carries source tensor plus
-  ownership/provenance metadata, but no live GPU runtime rerun yet because the
-  1-GPU nscale smoke was capacity blocked.
+  Engine-owned tensor/weight smokes are proven, same-node vLLM/SGLang
+  NIXL-to-runtime bridges are proven, and vLLM now has a same-node GPU rerun
+  using optimizer-step source publications instead of deterministic source
+  values. SGLang still needs the same optimizer-step GPU rerun, and neither
+  runtime bridge proves cross-node runtime placement, direct NIXL landing into
+  runtime-owned storage, or a real RL trainer loop.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod

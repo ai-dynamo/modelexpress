@@ -340,6 +340,21 @@ Files:
   plane evidence that trainer-step source publications can be published through
   the MX metadata client path, listed back as `SliceOwnership`s, and used for
   receiver-side `SegmentPlan`s.
+- `nscale-live-vllm-nixl-runtime-trainer-step-20260605.json` and
+  `nscale-live-vllm-nixl-runtime-trainer-step-summary-20260605.json`:
+  completed same-node, one-pod, 3-rank vLLM+NIXL runtime bridge rerun using
+  the optimizer-step source publisher. Two source ranks publish post-step
+  `torch.optim.SGD` CUDA shards plus source-publication provenance, the target
+  starts live vLLM 0.17.1, reads two UCX/NIXL segments into CUDA staging,
+  installs/restores through `LLM.apply_model`, and validates staging allclose,
+  runtime allclose, and checksum. The artifact records
+  `trainer_optimizer_step_publisher_used=true`,
+  `synthetic_source_values_used=false`, `trainer_to_inference_bytes=4096`,
+  `raw_nixl_read_duration_ms=14.29297006689012`, and `run_rc=0` in the
+  summary. Scope boundary: this is same-node/one-pod evidence with GPU reuse
+  and a synthetic optimizer objective; it is not cross-node runtime placement,
+  not one-pod-per-source-rank runtime placement, not direct NIXL landing into
+  vLLM-owned storage, and not a real RL trainer loop.
 - `nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json` and
   `.log`: live `mx-server-rl:8001` pass. The deployed server accepted
   `PublishMetadata`, returned `metadata_endpoint` sidecars while still dropping
@@ -355,11 +370,10 @@ Files:
   `.log`: historical pre-bridge block retained for provenance; superseded by
   the sidecar-pass artifact above.
 - `nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json` and
-  `.log`: honest block for the attempted live vLLM+NIXL runtime GPU rerun using
-  the optimizer-step source publisher patch. The 1-GPU pod stayed Pending with
-  `0/29 nodes`, `10 Insufficient nvidia.com/gpu`, `19` untolerated taints, and
-  autoscaler max node group size reached, so no new vLLM GPU runtime claim is
-  made.
+  `.log`: historical honest block for the first attempted live vLLM+NIXL
+  runtime GPU rerun using the optimizer-step source publisher patch. It is
+  superseded for same-node vLLM trainer-step scope by the later checksum-backed
+  `nscale-live-vllm-nixl-runtime-trainer-step-20260605.json` run above.
 - `nscale-1gpu-capacity-probe-block-20260605.json` and `.log`: fresh 1-GPU
   nscale capacity probe for the next live runtime rerun. It hit the same
   scheduler/autoscaler block, so no GPU runtime rerun was attempted in that
@@ -435,8 +449,10 @@ with deterministic trainer-like source values and staging-copy runtime APIs.
 The current branch has CPU-tested optimizer-step source-publisher,
 source-publication metadata, and MX metadata publication code for the runtime
 bridges, plus a live `mx-server-rl` trainer-step publication pass through the
-metadata sidecar compatibility path. Live vLLM GPU reruns remain
-capacity-blocked on 2026-06-05. The NCCL distributed JSON remains the Level 1
+metadata sidecar compatibility path. The vLLM same-node GPU runtime bridge now
+has a checksum-backed optimizer-step rerun; SGLang still needs the same updated
+source-publisher rerun, and cross-node/one-pod-per-source-rank runtime bridge
+claims remain unproven. The NCCL distributed JSON remains the Level 1
 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 synthetic same-node table now has comparable checksum-backed MX/NIXL, NCCL

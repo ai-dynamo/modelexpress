@@ -1,0 +1,7 @@
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+opentelemetry-exporter-otlp-proto-http 1.40.0 requires opentelemetry-sdk~=1.40.0, but you have opentelemetry-sdk 1.42.1 which is incompatible.
+opentelemetry-exporter-otlp-proto-grpc 1.40.0 requires opentelemetry-sdk~=1.40.0, but you have opentelemetry-sdk 1.42.1 which is incompatible.
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+
+[notice] A new release of pip is available: 26.0.1 -> 26.1.2
+[notice] To update, run: python3 -m pip install --upgrade pip

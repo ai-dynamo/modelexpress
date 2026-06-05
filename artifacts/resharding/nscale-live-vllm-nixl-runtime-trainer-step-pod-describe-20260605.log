@@ -1,0 +1,151 @@
+Name:             mx-vllm-trainerstep-20260605-1300
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Fri, 05 Jun 2026 14:39:04 +0200
+Labels:           app=mx-vllm-trainerstep
+                  modelexpress.nvidia.com/run=rl-resharding-20260605
+Annotations:      <none>
+Status:           Running
+IP:               10.0.12.180
+IPs:
+  IP:  10.0.12.180
+Containers:
+  vllm:
+    Container ID:  containerd://05c4277ec24b73ead8564be233425a99509c167423db5412ed5bfdac3053402d
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-d168542
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:10530fa7a16a3d3dc2597d15debfaa7c163acfb8c0b2885933c96a818ecec678
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      bash
+      -lc
+      set -uo pipefail
+      ART=/workspace/artifacts
+      mkdir -p "$ART"
+      MAIN_LOG="$ART/nscale-live-vllm-nixl-runtime-trainer-step-20260605.log"
+      SUMMARY="$ART/nscale-live-vllm-nixl-runtime-trainer-step-summary-20260605.json"
+      RUN_ART="$ART/nscale-live-vllm-nixl-runtime-trainer-step-20260605.json"
+      COMMIT="6b4db1cd05e1daabaf8b280a75d13c9c32b746c8"
+      BRANCH="mx-rl-resharding-planner-poc"
+      IMAGE="docker.io/amaddipoti439/modelexpress:vllm-rl-d168542"
+      RUN_RC=127
+      PIP_RC=127
+      GIT_RC=127
+      {
+        echo "[mx-vllm-trainer-step] started $(date -Is)"
+        echo "[mx-vllm-trainer-step] pod=$HOSTNAME image=$IMAGE branch=$BRANCH commit=$COMMIT"
+        nvidia-smi || true
+        if ! command -v git >/dev/null 2>&1; then
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+        fi
+        rm -rf /workspace/mx
+        git clone --branch "$BRANCH" "https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/ai-dynamo/modelexpress.git" /workspace/mx
+        GIT_RC=$?
+        if [ "$GIT_RC" -eq 0 ]; then
+          cd /workspace/mx
+          git checkout "$COMMIT"
+          GIT_RC=$?
+          git rev-parse HEAD
+        fi
+        if [ "$GIT_RC" -eq 0 ]; then
+          cd /workspace/mx/modelexpress_client/python
+          python3 -m pip install -q '.[dev]' 2>&1 | tee "$ART/nscale-live-vllm-nixl-runtime-trainer-step-pip-20260605.log"
+          PIP_RC=${PIPESTATUS[0]}
+          echo "[mx-vllm-trainer-step] pip_rc=$PIP_RC"
+        fi
+        if [ "$GIT_RC" -eq 0 ] && [ "$PIP_RC" -eq 0 ]; then
+          cd /workspace/mx
+          export PYTHONPATH=/workspace/mx/modelexpress_client/python:${PYTHONPATH:-}
+          export PYTHONUNBUFFERED=1
+          export MX_REFIT_ALLOW_GPU_REUSE=1
+          export MX_REFIT_DIST_TIMEOUT_MINUTES=10
+          export NIXL_LOG_LEVEL=INFO
+          export UCX_LOG_LEVEL=warn
+          export UCX_TLS=rc_x,rc,dc_x,dc,cuda_copy,cuda_ipc,tcp,self,sm
+          export UCX_RNDV_SCHEME=get_zcopy
+          export UCX_RNDV_THRESH=0
+          export VLLM_ALLOW_INSECURE_SERIALIZATION=1
+          export VLLM_SERVER_DEV_MODE=1
+          python3 -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=3 \
+            -m modelexpress.refit_vllm_nixl_runtime_smoke \
+            --artifact-path "$RUN_ART" \
+            --gpu-memory-utilization 0.1 \
+            --max-model-len 64 \
+            --distributed-executor-backend uni
+          RUN_RC=$?
+          echo "[mx-vllm-trainer-step] run_rc=$RUN_RC"
+        fi
+      } 2>&1 | tee "$MAIN_LOG"
+      python3 - <<PY
+      import json, os, pathlib, time
+      art = pathlib.Path(os.environ.get("ART", "/workspace/artifacts"))
+      run_art = art / "nscale-live-vllm-nixl-runtime-trainer-step-20260605.json"
+      payload = {
+          "schema_version": 1,
+          "run_id": "nscale-live-vllm-nixl-runtime-trainer-step-20260605",
+          "pod": os.environ.get("HOSTNAME"),
+          "image": "docker.io/amaddipoti439/modelexpress:vllm-rl-d168542",
+          "branch": "mx-rl-resharding-planner-poc",
+          "commit": "6b4db1cd05e1daabaf8b280a75d13c9c32b746c8",
+          "requested_gpus": 1,
+          "world_size": 3,
+          "mx_refit_allow_gpu_reuse": True,
+          "git_rc": int(os.environ.get("GIT_RC", "127")),
+          "pip_rc": int(os.environ.get("PIP_RC", "127")),
+          "run_rc": int(os.environ.get("RUN_RC", "127")),
+          "artifact_written": run_art.exists(),
+          "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          "artifacts": [p.name for p in sorted(art.iterdir())],
+      }
+      (art / "nscale-live-vllm-nixl-runtime-trainer-step-summary-20260605.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+      PY
+      echo "[mx-vllm-trainer-step] sleeping for artifact collection"
+      sleep 1800
+
+    State:          Running
+      Started:      Fri, 05 Jun 2026 14:39:05 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             16
+      memory:          128Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Environment:
+      GIT_USERNAME:  <set to the key 'GIT_USERNAME' in secret 'kaniko-git'>  Optional: false
+      GIT_PASSWORD:  <set to the key 'GIT_PASSWORD' in secret 'kaniko-git'>  Optional: false
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-tc22m (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  kube-api-access-tc22m:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              modelexpress.nvidia.com/rl-ce-role=primary
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved=anish-20260601:NoSchedule
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age   From               Message
+  ----    ------     ----  ----               -------
+  Normal  Scheduled  84s   default-scheduler  Successfully assigned anish-dynamo/mx-vllm-trainerstep-20260605-1300 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     83s   kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-d168542" already present on machine
+  Normal  Created    83s   kubelet            Created container: vllm
+  Normal  Started    83s   kubelet            Started container vllm

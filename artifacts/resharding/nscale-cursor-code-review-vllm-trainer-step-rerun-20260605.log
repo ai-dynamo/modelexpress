@@ -1,0 +1,24 @@
+cursor-code-review artifact: nscale-vllm-trainer-step-rerun-20260605
+
+Review source:
+- Requested cursor-code-review cadence.
+- /workspace/a3sh-dotfiles was checked; it does not contain a cursor-code-review skill.
+- Applied the available cursor-code-review rubric from /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review/SKILL.md inside nscale.
+
+Scope reviewed:
+- goal.md
+- artifacts/resharding/README.md
+- New small vLLM trainer-step runtime rerun artifacts under artifacts/resharding/.
+- Diff stat at review time: 43 insertions, 20 deletions across two documentation files.
+
+Findings:
+- None.
+
+Reasoning:
+- The diff does not alter production code paths, abstractions, branching, type boundaries, or module ownership.
+- The documentation change tightens claim boundaries: same-node/one-pod/GPU-reuse vLLM optimizer-step runtime rerun is marked proven, while SGLang optimizer-step rerun, cross-node runtime bridge, one-pod-per-source-rank runtime placement, direct runtime-buffer landing, and real RL trainer loop remain explicitly unproven.
+- Artifact banking is small and focused; no large-file pre-commit risk was introduced.
+
+Residual risks:
+- The new evidence is still same-node vLLM runtime scope only.
+- It does not close the SGLang updated-source rerun, cross-node runtime bridge, or real trainer-loop gaps.
