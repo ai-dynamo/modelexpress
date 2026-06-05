@@ -393,6 +393,7 @@ def run_refit_cycle(
     context: MegatronReceiverContext,
     pull: Callable[[MegatronSliceSource, torch.Tensor], None],
     device: torch.device | str = "cuda",
+    pre_assembled_buffers: dict[str, torch.Tensor] | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """One refit cycle: discover → plan → assemble → translate → yield.
 
@@ -407,6 +408,14 @@ def run_refit_cycle(
             register the destination view with NIXL and complete the
             transfer before returning.
         device: where to pre-allocate destination tensors.
+        pre_assembled_buffers: optional ``{megatron_name: tensor}`` map
+            of pre-filled buffers. When set, the orchestrator skips
+            ``assemble_into_destination`` for matched names and uses the
+            pre-filled tensor directly. The matched-TP fast path
+            registers buffers under each Megatron name with NIXL once
+            and calls a bulk ``receive_weights`` per cycle; the translator
+            then walks the filled buffers via this argument and
+            ``pull`` becomes a no-op.
 
     Yields ``(hf_name, hf_tensor)`` ready for ``vllm.model.load_weights()``.
     """
@@ -427,14 +436,20 @@ def run_refit_cycle(
         target_tensor_specs=target_specs,
     )
 
+    pre = pre_assembled_buffers or {}
     for plan in plans:
-        if not plan.sources:
+        if not plan.sources and plan.tensor_name not in pre:
             logger.warning(
                 "no sources for tensor %s (cycle skipped)", plan.tensor_name
             )
             continue
         rs = context.receive_specs[plan.tensor_name]
-        assembled = assemble_into_destination(plan, pull=pull, device=device)
+        if plan.tensor_name in pre and plan.assembly != "per_expert":
+            # Pre-pulled buffer path: bypass per-source assembly. The buffer
+            # already holds the receiver-side view of the assembled tensor.
+            assembled: torch.Tensor | dict[int, torch.Tensor] = pre[plan.tensor_name]
+        else:
+            assembled = assemble_into_destination(plan, pull=pull, device=device)
         yield from translate_megatron_to_hf(
             plan,
             assembled,
