@@ -1,0 +1,212 @@
+{
+  "discovered_ownerships": [
+    {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": null,
+      "global_shape": [
+        8,
+        4
+      ],
+      "layout_tags": {
+        "learning_rate": "0.25",
+        "moe_expert_axis": 0,
+        "optimizer": "SGD",
+        "optimizer_step_count": 2,
+        "optimizer_step_publisher": true,
+        "source_payload_generator": "torch.optim.SGD",
+        "static_replacement_formula": false,
+        "storage_layout": "row-major",
+        "synthetic_training_objective": true,
+        "trainer_layout": "fsdp",
+        "trainer_update_source": "torch.optim.SGD-step-publisher"
+      },
+      "model_name": "qwen3-moe-refit-live-smoke",
+      "model_version": "trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "nixl_descriptor_id": "nixl-rank1-primary",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank1",
+      "source_lease": "lease-rank1-primary",
+      "source_range": [
+        [
+          3,
+          8
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+      "worker_id": "worker-rank1-trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "worker_rank": 1
+    },
+    {
+      "contiguous": true,
+      "dtype": "float32",
+      "element_size_bytes": null,
+      "global_shape": [
+        8,
+        4
+      ],
+      "layout_tags": {
+        "learning_rate": "0.25",
+        "moe_expert_axis": 0,
+        "optimizer": "SGD",
+        "optimizer_step_count": 2,
+        "optimizer_step_publisher": true,
+        "source_payload_generator": "torch.optim.SGD",
+        "static_replacement_formula": false,
+        "storage_layout": "row-major",
+        "synthetic_training_objective": true,
+        "trainer_layout": "fsdp",
+        "trainer_update_source": "torch.optim.SGD-step-publisher"
+      },
+      "model_name": "qwen3-moe-refit-live-smoke",
+      "model_version": "trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "nixl_descriptor_id": "nixl-rank0-primary",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank0",
+      "source_lease": "lease-rank0-primary",
+      "source_range": [
+        [
+          0,
+          3
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+      "worker_id": "worker-rank0-trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "worker_rank": 0
+    }
+  ],
+  "discovered_source_ids": [
+    "trainer-rank1",
+    "trainer-rank0"
+  ],
+  "get_metadata_found_worker": true,
+  "local_session_date": "2026-06-05",
+  "metadata_observations": [
+    {
+      "metadata_endpoint_bytes": 984,
+      "metadata_endpoint_has_sidecar": true,
+      "sidecar_ownership_count": 1,
+      "sidecar_payload_keys": [
+        "metadata_endpoint",
+        "ownerships"
+      ],
+      "slice_ownership_count": 0,
+      "status_before_ready": 1,
+      "worker_id": "worker-rank0-trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "worker_rank": 0
+    },
+    {
+      "metadata_endpoint_bytes": 984,
+      "metadata_endpoint_has_sidecar": true,
+      "sidecar_ownership_count": 1,
+      "sidecar_payload_keys": [
+        "metadata_endpoint",
+        "ownerships"
+      ],
+      "slice_ownership_count": 0,
+      "status_before_ready": 1,
+      "worker_id": "worker-rank1-trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "worker_rank": 1
+    }
+  ],
+  "mode": "live-mx-trainer-step-publication-sidecar-pass",
+  "model_name": "qwen3-moe-refit-live-smoke",
+  "model_version": "trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+  "namespace": "anish-dynamo",
+  "primary_slice_ownership_field_returned": false,
+  "proof": {
+    "gpu_runtime_smoke": false,
+    "optimizer_step_metadata_preserved": true,
+    "receiver_planned_from_live_mx_returned_metadata": true,
+    "source_lease_used_in_segment_plan": true,
+    "trainer_step_source_publications_published_to_live_mx": true
+  },
+  "publish_metadata_accepted": true,
+  "pytest_log_artifact": "nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.log",
+  "result": "pass",
+  "schema_version": 1,
+  "segment_plans": [
+    {
+      "bytes": 16,
+      "lease_version": "lease-rank0-primary",
+      "nixl_descriptor_id": "nixl-rank0-primary",
+      "source_byte_offset": 32,
+      "source_id": "trainer-rank0",
+      "source_range": [
+        [
+          2,
+          3
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_byte_offset": 0,
+      "target_id": "inference-rank3",
+      "target_range": [
+        [
+          2,
+          3
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+      "worker_id": "worker-rank0-trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "worker_rank": 0
+    },
+    {
+      "bytes": 48,
+      "lease_version": "lease-rank1-primary",
+      "nixl_descriptor_id": "nixl-rank1-primary",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank1",
+      "source_range": [
+        [
+          3,
+          6
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_byte_offset": 16,
+      "target_id": "inference-rank3",
+      "target_range": [
+        [
+          3,
+          6
+        ],
+        [
+          0,
+          4
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "model.layers.0.mlp.experts.w1.weight",
+      "worker_id": "worker-rank1-trainer-step-publication-331cada88f7a4dcb9794a051919d4a6c",
+      "worker_rank": 1
+    }
+  ],
+  "server_url": "mx-server-rl:8001",
+  "sidecar_compatibility_used": true,
+  "sidecar_payload_uses_ownerships_list": true,
+  "source_ids_equal": true
+}

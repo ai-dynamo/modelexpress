@@ -316,10 +316,20 @@ def publish_slice_ownerships(
 ) -> str:
     """Publish slice ownership metadata through the existing MX P2P API."""
 
+    ownership_list = list(ownerships)
+    metadata_endpoint = (
+        _encode_refit_ownership_sidecar(
+            ownerships=ownership_list,
+            metadata_endpoint="",
+        )
+        if ownership_list
+        else ""
+    )
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=worker_rank,
-        slice_ownerships=[slice_ownership_to_proto(o) for o in ownerships],
+        slice_ownerships=[slice_ownership_to_proto(o) for o in ownership_list],
         status=status,
+        metadata_endpoint=metadata_endpoint,
     )
     return mx_client.publish_metadata(identity, worker, worker_id)
 
@@ -351,7 +361,7 @@ def publish_refit_nixl_endpoint(
         int(worker_rank) if worker_rank is not None else int(ownership.worker_rank or 0)
     )
     encoded_metadata_endpoint = _encode_refit_ownership_sidecar(
-        ownership=ownership,
+        ownerships=[ownership],
         metadata_endpoint=metadata_endpoint,
     )
     worker = p2p_pb2.WorkerMetadata(
@@ -386,10 +396,14 @@ def list_slice_ownerships(
         )
         if not metadata.found or not has_worker:
             continue
-        ownerships.extend(
+        worker_ownerships = [
             slice_ownership_from_proto(desc)
             for desc in metadata.worker.slice_ownerships
-        )
+        ]
+        sidecar = _decode_refit_ownership_sidecar(metadata.worker.metadata_endpoint)
+        if not worker_ownerships and sidecar is not None:
+            worker_ownerships = sidecar[0]
+        ownerships.extend(worker_ownerships)
     return ownerships
 
 
@@ -425,7 +439,7 @@ def list_refit_nixl_endpoints(
         ]
         sidecar = _decode_refit_ownership_sidecar(worker.metadata_endpoint)
         if not ownerships and sidecar is not None:
-            ownerships = [sidecar[0]]
+            ownerships = sidecar[0]
 
         metadata_endpoint = (
             sidecar[1] if sidecar is not None else worker.metadata_endpoint
@@ -509,7 +523,7 @@ def _range_from_proto(ranges) -> tuple[tuple[int, int], ...]:
 
 def _encode_refit_ownership_sidecar(
     *,
-    ownership: SliceOwnership,
+    ownerships: Sequence[SliceOwnership],
     metadata_endpoint: str,
 ) -> str:
     """Encode ownership in a legacy field for older MX server deployments.
@@ -517,15 +531,13 @@ def _encode_refit_ownership_sidecar(
     The current schema stores ownership in ``WorkerMetadata.slice_ownerships``.
     Some live server images can accept the new client proto but drop that field
     while preserving older string fields. The sidecar keeps cross-node POCs
-    honest without replacing the primary schema path.
+    honest without replacing the primary schema path, and preserves the original
+    endpoint string for callers that still need it after decode.
     """
-
-    if metadata_endpoint:
-        return metadata_endpoint
 
     payload = {
         "metadata_endpoint": metadata_endpoint,
-        "ownership": ownership.to_dict(),
+        "ownerships": [ownership.to_dict() for ownership in ownerships],
     }
     return _REFIT_OWNERSHIP_SIDECAR_PREFIX + json.dumps(
         payload,
@@ -536,12 +548,15 @@ def _encode_refit_ownership_sidecar(
 
 def _decode_refit_ownership_sidecar(
     metadata_endpoint: str,
-) -> tuple[SliceOwnership, str] | None:
+) -> tuple[list[SliceOwnership], str] | None:
     if not metadata_endpoint.startswith(_REFIT_OWNERSHIP_SIDECAR_PREFIX):
         return None
     payload = json.loads(metadata_endpoint[len(_REFIT_OWNERSHIP_SIDECAR_PREFIX) :])
+    ownership_payloads = payload.get("ownerships")
+    if ownership_payloads is None:
+        ownership_payloads = [payload["ownership"]]
     return (
-        SliceOwnership.from_dict(payload["ownership"]),
+        [SliceOwnership.from_dict(ownership) for ownership in ownership_payloads],
         str(payload.get("metadata_endpoint", "")),
     )
 

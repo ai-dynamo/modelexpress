@@ -1,0 +1,42 @@
+cursor-code-review nscale run - 2026-06-05
+
+Scope:
+- Branch: mx-rl-resharding-planner-poc
+- Base commit before this patch: b5af5f2
+- Review target: current uncommitted sidecar/live-MX trainer-step publication diff.
+
+Provenance:
+- Requested source: a3sh-dotfiles.
+- /workspace/a3sh-dotfiles at 0effaa5481f0b74b88ce0b9b20bf38ad4137034c states in agents/IMPORTS.md that cursor-code-review was inspected but not imported.
+- Used the referenced upstream skill from /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review at c3a862316d079888b5a46614dabdd94c984e7f60.
+- Skill metadata: cursor-code-review, MIT license, adapted from Cursor thermo-nuclear code quality review rubric.
+- No executable runner is present in the skill directory; review was applied manually from SKILL.md in the nscale pod.
+
+Checks performed:
+- git diff --stat
+- git diff --check
+- changed-file line counts
+- sidecar control-plane flow inspection
+- affected tests around publish/list MX metadata and NIXL endpoint fallback
+
+Findings:
+1. Structural boundary issue, fixed before commit.
+   The first sidecar bridge was single-ownership only in publish_slice_ownerships and the encoder returned the raw metadata_endpoint when a real endpoint string was present. That preserved the immediate live trainer-step case, but left two brittle edges:
+   - multi-ownership workers would silently lose compatibility fallback on older MX servers;
+   - NIXL endpoint publishes with a real metadata endpoint would not carry ownership in the legacy field if the server dropped slice_ownerships.
+
+Fix applied:
+- _encode_refit_ownership_sidecar now accepts Sequence[SliceOwnership] and always encodes ownerships plus the original metadata_endpoint.
+- _decode_refit_ownership_sidecar now returns list[SliceOwnership] and preserves backward decode support for the earlier single ownership payload key.
+- list_slice_ownerships and list_refit_nixl_endpoints now recover list-shaped sidecar ownerships when the proto field is missing.
+- Added multi-ownership sidecar fallback coverage.
+- Strengthened NIXL endpoint legacy-sidecar coverage to prove the original metadata_endpoint survives decode.
+
+Remaining review findings:
+- None high-confidence in this diff after the fix.
+- No changed file crosses 1000 lines.
+- No unrelated local refactor recommended before commit.
+
+Verification after fix:
+- modelexpress_client/python/tests/test_resharding_control_plane.py: 12 passed
+- modelexpress_client/python/tests/test_resharding_live_control_plane.py with MX_LIVE_SERVER_URL=mx-server-rl:8001: 2 passed

@@ -248,6 +248,84 @@ def test_publish_list_get_status_and_plan_from_mx_metadata():
     assert plans[1].target_range == ((3, 6), (0, 4))
 
 
+def test_multi_ownership_publish_sidecar_recovers_when_server_drops_proto_field():
+    client = InMemoryMxClient()
+    identity = _identity()
+    ownerships = [
+        replace(
+            _ownerships()[0],
+            source_id="trainer-rank0-a",
+            source_range=((0, 2), (0, 4)),
+            source_lease="lease-rank0-a",
+            nixl_descriptor_id="nixl-rank0-a",
+        ),
+        replace(
+            _ownerships()[0],
+            source_id="trainer-rank0-b",
+            source_range=((2, 3), (0, 4)),
+            source_lease="lease-rank0-b",
+            nixl_descriptor_id="nixl-rank0-b",
+        ),
+    ]
+
+    source_id = publish_slice_ownerships(
+        client,
+        identity=identity,
+        ownerships=ownerships,
+        worker_id="rank0",
+        worker_rank=0,
+    )
+    worker = client._workers[(source_id, "rank0")]["worker"]
+    assert len(worker.slice_ownerships) == 2
+    assert worker.metadata_endpoint.startswith("mx-refit-ownership-v1:")
+    del worker.slice_ownerships[:]
+    assert client.update_status(
+        source_id,
+        "rank0",
+        0,
+        p2p_pb2.SOURCE_STATUS_READY,
+    )
+
+    assert list_slice_ownerships(client, identity=identity) == ownerships
+
+
+def test_single_ownership_publish_sidecar_recovers_when_server_drops_proto_field():
+    client = InMemoryMxClient()
+    identity = _identity()
+    ownerships = _ownerships()
+
+    source_id = None
+    for ownership in ownerships:
+        source_id = publish_slice_ownerships(
+            client,
+            identity=identity,
+            ownerships=[ownership],
+            worker_id=ownership.worker_id,
+            worker_rank=ownership.worker_rank,
+        )
+        worker = client._workers[(source_id, ownership.worker_id)]["worker"]
+        assert len(worker.slice_ownerships) == 1
+        assert worker.metadata_endpoint.startswith("mx-refit-ownership-v1:")
+        del worker.slice_ownerships[:]
+        assert client.update_status(
+            source_id,
+            ownership.worker_id,
+            ownership.worker_rank,
+            p2p_pb2.SOURCE_STATUS_READY,
+        )
+
+    discovered = list_slice_ownerships(client, identity=identity)
+    assert discovered == ownerships
+
+    plans = plan_from_mx_metadata(
+        client,
+        identity=identity,
+        requests=[_request()],
+    )
+    assert [plan.source_id for plan in plans] == ["trainer-rank0", "trainer-rank1"]
+    assert [plan.bytes for plan in plans] == [16, 48]
+
+
 def test_trainer_step_publications_roundtrip_through_mx_metadata():
     client = InMemoryMxClient()
     identity = _identity()
@@ -439,6 +517,7 @@ def test_refit_nixl_endpoint_recovers_ownership_from_legacy_sidecar():
         nixl_metadata=b"nixl-metadata-0",
         worker_id=ownership.worker_id,
         worker_rank=ownership.worker_rank,
+        metadata_endpoint="10.0.0.1:5555",
     )
 
     worker = client._workers[(source_id, ownership.worker_id)]["worker"]
@@ -451,7 +530,7 @@ def test_refit_nixl_endpoint_recovers_ownership_from_legacy_sidecar():
     endpoint = endpoints[0]
     assert endpoint.ownership == ownership
     assert endpoint.source_id == "trainer-rank0"
-    assert endpoint.metadata_endpoint == ""
+    assert endpoint.metadata_endpoint == "10.0.0.1:5555"
     assert endpoint.nixl_metadata == b"nixl-metadata-0"
 
 

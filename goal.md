@@ -266,10 +266,11 @@ Artifacts under `artifacts/resharding/` prove:
   path was attempted but 1-GPU nscale scheduling was blocked:
   `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`
   and `artifacts/resharding/nscale-1gpu-capacity-probe-block-20260605.json`.
-  A live `mx-server-rl` trainer-step publication attempt was also banked as a
-  server compatibility block because that deployed server dropped both the new
-  ownership field and the legacy sidecar:
-  `artifacts/resharding/nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json`.
+  A live `mx-server-rl` trainer-step publication pass is now banked in
+  `artifacts/resharding/nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json`
+  and `.log`: the deployed server still drops the new repeated ownership field,
+  but preserves the legacy `metadata_endpoint` sidecar, and the client lists and
+  plans trainer-step slices from that returned sidecar metadata.
 - Target-side runtime read-failure recovery logic now exists in the cross-node
   harness. A nscale unit test simulates a READY primary source failing during
   its read group, verifies that only that failed source range is replanned from
@@ -567,14 +568,14 @@ Current partial evidence:
   `artifacts/resharding/nscale-trainer-step-runtime-source-smoke-20260605.json`,
   `artifacts/resharding/nscale-trainer-step-source-publication-smoke-20260605.json`,
   `artifacts/resharding/nscale-trainer-step-mx-publication-smoke-20260605.json`,
-  and `artifacts/resharding/nscale-trainer-step-mx-publication-pytest-20260605.log`
-  (`7 passed, 1 skipped` for the live-server compatibility block). A live vLLM
-  GPU rerun of the updated path was attempted but blocked by 1-GPU nscale
-  capacity:
+  `artifacts/resharding/nscale-trainer-step-mx-publication-pytest-20260605.log`,
+  and `artifacts/resharding/nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json`
+  prove the live MX publication path as well. The focused nscale log records
+  `12 passed` for in-memory control-plane coverage plus `2 passed` for live
+  `mx-server-rl`; live discovery used the sidecar because the deployed server
+  still dropped the repeated ownership field. A live vLLM GPU rerun of the
+  updated path was attempted but blocked by 1-GPU nscale capacity:
   `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`.
-  A live `mx-server-rl` trainer-step publication attempt was blocked by the
-  deployed server dropping ownership metadata:
-  `artifacts/resharding/nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json`.
 - `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
   SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
   `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the

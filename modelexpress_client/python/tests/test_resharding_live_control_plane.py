@@ -69,8 +69,13 @@ def test_live_mx_server_slice_ownership_lifecycle():
             worker_id = f"worker-rank{worker_rank}-{model_version}"
             response = client.get_metadata(source_id_0, worker_id)
             assert response.found
-            assert len(response.worker.slice_ownerships) == 1
-            assert response.worker.slice_ownerships[0].worker_rank == worker_rank
+            if response.worker.slice_ownerships:
+                assert len(response.worker.slice_ownerships) == 1
+                assert response.worker.slice_ownerships[0].worker_rank == worker_rank
+            else:
+                assert response.worker.metadata_endpoint.startswith(
+                    "mx-refit-ownership-v1:"
+                )
             assert client.update_status(
                 source_id_0,
                 worker_id,

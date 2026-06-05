@@ -87,7 +87,11 @@
       "worker_rank": 1
     }
   ],
-  "live_server_attempt_artifact": "nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json",
+  "live_server_attempt_artifact": "nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json",
+  "live_server_primary_slice_ownership_field_returned": false,
+  "live_server_result": "pass",
+  "live_server_sidecar_compatibility_used": true,
+  "live_server_sidecar_payload_uses_ownerships_list": true,
   "local_session_date": "2026-06-05",
   "mode": "trainer-step-mx-publication-roundtrip-smoke",
   "mx_client": "InMemoryMxClient",

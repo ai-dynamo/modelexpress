@@ -326,13 +326,21 @@ Files:
   `nscale-trainer-step-mx-publication-pytest-20260605.log`: nscale CPU/control
   plane evidence that trainer-step source publications can be published through
   the MX metadata client path, listed back as `SliceOwnership`s, and used for
-  receiver-side `SegmentPlan`s. The focused gate records `7 passed, 1 skipped`;
-  the skip is the current live `mx-server-rl` compatibility block below.
+  receiver-side `SegmentPlan`s.
+- `nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json` and
+  `.log`: live `mx-server-rl:8001` pass. The deployed server accepted
+  `PublishMetadata`, returned `metadata_endpoint` sidecars while still dropping
+  the new repeated `slice_ownerships` field, and the client discovered and
+  planned trainer-step ownership from those returned sidecars. The banked pytest
+  log records `12 passed` for in-memory control-plane coverage plus `2 passed`
+  for live MX.
+- `nscale-cursor-code-review-sidecar-20260605.log`: nscale review artifact
+  applying the `cursor-code-review` rubric from the dotfiles-provenance skill;
+  it records the single-ownership/endpoint-preservation finding and the list
+  sidecar fix before final verification.
 - `nscale-live-mx-trainer-step-publication-server-drop-block-20260605.json` and
-  `.log`: honest live-server compatibility block. `mx-server-rl:8001` accepted
-  `PublishMetadata` but `GetMetadata` returned only status and dropped both the
-  new `slice_ownerships` field and the legacy sidecar, so this deployed server
-  cannot prove trainer-step publication round-trip for the current client path.
+  `.log`: historical pre-bridge block retained for provenance; superseded by
+  the sidecar-pass artifact above.
 - `nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json` and
   `.log`: honest block for the attempted live vLLM+NIXL runtime GPU rerun using
   the optimizer-step source publisher patch. The 1-GPU pod stayed Pending with
@@ -413,9 +421,10 @@ artifacts, but both committed GPU artifacts remain one-pod/GPU-reuse proofs
 with deterministic trainer-like source values and staging-copy runtime APIs.
 The current branch has CPU-tested optimizer-step source-publisher,
 source-publication metadata, and MX metadata publication code for the runtime
-bridges, with live vLLM GPU reruns capacity-blocked on 2026-06-05 and the
-current live `mx-server-rl` blocked by metadata-drop compatibility. The
-NCCL distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
+bridges, plus a live `mx-server-rl` trainer-step publication pass through the
+metadata sidecar compatibility path. Live vLLM GPU reruns remain
+capacity-blocked on 2026-06-05. The NCCL distributed JSON remains the Level 1
+comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 normalizer/baseline harness now exists, but real Level-5 timing remains unproven
 until comparable checksum-backed MX/NIXL, NCCL Reshard, and CheckpointEngine
