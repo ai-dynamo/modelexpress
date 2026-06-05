@@ -512,6 +512,24 @@ Artifacts under `artifacts/resharding/` prove:
   autoscaler `max node group size reached`. The artifact records
   `proof_claim_safe=false` and blocks live GPU vLLM/SGLang multi-tensor and
   multi-tensor NIXL claims for this pass.
+- `modelexpress.refit_runtime_multitensor_smoke` now also has a
+  NIXL-style staging contract for multi-tensor runtime refit. vLLM-tagged and
+  SGLang-tagged smokes build the same two runtime `SliceRequest`s and four
+  `SegmentPlan`s, materialize source-rank optimizer-step payloads into
+  per-target staging tensors, validate staging allclose/checksum, install from
+  staging into runtime-owned tensors, and roll the transaction back. Evidence:
+  `artifacts/resharding/nscale-runtime-multitensor-vllm-nixl-staging-smoke-20260605.json`,
+  `artifacts/resharding/nscale-runtime-multitensor-sglang-nixl-staging-smoke-20260605.json`,
+  `artifacts/resharding/nscale-runtime-multitensor-nixl-staging-pytest-20260605.log`,
+  and
+  `artifacts/resharding/nscale-cursor-code-review-runtime-multitensor-nixl-staging-20260605.md`.
+  Both artifacts record `target_tensor_count=2`, `staging_tensor_count=2`,
+  `segment_count=4`, `trainer_to_inference_bytes=224`,
+  `nixl_read_descriptor_groups_planned=true`,
+  `nixl_reads_land_into_staging_tensors=true`, and
+  `runtime_update_from_nixl_staging_tensors=true`. Scope boundary: this is
+  still CPU/staging-contract evidence; it explicitly records
+  `actual_nixl_reads_used=false` and `gpu_nixl_reads_used=false`.
 - `artifacts/resharding/nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-bw4bt-import-hang-20260605.json`
   banks the first rank-1 placement for that vLLM distributed-trainer runtime
   proof on `cluster-0967a26d-pool-14bee067-prctr-bw4bt`. The pod scheduled and
@@ -597,8 +615,9 @@ The current POC does **not** prove:
   deletion, but it is not real trainer/runtime integration.
 - Full-model or multi-layer live runtime refit. Multi-tensor CPU/runtime-tensor
   transaction semantics are now proven for two vLLM-tagged and SGLang-tagged
-  tensors, and live-engine multi-tensor API wrappers are unit-tested, but live
-  GPU runtime-engine multi-tensor refit and multi-tensor GPU NIXL movement
+  tensors, live-engine multi-tensor API wrappers are unit-tested, and
+  NIXL-style multi-tensor staging contracts are proven on CPU, but live GPU
+  runtime-engine multi-tensor refit and actual multi-tensor GPU NIXL movement
   remain unproven because the 1-GPU nscale proof pod was capacity-blocked.
 - Runtime installation of real Qwen MoE model tensors.
 - End-to-end runtime fallback installation using real Qwen FP8 payload bytes
@@ -860,6 +879,15 @@ Current partial evidence:
   `artifacts/resharding/nscale-live-engine-multitensor-regression-pytest-20260605.log`
   (`29 passed`). A bounded 1-GPU live vLLM pod attempt was scheduler-blocked,
   so this is not yet live GPU evidence.
+- `modelexpress.refit_runtime_multitensor_smoke` now exposes
+  `run_runtime_multitensor_nixl_staging_smoke`, which models the multi-tensor
+  NIXL staging side of the future live bridge. It allocates one staging tensor
+  per target tensor, installs planned source segments into those staging
+  tensors, validates staging allclose/checksum, installs from staging into the
+  runtime transaction, and rolls back. nscale artifacts for `vllm` and `sglang`
+  both pass with two staging tensors, four planned segments, and two planned
+  source read groups. The focused regression reports `31 passed`. This is not
+  actual NIXL data-plane evidence.
 - `modelexpress.refit_vllm_receiver_smoke` now provides a live vLLM V1
   receiver-owned tensor smoke through `LLM.apply_model`, plus a
   framework-explicit module helper. The live entrypoint creates a tiny Qwen2
@@ -1079,9 +1107,10 @@ These are the next useful things to do, in order:
 
 1. Extend the live GPU runtime bridge placement work beyond tiny single-tensor
    vLLM and SGLang targets while keeping the allclose/checksum gates. The
-   CPU/runtime-tensor multi-tensor transaction shape and live-engine API
-   wrappers are now banked; the next proof needs schedulable GPU capacity for
-   real engine-owned multi-tensor install plus NIXL data movement.
+   CPU/runtime-tensor multi-tensor transaction shape, live-engine API wrappers,
+   and NIXL-style multi-tensor staging contract are now banked; the next proof
+   needs schedulable GPU capacity for real engine-owned multi-tensor install
+   plus actual NIXL data movement.
 2. Promote the runtime bridges into each engine's production post-load/refit
    lifecycle, using the same source-published ownership and receiver-side
    request path.
