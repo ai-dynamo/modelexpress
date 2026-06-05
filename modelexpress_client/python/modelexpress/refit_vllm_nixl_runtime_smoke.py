@@ -37,9 +37,12 @@ from .refit_nixl import (
     select_cuda_device,
 )
 from .refit_trainer_step import (
+    DEFAULT_TRAINER_LR,
+    DEFAULT_TRAINER_STEP_COUNT,
     publish_trainer_step_source,
     trainer_step_replacement_tensor,
     trainer_step_source_provenance,
+    trainer_update_parameters_from_ownerships,
 )
 from .refit_vllm_receiver_smoke import (
     _json_default,
@@ -119,8 +122,16 @@ def _replacement_tensor(
     *,
     dtype: torch.dtype,
     device: torch.device | str,
+    step_count: int = DEFAULT_TRAINER_STEP_COUNT,
+    learning_rate: float = DEFAULT_TRAINER_LR,
 ) -> torch.Tensor:
-    return trainer_step_replacement_tensor(shape, dtype=dtype, device=device)
+    return trainer_step_replacement_tensor(
+        shape,
+        dtype=dtype,
+        device=device,
+        step_count=step_count,
+        learning_rate=learning_rate,
+    )
 
 
 def _range_slices(tensor_range: TensorRange) -> tuple[slice, ...]:
@@ -291,6 +302,8 @@ def _apply_vllm_nixl_payload_on_worker_model(
         _shape(target_tensor),
         dtype=target_tensor.dtype,
         device=target_tensor.device,
+        step_count=int(kwargs.get("expected_step_count", DEFAULT_TRAINER_STEP_COUNT)),
+        learning_rate=float(kwargs.get("expected_learning_rate", DEFAULT_TRAINER_LR)),
     )
     prepared = assembled_payload.to(
         device=target_tensor.device,
@@ -418,8 +431,16 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
     tensor_name = str(scenario["target_tensor_name"])
     target_shape = tuple(int(dim) for dim in scenario["target_shape"])
     dtype_obj = _torch_dtype_from_name(str(scenario["target_dtype"]))
+    request = SliceRequest.from_dict(scenario["request"])
+    owners = [SliceOwnership.from_dict(item) for item in scenario["source_ownerships"]]
+    plans = [SegmentPlan.from_dict(item) for item in scenario["segment_plans"]]
+    trainer_update = trainer_update_parameters_from_ownerships(owners)
     expected = _replacement_tensor(
-        target_shape, dtype=dtype_obj, device=assembled.device
+        target_shape,
+        dtype=dtype_obj,
+        device=assembled.device,
+        step_count=trainer_update.step_count,
+        learning_rate=trainer_update.learning_rate,
     )
     staging_allclose = _tensor_close(assembled, expected)
     staging_checksum = _tensor_checksum(assembled)
@@ -436,6 +457,8 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
         "tensor_name": tensor_name,
         "module_path": str(scenario.get("module_path", "llm.apply_model.worker_model")),
         "assembled_payload_cpu": assembled_payload_cpu,
+        "expected_step_count": trainer_update.step_count,
+        "expected_learning_rate": trainer_update.learning_rate,
     }
     apply_start = time.perf_counter()
     worker_results = apply_model(
@@ -446,9 +469,6 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
         raise RuntimeError("vLLM apply_model returned no install results")
     worker_result = worker_results[0]
 
-    request = SliceRequest.from_dict(scenario["request"])
-    owners = [SliceOwnership.from_dict(item) for item in scenario["source_ownerships"]]
-    plans = [SegmentPlan.from_dict(item) for item in scenario["segment_plans"]]
     copied_bytes = sum(plan.bytes for plan in plans)
     source_count = len({plan.source_id for plan in plans})
     target_bytes = int(scenario.get("target_tensor_bytes", copied_bytes))
@@ -460,6 +480,8 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
             "nixl_staging_checksum": staging_checksum,
             "nixl_staging_checksum_matches": staging_checksum_matches,
             "expected_checksum": expected_checksum,
+            "expected_optimizer_step_count": trainer_update.step_count,
+            "expected_learning_rate": trainer_update.learning_rate,
         }
     )
     proof = {
@@ -490,6 +512,7 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
         "trainer_like_source_processes_used": True,
         "real_trainer_process_used": False,
         "trainer_optimizer_step_publisher_used": True,
+        "receiver_expected_update_from_source_metadata": True,
         "trainer_owned_parameter_tensor_used": True,
         "real_training_loop_used": False,
         "real_rl_training_loop_used": False,
@@ -564,7 +587,10 @@ def run_vllm_receiver_refit_from_nixl_staging_tensor(
         },
         "distributed": distributed,
         "nixl": {"reads": nixl_reads},
-        "trainer_source_update": trainer_step_source_provenance(),
+        "trainer_source_update": trainer_step_source_provenance(
+            step_count=trainer_update.step_count,
+            learning_rate=trainer_update.learning_rate,
+        ),
         "worker_result_count": len(worker_results),
         "runtime_module_discovery_path": "vllm.apply_model",
     }

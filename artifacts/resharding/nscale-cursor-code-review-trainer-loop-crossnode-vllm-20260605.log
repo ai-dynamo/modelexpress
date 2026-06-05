@@ -1,0 +1,40 @@
+cursor-code-review rubric: a3sh-dotfiles cursor-code-review skill
+scope: uncommitted nscale diff for vLLM trainer-loop cross-node runtime proof
+branch: mx-rl-resharding-planner-poc
+date: 2026-06-05
+
+diff stat reviewed:
+  9 files changed, 341 insertions(+), 15 deletions(-)
+
+line-count check:
+  refit_trainer_step.py: 473
+  refit_vllm_nixl_runtime_smoke.py: 962
+  refit_sglang_nixl_runtime_smoke.py: 900
+  no changed implementation file crossed 1000 lines
+
+finding:
+  medium - runtime helpers reintroduced hard-coded optimizer defaults
+  `1` and `0.125` even though `refit_trainer_step` owns
+  DEFAULT_TRAINER_STEP_COUNT and DEFAULT_TRAINER_LR. This is small but it
+  weakens the metadata boundary: future trainer-step default changes could make
+  receiver fallback validation drift from source publication semantics.
+
+fix applied:
+  vLLM and SGLang runtime helper defaults now import and use
+  DEFAULT_TRAINER_STEP_COUNT and DEFAULT_TRAINER_LR from refit_trainer_step.
+
+post-fix verification:
+  python3 -m black modelexpress/refit_vllm_nixl_runtime_smoke.py
+    modelexpress/refit_sglang_nixl_runtime_smoke.py
+  pytest -q tests/test_refit_vllm_nixl_runtime_smoke.py
+    tests/test_refit_sglang_nixl_runtime_smoke.py
+    tests/test_refit_trainer_step.py
+    tests/test_refit_vllm_mx_runtime.py
+    tests/test_refit_sglang_mx_runtime.py
+    tests/test_resharding_control_plane.py
+  result: 42 passed
+
+remaining review risk:
+  refit_vllm_nixl_runtime_smoke.py is now close to 1000 lines. The next runtime
+  bridge feature should extract shared vLLM/SGLang expected-update validation or
+  artifact assembly instead of continuing to grow the runtime smoke files.

@@ -1,0 +1,689 @@
+{
+  "control_plane": {
+    "metadata_query_duration_ms": 28.369619976729155,
+    "mode": "live-vllm-mx-endpoint-runtime",
+    "planner_duration_ms": 0.1897109905257821,
+    "server_url": "mx-server-rl:8001",
+    "source_endpoints_from_control_plane": [
+      {
+        "agent_name": "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank0",
+        "metadata_bytes": 434,
+        "metadata_endpoint": "",
+        "mx_source_id": "1061338e47ab5891",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "bfloat16",
+          "element_size_bytes": 2,
+          "global_shape": [
+            64,
+            32
+          ],
+          "layout_tags": {
+            "learning_rate": "0.125",
+            "optimizer": "SGD",
+            "optimizer_step_count": 2,
+            "optimizer_step_publisher": true,
+            "runtime_refit_target": "vllm.LLM.apply_model",
+            "source_payload_generator": "torch.optim.SGD",
+            "source_tensor_owner": "torchrun-trainer-rank",
+            "static_replacement_formula": false,
+            "storage_layout": "row-major",
+            "synthetic_trainer_loop_smoke": true,
+            "synthetic_training_objective": true,
+            "trainer_layout": "fsdp-row-shard-poc",
+            "trainer_loop_base_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2",
+            "trainer_loop_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+            "trainer_loop_publisher": true,
+            "trainer_loop_step_index": 2,
+            "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+            "trainer_update_source": "torch.optim.SGD-trainer-loop-smoke"
+          },
+          "model_name": "mx-live-vllm-nixl-runtime-smoke",
+          "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+          "nixl_descriptor_id": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank0",
+          "source_lease": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+          "source_range": [
+            [
+              0,
+              32
+            ],
+            [
+              0,
+              32
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "lm_head.weight",
+          "worker_id": "trainer-rank0-worker",
+          "worker_rank": 0
+        },
+        "source_id": "trainer-rank0",
+        "status": 2,
+        "tensor": {
+          "addr": 133149707224064,
+          "device_id": 0,
+          "dtype": "bfloat16",
+          "name": "lm_head.weight",
+          "size": 2048
+        },
+        "updated_at": 1780680927764,
+        "worker_grpc_endpoint": "",
+        "worker_id": "trainer-rank0-worker",
+        "worker_rank": 0
+      },
+      {
+        "agent_name": "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank1",
+        "metadata_bytes": 434,
+        "metadata_endpoint": "",
+        "mx_source_id": "1061338e47ab5891",
+        "ownership": {
+          "contiguous": true,
+          "dtype": "bfloat16",
+          "element_size_bytes": 2,
+          "global_shape": [
+            64,
+            32
+          ],
+          "layout_tags": {
+            "learning_rate": "0.125",
+            "optimizer": "SGD",
+            "optimizer_step_count": 2,
+            "optimizer_step_publisher": true,
+            "runtime_refit_target": "vllm.LLM.apply_model",
+            "source_payload_generator": "torch.optim.SGD",
+            "source_tensor_owner": "torchrun-trainer-rank",
+            "static_replacement_formula": false,
+            "storage_layout": "row-major",
+            "synthetic_trainer_loop_smoke": true,
+            "synthetic_training_objective": true,
+            "trainer_layout": "fsdp-row-shard-poc",
+            "trainer_loop_base_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2",
+            "trainer_loop_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+            "trainer_loop_publisher": true,
+            "trainer_loop_step_index": 2,
+            "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+            "trainer_update_source": "torch.optim.SGD-trainer-loop-smoke"
+          },
+          "model_name": "mx-live-vllm-nixl-runtime-smoke",
+          "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+          "nixl_descriptor_id": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank1",
+          "source_lease": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+          "source_range": [
+            [
+              32,
+              64
+            ],
+            [
+              0,
+              32
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "lm_head.weight",
+          "worker_id": "trainer-rank1-worker",
+          "worker_rank": 1
+        },
+        "source_id": "trainer-rank1",
+        "status": 2,
+        "tensor": {
+          "addr": 136852136805376,
+          "device_id": 0,
+          "dtype": "bfloat16",
+          "name": "lm_head.weight",
+          "size": 2048
+        },
+        "updated_at": 1780680928280,
+        "worker_grpc_endpoint": "",
+        "worker_id": "trainer-rank1-worker",
+        "worker_rank": 1
+      }
+    ],
+    "source_statuses_by_id": {
+      "trainer-rank0": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780680927764
+      },
+      "trainer-rank1": {
+        "status": 2,
+        "status_name": "SOURCE_STATUS_READY",
+        "updated_at": 1780680928280
+      }
+    }
+  },
+  "distributed": {
+    "backend": "nixl-read+mx-endpoint-control+vllm-apply-model-update",
+    "cross_node": true,
+    "gpu_reuse_used": false,
+    "run_id": "mxvllmloop-20260605-ib2",
+    "source_agent_names_by_source_id": {
+      "trainer-rank0": "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank0",
+      "trainer-rank1": "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank1"
+    },
+    "source_ids": [
+      "trainer-rank0",
+      "trainer-rank1"
+    ],
+    "source_nodes": [
+      "cluster-0967a26d-pool-14bee067-prctr-g2j7h"
+    ],
+    "source_pods": [
+      "mx-vllm-loop-src0-20260605",
+      "mx-vllm-loop-src1-20260605"
+    ],
+    "target_agent_name": "mx-vllm-mx-target-mxvllmloop-20260605-ib2",
+    "target_node": "cluster-0967a26d-pool-14bee067-prctr-9c2x7",
+    "target_pod": "mx-vllm-loop-tgt-20260605",
+    "torch_distributed_control_plane_used": false,
+    "torch_distributed_nixl_metadata_exchange_used": false
+  },
+  "framework_version": "0.17.1",
+  "metrics": {
+    "activation_install_duration_ms": 0.15898107085376978,
+    "apply_model_install_duration_ms": 93.87299697846174,
+    "distinct_source_agent_count": 2,
+    "engine_start_duration_ms": 14877.708170097321,
+    "inference_side_fanout_bytes": 0,
+    "initial_tensor_inspection_duration_ms": 16.27730601467192,
+    "metadata_query_duration_ms": 28.369619976729155,
+    "nixl_add_remote_agent_duration_ms": 7.389615988358855,
+    "nixl_prep_duration_ms": 0.07434806320816278,
+    "nixl_read_group_count": 2,
+    "nixl_registration_duration_ms": 5.09789795614779,
+    "planner_duration_ms": 0.1897109905257821,
+    "raw_nixl_read_duration_ms": 11.092181084677577,
+    "redundant_cross_boundary_factor": 1.0,
+    "restore_duration_ms": 0.061826081946492195,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "lm_head.weight": 2
+    },
+    "source_endpoint_count": 2,
+    "staging_to_apply_model_payload_duration_ms": 0.043116044253110886,
+    "successful_nixl_source_count": 2,
+    "target_tensor_bytes": 4096,
+    "trainer_to_inference_bytes": 4096
+  },
+  "mode": "live-vllm-nixl-runtime-mx-crossnode-refit",
+  "model_name": "mx-live-vllm-nixl-runtime-smoke",
+  "model_path": "/tmp/mx-vllm-mx-runtime-model-ii1tjtsq",
+  "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+  "model_version_base": "mx-endpoint-crossnode-vllm-nixl",
+  "model_version_runtime_base": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2",
+  "module_class": "Qwen2ForCausalLM",
+  "module_path": "llm.apply_model.worker_model",
+  "nixl": {
+    "add_remote_agent_duration_ms": {
+      "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank0": 3.704568953253329,
+      "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank1": 3.6850470351055264
+    },
+    "nixl_backends": [
+      "UCX"
+    ],
+    "reads": [
+      {
+        "backend": "UCX",
+        "bytes": 2048,
+        "prep_duration_ms": 0.05875702481716871,
+        "read_duration_ms": 10.568985948339105,
+        "segment_count": 1,
+        "segments": [
+          {
+            "bytes": 2048,
+            "lease_version": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+            "nixl_descriptor_id": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+            "retry_policy": "replan-from-alternate-holder",
+            "source_byte_offset": 0,
+            "source_id": "trainer-rank0",
+            "source_range": [
+              [
+                0,
+                32
+              ],
+              [
+                0,
+                32
+              ]
+            ],
+            "target_byte_offset": 0,
+            "target_id": "vllm:lm_head.weight",
+            "target_range": [
+              [
+                0,
+                32
+              ],
+              [
+                0,
+                32
+              ]
+            ],
+            "target_runtime": "vllm",
+            "tensor_name": "lm_head.weight",
+            "worker_id": "trainer-rank0-worker",
+            "worker_rank": 0
+          }
+        ],
+        "source_id": "trainer-rank0",
+        "source_rank": 0,
+        "telemetry": null
+      },
+      {
+        "backend": "UCX",
+        "bytes": 2048,
+        "prep_duration_ms": 0.015591038390994072,
+        "read_duration_ms": 0.11252693366259336,
+        "segment_count": 1,
+        "segments": [
+          {
+            "bytes": 2048,
+            "lease_version": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+            "nixl_descriptor_id": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+            "retry_policy": "replan-from-alternate-holder",
+            "source_byte_offset": 0,
+            "source_id": "trainer-rank1",
+            "source_range": [
+              [
+                32,
+                64
+              ],
+              [
+                0,
+                32
+              ]
+            ],
+            "target_byte_offset": 2048,
+            "target_id": "vllm:lm_head.weight",
+            "target_range": [
+              [
+                32,
+                64
+              ],
+              [
+                0,
+                32
+              ]
+            ],
+            "target_runtime": "vllm",
+            "tensor_name": "lm_head.weight",
+            "worker_id": "trainer-rank1-worker",
+            "worker_rank": 1
+          }
+        ],
+        "source_id": "trainer-rank1",
+        "source_rank": 1,
+        "telemetry": null
+      }
+    ],
+    "remote_agent_names": {
+      "trainer-rank0": "b'mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank0'",
+      "trainer-rank1": "b'mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank1'"
+    },
+    "source_metadata": {
+      "trainer-rank0": {
+        "agent_name": "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank0",
+        "device_id": 0,
+        "metadata_bytes": 434,
+        "registered_bytes": 2048,
+        "source_range": [
+          [
+            0,
+            32
+          ],
+          [
+            0,
+            32
+          ]
+        ],
+        "trainer_loop_publisher": true,
+        "trainer_loop_step_index": 2,
+        "worker_rank": 0
+      },
+      "trainer-rank1": {
+        "agent_name": "mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank1",
+        "device_id": 0,
+        "metadata_bytes": 434,
+        "registered_bytes": 2048,
+        "source_range": [
+          [
+            32,
+            64
+          ],
+          [
+            0,
+            32
+          ]
+        ],
+        "trainer_loop_publisher": true,
+        "trainer_loop_step_index": 2,
+        "worker_rank": 1
+      }
+    },
+    "target_agent_name": "mx-vllm-mx-target-mxvllmloop-20260605-ib2"
+  },
+  "nixl_staging_device": "cuda:0",
+  "nixl_staging_dtype": "bfloat16",
+  "nixl_staging_shape": [
+    64,
+    32
+  ],
+  "proof": {
+    "actual_nixl_reads_used": true,
+    "allclose": true,
+    "checksum_gate": true,
+    "cross_node_pods": true,
+    "cross_node_runtime_target_pod": true,
+    "distinct_source_agent_count": 2,
+    "host_side_torch_cat_used": false,
+    "live_mx_returned_metadata_used_for_nixl_plan": true,
+    "nixl_reads_land_at_segment_offsets": true,
+    "nixl_reads_land_directly_in_runtime_tensor": false,
+    "nixl_reads_land_into_staging_tensor": true,
+    "nixl_source_endpoints_from_mx": true,
+    "one_nixl_agent_per_source_rank": true,
+    "one_pod_per_source_rank": true,
+    "real_distributed_trainer_loop_used": false,
+    "real_rl_training_loop_used": false,
+    "real_runtime_engine_used": true,
+    "real_trainer_process_used": false,
+    "real_training_loop_used": false,
+    "receiver_expected_update_from_source_metadata": true,
+    "receiver_installed_into_runtime_owned_tensor": true,
+    "receiver_installed_into_vllm_worker_owned_tensor": true,
+    "receiver_request_from_live_vllm_worker_tensor": true,
+    "receiver_request_from_runtime_owned_tensor": true,
+    "receiver_request_from_vllm_worker_tensor": true,
+    "restored_original_tensor": true,
+    "runtime_imported": true,
+    "runtime_owned_target_tensor": true,
+    "runtime_update_from_nixl_staging_tensor": true,
+    "runtime_update_payload_copied_through_apply_model": true,
+    "source_endpoint_count": 2,
+    "source_pod_separate_from_target_pod": true,
+    "source_rank_owned_trainer_tensors_used": true,
+    "staging_checksum_gate": true,
+    "static_replacement_formula_source_values_used": false,
+    "synthetic_source_values_used": false,
+    "synthetic_trainer_loop_smoke_used": true,
+    "synthetic_trainer_payloads_used": false,
+    "synthetic_training_objective_used": true,
+    "target_buffer_preallocated": true,
+    "target_slice_spans_multiple_trainers": true,
+    "torch_distributed_control_plane_used": false,
+    "torch_distributed_data_transfer_used": false,
+    "torch_distributed_nixl_metadata_exchange_used": false,
+    "trainer_full_all_gather_used": false,
+    "trainer_like_source_processes_used": true,
+    "trainer_loop_runtime_model_version_used": true,
+    "trainer_loop_source_publication_used": true,
+    "trainer_loop_step_index": 2,
+    "trainer_optimizer_step_publisher_used": true,
+    "trainer_owned_parameter_tensor_used": true,
+    "trainer_side_inference_layout_conversion_used": false,
+    "vllm_apply_model_used": true,
+    "vllm_imported": true,
+    "vllm_owned_target_tensor": true,
+    "vllm_worker_owned_target_tensor": true
+  },
+  "request": {
+    "destination_strides": [
+      32,
+      1
+    ],
+    "dtype": "bfloat16",
+    "element_size_bytes": 2,
+    "layout_tags": {
+      "runtime_framework": "vllm",
+      "runtime_lifecycle": "apply-model-update-from-nixl-staging",
+      "runtime_module_path": "llm.apply_model.worker_model",
+      "runtime_tensor_name": "lm_head.weight",
+      "storage_layout": "row-major",
+      "target_contiguous": true,
+      "vllm_module_path": "llm.apply_model.worker_model",
+      "vllm_tensor_name": "lm_head.weight"
+    },
+    "model_name": "mx-live-vllm-nixl-runtime-smoke",
+    "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+    "quantization_scope": "absent",
+    "requested_range": [
+      [
+        0,
+        64
+      ],
+      [
+        0,
+        32
+      ]
+    ],
+    "runtime_framework": "vllm",
+    "target_id": "vllm:lm_head.weight",
+    "target_offset_bytes": 0,
+    "target_shape": [
+      64,
+      32
+    ],
+    "tensor_name": "lm_head.weight"
+  },
+  "result": "pass",
+  "run_id": "mxvllmloop-20260605-ib2",
+  "runtime_framework": "vllm",
+  "runtime_module_discovery_path": "vllm.apply_model",
+  "schema_version": 1,
+  "segment_plans": [
+    {
+      "bytes": 2048,
+      "lease_version": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "nixl_descriptor_id": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank0",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_byte_offset": 0,
+      "target_id": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "bytes": 2048,
+      "lease_version": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "nixl_descriptor_id": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "retry_policy": "replan-from-alternate-holder",
+      "source_byte_offset": 0,
+      "source_id": "trainer-rank1",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_byte_offset": 2048,
+      "target_id": "vllm:lm_head.weight",
+      "target_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "target_runtime": "vllm",
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "source_ownerships": [
+    {
+      "contiguous": true,
+      "dtype": "bfloat16",
+      "element_size_bytes": 2,
+      "global_shape": [
+        64,
+        32
+      ],
+      "layout_tags": {
+        "learning_rate": "0.125",
+        "optimizer": "SGD",
+        "optimizer_step_count": 2,
+        "optimizer_step_publisher": true,
+        "runtime_refit_target": "vllm.LLM.apply_model",
+        "source_payload_generator": "torch.optim.SGD",
+        "source_tensor_owner": "torchrun-trainer-rank",
+        "static_replacement_formula": false,
+        "storage_layout": "row-major",
+        "synthetic_trainer_loop_smoke": true,
+        "synthetic_training_objective": true,
+        "trainer_layout": "fsdp-row-shard-poc",
+        "trainer_loop_base_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2",
+        "trainer_loop_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+        "trainer_loop_publisher": true,
+        "trainer_loop_step_index": 2,
+        "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+        "trainer_update_source": "torch.optim.SGD-trainer-loop-smoke"
+      },
+      "model_name": "mx-live-vllm-nixl-runtime-smoke",
+      "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+      "nixl_descriptor_id": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank0",
+      "source_lease": "trainer-rank0-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "source_range": [
+        [
+          0,
+          32
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    },
+    {
+      "contiguous": true,
+      "dtype": "bfloat16",
+      "element_size_bytes": 2,
+      "global_shape": [
+        64,
+        32
+      ],
+      "layout_tags": {
+        "learning_rate": "0.125",
+        "optimizer": "SGD",
+        "optimizer_step_count": 2,
+        "optimizer_step_publisher": true,
+        "runtime_refit_target": "vllm.LLM.apply_model",
+        "source_payload_generator": "torch.optim.SGD",
+        "source_tensor_owner": "torchrun-trainer-rank",
+        "static_replacement_formula": false,
+        "storage_layout": "row-major",
+        "synthetic_trainer_loop_smoke": true,
+        "synthetic_training_objective": true,
+        "trainer_layout": "fsdp-row-shard-poc",
+        "trainer_loop_base_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2",
+        "trainer_loop_model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+        "trainer_loop_publisher": true,
+        "trainer_loop_step_index": 2,
+        "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+        "trainer_update_source": "torch.optim.SGD-trainer-loop-smoke"
+      },
+      "model_name": "mx-live-vllm-nixl-runtime-smoke",
+      "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002",
+      "nixl_descriptor_id": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "quantization_scope": "absent",
+      "source_id": "trainer-rank1",
+      "source_lease": "trainer-rank1-mx-endpoint-crossnode-vllm-nixl-mxvllmloop-20260605-ib2-trainer-loop-step-000002-optimizer-step-2",
+      "source_range": [
+        [
+          32,
+          64
+        ],
+        [
+          0,
+          32
+        ]
+      ],
+      "storage_offset_bytes": 0,
+      "strides": null,
+      "tensor_name": "lm_head.weight",
+      "worker_id": "trainer-rank1-worker",
+      "worker_rank": 1
+    }
+  ],
+  "target_device": "cuda:0",
+  "target_dtype": "bfloat16",
+  "target_key": "vllm:lm_head.weight",
+  "target_shape": [
+    64,
+    32
+  ],
+  "target_tensor_name": "lm_head.weight",
+  "trainer_source_update": {
+    "learning_rate": 0.125,
+    "optimizer": "SGD",
+    "optimizer_step_count": 2,
+    "optimizer_step_publisher_used": true,
+    "real_rl_training_loop_used": false,
+    "source_payload_generator": "torch.optim.SGD",
+    "static_replacement_formula_used": false,
+    "synthetic_training_objective_used": true,
+    "trainer_owned_parameter_tensor_used": true
+  },
+  "trainer_step_index": 2,
+  "validation": {
+    "allclose": true,
+    "checksum": -101.92138671875,
+    "checksum_matches": true,
+    "expected_checksum": -101.92138671875,
+    "expected_learning_rate": 0.125,
+    "expected_optimizer_step_count": 2,
+    "max_abs_error": 0.0,
+    "nixl_staging_allclose": true,
+    "nixl_staging_checksum": -101.92138671875,
+    "nixl_staging_checksum_matches": true,
+    "original_checksum": -0.5268852114677429,
+    "payload_allclose": true,
+    "payload_checksum": -101.92138671875,
+    "payload_checksum_matches": true,
+    "restored_checksum": -0.5268852114677429,
+    "restored_original": true
+  },
+  "vllm_version": "0.17.1",
+  "worker_result_count": 1
+}

@@ -78,6 +78,14 @@ class TrainerLoopStepPublication:
         }
 
 
+@dataclass(frozen=True)
+class TrainerUpdateParameters:
+    """Optimizer-step parameters inferred from source ownership metadata."""
+
+    step_count: int
+    learning_rate: float
+
+
 def publish_trainer_step_source(
     owner: SliceOwnership,
     *,
@@ -270,6 +278,39 @@ def trainer_step_source_provenance(
         "static_replacement_formula_used": False,
         "real_rl_training_loop_used": False,
     }
+
+
+def trainer_update_parameters_from_ownerships(
+    ownerships: Sequence[SliceOwnership],
+    *,
+    default_step_count: int = DEFAULT_TRAINER_STEP_COUNT,
+    default_learning_rate: float = DEFAULT_TRAINER_LR,
+) -> TrainerUpdateParameters:
+    """Infer the expected trainer update from published source ownerships."""
+
+    step_counts: set[int] = set()
+    learning_rates: set[float] = set()
+    for owner in ownerships:
+        tags = owner.layout_tags
+        step_value = tags.get("trainer_loop_step_index")
+        if step_value is None:
+            step_value = tags.get("optimizer_step_count")
+        if step_value is not None:
+            step_counts.add(int(step_value))
+
+        learning_rate_value = tags.get("learning_rate")
+        if learning_rate_value is not None:
+            learning_rates.add(float(learning_rate_value))
+
+    if len(step_counts) > 1:
+        raise ValueError(f"inconsistent optimizer step counts: {sorted(step_counts)}")
+    if len(learning_rates) > 1:
+        raise ValueError(f"inconsistent learning rates: {sorted(learning_rates)}")
+
+    return TrainerUpdateParameters(
+        step_count=next(iter(step_counts), int(default_step_count)),
+        learning_rate=next(iter(learning_rates), float(default_learning_rate)),
+    )
 
 
 def trainer_step_replacement_tensor(

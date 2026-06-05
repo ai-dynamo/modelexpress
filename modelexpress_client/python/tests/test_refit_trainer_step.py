@@ -16,6 +16,7 @@ from modelexpress.refit_trainer_step import (
     trainer_step_replacement_tensor,
     trainer_step_source_provenance,
     trainer_step_tensor_for_range,
+    trainer_update_parameters_from_ownerships,
 )
 from modelexpress.resharding import SliceOwnership
 
@@ -157,6 +158,70 @@ def test_trainer_step_publication_carries_tensor_ownership_and_artifact_metadata
     assert metadata["tensor_shape"] == [4, 4]
     assert metadata["tensor_dtype"] == "float32"
     assert metadata["tensor_bytes"] == 64
+
+
+def test_trainer_update_parameters_are_inferred_from_source_ownership_metadata():
+    owners = [
+        replace(
+            owner,
+            layout_tags={
+                **owner.layout_tags,
+                "optimizer_step_count": 2,
+                "learning_rate": "0.25",
+            },
+        )
+        for owner in _loop_ownerships()
+    ]
+
+    params = trainer_update_parameters_from_ownerships(owners)
+
+    assert params.step_count == 2
+    assert params.learning_rate == 0.25
+
+    loop_params = trainer_update_parameters_from_ownerships(
+        [
+            replace(
+                owner,
+                layout_tags={
+                    **owner.layout_tags,
+                    "optimizer_step_count": 1,
+                    "trainer_loop_step_index": 4,
+                    "learning_rate": "0.5",
+                },
+            )
+            for owner in _loop_ownerships()
+        ]
+    )
+    assert loop_params.step_count == 4
+    assert loop_params.learning_rate == 0.5
+
+    with pytest.raises(ValueError, match="inconsistent optimizer step counts"):
+        trainer_update_parameters_from_ownerships(
+            [
+                replace(
+                    owners[0],
+                    layout_tags={**owners[0].layout_tags, "optimizer_step_count": 2},
+                ),
+                replace(
+                    owners[1],
+                    layout_tags={**owners[1].layout_tags, "optimizer_step_count": 3},
+                ),
+            ]
+        )
+
+    with pytest.raises(ValueError, match="inconsistent learning rates"):
+        trainer_update_parameters_from_ownerships(
+            [
+                replace(
+                    owners[0],
+                    layout_tags={**owners[0].layout_tags, "learning_rate": "0.25"},
+                ),
+                replace(
+                    owners[1],
+                    layout_tags={**owners[1].layout_tags, "learning_rate": "0.5"},
+                ),
+            ]
+        )
 
 
 def _loop_ownerships():

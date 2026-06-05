@@ -35,9 +35,12 @@ from .refit_nixl import (
     select_cuda_device,
 )
 from .refit_trainer_step import (
+    DEFAULT_TRAINER_LR,
+    DEFAULT_TRAINER_STEP_COUNT,
     publish_trainer_step_source,
     trainer_step_replacement_tensor,
     trainer_step_source_provenance,
+    trainer_update_parameters_from_ownerships,
 )
 from .refit_sglang_receiver_smoke import (
     _coerce_sglang_weight_to_tensor,
@@ -121,8 +124,16 @@ def _replacement_tensor(
     *,
     dtype: torch.dtype,
     device: torch.device | str,
+    step_count: int = DEFAULT_TRAINER_STEP_COUNT,
+    learning_rate: float = DEFAULT_TRAINER_LR,
 ) -> torch.Tensor:
-    return trainer_step_replacement_tensor(shape, dtype=dtype, device=device)
+    return trainer_step_replacement_tensor(
+        shape,
+        dtype=dtype,
+        device=device,
+        step_count=step_count,
+        learning_rate=learning_rate,
+    )
 
 
 def _runtime_storage_expected_tensor(
@@ -284,10 +295,13 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
     nixl_metrics = dict(nixl_metrics or {})
     distributed = dict(distributed or {})
 
+    trainer_update = trainer_update_parameters_from_ownerships(source_ownerships)
     expected = _replacement_tensor(
         _shape(original),
         dtype=original.dtype,
         device=original.device,
+        step_count=trainer_update.step_count,
+        learning_rate=trainer_update.learning_rate,
     )
     assembled_for_engine = (
         assembled.detach()
@@ -369,6 +383,7 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
         "trainer_like_source_processes_used": True,
         "real_trainer_process_used": False,
         "trainer_optimizer_step_publisher_used": True,
+        "receiver_expected_update_from_source_metadata": True,
         "trainer_owned_parameter_tensor_used": True,
         "real_training_loop_used": False,
         "real_rl_training_loop_used": False,
@@ -430,6 +445,8 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
             "checksum": checksum,
             "expected_checksum": runtime_expected_checksum,
             "full_precision_expected_checksum": expected_checksum,
+            "expected_optimizer_step_count": trainer_update.step_count,
+            "expected_learning_rate": trainer_update.learning_rate,
             "checksum_matches": checksum_matches,
             "max_abs_error": max_abs_error,
             "full_precision_max_abs_error": full_precision_max_abs_error,
@@ -466,7 +483,10 @@ def run_sglang_receiver_refit_from_nixl_staging_tensor(
         "nixl": {
             "reads": nixl_reads,
         },
-        "trainer_source_update": trainer_step_source_provenance(),
+        "trainer_source_update": trainer_step_source_provenance(
+            step_count=trainer_update.step_count,
+            learning_rate=trainer_update.learning_rate,
+        ),
     }
     if artifact_path is not None:
         _write_artifact(result, artifact_path)

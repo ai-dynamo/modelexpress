@@ -1,0 +1,2 @@
+2026-06-05 17:34:38 NIXL INFO    _api.py:363 Backend UCX was instantiated
+2026-06-05 17:34:38 NIXL INFO    _api.py:253 Initialized NIXL agent: mx-vllm-mx-source-mxvllmloop-20260605-ib2-trainer-rank1

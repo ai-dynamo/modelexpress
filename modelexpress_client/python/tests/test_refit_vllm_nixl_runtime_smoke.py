@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 
@@ -19,6 +20,7 @@ from modelexpress.refit_vllm_nixl_runtime_smoke import (
     materialize_vllm_nixl_source_tensor,
     run_vllm_receiver_refit_from_nixl_staging_tensor,
 )
+from modelexpress.resharding import SliceOwnership
 
 
 class TinyVllmOwnedModule(nn.Module):
@@ -189,3 +191,54 @@ def test_vllm_nixl_runtime_refit_installs_and_restores_worker_weight(tmp_path):
     payload = json.loads(artifact_path.read_text())
     assert payload["proof"]["actual_nixl_reads_used"] is True
     assert payload["distributed"] == {"world_size": 3, "target_rank": 2}
+
+
+def test_vllm_nixl_runtime_refit_uses_source_metadata_step_count(tmp_path):
+    module = TinyVllmOwnedModule()
+    original = module.lm_head.weight.detach().clone()
+    llm = FakeVllmLLM(module)
+    scenario = inspect_vllm_runtime_nixl_scenario(
+        llm,
+        model_name="tiny-vllm-nixl",
+        model_version="step-24",
+        preferred_tensor_name="lm_head.weight",
+    )
+    annotated_owners = [
+        replace(
+            owner,
+            layout_tags={
+                **owner.layout_tags,
+                "trainer_loop_step_index": 2,
+                "learning_rate": "0.125",
+            },
+        )
+        for owner in (
+            SliceOwnership.from_dict(owner_payload)
+            for owner_payload in scenario["source_ownerships"]
+        )
+    ]
+    scenario["source_ownerships"] = [owner.to_dict() for owner in annotated_owners]
+    assembled = _replacement_tensor(
+        original.shape,
+        dtype=original.dtype,
+        device="cpu",
+        step_count=2,
+    )
+
+    result = run_vllm_receiver_refit_from_nixl_staging_tensor(
+        llm,
+        assembled=assembled,
+        scenario=scenario,
+        model_name="tiny-vllm-nixl",
+        model_version="step-24",
+        vllm_version="unit-test",
+        artifact_path=tmp_path / "vllm-nixl-runtime-step2-smoke.json",
+        model_path="unit-tiny-qwen2",
+    )
+
+    assert result["result"] == "pass"
+    assert result["proof"]["receiver_expected_update_from_source_metadata"] is True
+    assert result["validation"]["expected_optimizer_step_count"] == 2
+    assert result["validation"]["expected_learning_rate"] == 0.125
+    assert result["trainer_source_update"]["optimizer_step_count"] == 2
+    torch.testing.assert_close(module.lm_head.weight, original)

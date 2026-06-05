@@ -1,0 +1,6 @@
+kaniko-mx-server-rl-d168542-mfmqn                           0/1     Completed   0               4d6h    10.0.10.28    cluster-0967a26d-pool-14bee067-prctr-xmhbj   <none>           <none>
+mx-dev-goal-20260605                                        1/1     Running     0               18h     10.0.21.215   cluster-0967a26d-pool-1f83edbe-mj5s4-gnsf4   <none>           <none>
+mx-server-rl-76b6854487-8zx79                               1/1     Running     0               4d6h    10.0.29.139   cluster-0967a26d-pool-1f83edbe-mj5s4-bf5w2   <none>           <none>
+mx-vllm-loop-src0-20260605                                  1/1     Running     0               16m     10.0.20.167   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+mx-vllm-loop-src1-20260605                                  1/1     Running     0               16m     10.0.20.123   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+mx-vllm-loop-tgt-20260605                                   1/1     Running     0               16m     10.0.12.233   cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>

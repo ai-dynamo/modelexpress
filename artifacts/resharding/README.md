@@ -401,6 +401,42 @@ Files:
   `nscale-live-vllm-mx-runtime-crossnode-source-nvidia-smi-ib-20260605.log`, and
   `nscale-live-vllm-mx-runtime-crossnode-target-nvidia-smi-ib-20260605.log`:
   placement and GPU/IB evidence for the successful vLLM cross-node runtime run.
+- `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-20260605.json`: completed
+  cross-node, one-pod-per-source-rank vLLM+NIXL runtime rerun using MX endpoint
+  discovery plus versioned trainer-loop step-2 source publication. Source pods
+  `mx-vllm-loop-src0-20260605` and `mx-vllm-loop-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`; target pod
+  `mx-vllm-loop-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`. The target loaded live vLLM
+  0.17.1, discovered both READY source endpoints from `mx-server-rl:8001`, read
+  two UCX/NIXL segments into CUDA staging, inferred the expected optimizer step
+  from source ownership metadata, installed/restored through `LLM.apply_model`,
+  and validated staging allclose, runtime allclose, and checksum. It records
+  `cross_node=true`, `one_pod_per_source_rank=true`,
+  `trainer_loop_source_publication_used=true`,
+  `receiver_expected_update_from_source_metadata=true`,
+  `expected_optimizer_step_count=2`, `trainer_to_inference_bytes=4096`,
+  `raw_nixl_read_duration_ms=11.092181084677577`,
+  `metadata_query_duration_ms=28.369619976729155`,
+  `planner_duration_ms=0.1897109905257821`, and
+  `activation_install_duration_ms=0.15898107085376978`. Scope boundary: vLLM
+  only, tiny single tensor, staging-copy install, deterministic trainer-loop
+  smoke, no direct NIXL landing into vLLM-owned storage, and no real RL trainer
+  loop.
+- `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-source0-20260605.json`
+  and `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-source1-20260605.json`:
+  source-side trainer-loop publication artifacts for the vLLM cross-node
+  trainer-loop runtime proof.
+- `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-20260605.log`,
+  `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-source0-20260605.log`,
+  `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-source1-20260605.log`,
+  and `nscale-live-vllm-mx-runtime-trainer-loop-crossnode-pods-20260605.log`:
+  target/source logs and placement evidence for the successful vLLM
+  trainer-loop cross-node runtime rerun.
+- `nscale-cursor-code-review-trainer-loop-crossnode-vllm-20260605.log`:
+  Cursor code-review rubric artifact for this rerun. It records the hard-coded
+  optimizer-default finding, the fix to reuse the shared trainer-step constants,
+  and the post-fix focused pytest gate (`42 passed`).
 - `nscale-live-vllm-mx-runtime-crossnode-bw4bt-startup-block-20260605.json` and
   `.log`: honest first-placement block. Source pods on
   `cluster-0967a26d-pool-14bee067-prctr-bw4bt` saw active `mlx5_10` IB, but the

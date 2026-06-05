@@ -306,8 +306,34 @@ Artifacts under `artifacts/resharding/` prove:
   metadata, use step-specific source/request model versions accepted by the MX
   endpoint planner, and reconstruct the step-2 target for vLLM and SGLang
   bridge-shaped ownerships. This is CPU/control-plane bridge evidence only; it
-  is not a new live GPU vLLM/SGLang runtime rerun and not real distributed
-  trainer ownership.
+  is not by itself a live GPU vLLM/SGLang runtime rerun and not real
+  distributed trainer ownership.
+- A live vLLM GPU rerun now closes the vLLM side of that bridge-to-runtime gap
+  for trainer-loop metadata:
+  `artifacts/resharding/nscale-live-vllm-mx-runtime-trainer-loop-crossnode-20260605.json`,
+  source JSONs, target/source logs, and pod-placement log. In run
+  `mxvllmloop-20260605-ib2`, source pods
+  `mx-vllm-loop-src0-20260605` and `mx-vllm-loop-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`, each published a versioned
+  trainer-loop step-2 `SliceOwnership`, CUDA tensor descriptor, and NIXL
+  metadata endpoint through live `mx-server-rl:8001`. The target pod
+  `mx-vllm-loop-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`, loaded live vLLM 0.17.1,
+  discovered both source endpoints from MX, issued two cross-node UCX/NIXL READs
+  into CUDA staging, inferred the expected optimizer step from source ownership
+  metadata, installed/restored through `LLM.apply_model`, and validated staging
+  allclose, runtime allclose, and checksum. The artifact records
+  `result=pass`, `cross_node=true`, `one_pod_per_source_rank=true`,
+  `trainer_loop_source_publication_used=true`,
+  `receiver_expected_update_from_source_metadata=true`,
+  `expected_optimizer_step_count=2`, `trainer_to_inference_bytes=4096`,
+  `raw_nixl_read_duration_ms=11.092181084677577`,
+  `metadata_query_duration_ms=28.369619976729155`,
+  `planner_duration_ms=0.1897109905257821`, and
+  `activation_install_duration_ms=0.15898107085376978`. Scope boundary: vLLM
+  only, tiny single tensor, staging-copy install, deterministic trainer-loop
+  smoke over `torch.optim.SGD`, no direct NIXL landing into vLLM-owned storage,
+  no SGLang trainer-loop cross-node rerun yet, and no real RL trainer loop.
 - `modelexpress.refit_vllm_mx_runtime` now proves cross-node vLLM+NIXL runtime
   refit with the MX endpoint control plane and one pod per source rank. In run
   `mxvllmrt-20260605-ib3`, two independent source pods

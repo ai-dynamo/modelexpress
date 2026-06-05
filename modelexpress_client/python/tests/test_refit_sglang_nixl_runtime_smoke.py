@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 
@@ -193,6 +194,56 @@ def test_sglang_nixl_runtime_refit_installs_and_restores_engine_weight(tmp_path)
     payload = json.loads(artifact_path.read_text())
     assert payload["proof"]["actual_nixl_reads_used"] is True
     assert payload["distributed"] == {"world_size": 3, "target_rank": 2}
+
+
+def test_sglang_nixl_runtime_refit_uses_source_metadata_step_count(tmp_path):
+    original = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    engine = FakeSglangEngine(original)
+    request, owners, plans = build_sglang_runtime_nixl_plan(
+        original,
+        tensor_name="lm_head.weight",
+        model_name="tiny-sglang-nixl",
+        model_version="step-25",
+    )
+    annotated_owners = [
+        replace(
+            owner,
+            layout_tags={
+                **owner.layout_tags,
+                "trainer_loop_step_index": 2,
+                "learning_rate": "0.125",
+            },
+        )
+        for owner in owners
+    ]
+    assembled = _replacement_tensor(
+        original.shape,
+        dtype=original.dtype,
+        device="cpu",
+        step_count=2,
+    )
+
+    result = run_sglang_receiver_refit_from_nixl_staging_tensor(
+        engine,
+        tensor_name="lm_head.weight",
+        original=original,
+        assembled=assembled,
+        request=request,
+        source_ownerships=annotated_owners,
+        segment_plans=plans,
+        model_name="tiny-sglang-nixl",
+        model_version="step-25",
+        sglang_version="unit-test",
+        artifact_path=tmp_path / "sglang-nixl-runtime-step2-smoke.json",
+        model_path="unit-tiny-llama",
+    )
+
+    assert result["result"] == "pass"
+    assert result["proof"]["receiver_expected_update_from_source_metadata"] is True
+    assert result["validation"]["expected_optimizer_step_count"] == 2
+    assert result["validation"]["expected_learning_rate"] == 0.125
+    assert result["trainer_source_update"]["optimizer_step_count"] == 2
+    torch.testing.assert_close(engine.weights["lm_head.weight"], original)
 
 
 def test_sglang_nixl_runtime_refit_accepts_runtime_bfloat16_roundtrip(tmp_path):
