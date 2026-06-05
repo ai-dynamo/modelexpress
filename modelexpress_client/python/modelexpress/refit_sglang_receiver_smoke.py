@@ -159,6 +159,51 @@ def _select_sglang_engine_weight(
     )
 
 
+def _select_sglang_engine_weights(
+    engine: Any,
+    *,
+    preferred_tensor_names: tuple[str, ...] = (),
+    count: int = 2,
+    truncate_size: int = 10_000_000,
+) -> dict[str, torch.Tensor]:
+    """Fetch multiple mutable SGLang engine weights for a refit transaction."""
+
+    if int(count) < 2:
+        raise ValueError("multi-tensor SGLang receiver smoke requires count >= 2")
+    candidates: list[str] = []
+    candidates.extend(name for name in preferred_tensor_names if name)
+    candidates.extend(
+        [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "embed_tokens.weight",
+            *DEFAULT_TENSOR_SUFFIXES,
+        ]
+    )
+
+    selected: dict[str, torch.Tensor] = {}
+    failures: list[str] = []
+    for name in candidates:
+        if not name or name in selected:
+            continue
+        try:
+            value = engine.get_weights_by_name(name, truncate_size=truncate_size)
+            if value is None:
+                failures.append(f"{name}: returned None")
+                continue
+            selected[name] = _coerce_sglang_weight_to_tensor(value, name=name)
+        except Exception as exc:  # pragma: no cover - exercised by live SGLang
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if len(selected) >= int(count):
+            return selected
+
+    raise RuntimeError(
+        f"needed {int(count)} usable SGLang engine weights, found "
+        f"{len(selected)}; selected={list(selected)!r}; failures={failures!r}"
+    )
+
+
 def _sglang_update_succeeded(update_result: Any) -> tuple[bool, str]:
     if isinstance(update_result, tuple) and update_result:
         message = update_result[1] if len(update_result) > 1 else ""
@@ -379,6 +424,273 @@ def run_sglang_receiver_refit_on_engine(
     return result
 
 
+def run_sglang_receiver_multitensor_refit_on_engine(
+    engine: Any,
+    *,
+    model_name: str,
+    model_version: str,
+    sglang_version: str = "",
+    preferred_tensor_names: tuple[str, ...] = (),
+    tensor_count: int = 2,
+    artifact_path: str | Path | None = None,
+    mode: str = "live-sglang-engine-owned-multitensor-smoke",
+    model_path: str = "",
+    engine_start_duration_ms: float | None = None,
+) -> dict[str, Any]:
+    """Install a multi-tensor planned receiver refit through SGLang Engine."""
+
+    from .refit_runtime_multitensor_smoke import (
+        _expected_by_tensor,
+        _materialize_segment_payloads,
+        build_runtime_multitensor_plan,
+    )
+    from .refit_trainer_step import (
+        trainer_step_source_provenance,
+        trainer_update_parameters_from_ownerships,
+    )
+
+    if not sglang_version:
+        sglang_version, _ = detect_sglang_version()
+
+    fetch_start = time.perf_counter()
+    originals = _select_sglang_engine_weights(
+        engine,
+        preferred_tensor_names=preferred_tensor_names,
+        count=tensor_count,
+    )
+    initial_fetch_duration_ms = (time.perf_counter() - fetch_start) * 1000
+
+    planner_start = time.perf_counter()
+    requests, owners, plans = build_runtime_multitensor_plan(
+        originals,
+        runtime_framework="sglang",
+        model_name=model_name,
+        model_version=model_version,
+    )
+    planner_duration_ms = (time.perf_counter() - planner_start) * 1000
+    trainer_update = trainer_update_parameters_from_ownerships(owners)
+    expected = _expected_by_tensor(
+        originals,
+        step_count=trainer_update.step_count,
+        learning_rate=trainer_update.learning_rate,
+    )
+
+    target_by_id = {
+        request.target_id
+        or request.tensor_name: torch.full_like(
+            originals[request.tensor_name],
+            float("nan"),
+        )
+        for request in requests
+    }
+    payloads = _materialize_segment_payloads(
+        plans,
+        owners,
+        tensors=originals,
+    )
+    assemble_start = time.perf_counter()
+    installed = install_segment_payloads_into_runtime_tensors(payloads, target_by_id)
+    assemble_duration_ms = (time.perf_counter() - assemble_start) * 1000
+    assembled_by_tensor = {
+        request.tensor_name: target_by_id[request.target_id or request.tensor_name]
+        for request in requests
+    }
+    assembled_validation = {
+        tensor_name: _tensor_close(assembled, expected[tensor_name])
+        for tensor_name, assembled in assembled_by_tensor.items()
+    }
+
+    update_start = time.perf_counter()
+    update_result = engine.update_weights_from_tensor(
+        [(tensor_name, assembled_by_tensor[tensor_name]) for tensor_name in originals],
+        load_format="direct",
+        flush_cache=True,
+    )
+    update_duration_ms = (time.perf_counter() - update_start) * 1000
+    update_success, update_message = _sglang_update_succeeded(update_result)
+
+    validate_start = time.perf_counter()
+    updated = {
+        tensor_name: _coerce_sglang_weight_to_tensor(
+            engine.get_weights_by_name(tensor_name, truncate_size=10_000_000),
+            name=tensor_name,
+        )
+        for tensor_name in originals
+    }
+    validate_fetch_duration_ms = (time.perf_counter() - validate_start) * 1000
+    validation_by_tensor: dict[str, dict[str, Any]] = {}
+    for tensor_name, updated_tensor in updated.items():
+        expected_tensor = expected[tensor_name]
+        checksum = _tensor_checksum(updated_tensor)
+        expected_checksum = _tensor_checksum(expected_tensor)
+        validation_by_tensor[tensor_name] = {
+            "assembled_allclose": assembled_validation[tensor_name],
+            "allclose": _tensor_close(updated_tensor, expected_tensor),
+            "checksum": checksum,
+            "expected_checksum": expected_checksum,
+            "checksum_matches": checksum == expected_checksum,
+            "max_abs_error": _tensor_max_abs_error(updated_tensor, expected_tensor),
+            "original_checksum": _tensor_checksum(originals[tensor_name]),
+        }
+
+    restore_start = time.perf_counter()
+    restore_result = engine.update_weights_from_tensor(
+        list(originals.items()),
+        load_format="direct",
+        flush_cache=True,
+    )
+    restore_duration_ms = (time.perf_counter() - restore_start) * 1000
+    restore_success, restore_message = _sglang_update_succeeded(restore_result)
+    restored = {
+        tensor_name: _coerce_sglang_weight_to_tensor(
+            engine.get_weights_by_name(tensor_name, truncate_size=10_000_000),
+            name=tensor_name,
+        )
+        for tensor_name in originals
+    }
+    restored_by_tensor = {
+        tensor_name: _tensor_close(restored_tensor, originals[tensor_name])
+        for tensor_name, restored_tensor in restored.items()
+    }
+
+    source_count_per_target_tensor = {
+        tensor_name: len(
+            {plan.source_id for plan in plans if plan.tensor_name == tensor_name}
+        )
+        for tensor_name in originals
+    }
+    segment_count_per_target_tensor = {
+        tensor_name: sum(1 for plan in plans if plan.tensor_name == tensor_name)
+        for tensor_name in originals
+    }
+    trainer_to_inference_bytes = sum(plan.bytes for plan in plans)
+    target_tensor_bytes = sum(_nbytes(tensor) for tensor in originals.values())
+    allclose = all(item["allclose"] for item in validation_by_tensor.values())
+    checksum_matches = all(
+        item["checksum_matches"] for item in validation_by_tensor.values()
+    )
+    assembled_allclose = all(assembled_validation.values())
+    restored_original = all(restored_by_tensor.values())
+
+    proof = {
+        "sglang_imported": True,
+        "sglang_engine_started": True,
+        "sglang_engine_get_weights_by_name_used": True,
+        "sglang_engine_update_weights_from_tensor_used": True,
+        "sglang_engine_owned_target_tensors": True,
+        "sglang_owned_target_tensors": True,
+        "receiver_requests_from_sglang_engine_weights": True,
+        "receiver_requests_from_runtime_owned_tensors": True,
+        "receiver_segment_assembly_used": True,
+        "receiver_installed_into_sglang_engine_owned_tensors": allclose,
+        "receiver_installed_into_sglang_owned_tensors": allclose,
+        "receiver_installed_into_runtime_owned_tensors": allclose,
+        "runtime_imported": True,
+        "runtime_owned_target_tensors": True,
+        "target_tensor_count_gt1": len(originals) > 1,
+        "target_slice_spans_multiple_trainers": all(
+            count >= 2 for count in source_count_per_target_tensor.values()
+        ),
+        "multi_tensor_refit_transaction_used": True,
+        "checksum_gate": checksum_matches,
+        "allclose": allclose,
+        "restored_original_tensors": restored_original,
+        "trainer_full_all_gather_used": False,
+        "trainer_side_inference_layout_conversion_used": False,
+        "host_side_torch_cat_used": False,
+        "actual_nixl_reads_used": False,
+        "gpu_nixl_reads_used": False,
+        "synthetic_trainer_payloads_used": True,
+        "real_trainer_process_used": False,
+        "real_runtime_engine_used": True,
+        "live_runtime_engine_used": True,
+    }
+
+    result = {
+        "schema_version": 1,
+        "result": (
+            "pass"
+            if update_success
+            and assembled_allclose
+            and allclose
+            and checksum_matches
+            and restore_success
+            and restored_original
+            else "fail"
+        ),
+        "mode": mode,
+        "runtime_framework": "sglang",
+        "framework_version": sglang_version,
+        "sglang_version": sglang_version,
+        "model_name": model_name,
+        "model_version": model_version,
+        "model_path": model_path,
+        "engine_class": type(engine).__name__,
+        "module_class": "sglang.Engine",
+        "module_path": "sglang.Engine",
+        "target_tensor_count": len(originals),
+        "target_tensor_names": list(originals),
+        "target_tensors": {
+            tensor_name: {
+                "shape": list(_shape(tensor)),
+                "dtype": _torch_dtype_name(tensor.dtype),
+                "device": str(tensor.device),
+                "bytes": _nbytes(tensor),
+            }
+            for tensor_name, tensor in originals.items()
+        },
+        "requests": [request.to_dict() for request in requests],
+        "source_ownerships": [owner.to_dict() for owner in owners],
+        "segment_plans": [plan.to_dict() for plan in plans],
+        "installed_segments": [segment.__dict__ for segment in installed],
+        "proof": proof,
+        "validation": {
+            "assembled_allclose": assembled_allclose,
+            "allclose": allclose,
+            "checksum_matches": checksum_matches,
+            "restored_original": restored_original,
+            "by_tensor": validation_by_tensor,
+            "restored_by_tensor": restored_by_tensor,
+            "update_success": update_success,
+            "update_message": update_message,
+            "restore_success": restore_success,
+            "restore_message": restore_message,
+            "expected_optimizer_step_count": trainer_update.step_count,
+            "expected_learning_rate": trainer_update.learning_rate,
+        },
+        "metrics": {
+            "engine_start_duration_ms": engine_start_duration_ms,
+            "initial_weight_fetch_duration_ms": initial_fetch_duration_ms,
+            "planner_duration_ms": planner_duration_ms,
+            "segment_assembly_duration_ms": assemble_duration_ms,
+            "activation_install_duration_ms": update_duration_ms,
+            "validate_weight_fetch_duration_ms": validate_fetch_duration_ms,
+            "restore_duration_ms": restore_duration_ms,
+            "trainer_to_inference_bytes": trainer_to_inference_bytes,
+            "inference_side_fanout_bytes": 0,
+            "redundant_cross_boundary_factor": (
+                trainer_to_inference_bytes / target_tensor_bytes
+                if target_tensor_bytes
+                else 0.0
+            ),
+            "target_tensor_bytes": target_tensor_bytes,
+            "target_tensor_count": len(originals),
+            "segment_count": len(plans),
+            "segment_count_per_target_tensor": segment_count_per_target_tensor,
+            "source_count_per_target_tensor": source_count_per_target_tensor,
+        },
+        "trainer_source_update": trainer_step_source_provenance(
+            step_count=trainer_update.step_count,
+            learning_rate=trainer_update.learning_rate,
+        ),
+    }
+    if artifact_path is not None:
+        _write_artifact(result, artifact_path)
+    if result["result"] != "pass":
+        raise RuntimeError(f"SGLang multi-tensor receiver smoke failed: {result!r}")
+    return result
+
+
 def run_sglang_receiver_refit_on_module(
     module: torch.nn.Module,
     *,
@@ -425,6 +737,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default="mx-live-sglang-receiver-smoke")
     parser.add_argument("--model-version", default="step-live-sglang-receiver")
     parser.add_argument("--preferred-tensor-name", default="lm_head.weight")
+    parser.add_argument("--multi-tensor", action="store_true")
+    parser.add_argument(
+        "--preferred-tensor-names",
+        default="model.embed_tokens.weight,lm_head.weight",
+        help="comma-separated preferred tensor names for --multi-tensor",
+    )
+    parser.add_argument("--tensor-count", type=int, default=2)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--context-length", type=int, default=64)
     parser.add_argument("--mem-fraction-static", type=float, default=0.2)
@@ -458,20 +777,38 @@ def main() -> None:
             log_level=args.log_level,
         )
         engine_start_duration_ms = (time.perf_counter() - engine_start) * 1000
-        result = run_sglang_receiver_refit_on_engine(
-            engine,
-            model_name=args.model_name,
-            model_version=args.model_version,
-            sglang_version=version,
-            preferred_tensor_name=args.preferred_tensor_name,
-            artifact_path=args.artifact_path,
-            model_path=model_path,
-            engine_start_duration_ms=engine_start_duration_ms,
-        )
+        if args.multi_tensor:
+            result = run_sglang_receiver_multitensor_refit_on_engine(
+                engine,
+                model_name=args.model_name,
+                model_version=args.model_version,
+                sglang_version=version,
+                preferred_tensor_names=tuple(
+                    name.strip()
+                    for name in args.preferred_tensor_names.split(",")
+                    if name.strip()
+                ),
+                tensor_count=args.tensor_count,
+                artifact_path=args.artifact_path,
+                model_path=model_path,
+                engine_start_duration_ms=engine_start_duration_ms,
+            )
+        else:
+            result = run_sglang_receiver_refit_on_engine(
+                engine,
+                model_name=args.model_name,
+                model_version=args.model_version,
+                sglang_version=version,
+                preferred_tensor_name=args.preferred_tensor_name,
+                artifact_path=args.artifact_path,
+                model_path=model_path,
+                engine_start_duration_ms=engine_start_duration_ms,
+            )
         print(
             "MX_SGLANG_RECEIVER_SMOKE "
-            f"result={result['result']} tensor={result['target_tensor_name']} "
-            f"shape={result['target_shape']} allclose={result['validation']['allclose']} "
+            f"result={result['result']} "
+            f"tensors={result.get('target_tensor_names', [result.get('target_tensor_name')])} "
+            f"allclose={result['validation']['allclose']} "
             f"checksum_matches={result['validation']['checksum_matches']}",
             flush=True,
         )

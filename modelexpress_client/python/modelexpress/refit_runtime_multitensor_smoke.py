@@ -282,6 +282,10 @@ def run_runtime_multitensor_refit_smoke(
     previous_model_version: str = "previous-runtime-version",
     artifact_path: str | Path | None = None,
     mode: str = "runtime-multitensor-refit-smoke",
+    runtime_imported: bool = False,
+    real_runtime_engine_used: bool = False,
+    actual_nixl_reads_used: bool = False,
+    gpu_nixl_reads_used: bool = False,
 ) -> dict[str, Any]:
     """Install and roll back a multi-tensor refit bundle."""
 
@@ -340,11 +344,7 @@ def run_runtime_multitensor_refit_smoke(
     target_key_by_tensor = _target_key_by_tensor(requests)
     source_count_per_target_tensor = {
         tensor_name: len(
-            {
-                plan.source_id
-                for plan in plans
-                if plan.tensor_name == tensor_name
-            }
+            {plan.source_id for plan in plans if plan.tensor_name == tensor_name}
         )
         for tensor_name in owned_tensors
     }
@@ -362,7 +362,12 @@ def run_runtime_multitensor_refit_smoke(
         "runtime_framework": runtime_framework,
         "receiver_requests_from_runtime_owned_tensors": True,
         "receiver_installed_into_runtime_owned_tensors": allclose,
+        f"{runtime_framework}_owned_target_tensors": True,
+        f"receiver_installed_into_{runtime_framework}_owned_tensors": allclose,
+        "runtime_imported": bool(runtime_imported),
         "runtime_owned_target_tensors": True,
+        "real_runtime_engine_used": bool(real_runtime_engine_used),
+        "live_runtime_engine_used": bool(real_runtime_engine_used),
         "multi_tensor_refit_transaction_used": True,
         "target_tensor_count_gt1": len(owned_tensors) > 1,
         "target_slice_spans_multiple_trainers": all(
@@ -374,9 +379,8 @@ def run_runtime_multitensor_refit_smoke(
         "synthetic_training_objective_used": True,
         "synthetic_source_values_used": False,
         "static_replacement_formula_source_values_used": False,
-        "actual_nixl_reads_used": False,
-        "gpu_nixl_reads_used": False,
-        "live_runtime_engine_used": False,
+        "actual_nixl_reads_used": bool(actual_nixl_reads_used),
+        "gpu_nixl_reads_used": bool(gpu_nixl_reads_used),
         "nixl_reads_land_directly_in_runtime_tensor": False,
         "runtime_update_from_segment_payloads": allclose,
         "restored_original_tensors": restored_original,
@@ -391,7 +395,9 @@ def run_runtime_multitensor_refit_smoke(
 
     result = {
         "schema_version": 1,
-        "result": "pass" if allclose and checksum_matches and restored_original else "fail",
+        "result": (
+            "pass" if allclose and checksum_matches and restored_original else "fail"
+        ),
         "mode": mode,
         "runtime_framework": runtime_framework,
         "model_name": model_name,

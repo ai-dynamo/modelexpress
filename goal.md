@@ -490,6 +490,28 @@ Artifacts under `artifacts/resharding/` prove:
   boundary: this is nscale CPU/runtime-tensor transaction evidence only; it
   explicitly records `actual_nixl_reads_used=false`,
   `gpu_nixl_reads_used=false`, and `live_runtime_engine_used=false`.
+- The receiver smoke APIs now have live-engine multi-tensor wrappers ready for
+  the next GPU proof attempt: vLLM runs the shared multi-tensor transaction
+  inside the existing `LLM.apply_model` worker boundary, and SGLang installs a
+  two-weight bundle through one `Engine.update_weights_from_tensor` call before
+  validating/restoring each weight through `Engine.get_weights_by_name`.
+  Evidence:
+  `artifacts/resharding/nscale-live-engine-multitensor-api-pytest-20260605.log`,
+  `artifacts/resharding/nscale-live-engine-multitensor-regression-pytest-20260605.log`,
+  and
+  `artifacts/resharding/nscale-cursor-code-review-live-engine-multitensor-20260605.md`.
+  The focused nscale regression covering these wrappers plus existing
+  vLLM/SGLang NIXL runtime smokes passed `29 passed`. Scope boundary: this is
+  API/unit evidence with fake `apply_model`/fake SGLang `Engine` wrappers; it
+  does **not** prove live GPU execution.
+- A bounded live-GPU multi-tensor receiver smoke attempt was capacity-blocked:
+  `artifacts/resharding/nscale-live-runtime-multitensor-gpu-capacity-block-20260605.json`
+  and `.log` record the 1-GPU vLLM proof pod
+  `mx-vllm-multitensor-20260605` stuck Pending with `0/29 nodes are available`,
+  `10 Insufficient nvidia.com/gpu`, `19 node(s) had untolerated taint(s)`, and
+  autoscaler `max node group size reached`. The artifact records
+  `proof_claim_safe=false` and blocks live GPU vLLM/SGLang multi-tensor and
+  multi-tensor NIXL claims for this pass.
 - `artifacts/resharding/nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-bw4bt-import-hang-20260605.json`
   banks the first rank-1 placement for that vLLM distributed-trainer runtime
   proof on `cluster-0967a26d-pool-14bee067-prctr-bw4bt`. The pod scheduled and
@@ -575,8 +597,9 @@ The current POC does **not** prove:
   deletion, but it is not real trainer/runtime integration.
 - Full-model or multi-layer live runtime refit. Multi-tensor CPU/runtime-tensor
   transaction semantics are now proven for two vLLM-tagged and SGLang-tagged
-  tensors, but live GPU NIXL/runtime-engine multi-tensor refit remains
-  unproven.
+  tensors, and live-engine multi-tensor API wrappers are unit-tested, but live
+  GPU runtime-engine multi-tensor refit and multi-tensor GPU NIXL movement
+  remain unproven because the 1-GPU nscale proof pod was capacity-blocked.
 - Runtime installation of real Qwen MoE model tensors.
 - End-to-end runtime fallback installation using real Qwen FP8 payload bytes
   and real runtime-owned model tensors after `global-required` metadata is
@@ -827,6 +850,16 @@ Current partial evidence:
   runtime smokes reports `18 passed`. This is not live engine, GPU NIXL, or
   full-model evidence; it is the receiver transaction shape needed before
   scaling the live bridges beyond one tensor.
+- vLLM and SGLang receiver smoke modules now expose live-engine multi-tensor
+  wrapper APIs. vLLM uses the existing `LLM.apply_model` worker callback path
+  to mutate and restore two worker-owned tensors in one transaction; SGLang
+  uses one `Engine.update_weights_from_tensor` call for a two-weight bundle and
+  validates/restores each weight via `Engine.get_weights_by_name`. nscale API
+  tests passed, and the broader focused regression including existing
+  vLLM/SGLang NIXL runtime smoke tests is banked in
+  `artifacts/resharding/nscale-live-engine-multitensor-regression-pytest-20260605.log`
+  (`29 passed`). A bounded 1-GPU live vLLM pod attempt was scheduler-blocked,
+  so this is not yet live GPU evidence.
 - `modelexpress.refit_vllm_receiver_smoke` now provides a live vLLM V1
   receiver-owned tensor smoke through `LLM.apply_model`, plus a
   framework-explicit module helper. The live entrypoint creates a tiny Qwen2
@@ -1046,8 +1079,9 @@ These are the next useful things to do, in order:
 
 1. Extend the live GPU runtime bridge placement work beyond tiny single-tensor
    vLLM and SGLang targets while keeping the allclose/checksum gates. The
-   CPU/runtime-tensor multi-tensor transaction shape is now banked; the next
-   proof needs real engine-owned multi-tensor install plus NIXL data movement.
+   CPU/runtime-tensor multi-tensor transaction shape and live-engine API
+   wrappers are now banked; the next proof needs schedulable GPU capacity for
+   real engine-owned multi-tensor install plus NIXL data movement.
 2. Promote the runtime bridges into each engine's production post-load/refit
    lifecycle, using the same source-published ownership and receiver-side
    request path.

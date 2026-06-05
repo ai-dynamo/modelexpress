@@ -1,0 +1,49 @@
+NAME                           READY   STATUS    RESTARTS   AGE     IP       NODE     NOMINATED NODE   READINESS GATES
+mx-vllm-multitensor-20260605   0/1     Pending   0          3m25s   <none>   <none>   <none>           <none>
+Name:             mx-vllm-multitensor-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             <none>
+Labels:           app=mx-vllm-multitensor
+Annotations:      <none>
+Status:           Pending
+IP:
+IPs:              <none>
+Containers:
+  main:
+    Image:      docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Port:       <none>
+    Host Port:  <none>
+    Command:
+      bash
+      -lc
+      sleep 7200
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:
+      CUDA_VISIBLE_DEVICES:               0
+      VLLM_ALLOW_INSECURE_SERIALIZATION:  1
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-wtx69 (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False
+Volumes:
+  kube-api-access-wtx69:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason             Age    From                Message
+  ----     ------             ----   ----                -------
+  Warning  FailedScheduling   3m27s  default-scheduler   0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.
+  Normal   NotTriggerScaleUp  3m22s  cluster-autoscaler  pod didn't trigger scale-up: 1 max node group size reached

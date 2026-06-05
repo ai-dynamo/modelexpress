@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "result": "blocked-capacity",
+  "proof_claim_safe": false,
+  "attempted_scope": "live GPU runtime multi-tensor receiver smoke",
+  "attempted_runtime": "vllm",
+  "pod": "mx-vllm-multitensor-20260605",
+  "namespace": "anish-dynamo",
+  "image": "docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a",
+  "requested_gpu_count": 1,
+  "scheduler_evidence": {
+    "pod_status": "Pending",
+    "pod_scheduled": false,
+    "failed_scheduling_message": "0/29 nodes are available: 10 Insufficient nvidia.com/gpu, 19 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/29 nodes are available: 29 Preemption is not helpful for scheduling.",
+    "autoscaler_message": "pod didn't trigger scale-up: 1 max node group size reached"
+  },
+  "blocked_claims": [
+    "live GPU vLLM multi-tensor receiver install",
+    "live GPU SGLang multi-tensor receiver install",
+    "multi-tensor GPU NIXL runtime bridge"
+  ],
+  "preserved_claim": "nscale CPU tests prove live-engine multi-tensor API paths with fake vLLM apply_model and fake SGLang Engine wrappers; live GPU execution is not proven by this artifact.",
+  "supporting_log": "artifacts/resharding/nscale-live-runtime-multitensor-gpu-capacity-block-20260605.log",
+  "cleanup": {
+    "pending_pod_deleted": true
+  }
+}

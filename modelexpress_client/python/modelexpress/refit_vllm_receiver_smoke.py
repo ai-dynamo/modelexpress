@@ -96,6 +96,16 @@ def _run_receiver_refit_on_worker_model(
     return run_receiver_refit_on_module(model, **kwargs)
 
 
+def _run_receiver_multitensor_refit_on_worker_model(
+    model: torch.nn.Module,
+    *,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the multi-tensor receiver smoke inside a vLLM worker."""
+
+    return run_receiver_multitensor_refit_on_module(model, **kwargs)
+
+
 def _replacement_payload_like(tensor: torch.Tensor) -> torch.Tensor:
     values = torch.arange(tensor.numel(), device=tensor.device, dtype=torch.float32)
     values = ((values % 257) - 128) / 8
@@ -189,6 +199,62 @@ def _select_refit_tensor(
             if name.endswith(suffix):
                 return name, tensor
     return candidates[0]
+
+
+def _select_refit_tensors(
+    named_tensors: Iterable[tuple[str, torch.Tensor]],
+    *,
+    preferred_names: Iterable[str] = (),
+    count: int = 2,
+) -> dict[str, torch.Tensor]:
+    """Select multiple mutable runtime tensors for a refit transaction."""
+
+    if int(count) < 2:
+        raise ValueError("multi-tensor receiver smoke requires count >= 2")
+    candidates = [
+        (name, tensor)
+        for name, tensor in named_tensors
+        if tensor.ndim >= 2
+        and int(tensor.shape[0]) >= 2
+        and torch.is_floating_point(tensor)
+    ]
+    if not candidates:
+        raise RuntimeError("no rank-2 floating runtime-owned tensors are available")
+
+    by_name = {name: tensor for name, tensor in candidates}
+    selected: dict[str, torch.Tensor] = {}
+    for preferred_name in preferred_names:
+        if not preferred_name:
+            continue
+        if preferred_name not in by_name:
+            raise RuntimeError(
+                f"preferred runtime tensor {preferred_name!r} was not found"
+            )
+        selected[preferred_name] = by_name[preferred_name]
+
+    for suffix in DEFAULT_TENSOR_SUFFIXES:
+        for name, tensor in candidates:
+            if len(selected) >= int(count):
+                break
+            if name in selected:
+                continue
+            if name.endswith(suffix):
+                selected[name] = tensor
+        if len(selected) >= int(count):
+            break
+
+    for name, tensor in candidates:
+        if len(selected) >= int(count):
+            break
+        if name not in selected:
+            selected[name] = tensor
+
+    if len(selected) < int(count):
+        raise RuntimeError(
+            f"needed {int(count)} runtime tensors, found {len(selected)} usable "
+            f"tensors: {list(selected)}"
+        )
+    return selected
 
 
 def _module_has_parameters(module: torch.nn.Module) -> bool:
@@ -524,6 +590,78 @@ def run_receiver_refit_on_module(
     return result
 
 
+def run_receiver_multitensor_refit_on_module(
+    module: torch.nn.Module,
+    *,
+    model_name: str,
+    model_version: str,
+    module_path: str,
+    vllm_version: str = "",
+    runtime_framework: str = "vllm",
+    framework_version: str | None = None,
+    runtime_imported: bool = False,
+    real_runtime_engine_used: bool = False,
+    preferred_tensor_names: Iterable[str] = (),
+    tensor_count: int = 2,
+    artifact_path: str | Path | None = None,
+    mode: str = "live-vllm-receiver-owned-multitensor-smoke",
+    model_path: str = "",
+) -> dict[str, Any]:
+    """Run a multi-tensor runtime refit transaction on a module."""
+
+    from .refit_runtime_multitensor_smoke import (
+        run_runtime_multitensor_refit_smoke,
+    )
+
+    runtime_framework = runtime_framework.strip().lower()
+    if not runtime_framework:
+        raise ValueError("runtime_framework is required")
+    if framework_version is None:
+        framework_version = vllm_version if runtime_framework == "vllm" else ""
+    if not framework_version:
+        framework_version = "unknown"
+
+    tensors = _select_refit_tensors(
+        module.named_parameters(),
+        preferred_names=preferred_tensor_names,
+        count=tensor_count,
+    )
+    result = run_runtime_multitensor_refit_smoke(
+        tensors,
+        runtime_framework=runtime_framework,
+        model_name=model_name,
+        model_version=model_version,
+        artifact_path=None,
+        mode=mode,
+        runtime_imported=runtime_imported,
+        real_runtime_engine_used=real_runtime_engine_used,
+    )
+    result.update(
+        {
+            "framework_version": framework_version,
+            "vllm_version": (
+                framework_version if runtime_framework == "vllm" else vllm_version
+            ),
+            "model_path": model_path,
+            "module_class": type(module).__name__,
+            "module_path": module_path,
+        }
+    )
+    result["proof"][f"{runtime_framework}_owned_target_tensors"] = True
+    result["proof"][f"receiver_installed_into_{runtime_framework}_owned_tensors"] = (
+        bool(result["validation"]["allclose"])
+    )
+    result["proof"]["runtime_module_path_used"] = True
+    if artifact_path is not None:
+        _write_artifact(result, artifact_path)
+    if result["result"] != "pass":
+        raise RuntimeError(
+            f"{runtime_framework} multi-tensor receiver smoke failed: "
+            f"{json.dumps(result, default=_json_default)}"
+        )
+    return result
+
+
 def run_receiver_refit_on_vllm_llm(
     llm: Any,
     *,
@@ -594,6 +732,83 @@ def run_receiver_refit_on_vllm_llm(
     )
 
 
+def run_receiver_multitensor_refit_on_vllm_llm(
+    llm: Any,
+    *,
+    model_name: str,
+    model_version: str,
+    vllm_version: str,
+    preferred_tensor_names: Iterable[str] = (),
+    tensor_count: int = 2,
+    artifact_path: str | Path | None = None,
+    mode: str = "live-vllm-receiver-owned-multitensor-smoke",
+    model_path: str = "",
+) -> dict[str, Any]:
+    """Run multi-tensor receiver refit against a live vLLM engine."""
+
+    apply_model = getattr(llm, "apply_model", None)
+    if callable(apply_model):
+        worker_kwargs = {
+            "model_name": model_name,
+            "model_version": model_version,
+            "module_path": "llm.apply_model.worker_model",
+            "vllm_version": vllm_version,
+            "runtime_framework": "vllm",
+            "framework_version": vllm_version,
+            "runtime_imported": True,
+            "real_runtime_engine_used": True,
+            "preferred_tensor_names": tuple(preferred_tensor_names),
+            "tensor_count": tensor_count,
+            "artifact_path": None,
+            "mode": mode,
+            "model_path": model_path,
+        }
+        results = apply_model(
+            partial(
+                _run_receiver_multitensor_refit_on_worker_model,
+                kwargs=worker_kwargs,
+            )
+        )
+        if not results:
+            raise RuntimeError("vLLM apply_model returned no worker results")
+        result = results[0]
+        result["worker_result_count"] = len(results)
+        result["runtime_module_discovery_path"] = "vllm.apply_model"
+        result["proof"]["vllm_apply_model_used"] = True
+        result["proof"]["vllm_worker_owned_target_tensors"] = True
+        result["proof"]["real_runtime_engine_used"] = True
+        result["proof"]["live_runtime_engine_used"] = True
+        result["proof"]["vllm_apply_model_insecure_serialization_enabled"] = (
+            os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") == "1"
+        )
+        if artifact_path is not None:
+            _write_artifact(result, artifact_path)
+        if result["result"] != "pass":
+            raise RuntimeError(
+                "vLLM apply_model multi-tensor receiver smoke failed: "
+                f"{json.dumps(result, default=_json_default)}"
+            )
+        return result
+
+    module_path, module = _find_vllm_module(llm)
+    return run_receiver_multitensor_refit_on_module(
+        module,
+        model_name=model_name,
+        model_version=model_version,
+        module_path=module_path,
+        vllm_version=vllm_version,
+        runtime_framework="vllm",
+        framework_version=vllm_version,
+        runtime_imported=True,
+        real_runtime_engine_used=True,
+        preferred_tensor_names=preferred_tensor_names,
+        tensor_count=tensor_count,
+        artifact_path=artifact_path,
+        mode=mode,
+        model_path=model_path,
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-path", required=True)
@@ -601,6 +816,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default="mx-live-vllm-receiver-smoke")
     parser.add_argument("--model-version", default="step-live-vllm-receiver")
     parser.add_argument("--preferred-tensor-name", default="")
+    parser.add_argument("--multi-tensor", action="store_true")
+    parser.add_argument(
+        "--preferred-tensor-names",
+        default="model.embed_tokens.weight,lm_head.weight",
+        help="comma-separated preferred tensor names for --multi-tensor",
+    )
+    parser.add_argument("--tensor-count", type=int, default=2)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.1)
@@ -627,15 +849,31 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         distributed_executor_backend=args.distributed_executor_backend,
     )
-    result = run_receiver_refit_on_vllm_llm(
-        llm,
-        model_name=args.model_name,
-        model_version=args.model_version,
-        vllm_version=getattr(vllm, "__version__", "unknown"),
-        preferred_tensor_name=args.preferred_tensor_name,
-        artifact_path=args.artifact_path,
-        model_path=model_path,
-    )
+    if args.multi_tensor:
+        result = run_receiver_multitensor_refit_on_vllm_llm(
+            llm,
+            model_name=args.model_name,
+            model_version=args.model_version,
+            vllm_version=getattr(vllm, "__version__", "unknown"),
+            preferred_tensor_names=tuple(
+                name.strip()
+                for name in args.preferred_tensor_names.split(",")
+                if name.strip()
+            ),
+            tensor_count=args.tensor_count,
+            artifact_path=args.artifact_path,
+            model_path=model_path,
+        )
+    else:
+        result = run_receiver_refit_on_vllm_llm(
+            llm,
+            model_name=args.model_name,
+            model_version=args.model_version,
+            vllm_version=getattr(vllm, "__version__", "unknown"),
+            preferred_tensor_name=args.preferred_tensor_name,
+            artifact_path=args.artifact_path,
+            model_path=model_path,
+        )
     print(
         "MX_VLLM_RECEIVER_SMOKE_RESULT "
         + json.dumps(result, default=_json_default, sort_keys=True),

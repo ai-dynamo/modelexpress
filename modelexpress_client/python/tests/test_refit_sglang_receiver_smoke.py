@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from modelexpress.refit_sglang_receiver_smoke import (
     run_sglang_receiver_refit_on_engine,
+    run_sglang_receiver_multitensor_refit_on_engine,
     run_sglang_receiver_refit_on_module,
 )
 
@@ -22,8 +23,13 @@ class TinySglangOwnedModule(nn.Module):
 
 
 class FakeSglangEngine:
-    def __init__(self, weight: torch.Tensor) -> None:
-        self.weights = {"lm_head.weight": weight.detach().clone()}
+    def __init__(self, weight: torch.Tensor | dict[str, torch.Tensor]) -> None:
+        if isinstance(weight, dict):
+            self.weights = {
+                name: tensor.detach().clone() for name, tensor in weight.items()
+            }
+        else:
+            self.weights = {"lm_head.weight": weight.detach().clone()}
         self.get_weight_calls = 0
         self.update_weight_calls = 0
 
@@ -145,3 +151,64 @@ def test_sglang_receiver_smoke_uses_engine_weight_update_path(tmp_path):
     payload = json.loads(artifact_path.read_text())
     assert payload["proof"]["sglang_engine_update_weights_from_tensor_used"] is True
     assert payload["metrics"]["segment_count"] == 2
+
+
+def test_sglang_receiver_smoke_uses_engine_multitensor_update_path(tmp_path):
+    originals = {
+        "model.embed_tokens.weight": torch.arange(32, dtype=torch.float32).reshape(
+            8, 4
+        ),
+        "lm_head.weight": torch.arange(24, dtype=torch.float32).reshape(6, 4),
+    }
+    engine = FakeSglangEngine(originals)
+    artifact_path = tmp_path / "sglang-engine-multitensor-receiver-smoke.json"
+
+    result = run_sglang_receiver_multitensor_refit_on_engine(
+        engine,
+        model_name="tiny-sglang-engine",
+        model_version="step-engine-multitensor",
+        sglang_version="unit-test",
+        preferred_tensor_names=(
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ),
+        artifact_path=artifact_path,
+        model_path="unit-tiny-llama",
+    )
+
+    assert result["result"] == "pass"
+    assert result["runtime_framework"] == "sglang"
+    assert result["target_tensor_count"] == 2
+    assert result["target_tensor_names"] == [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+    ]
+    assert result["proof"]["sglang_engine_started"] is True
+    assert result["proof"]["sglang_engine_get_weights_by_name_used"] is True
+    assert result["proof"]["sglang_engine_update_weights_from_tensor_used"] is True
+    assert result["proof"]["sglang_engine_owned_target_tensors"] is True
+    assert result["proof"]["receiver_requests_from_sglang_engine_weights"] is True
+    assert result["proof"]["receiver_segment_assembly_used"] is True
+    assert (
+        result["proof"]["receiver_installed_into_sglang_engine_owned_tensors"] is True
+    )
+    assert result["proof"]["real_runtime_engine_used"] is True
+    assert result["proof"]["live_runtime_engine_used"] is True
+    assert result["proof"]["actual_nixl_reads_used"] is False
+    assert result["validation"]["assembled_allclose"] is True
+    assert result["validation"]["checksum_matches"] is True
+    assert result["validation"]["restored_original"] is True
+    assert result["metrics"]["segment_count"] == 4
+    assert result["metrics"]["trainer_to_inference_bytes"] == 224
+    assert result["metrics"]["source_count_per_target_tensor"] == {
+        "model.embed_tokens.weight": 2,
+        "lm_head.weight": 2,
+    }
+    assert engine.get_weight_calls >= 6
+    assert engine.update_weight_calls == 2
+    for name, original in originals.items():
+        torch.testing.assert_close(engine.weights[name], original)
+
+    payload = json.loads(artifact_path.read_text())
+    assert payload["proof"]["sglang_engine_update_weights_from_tensor_used"] is True
+    assert payload["target_tensor_count"] == 2
