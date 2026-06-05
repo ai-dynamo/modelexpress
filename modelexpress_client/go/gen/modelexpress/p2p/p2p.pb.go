@@ -472,8 +472,11 @@ func (x *TensorDescriptor) GetDtype() string {
 }
 
 // Small discovery summary for file-backed artifact sources. This does not carry
-// full file or chunk manifests; targets use WorkerService manifest header/page
-// RPCs for the sealed manifest before any future byte-transfer path.
+// full file or chunk manifests, and it does not carry lifecycle status.
+// Readiness/staleness is source-record scoped and lives in WorkerMetadata.status
+// so ListSources(status_filter=READY) works uniformly for tensor and artifact
+// sources. Targets use WorkerService manifest header/page RPCs for the sealed
+// manifest before any byte-transfer path.
 type ArtifactSourceMetadata struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Digest of the canonical sealed artifact manifest.
@@ -694,7 +697,8 @@ type ArtifactManifestFile struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// File index used by ArtifactManifestChunk.file_index.
 	FileIndex uint32 `protobuf:"varint,1,opt,name=file_index,json=fileIndex,proto3" json:"file_index,omitempty"`
-	// Canonical absolute install path using "/" separators.
+	// Canonical absolute publisher path using "/" separators. Transfer targets
+	// may rewrite this to a target-local staging path before installation.
 	Path string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	// File size in bytes.
 	Size uint64 `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
@@ -869,8 +873,8 @@ type WorkerMetadata struct {
 	MetadataEndpoint string `protobuf:"bytes,6,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
 	// NIXL agent name (used by targets to identify the remote agent)
 	AgentName string `protobuf:"bytes,7,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
-	// host:port for the worker's gRPC WorkerService, used for tensor and artifact
-	// manifests. Artifact byte transfer is not part of this endpoint yet.
+	// host:port for the worker's gRPC WorkerService, used for tensor manifests,
+	// artifact manifests, and artifact chunk transfer coordination.
 	WorkerGrpcEndpoint string `protobuf:"bytes,8,opt,name=worker_grpc_endpoint,json=workerGrpcEndpoint,proto3" json:"worker_grpc_endpoint,omitempty"`
 	// Source-type-specific bounded metadata. This selects the metadata payload
 	// shape, not a transfer endpoint. Readers should prefer tensor_source over
@@ -1521,6 +1525,382 @@ func (x *GetArtifactManifestChunksResponse) GetNextPageToken() string {
 	return ""
 }
 
+type ArtifactChunkTransferDescriptor struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Registered source buffer address for the prepared chunk.
+	Addr uint64 `protobuf:"varint,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	// Prepared range length in bytes.
+	Length uint64 `protobuf:"varint,2,opt,name=length,proto3" json:"length,omitempty"`
+	// NIXL device id for the prepared range. DRAM buffers use 0.
+	DeviceId uint32 `protobuf:"varint,3,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	// NIXL memory type for prep_xfer_dlist, for example "DRAM".
+	MemType       string `protobuf:"bytes,4,opt,name=mem_type,json=memType,proto3" json:"mem_type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ArtifactChunkTransferDescriptor) Reset() {
+	*x = ArtifactChunkTransferDescriptor{}
+	mi := &file_p2p_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ArtifactChunkTransferDescriptor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ArtifactChunkTransferDescriptor) ProtoMessage() {}
+
+func (x *ArtifactChunkTransferDescriptor) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ArtifactChunkTransferDescriptor.ProtoReflect.Descriptor instead.
+func (*ArtifactChunkTransferDescriptor) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ArtifactChunkTransferDescriptor) GetAddr() uint64 {
+	if x != nil {
+		return x.Addr
+	}
+	return 0
+}
+
+func (x *ArtifactChunkTransferDescriptor) GetLength() uint64 {
+	if x != nil {
+		return x.Length
+	}
+	return 0
+}
+
+func (x *ArtifactChunkTransferDescriptor) GetDeviceId() uint32 {
+	if x != nil {
+		return x.DeviceId
+	}
+	return 0
+}
+
+func (x *ArtifactChunkTransferDescriptor) GetMemType() string {
+	if x != nil {
+		return x.MemType
+	}
+	return ""
+}
+
+type PrepareArtifactChunkRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// mx_source_id for validation (catches stale discovery)
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// Optional artifact_id from ArtifactSourceMetadata for validation.
+	ArtifactId string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	// Global chunk index to fetch.
+	ChunkIndex    uint32 `protobuf:"varint,3,opt,name=chunk_index,json=chunkIndex,proto3" json:"chunk_index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PrepareArtifactChunkRequest) Reset() {
+	*x = PrepareArtifactChunkRequest{}
+	mi := &file_p2p_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrepareArtifactChunkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrepareArtifactChunkRequest) ProtoMessage() {}
+
+func (x *PrepareArtifactChunkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrepareArtifactChunkRequest.ProtoReflect.Descriptor instead.
+func (*PrepareArtifactChunkRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PrepareArtifactChunkRequest) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkRequest) GetArtifactId() string {
+	if x != nil {
+		return x.ArtifactId
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkRequest) GetChunkIndex() uint32 {
+	if x != nil {
+		return x.ChunkIndex
+	}
+	return 0
+}
+
+type PrepareArtifactChunkResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Echoed mx_source_id for confirmation.
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// SHA256 digest of the canonical sealed artifact manifest.
+	ArtifactId string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	// Lease that keeps the source-side registered range alive until released.
+	LeaseId string `protobuf:"bytes,3,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	// Metadata for the prepared chunk.
+	Chunk *ArtifactManifestChunk `protobuf:"bytes,4,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	// NIXL source descriptor for this chunk.
+	Source *ArtifactChunkTransferDescriptor `protobuf:"bytes,5,opt,name=source,proto3" json:"source,omitempty"`
+	// Self-describing worker info, matching GetArtifactManifestHeaderResponse.
+	MetadataEndpoint string `protobuf:"bytes,6,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
+	AgentName        string `protobuf:"bytes,7,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
+	WorkerRank       uint32 `protobuf:"varint,8,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// NIXL metadata for the source agent after this chunk has been prepared.
+	SourceMetadata []byte `protobuf:"bytes,9,opt,name=source_metadata,json=sourceMetadata,proto3" json:"source_metadata,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PrepareArtifactChunkResponse) Reset() {
+	*x = PrepareArtifactChunkResponse{}
+	mi := &file_p2p_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrepareArtifactChunkResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrepareArtifactChunkResponse) ProtoMessage() {}
+
+func (x *PrepareArtifactChunkResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrepareArtifactChunkResponse.ProtoReflect.Descriptor instead.
+func (*PrepareArtifactChunkResponse) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *PrepareArtifactChunkResponse) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkResponse) GetArtifactId() string {
+	if x != nil {
+		return x.ArtifactId
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkResponse) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkResponse) GetChunk() *ArtifactManifestChunk {
+	if x != nil {
+		return x.Chunk
+	}
+	return nil
+}
+
+func (x *PrepareArtifactChunkResponse) GetSource() *ArtifactChunkTransferDescriptor {
+	if x != nil {
+		return x.Source
+	}
+	return nil
+}
+
+func (x *PrepareArtifactChunkResponse) GetMetadataEndpoint() string {
+	if x != nil {
+		return x.MetadataEndpoint
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkResponse) GetAgentName() string {
+	if x != nil {
+		return x.AgentName
+	}
+	return ""
+}
+
+func (x *PrepareArtifactChunkResponse) GetWorkerRank() uint32 {
+	if x != nil {
+		return x.WorkerRank
+	}
+	return 0
+}
+
+func (x *PrepareArtifactChunkResponse) GetSourceMetadata() []byte {
+	if x != nil {
+		return x.SourceMetadata
+	}
+	return nil
+}
+
+type ReleaseArtifactChunkRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// mx_source_id for validation (catches stale discovery)
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// Optional artifact_id from ArtifactSourceMetadata for validation.
+	ArtifactId string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	// Lease returned by PrepareArtifactChunk.
+	LeaseId       string `protobuf:"bytes,3,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseArtifactChunkRequest) Reset() {
+	*x = ReleaseArtifactChunkRequest{}
+	mi := &file_p2p_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseArtifactChunkRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseArtifactChunkRequest) ProtoMessage() {}
+
+func (x *ReleaseArtifactChunkRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseArtifactChunkRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseArtifactChunkRequest) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ReleaseArtifactChunkRequest) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *ReleaseArtifactChunkRequest) GetArtifactId() string {
+	if x != nil {
+		return x.ArtifactId
+	}
+	return ""
+}
+
+func (x *ReleaseArtifactChunkRequest) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+type ReleaseArtifactChunkResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Echoed mx_source_id for confirmation.
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// SHA256 digest of the canonical sealed artifact manifest.
+	ArtifactId string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	// Released chunk metadata.
+	Chunk         *ArtifactManifestChunk `protobuf:"bytes,3,opt,name=chunk,proto3" json:"chunk,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseArtifactChunkResponse) Reset() {
+	*x = ReleaseArtifactChunkResponse{}
+	mi := &file_p2p_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseArtifactChunkResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseArtifactChunkResponse) ProtoMessage() {}
+
+func (x *ReleaseArtifactChunkResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_p2p_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseArtifactChunkResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseArtifactChunkResponse) Descriptor() ([]byte, []int) {
+	return file_p2p_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ReleaseArtifactChunkResponse) GetMxSourceId() string {
+	if x != nil {
+		return x.MxSourceId
+	}
+	return ""
+}
+
+func (x *ReleaseArtifactChunkResponse) GetArtifactId() string {
+	if x != nil {
+		return x.ArtifactId
+	}
+	return ""
+}
+
+func (x *ReleaseArtifactChunkResponse) GetChunk() *ArtifactManifestChunk {
+	if x != nil {
+		return x.Chunk
+	}
+	return nil
+}
+
 type PublishMetadataRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Source identity — the server computes mx_source_id from this
@@ -1537,7 +1917,7 @@ type PublishMetadataRequest struct {
 
 func (x *PublishMetadataRequest) Reset() {
 	*x = PublishMetadataRequest{}
-	mi := &file_p2p_proto_msgTypes[14]
+	mi := &file_p2p_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1549,7 +1929,7 @@ func (x *PublishMetadataRequest) String() string {
 func (*PublishMetadataRequest) ProtoMessage() {}
 
 func (x *PublishMetadataRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[14]
+	mi := &file_p2p_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1562,7 +1942,7 @@ func (x *PublishMetadataRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishMetadataRequest.ProtoReflect.Descriptor instead.
 func (*PublishMetadataRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{14}
+	return file_p2p_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PublishMetadataRequest) GetIdentity() *SourceIdentity {
@@ -1600,7 +1980,7 @@ type PublishMetadataResponse struct {
 
 func (x *PublishMetadataResponse) Reset() {
 	*x = PublishMetadataResponse{}
-	mi := &file_p2p_proto_msgTypes[15]
+	mi := &file_p2p_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1612,7 +1992,7 @@ func (x *PublishMetadataResponse) String() string {
 func (*PublishMetadataResponse) ProtoMessage() {}
 
 func (x *PublishMetadataResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[15]
+	mi := &file_p2p_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1625,7 +2005,7 @@ func (x *PublishMetadataResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishMetadataResponse.ProtoReflect.Descriptor instead.
 func (*PublishMetadataResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{15}
+	return file_p2p_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PublishMetadataResponse) GetSuccess() bool {
@@ -1675,7 +2055,7 @@ type SourceInstanceRef struct {
 
 func (x *SourceInstanceRef) Reset() {
 	*x = SourceInstanceRef{}
-	mi := &file_p2p_proto_msgTypes[16]
+	mi := &file_p2p_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1687,7 +2067,7 @@ func (x *SourceInstanceRef) String() string {
 func (*SourceInstanceRef) ProtoMessage() {}
 
 func (x *SourceInstanceRef) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[16]
+	mi := &file_p2p_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1700,7 +2080,7 @@ func (x *SourceInstanceRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SourceInstanceRef.ProtoReflect.Descriptor instead.
 func (*SourceInstanceRef) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{16}
+	return file_p2p_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SourceInstanceRef) GetMxSourceId() string {
@@ -1744,7 +2124,7 @@ type ListSourcesRequest struct {
 
 func (x *ListSourcesRequest) Reset() {
 	*x = ListSourcesRequest{}
-	mi := &file_p2p_proto_msgTypes[17]
+	mi := &file_p2p_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1756,7 +2136,7 @@ func (x *ListSourcesRequest) String() string {
 func (*ListSourcesRequest) ProtoMessage() {}
 
 func (x *ListSourcesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[17]
+	mi := &file_p2p_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1769,7 +2149,7 @@ func (x *ListSourcesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSourcesRequest.ProtoReflect.Descriptor instead.
 func (*ListSourcesRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{17}
+	return file_p2p_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ListSourcesRequest) GetIdentity() *SourceIdentity {
@@ -1795,7 +2175,7 @@ type ListSourcesResponse struct {
 
 func (x *ListSourcesResponse) Reset() {
 	*x = ListSourcesResponse{}
-	mi := &file_p2p_proto_msgTypes[18]
+	mi := &file_p2p_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1807,7 +2187,7 @@ func (x *ListSourcesResponse) String() string {
 func (*ListSourcesResponse) ProtoMessage() {}
 
 func (x *ListSourcesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[18]
+	mi := &file_p2p_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1820,7 +2200,7 @@ func (x *ListSourcesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSourcesResponse.ProtoReflect.Descriptor instead.
 func (*ListSourcesResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{18}
+	return file_p2p_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ListSourcesResponse) GetInstances() []*SourceInstanceRef {
@@ -1842,7 +2222,7 @@ type GetMetadataRequest struct {
 
 func (x *GetMetadataRequest) Reset() {
 	*x = GetMetadataRequest{}
-	mi := &file_p2p_proto_msgTypes[19]
+	mi := &file_p2p_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1854,7 +2234,7 @@ func (x *GetMetadataRequest) String() string {
 func (*GetMetadataRequest) ProtoMessage() {}
 
 func (x *GetMetadataRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[19]
+	mi := &file_p2p_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1867,7 +2247,7 @@ func (x *GetMetadataRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMetadataRequest.ProtoReflect.Descriptor instead.
 func (*GetMetadataRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{19}
+	return file_p2p_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *GetMetadataRequest) GetMxSourceId() string {
@@ -1900,7 +2280,7 @@ type GetMetadataResponse struct {
 
 func (x *GetMetadataResponse) Reset() {
 	*x = GetMetadataResponse{}
-	mi := &file_p2p_proto_msgTypes[20]
+	mi := &file_p2p_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1912,7 +2292,7 @@ func (x *GetMetadataResponse) String() string {
 func (*GetMetadataResponse) ProtoMessage() {}
 
 func (x *GetMetadataResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[20]
+	mi := &file_p2p_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1925,7 +2305,7 @@ func (x *GetMetadataResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMetadataResponse.ProtoReflect.Descriptor instead.
 func (*GetMetadataResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{20}
+	return file_p2p_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *GetMetadataResponse) GetFound() bool {
@@ -1972,7 +2352,7 @@ type UpdateStatusRequest struct {
 
 func (x *UpdateStatusRequest) Reset() {
 	*x = UpdateStatusRequest{}
-	mi := &file_p2p_proto_msgTypes[21]
+	mi := &file_p2p_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1984,7 +2364,7 @@ func (x *UpdateStatusRequest) String() string {
 func (*UpdateStatusRequest) ProtoMessage() {}
 
 func (x *UpdateStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[21]
+	mi := &file_p2p_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1997,7 +2377,7 @@ func (x *UpdateStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateStatusRequest.ProtoReflect.Descriptor instead.
 func (*UpdateStatusRequest) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{21}
+	return file_p2p_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *UpdateStatusRequest) GetMxSourceId() string {
@@ -2038,7 +2418,7 @@ type UpdateStatusResponse struct {
 
 func (x *UpdateStatusResponse) Reset() {
 	*x = UpdateStatusResponse{}
-	mi := &file_p2p_proto_msgTypes[22]
+	mi := &file_p2p_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2050,7 +2430,7 @@ func (x *UpdateStatusResponse) String() string {
 func (*UpdateStatusResponse) ProtoMessage() {}
 
 func (x *UpdateStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_p2p_proto_msgTypes[22]
+	mi := &file_p2p_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2063,7 +2443,7 @@ func (x *UpdateStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdateStatusResponse) Descriptor() ([]byte, []int) {
-	return file_p2p_proto_rawDescGZIP(), []int{22}
+	return file_p2p_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *UpdateStatusResponse) GetSuccess() bool {
@@ -2220,7 +2600,45 @@ const file_p2p_proto_rawDesc = "" +
 	"artifactId\x12*\n" +
 	"\x11start_chunk_index\x18\x03 \x01(\rR\x0fstartChunkIndex\x12@\n" +
 	"\x06chunks\x18\x04 \x03(\v2(.model_express.p2p.ArtifactManifestChunkR\x06chunks\x12&\n" +
-	"\x0fnext_page_token\x18\x05 \x01(\tR\rnextPageToken\"\xaf\x01\n" +
+	"\x0fnext_page_token\x18\x05 \x01(\tR\rnextPageToken\"\x85\x01\n" +
+	"\x1fArtifactChunkTransferDescriptor\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\x04R\x04addr\x12\x16\n" +
+	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1b\n" +
+	"\tdevice_id\x18\x03 \x01(\rR\bdeviceId\x12\x19\n" +
+	"\bmem_type\x18\x04 \x01(\tR\amemType\"\x81\x01\n" +
+	"\x1bPrepareArtifactChunkRequest\x12 \n" +
+	"\fmx_source_id\x18\x01 \x01(\tR\n" +
+	"mxSourceId\x12\x1f\n" +
+	"\vartifact_id\x18\x02 \x01(\tR\n" +
+	"artifactId\x12\x1f\n" +
+	"\vchunk_index\x18\x03 \x01(\rR\n" +
+	"chunkIndex\"\x9e\x03\n" +
+	"\x1cPrepareArtifactChunkResponse\x12 \n" +
+	"\fmx_source_id\x18\x01 \x01(\tR\n" +
+	"mxSourceId\x12\x1f\n" +
+	"\vartifact_id\x18\x02 \x01(\tR\n" +
+	"artifactId\x12\x19\n" +
+	"\blease_id\x18\x03 \x01(\tR\aleaseId\x12>\n" +
+	"\x05chunk\x18\x04 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\x12J\n" +
+	"\x06source\x18\x05 \x01(\v22.model_express.p2p.ArtifactChunkTransferDescriptorR\x06source\x12+\n" +
+	"\x11metadata_endpoint\x18\x06 \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
+	"\n" +
+	"agent_name\x18\a \x01(\tR\tagentName\x12\x1f\n" +
+	"\vworker_rank\x18\b \x01(\rR\n" +
+	"workerRank\x12'\n" +
+	"\x0fsource_metadata\x18\t \x01(\fR\x0esourceMetadata\"{\n" +
+	"\x1bReleaseArtifactChunkRequest\x12 \n" +
+	"\fmx_source_id\x18\x01 \x01(\tR\n" +
+	"mxSourceId\x12\x1f\n" +
+	"\vartifact_id\x18\x02 \x01(\tR\n" +
+	"artifactId\x12\x19\n" +
+	"\blease_id\x18\x03 \x01(\tR\aleaseId\"\xa1\x01\n" +
+	"\x1cReleaseArtifactChunkResponse\x12 \n" +
+	"\fmx_source_id\x18\x01 \x01(\tR\n" +
+	"mxSourceId\x12\x1f\n" +
+	"\vartifact_id\x18\x02 \x01(\tR\n" +
+	"artifactId\x12>\n" +
+	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\xaf\x01\n" +
 	"\x16PublishMetadataRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x129\n" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12\x1b\n" +
@@ -2287,11 +2705,13 @@ const file_p2p_proto_rawDesc = "" +
 	"\x0fPublishMetadata\x12).model_express.p2p.PublishMetadataRequest\x1a*.model_express.p2p.PublishMetadataResponse\x12\\\n" +
 	"\vListSources\x12%.model_express.p2p.ListSourcesRequest\x1a&.model_express.p2p.ListSourcesResponse\x12\\\n" +
 	"\vGetMetadata\x12%.model_express.p2p.GetMetadataRequest\x1a&.model_express.p2p.GetMetadataResponse\x12_\n" +
-	"\fUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a'.model_express.p2p.UpdateStatusResponse2\x91\x03\n" +
+	"\fUpdateStatus\x12&.model_express.p2p.UpdateStatusRequest\x1a'.model_express.p2p.UpdateStatusResponse2\x83\x05\n" +
 	"\rWorkerService\x12n\n" +
 	"\x11GetTensorManifest\x12+.model_express.p2p.GetTensorManifestRequest\x1a,.model_express.p2p.GetTensorManifestResponse\x12\x86\x01\n" +
 	"\x19GetArtifactManifestHeader\x123.model_express.p2p.GetArtifactManifestHeaderRequest\x1a4.model_express.p2p.GetArtifactManifestHeaderResponse\x12\x86\x01\n" +
-	"\x19GetArtifactManifestChunks\x123.model_express.p2p.GetArtifactManifestChunksRequest\x1a4.model_express.p2p.GetArtifactManifestChunksResponseb\x06proto3"
+	"\x19GetArtifactManifestChunks\x123.model_express.p2p.GetArtifactManifestChunksRequest\x1a4.model_express.p2p.GetArtifactManifestChunksResponse\x12w\n" +
+	"\x14PrepareArtifactChunk\x12..model_express.p2p.PrepareArtifactChunkRequest\x1a/.model_express.p2p.PrepareArtifactChunkResponse\x12w\n" +
+	"\x14ReleaseArtifactChunk\x12..model_express.p2p.ReleaseArtifactChunkRequest\x1a/.model_express.p2p.ReleaseArtifactChunkResponseb\x06proto3"
 
 var (
 	file_p2p_proto_rawDescOnce sync.Once
@@ -2306,7 +2726,7 @@ func file_p2p_proto_rawDescGZIP() []byte {
 }
 
 var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
 var file_p2p_proto_goTypes = []any{
 	(BackendFramework)(0),                     // 0: model_express.p2p.BackendFramework
 	(MxSourceType)(0),                         // 1: model_express.p2p.MxSourceType
@@ -2325,21 +2745,26 @@ var file_p2p_proto_goTypes = []any{
 	(*GetArtifactManifestHeaderResponse)(nil), // 14: model_express.p2p.GetArtifactManifestHeaderResponse
 	(*GetArtifactManifestChunksRequest)(nil),  // 15: model_express.p2p.GetArtifactManifestChunksRequest
 	(*GetArtifactManifestChunksResponse)(nil), // 16: model_express.p2p.GetArtifactManifestChunksResponse
-	(*PublishMetadataRequest)(nil),            // 17: model_express.p2p.PublishMetadataRequest
-	(*PublishMetadataResponse)(nil),           // 18: model_express.p2p.PublishMetadataResponse
-	(*SourceInstanceRef)(nil),                 // 19: model_express.p2p.SourceInstanceRef
-	(*ListSourcesRequest)(nil),                // 20: model_express.p2p.ListSourcesRequest
-	(*ListSourcesResponse)(nil),               // 21: model_express.p2p.ListSourcesResponse
-	(*GetMetadataRequest)(nil),                // 22: model_express.p2p.GetMetadataRequest
-	(*GetMetadataResponse)(nil),               // 23: model_express.p2p.GetMetadataResponse
-	(*UpdateStatusRequest)(nil),               // 24: model_express.p2p.UpdateStatusRequest
-	(*UpdateStatusResponse)(nil),              // 25: model_express.p2p.UpdateStatusResponse
-	nil,                                       // 26: model_express.p2p.SourceIdentity.ExtraParametersEntry
+	(*ArtifactChunkTransferDescriptor)(nil),   // 17: model_express.p2p.ArtifactChunkTransferDescriptor
+	(*PrepareArtifactChunkRequest)(nil),       // 18: model_express.p2p.PrepareArtifactChunkRequest
+	(*PrepareArtifactChunkResponse)(nil),      // 19: model_express.p2p.PrepareArtifactChunkResponse
+	(*ReleaseArtifactChunkRequest)(nil),       // 20: model_express.p2p.ReleaseArtifactChunkRequest
+	(*ReleaseArtifactChunkResponse)(nil),      // 21: model_express.p2p.ReleaseArtifactChunkResponse
+	(*PublishMetadataRequest)(nil),            // 22: model_express.p2p.PublishMetadataRequest
+	(*PublishMetadataResponse)(nil),           // 23: model_express.p2p.PublishMetadataResponse
+	(*SourceInstanceRef)(nil),                 // 24: model_express.p2p.SourceInstanceRef
+	(*ListSourcesRequest)(nil),                // 25: model_express.p2p.ListSourcesRequest
+	(*ListSourcesResponse)(nil),               // 26: model_express.p2p.ListSourcesResponse
+	(*GetMetadataRequest)(nil),                // 27: model_express.p2p.GetMetadataRequest
+	(*GetMetadataResponse)(nil),               // 28: model_express.p2p.GetMetadataResponse
+	(*UpdateStatusRequest)(nil),               // 29: model_express.p2p.UpdateStatusRequest
+	(*UpdateStatusResponse)(nil),              // 30: model_express.p2p.UpdateStatusResponse
+	nil,                                       // 31: model_express.p2p.SourceIdentity.ExtraParametersEntry
 }
 var file_p2p_proto_depIdxs = []int32{
 	1,  // 0: model_express.p2p.SourceIdentity.mx_source_type:type_name -> model_express.p2p.MxSourceType
 	0,  // 1: model_express.p2p.SourceIdentity.backend_framework:type_name -> model_express.p2p.BackendFramework
-	26, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
+	31, // 2: model_express.p2p.SourceIdentity.extra_parameters:type_name -> model_express.p2p.SourceIdentity.ExtraParametersEntry
 	4,  // 3: model_express.p2p.TensorSourceMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
 	1,  // 4: model_express.p2p.ArtifactManifest.mx_source_type:type_name -> model_express.p2p.MxSourceType
 	8,  // 5: model_express.p2p.ArtifactManifest.files:type_name -> model_express.p2p.ArtifactManifestFile
@@ -2352,32 +2777,39 @@ var file_p2p_proto_depIdxs = []int32{
 	1,  // 12: model_express.p2p.GetArtifactManifestHeaderResponse.mx_source_type:type_name -> model_express.p2p.MxSourceType
 	8,  // 13: model_express.p2p.GetArtifactManifestHeaderResponse.files:type_name -> model_express.p2p.ArtifactManifestFile
 	9,  // 14: model_express.p2p.GetArtifactManifestChunksResponse.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
-	3,  // 15: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	10, // 16: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 17: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	2,  // 18: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
-	19, // 19: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
-	10, // 20: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	2,  // 21: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	17, // 22: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	20, // 23: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	22, // 24: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	24, // 25: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	11, // 26: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	13, // 27: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
-	15, // 28: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
-	18, // 29: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	21, // 30: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	23, // 31: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	25, // 32: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	12, // 33: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	14, // 34: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
-	16, // 35: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
-	29, // [29:36] is the sub-list for method output_type
-	22, // [22:29] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	22, // [22:22] is the sub-list for extension extendee
-	0,  // [0:22] is the sub-list for field type_name
+	9,  // 15: model_express.p2p.PrepareArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
+	17, // 16: model_express.p2p.PrepareArtifactChunkResponse.source:type_name -> model_express.p2p.ArtifactChunkTransferDescriptor
+	9,  // 17: model_express.p2p.ReleaseArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
+	3,  // 18: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	10, // 19: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
+	3,  // 20: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 21: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
+	24, // 22: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
+	10, // 23: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
+	2,  // 24: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
+	22, // 25: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	25, // 26: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	27, // 27: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	29, // 28: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	11, // 29: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	13, // 30: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
+	15, // 31: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
+	18, // 32: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
+	20, // 33: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
+	23, // 34: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	26, // 35: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	28, // 36: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	30, // 37: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	12, // 38: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	14, // 39: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
+	16, // 40: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
+	19, // 41: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
+	21, // 42: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
+	34, // [34:43] is the sub-list for method output_type
+	25, // [25:34] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }
@@ -2391,14 +2823,14 @@ func file_p2p_proto_init() {
 		(*WorkerMetadata_TensorSource)(nil),
 		(*WorkerMetadata_ArtifactSource)(nil),
 	}
-	file_p2p_proto_msgTypes[17].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_p2p_proto_rawDesc), len(file_p2p_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   24,
+			NumMessages:   29,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

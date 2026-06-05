@@ -138,8 +138,11 @@ message TensorDescriptor {
 }
 
 // Small discovery summary for file-backed artifact sources. This does not carry
-// full file or chunk manifests; targets use WorkerService manifest header/page
-// RPCs for the sealed manifest before any future byte-transfer path.
+// full file or chunk manifests, and it does not carry lifecycle status.
+// Readiness/staleness is source-record scoped and lives in WorkerMetadata.status
+// so ListSources(status_filter=READY) works uniformly for tensor and artifact
+// sources. Targets use WorkerService manifest header/page RPCs for the sealed
+// manifest before any byte-transfer path.
 message ArtifactSourceMetadata {
   // Digest of the canonical sealed artifact manifest.
   string artifact_id = 1;
@@ -196,7 +199,8 @@ message ArtifactManifestFile {
   // File index used by ArtifactManifestChunk.file_index.
   uint32 file_index = 1;
 
-  // Canonical absolute install path using "/" separators.
+  // Canonical absolute publisher path using "/" separators. Transfer targets
+  // may rewrite this to a target-local staging path before installation.
   string path = 2;
 
   // File size in bytes.
@@ -267,8 +271,8 @@ message WorkerMetadata {
   // NIXL agent name (used by targets to identify the remote agent)
   string agent_name = 7;
 
-  // host:port for the worker's gRPC WorkerService, used for tensor and artifact
-  // manifests. Artifact byte transfer is not part of this endpoint yet.
+  // host:port for the worker's gRPC WorkerService, used for tensor manifests,
+  // artifact manifests, and artifact chunk transfer coordination.
   string worker_grpc_endpoint = 8;
 
   // Source-type-specific bounded metadata. This selects the metadata payload
@@ -287,12 +291,15 @@ message WorkerMetadata {
 
 // Per-worker gRPC service for direct manifest retrieval. Sources start this
 // service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
-// descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
-// file-backed artifact manifests.
+// descriptors or artifact manifest RPCs for sealed file-backed artifacts.
+// Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
+// source-side registered DRAM range and returns its transfer descriptor.
 service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
   rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
   rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
+  rpc PrepareArtifactChunk(PrepareArtifactChunkRequest) returns (PrepareArtifactChunkResponse);
+  rpc ReleaseArtifactChunk(ReleaseArtifactChunkRequest) returns (ReleaseArtifactChunkResponse);
 }
 
 message GetTensorManifestRequest {
@@ -386,6 +393,78 @@ message GetArtifactManifestChunksResponse {
   // Empty when this is the last page; otherwise the decimal string form of the
   // next start_chunk_index.
   string next_page_token = 5;
+}
+
+message ArtifactChunkTransferDescriptor {
+  // Registered source buffer address for the prepared chunk.
+  uint64 addr = 1;
+
+  // Prepared range length in bytes.
+  uint64 length = 2;
+
+  // NIXL device id for the prepared range. DRAM buffers use 0.
+  uint32 device_id = 3;
+
+  // NIXL memory type for prep_xfer_dlist, for example "DRAM".
+  string mem_type = 4;
+}
+
+message PrepareArtifactChunkRequest {
+  // mx_source_id for validation (catches stale discovery)
+  string mx_source_id = 1;
+
+  // Optional artifact_id from ArtifactSourceMetadata for validation.
+  string artifact_id = 2;
+
+  // Global chunk index to fetch.
+  uint32 chunk_index = 3;
+}
+
+message PrepareArtifactChunkResponse {
+  // Echoed mx_source_id for confirmation.
+  string mx_source_id = 1;
+
+  // SHA256 digest of the canonical sealed artifact manifest.
+  string artifact_id = 2;
+
+  // Lease that keeps the source-side registered range alive until released.
+  string lease_id = 3;
+
+  // Metadata for the prepared chunk.
+  ArtifactManifestChunk chunk = 4;
+
+  // NIXL source descriptor for this chunk.
+  ArtifactChunkTransferDescriptor source = 5;
+
+  // Self-describing worker info, matching GetArtifactManifestHeaderResponse.
+  string metadata_endpoint = 6;
+  string agent_name = 7;
+  uint32 worker_rank = 8;
+
+  // NIXL metadata for the source agent after this chunk has been prepared.
+  bytes source_metadata = 9;
+}
+
+message ReleaseArtifactChunkRequest {
+  // mx_source_id for validation (catches stale discovery)
+  string mx_source_id = 1;
+
+  // Optional artifact_id from ArtifactSourceMetadata for validation.
+  string artifact_id = 2;
+
+  // Lease returned by PrepareArtifactChunk.
+  string lease_id = 3;
+}
+
+message ReleaseArtifactChunkResponse {
+  // Echoed mx_source_id for confirmation.
+  string mx_source_id = 1;
+
+  // SHA256 digest of the canonical sealed artifact manifest.
+  string artifact_id = 2;
+
+  // Released chunk metadata.
+  ArtifactManifestChunk chunk = 3;
 }
 
 // ============================================================================

@@ -263,6 +263,8 @@ const (
 	WorkerService_GetTensorManifest_FullMethodName         = "/model_express.p2p.WorkerService/GetTensorManifest"
 	WorkerService_GetArtifactManifestHeader_FullMethodName = "/model_express.p2p.WorkerService/GetArtifactManifestHeader"
 	WorkerService_GetArtifactManifestChunks_FullMethodName = "/model_express.p2p.WorkerService/GetArtifactManifestChunks"
+	WorkerService_PrepareArtifactChunk_FullMethodName      = "/model_express.p2p.WorkerService/PrepareArtifactChunk"
+	WorkerService_ReleaseArtifactChunk_FullMethodName      = "/model_express.p2p.WorkerService/ReleaseArtifactChunk"
 )
 
 // WorkerServiceClient is the client API for WorkerService service.
@@ -271,12 +273,15 @@ const (
 //
 // Per-worker gRPC service for direct manifest retrieval. Sources start this
 // service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
-// descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
-// file-backed artifact manifests.
+// descriptors or artifact manifest RPCs for sealed file-backed artifacts.
+// Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
+// source-side registered DRAM range and returns its transfer descriptor.
 type WorkerServiceClient interface {
 	GetTensorManifest(ctx context.Context, in *GetTensorManifestRequest, opts ...grpc.CallOption) (*GetTensorManifestResponse, error)
 	GetArtifactManifestHeader(ctx context.Context, in *GetArtifactManifestHeaderRequest, opts ...grpc.CallOption) (*GetArtifactManifestHeaderResponse, error)
 	GetArtifactManifestChunks(ctx context.Context, in *GetArtifactManifestChunksRequest, opts ...grpc.CallOption) (*GetArtifactManifestChunksResponse, error)
+	PrepareArtifactChunk(ctx context.Context, in *PrepareArtifactChunkRequest, opts ...grpc.CallOption) (*PrepareArtifactChunkResponse, error)
+	ReleaseArtifactChunk(ctx context.Context, in *ReleaseArtifactChunkRequest, opts ...grpc.CallOption) (*ReleaseArtifactChunkResponse, error)
 }
 
 type workerServiceClient struct {
@@ -317,18 +322,41 @@ func (c *workerServiceClient) GetArtifactManifestChunks(ctx context.Context, in 
 	return out, nil
 }
 
+func (c *workerServiceClient) PrepareArtifactChunk(ctx context.Context, in *PrepareArtifactChunkRequest, opts ...grpc.CallOption) (*PrepareArtifactChunkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareArtifactChunkResponse)
+	err := c.cc.Invoke(ctx, WorkerService_PrepareArtifactChunk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) ReleaseArtifactChunk(ctx context.Context, in *ReleaseArtifactChunkRequest, opts ...grpc.CallOption) (*ReleaseArtifactChunkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseArtifactChunkResponse)
+	err := c.cc.Invoke(ctx, WorkerService_ReleaseArtifactChunk_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WorkerServiceServer is the server API for WorkerService service.
 // All implementations must embed UnimplementedWorkerServiceServer
 // for forward compatibility.
 //
 // Per-worker gRPC service for direct manifest retrieval. Sources start this
 // service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
-// descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
-// file-backed artifact manifests.
+// descriptors or artifact manifest RPCs for sealed file-backed artifacts.
+// Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
+// source-side registered DRAM range and returns its transfer descriptor.
 type WorkerServiceServer interface {
 	GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error)
 	GetArtifactManifestHeader(context.Context, *GetArtifactManifestHeaderRequest) (*GetArtifactManifestHeaderResponse, error)
 	GetArtifactManifestChunks(context.Context, *GetArtifactManifestChunksRequest) (*GetArtifactManifestChunksResponse, error)
+	PrepareArtifactChunk(context.Context, *PrepareArtifactChunkRequest) (*PrepareArtifactChunkResponse, error)
+	ReleaseArtifactChunk(context.Context, *ReleaseArtifactChunkRequest) (*ReleaseArtifactChunkResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
 
@@ -347,6 +375,12 @@ func (UnimplementedWorkerServiceServer) GetArtifactManifestHeader(context.Contex
 }
 func (UnimplementedWorkerServiceServer) GetArtifactManifestChunks(context.Context, *GetArtifactManifestChunksRequest) (*GetArtifactManifestChunksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetArtifactManifestChunks not implemented")
+}
+func (UnimplementedWorkerServiceServer) PrepareArtifactChunk(context.Context, *PrepareArtifactChunkRequest) (*PrepareArtifactChunkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareArtifactChunk not implemented")
+}
+func (UnimplementedWorkerServiceServer) ReleaseArtifactChunk(context.Context, *ReleaseArtifactChunkRequest) (*ReleaseArtifactChunkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseArtifactChunk not implemented")
 }
 func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
 func (UnimplementedWorkerServiceServer) testEmbeddedByValue()                       {}
@@ -423,6 +457,42 @@ func _WorkerService_GetArtifactManifestChunks_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerService_PrepareArtifactChunk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareArtifactChunkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).PrepareArtifactChunk(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_PrepareArtifactChunk_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).PrepareArtifactChunk(ctx, req.(*PrepareArtifactChunkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_ReleaseArtifactChunk_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseArtifactChunkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).ReleaseArtifactChunk(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_ReleaseArtifactChunk_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).ReleaseArtifactChunk(ctx, req.(*ReleaseArtifactChunkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -441,6 +511,14 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetArtifactManifestChunks",
 			Handler:    _WorkerService_GetArtifactManifestChunks_Handler,
+		},
+		{
+			MethodName: "PrepareArtifactChunk",
+			Handler:    _WorkerService_PrepareArtifactChunk_Handler,
+		},
+		{
+			MethodName: "ReleaseArtifactChunk",
+			Handler:    _WorkerService_ReleaseArtifactChunk_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
