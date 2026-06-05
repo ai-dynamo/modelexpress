@@ -1,0 +1,2 @@
+NAME                         READY   STATUS    RESTARTS   AGE    IP            NODE                                         NOMINATED NODE   READINESS GATES
+mx-vllm-dist-src1-20260605   1/1     Running   0          100m   10.0.11.116   cluster-0967a26d-pool-14bee067-prctr-bw4bt   <none>           <none>

@@ -1,0 +1,20 @@
+{
+  "artifact": "nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-bw4bt-import-hang",
+  "date": "2026-06-05",
+  "result": "blocked-placement-superseded",
+  "run_id": "mxvllmdist-20260605-ib1",
+  "scope": "vLLM distributed-trainer runtime proof source-rank placement attempt",
+  "pod": "mx-vllm-dist-src1-20260605",
+  "node": "cluster-0967a26d-pool-14bee067-prctr-bw4bt",
+  "image": "docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a",
+  "observed_failure": "bounded python import/CUDA probe did not return; pod later stuck Terminating after delete",
+  "evidence": [
+    "artifacts/resharding/nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-bw4bt-import-hang-pod-20260605.log",
+    "artifacts/resharding/nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-bw4bt-import-hang-pod-describe-20260605.log"
+  ],
+  "action_taken": "force-deleted the bad source pod and recreated source rank 1 with nodeAffinity excluding bw4bt",
+  "replacement_pod": "mx-vllm-dist-src1-20260605",
+  "replacement_node": "cluster-0967a26d-pool-14bee067-prctr-th9sn",
+  "proof_claim_safe": false,
+  "superseded_by": "artifacts/resharding/nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-20260605.json"
+}

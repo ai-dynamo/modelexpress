@@ -1,0 +1,243 @@
+Name:             mx-vllm-dist-src0-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Fri, 05 Jun 2026 20:55:24 +0200
+Labels:           app=mx-vllm-dist-runtime
+                  gpu-reaper.nvidia.com/status=idle
+                  modelexpress.nvidia.com/role=source
+                  modelexpress.nvidia.com/run=vllm-dist-runtime-20260605
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 0
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-05T19:00:44Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 0
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.20.98
+IPs:
+  IP:  10.0.20.98
+Containers:
+  main:
+    Container ID:  containerd://00a1b4f4a6387a1631fdcca38bdb19122a91f804981ae435ac3ef7a098ae9ce9
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:036d63833b32418154b4ad79b95867c4780e9adb824a42b570b01524ac39b3b6
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:55:27 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:                    mx-vllm-dist-src0-20260605 (v1:metadata.name)
+      NODE_NAME:                    (v1:spec.nodeName)
+      HF_HOME:                     /models/hf
+      TRANSFORMERS_CACHE:          /models/hf
+      MODEL_EXPRESS_URL:           mx-server-rl:8001
+      MX_SERVER_ADDRESS:           mx-server-rl:8001
+      MX_NIXL_BACKEND:             UCX
+      UCX_TLS:                     rc_x,rc,tcp,cuda_copy
+      UCX_NET_DEVICES:             mlx5_10:1
+      MX_RDMA_NIC_PIN:             mlx5_10:1
+      MX_HEARTBEAT_INTERVAL_SECS:  1
+    Mounts:
+      /models from shared-model-cache (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-w4n82 (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  shared-model-cache:
+    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)
+    ClaimName:  shared-model-cache
+    ReadOnly:   false
+  kube-api-access-w4n82:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:                      <none>
+
+
+Name:             mx-vllm-dist-src1-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-th9sn/192.168.0.242
+Start Time:       Fri, 05 Jun 2026 22:37:23 +0200
+Labels:           app=mx-vllm-dist-runtime
+                  gpu-reaper.nvidia.com/status=idle
+                  modelexpress.nvidia.com/role=source
+                  modelexpress.nvidia.com/run=vllm-dist-runtime-20260605
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 29
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-05T20:37:46Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 5
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.9.78
+IPs:
+  IP:  10.0.9.78
+Containers:
+  main:
+    Container ID:  containerd://289de24751d5b70509e837d9771f01d3cf12d46a58e56699f2669557ad6acb19
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:036d63833b32418154b4ad79b95867c4780e9adb824a42b570b01524ac39b3b6
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 22:37:24 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:                    mx-vllm-dist-src1-20260605 (v1:metadata.name)
+      NODE_NAME:                    (v1:spec.nodeName)
+      HF_HOME:                     /models/hf
+      TRANSFORMERS_CACHE:          /models/hf
+      MODEL_EXPRESS_URL:           mx-server-rl:8001
+      MX_SERVER_ADDRESS:           mx-server-rl:8001
+      MX_NIXL_BACKEND:             UCX
+      UCX_TLS:                     rc_x,rc,tcp,cuda_copy
+      UCX_NET_DEVICES:             mlx5_10:1
+      MX_RDMA_NIC_PIN:             mlx5_10:1
+      MX_HEARTBEAT_INTERVAL_SECS:  1
+    Mounts:
+      /models from shared-model-cache (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-97mtx (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  shared-model-cache:
+    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)
+    ClaimName:  shared-model-cache
+    ReadOnly:   false
+  kube-api-access-97mtx:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  3m33s  default-scheduler  Successfully assigned anish-dynamo/mx-vllm-dist-src1-20260605 to cluster-0967a26d-pool-14bee067-prctr-th9sn
+  Normal  Pulled     3m32s  kubelet            Container image "docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a" already present on machine
+  Normal  Created    3m32s  kubelet            Created container: main
+  Normal  Started    3m32s  kubelet            Started container main
+
+
+Name:             mx-vllm-dist-tgt-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Fri, 05 Jun 2026 20:55:25 +0200
+Labels:           app=mx-vllm-dist-runtime
+                  gpu-reaper.nvidia.com/status=idle
+                  modelexpress.nvidia.com/role=target
+                  modelexpress.nvidia.com/run=vllm-dist-runtime-20260605
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 0
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-05T19:00:44Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 0
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.12.29
+IPs:
+  IP:  10.0.12.29
+Containers:
+  main:
+    Container ID:  containerd://20a5c2cd5cc27cfdb4e338ffb43c52e1f6c7f1effd9ae287f818d29f0c73f99f
+    Image:         docker.io/amaddipoti439/modelexpress:vllm-rl-e59fc0a
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:036d63833b32418154b4ad79b95867c4780e9adb824a42b570b01524ac39b3b6
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:55:26 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      nvidia.com/gpu:  1
+    Requests:
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:                           mx-vllm-dist-tgt-20260605 (v1:metadata.name)
+      NODE_NAME:                           (v1:spec.nodeName)
+      HF_HOME:                            /models/hf
+      TRANSFORMERS_CACHE:                 /models/hf
+      MODEL_EXPRESS_URL:                  mx-server-rl:8001
+      MX_SERVER_ADDRESS:                  mx-server-rl:8001
+      MX_NIXL_BACKEND:                    UCX
+      UCX_TLS:                            rc_x,rc,tcp,cuda_copy
+      UCX_NET_DEVICES:                    mlx5_10:1
+      MX_RDMA_NIC_PIN:                    mlx5_10:1
+      MX_HEARTBEAT_INTERVAL_SECS:         1
+      VLLM_ALLOW_INSECURE_SERIALIZATION:  1
+    Mounts:
+      /models from shared-model-cache (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-bxgvc (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  shared-model-cache:
+    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)
+    ClaimName:  shared-model-cache
+    ReadOnly:   false
+  kube-api-access-bxgvc:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved:NoSchedule op=Exists
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:                      <none>
