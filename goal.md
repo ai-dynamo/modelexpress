@@ -284,6 +284,18 @@ Artifacts under `artifacts/resharding/` prove:
   and `.log`: the deployed server still drops the new repeated ownership field,
   but preserves the legacy `metadata_endpoint` sidecar, and the client lists and
   plans trainer-step slices from that returned sidecar metadata.
+- Source publication now has a versioned trainer-loop smoke on top of the
+  single-step publisher:
+  `artifacts/resharding/nscale-trainer-loop-source-publication-smoke-20260605.json`
+  plus
+  `artifacts/resharding/nscale-trainer-loop-source-publication-pytest-20260605.log`.
+  It publishes coherent step-specific model versions, leases, descriptors, and
+  provenance across two source-rank ownerships, reconstructs the step-2 target
+  from source-owned ranges, proves step-2 differs from step-1, and round-trips
+  loop ownership metadata through the MX metadata planning path in tests. This
+  is still a synthetic trainer-loop smoke over a deterministic
+  `torch.optim.SGD` objective; it is not a real distributed RL/FSDP trainer
+  loop.
 - `modelexpress.refit_vllm_mx_runtime` now proves cross-node vLLM+NIXL runtime
   refit with the MX endpoint control plane and one pod per source rank. In run
   `mxvllmrt-20260605-ib3`, two independent source pods
@@ -649,6 +661,17 @@ Current partial evidence:
   still dropped the repeated ownership field. A live vLLM GPU rerun of the
   updated path was attempted but blocked by 1-GPU nscale capacity:
   `artifacts/resharding/nscale-live-vllm-nixl-runtime-trainer-step-capacity-block-20260605.json`.
+- `modelexpress.refit_trainer_step` also exposes
+  `TrainerLoopStepPublication` for coherent versioned source publication across
+  source ranks. It resets leases/descriptors per trainer-loop step, records
+  `trainer_loop_publisher_used=true`, and keeps the no-overclaim flags explicit
+  (`synthetic_trainer_loop_smoke_used=true`,
+  `real_rl_training_loop_used=false`). Evidence:
+  `artifacts/resharding/nscale-trainer-loop-source-publication-smoke-20260605.json`
+  and
+  `artifacts/resharding/nscale-trainer-loop-source-publication-pytest-20260605.log`
+  (`29 passed`). This moves source publication closer to a trainer loop, but it
+  is still a deterministic CPU/control-plane smoke, not a real RL trainer.
 - `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
   SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
   `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the
@@ -786,11 +809,12 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Replace the synthetic optimizer-step publisher in the vLLM/SGLang NIXL
-   runtime bridges with a real trainer-loop integration. The current branch now
-   has CPU tests, same-node vLLM/SGLang GPU reruns, and cross-node
-   one-pod-per-source-rank runtime evidence for both runtimes; the next
-   source-side step is real FSDP/TP/PP/EP or RL trainer ownership publication.
+1. Continue replacing the synthetic optimizer-step publisher in the vLLM/SGLang
+   NIXL runtime bridges with real trainer-loop integration. The current branch
+   now has CPU tests, versioned trainer-loop publication smoke, same-node
+   vLLM/SGLang GPU reruns, and cross-node one-pod-per-source-rank runtime
+   evidence for both runtimes; the next source-side step is real FSDP/TP/PP/EP
+   or RL trainer ownership publication.
 2. Extend the runtime bridge placement work beyond tiny single-tensor vLLM and
    SGLang targets while keeping the allclose/checksum gates.
 3. Promote the runtime bridges into each engine's production post-load/refit

@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
 import torch
 
 from modelexpress.refit_trainer_step import (
     annotate_trainer_step_ownership,
+    publish_trainer_loop_step,
     publish_trainer_step_source,
+    trainer_loop_model_version,
     trainer_step_replacement_tensor,
     trainer_step_source_provenance,
     trainer_step_tensor_for_range,
@@ -152,3 +157,176 @@ def test_trainer_step_publication_carries_tensor_ownership_and_artifact_metadata
     assert metadata["tensor_shape"] == [4, 4]
     assert metadata["tensor_dtype"] == "float32"
     assert metadata["tensor_bytes"] == 64
+
+
+def _loop_ownerships():
+    shape = (6, 4)
+    return [
+        SliceOwnership(
+            model_name="tiny-trainer-loop",
+            model_version="base-step",
+            tensor_name="lm_head.weight",
+            global_shape=shape,
+            dtype="float32",
+            source_range=((0, 3), (0, 4)),
+            worker_id="trainer-rank0-worker",
+            source_id="trainer-rank0",
+            worker_rank=0,
+            layout_tags={"trainer_layout": "fsdp-row-shard-poc"},
+            element_size_bytes=4,
+        ),
+        SliceOwnership(
+            model_name="tiny-trainer-loop",
+            model_version="base-step",
+            tensor_name="lm_head.weight",
+            global_shape=shape,
+            dtype="float32",
+            source_range=((3, 6), (0, 4)),
+            worker_id="trainer-rank1-worker",
+            source_id="trainer-rank1",
+            worker_rank=1,
+            layout_tags={"trainer_layout": "fsdp-row-shard-poc"},
+            element_size_bytes=4,
+        ),
+    ]
+
+
+def _assemble_loop_publications(loop_step):
+    shape = loop_step.source_publications[0].ownership.global_shape
+    assembled = torch.empty(shape, dtype=loop_step.source_publications[0].tensor.dtype)
+    for publication in loop_step.source_publications:
+        assembled[_range_slices(publication.ownership.source_range)] = (
+            publication.tensor
+        )
+    return assembled
+
+
+def test_trainer_loop_step_publication_versions_all_source_ranks():
+    loop_step = publish_trainer_loop_step(
+        _loop_ownerships(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_index=3,
+        learning_rate=0.25,
+    )
+
+    expected_model_version = trainer_loop_model_version("base-step", 3)
+    assert loop_step.model_version == expected_model_version
+    assert loop_step.step_index == 3
+    assert [pub.ownership.source_id for pub in loop_step.source_publications] == [
+        "trainer-rank0",
+        "trainer-rank1",
+    ]
+    assert all(
+        pub.ownership.model_version == expected_model_version
+        for pub in loop_step.source_publications
+    )
+    assert all(pub.ownership.source_lease for pub in loop_step.source_publications)
+    assert all(
+        pub.ownership.layout_tags["trainer_loop_publisher"] is True
+        for pub in loop_step.source_publications
+    )
+    assert all(
+        pub.provenance["trainer_loop_publisher_used"] is True
+        for pub in loop_step.source_publications
+    )
+    assert loop_step.provenance["synthetic_trainer_loop_smoke_used"] is True
+    assert loop_step.provenance["real_rl_training_loop_used"] is False
+    metadata = loop_step.to_artifact_metadata()
+    assert metadata["source_publication_count"] == 2
+    assert metadata["total_tensor_bytes"] == 96
+
+
+def test_trainer_loop_step_reconstructs_expected_step_version():
+    step1 = publish_trainer_loop_step(
+        _loop_ownerships(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_index=1,
+    )
+    step2 = publish_trainer_loop_step(
+        _loop_ownerships(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_index=2,
+    )
+
+    assembled_step2 = _assemble_loop_publications(step2)
+    expected_step2 = trainer_step_replacement_tensor(
+        (6, 4),
+        dtype=torch.float32,
+        device="cpu",
+        step_count=2,
+    )
+
+    torch.testing.assert_close(assembled_step2, expected_step2)
+    assert not torch.allclose(_assemble_loop_publications(step1), assembled_step2)
+
+
+def test_trainer_loop_step_custom_model_version_resets_step_scoped_metadata():
+    owners = _loop_ownerships()
+    owners[0] = replace(
+        owners[0],
+        source_lease="stale-lease",
+        nixl_descriptor_id="stale-descriptor",
+    )
+
+    loop_step = publish_trainer_loop_step(
+        owners,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_index=4,
+        model_version="extern-trainer-step-000004",
+    )
+
+    assert loop_step.base_model_version == "base-step"
+    assert loop_step.model_version == "extern-trainer-step-000004"
+    assert all(
+        pub.ownership.model_version == "extern-trainer-step-000004"
+        for pub in loop_step.source_publications
+    )
+    assert all(
+        "extern-trainer-step-000004" in pub.ownership.source_lease
+        for pub in loop_step.source_publications
+    )
+    assert all(
+        pub.ownership.nixl_descriptor_id == pub.ownership.source_lease
+        for pub in loop_step.source_publications
+    )
+    assert all(
+        pub.ownership.source_lease != "stale-lease"
+        for pub in loop_step.source_publications
+    )
+
+
+def test_trainer_loop_step_rejects_incoherent_ownership_batch():
+    owners = _loop_ownerships()
+
+    with pytest.raises(ValueError, match="at least one source ownership"):
+        publish_trainer_loop_step(
+            [],
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            step_index=1,
+        )
+    with pytest.raises(ValueError, match="step_index must be positive"):
+        publish_trainer_loop_step(
+            owners,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            step_index=0,
+        )
+    with pytest.raises(ValueError, match="span model names"):
+        publish_trainer_loop_step(
+            [owners[0], replace(owners[1], model_name="other-model")],
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            step_index=1,
+        )
+    with pytest.raises(ValueError, match="span base model versions"):
+        publish_trainer_loop_step(
+            [owners[0], replace(owners[1], model_version="other-base")],
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            step_index=1,
+        )

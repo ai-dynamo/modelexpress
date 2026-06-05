@@ -18,7 +18,10 @@ from modelexpress.refit_poc import (
     refit_source_identity,
 )
 from modelexpress.refit_poc_artifacts import artifact_base, build_planner_artifacts
-from modelexpress.refit_trainer_step import publish_trainer_step_source
+from modelexpress.refit_trainer_step import (
+    publish_trainer_loop_step,
+    publish_trainer_step_source,
+)
 from modelexpress.types import TensorDescriptor
 from modelexpress.resharding import SliceOwnership, SliceRequest
 from modelexpress.resharding_control_plane import (
@@ -116,6 +119,16 @@ def _identity():
     )
 
 
+def _identity_for_model_version(model_version):
+    return build_refit_source_identity(
+        model_name=MODEL_NAME,
+        model_version=model_version,
+        dtype="float32",
+        trainer_framework="synthetic-fsdp-trainer-loop-smoke",
+        trainer_layout="fsdp",
+    )
+
+
 def _ownerships():
     return [
         SliceOwnership(
@@ -173,6 +186,11 @@ def _request():
             "moe_expert_axis": 0,
         },
     )
+
+
+def _request_for_model_version(model_version):
+    request = _request()
+    return replace(request, model_version=model_version)
 
 
 def test_slice_ownership_proto_preserves_typed_layout_tags():
@@ -386,6 +404,64 @@ def test_trainer_step_publications_roundtrip_through_mx_metadata():
     assert (
         source_publications[0].to_artifact_metadata()["ownership"]["layout_tags"][
             "optimizer_step_publisher"
+        ]
+        is True
+    )
+
+
+def test_trainer_loop_step_publications_roundtrip_through_mx_metadata():
+    client = InMemoryMxClient()
+    loop_step = publish_trainer_loop_step(
+        _ownerships(),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        step_index=3,
+        learning_rate=0.25,
+    )
+    identity = _identity_for_model_version(loop_step.model_version)
+
+    for publication in loop_step.source_publications:
+        ownership = publication.ownership
+        source_id = publish_slice_ownerships(
+            client,
+            identity=identity,
+            ownerships=[ownership],
+            worker_id=ownership.worker_id,
+            worker_rank=ownership.worker_rank,
+        )
+        assert client.update_status(
+            source_id,
+            ownership.worker_id,
+            ownership.worker_rank,
+            p2p_pb2.SOURCE_STATUS_READY,
+        )
+
+    discovered = list_slice_ownerships(client, identity=identity)
+    assert [owner.model_version for owner in discovered] == [
+        loop_step.model_version,
+        loop_step.model_version,
+    ]
+    assert all(
+        owner.layout_tags["trainer_loop_publisher"] is True for owner in discovered
+    )
+    assert all(
+        owner.layout_tags["trainer_loop_step_index"] == 3 for owner in discovered
+    )
+    assert all(loop_step.model_version in owner.source_lease for owner in discovered)
+
+    plans = plan_from_mx_metadata(
+        client,
+        identity=identity,
+        requests=[_request_for_model_version(loop_step.model_version)],
+    )
+    assert [plan.source_id for plan in plans] == ["trainer-rank0", "trainer-rank1"]
+    assert [plan.lease_version for plan in plans] == [
+        discovered[0].source_lease,
+        discovered[1].source_lease,
+    ]
+    assert (
+        loop_step.to_artifact_metadata()["trainer_loop_provenance"][
+            "synthetic_trainer_loop_smoke_used"
         ]
         is True
     )

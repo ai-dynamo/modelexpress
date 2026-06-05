@@ -335,6 +335,16 @@ Files:
   NIXL descriptor identity, and source-update provenance together, and the
   vLLM/SGLang source-rank paths now emit `source_publication` metadata (`15
   passed`). This is code-path evidence only; it is not a live GPU runtime rerun.
+- `nscale-trainer-loop-source-publication-smoke-20260605.json` and
+  `nscale-trainer-loop-source-publication-pytest-20260605.log`: nscale
+  CPU/control-plane evidence for versioned trainer-loop source publication.
+  Two source-rank ownerships publish coherent step-specific model versions,
+  leases, descriptors, and provenance; the smoke reconstructs the step-2 target
+  from source-owned ranges, proves step-2 differs from step-1, and the pytest
+  gate verifies MX metadata round-trip/planning for the loop-owned slices
+  (`29 passed`). This is still a deterministic trainer-loop smoke over a
+  synthetic `torch.optim.SGD` objective, not a real distributed RL/FSDP trainer
+  loop.
 - `nscale-trainer-step-mx-publication-smoke-20260605.json` and
   `nscale-trainer-step-mx-publication-pytest-20260605.log`: nscale CPU/control
   plane evidence that trainer-step source publications can be published through

@@ -1,0 +1,30 @@
+Cursor code review: trainer-loop source publication increment
+Date: 2026-06-05
+Location: nscale pod mx-dev-goal-20260605, /workspace/modelexpress
+Branch: mx-rl-resharding-planner-poc
+Scope:
+- modelexpress_client/python/modelexpress/refit_trainer_step.py
+- modelexpress_client/python/tests/test_refit_trainer_step.py
+- modelexpress_client/python/tests/test_resharding_control_plane.py
+- goal.md
+- artifacts/resharding/README.md
+- artifacts/resharding/nscale-trainer-loop-source-publication-smoke-20260605.json
+
+Review rubric:
+- Used /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review/SKILL.md.
+- Focus: structural maintainability, abstraction boundaries, file-size risk, spaghetti growth, and missing explicit contracts.
+
+Findings:
+1. Medium: publish_trainer_loop_step added a new API contract but only had happy-path tests.
+   The implementation rejected empty ownership batches, non-positive step indices, mixed model names, and mixed base versions, and also reset stale leases/descriptors for each loop step. Without tests, those boundary assumptions could regress silently as real trainer integration lands.
+   Resolution: added test_trainer_loop_step_custom_model_version_resets_step_scoped_metadata and test_trainer_loop_step_rejects_incoherent_ownership_batch.
+
+Non-blockers checked:
+- refit_trainer_step.py remains 431 lines after the increment, below the 1000-line decomposition threshold.
+- The loop publisher reuses publish_trainer_step_source and annotate_trainer_step_ownership instead of forking the source-publication path.
+- The new docs keep the claim boundary explicit: deterministic CPU/control-plane trainer-loop smoke, not a real distributed RL/FSDP trainer loop.
+
+Post-fix verification:
+- python3 -m black modelexpress/refit_trainer_step.py tests/test_refit_trainer_step.py tests/test_resharding_control_plane.py
+- pytest -q tests/test_refit_trainer_step.py tests/test_resharding_control_plane.py tests/test_refit_vllm_mx_runtime.py tests/test_refit_sglang_mx_runtime.py
+- Result: 29 passed in 0.14s

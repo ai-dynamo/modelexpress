@@ -1,0 +1,221 @@
+{
+  "base_model_version": "base-step",
+  "dtype": "float32",
+  "global_shape": [
+    6,
+    4
+  ],
+  "metrics": {
+    "optimizer_step_count": 2,
+    "segment_count": 2,
+    "source_count_per_target_tensor": {
+      "lm_head.weight": 2
+    },
+    "source_publication_count": 2,
+    "trainer_to_inference_bytes": 96
+  },
+  "mode": "trainer-loop-source-publication-smoke",
+  "model_name": "tiny-trainer-loop",
+  "proof": {
+    "coherent_model_version_across_source_ranks": true,
+    "mx_metadata_roundtrip_covered_by_pytest": true,
+    "real_distributed_trainer_loop_used": false,
+    "real_rl_training_loop_used": false,
+    "source_owned_ranges_reconstruct_step2_target": true,
+    "step2_differs_from_step1": true,
+    "step_specific_leases_and_descriptors": true,
+    "synthetic_trainer_loop_smoke_used": true,
+    "trainer_loop_publisher_used": true
+  },
+  "published_model_versions": [
+    "base-step-trainer-loop-step-000001",
+    "base-step-trainer-loop-step-000002"
+  ],
+  "result": "pass",
+  "schema_version": 1,
+  "tensor_name": "lm_head.weight",
+  "trainer_loop_step": {
+    "base_model_version": "base-step",
+    "model_name": "tiny-trainer-loop",
+    "model_version": "base-step-trainer-loop-step-000002",
+    "source_ids": [
+      "trainer-rank0",
+      "trainer-rank1"
+    ],
+    "source_publication_count": 2,
+    "source_publications": [
+      {
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": 4,
+          "global_shape": [
+            6,
+            4
+          ],
+          "layout_tags": {
+            "learning_rate": "0.125",
+            "optimizer": "SGD",
+            "optimizer_step_count": 2,
+            "optimizer_step_publisher": true,
+            "source_payload_generator": "torch.optim.SGD",
+            "static_replacement_formula": false,
+            "synthetic_trainer_loop_smoke": true,
+            "synthetic_training_objective": true,
+            "trainer_layout": "fsdp-row-shard-poc",
+            "trainer_loop_base_model_version": "base-step",
+            "trainer_loop_model_version": "base-step-trainer-loop-step-000002",
+            "trainer_loop_publisher": true,
+            "trainer_loop_step_index": 2,
+            "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+            "trainer_update_source": "torch.optim.SGD-step-publisher"
+          },
+          "model_name": "tiny-trainer-loop",
+          "model_version": "base-step-trainer-loop-step-000002",
+          "nixl_descriptor_id": "trainer-rank0-base-step-trainer-loop-step-000002-optimizer-step-2",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank0",
+          "source_lease": "trainer-rank0-base-step-trainer-loop-step-000002-optimizer-step-2",
+          "source_range": [
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              4
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "lm_head.weight",
+          "worker_id": "trainer-rank0-worker",
+          "worker_rank": 0
+        },
+        "source_payload_provenance": {
+          "learning_rate": 0.125,
+          "optimizer": "SGD",
+          "optimizer_step_count": 2,
+          "optimizer_step_publisher_used": true,
+          "real_distributed_trainer_loop_used": false,
+          "real_rl_training_loop_used": false,
+          "source_payload_generator": "torch.optim.SGD",
+          "static_replacement_formula_used": false,
+          "synthetic_trainer_loop_smoke_used": true,
+          "synthetic_training_objective_used": true,
+          "trainer_loop_base_model_version": "base-step",
+          "trainer_loop_model_version": "base-step-trainer-loop-step-000002",
+          "trainer_loop_publisher_used": true,
+          "trainer_loop_step_index": 2,
+          "trainer_owned_parameter_tensor_used": true
+        },
+        "tensor_bytes": 48,
+        "tensor_device": "cpu",
+        "tensor_dtype": "float32",
+        "tensor_shape": [
+          3,
+          4
+        ]
+      },
+      {
+        "ownership": {
+          "contiguous": true,
+          "dtype": "float32",
+          "element_size_bytes": 4,
+          "global_shape": [
+            6,
+            4
+          ],
+          "layout_tags": {
+            "learning_rate": "0.125",
+            "optimizer": "SGD",
+            "optimizer_step_count": 2,
+            "optimizer_step_publisher": true,
+            "source_payload_generator": "torch.optim.SGD",
+            "static_replacement_formula": false,
+            "synthetic_trainer_loop_smoke": true,
+            "synthetic_training_objective": true,
+            "trainer_layout": "fsdp-row-shard-poc",
+            "trainer_loop_base_model_version": "base-step",
+            "trainer_loop_model_version": "base-step-trainer-loop-step-000002",
+            "trainer_loop_publisher": true,
+            "trainer_loop_step_index": 2,
+            "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+            "trainer_update_source": "torch.optim.SGD-step-publisher"
+          },
+          "model_name": "tiny-trainer-loop",
+          "model_version": "base-step-trainer-loop-step-000002",
+          "nixl_descriptor_id": "trainer-rank1-base-step-trainer-loop-step-000002-optimizer-step-2",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank1",
+          "source_lease": "trainer-rank1-base-step-trainer-loop-step-000002-optimizer-step-2",
+          "source_range": [
+            [
+              3,
+              6
+            ],
+            [
+              0,
+              4
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "lm_head.weight",
+          "worker_id": "trainer-rank1-worker",
+          "worker_rank": 1
+        },
+        "source_payload_provenance": {
+          "learning_rate": 0.125,
+          "optimizer": "SGD",
+          "optimizer_step_count": 2,
+          "optimizer_step_publisher_used": true,
+          "real_distributed_trainer_loop_used": false,
+          "real_rl_training_loop_used": false,
+          "source_payload_generator": "torch.optim.SGD",
+          "static_replacement_formula_used": false,
+          "synthetic_trainer_loop_smoke_used": true,
+          "synthetic_training_objective_used": true,
+          "trainer_loop_base_model_version": "base-step",
+          "trainer_loop_model_version": "base-step-trainer-loop-step-000002",
+          "trainer_loop_publisher_used": true,
+          "trainer_loop_step_index": 2,
+          "trainer_owned_parameter_tensor_used": true
+        },
+        "tensor_bytes": 48,
+        "tensor_device": "cpu",
+        "tensor_dtype": "float32",
+        "tensor_shape": [
+          3,
+          4
+        ]
+      }
+    ],
+    "step_index": 2,
+    "total_tensor_bytes": 96,
+    "trainer_loop_provenance": {
+      "learning_rate": 0.125,
+      "optimizer": "SGD",
+      "optimizer_step_count": 2,
+      "optimizer_step_publisher_used": true,
+      "real_distributed_trainer_loop_used": false,
+      "real_rl_training_loop_used": false,
+      "source_payload_generator": "torch.optim.SGD",
+      "static_replacement_formula_used": false,
+      "synthetic_trainer_loop_smoke_used": true,
+      "synthetic_training_objective_used": true,
+      "trainer_loop_base_model_version": "base-step",
+      "trainer_loop_model_version": "base-step-trainer-loop-step-000002",
+      "trainer_loop_publisher_used": true,
+      "trainer_loop_step_index": 2,
+      "trainer_owned_parameter_tensor_used": true
+    }
+  },
+  "validation": {
+    "allclose": true,
+    "expected_step2_checksum": -368.162109375,
+    "max_abs_error": 0.0,
+    "step1_checksum": -370.828125,
+    "step2_checksum": -368.162109375
+  }
+}

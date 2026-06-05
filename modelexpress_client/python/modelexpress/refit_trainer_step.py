@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from math import prod
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -40,6 +40,41 @@ class TrainerStepSourcePublication:
             "tensor_dtype": str(self.tensor.dtype).removeprefix("torch."),
             "tensor_device": str(self.tensor.device),
             "tensor_bytes": int(self.tensor.numel() * self.tensor.element_size()),
+        }
+
+
+@dataclass(frozen=True)
+class TrainerLoopStepPublication:
+    """All source-rank publications for one versioned trainer-loop step."""
+
+    model_name: str
+    base_model_version: str
+    model_version: str
+    step_index: int
+    source_publications: tuple[TrainerStepSourcePublication, ...]
+    provenance: dict[str, Any]
+
+    def to_artifact_metadata(self) -> dict[str, Any]:
+        source_publications = [
+            publication.to_artifact_metadata()
+            for publication in self.source_publications
+        ]
+        return {
+            "model_name": self.model_name,
+            "base_model_version": self.base_model_version,
+            "model_version": self.model_version,
+            "step_index": int(self.step_index),
+            "source_publication_count": len(source_publications),
+            "source_ids": [
+                publication.ownership.source_id
+                for publication in self.source_publications
+            ],
+            "total_tensor_bytes": sum(
+                publication.tensor.numel() * publication.tensor.element_size()
+                for publication in self.source_publications
+            ),
+            "trainer_loop_provenance": dict(self.provenance),
+            "source_publications": source_publications,
         }
 
 
@@ -70,6 +105,88 @@ def publish_trainer_step_source(
         tensor=tensor,
         provenance=trainer_step_source_provenance(
             step_count=step_count,
+            learning_rate=learning_rate,
+        ),
+    )
+
+
+def trainer_loop_model_version(base_model_version: str, step_index: int) -> str:
+    """Return the model version name for one trainer-loop publication step."""
+
+    if not base_model_version:
+        raise ValueError("base_model_version is required")
+    if int(step_index) <= 0:
+        raise ValueError("step_index must be positive")
+    return f"{base_model_version}-trainer-loop-step-{int(step_index):06d}"
+
+
+def publish_trainer_loop_step(
+    ownerships: Sequence[SliceOwnership],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    step_index: int,
+    learning_rate: float = DEFAULT_TRAINER_LR,
+    model_version: str | None = None,
+) -> TrainerLoopStepPublication:
+    """Publish all source-owned shards for one versioned trainer-loop step.
+
+    This is still a deterministic trainer-loop smoke over a tiny synthetic
+    objective. The important boundary change is that one trainer loop step
+    publishes a coherent model version across all source ranks, with
+    step-specific leases/descriptors that downstream MX planning can verify.
+    """
+
+    owners = tuple(ownerships)
+    if not owners:
+        raise ValueError("at least one source ownership is required")
+    if int(step_index) <= 0:
+        raise ValueError("step_index must be positive")
+
+    model_names = {owner.model_name for owner in owners}
+    if len(model_names) != 1:
+        raise ValueError(f"trainer loop ownerships span model names: {model_names}")
+    base_versions = {owner.model_version for owner in owners}
+    if len(base_versions) != 1:
+        raise ValueError(
+            f"trainer loop ownerships span base model versions: {base_versions}"
+        )
+
+    model_name = owners[0].model_name
+    base_model_version = owners[0].model_version
+    step_model_version = model_version or trainer_loop_model_version(
+        base_model_version, step_index
+    )
+    publications = tuple(
+        _annotate_trainer_loop_publication(
+            publish_trainer_step_source(
+                replace(
+                    owner,
+                    model_version=step_model_version,
+                    source_lease="",
+                    nixl_descriptor_id="",
+                ),
+                dtype=dtype,
+                device=device,
+                step_count=step_index,
+                learning_rate=learning_rate,
+            ),
+            base_model_version=base_model_version,
+            step_index=step_index,
+            learning_rate=learning_rate,
+        )
+        for owner in owners
+    )
+    return TrainerLoopStepPublication(
+        model_name=model_name,
+        base_model_version=base_model_version,
+        model_version=step_model_version,
+        step_index=int(step_index),
+        source_publications=publications,
+        provenance=trainer_loop_source_provenance(
+            base_model_version=base_model_version,
+            model_version=step_model_version,
+            step_index=step_index,
             learning_rate=learning_rate,
         ),
     )
@@ -107,6 +224,32 @@ def annotate_trainer_step_ownership(
         nixl_descriptor_id=nixl_descriptor_id,
         layout_tags=layout_tags,
     )
+
+
+def trainer_loop_source_provenance(
+    *,
+    base_model_version: str,
+    model_version: str,
+    step_index: int,
+    learning_rate: float = DEFAULT_TRAINER_LR,
+) -> dict[str, Any]:
+    """Return artifact metadata for a versioned trainer-loop publication step."""
+
+    provenance = trainer_step_source_provenance(
+        step_count=step_index,
+        learning_rate=learning_rate,
+    )
+    provenance.update(
+        {
+            "trainer_loop_publisher_used": True,
+            "trainer_loop_step_index": int(step_index),
+            "trainer_loop_base_model_version": base_model_version,
+            "trainer_loop_model_version": model_version,
+            "real_distributed_trainer_loop_used": False,
+            "synthetic_trainer_loop_smoke_used": True,
+        }
+    )
+    return provenance
 
 
 def trainer_step_source_provenance(
@@ -200,6 +343,38 @@ def trainer_step_tensor_for_range(
             loss.backward()
             optimizer.step()
     return param.detach().to(dtype=dtype).contiguous()
+
+
+def _annotate_trainer_loop_publication(
+    publication: TrainerStepSourcePublication,
+    *,
+    base_model_version: str,
+    step_index: int,
+    learning_rate: float,
+) -> TrainerStepSourcePublication:
+    owner = publication.ownership
+    layout_tags = dict(owner.layout_tags)
+    layout_tags.update(
+        {
+            "trainer_loop_publisher": True,
+            "trainer_loop_step_index": int(step_index),
+            "trainer_loop_base_model_version": base_model_version,
+            "trainer_loop_model_version": owner.model_version,
+            "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
+            "synthetic_trainer_loop_smoke": True,
+        }
+    )
+    provenance = trainer_loop_source_provenance(
+        base_model_version=base_model_version,
+        model_version=owner.model_version,
+        step_index=step_index,
+        learning_rate=learning_rate,
+    )
+    return replace(
+        publication,
+        ownership=replace(owner, layout_tags=layout_tags),
+        provenance=provenance,
+    )
 
 
 def _normalize_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
