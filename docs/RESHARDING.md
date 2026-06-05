@@ -120,18 +120,21 @@ and validates allclose/checksum. This proves independent source-pod fan-in for
 the synthetic MX/NIXL refit path. It does not yet prove real trainer pod churn
 or real runtime-owned vLLM/SGLang refit.
 
-The current runtime-owned vLLM trainer-loop cross-node proof is
-`artifacts/resharding/nscale-live-vllm-mx-runtime-trainer-loop-crossnode-20260605.json`.
+The current runtime-owned trainer-loop cross-node proofs are
+`artifacts/resharding/nscale-live-vllm-mx-runtime-trainer-loop-crossnode-20260605.json`
+and
+`artifacts/resharding/nscale-live-sglang-mx-runtime-trainer-loop-crossnode-20260605.json`.
 Two independent source pods on
 `cluster-0967a26d-pool-14bee067-prctr-g2j7h` publish versioned trainer-loop
 step-2 source ownership/NIXL endpoint metadata through MX; a target pod on
-`cluster-0967a26d-pool-14bee067-prctr-9c2x7` loads live vLLM 0.17.1, discovers
-both endpoints from MX, performs two cross-node UCX/NIXL reads into CUDA
-staging, infers expected optimizer step 2 from source metadata, installs via
-`LLM.apply_model`, and validates allclose/checksum. This proves tiny
-single-tensor vLLM runtime-owned staging-copy refit with trainer-loop metadata;
-direct NIXL landing into vLLM-owned storage, SGLang trainer-loop cross-node
-rerun, full-model refit, and real RL trainer integration remain open.
+`cluster-0967a26d-pool-14bee067-prctr-9c2x7` loads live vLLM 0.17.1 or live
+SGLang, discovers both endpoints from MX, performs two cross-node UCX/NIXL
+reads into CUDA staging, infers expected optimizer step 2 from source metadata,
+installs via `LLM.apply_model` or `Engine.update_weights_from_tensor`, and
+validates allclose/checksum. This proves tiny single-tensor runtime-owned
+staging-copy refit with trainer-loop metadata for both runtimes; direct NIXL
+landing into runtime-owned storage, full-model refit, and real RL trainer
+integration remain open.
 
 Qwen-style MoE manifest classification lives in
 `modelexpress.resharding_manifest`. It emits tensor family,

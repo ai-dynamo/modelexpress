@@ -1,0 +1,44 @@
+cursor-code-review rubric: a3sh-dotfiles cursor-code-review skill
+scope: uncommitted nscale diff for SGLang trainer-loop cross-node proof
+branch: mx-rl-resharding-planner-poc
+date: 2026-06-05
+
+diff reviewed:
+  artifacts/resharding/README.md
+  docs/RESHARDING.md
+  goal.md
+  SGLang trainer-loop cross-node JSON/source artifacts and logs
+
+line-count check:
+  goal.md: 960
+  docs/RESHARDING.md: 251
+  artifacts/resharding/README.md: 637
+  refit_sglang_mx_runtime.py: 835
+  refit_sglang_nixl_runtime_smoke.py: 902
+  no changed implementation file crossed 1000 lines in this increment
+
+findings:
+  none blocking for this docs/artifact-only increment.
+
+review notes:
+  The proof claim is narrowly framed: SGLang, tiny single tensor, staging-copy
+  runtime install, deterministic trainer-loop smoke over torch.optim.SGD, no
+  direct NIXL landing into SGLang-owned storage, no full-model refit, and no
+  real RL trainer loop.
+
+  goal.md is now close to 1000 lines. The next material goal update should
+  split proof ledger/status history into a separate document or artifact index
+  instead of continuing to grow goal.md.
+
+post-review verification:
+  JSON proof assertions:
+    nscale-live-sglang-mx-runtime-trainer-loop-crossnode-20260605.json pass
+    nscale-live-vllm-mx-runtime-trainer-loop-crossnode-20260605.json pass
+  pytest -q tests/test_refit_sglang_mx_runtime.py
+    tests/test_refit_sglang_nixl_runtime_smoke.py
+    tests/test_refit_vllm_mx_runtime.py
+    tests/test_refit_vllm_nixl_runtime_smoke.py
+    tests/test_refit_trainer_step.py
+    tests/test_resharding_control_plane.py
+  result: 42 passed
+  git diff --check: passed

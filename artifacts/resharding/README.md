@@ -437,6 +437,50 @@ Files:
   Cursor code-review rubric artifact for this rerun. It records the hard-coded
   optimizer-default finding, the fix to reuse the shared trainer-step constants,
   and the post-fix focused pytest gate (`42 passed`).
+- `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-20260605.json`:
+  completed cross-node, one-pod-per-source-rank SGLang+NIXL runtime rerun using
+  MX endpoint discovery plus versioned trainer-loop step-2 source publication.
+  Source pods `mx-sglang-loop-src0-20260605` and
+  `mx-sglang-loop-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`; target pod
+  `mx-sglang-loop-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`. The target loaded live SGLang
+  `0.0.0.dev1+g229cadec0`, discovered both READY source endpoints from
+  `mx-server-rl:8001`, read two UCX/NIXL segments into CUDA staging, inferred
+  the expected optimizer step from source ownership metadata, installed/restored
+  through `Engine.update_weights_from_tensor`, and validated staging allclose,
+  runtime allclose, and checksum. It records `cross_node=true`,
+  `one_pod_per_source_rank=true`, `trainer_loop_source_publication_used=true`,
+  `receiver_expected_update_from_source_metadata=true`,
+  `expected_optimizer_step_count=2`, `runtime_storage_dtype=bfloat16`,
+  `trainer_to_inference_bytes=16384`,
+  `raw_nixl_read_duration_ms=10.27112896554172`,
+  `metadata_query_duration_ms=41.94057593122125`,
+  `planner_duration_ms=0.1561130629852414`, and
+  `activation_install_duration_ms=13.772701029665768`. Scope boundary: SGLang
+  only, tiny single tensor, staging-copy install, deterministic trainer-loop
+  smoke, no direct NIXL landing into SGLang-owned storage, and no real RL
+  trainer loop.
+- `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-source0-20260605.json`
+  and
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-source1-20260605.json`:
+  source-side trainer-loop publication artifacts for the SGLang cross-node
+  trainer-loop runtime proof.
+- `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-20260605.log`,
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-source0-20260605.log`,
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-source1-20260605.log`,
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-pods-20260605.log`,
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-pod-describe-20260605.log`,
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-source-nvidia-smi-ib-20260605.log`,
+  and
+  `nscale-live-sglang-mx-runtime-trainer-loop-crossnode-target-nvidia-smi-ib-20260605.log`:
+  target/source logs, placement evidence, and GPU/IB evidence for the
+  successful SGLang trainer-loop cross-node runtime rerun.
+- `nscale-cursor-code-review-sglang-trainer-loop-crossnode-20260605.log`:
+  Cursor code-review rubric artifact for the SGLang trainer-loop cross-node
+  rerun. It records no blocking findings for the docs/artifact-only increment,
+  preserves the scope boundary, and flags `goal.md` as close to the next
+  decomposition threshold.
 - `nscale-live-vllm-mx-runtime-crossnode-bw4bt-startup-block-20260605.json` and
   `.log`: honest first-placement block. Source pods on
   `cluster-0967a26d-pool-14bee067-prctr-bw4bt` saw active `mlx5_10` IB, but the

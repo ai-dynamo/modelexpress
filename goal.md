@@ -333,7 +333,35 @@ Artifacts under `artifacts/resharding/` prove:
   `activation_install_duration_ms=0.15898107085376978`. Scope boundary: vLLM
   only, tiny single tensor, staging-copy install, deterministic trainer-loop
   smoke over `torch.optim.SGD`, no direct NIXL landing into vLLM-owned storage,
-  no SGLang trainer-loop cross-node rerun yet, and no real RL trainer loop.
+  and no real RL trainer loop.
+- A live SGLang GPU rerun now closes the SGLang side of the same
+  bridge-to-runtime gap for trainer-loop metadata:
+  `artifacts/resharding/nscale-live-sglang-mx-runtime-trainer-loop-crossnode-20260605.json`,
+  source JSONs, target/source logs, pod placement/describe logs, and
+  source/target IB/GPU snapshots. In run `mxsglangloop-20260605-ib1`, source
+  pods `mx-sglang-loop-src0-20260605` and `mx-sglang-loop-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`, each published a versioned
+  trainer-loop step-2 `SliceOwnership`, CUDA tensor descriptor, and NIXL
+  metadata endpoint through live `mx-server-rl:8001`. The target pod
+  `mx-sglang-loop-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`, loaded live SGLang
+  `0.0.0.dev1+g229cadec0`, discovered both source endpoints from MX, issued two
+  cross-node UCX/NIXL READs into CUDA staging, inferred the expected optimizer
+  step from source ownership metadata, installed/restored through
+  `Engine.update_weights_from_tensor`, and validated staging allclose, runtime
+  allclose, and checksum. The artifact records `result=pass`,
+  `cross_node=true`, `one_pod_per_source_rank=true`,
+  `trainer_loop_source_publication_used=true`,
+  `receiver_expected_update_from_source_metadata=true`,
+  `expected_optimizer_step_count=2`, `runtime_storage_dtype=bfloat16`,
+  `trainer_to_inference_bytes=16384`,
+  `raw_nixl_read_duration_ms=10.27112896554172`,
+  `metadata_query_duration_ms=41.94057593122125`,
+  `planner_duration_ms=0.1561130629852414`, and
+  `activation_install_duration_ms=13.772701029665768`. Scope boundary: SGLang
+  only, tiny single tensor, staging-copy install, deterministic trainer-loop
+  smoke over `torch.optim.SGD`, no direct NIXL landing into SGLang-owned
+  storage, and no real RL trainer loop.
 - `modelexpress.refit_vllm_mx_runtime` now proves cross-node vLLM+NIXL runtime
   refit with the MX endpoint control plane and one pod per source rank. In run
   `mxvllmrt-20260605-ib3`, two independent source pods
@@ -425,7 +453,8 @@ trainer-like source ranks feed runtime-owned weights through engine APIs, and
 both runtime bridges have same-node GPU reruns whose source ranks publish
 optimizer-step shards instead of deterministic replacement values. vLLM and
 SGLang also have checksum-backed cross-node, one-pod-per-source-rank MX-endpoint
-runtime bridges with staging-copy install. Full production real
+runtime bridges with staging-copy install, plus trainer-loop-metadata
+cross-node GPU reruns for both runtimes. Full production real
 trainer/inference refit remains unproven.
 
 ## What Is Not Proven Yet

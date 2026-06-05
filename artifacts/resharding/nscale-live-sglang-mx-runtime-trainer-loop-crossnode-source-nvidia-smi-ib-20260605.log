@@ -1,0 +1,46 @@
+===== mx-sglang-loop-src0-20260605 =====
+GPU 0: NVIDIA B200 (UUID: GPU-db79539e-7cc1-1fd3-d2b8-65dd14307cfb)
+--- infiniband
+total 0
+crw-rw-rw- 1 root root  10, 122 Jun  5 17:48 rdma_cm
+crw-rw-rw- 1 root root 231, 192 Jun  5 17:48 uverbs0
+crw-rw-rw- 1 root root 231, 193 Jun  5 17:48 uverbs1
+crw-rw-rw- 1 root root 231, 202 Jun  5 17:48 uverbs10
+crw-rw-rw- 1 root root 231, 203 Jun  5 17:48 uverbs11
+crw-rw-rw- 1 root root 231, 204 Jun  5 17:48 uverbs12
+crw-rw-rw- 1 root root 231, 194 Jun  5 17:48 uverbs2
+crw-rw-rw- 1 root root 231, 195 Jun  5 17:48 uverbs3
+crw-rw-rw- 1 root root 231, 196 Jun  5 17:48 uverbs4
+crw-rw-rw- 1 root root 231, 197 Jun  5 17:48 uverbs5
+crw-rw-rw- 1 root root 231, 198 Jun  5 17:48 uverbs6
+crw-rw-rw- 1 root root 231, 199 Jun  5 17:48 uverbs7
+crw-rw-rw- 1 root root 231, 200 Jun  5 17:48 uverbs8
+crw-rw-rw- 1 root root 231, 201 Jun  5 17:48 uverbs9
+--- mlx5_10
+4: ACTIVE
+5: LinkUp
+0x1
+0xffff
+===== mx-sglang-loop-src1-20260605 =====
+GPU 0: NVIDIA B200 (UUID: GPU-32734ff7-688b-de0c-bc0b-9c9e7d7d3e81)
+--- infiniband
+total 0
+crw-rw-rw- 1 root root  10, 122 Jun  5 17:48 rdma_cm
+crw-rw-rw- 1 root root 231, 192 Jun  5 17:48 uverbs0
+crw-rw-rw- 1 root root 231, 193 Jun  5 17:48 uverbs1
+crw-rw-rw- 1 root root 231, 202 Jun  5 17:48 uverbs10
+crw-rw-rw- 1 root root 231, 203 Jun  5 17:48 uverbs11
+crw-rw-rw- 1 root root 231, 204 Jun  5 17:48 uverbs12
+crw-rw-rw- 1 root root 231, 194 Jun  5 17:48 uverbs2
+crw-rw-rw- 1 root root 231, 195 Jun  5 17:48 uverbs3
+crw-rw-rw- 1 root root 231, 196 Jun  5 17:48 uverbs4
+crw-rw-rw- 1 root root 231, 197 Jun  5 17:48 uverbs5
+crw-rw-rw- 1 root root 231, 198 Jun  5 17:48 uverbs6
+crw-rw-rw- 1 root root 231, 199 Jun  5 17:48 uverbs7
+crw-rw-rw- 1 root root 231, 200 Jun  5 17:48 uverbs8
+crw-rw-rw- 1 root root 231, 201 Jun  5 17:48 uverbs9
+--- mlx5_10
+4: ACTIVE
+5: LinkUp
+0x1
+0xffff
