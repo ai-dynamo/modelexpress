@@ -411,6 +411,37 @@ Artifacts under `artifacts/resharding/` prove:
   staging-copy install and a synthetic optimizer objective; it is not direct
   NIXL landing into SGLang-owned storage, full-model refit, or a real RL
   trainer loop.
+- `modelexpress.refit_sglang_mx_runtime` now also proves a live SGLang
+  runtime target can consume source shards published by real
+  `torch.distributed` trainer source processes, with one pod per source rank
+  and all pods on distinct GPU nodes. In run `mxsglangdist-20260605-ib1`,
+  source pod `mx-sglang-dist-src0-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`, source pod
+  `mx-sglang-dist-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`, and target pod
+  `mx-sglang-dist-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-rxczf`. The source ranks used a real
+  initialized `torch.distributed` process group plus `torch.optim.SGD`
+  trainer-loop publisher, each defaulted to its own rank-owned source range,
+  published MX endpoint metadata, and the SGLang target discovered those
+  endpoints through MX, issued two UCX/NIXL reads into CUDA staging, installed
+  through `Engine.update_weights_from_tensor`, and validated staging/runtime
+  allclose and checksum. Evidence:
+  `artifacts/resharding/nscale-live-sglang-mx-runtime-distributed-trainer-crossnode-20260605.json`,
+  source JSONs, pod placement/describe logs, and source/target GPU/IB
+  snapshots. The target artifact records `result=pass`, `cross_node=true`,
+  `one_pod_per_source_rank=true`, `real_distributed_trainer_loop_used=true`,
+  `real_trainer_process_used=true`, `synthetic_trainer_loop_smoke_used=false`,
+  `actual_nixl_reads_used=true`, `trainer_full_all_gather_used=false`,
+  `trainer_to_inference_bytes=16384`, `segment_count=2`,
+  `raw_nixl_read_duration_ms=8.47374100703746`,
+  `metadata_query_duration_ms=34.77636503521353`,
+  `planner_duration_ms=0.1623230054974556`, and
+  `activation_install_duration_ms=14.938742970116436`. Scope boundary:
+  SGLang only, tiny single tensor, Gloo control/process-group coordination,
+  synthetic optimizer objective, staging-copy install, no FSDP/TP/PP/EP/RL
+  trainer, no direct NIXL landing into SGLang-owned storage, and no full-model
+  refit.
 - `artifacts/resharding/nscale-live-vllm-mx-runtime-crossnode-bw4bt-startup-block-20260605.json`
   and `.log` bank the first attempted source placement on
   `cluster-0967a26d-pool-14bee067-prctr-bw4bt`. IB was active on `mlx5_10`, but
@@ -455,19 +486,23 @@ optimizer-step shards instead of deterministic replacement values. vLLM and
 SGLang also have checksum-backed cross-node, one-pod-per-source-rank MX-endpoint
 runtime bridges with staging-copy install, plus trainer-loop-metadata
 cross-node GPU reruns for both runtimes. A source-side-only two-pod,
-two-node GPU smoke now proves real `torch.distributed` trainer ranks can own,
+two-node GPU smoke proves real `torch.distributed` trainer ranks can own,
 optimize, validate, and publish MX-compatible row-shard ownership metadata
-without using torch distributed tensor payload gather. Full production real
-trainer/inference refit remains unproven.
+without using torch distributed tensor payload gather, and a newer SGLang
+cross-node runtime proof wires those real distributed trainer source processes
+through MX endpoint publication into live NIXL reads and SGLang weight install.
+Full production real trainer/inference refit remains unproven.
 
 ## What Is Not Proven Yet
 
 The current POC does **not** prove:
 
-- Real FSDP, TP, PP, EP, or RL training loop integration. A tiny
-  `torch.distributed` row-shard trainer source-publication smoke is proven on
-  two cross-node B200 pods, but it is not FSDP/TP/PP/EP/RL and it is not yet
-  wired through the live vLLM/SGLang runtime bridge.
+- Real FSDP, TP, PP, EP, or RL training loop integration. Tiny
+  `torch.distributed` row-shard trainer source-publication is proven on
+  cross-node B200 pods, and the SGLang runtime bridge now consumes those real
+  distributed trainer source publications over MX/NIXL. This is still not
+  FSDP/TP/PP/EP/RL, not vLLM distributed-trainer runtime proof, not direct
+  runtime-buffer landing, and not full-model refit.
 - Full live vLLM or SGLang process integration with real trainer-process
   payloads, direct runtime-buffer NIXL landing, and the production
   post-load/refit lifecycle. Tiny live vLLM V1 and SGLang Engine-owned
@@ -638,8 +673,10 @@ Status: partially implemented; CPU receiver-install, tiny live vLLM/SGLang
 engine smokes, same-node SGLang+NIXL and vLLM+NIXL runtime bridges, and
 cross-node one-pod-per-source-rank vLLM/SGLang+NIXL MX-endpoint runtime bridges
 are implemented. Source-side real `torch.distributed` trainer publication is
-implemented and proven in a two-node GPU smoke, but not yet connected to the
-runtime NIXL bridge target.
+implemented and proven in GPU smokes, and the SGLang runtime bridge now
+consumes those distributed trainer source publications cross-node through
+MX/NIXL. The vLLM distributed-trainer runtime bridge, production lifecycle,
+direct runtime-buffer landing, and full-model/refit scale remain pending.
 
 Goal:
 
@@ -694,6 +731,18 @@ Current partial evidence:
   `...-pod-describe-20260605.log`, `...-src0-device-20260605.log`, and
   `...-src1-device-20260605.log`. This is source-side publication evidence,
   not runtime install or NIXL transfer evidence.
+- `modelexpress.refit_sglang_mx_runtime` now consumes those real
+  distributed-trainer source publications in a live cross-node SGLang target
+  proof. Evidence:
+  `artifacts/resharding/nscale-live-sglang-mx-runtime-distributed-trainer-crossnode-20260605.json`,
+  `...-source0-20260605.json`, `...-source1-20260605.json`, pod
+  placement/describe logs, and source/target device logs. The target reports
+  `real_distributed_trainer_loop_used=true`,
+  `real_trainer_process_used=true`, `one_pod_per_source_rank=true`,
+  `cross_node=true`, `actual_nixl_reads_used=true`, staging/runtime
+  allclose+checksum pass, 16,384 trainer-to-inference bytes, two source
+  segments, and no trainer full all-gather. This closes the SGLang side of the
+  distributed-trainer-to-runtime bridge for tiny single-tensor scope only.
 - `modelexpress.refit_vllm_receiver_smoke` now provides a live vLLM V1
   receiver-owned tensor smoke through `LLM.apply_model`, plus a
   framework-explicit module helper. The live entrypoint creates a tiny Qwen2
@@ -911,15 +960,16 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Wire the proven `torch.distributed` source publisher into the vLLM/SGLang
-   NIXL runtime bridges and rerun the cross-node one-pod-per-source-rank path.
-   The current branch now has CPU tests, versioned trainer-loop publication
-   smoke, vLLM/SGLang bridge source paths wired to selectable source-publisher
-   identity metadata, same-node vLLM/SGLang GPU reruns, cross-node
-   one-pod-per-source-rank runtime evidence for both runtimes, and a separate
-   two-node GPU `torch.distributed` source-publication proof. The missing link
-   is a single artifact where the live runtime target reads shards published by
-   those real distributed trainer source processes.
+1. Mirror the SGLang distributed-trainer runtime proof on vLLM, then scale both
+   paths. The current branch now has CPU tests, versioned trainer-loop
+   publication smoke, vLLM/SGLang bridge source paths wired to selectable
+   source-publisher identity metadata, same-node vLLM/SGLang GPU reruns,
+   cross-node one-pod-per-source-rank runtime evidence for both runtimes, a
+   separate GPU `torch.distributed` source-publication proof, and a live
+   SGLang target artifact where the runtime reads shards published by real
+   distributed trainer source processes. Remaining near-term gaps are the vLLM
+   equivalent, larger/multi-layer target tensors, direct runtime-buffer landing,
+   and real FSDP/TP/PP/EP/RL source ownership.
 2. Extend the runtime bridge placement work beyond tiny single-tensor vLLM and
    SGLang targets while keeping the allclose/checksum gates.
 3. Promote the runtime bridges into each engine's production post-load/refit
@@ -968,13 +1018,15 @@ Safe claim:
 > allclose/checksum, and both have same-node optimizer-step source reruns. vLLM
 > and SGLang now also have cross-node, one-pod-per-source-rank MX-endpoint
 > runtime bridges over UCX/IB rc with checksum/allclose. A separate source-side
-> GPU smoke now proves real `torch.distributed` trainer ranks on two B200 nodes
-> can publish validated MX-compatible source ownership without torch distributed
-> tensor payload gather. These runtime artifacts still use tiny single-tensor
-> payloads, staging-copy runtime APIs, synthetic optimizer objectives, and no
-> live RL trainer loop; the new distributed trainer source proof is not yet
-> wired through a live runtime target. Direct runtime-buffer NIXL landing,
-> full-model refit, and production real trainer/runtime refit remain unproven.
+> GPU smoke proves real `torch.distributed` trainer ranks on B200 nodes can
+> publish validated MX-compatible source ownership without torch distributed
+> tensor payload gather, and SGLang now has a cross-node runtime target proof
+> that consumes those real distributed trainer source publications through MX
+> endpoint discovery and NIXL segment reads. These runtime artifacts still use
+> tiny single-tensor payloads, staging-copy runtime APIs, synthetic optimizer
+> objectives, and no live RL trainer loop. Direct runtime-buffer NIXL landing,
+> vLLM distributed-trainer runtime proof, full-model refit, and production real
+> trainer/runtime refit remain unproven.
 
 Unsafe claim:
 

@@ -67,6 +67,7 @@ from .refit_mx_runtime_common import (
     normalize_source_publisher as _normalize_source_publisher,
     parse_csv as _parse_csv,
     parse_shape as _parse_shape,
+    resolve_source_filter_for_publisher as _resolve_source_filter_for_publisher,
     scenario_with_mx_endpoint_plan as _common_scenario_with_mx_endpoint_plan,
     source_status_name as _source_status_name,
     trainer_framework_for_source_publisher as _trainer_framework_for_source_publisher,
@@ -269,6 +270,20 @@ def run_source(
 
     source_publisher = _normalize_source_publisher(source_publisher)
     dtype_obj = _torch_dtype_from_name(source_dtype)
+    distributed_context = None
+    distributed_process_group_created = False
+    if source_publisher == SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP:
+        distributed_context, distributed_process_group_created = (
+            ensure_distributed_trainer_process_group(
+                backend=distributed_trainer_backend
+            )
+        )
+    source_id, source_worker_rank = _resolve_source_filter_for_publisher(
+        source_publisher=source_publisher,
+        source_id=source_id,
+        source_worker_rank=source_worker_rank,
+        distributed_context=distributed_context,
+    )
     ownerships = _filter_source_ownerships(
         build_sglang_mx_runtime_source_ownerships(
             tensor_name=tensor_name,
@@ -280,14 +295,6 @@ def run_source(
         source_id=source_id,
         worker_rank=source_worker_rank,
     )
-    distributed_context = None
-    distributed_process_group_created = False
-    if source_publisher == SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP:
-        distributed_context, distributed_process_group_created = (
-            ensure_distributed_trainer_process_group(
-                backend=distributed_trainer_backend
-            )
-        )
 
     adapter = NixlAdapter(_source_agent_name(run_id, ownerships))
     try:
@@ -434,6 +441,11 @@ def run_source(
                 "torch_distributed_process_group_used": bool(
                     trainer_loop_publication.provenance.get(
                         "torch_distributed_process_group_used"
+                    )
+                ),
+                "real_trainer_process_used": bool(
+                    trainer_loop_publication.provenance.get(
+                        "real_distributed_trainer_loop_used"
                     )
                 ),
                 "real_rl_training_loop_used": False,
@@ -745,6 +757,7 @@ def run_target(
                 "trainer_loop_step_index": int(trainer_step_index),
                 "synthetic_trainer_loop_smoke_used": synthetic_trainer_sources_used,
                 "real_distributed_trainer_loop_used": distributed_trainer_sources_used,
+                "real_trainer_process_used": distributed_trainer_sources_used,
                 "real_rl_training_loop_used": False,
             }
         )

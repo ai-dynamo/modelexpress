@@ -118,6 +118,29 @@ def trainer_framework_for_source_publisher(source_publisher: str) -> str:
     return "torch.optim.SGD-trainer-loop-smoke"
 
 
+def resolve_source_filter_for_publisher(
+    *,
+    source_publisher: str,
+    source_id: str,
+    source_worker_rank: int | None,
+    distributed_context: DistributedTrainerContext | None = None,
+) -> tuple[str, int | None]:
+    """Return the source ownership filter for the selected source publisher."""
+
+    source_publisher = normalize_source_publisher(source_publisher)
+    if (
+        source_publisher == SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP
+        and not source_id
+        and source_worker_rank is None
+    ):
+        if distributed_context is None:
+            raise ValueError(
+                "distributed_context is required to infer distributed source rank"
+            )
+        return source_id, int(distributed_context.rank)
+    return source_id, source_worker_rank
+
+
 def parse_shape(value: str | Sequence[int]) -> tuple[int, ...]:
     if isinstance(value, str):
         dims = tuple(int(part) for part in value.replace("x", ",").split(",") if part)

@@ -16,8 +16,11 @@ from modelexpress.refit_vllm_mx_runtime import (
     scenario_with_mx_endpoint_plan,
 )
 from modelexpress.refit_mx_runtime_common import (
+    SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
     SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
+    resolve_source_filter_for_publisher,
 )
+from modelexpress.refit_trainer_step import DistributedTrainerContext
 from modelexpress.refit_vllm_nixl_runtime_smoke import build_vllm_runtime_nixl_plan
 from modelexpress.resharding_control_plane import RefitNixlEndpoint
 from modelexpress.types import TensorDescriptor
@@ -107,6 +110,44 @@ def test_vllm_mx_runtime_identity_can_select_distributed_trainer_publisher():
     assert identity.extra_parameters["trainer_layout"] == (
         "fsdp-row-shard-vllm-runtime"
     )
+
+
+def test_vllm_mx_runtime_distributed_publisher_defaults_to_current_rank_filter():
+    source_id, worker_rank = resolve_source_filter_for_publisher(
+        source_publisher=SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
+        source_id="",
+        source_worker_rank=None,
+        distributed_context=DistributedTrainerContext(
+            backend="gloo",
+            rank=1,
+            world_size=2,
+            local_rank=0,
+        ),
+    )
+
+    assert source_id == ""
+    assert worker_rank == 1
+
+    explicit = resolve_source_filter_for_publisher(
+        source_publisher=SOURCE_PUBLISHER_DISTRIBUTED_TRAINER_LOOP,
+        source_id="trainer-rank0",
+        source_worker_rank=None,
+        distributed_context=DistributedTrainerContext(
+            backend="gloo",
+            rank=1,
+            world_size=2,
+            local_rank=0,
+        ),
+    )
+    assert explicit == ("trainer-rank0", None)
+
+    smoke_default = resolve_source_filter_for_publisher(
+        source_publisher=SOURCE_PUBLISHER_TRAINER_LOOP_SMOKE,
+        source_id="",
+        source_worker_rank=None,
+        distributed_context=None,
+    )
+    assert smoke_default == ("", None)
 
 
 def test_vllm_mx_runtime_scenario_uses_mx_endpoint_ownerships_for_plan():

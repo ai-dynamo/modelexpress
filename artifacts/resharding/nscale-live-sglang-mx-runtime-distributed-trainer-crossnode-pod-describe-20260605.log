@@ -1,0 +1,245 @@
+Name:             mx-sglang-dist-src0-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-g2j7h/192.168.0.197
+Start Time:       Fri, 05 Jun 2026 20:31:57 +0200
+Labels:           app=mx-sglang-dist-runtime
+                  gpu-reaper.nvidia.com/status=idle
+                  modelexpress.nvidia.com/run=sglang-dist-runtime-20260605
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 852
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-05T18:35:14Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 461
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.20.221
+IPs:
+  IP:  10.0.20.221
+Containers:
+  main:
+    Container ID:  containerd://7006ee951242bdf6bcc5faffbff12f341765f5b907181ae7e1eb6f13ba13fe83
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:31:58 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             4
+      memory:          32Gi
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:                    mx-sglang-dist-src0-20260605 (v1:metadata.name)
+      NODE_NAME:                    (v1:spec.nodeName)
+      MODEL_EXPRESS_URL:           mx-server-rl:8001
+      MX_SERVER_ADDRESS:           mx-server-rl:8001
+      MX_NIXL_BACKEND:             UCX
+      UCX_TLS:                     rc_x,rc,tcp,cuda_copy
+      UCX_NET_DEVICES:             mlx5_10:1
+      MX_RDMA_NIC_PIN:             mlx5_10:1
+      MX_HEARTBEAT_INTERVAL_SECS:  1
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-jb49q (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  kube-api-access-jb49q:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              <none>
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved:NoSchedule op=Exists
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  9m58s  default-scheduler  Successfully assigned anish-dynamo/mx-sglang-dist-src0-20260605 to cluster-0967a26d-pool-14bee067-prctr-g2j7h
+  Normal  Pulled     9m58s  kubelet            Container image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" already present on machine
+  Normal  Created    9m58s  kubelet            Created container: main
+  Normal  Started    9m57s  kubelet            Started container main
+
+
+Name:             mx-sglang-dist-src1-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-9c2x7/192.168.0.203
+Start Time:       Fri, 05 Jun 2026 20:31:58 +0200
+Labels:           app=mx-sglang-dist-runtime
+                  gpu-reaper.nvidia.com/status=idle
+                  modelexpress.nvidia.com/run=sglang-dist-runtime-20260605
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 863
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-05T18:35:14Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 453
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.12.208
+IPs:
+  IP:  10.0.12.208
+Containers:
+  main:
+    Container ID:  containerd://c93b4d36b92eb25592327835df86f6126d33b672b5a2a082b133206fd5c06e6b
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:31:59 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             4
+      memory:          32Gi
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:                    mx-sglang-dist-src1-20260605 (v1:metadata.name)
+      NODE_NAME:                    (v1:spec.nodeName)
+      MODEL_EXPRESS_URL:           mx-server-rl:8001
+      MX_SERVER_ADDRESS:           mx-server-rl:8001
+      MX_NIXL_BACKEND:             UCX
+      UCX_TLS:                     rc_x,rc,tcp,cuda_copy
+      UCX_NET_DEVICES:             mlx5_10:1
+      MX_RDMA_NIC_PIN:             mlx5_10:1
+      MX_HEARTBEAT_INTERVAL_SECS:  1
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-bcjdk (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  kube-api-access-bcjdk:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              <none>
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved:NoSchedule op=Exists
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  9m57s  default-scheduler  Successfully assigned anish-dynamo/mx-sglang-dist-src1-20260605 to cluster-0967a26d-pool-14bee067-prctr-9c2x7
+  Normal  Pulled     9m57s  kubelet            Container image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" already present on machine
+  Normal  Created    9m56s  kubelet            Created container: main
+  Normal  Started    9m56s  kubelet            Started container main
+
+
+Name:             mx-sglang-dist-tgt-20260605
+Namespace:        anish-dynamo
+Priority:         0
+Service Account:  default
+Node:             cluster-0967a26d-pool-14bee067-prctr-rxczf/192.168.0.214
+Start Time:       Fri, 05 Jun 2026 20:31:59 +0200
+Labels:           app=mx-sglang-dist-runtime
+                  gpu-reaper.nvidia.com/status=idle
+                  modelexpress.nvidia.com/run=sglang-dist-runtime-20260605
+Annotations:      gpu-reaper.nvidia.com/cpu-util-millicores: 335
+                  gpu-reaper.nvidia.com/gpu-util-pct: 0
+                  gpu-reaper.nvidia.com/idle-since: 2026-06-05T18:40:20Z
+                  gpu-reaper.nvidia.com/net-throughput-bytes: 72
+                  gpu-reaper.nvidia.com/state: idle
+Status:           Running
+IP:               10.0.14.168
+IPs:
+  IP:  10.0.14.168
+Containers:
+  main:
+    Container ID:  containerd://0093f7acd5be039285554ff8f4c90706cdd3078134b39cc37d8db0eb2119ac3c
+    Image:         docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90
+    Image ID:      docker.io/amaddipoti439/modelexpress@sha256:8f7188409c80c6998a06054718240d1b4abd61842e7f03beb8e2528bd98c4298
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/bash
+      -lc
+      sleep infinity
+    State:          Running
+      Started:      Fri, 05 Jun 2026 20:35:16 +0200
+    Ready:          True
+    Restart Count:  0
+    Limits:
+      cpu:             16
+      memory:          128Gi
+      nvidia.com/gpu:  1
+    Requests:
+      cpu:             8
+      memory:          64Gi
+      nvidia.com/gpu:  1
+    Environment:
+      POD_NAME:                    mx-sglang-dist-tgt-20260605 (v1:metadata.name)
+      NODE_NAME:                    (v1:spec.nodeName)
+      MODEL_EXPRESS_URL:           mx-server-rl:8001
+      MX_SERVER_ADDRESS:           mx-server-rl:8001
+      MX_NIXL_BACKEND:             UCX
+      UCX_TLS:                     rc_x,rc,tcp,cuda_copy
+      UCX_NET_DEVICES:             mlx5_10:1
+      MX_RDMA_NIC_PIN:             mlx5_10:1
+      MX_HEARTBEAT_INTERVAL_SECS:  1
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-7hw5l (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   True
+  Initialized                 True
+  Ready                       True
+  ContainersReady             True
+  PodScheduled                True
+Volumes:
+  kube-api-access-7hw5l:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    Optional:                false
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              <none>
+Tolerations:                 modelexpress.nvidia.com/rl-ce-reserved:NoSchedule op=Exists
+                             node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             nvidia.com/gpu:NoSchedule op=Exists
+Events:
+  Type    Reason     Age    From               Message
+  ----    ------     ----   ----               -------
+  Normal  Scheduled  9m57s  default-scheduler  Successfully assigned anish-dynamo/mx-sglang-dist-tgt-20260605 to cluster-0967a26d-pool-14bee067-prctr-rxczf
+  Normal  Pulling    9m57s  kubelet            Pulling image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90"
+  Normal  Pulled     6m41s  kubelet            Successfully pulled image "docker.io/amaddipoti439/modelexpress:sglang-public-rl-bb22a90" in 3m15.866s (3m15.866s including waiting). Image size: 13089678644 bytes.
+  Normal  Created    6m40s  kubelet            Created container: main
+  Normal  Started    6m40s  kubelet            Started container main
