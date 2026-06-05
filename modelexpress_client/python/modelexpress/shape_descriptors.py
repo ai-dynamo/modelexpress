@@ -266,18 +266,40 @@ def encode_registry(
     *,
     version: int,
     trainer_world_layout: str,
+    extras: dict[str, Any] | None = None,
 ) -> str:
-    """Serialize a registry to a string for ``extra_parameters``."""
-    payload = {
+    """Serialize a registry to a string for ``extra_parameters``.
+
+    ``extras`` is an optional dict of additional top-level keys to merge
+    into the registry payload. Used by Megatron-Core publishes to carry
+    the transformer config + Megatron→HF name map alongside the
+    per-tensor descriptors. Receivers pick the keys up via
+    :func:`decode_registry` (which round-trips unknown top-level keys
+    unchanged).
+    """
+    payload: dict[str, Any] = {
         "version": int(version),
         "trainer_world_layout": trainer_world_layout,
         "tensors": [d.to_dict() for d in descriptors],
     }
+    if extras:
+        for key, value in extras.items():
+            # Don't let extras shadow the structural keys.
+            if key in ("version", "trainer_world_layout", "tensors"):
+                continue
+            payload[key] = value
     return json.dumps(payload, separators=(",", ":"))
 
 
 def decode_registry(blob: str) -> dict[str, Any]:
-    """Inverse of ``encode_registry``. Returns ``{version, trainer_world_layout, tensors}``."""
+    """Inverse of :func:`encode_registry`.
+
+    Returns the full registry dict — at minimum ``{version,
+    trainer_world_layout, tensors}``, plus any extras the publisher
+    attached (round-tripped unchanged). Receivers inspect the dict
+    directly for the keys they care about; unknown keys are preserved
+    so future fields don't require coordinated upgrades.
+    """
     parsed = json.loads(blob)
     parsed["tensors"] = [
         TensorDescriptorV2.from_dict(t) for t in parsed.get("tensors", [])

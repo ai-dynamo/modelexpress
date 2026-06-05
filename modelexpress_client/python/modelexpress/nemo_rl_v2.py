@@ -239,6 +239,13 @@ class MxV2TrainingPublisher:
         self._megatron_pp_rank: int = 0
         self._megatron_ep_rank: int = 0
 
+        # Optional Megatron-Bridge-derived sidecar payload (transformer
+        # config + Megatron→HF name map). Set once at trainer init via
+        # :meth:`set_megatron_sidecar`; merged into the v2 sidecar JSON
+        # at every :meth:`publish` so receivers can do role-aware
+        # assembly without importing Bridge.
+        self._megatron_sidecar: dict[str, Any] = {}
+
     @property
     def worker_rank(self) -> int:
         return self._worker_rank
@@ -262,6 +269,22 @@ class MxV2TrainingPublisher:
             training_framework="nemo_rl",
         )
         self._initialized = True
+
+    def set_megatron_sidecar(self, sidecar: dict[str, Any]) -> None:
+        """Set the Megatron-Bridge-derived sidecar payload.
+
+        ``sidecar`` is a dict with the keys
+        ``"megatron_transformer_config"`` and ``"megatron_hf_name_map"``
+        (per :mod:`modelexpress.megatron_translator`). The publisher
+        merges these into the v2 sidecar JSON at every :meth:`publish`,
+        so receivers can do role-aware assembly without importing
+        Megatron-Bridge themselves.
+
+        Call once at trainer init after Bridge introspection. Empty
+        dict (the default) is a no-op — receivers fall back to deriving
+        head config / name map independently.
+        """
+        self._megatron_sidecar = dict(sidecar) if sidecar else {}
 
     def set_megatron_mesh_position(
         self,
@@ -365,10 +388,21 @@ class MxV2TrainingPublisher:
                 "no tensors added; call add_tensor() before publish()"
             )
 
+        # Build the registry blob; merge in the Megatron sidecar (if any)
+        # via encode_registry's extras so the receiver sees
+        # transformer_config + name_map at the top level of
+        # candidate.registry. parse_megatron_sidecar consumes them from
+        # there.
+        registry_extras: dict[str, Any] = {}
+        if self._megatron_sidecar:
+            for key in ("megatron_transformer_config", "megatron_hf_name_map"):
+                if key in self._megatron_sidecar:
+                    registry_extras[key] = self._megatron_sidecar[key]
         registry_blob = encode_registry(
             self._registry,
             version=version,
             trainer_world_layout=self._world_layout.encode(),
+            extras=registry_extras or None,
         )
 
         # Fold the v2 metadata into the underlying publisher's
@@ -427,6 +461,13 @@ class MxV2TrainingPublisher:
             sidecar_dict["pp_size"] = int(wl.pp_world_size)
             sidecar_dict["ep_rank"] = int(self._megatron_ep_rank)
             sidecar_dict["ep_size"] = int(wl.ep_world_size)
+            # Merge in the Bridge-derived transformer config + Megatron→HF
+            # name map (set once at trainer init via set_megatron_sidecar).
+            # Receivers consume these via
+            # modelexpress.megatron_translator.parse_megatron_sidecar.
+            for key in ("megatron_transformer_config", "megatron_hf_name_map"):
+                if key in self._megatron_sidecar:
+                    sidecar_dict[key] = self._megatron_sidecar[key]
         sidecar_payload = json.dumps(sidecar_dict, separators=(",", ":"))
 
         # Wrap the agent_name with v2 markers (legacy-server fallback path 2).
