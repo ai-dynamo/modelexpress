@@ -1,0 +1,15 @@
+I0605 16:15:43.856380     357 nixl_log.cpp:80] NIXL version: 1.1.0 (git: 19a7c8c2)
+2026-06-05 16:15:43 NIXL INFO    logging.py:82 Log level set to INFO from NIXL_LOG_LEVEL environment variable
+I0605 16:15:44.979066     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: OBJ
+I0605 16:15:44.979084     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: GPUNETIO
+I0605 16:15:44.979087     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: POSIX
+I0605 16:15:44.979089     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: AZURE_BLOB
+I0605 16:15:44.979091     357 nixl_plugin_manager.cpp:491] Discovered telemetry plugin: prometheus
+I0605 16:15:44.979093     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: GDS
+I0605 16:15:44.979095     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: UCX
+I0605 16:15:44.979097     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: GUSLI
+I0605 16:15:44.979098     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: LIBFABRIC
+I0605 16:15:44.979101     357 nixl_plugin_manager.cpp:482] Discovered backend plugin: GDS_MT
+I0605 16:15:44.979108     357 nixl_plugin_manager.cpp:649] Loading static plugin: BUFFER
+2026-06-05 16:15:46 NIXL INFO    _api.py:369 Backend UCX was instantiated
+2026-06-05 16:15:46 NIXL INFO    _api.py:247 Initialized NIXL agent: mx-sglang-mx-source-mxsglangrt-20260605-ib1-trainer-rank1

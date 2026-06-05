@@ -1,0 +1,4 @@
+NAME                         READY   STATUS    RESTARTS   AGE     IP           NODE                                         NOMINATED NODE   READINESS GATES
+mx-sglang-mx-src0-20260605   1/1     Running   0          3m24s   10.0.20.52   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+mx-sglang-mx-src1-20260605   1/1     Running   0          3m23s   10.0.20.51   cluster-0967a26d-pool-14bee067-prctr-g2j7h   <none>           <none>
+mx-sglang-mx-tgt-20260605    1/1     Running   0          3m22s   10.0.12.33   cluster-0967a26d-pool-14bee067-prctr-9c2x7   <none>           <none>

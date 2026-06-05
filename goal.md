@@ -275,10 +275,10 @@ Artifacts under `artifacts/resharding/` prove:
   storage round-trip while keeping the NIXL staging gate full precision. These
   supersede the earlier same-node trainer-step GPU capacity/runtime blocks for
   vLLM and SGLang scope, but remain same-node/one-pod GPU-reuse proofs over a
-  synthetic objective. The vLLM cross-node proof below now covers
-  one-pod-per-source-rank runtime placement for tiny vLLM with staging-copy
-  install; direct NIXL landing into runtime-owned storage and a real RL trainer
-  loop remain unproven.
+  synthetic objective. The vLLM and SGLang cross-node proofs below now cover
+  one-pod-per-source-rank runtime placement for tiny runtime weights with
+  staging-copy install; direct NIXL landing into runtime-owned storage and a
+  real RL trainer loop remain unproven.
   A live `mx-server-rl` trainer-step publication pass is now banked in
   `artifacts/resharding/nscale-live-mx-trainer-step-publication-sidecar-pass-20260605.json`
   and `.log`: the deployed server still drops the new repeated ownership field,
@@ -306,9 +306,33 @@ Artifacts under `artifacts/resharding/` prove:
   `metadata_query_duration_ms=31.619531917385757`,
   `planner_duration_ms=0.18348696175962687`, and checksum/allclose gates. Scope
   boundary: this is tiny single-tensor vLLM runtime evidence with staging-copy
-  install and a synthetic optimizer objective; it is not SGLang cross-node
-  runtime placement, direct NIXL landing into vLLM-owned storage, full-model
-  refit, or a real RL trainer loop.
+  install and a synthetic optimizer objective; it is not direct NIXL landing
+  into vLLM-owned storage, full-model refit, or a real RL trainer loop.
+- `modelexpress.refit_sglang_mx_runtime` now proves cross-node SGLang+NIXL
+  runtime refit with the MX endpoint control plane and one pod per source rank.
+  In run `mxsglangrt-20260605-ib1`, two independent source pods
+  (`mx-sglang-mx-src0-20260605` and `mx-sglang-mx-src1-20260605`) ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`, each published one
+  optimizer-step `SliceOwnership`, CUDA tensor descriptor, and NIXL metadata
+  endpoint through live `mx-server-rl:8001`. The target pod
+  `mx-sglang-mx-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`, loaded live SGLang
+  `0.0.0.dev1+g229cadec0`, built its receiver `SliceRequest` from
+  `lm_head.weight`, discovered both READY source endpoints from MX, issued two
+  cross-node UCX/NIXL READs into CUDA staging, installed through
+  `Engine.update_weights_from_tensor`, and validated staging allclose, runtime
+  allclose, and checksum. Evidence:
+  `artifacts/resharding/nscale-live-sglang-mx-runtime-crossnode-20260605.json`,
+  source JSONs, pod placement/describe logs, and source/target IB/GPU snapshots.
+  The target artifact records `result=pass`, `cross_node=true`,
+  `one_pod_per_source_rank=true`, `trainer_to_inference_bytes=16384`,
+  `raw_nixl_read_duration_ms=12.166149914264679`,
+  `metadata_query_duration_ms=44.608733034692705`,
+  `planner_duration_ms=0.14281098265200853`, and checksum/allclose gates. Scope
+  boundary: this is tiny single-tensor SGLang runtime evidence with
+  staging-copy install and a synthetic optimizer objective; it is not direct
+  NIXL landing into SGLang-owned storage, full-model refit, or a real RL
+  trainer loop.
 - `artifacts/resharding/nscale-live-vllm-mx-runtime-crossnode-bw4bt-startup-block-20260605.json`
   and `.log` bank the first attempted source placement on
   `cluster-0967a26d-pool-14bee067-prctr-bw4bt`. IB was active on `mlx5_10`, but
@@ -349,10 +373,10 @@ hard-kill recovery NIXL GPU data-plane runs. Level 4 now has same-node,
 one-pod live vLLM and SGLang runtime bridge proofs where NIXL reads from
 trainer-like source ranks feed runtime-owned weights through engine APIs, and
 both runtime bridges have same-node GPU reruns whose source ranks publish
-optimizer-step shards instead of deterministic replacement values. vLLM also
-has a checksum-backed cross-node, one-pod-per-source-rank MX-endpoint runtime
-bridge with staging-copy install. Full production real trainer/inference refit
-remains unproven.
+optimizer-step shards instead of deterministic replacement values. vLLM and
+SGLang also have checksum-backed cross-node, one-pod-per-source-rank MX-endpoint
+runtime bridges with staging-copy install. Full production real
+trainer/inference refit remains unproven.
 
 ## What Is Not Proven Yet
 
@@ -364,10 +388,10 @@ The current POC does **not** prove:
   post-load/refit lifecycle. Tiny live vLLM V1 and SGLang Engine-owned
   tensor/weight smokes are proven, same-node vLLM/SGLang NIXL-to-runtime
   bridges are proven, both runtimes have same-node GPU reruns using
-  optimizer-step source publications, and vLLM now has a checksum-backed
-  cross-node one-pod-per-source-rank runtime bridge. Still unproven: SGLang
-  cross-node runtime placement, direct NIXL landing into runtime-owned storage,
-  full-model/runtime lifecycle integration, and a real RL trainer loop.
+  optimizer-step source publications, and both vLLM and SGLang now have
+  checksum-backed cross-node one-pod-per-source-rank runtime bridges. Still
+  unproven: direct NIXL landing into runtime-owned storage, full-model/runtime
+  lifecycle integration, and a real RL trainer loop.
 - A hard source pod kill during an in-flight NIXL read against real
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
@@ -526,9 +550,9 @@ Remaining gap:
 ### Level 4: Real Runtime Refit
 
 Status: partially implemented; CPU receiver-install, tiny live vLLM/SGLang
-engine smokes, same-node SGLang+NIXL and vLLM+NIXL runtime bridges, and a
-cross-node one-pod-per-source-rank vLLM+NIXL MX-endpoint runtime bridge are
-implemented.
+engine smokes, same-node SGLang+NIXL and vLLM+NIXL runtime bridges, and
+cross-node one-pod-per-source-rank vLLM/SGLang+NIXL MX-endpoint runtime bridges
+are implemented.
 
 Goal:
 
@@ -764,13 +788,11 @@ These are the next useful things to do, in order:
 
 1. Replace the synthetic optimizer-step publisher in the vLLM/SGLang NIXL
    runtime bridges with a real trainer-loop integration. The current branch now
-   has CPU tests, same-node vLLM/SGLang GPU reruns, and cross-node vLLM runtime
-   evidence for the optimizer-step publisher; the next source-side step is real
-   FSDP/TP/PP/EP or RL trainer ownership publication.
-2. Extend the runtime bridge placement work: vLLM now has tiny single-tensor
-   cross-node, one-pod-per-source-rank evidence; next repeat the scope for
-   SGLang, then scale vLLM beyond tiny single-tensor while keeping the
-   allclose/checksum gates.
+   has CPU tests, same-node vLLM/SGLang GPU reruns, and cross-node
+   one-pod-per-source-rank runtime evidence for both runtimes; the next
+   source-side step is real FSDP/TP/PP/EP or RL trainer ownership publication.
+2. Extend the runtime bridge placement work beyond tiny single-tensor vLLM and
+   SGLang targets while keeping the allclose/checksum gates.
 3. Promote the runtime bridges into each engine's production post-load/refit
    lifecycle, using the same source-published ownership and receiver-side
    request path.
@@ -815,12 +837,12 @@ Safe claim:
 > SGLang+NIXL runtime bridges now prove trainer-like source-rank CUDA shards can
 > be NIXL-read into staging and installed through engine APIs with
 > allclose/checksum, and both have same-node optimizer-step source reruns. vLLM
-> now also has a cross-node, one-pod-per-source-rank MX-endpoint runtime bridge
-> over UCX/IB rc with checksum/allclose. These runtime artifacts still use tiny
-> single-tensor payloads, staging-copy runtime APIs, synthetic optimizer
-> objectives, and no live RL trainer loop; SGLang cross-node runtime placement,
-> direct runtime-buffer NIXL landing, full-model refit, and production real
-> trainer/runtime refit remain unproven.
+> and SGLang now also have cross-node, one-pod-per-source-rank MX-endpoint
+> runtime bridges over UCX/IB rc with checksum/allclose. These runtime artifacts
+> still use tiny single-tensor payloads, staging-copy runtime APIs, synthetic
+> optimizer objectives, and no live RL trainer loop; direct runtime-buffer NIXL
+> landing, full-model refit, and production real trainer/runtime refit remain
+> unproven.
 
 Unsafe claim:
 

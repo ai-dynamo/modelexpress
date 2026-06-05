@@ -387,6 +387,40 @@ Files:
   source Python process and `nvidia-smi` entered uninterruptible sleep before
   source-ready artifacts were written. This is not a proof and is superseded by
   the successful `g2j7h` to `9c2x7` artifact above.
+- `nscale-live-sglang-mx-runtime-crossnode-20260605.json`: completed
+  cross-node, one-pod-per-source-rank SGLang+NIXL runtime bridge using MX
+  endpoint discovery. Source pods `mx-sglang-mx-src0-20260605` and
+  `mx-sglang-mx-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`; target pod
+  `mx-sglang-mx-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`. The target loaded live SGLang
+  `0.0.0.dev1+g229cadec0`, built the receiver request from `lm_head.weight`,
+  discovered two READY source endpoints from `mx-server-rl:8001`, added two
+  distinct NIXL source agents, performed two cross-node UCX/NIXL READs into
+  CUDA staging, installed/restored through `Engine.update_weights_from_tensor`,
+  and validated staging allclose, runtime allclose, and checksum. It records
+  `cross_node=true`, `one_pod_per_source_rank=true`,
+  `runtime_storage_dtype=bfloat16`, `trainer_to_inference_bytes=16384`,
+  `raw_nixl_read_duration_ms=12.166149914264679`,
+  `metadata_query_duration_ms=44.608733034692705`, and
+  `planner_duration_ms=0.14281098265200853`. Scope boundary: SGLang only, tiny
+  single tensor, staging-copy install, synthetic optimizer objective, no direct
+  NIXL landing into SGLang-owned storage, and no real RL trainer loop.
+- `nscale-live-sglang-mx-runtime-crossnode-source0-20260605.json` and
+  `nscale-live-sglang-mx-runtime-crossnode-source1-20260605.json`: source-side
+  publication artifacts for the two independent source-rank pods in the SGLang
+  cross-node runtime proof.
+- `nscale-live-sglang-mx-runtime-crossnode-pods-20260605.log`,
+  `nscale-live-sglang-mx-runtime-crossnode-pod-describe-20260605.log`,
+  `nscale-live-sglang-mx-runtime-crossnode-source-nvidia-smi-ib-20260605.log`,
+  and
+  `nscale-live-sglang-mx-runtime-crossnode-target-nvidia-smi-ib-20260605.log`:
+  placement and GPU/IB evidence for the successful SGLang cross-node runtime
+  run.
+- `nscale-cursor-code-review-sglang-mx-crossnode-runtime-20260605.log`:
+  cursor-code-review artifact for the SGLang cross-node runtime change. It
+  records the fixed vLLM/SGLang helper-boundary finding, the extraction of
+  `refit_mx_runtime_common.py`, and the focused post-fix pytest gate.
 - `nscale-live-sglang-nixl-runtime-trainer-step-20260605.json` and
   `nscale-live-sglang-nixl-runtime-trainer-step-summary-20260605.json`:
   completed same-node, one-pod, 3-rank SGLang+NIXL runtime bridge rerun using
@@ -496,11 +530,10 @@ artifacts, with the one-pod-per-source-rank, stale-source recovery, and
 hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
 claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
 artifacts, checksum-backed same-node optimizer-step reruns for both runtimes,
-and a checksum-backed cross-node/one-pod-per-source-rank vLLM MX-endpoint
-runtime bridge. These remain tiny/staging-copy runtime proofs with synthetic
-optimizer objectives; SGLang cross-node runtime placement, direct
-runtime-buffer NIXL landing, full-model refit, and real RL trainer-loop claims
-remain unproven. The NCCL
+and checksum-backed cross-node/one-pod-per-source-rank vLLM and SGLang
+MX-endpoint runtime bridges. These remain tiny/staging-copy runtime proofs with
+synthetic optimizer objectives; direct runtime-buffer NIXL landing, full-model
+refit, and real RL trainer-loop claims remain unproven. The NCCL
 distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 synthetic same-node table now has comparable checksum-backed MX/NIXL, NCCL

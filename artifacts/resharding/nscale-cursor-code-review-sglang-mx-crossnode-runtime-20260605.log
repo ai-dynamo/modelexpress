@@ -1,0 +1,58 @@
+cursor-code-review: SGLang MX cross-node runtime refit
+date: 2026-06-05
+environment: nscale dev pod mx-dev-goal-20260605, repo /workspace/modelexpress
+
+Skill provenance:
+- Requested source: a3sh-dotfiles.
+- Checked /workspace/a3sh-dotfiles for cursor-code-review; no matching skill was present.
+- Applied the available restored dotfiles skill at
+  /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review/SKILL.md.
+
+Review target:
+- modelexpress_client/python/modelexpress/refit_sglang_mx_runtime.py
+- modelexpress_client/python/tests/test_refit_sglang_mx_runtime.py
+- modelexpress_client/python/modelexpress/refit_vllm_mx_runtime.py
+- modelexpress_client/python/modelexpress/refit_mx_runtime_common.py
+- goal.md
+- artifacts/resharding/README.md
+- artifacts/resharding/nscale-live-sglang-mx-runtime-crossnode-20260605.json
+- artifacts/resharding/nscale-live-sglang-mx-runtime-crossnode-source0-20260605.json
+- artifacts/resharding/nscale-live-sglang-mx-runtime-crossnode-source1-20260605.json
+
+File-size check:
+- refit_mx_runtime_common.py: 128 lines
+- refit_sglang_mx_runtime.py: 775 lines
+- refit_vllm_mx_runtime.py: 733 lines after extraction
+- test_refit_sglang_mx_runtime.py: 146 lines
+- No changed Python file crosses the 1000-line threshold.
+
+Finding fixed:
+- Structural boundary leak: refit_sglang_mx_runtime.py initially imported
+  shared runtime helper behavior from refit_vllm_mx_runtime.py. That made the
+  SGLang runtime proof depend on a vLLM-owned module and left the SGLang plan
+  source label as a local override of a vLLM helper.
+- Fix: extracted the shared pure helper layer into
+  refit_mx_runtime_common.py. vLLM and SGLang now keep thin runtime-specific
+  wrappers that set their own mode/plan_source labels while reusing the same
+  endpoint-to-segment planning implementation. This removes the vLLM/SGLang
+  ownership leak and reduced refit_vllm_mx_runtime.py from 823 to 733 lines.
+
+Post-fix review result:
+- No remaining cursor-code-review blockers found in the scoped diff.
+- The SGLang role-split module is still a POC harness, but the heavy runtime
+  orchestration remains runtime-specific and the shared helper is limited to
+  pure metadata/parsing/planning logic.
+- Documentation keeps same-node, cross-node, one-pod-per-rank, and production
+  claims separated. It does not claim direct NIXL landing, full-model refit, or
+  real RL trainer-loop integration.
+
+Verification after fix:
+- python3 -m black modelexpress/refit_mx_runtime_common.py
+  modelexpress/refit_vllm_mx_runtime.py
+  modelexpress/refit_sglang_mx_runtime.py
+  tests/test_refit_sglang_mx_runtime.py tests/test_refit_vllm_mx_runtime.py
+- pytest -q tests/test_refit_sglang_mx_runtime.py
+  tests/test_refit_vllm_mx_runtime.py
+  tests/test_refit_sglang_nixl_runtime_smoke.py
+  tests/test_refit_sglang_receiver_smoke.py
+- Result: 13 passed in 0.12s.
