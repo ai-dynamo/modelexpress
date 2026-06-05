@@ -172,26 +172,25 @@ def v2():
 def _make_megatron_candidate(
     v2,
     *,
-    role: str,
     tp_rank: int,
     tp_size: int,
     pp_rank: int = 0,
     pp_size: int = 1,
     ep_rank: int = 0,
     ep_size: int = 1,
-    num_heads_local: int | None = None,
-    num_kv_heads_local: int | None = None,
-    head_dim: int | None = None,
-    qkv_interleave: str | None = None,
-    gated_mlp_order: str | None = None,
     updated_at: int = 0,
     sid: str | None = None,
     owned_experts_per_layer: dict | None = None,
+    role: str | None = None,  # accepted+ignored for test-readability only
 ):
-    """Build a V2SourceCandidate with megatron_meta populated."""
+    """Build a V2SourceCandidate with megatron_meta populated.
+
+    ``role`` is unused (just a label for test readability — production
+    Megatron sources don't carry a per-source role).
+    """
     ref_cls = v2.SourceRef if hasattr(v2, "SourceRef") else \
         sys.modules["modelexpress.refit_receiver"].SourceRef
-    sid = sid or f"sid-{role}-tp{tp_rank}"
+    sid = sid or f"sid-{role or 'mt'}-tp{tp_rank}"
     ref = ref_cls(
         mx_source_id=sid,
         worker_id=f"wid-{sid}",
@@ -200,15 +199,9 @@ def _make_megatron_candidate(
         training_step=1,
     )
     mm = v2.MegatronSourceMeta(
-        role=role,
         tp_rank=tp_rank, tp_size=tp_size,
         pp_rank=pp_rank, pp_size=pp_size,
         ep_rank=ep_rank, ep_size=ep_size,
-        num_heads_local=num_heads_local,
-        num_kv_heads_local=num_kv_heads_local,
-        head_dim=head_dim,
-        qkv_interleave=qkv_interleave,
-        gated_mlp_order=gated_mlp_order,
     )
     return v2.V2SourceCandidate(
         ref=ref,
@@ -388,21 +381,15 @@ def test_column_mixed_tp_target_narrower(v2):
 # ---------------------------------------------------------------------------
 
 
-def test_qkv_column_aggregates_head_counts(v2):
+def test_qkv_column_assembles_with_receiver_spec(v2):
+    """QKV per-tensor descriptor is receiver-owned (typically derived from
+    the HF model config). The planner forwards it verbatim into
+    role_descriptor so the receiver-side translator can consume it.
+    """
     rcv, layout = _make_receiver(v2, target_tp=2, target_rank=0)
     cands = [
-        _make_megatron_candidate(
-            v2, role=v2.ROLE_MEGATRON_QKV_COLUMN,
-            tp_rank=0, tp_size=2,
-            num_heads_local=16, num_kv_heads_local=4, head_dim=128,
-            qkv_interleave="by_head", sid="q0",
-        ),
-        _make_megatron_candidate(
-            v2, role=v2.ROLE_MEGATRON_QKV_COLUMN,
-            tp_rank=1, tp_size=2,
-            num_heads_local=16, num_kv_heads_local=4, head_dim=128,
-            qkv_interleave="by_head", sid="q1",
-        ),
+        _make_megatron_candidate(v2, tp_rank=0, tp_size=2, sid="q0"),
+        _make_megatron_candidate(v2, tp_rank=1, tp_size=2, sid="q1"),
     ]
     # Each source rank publishes (16+2*4)*128 = 3072 rows; global has 2*3072 = 6144 rows.
     spec = v2.MegatronTensorSpec(
@@ -410,6 +397,16 @@ def test_qkv_column_aggregates_head_counts(v2):
         target_shape=(6144, 4096),
         target_dtype="bfloat16",
         shard_axis=0,
+        # Receiver supplies the descriptor directly (it knows num_heads
+        # from the HF model config). Per-tensor role extras live on the
+        # source's shape_registry entries; the receiver can also choose
+        # to consume those instead.
+        role_descriptor={
+            "num_heads_total": "32",
+            "num_kv_heads_total": "8",
+            "head_dim": "128",
+            "qkv_interleave": "by_head",
+        },
     )
     plan = rcv.pick_megatron_slice_plans(
         cands, target_tp_layout=layout,
@@ -418,9 +415,9 @@ def test_qkv_column_aggregates_head_counts(v2):
     assert plan.assembly == "qkv_uninterleave"
     assert len(plan.sources) == 1  # target_rank=0 of 2 covered by source rank 0
     rd = plan.role_descriptor
-    # Aggregation sums the per-source local counts across the contributing sources.
-    assert rd["num_heads_total"] == "16"  # only c0 contributes for target_rank=0
-    assert rd["num_kv_heads_total"] == "4"
+    # Receiver's spec descriptor is forwarded verbatim.
+    assert rd["num_heads_total"] == "32"
+    assert rd["num_kv_heads_total"] == "8"
     assert rd["head_dim"] == "128"
     assert rd["qkv_interleave"] == "by_head"
 
@@ -433,22 +430,15 @@ def test_qkv_column_aggregates_head_counts(v2):
 def test_gated_mlp_assembly_and_descriptor(v2):
     rcv, layout = _make_receiver(v2, target_tp=2, target_rank=0)
     cands = [
-        _make_megatron_candidate(
-            v2, role=v2.ROLE_MEGATRON_GATED_MLP_COLUMN,
-            tp_rank=0, tp_size=2,
-            gated_mlp_order="gate_then_up", sid="g0",
-        ),
-        _make_megatron_candidate(
-            v2, role=v2.ROLE_MEGATRON_GATED_MLP_COLUMN,
-            tp_rank=1, tp_size=2,
-            gated_mlp_order="gate_then_up", sid="g1",
-        ),
+        _make_megatron_candidate(v2, tp_rank=0, tp_size=2, sid="g0"),
+        _make_megatron_candidate(v2, tp_rank=1, tp_size=2, sid="g1"),
     ]
     spec = v2.MegatronTensorSpec(
         role=v2.ROLE_MEGATRON_GATED_MLP_COLUMN,
         target_shape=(8192, 4096),
         target_dtype="bfloat16",
         shard_axis=0,
+        role_descriptor={"gated_mlp_order": "gate_then_up"},
     )
     plan = rcv.pick_megatron_slice_plans(
         cands, target_tp_layout=layout,
@@ -575,37 +565,39 @@ def test_non_megatron_candidates_yield_empty_source_lists(v2):
 # ---------------------------------------------------------------------------
 
 
-def test_extract_megatron_meta_from_extras(v2):
-    """Direct unit test of _extract_megatron_meta: full-keys round-trip."""
+def test_extract_megatron_meta_publisher_kind_marker(v2):
+    """Source-level Megatron metadata is rank-position only — no role.
+
+    Detection is via ``publisher_kind == "megatron"`` OR presence of
+    ``tp_rank`` + ``tp_size``. Per-tensor role lives in the registry,
+    not in source extras.
+    """
     extra = {
         "mx_v2": "1",
-        "megatron_role": v2.ROLE_MEGATRON_QKV_COLUMN,
+        "publisher_kind": "megatron",
         "tp_rank": "2",
         "tp_size": "4",
         "pp_rank": "1",
         "pp_size": "2",
         "ep_rank": "0",
         "ep_size": "1",
-        "num_heads_local": "8",
-        "num_kv_heads_local": "2",
-        "head_dim": "128",
-        "qkv_interleave": "by_head",
     }
     mm = v2._extract_megatron_meta(extra)
     assert mm is not None
-    assert mm.role == v2.ROLE_MEGATRON_QKV_COLUMN
     assert (mm.tp_rank, mm.tp_size) == (2, 4)
     assert (mm.pp_rank, mm.pp_size) == (1, 2)
-    assert mm.num_heads_local == 8
-    assert mm.head_dim == 128
-    assert mm.qkv_interleave == "by_head"
+    assert (mm.ep_rank, mm.ep_size) == (0, 1)
+
+
+def test_extract_megatron_meta_tp_keys_alone_trigger_detection(v2):
+    """Even without publisher_kind, presence of tp_rank + tp_size signals
+    a Megatron-shaped source."""
+    extra = {"mx_v2": "1", "tp_rank": "0", "tp_size": "2"}
+    mm = v2._extract_megatron_meta(extra)
+    assert mm is not None
+    assert mm.tp_size == 2
 
 
 def test_extract_megatron_meta_returns_none_for_non_megatron(v2):
-    extra = {"mx_v2": "1", "role": "trainer", "worker_rank": "0"}  # no megatron_role
-    assert v2._extract_megatron_meta(extra) is None
-
-
-def test_extract_megatron_meta_returns_none_for_unknown_role(v2):
-    extra = {"mx_v2": "1", "megatron_role": "something_unknown", "tp_rank": "0", "tp_size": "1"}
+    extra = {"mx_v2": "1", "role": "trainer", "worker_rank": "0"}  # neither marker
     assert v2._extract_megatron_meta(extra) is None

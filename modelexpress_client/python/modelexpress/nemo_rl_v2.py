@@ -104,13 +104,16 @@ _MEGATRON_ROLE_SET = frozenset({
 
 
 def _extract_megatron_meta(extra: dict[str, str]) -> "MegatronSourceMeta | None":
-    """Pull Megatron publisher metadata out of a source's extra_parameters.
+    """Pull source-level Megatron rank metadata out of extra_parameters.
 
-    Returns ``None`` for non-Megatron sources (DTensor, PrimeRL) so the
-    planner can short-circuit to the FSDP/EP picker.
+    Detection is by ``publisher_kind == "megatron"`` (set on the source
+    identity) and / or presence of ``tp_size`` + ``tp_rank`` keys.
+    Per-tensor role lives in the source's shape_registry, not here.
+    Returns ``None`` for non-Megatron sources (DTensor, PrimeRL).
     """
-    role = extra.get("megatron_role")
-    if role not in _MEGATRON_ROLE_SET:
+    if extra.get("publisher_kind") != "megatron" and not (
+        "tp_size" in extra and "tp_rank" in extra
+    ):
         return None
 
     def _i(key: str, default: int = 0) -> int:
@@ -119,28 +122,13 @@ def _extract_megatron_meta(extra: dict[str, str]) -> "MegatronSourceMeta | None"
         except (TypeError, ValueError):
             return default
 
-    def _opt_i(key: str) -> "int | None":
-        v = extra.get(key)
-        if v is None:
-            return None
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-
     return MegatronSourceMeta(
-        role=role,
         tp_rank=_i("tp_rank"),
         tp_size=_i("tp_size", 1),
         pp_rank=_i("pp_rank"),
         pp_size=_i("pp_size", 1),
         ep_rank=_i("ep_rank"),
         ep_size=_i("ep_size", 1),
-        num_heads_local=_opt_i("num_heads_local"),
-        num_kv_heads_local=_opt_i("num_kv_heads_local"),
-        head_dim=_opt_i("head_dim"),
-        qkv_interleave=extra.get("qkv_interleave"),
-        gated_mlp_order=extra.get("gated_mlp_order"),
     )
 
 
@@ -241,6 +229,16 @@ class MxV2TrainingPublisher:
         self._registered_tensors: dict[str, torch.Tensor] = {}
         self._initialized = False
 
+        # Megatron rank position within the TP × PP × EP mesh. Receivers
+        # use these to route per-rank pulls. Set via
+        # :meth:`set_megatron_mesh_position` before publish() when this
+        # publisher is being used by a Megatron-Core trainer; defaults
+        # (0, 0, 0) are correct for the FSDP / DTensor case where the
+        # sub-mesh axes are all size 1.
+        self._megatron_tp_rank: int = 0
+        self._megatron_pp_rank: int = 0
+        self._megatron_ep_rank: int = 0
+
     @property
     def worker_rank(self) -> int:
         return self._worker_rank
@@ -264,6 +262,26 @@ class MxV2TrainingPublisher:
             training_framework="nemo_rl",
         )
         self._initialized = True
+
+    def set_megatron_mesh_position(
+        self,
+        *,
+        tp_rank: int,
+        pp_rank: int = 0,
+        ep_rank: int = 0,
+    ) -> None:
+        """Set this publisher's rank position in the Megatron TP × PP × EP mesh.
+
+        Call before :meth:`publish` if any tensor in the in-flight registry
+        has ``megatron_role`` set. The rank-position metadata is stamped
+        onto the source identity so receivers can route per-rank pulls
+        (the per-tensor role drives assembly; rank position drives source
+        selection). Default (0, 0, 0) is correct for FSDP / DTensor
+        publishers where these mesh axes have size 1.
+        """
+        self._megatron_tp_rank = int(tp_rank)
+        self._megatron_pp_rank = int(pp_rank)
+        self._megatron_ep_rank = int(ep_rank)
         logger.info(
             "MxV2TrainingPublisher initialized: rank=%d layout=%s",
             self._worker_rank,
@@ -278,6 +296,8 @@ class MxV2TrainingPublisher:
         is_expert: bool = False,
         expert_axis: int = 0,
         owned_expert_ids: tuple[int, ...] | set[int] | list[int] = (),
+        megatron_role: str | None = None,
+        megatron_extras: dict[str, str] | None = None,
     ) -> None:
         """Register a tensor for publication.
 
@@ -297,6 +317,15 @@ class MxV2TrainingPublisher:
             expert_axis: axis index for the expert dimension.
             owned_expert_ids: which expert IDs this rank holds. Pass
                 only when ``is_expert == True``.
+            megatron_role: per-tensor Megatron role string (one of
+                ``ROLE_MEGATRON_*``). Stashed on the per-tensor
+                ``TensorDescriptorV2`` in the registry blob — the
+                receiver-side slice planner reads it from there. Leave
+                ``None`` for DTensor / PrimeRL publishes.
+            megatron_extras: per-tensor Megatron descriptor extras
+                (head counts for ``qkv_column``, ``gated_mlp_order``
+                for ``gated_mlp_column``, etc.). Same lifetime as
+                ``megatron_role``.
         """
         if not self._initialized:
             raise RuntimeError("call initialize() before add_tensor()")
@@ -314,6 +343,10 @@ class MxV2TrainingPublisher:
             expert_axis=expert_axis,
             owned_expert_ids=tuple(sorted(owned_expert_ids)),
         )
+        if megatron_role is not None:
+            descriptor.megatron_role = megatron_role
+        if megatron_extras:
+            descriptor.megatron_extras = dict(megatron_extras)
         self._registry.append(descriptor)
         # Use a key that's unique per descriptor (including any potential
         # name collisions from layer publishing). For v2 we publish all
@@ -355,6 +388,20 @@ class MxV2TrainingPublisher:
             ident.extra_parameters["worker_rank"] = str(self._worker_rank)
             ident.extra_parameters["shape_registry"] = registry_blob
             ident.extra_parameters["world_layout"] = self._world_layout.encode()
+            # If any registered tensor carries a megatron_role, stamp the
+            # source as Megatron-shaped so receivers can route through the
+            # Megatron slice planner. Per-source rank-position metadata
+            # (tp_rank, tp_size, pp_rank, pp_size, ep_rank, ep_size) is
+            # filled from world_layout — same source publishes all roles.
+            if any(d.megatron_role is not None for d in self._registry):
+                ident.extra_parameters["publisher_kind"] = "megatron"
+                wl = self._world_layout
+                ident.extra_parameters["tp_rank"] = str(self._megatron_tp_rank)
+                ident.extra_parameters["tp_size"] = str(wl.tp_world_size)
+                ident.extra_parameters["pp_rank"] = str(self._megatron_pp_rank)
+                ident.extra_parameters["pp_size"] = str(wl.pp_world_size)
+                ident.extra_parameters["ep_rank"] = str(self._megatron_ep_rank)
+                ident.extra_parameters["ep_size"] = str(wl.ep_world_size)
             return ident
 
         # Build the v2 sidecar payload (preserves all the same data as
@@ -362,18 +409,25 @@ class MxV2TrainingPublisher:
         # ``shape_registry`` is intentionally embedded as a nested JSON string
         # inside this JSON document — receivers parse the outer JSON with
         # decode_registry's matching call to handle the inner blob.
-        sidecar_payload = json.dumps(
-            {
-                "mx_v2": "1",
-                "role": ROLE_TRAINER,
-                "worker_rank": int(self._worker_rank),
-                "training_step": int(version),
-                "world_layout": self._world_layout.encode(),
-                "framework": "nemo_rl",
-                "shape_registry": registry_blob,
-            },
-            separators=(",", ":"),
-        )
+        sidecar_dict: dict[str, Any] = {
+            "mx_v2": "1",
+            "role": ROLE_TRAINER,
+            "worker_rank": int(self._worker_rank),
+            "training_step": int(version),
+            "world_layout": self._world_layout.encode(),
+            "framework": "nemo_rl",
+            "shape_registry": registry_blob,
+        }
+        if any(d.megatron_role is not None for d in self._registry):
+            wl = self._world_layout
+            sidecar_dict["publisher_kind"] = "megatron"
+            sidecar_dict["tp_rank"] = int(self._megatron_tp_rank)
+            sidecar_dict["tp_size"] = int(wl.tp_world_size)
+            sidecar_dict["pp_rank"] = int(self._megatron_pp_rank)
+            sidecar_dict["pp_size"] = int(wl.pp_world_size)
+            sidecar_dict["ep_rank"] = int(self._megatron_ep_rank)
+            sidecar_dict["ep_size"] = int(wl.ep_world_size)
+        sidecar_payload = json.dumps(sidecar_dict, separators=(",", ":"))
 
         # Wrap the agent_name with v2 markers (legacy-server fallback path 2).
         original_agent_name = self._publisher._agent_name
@@ -451,28 +505,29 @@ class MxV2TrainingPublisher:
 
 @dataclass
 class MegatronSourceMeta:
-    """Per-source Megatron-publish metadata extracted from extra_parameters.
+    """Per-SOURCE Megatron-publish metadata extracted from extra_parameters.
 
-    Populated only when the source's v2 metadata carries ``megatron_role``
-    (i.e. when the publisher is a Megatron-Core trainer). Absent (``None``
-    on the candidate) for DTensor and PrimeRL publishers; the planner
-    short-circuits to the existing pickers in that case.
+    Populated only when the source's v2 metadata signals a Megatron
+    publisher (the per-tensor registry carries ``megatron_role`` keys).
+    Absent (``None`` on the candidate) for DTensor and PrimeRL
+    publishers; the planner short-circuits to the existing pickers in
+    that case.
+
+    Per-source metadata is intentionally **rank-position only**
+    (tp_rank, tp_size, pp_rank, ep_rank, etc). The per-tensor role and
+    role-specific descriptor extras live on the source's
+    :class:`shape_descriptors.TensorDescriptorV2` registry entries —
+    one source publishes many tensors with different roles, so role is
+    not a source-level attribute.
     """
 
-    role: str
     tp_rank: int
     tp_size: int
     pp_rank: int = 0
     pp_size: int = 1
     ep_rank: int = 0
     ep_size: int = 1
-    # qkv_column-only:
-    num_heads_local: int | None = None
-    num_kv_heads_local: int | None = None
-    head_dim: int | None = None
-    qkv_interleave: str | None = None  # "by_head"
-    # gated_mlp_column-only:
-    gated_mlp_order: str | None = None  # "gate_then_up"
+    is_megatron: bool = True
 
 
 @dataclass
@@ -545,20 +600,17 @@ class MegatronTensorSpec:
 
 
 def _role_extras_from_meta(mm: "MegatronSourceMeta") -> dict[str, str]:
-    """Convert MegatronSourceMeta back to the per-source extras dict the
-    receiver translator consumes (head counts for QKV, etc.)."""
-    out: dict[str, str] = {}
-    if mm.num_heads_local is not None:
-        out["num_heads_local"] = str(mm.num_heads_local)
-    if mm.num_kv_heads_local is not None:
-        out["num_kv_heads_local"] = str(mm.num_kv_heads_local)
-    if mm.head_dim is not None:
-        out["head_dim"] = str(mm.head_dim)
-    if mm.qkv_interleave:
-        out["qkv_interleave"] = mm.qkv_interleave
-    if mm.gated_mlp_order:
-        out["gated_mlp_order"] = mm.gated_mlp_order
-    return out
+    """Stub — returns empty dict.
+
+    Per-tensor role extras live on the source's
+    :class:`shape_descriptors.TensorDescriptorV2` registry entries, not on
+    the per-source :class:`MegatronSourceMeta`. The receiver's per-tensor
+    :class:`MegatronTensorSpec.role_descriptor` is authoritative for
+    assembly. This function is kept (returning empty) so callers that
+    forwarded its output to ``MegatronSliceSource.role_extras`` continue
+    to compile.
+    """
+    return {}
 
 
 @dataclass
@@ -904,15 +956,14 @@ class MxV2RefitReceiver:
         """Build a single MegatronSlicePlan for one source-side tensor name."""
         role = spec.role
 
-        # Filter candidates to those that own this role for this PP stage.
-        # Replicated tensors live on rank 0 only by convention. Other roles
-        # use whatever sources advertise this role + matching pp_rank.
+        # Filter candidates to those covering this PP stage. Per-tensor
+        # role determines assembly (set by the receiver in spec.role); it
+        # is NOT a source-level filter — every Megatron rank publishes
+        # tensors of all roles in one source.
         relevant: list[V2SourceCandidate] = []
         for c in candidates:
             mm = c.megatron_meta
             assert mm is not None  # filtered above
-            if mm.role != role:
-                continue
             if mm.pp_rank != spec.pp_rank:
                 continue
             relevant.append(c)
@@ -1150,23 +1201,19 @@ class MxV2RefitReceiver:
         *,
         base: dict[str, str],
     ) -> dict[str, str]:
-        """Sum per-source head counts for QKV; pass-through otherwise."""
-        out = dict(base)
-        if role == ROLE_MEGATRON_QKV_COLUMN and sources:
-            heads = sum(int(c.megatron_meta.num_heads_local or 0) for c in sources)
-            kv_heads = sum(int(c.megatron_meta.num_kv_heads_local or 0) for c in sources)
-            head_dim = sources[0].megatron_meta.head_dim or 0
-            out["num_heads_total"] = str(heads)
-            out["num_kv_heads_total"] = str(kv_heads)
-            out["head_dim"] = str(head_dim)
-            interleave = sources[0].megatron_meta.qkv_interleave or ""
-            if interleave:
-                out["qkv_interleave"] = interleave
-        elif role == ROLE_MEGATRON_GATED_MLP_COLUMN and sources:
-            order = sources[0].megatron_meta.gated_mlp_order or ""
-            if order:
-                out["gated_mlp_order"] = order
-        return out
+        """Forward the receiver-supplied descriptor (per-tensor extras).
+
+        Per-tensor descriptor extras (head counts for ``qkv_column``,
+        ``gated_mlp_order`` for ``gated_mlp_column``, etc.) are
+        receiver-owned: the receiver's ``MegatronTensorSpec.role_descriptor``
+        carries them (typically derived from the HF model config).
+
+        The publisher's per-tensor ``megatron_extras`` blob — visible in
+        the source's shape_registry — is available for the receiver to
+        cross-check, but it's not required to drive assembly. Returning
+        ``base`` unchanged means the receiver's spec is authoritative.
+        """
+        return dict(base)
 
     def receive_from(
         self,

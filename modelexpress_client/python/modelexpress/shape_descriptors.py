@@ -80,6 +80,13 @@ class TensorDescriptorV2:
     is_expert: bool = False
     expert_axis: int = 0
     owned_expert_ids: tuple[int, ...] = ()
+    # Per-tensor Megatron role + role-specific descriptor extras. None /
+    # empty for DTensor / PrimeRL publishers; populated by Megatron-Core
+    # publishers so the receiver can dispatch on the role per tensor.
+    # See temp/NemoRL_Megatron_MX_Design.md §4 for the role enum and
+    # the extras keys per role.
+    megatron_role: str | None = None
+    megatron_extras: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -95,6 +102,10 @@ class TensorDescriptorV2:
             d["is_expert"] = True
             d["expert_axis"] = self.expert_axis
             d["owned_expert_ids"] = list(self.owned_expert_ids)
+        if self.megatron_role is not None:
+            d["megatron_role"] = self.megatron_role
+        if self.megatron_extras:
+            d["megatron_extras"] = dict(self.megatron_extras)
         return d
 
     @classmethod
@@ -110,6 +121,8 @@ class TensorDescriptorV2:
             is_expert=bool(d.get("is_expert", False)),
             expert_axis=int(d.get("expert_axis", 0)),
             owned_expert_ids=tuple(d.get("owned_expert_ids", [])),
+            megatron_role=d.get("megatron_role"),
+            megatron_extras=dict(d.get("megatron_extras") or {}),
         )
 
 
