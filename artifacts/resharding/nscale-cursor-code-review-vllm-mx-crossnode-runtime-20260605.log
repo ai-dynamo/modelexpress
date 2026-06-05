@@ -1,0 +1,33 @@
+cursor-code-review artifact: nscale-vllm-mx-crossnode-runtime-20260605
+
+Review source:
+- Requested cursor-code-review cadence.
+- /workspace/a3sh-dotfiles was checked previously and did not contain a cursor-code-review skill.
+- Applied the available cursor-code-review rubric from /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review/SKILL.md inside nscale.
+
+Scope reviewed:
+- modelexpress_client/python/modelexpress/refit_vllm_mx_runtime.py
+- modelexpress_client/python/tests/test_refit_vllm_mx_runtime.py
+- goal.md
+- artifacts/resharding/README.md
+- New vLLM MX runtime cross-node artifacts under artifacts/resharding/.
+
+Diff/size notes:
+- New proof harness file is 822 lines, below the 1000-line Cursor threshold.
+- The implementation is isolated in a new role-split POC module instead of adding cross-node/MX endpoint special cases into the existing same-node vLLM torchrun runner.
+- Existing vLLM runtime install helper remains the canonical runtime install path; the new module only swaps the control-plane/data-plane orchestration to MX endpoint discovery across pods.
+
+Findings:
+- None requiring code change.
+
+Reasoning:
+- The new role split is a dedicated proof harness for source pod publishing and target pod runtime refit, which keeps the existing same-node Gloo runner from accumulating cross-node conditionals.
+- The target reuses existing SliceRequest/SliceOwnership/SegmentPlan models, MX refit endpoint helpers, NIXL read_segment_groups, and vLLM apply_model install helper instead of inventing a second install path.
+- The source-side bug found during GPU execution was fixed by materializing full TrainerStepSourcePublication objects, preserving ownership/provenance as the MX publication contract.
+- Artifact serialization was fixed at the harness boundary without changing NIXL read behavior.
+- Documentation now separates same-node runtime, synthetic cross-node, vLLM cross-node runtime, failed bw4bt startup, and remaining production gaps.
+
+Residual risks:
+- The module duplicates some orchestration shape from refit_crossnode.py and refit_vllm_nixl_runtime_smoke.py. That is acceptable for this private POC proof, but a productionization pass should factor common MX endpoint wait/plan/read artifact helpers before adding SGLang or TRT-LLM variants.
+- The proof still uses tiny single-tensor payloads, staging-copy runtime install, and a synthetic optimizer objective.
+- SGLang cross-node runtime placement, direct runtime-buffer NIXL landing, full-model refit, and real trainer-loop integration remain unproven.

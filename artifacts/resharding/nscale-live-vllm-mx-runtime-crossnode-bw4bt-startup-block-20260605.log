@@ -1,0 +1,10 @@
+First placement attempt for vLLM MX runtime cross-node proof used source pods on cluster-0967a26d-pool-14bee067-prctr-bw4bt and target on cluster-0967a26d-pool-14bee067-prctr-th9sn.
+
+Observed inside both source pods before any source-ready artifact was written:
+- python3 -m modelexpress.refit_vllm_mx_runtime source process state: Dsl
+- nvidia-smi diagnostic process state: Dl
+- /sys/class/infiniband/mlx5_10/ports/1/state: 4: ACTIVE
+- /sys/class/infiniband/mlx5_10/ports/1/phys_state: 5: LinkUp
+- /sys/class/infiniband/mlx5_10/ports/1/rate: 400 Gb/sec (4X NDR)
+
+Interpretation: not an IB exposure/fabric block; source startup hit a node/GPU runtime uninterruptible-sleep condition. This attempt is not used for a proof claim and was superseded by the successful g2j7h -> 9c2x7 run banked in nscale-live-vllm-mx-runtime-crossnode-20260605.json.

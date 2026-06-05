@@ -1,0 +1,135 @@
+{
+  "agent_name": "mx-vllm-mx-source-mxvllmrt-20260605-ib3-trainer-rank0",
+  "cuda_device": 0,
+  "gpu_reuse_used": false,
+  "metrics": {
+    "nixl_metadata_duration_ms": 0.009431969374418259,
+    "nixl_registration_duration_ms": 1.9827110227197409,
+    "publish_duration_ms": 41.24190704897046
+  },
+  "mode": "live-vllm-mx-runtime-source",
+  "model_name": "mx-live-vllm-nixl-runtime-smoke",
+  "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmrt-20260605-ib3",
+  "model_version_base": "mx-endpoint-crossnode-vllm-nixl",
+  "nixl_backends": [
+    "UCX"
+  ],
+  "node_name": "cluster-0967a26d-pool-14bee067-prctr-g2j7h",
+  "pod_name": "mx-vllm-mx-src0-20260605",
+  "result": "source-ready",
+  "role": "source",
+  "run_id": "mxvllmrt-20260605-ib3",
+  "schema_version": 1,
+  "single_source_ownership_mode": true,
+  "source_filter": {
+    "source_id": "trainer-rank0",
+    "source_worker_rank": null
+  },
+  "source_ownership_count": 1,
+  "source_publications": [
+    {
+      "agent_name": "mx-vllm-mx-source-mxvllmrt-20260605-ib3-trainer-rank0",
+      "metadata_bytes": 432,
+      "mx_source_id": "8b49a8bdce917f24",
+      "publish_duration_ms": 41.24190704897046,
+      "source_id": "trainer-rank0",
+      "source_payload_provenance": {
+        "learning_rate": 0.125,
+        "optimizer": "SGD",
+        "optimizer_step_count": 1,
+        "optimizer_step_publisher_used": true,
+        "real_rl_training_loop_used": false,
+        "source_payload_generator": "torch.optim.SGD",
+        "static_replacement_formula_used": false,
+        "synthetic_training_objective_used": true,
+        "trainer_owned_parameter_tensor_used": true
+      },
+      "source_publication": {
+        "ownership": {
+          "contiguous": true,
+          "dtype": "bfloat16",
+          "element_size_bytes": 2,
+          "global_shape": [
+            64,
+            32
+          ],
+          "layout_tags": {
+            "learning_rate": "0.125",
+            "optimizer": "SGD",
+            "optimizer_step_count": 1,
+            "optimizer_step_publisher": true,
+            "runtime_refit_target": "vllm.LLM.apply_model",
+            "source_payload_generator": "torch.optim.SGD",
+            "source_tensor_owner": "torchrun-trainer-rank",
+            "static_replacement_formula": false,
+            "storage_layout": "row-major",
+            "synthetic_training_objective": true,
+            "trainer_layout": "fsdp-row-shard-poc",
+            "trainer_update_source": "torch.optim.SGD-step-publisher"
+          },
+          "model_name": "mx-live-vllm-nixl-runtime-smoke",
+          "model_version": "mx-endpoint-crossnode-vllm-nixl-mxvllmrt-20260605-ib3",
+          "nixl_descriptor_id": "trainer-rank0-live-vllm-nixl-refit",
+          "quantization_scope": "absent",
+          "source_id": "trainer-rank0",
+          "source_lease": "trainer-rank0-live-vllm-nixl-refit",
+          "source_range": [
+            [
+              0,
+              32
+            ],
+            [
+              0,
+              32
+            ]
+          ],
+          "storage_offset_bytes": 0,
+          "strides": null,
+          "tensor_name": "lm_head.weight",
+          "worker_id": "trainer-rank0-worker",
+          "worker_rank": 0
+        },
+        "source_payload_provenance": {
+          "learning_rate": 0.125,
+          "optimizer": "SGD",
+          "optimizer_step_count": 1,
+          "optimizer_step_publisher_used": true,
+          "real_rl_training_loop_used": false,
+          "source_payload_generator": "torch.optim.SGD",
+          "static_replacement_formula_used": false,
+          "synthetic_training_objective_used": true,
+          "trainer_owned_parameter_tensor_used": true
+        },
+        "tensor_bytes": 2048,
+        "tensor_device": "cuda:0",
+        "tensor_dtype": "bfloat16",
+        "tensor_shape": [
+          32,
+          32
+        ]
+      },
+      "tensor_addr": 130586282836992,
+      "tensor_bytes": 2048,
+      "tensor_device_id": 0,
+      "worker_id": "trainer-rank0-worker",
+      "worker_rank": 0
+    }
+  ],
+  "target_dtype": "bfloat16",
+  "target_shape": [
+    64,
+    32
+  ],
+  "target_tensor_name": "lm_head.weight",
+  "trainer_source_update": {
+    "learning_rate": 0.125,
+    "optimizer": "SGD",
+    "optimizer_step_count": 1,
+    "optimizer_step_publisher_used": true,
+    "real_rl_training_loop_used": false,
+    "source_payload_generator": "torch.optim.SGD",
+    "static_replacement_formula_used": false,
+    "synthetic_training_objective_used": true,
+    "trainer_owned_parameter_tensor_used": true
+  }
+}

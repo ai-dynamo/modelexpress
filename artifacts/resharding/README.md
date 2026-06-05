@@ -355,6 +355,38 @@ Files:
   and a synthetic optimizer objective; it is not cross-node runtime placement,
   not one-pod-per-source-rank runtime placement, not direct NIXL landing into
   vLLM-owned storage, and not a real RL trainer loop.
+- `nscale-live-vllm-mx-runtime-crossnode-20260605.json`: completed cross-node,
+  one-pod-per-source-rank vLLM+NIXL runtime bridge using MX endpoint discovery.
+  Source pods `mx-vllm-mx-src0-20260605` and `mx-vllm-mx-src1-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-g2j7h`; target pod
+  `mx-vllm-mx-tgt-20260605` ran on
+  `cluster-0967a26d-pool-14bee067-prctr-9c2x7`. The target loaded live vLLM
+  0.17.1, built the receiver request from worker-owned `lm_head.weight`,
+  discovered two READY source endpoints from `mx-server-rl:8001`, added two
+  distinct NIXL source agents, performed two cross-node UCX/NIXL READs into
+  CUDA staging, installed/restored through `LLM.apply_model`, and validated
+  staging allclose, runtime allclose, and checksum. It records
+  `cross_node=true`, `one_pod_per_source_rank=true`,
+  `trainer_to_inference_bytes=4096`, `raw_nixl_read_duration_ms=9.514622972346842`,
+  `metadata_query_duration_ms=31.619531917385757`, and
+  `planner_duration_ms=0.18348696175962687`. Scope boundary: vLLM only, tiny
+  single tensor, staging-copy install, synthetic optimizer objective, no direct
+  NIXL landing into vLLM-owned storage, and no real RL trainer loop.
+- `nscale-live-vllm-mx-runtime-crossnode-source0-20260605.json` and
+  `nscale-live-vllm-mx-runtime-crossnode-source1-20260605.json`: source-side
+  publication artifacts for the two independent source-rank pods in the vLLM
+  cross-node runtime proof.
+- `nscale-live-vllm-mx-runtime-crossnode-pods-20260605.log`,
+  `nscale-live-vllm-mx-runtime-crossnode-pod-describe-20260605.log`,
+  `nscale-live-vllm-mx-runtime-crossnode-source-nvidia-smi-ib-20260605.log`, and
+  `nscale-live-vllm-mx-runtime-crossnode-target-nvidia-smi-ib-20260605.log`:
+  placement and GPU/IB evidence for the successful vLLM cross-node runtime run.
+- `nscale-live-vllm-mx-runtime-crossnode-bw4bt-startup-block-20260605.json` and
+  `.log`: honest first-placement block. Source pods on
+  `cluster-0967a26d-pool-14bee067-prctr-bw4bt` saw active `mlx5_10` IB, but the
+  source Python process and `nvidia-smi` entered uninterruptible sleep before
+  source-ready artifacts were written. This is not a proof and is superseded by
+  the successful `g2j7h` to `9c2x7` artifact above.
 - `nscale-live-sglang-nixl-runtime-trainer-step-20260605.json` and
   `nscale-live-sglang-nixl-runtime-trainer-step-summary-20260605.json`:
   completed same-node, one-pod, 3-rank SGLang+NIXL runtime bridge rerun using
@@ -463,10 +495,12 @@ live-MX NIXL endpoint JSONs are the strongest current Level 3 synthetic proof
 artifacts, with the one-pod-per-source-rank, stale-source recovery, and
 hard-kill in-flight recovery target/summary JSONs as the strictest cross-node
 claims. Level 4 now has same-node SGLang and vLLM NIXL-to-runtime bridge
-artifacts, plus checksum-backed same-node optimizer-step reruns for both
-runtimes. These remain one-pod/GPU-reuse proofs with staging-copy runtime APIs;
-cross-node/one-pod-per-source-rank runtime bridge claims, direct runtime-buffer
-NIXL landing, and real RL trainer-loop claims remain unproven. The NCCL
+artifacts, checksum-backed same-node optimizer-step reruns for both runtimes,
+and a checksum-backed cross-node/one-pod-per-source-rank vLLM MX-endpoint
+runtime bridge. These remain tiny/staging-copy runtime proofs with synthetic
+optimizer objectives; SGLang cross-node runtime placement, direct
+runtime-buffer NIXL landing, full-model refit, and real RL trainer-loop claims
+remain unproven. The NCCL
 distributed JSON remains the Level 1 comparison artifact. Existing Qwen3
 timing jobs are now banked as partial competitive context. The Level-5
 synthetic same-node table now has comparable checksum-backed MX/NIXL, NCCL

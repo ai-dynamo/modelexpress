@@ -1,0 +1,24 @@
+{
+  "block_type": "source GPU/NIXL startup uninterruptible sleep",
+  "claim_safety": {
+    "proof_claimed_from_blocked_attempt": false,
+    "superseded_by": "nscale-live-vllm-mx-runtime-crossnode-20260605.json"
+  },
+  "date": "2026-06-05",
+  "ib_status": {
+    "mlx5_10_phys_state": "5: LinkUp",
+    "mlx5_10_rate": "400 Gb/sec (4X NDR)",
+    "mlx5_10_state": "4: ACTIVE"
+  },
+  "observed_process_state": {
+    "artifact_written": false,
+    "nvidia_smi_state": "Dl",
+    "source_python_state": "Dsl"
+  },
+  "result": "blocked-superseded",
+  "run_id": "mxvllmrt-20260605-ib",
+  "schema_version": 1,
+  "scope": "failed first placement for vLLM MX runtime cross-node source pods",
+  "source_node": "cluster-0967a26d-pool-14bee067-prctr-bw4bt",
+  "target_node": "cluster-0967a26d-pool-14bee067-prctr-th9sn"
+}
