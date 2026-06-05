@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -457,8 +458,6 @@ class MxV2RefitReceiver:
         worker_rank: int,
         listen_port: int | None = None,
     ):
-        import uuid
-
         self._receiver = MxRefitReceiver(
             agent_name=agent_name,
             device_id=device_id,
@@ -468,15 +467,11 @@ class MxV2RefitReceiver:
         self._worker_rank = worker_rank
         self._initialized = False
         self._registered_buffers: dict[str, torch.Tensor] = {}
-        # Used by publish_self_as_source for the tree-fan-out v2 publish.
-        # The Rust MX server's PublishMetadata RPC requires a non-empty
-        # worker_id; generate one per receiver so we don't fail with
-        # "PublishMetadata failed: worker_id is required".
-        self._self_publish_worker_id = uuid.uuid4().hex[:8]
         # Heartbeat for the self-publish so the server doesn't mark our
         # inference_replica source STALE between refit cycles. Started on
         # the first successful publish_self_as_source call; stopped on
-        # shutdown.
+        # shutdown. The worker_id is sourced from the inner receiver's
+        # _worker_id (assigned in MxRefitReceiver.__init__; see PR #421).
         self._self_publish_heartbeat: HeartbeatThread | None = None
 
     @property
@@ -636,26 +631,60 @@ class MxV2RefitReceiver:
     ) -> V2SourceCandidate | None:
         """Pick the best candidate. Optionally requires expert coverage.
 
+        Tree fan-out preference: when inference_replicas exist at the
+        requested version, prefer them over the trainer and random-pick
+        among them. The trainer is reserved as a fallback for the first
+        wave (no replicas yet exist). This spreads load across the
+        replicas' NICs so a sequential or wave-parallel dispatcher
+        actually benefits from tree fan-out.
+
+        Stale-source filter: MX server persists source registrations in
+        Redis with no TTL (TTL=-1), so dead-pod sources from prior runs
+        linger in ``list_sources(status_filter=READY)``. Filter to
+        candidates whose ``updated_at`` (heartbeat) is within the last
+        ~60s; fall back to the unfiltered set only if nothing recent
+        remains (defensive).
+
         If ``needed_experts_per_layer`` is set, the candidate must own a
         superset of the requested experts (or be a trainer with full info).
         """
         if not candidates:
             return None
+
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        FRESH_MS = 60_000  # 60s — generous for ~5s heartbeat cadence
+        fresh = [c for c in candidates if (now_ms - c.updated_at) < FRESH_MS]
+        if fresh:
+            candidates = fresh
+
+        replicas = [c for c in candidates if c.role == ROLE_INFERENCE_REPLICA]
+        trainers = [c for c in candidates if c.role == ROLE_TRAINER]
+
         if needed_experts_per_layer is None:
+            # Dense / EP=1: any same-rank source carries the full state.
+            # Prefer a replica (random across them) so we fan-out load.
+            if replicas:
+                return random.choice(replicas)
+            if trainers:
+                return trainers[0]
             return candidates[0]
 
-        for cand in candidates:
-            if cand.role == ROLE_TRAINER:
-                # Trainer publishes its rank's owned set in the registry; if
-                # we need experts the trainer doesn't own, no single source
-                # has them and the caller has to multi-source. v0 punts.
-                return cand
-            covers_all = all(
-                needed.issubset(cand.owned_experts_per_layer.get(layer, set()))
+        # MoE / EP>1: candidate must cover our needed experts. Trainer is
+        # always full-info; replicas may be partial. Prefer covering
+        # replicas first, fall back to trainer.
+        covering_replicas = [
+            c
+            for c in replicas
+            if all(
+                needed.issubset(c.owned_experts_per_layer.get(layer, set()))
                 for layer, needed in needed_experts_per_layer.items()
             )
-            if covers_all:
-                return cand
+        ]
+        if covering_replicas:
+            return random.choice(covering_replicas)
+        if trainers:
+            return trainers[0]
         return None
 
     def receive_from(
@@ -685,6 +714,31 @@ class MxV2RefitReceiver:
         successfully received a version, we publish ourselves as an
         ``inference_replica`` source so that any rank N receiver who hasn't
         yet pulled can pull from us instead of contending on the trainer.
+
+        Emits v2 metadata via all three transports the trainer's
+        :meth:`MxV2TrainingPublisher.publish` uses, in parallel:
+
+        1. ``identity.extra_parameters`` — clean path; works once the
+           Rust server round-trips ``SourceIdentity`` on
+           ``GetMetadataResponse`` (server PR #162571f and later).
+        2. A ``__mx_v2_meta__`` synthetic ``TensorDescriptor``
+           (``size=0``, JSON payload in ``dtype``) — the path that
+           survives the older Rust server's identity-strip behaviour.
+        3. A ``mx_v2|<role>|rank=N|version=K|orig=...`` ``agent_name``
+           marker on the outgoing ``WorkerMetadata`` — legacy fallback
+           if the sidecar is missing.
+
+        Earlier versions of this method emitted only transport #1, which
+        meant replicas were invisible to ``discover_v2_sources`` on any
+        server that strips ``identity.extra_parameters``. Emitting all
+        three matches the trainer's own publish path and makes
+        receiver-to-receiver tree fan-out actually discoverable.
+
+        Returns:
+            The ``mx_source_id`` of the published replica entry, or
+            ``None`` if the receiver isn't initialized / has no
+            registered buffers. Server-side errors are re-raised so
+            silent failures don't mask a broken catalog.
         """
         if not self._registered_buffers:
             logger.warning(
@@ -699,7 +753,21 @@ class MxV2RefitReceiver:
             )
             return None
 
-        # Build a lightweight identity declaring ourselves as a replica.
+        # Transport #2 sidecar payload. shape_registry / world_layout are
+        # intentionally omitted — the trainer's registry is authoritative;
+        # receivers don't republish a different one.
+        sidecar_payload = json.dumps(
+            {
+                "mx_v2": "1",
+                "role": ROLE_INFERENCE_REPLICA,
+                "worker_rank": int(self._worker_rank),
+                "training_step": int(version),
+                "framework": "nemo_rl",
+            },
+            separators=(",", ":"),
+        )
+
+        # Transport #1: identity.extra_parameters.
         identity = p2p_pb2.SourceIdentity(
             model_name=model_name,
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
@@ -718,38 +786,72 @@ class MxV2RefitReceiver:
             },
         )
 
-        # Build a tensor-descriptor list from our already-registered buffers.
-        from .types import TensorDescriptor
+        # Transport #2: append a __mx_v2_meta__ sidecar TensorDescriptor.
+        descriptors = nixl.tensor_descriptors  # populated at register time
+        tensor_protos = [
+            p2p_pb2.TensorDescriptor(
+                name=d.name,
+                addr=d.addr,
+                size=d.size,
+                device_id=d.device_id,
+                dtype=d.dtype,
+            )
+            for d in descriptors
+        ]
+        tensor_protos.append(
+            p2p_pb2.TensorDescriptor(
+                name=_V2_SIDECAR_NAME,
+                addr=0,
+                size=0,
+                device_id=0,
+                dtype=sidecar_payload,
+            )
+        )
 
-        descriptors = nixl.tensor_descriptors  # already populated at register time
+        # Transport #3: mx_v2|... marker on the outgoing agent_name.
+        agent_name_marker = (
+            f"mx_v2|{ROLE_INFERENCE_REPLICA}|rank={self._worker_rank}|"
+            f"version={int(version)}|orig={self._receiver._agent_name}"
+        )
+
         worker_meta = p2p_pb2.WorkerMetadata(
             worker_rank=self._worker_rank,
             nixl_metadata=nixl.nixl_metadata,
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name=d.name,
-                    addr=d.addr,
-                    size=d.size,
-                    device_id=d.device_id,
-                    dtype=d.dtype,
-                )
-                for d in descriptors
-            ],
+            tensors=tensor_protos,
             status=p2p_pb2.SOURCE_STATUS_READY,
-            agent_name=self._receiver._agent_name,
+            agent_name=agent_name_marker,
+        )
+
+        # MxRefitReceiver.initialize assigns _worker_id eagerly, so this
+        # is always populated. The hasattr-fallback is retained for
+        # forward compatibility with caller-provided receivers that
+        # might not run through initialize().
+        worker_id = (
+            self._receiver._worker_id
+            if hasattr(self._receiver, "_worker_id") and self._receiver._worker_id
+            else f"{self._receiver._agent_name}-replica-{int(version)}"
         )
 
         try:
             mx_source_id = client.publish_metadata(
                 identity=identity,
                 worker=worker_meta,
-                worker_id=self._self_publish_worker_id,
+                worker_id=worker_id,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "publish_self_as_source failed: %s", e, exc_info=True
+        except Exception:
+            # Re-raise rather than silently returning None. Earlier
+            # versions swallowed this; the result was that
+            # ``publish_self_as_source`` looked like it was succeeding
+            # (returning a str-ish from the caller's perspective) while
+            # the catalog stayed empty. Surfacing the exception lets
+            # the caller's retry logic handle it explicitly.
+            logger.error(
+                "publish_self_as_source failed for rank=%d version=%d",
+                self._worker_rank,
+                version,
+                exc_info=True,
             )
-            return None
+            raise
 
         # Start (or restart) a heartbeat so the server doesn't mark this
         # source STALE after the heartbeat-detection timeout. Without
@@ -763,7 +865,7 @@ class MxV2RefitReceiver:
             self._self_publish_heartbeat = HeartbeatThread(
                 mx_client=client,
                 mx_source_id=mx_source_id,
-                worker_id=self._self_publish_worker_id,
+                worker_id=worker_id,
                 worker_rank=self._worker_rank,
                 nixl_manager=nixl,
             )

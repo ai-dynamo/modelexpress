@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -97,6 +98,11 @@ class MxRefitReceiver:
         # allocate + register ONCE and RDMA into the same buffers every time.
         self._scratch_tensors: dict[str, torch.Tensor] = {}
         self._scratch_sig: tuple[tuple[str, int], ...] | None = None
+        # Stable per-instance worker_id consumed by publish flows that
+        # require a non-empty worker_id (e.g.
+        # MxV2RefitReceiver.publish_self_as_source). Assigned eagerly
+        # so the attribute exists even before initialize() runs.
+        self._worker_id = f"{self._agent_name}-{uuid.uuid4().hex[:12]}"
 
     @property
     def current_step(self) -> int:
