@@ -1,0 +1,81 @@
+{
+  "bridges": [
+    {
+      "allclose": true,
+      "base_model_version": "vllm-runtime-loop-smoke",
+      "bridge": "vllm",
+      "checksum": -368.162109375,
+      "max_abs_error": 0.0,
+      "model_version": "vllm-runtime-loop-smoke-runtime-loop-20260605-trainer-loop-step-000002",
+      "proof": {
+        "gpu_runtime_rerun_used": false,
+        "mx_endpoint_planner_accepts_loop_model_version": true,
+        "real_distributed_trainer_loop_used": false,
+        "real_rl_training_loop_used": false,
+        "source_and_request_model_versions_match": true,
+        "synthetic_trainer_loop_smoke_used": true,
+        "trainer_loop_source_publication_used": true,
+        "trainer_update_source_is_loop_smoke": true
+      },
+      "result": "pass",
+      "run_scoped_base_model_version": "vllm-runtime-loop-smoke-runtime-loop-20260605",
+      "segment_count": 2,
+      "source_ids": [
+        "trainer-rank0",
+        "trainer-rank1"
+      ],
+      "source_publication_count": 2,
+      "trainer_step_index": 2,
+      "trainer_to_inference_bytes": 96
+    },
+    {
+      "allclose": true,
+      "base_model_version": "sglang-runtime-loop-smoke",
+      "bridge": "sglang",
+      "checksum": -368.162109375,
+      "max_abs_error": 0.0,
+      "model_version": "sglang-runtime-loop-smoke-runtime-loop-20260605-trainer-loop-step-000002",
+      "proof": {
+        "gpu_runtime_rerun_used": false,
+        "mx_endpoint_planner_accepts_loop_model_version": true,
+        "real_distributed_trainer_loop_used": false,
+        "real_rl_training_loop_used": false,
+        "source_and_request_model_versions_match": true,
+        "synthetic_trainer_loop_smoke_used": true,
+        "trainer_loop_source_publication_used": true,
+        "trainer_update_source_is_loop_smoke": true
+      },
+      "result": "pass",
+      "run_scoped_base_model_version": "sglang-runtime-loop-smoke-runtime-loop-20260605",
+      "segment_count": 2,
+      "source_ids": [
+        "trainer-rank0",
+        "trainer-rank1"
+      ],
+      "source_publication_count": 2,
+      "trainer_step_index": 2,
+      "trainer_to_inference_bytes": 96
+    }
+  ],
+  "metrics": {
+    "runtime_bridge_count": 2,
+    "segment_count": 4,
+    "source_publication_count": 4,
+    "trainer_to_inference_bytes": 192
+  },
+  "mode": "runtime-bridges-trainer-loop-publication-smoke",
+  "proof": {
+    "gpu_runtime_rerun_used": false,
+    "mx_endpoint_planner_accepts_loop_model_version": true,
+    "real_distributed_trainer_loop_used": false,
+    "real_rl_training_loop_used": false,
+    "request_and_source_model_versions_match": true,
+    "sglang_bridge_uses_trainer_loop_source_publication": true,
+    "synthetic_trainer_loop_smoke_used": true,
+    "trainer_update_source_is_loop_smoke": true,
+    "vllm_bridge_uses_trainer_loop_source_publication": true
+  },
+  "result": "pass",
+  "schema_version": 1,
+  "scope": "nscale CPU/control-plane bridge metadata smoke; not a GPU runtime rerun"
+}

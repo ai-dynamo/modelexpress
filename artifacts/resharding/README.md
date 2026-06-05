@@ -345,6 +345,16 @@ Files:
   (`29 passed`). This is still a deterministic trainer-loop smoke over a
   synthetic `torch.optim.SGD` objective, not a real distributed RL/FSDP trainer
   loop.
+- `nscale-runtime-bridges-trainer-loop-publication-smoke-20260605.json`,
+  `nscale-runtime-bridges-trainer-loop-publication-pytest-20260605.log`, and
+  `nscale-cursor-code-review-runtime-bridges-trainer-loop-publication-20260605.log`:
+  nscale CPU/control-plane evidence that the vLLM and SGLang MX runtime bridge
+  source helpers now materialize source publications through the trainer-loop path.
+  The smoke records `runtime_bridge_count=2`, `source_publication_count=4`,
+  `segment_count=4`, `trainer_to_inference_bytes=192`, allclose/checksum pass,
+  step-specific source/request model-version compatibility, and MX endpoint
+  planner acceptance. This is not a live GPU runtime rerun and not real
+  distributed RL/FSDP trainer ownership.
 - `nscale-trainer-step-mx-publication-smoke-20260605.json` and
   `nscale-trainer-step-mx-publication-pytest-20260605.log`: nscale CPU/control
   plane evidence that trainer-step source publications can be published through

@@ -360,6 +360,7 @@ def _annotate_trainer_loop_publication(
             "trainer_loop_step_index": int(step_index),
             "trainer_loop_base_model_version": base_model_version,
             "trainer_loop_model_version": owner.model_version,
+            "trainer_update_source": "torch.optim.SGD-trainer-loop-smoke",
             "trainer_loop_update_source": "torch.optim.SGD-trainer-loop-smoke",
             "synthetic_trainer_loop_smoke": True,
         }

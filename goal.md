@@ -296,6 +296,18 @@ Artifacts under `artifacts/resharding/` prove:
   is still a synthetic trainer-loop smoke over a deterministic
   `torch.optim.SGD` objective; it is not a real distributed RL/FSDP trainer
   loop.
+- The vLLM and SGLang MX runtime bridge source helpers now consume the
+  versioned trainer-loop publication path instead of calling the single-step
+  source publisher directly. Evidence:
+  `artifacts/resharding/nscale-runtime-bridges-trainer-loop-publication-smoke-20260605.json`
+  plus
+  `artifacts/resharding/nscale-runtime-bridges-trainer-loop-publication-pytest-20260605.log`.
+  The smoke proves both bridge source paths publish `trainer_loop_publisher`
+  metadata, use step-specific source/request model versions accepted by the MX
+  endpoint planner, and reconstruct the step-2 target for vLLM and SGLang
+  bridge-shaped ownerships. This is CPU/control-plane bridge evidence only; it
+  is not a new live GPU vLLM/SGLang runtime rerun and not real distributed
+  trainer ownership.
 - `modelexpress.refit_vllm_mx_runtime` now proves cross-node vLLM+NIXL runtime
   refit with the MX endpoint control plane and one pod per source rank. In run
   `mxvllmrt-20260605-ib3`, two independent source pods
@@ -672,6 +684,19 @@ Current partial evidence:
   `artifacts/resharding/nscale-trainer-loop-source-publication-pytest-20260605.log`
   (`29 passed`). This moves source publication closer to a trainer loop, but it
   is still a deterministic CPU/control-plane smoke, not a real RL trainer.
+- `modelexpress.refit_vllm_mx_runtime` and
+  `modelexpress.refit_sglang_mx_runtime` now derive a shared
+  `*-trainer-loop-step-*` runtime model version and materialize source
+  publications through `TrainerLoopStepPublication`. The CPU/control-plane
+  bridge artifact
+  `artifacts/resharding/nscale-runtime-bridges-trainer-loop-publication-smoke-20260605.json`
+  records `runtime_bridge_count=2`, `source_publication_count=4`,
+  `segment_count=4`, `trainer_to_inference_bytes=192`, allclose/checksum pass,
+  and explicit no-overclaim flags (`gpu_runtime_rerun_used=false`,
+  `real_distributed_trainer_loop_used=false`). Focused nscale pytest:
+  `artifacts/resharding/nscale-runtime-bridges-trainer-loop-publication-pytest-20260605.log`
+  (`29 passed`). This updates the bridge source code path; the prior cross-node
+  GPU artifacts remain the latest live runtime proof until rerun.
 - `modelexpress.refit_sglang_receiver_smoke` now has both the earlier
   SGLang-shaped module helper and a live `sglang.Engine` weight-update smoke.
   `artifacts/resharding/nscale-sglang-receiver-smoke.json` proves the
@@ -811,10 +836,12 @@ These are the next useful things to do, in order:
 
 1. Continue replacing the synthetic optimizer-step publisher in the vLLM/SGLang
    NIXL runtime bridges with real trainer-loop integration. The current branch
-   now has CPU tests, versioned trainer-loop publication smoke, same-node
+   now has CPU tests, versioned trainer-loop publication smoke, vLLM/SGLang
+   bridge source paths wired to trainer-loop publication metadata, same-node
    vLLM/SGLang GPU reruns, and cross-node one-pod-per-source-rank runtime
    evidence for both runtimes; the next source-side step is real FSDP/TP/PP/EP
-   or RL trainer ownership publication.
+   or RL trainer ownership publication and a GPU rerun of the loop-published
+   runtime bridge path.
 2. Extend the runtime bridge placement work beyond tiny single-tensor vLLM and
    SGLang targets while keeping the allclose/checksum gates.
 3. Promote the runtime bridges into each engine's production post-load/refit

@@ -1,0 +1,39 @@
+Cursor code review: runtime bridges trainer-loop publication wiring
+Date: 2026-06-05
+Location: nscale pod mx-dev-goal-20260605, /workspace/modelexpress
+Branch: mx-rl-resharding-planner-poc
+Scope:
+- modelexpress_client/python/modelexpress/refit_mx_runtime_common.py
+- modelexpress_client/python/modelexpress/refit_vllm_mx_runtime.py
+- modelexpress_client/python/modelexpress/refit_sglang_mx_runtime.py
+- modelexpress_client/python/modelexpress/refit_trainer_step.py
+- modelexpress_client/python/tests/test_refit_vllm_mx_runtime.py
+- modelexpress_client/python/tests/test_refit_sglang_mx_runtime.py
+- modelexpress_client/python/tests/test_refit_trainer_step.py
+- goal.md
+- artifacts/resharding/README.md
+- artifacts/resharding/nscale-runtime-bridges-trainer-loop-publication-smoke-20260605.json
+
+Review rubric:
+- Used /workspace/ishandhanani-dotfiles/agents/skills/cursor-code-review/SKILL.md.
+- Focus: structural maintainability, abstraction boundaries, duplicated bridge logic, and misleading metadata contracts.
+
+Findings:
+1. Medium: initial bridge wiring duplicated thin trainer-loop materialization helpers in both vLLM and SGLang runtime modules.
+   That would make the trainer-loop publication boundary drift as the real trainer path lands.
+   Resolution: moved the generic publication call into refit_mx_runtime_common.materialize_trainer_loop_publication; vLLM/SGLang keep only runtime-specific source ownership and artifact wiring.
+
+2. Medium: loop-published ownerships carried trainer_loop_update_source but still left the generic trainer_update_source value from the underlying single-step publisher.
+   That made the metadata contract ambiguous for downstream control-plane consumers.
+   Resolution: _annotate_trainer_loop_publication now overwrites trainer_update_source to torch.optim.SGD-trainer-loop-smoke, and tests/artifact assertions cover it.
+
+Non-blockers checked:
+- No changed file crosses 1000 lines. Largest changed files after the fix are refit_sglang_mx_runtime.py at 834 lines and refit_vllm_mx_runtime.py at 792 lines.
+- The target/source model-version contract is centralized through trainer_loop_runtime_model_version, so source endpoints and receiver requests use the same step-specific model version.
+- The docs keep the claim boundary explicit: CPU/control-plane runtime bridge metadata evidence only, not a new GPU runtime rerun and not real distributed RL/FSDP trainer ownership.
+
+Post-fix verification:
+- python3 -m black modelexpress/refit_trainer_step.py modelexpress/refit_mx_runtime_common.py modelexpress/refit_vllm_mx_runtime.py modelexpress/refit_sglang_mx_runtime.py tests/test_refit_trainer_step.py tests/test_refit_vllm_mx_runtime.py tests/test_refit_sglang_mx_runtime.py --check
+- pytest -q tests/test_refit_vllm_mx_runtime.py tests/test_refit_sglang_mx_runtime.py tests/test_refit_trainer_step.py tests/test_resharding_control_plane.py
+- artifact JSON assertions for nscale-runtime-bridges-trainer-loop-publication-smoke-20260605.json
+- Result: 29 passed in 0.15s during focused post-fix runs.

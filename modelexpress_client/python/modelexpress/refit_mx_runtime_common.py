@@ -7,13 +7,52 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+import torch
+
 from . import p2p_pb2
+from .refit_trainer_step import (
+    TrainerLoopStepPublication,
+    publish_trainer_loop_step,
+    trainer_loop_model_version,
+)
 from .resharding import SliceOwnership, SliceRequest, plan_segments
 from .resharding_control_plane import RefitNixlEndpoint
 
 
 def effective_model_version(model_version: str, run_id: str) -> str:
     return f"{model_version}-{run_id}"
+
+
+def trainer_loop_runtime_model_version(
+    model_version: str,
+    run_id: str,
+    trainer_step_index: int,
+) -> str:
+    """Return the MX runtime model version for one trainer-loop source step."""
+
+    return trainer_loop_model_version(
+        effective_model_version(model_version, run_id),
+        trainer_step_index,
+    )
+
+
+def materialize_trainer_loop_publication(
+    ownerships: Sequence[SliceOwnership],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    trainer_step_index: int,
+    model_version: str | None = None,
+) -> TrainerLoopStepPublication:
+    """Create one trainer-loop publication for runtime bridge source pods."""
+
+    return publish_trainer_loop_step(
+        ownerships,
+        dtype=dtype,
+        device=device,
+        step_index=trainer_step_index,
+        model_version=model_version,
+    )
 
 
 def parse_shape(value: str | Sequence[int]) -> tuple[int, ...]:

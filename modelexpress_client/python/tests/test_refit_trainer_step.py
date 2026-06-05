@@ -227,6 +227,11 @@ def test_trainer_loop_step_publication_versions_all_source_ranks():
         for pub in loop_step.source_publications
     )
     assert all(
+        pub.ownership.layout_tags["trainer_update_source"]
+        == "torch.optim.SGD-trainer-loop-smoke"
+        for pub in loop_step.source_publications
+    )
+    assert all(
         pub.provenance["trainer_loop_publisher_used"] is True
         for pub in loop_step.source_publications
     )

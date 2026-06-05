@@ -9,6 +9,7 @@ from modelexpress import p2p_pb2
 from modelexpress.refit_sglang_mx_runtime import (
     _effective_model_version,
     _filter_source_ownerships,
+    _trainer_loop_runtime_model_version,
     build_sglang_mx_runtime_source_ownerships,
     materialize_sglang_mx_runtime_source_publications,
     scenario_with_mx_endpoint_plan,
@@ -28,6 +29,9 @@ def test_sglang_mx_runtime_source_ownerships_are_filterable_per_pod():
     )
 
     assert _effective_model_version("base", "run-1") == "base-run-1"
+    assert _trainer_loop_runtime_model_version("base", "run-1", 3) == (
+        "base-run-1-trainer-loop-step-000003"
+    )
     assert [owner.source_id for owner in owners] == ["trainer-rank0", "trainer-rank1"]
     assert [owner.worker_rank for owner in owners] == [0, 1]
     assert owners[0].source_range == ((0, 4), (0, 4))
@@ -52,6 +56,8 @@ def test_sglang_mx_runtime_source_publications_keep_metadata():
         owners,
         dtype=torch.float32,
         device=torch.device("cpu"),
+        trainer_step_index=2,
+        model_version="step-9-trainer-loop-step-000002",
     )
 
     assert [publication.ownership.source_id for publication in publications] == [
@@ -63,18 +69,35 @@ def test_sglang_mx_runtime_source_publications_keep_metadata():
         (3, 4),
     ]
     assert all(
+        publication.ownership.model_version == "step-9-trainer-loop-step-000002"
+        for publication in publications
+    )
+    assert all(
+        publication.ownership.layout_tags["trainer_loop_publisher"] is True
+        for publication in publications
+    )
+    assert all(
+        publication.ownership.layout_tags["trainer_loop_step_index"] == 2
+        for publication in publications
+    )
+    assert all(
         publication.provenance["optimizer_step_publisher_used"]
+        for publication in publications
+    )
+    assert all(
+        publication.provenance["trainer_loop_publisher_used"]
         for publication in publications
     )
 
 
 def test_sglang_mx_runtime_scenario_uses_mx_endpoint_ownerships_for_plan():
+    loop_model_version = _trainer_loop_runtime_model_version("step-8", "run-a", 1)
     target = torch.empty((8, 4), dtype=torch.float32)
     request, local_owners, local_plans = build_sglang_runtime_nixl_plan(
         target,
         tensor_name="lm_head.weight",
         model_name="mx-sglang-mx-unit",
-        model_version="step-8",
+        model_version=loop_model_version,
     )
     scenario = {
         "target_tensor_name": "lm_head.weight",
@@ -92,7 +115,13 @@ def test_sglang_mx_runtime_scenario_uses_mx_endpoint_ownerships_for_plan():
         model_name="mx-sglang-mx-unit",
         model_version="step-8",
     )
-    endpoints = [_endpoint(owner) for owner in mx_owners]
+    mx_publications = materialize_sglang_mx_runtime_source_publications(
+        mx_owners,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        model_version=loop_model_version,
+    )
+    endpoints = [_endpoint(publication.ownership) for publication in mx_publications]
 
     planned, context = scenario_with_mx_endpoint_plan(
         scenario,
@@ -105,6 +134,9 @@ def test_sglang_mx_runtime_scenario_uses_mx_endpoint_ownerships_for_plan():
         "trainer-rank0",
         "trainer-rank1",
     ]
+    assert {owner["model_version"] for owner in planned["source_ownerships"]} == {
+        loop_model_version
+    }
     assert [plan["source_id"] for plan in planned["segment_plans"]] == [
         "trainer-rank0",
         "trainer-rank1",
