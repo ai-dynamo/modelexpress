@@ -474,6 +474,22 @@ Artifacts under `artifacts/resharding/` prove:
   synthetic optimizer objective, staging-copy install, no FSDP/TP/PP/EP/RL
   trainer, no direct NIXL landing into vLLM-owned storage, and no full-model
   refit.
+- `modelexpress.refit_runtime_multitensor_smoke` now proves the next
+  receiver-side runtime transaction boundary beyond a single target tensor:
+  vLLM-tagged and SGLang-tagged runtime-owned tensor bundles can each build two
+  receiver `SliceRequest`s, plan four source intersections across two trainer
+  rank holders, install segment payloads into both runtime-owned tensors, and
+  roll the transaction back with per-tensor allclose/checksum gates. Evidence:
+  `artifacts/resharding/nscale-runtime-multitensor-vllm-smoke-20260605.json`,
+  `artifacts/resharding/nscale-runtime-multitensor-sglang-smoke-20260605.json`,
+  and
+  `artifacts/resharding/nscale-cursor-code-review-runtime-multitensor-20260605.md`.
+  Both artifacts record `target_tensor_count=2`, `segment_count=4`,
+  `trainer_to_inference_bytes=224`, redundant cross-boundary factor `1.0`,
+  `multi_tensor_refit_transaction_used=true`, and rollback success. Scope
+  boundary: this is nscale CPU/runtime-tensor transaction evidence only; it
+  explicitly records `actual_nixl_reads_used=false`,
+  `gpu_nixl_reads_used=false`, and `live_runtime_engine_used=false`.
 - `artifacts/resharding/nscale-live-vllm-mx-runtime-distributed-trainer-crossnode-bw4bt-import-hang-20260605.json`
   banks the first rank-1 placement for that vLLM distributed-trainer runtime
   proof on `cluster-0967a26d-pool-14bee067-prctr-bw4bt`. The pod scheduled and
@@ -557,7 +573,10 @@ The current POC does **not** prove:
   trainer-owned and runtime-owned tensors. The synthetic cross-node GPU harness
   now proves the segment-level recovery mechanism under a forced source pod
   deletion, but it is not real trainer/runtime integration.
-- Full-model or multi-layer refit.
+- Full-model or multi-layer live runtime refit. Multi-tensor CPU/runtime-tensor
+  transaction semantics are now proven for two vLLM-tagged and SGLang-tagged
+  tensors, but live GPU NIXL/runtime-engine multi-tensor refit remains
+  unproven.
 - Runtime installation of real Qwen MoE model tensors.
 - End-to-end runtime fallback installation using real Qwen FP8 payload bytes
   and real runtime-owned model tensors after `global-required` metadata is
@@ -796,6 +815,18 @@ Current partial evidence:
   segments, restored-original validation, and no trainer full all-gather. This
   closes the vLLM side of the distributed-trainer-to-runtime bridge for tiny
   single-tensor scope only.
+- `modelexpress.refit_runtime_multitensor_smoke` adds a multi-tensor
+  receiver-side transaction smoke for both runtime framework dimensions.
+  nscale artifacts
+  `artifacts/resharding/nscale-runtime-multitensor-vllm-smoke-20260605.json`
+  and
+  `artifacts/resharding/nscale-runtime-multitensor-sglang-smoke-20260605.json`
+  each report `result=pass`, two runtime-owned tensors, four planned segments,
+  per-tensor allclose/checksum validation, and rollback of the transaction.
+  Focused nscale regression for this helper and the existing vLLM/SGLang NIXL
+  runtime smokes reports `18 passed`. This is not live engine, GPU NIXL, or
+  full-model evidence; it is the receiver transaction shape needed before
+  scaling the live bridges beyond one tensor.
 - `modelexpress.refit_vllm_receiver_smoke` now provides a live vLLM V1
   receiver-owned tensor smoke through `LLM.apply_model`, plus a
   framework-explicit module helper. The live entrypoint creates a tiny Qwen2
@@ -1013,8 +1044,10 @@ Current partial evidence:
 
 These are the next useful things to do, in order:
 
-1. Extend the runtime bridge placement work beyond tiny single-tensor vLLM and
-   SGLang targets while keeping the allclose/checksum gates.
+1. Extend the live GPU runtime bridge placement work beyond tiny single-tensor
+   vLLM and SGLang targets while keeping the allclose/checksum gates. The
+   CPU/runtime-tensor multi-tensor transaction shape is now banked; the next
+   proof needs real engine-owned multi-tensor install plus NIXL data movement.
 2. Promote the runtime bridges into each engine's production post-load/refit
    lifecycle, using the same source-published ownership and receiver-side
    request path.
@@ -1050,7 +1083,8 @@ Safe claim:
 > and synthetic in-flight source-pod hard-kill recovery runs over UCX/IB rc, each
 > gated by checksum/allclose. The metadata side also covers real Qwen3 MoE and
 > Qwen3 FP8 safetensors headers, including real global-required quantization
-> metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes. A
+> metadata, plus CPU runtime-shaped vLLM/SGLang target tensor install smokes and
+> multi-tensor runtime transaction smokes with rollback. A
 > CPU competitive simulator now records MX direct, MX fanout, NCCL Reshard, and
 > CheckpointEngine-style byte/cost comparisons for a two-step RL rollout
 > scenario. Tiny live vLLM and SGLang engine-owned smokes prove receiver-owned
