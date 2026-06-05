@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::expect_used)]
-#![allow(deprecated)]
 
-use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
-use modelexpress_common::grpc::p2p::{
-    ArtifactSourceMetadata, BackendFramework, MxSourceType, SourceIdentity, TensorDescriptor,
-    WorkerMetadata,
+use modelexpress_common::{
+    artifact_manifest::ArtifactManifest,
+    grpc::p2p::worker_metadata::SourcePayload,
+    grpc::p2p::{
+        ArtifactSourceMetadata, BackendFramework, MxSourceType, SourceIdentity, TensorDescriptor,
+        WorkerMetadata,
+    },
 };
 use modelexpress_server::p2p::backend::WorkerRecord;
 use modelexpress_server::p2p::k8s_types::{ArtifactSourceStatus, ModelMetadataSpec, WorkerStatus};
+use std::fs;
 
 fn base_identity() -> SourceIdentity {
     SourceIdentity {
@@ -62,6 +65,7 @@ fn artifact_source_identity_is_separate_from_weights() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn artifact_payload_does_not_publish_weight_tensors() {
     let worker = WorkerMetadata {
         worker_rank: 0,
@@ -109,6 +113,34 @@ fn artifact_payload_does_not_publish_weight_tensors() {
 }
 
 #[test]
+fn sealed_artifact_manifest_derives_discovery_summary() {
+    let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+    fs::create_dir(temp_dir.path().join("torchinductor")).expect("create artifact dir");
+    fs::write(
+        temp_dir.path().join("torchinductor/fxgraph"),
+        b"compiled-graph",
+    )
+    .expect("write compiled graph");
+    fs::write(temp_dir.path().join("triton.cubin"), b"cubin").expect("write cubin");
+
+    let sealed = ArtifactManifest::from_directory(
+        temp_dir.path(),
+        8,
+        MxSourceType::TorchCompileCache as i32,
+    )
+    .expect("build artifact manifest")
+    .seal()
+    .expect("seal artifact manifest");
+    let metadata = sealed.source_metadata().expect("derive source metadata");
+
+    assert_eq!(metadata.artifact_id, sealed.artifact_id);
+    assert_eq!(metadata.total_size, 19);
+    assert_eq!(metadata.file_count, 2);
+    assert_eq!(metadata.chunk_count, 3);
+}
+
+#[test]
+#[allow(deprecated)]
 fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
     let worker = WorkerMetadata {
         worker_rank: 0,
@@ -144,6 +176,10 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
     assert_eq!(
         ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TorchCompileCache as i32),
         "torch_compile_cache"
+    );
+    assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::DeepGemmCache as i32),
+        "deep_gemm_cache"
     );
 
     let worker = WorkerStatus {

@@ -45,6 +45,7 @@ impl ModelMetadataSpec {
             Ok(MxSourceType::CudaGraph) => "cuda_graph",
             Ok(MxSourceType::TorchCompileCache) => "torch_compile_cache",
             Ok(MxSourceType::TritonCache) => "triton_cache",
+            Ok(MxSourceType::DeepGemmCache) => "deep_gemm_cache",
             Err(_) => "unknown",
         }
         .to_string()
@@ -269,6 +270,10 @@ mod tests {
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(3),
             "torch_compile_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(5),
+            "deep_gemm_cache"
         );
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(99),
