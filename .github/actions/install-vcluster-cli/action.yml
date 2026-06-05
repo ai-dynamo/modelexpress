@@ -15,8 +15,10 @@ runs:
   steps:
     - name: Install vCluster CLI
       shell: bash
+      env:
+        VCLUSTER_VERSION: ${{ inputs.vcluster_version }}
       run: |
-        echo "::group::Install vCluster CLI ${{ inputs.vcluster_version }}"
+        echo "::group::Install vCluster CLI ${VCLUSTER_VERSION}"
         if command -v vcluster &>/dev/null; then
           echo "vCluster CLI already installed: $(vcluster version)"
         else
@@ -31,7 +33,7 @@ runs:
             --connect-timeout 10 --max-time 120 \
             --fail --show-error -sL \
             -o "${TMP_BIN}" \
-            "https://github.com/loft-sh/vcluster/releases/download/${{ inputs.vcluster_version }}/vcluster-linux-${VCLUSTER_ARCH}"
+            "https://github.com/loft-sh/vcluster/releases/download/${VCLUSTER_VERSION}/vcluster-linux-${VCLUSTER_ARCH}"
           sudo install -m 0755 "${TMP_BIN}" /usr/local/bin/vcluster
           rm -f "${TMP_BIN}"
           vcluster version
