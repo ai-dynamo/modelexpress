@@ -32,13 +32,14 @@ runs:
       env:
         VCLUSTER_NAME: ${{ inputs.vcluster_name }}
         NAMESPACE: ${{ inputs.vcluster_namespace }}
+        KUBECONFIG_BASE64: ${{ inputs.kubeconfig_base64 }}
       run: |
         # Use a unique temp file so concurrent runs on the same self-hosted
         # runner don't clobber each other's kubeconfig. Trap on EXIT to
         # remove the credential whether the step succeeds or fails.
         KUBECONFIG_FILE=$(mktemp)
         trap 'rm -f "${KUBECONFIG_FILE}"' EXIT
-        echo "${{ inputs.kubeconfig_base64 }}" | base64 -d > "${KUBECONFIG_FILE}"
+        echo "${KUBECONFIG_BASE64}" | base64 -d > "${KUBECONFIG_FILE}"
         chmod 600 "${KUBECONFIG_FILE}"
         export KUBECONFIG="${KUBECONFIG_FILE}"
         RESULT=$(vcluster list --output json -n ${NAMESPACE})
