@@ -28,11 +28,12 @@
 #                         parallel once each framework has been validated
 #                         independently.
 #
-#   test-tp             — TP > 1 variant of test-p2p. Pinned to the agent
-#                         pool with non-MIG, full physical GPUs via the
-#                         tp2 manifest's nodeSelector. Single-node only
-#                         today; multi-node TP is still blocked on the
-#                         device_id bug (see TEST_PLAN row 5).
+#   test-tp             — TP > 1 variant of test-p2p. Matrix covers
+#                         single-node TP=2 (one Job, two GPUs per pod,
+#                         pinned to a non-MIG GPU pool via nodeSelector)
+#                         and multi-node TP=2 (StatefulSet + Ray, one
+#                         GPU per pod, 2 pods per role). See TEST_PLAN
+#                         row 5.1 for the full topology rationale.
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
@@ -412,53 +413,32 @@ jobs:
   # manifest-azure-tp2.yaml.
   # ---------------------------------------------------------------------------
   test-tp:
-    name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }})
+    name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include:
           - framework: vllm
             tp_size: 2
+            topology: single-node
             namespace: mx-ci-vllm-tp2-${{ github.run_id }}
             manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
             source_port: "8001"
             worker_port: "8002"
 
-          # Multi-node TP=2 (vLLM) — scaffolded, gated.
-          # Manifest: ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml
-          # (see header of that file for the full blocker list).
-          # Summary of blockers:
-          #   1. ModelExpress device_id bug under Ray executor. Rank-1
-          #      NIXL registration fails with "CUDA error: invalid device
-          #      ordinal" because adapter.py `_get_vllm_device_id` uses
-          #      the global rank as the device index, but each pod only
-          #      exposes its assigned GPU as local device 0. Result: only
-          #      rank 0 publishes ModelMetadata, P2P never happens. Single-
-          #      node TP=2 unaffected. Tracked as a separate bug; must land
-          #      before this matrix entry is enabled.
-          #   2. Cluster capacity — needs ≥2 A100+IB nodes with ≥2 GPUs each.
-          #      Anti-affinity uses matchLabelKeys to cross-pair ranks
-          #      (Node A: source-0 + target-1, Node B: source-1 + target-0)
-          #      so all RDMA paths stay cross-host. Cluster K8s must be
-          #      ≥ 1.29 for matchLabelKeys.
-          #   3. action.yml's `envsubst` call must move to an explicit var
-          #      allowlist so shell vars (${POD_NAME}, ${HOSTNAME}) in the
-          #      Ray bootstrap script aren't substituted at apply time.
-          #   4. action.yml + pytest pod selection by `job-name=` returns
-          #      `.items[0]` without ordinal ordering — could pick the Ray
-          #      worker pod (no API server). Pin to pod-0 once enabling.
-          # When unblocked, uncomment:
-          # - framework: vllm
-          #   tp_size: 2
-          #   namespace: mx-ci-vllm-multinode-tp2-${{ github.run_id }}
-          #   manifest: ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml
-          #   source_port: "8001"
-          #   worker_port: "8002"
+          # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
+          # manifest header for the cross-host pod-pairing rationale.
+          - framework: vllm
+            tp_size: 2
+            topology: multi-node
+            namespace: mx-ci-vllm-multinode-tp2-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
 
     steps:
       - name: Checkout
