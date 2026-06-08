@@ -153,8 +153,8 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     # StatefulSets it captures the rank-1 worker's logs from pod-1, which
     # Ray's distributed executor doesn't forward to the head pod's stdout.
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    marker_lines = [l for l in logs.splitlines() if any(k in l for k in ("RDMA", "P2P", "transfer"))]
-    print(f"[mx-target] transfer log lines:\n" + "\n".join(marker_lines))
+    marker_lines = [line for line in logs.splitlines() if any(k in line for k in ("RDMA", "P2P", "transfer"))]
+    print("[mx-target] transfer log lines:\n" + "\n".join(marker_lines))
     assert p2p_marker in logs, (
         f"P2P marker {p2p_marker!r} not found in target logs.\n"
         f"Last 50 log lines:\n" + "\n".join(logs.splitlines()[-50:])
