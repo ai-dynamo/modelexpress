@@ -61,10 +61,12 @@ runs:
   steps:
     - name: Setup host kubeconfig
       shell: bash
+      env:
+        KUBECONFIG_BASE64: ${{ inputs.kubeconfig_base64 }}
       run: |
-        echo "${{ inputs.kubeconfig_base64 }}" | base64 -d > ${{ github.workspace }}/.kubeconfig-host
-        chmod 600 ${{ github.workspace }}/.kubeconfig-host
-        echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-host" >> $GITHUB_ENV
+        echo "${KUBECONFIG_BASE64}" | base64 -d > "${GITHUB_WORKSPACE}/.kubeconfig-host"
+        chmod 600 "${GITHUB_WORKSPACE}/.kubeconfig-host"
+        echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-host" >> $GITHUB_ENV
 
     - name: Install vCluster CLI
       uses: ./.github/actions/install-vcluster-cli
@@ -105,6 +107,7 @@ runs:
       env:
         VCLUSTER_NAME: ${{ inputs.vcluster_name }}
         NAMESPACE: ${{ inputs.vcluster_namespace }}
+        VCLUSTER_K8S_VERSION: ${{ inputs.vcluster_k8s_version }}
       run: |
         echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
         # GPU workloads require syncing host nodes into the vCluster so the GPU
@@ -114,7 +117,7 @@ runs:
           --connect=false \
           --upgrade \
           --set controlPlane.distro.k8s.enabled=true \
-          --set controlPlane.distro.k8s.version=${{ inputs.vcluster_k8s_version }} \
+          --set controlPlane.distro.k8s.version=${VCLUSTER_K8S_VERSION} \
           --set sync.fromHost.nodes.enabled=true \
           --set sync.fromHost.nodes.selector.all=true
         echo "::endgroup::"
@@ -146,7 +149,7 @@ runs:
         echo "::group::Apply ModelExpress CRD inside vCluster"
         # CRD is cluster-scoped — applied once here on bootstrap.
         # run-mx-p2p-test also applies it on every run for idempotency.
-        kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-vcluster apply \
+        kubectl --kubeconfig="${GITHUB_WORKSPACE}/.kubeconfig-vcluster" apply \
           -f ci/k8s/server/crd-modelmetadata.yaml
         echo "::endgroup::"
 
@@ -232,7 +235,7 @@ runs:
         echo "::group::Events (host namespace)"
         kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' 2>&1 || true
         echo "::endgroup::"
-        VC_KC=${{ github.workspace }}/.kubeconfig-vcluster
+        VC_KC="${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
         if [ -f "${VC_KC}" ]; then
           echo "::group::Pod status (vCluster, all namespaces)"
           kubectl --kubeconfig=${VC_KC} get pods -A -o wide 2>&1 || true
