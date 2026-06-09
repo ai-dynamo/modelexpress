@@ -56,9 +56,8 @@ RUN python3 -c "from modelexpress.client import MxClient; print('MxClient OK')" 
 # Canary: fail the build if the base SGLang lacks the transfer_engine hook,
 # so a green build guarantees this image can take the Mooncake path. Mirrors
 # the PR-detection check in the example Dockerfile.pr23105.
-RUN python3 -c "import importlib.metadata as m, pathlib; \
-        sg = pathlib.Path(m.distribution('sglang').locate_file('sglang/srt/server_args.py')); \
-        src = sg.read_text(); \
+RUN python3 -c "import importlib.metadata as m, pathlib, sglang.srt.server_args as sa; \
+        src = pathlib.Path(sa.__file__).read_text(); \
         assert 'transfer_engine' in src or 'start_seed_via_transfer_engine' in src, \
         'SGLang base lacks transfer_engine hook; repin SGLANG_IMAGE (see header TODO)'; \
         print('OK: sglang', m.version('sglang'), 'has transfer_engine hook')"
