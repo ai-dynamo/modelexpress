@@ -347,10 +347,11 @@ jobs:
             source_port: "8005"
             worker_port: "8006"
           # Same SGLang P2P test as above, but over the Mooncake TransferEngine
-          # transport instead of NIXL. Seed/client run different launch args
-          # (manifest branches on JOB_NAME); the per-rank NIXL agent assertion
-          # is skipped via --transport, and the transfer marker comes from the
-          # loader's "Receiving N tensors via TransferEngine" log line.
+          # transport instead of NIXL. Identical manifest shape to the nixl
+          # entry (source/target run the same command, first becomes source);
+          # the only change is transport=transfer_engine in modelexpress-config.
+          # The per-rank NIXL agent assertion is skipped via --transport, and
+          # the transfer marker is the loader's "tensors via TransferEngine" log.
           - framework: sglang-mooncake
             namespace: mx-ci-sglang-mooncake-${{ github.run_id }}
             manifest: ci/k8s/client/sgl/manifest-azure-mooncake.yaml

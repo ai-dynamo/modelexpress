@@ -4,29 +4,23 @@
 # Azure A100 single-job template for SGLang P2P weight-transfer CI tests over
 # the Mooncake TransferEngine transport (transport=transfer_engine).
 #
-# Mirror of ci/k8s/client/sgl/manifest-azure.yaml (the NIXL variant). Same
-# image build path (here: ci/k8s/client/sgl/Dockerfile.mooncake), same node
-# pool, RDMA resource, affinity, and IPC_LOCK. The ONLY differences are the
-# launch args and the transport:
+# This is a near-exact clone of ci/k8s/client/sgl/manifest-azure.yaml (the NIXL
+# variant). The ONLY functional difference is the modelexpress-config transport:
+#   NIXL variant:    '{"url": "mx-server:8000", "transport": "nixl"}'
+#   this variant:    '{"url": "mx-server:8000", "transport": "transfer_engine"}'
 #
-#   - NIXL variant runs the SAME command on source and target and selects the
-#     transport via `--modelexpress-config '{... "transport": "nixl"}'`.
-#   - TransferEngine seed and client run DIFFERENT commands, so this manifest
-#     branches on ${JOB_NAME} (envsubst substitutes it at apply time, so the
-#     bash `if` resolves to the right branch per apply):
-#       seed   : --load-format auto
-#                --remote-instance-weight-loader-start-seed-via-transfer-engine
-#                --modelexpress-config '{"url": "mx-server:8000", "source": true}'
-#       client : --load-format remote_instance
-#                --remote-instance-weight-loader-backend modelexpress
-#                --modelexpress-config '{"url": "mx-server:8000"}'
-#     The transport is NOT passed in modelexpress-config here; the patched
-#     SGLang sets load_config.modelexpress_transport == "transfer_engine" off
-#     the seed flag / transfer-engine backend.
-#
-# mx-server is still the coordination point: the seed publishes a
-# WorkerMetadata carrying transfer_engine_session_id, the client discovers it
-# via ListSources/GetMetadata and pulls with batch_transfer_sync_read.
+# Per SGLang's server_args.remote_instance_weight_loader_use_transfer_engine(),
+# the modelexpress backend initializes the Mooncake TransferEngine iff
+# modelexpress-config carries "transport": "transfer_engine". With that set,
+# SGLang inits the TransferEngine and hands it (plus the session id) to
+# ModelExpress's MxModelLoader, which takes its _load_model_via_transfer_engine
+# path. mx-server is still the coordination point: the first replica finds no
+# READY source, loads natively, and publishes a WorkerMetadata carrying
+# transfer_engine_session_id; the second replica discovers it and pulls with
+# batch_transfer_sync_read. Same first-replica-becomes-source flow as the NIXL
+# variant, so source and target run the IDENTICAL command (no JOB_NAME branch,
+# no --remote-instance-weight-loader-start-seed-via-transfer-engine; that flag
+# is only for the bare transfer_engine backend with a hardcoded seed IP).
 #
 # Applied twice by the workflow with different envsubst values:
 #   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
@@ -100,29 +94,22 @@ spec:
           # Force re-pull on every pod creation so CI/dev iterations on the same
           # tag pick up freshly pushed images instead of the node's cached copy.
           imagePullPolicy: Always
-          command: ["/bin/bash", "-c"]
+          command: ["python3", "-m", "sglang.launch_server"]
           args:
-            - |
-              ulimit -l unlimited
-              if [ "${JOB_NAME}" = "mx-source" ]; then
-                exec python3 -m sglang.launch_server \
-                  --model-path "${MX_CI_MODEL}" \
-                  --host 0.0.0.0 \
-                  --port "${WORKER_PORT}" \
-                  --tp 1 \
-                  --load-format auto \
-                  --remote-instance-weight-loader-start-seed-via-transfer-engine \
-                  --modelexpress-config '{"url": "mx-server:8000", "source": true}'
-              else
-                exec python3 -m sglang.launch_server \
-                  --model-path "${MX_CI_MODEL}" \
-                  --host 0.0.0.0 \
-                  --port "${WORKER_PORT}" \
-                  --tp 1 \
-                  --load-format remote_instance \
-                  --remote-instance-weight-loader-backend modelexpress \
-                  --modelexpress-config '{"url": "mx-server:8000"}'
-              fi
+            - --model-path
+            - "${MX_CI_MODEL}"
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "${WORKER_PORT}"
+            - --tp
+            - "1"
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"url": "mx-server:8000", "transport": "transfer_engine"}'
           env:
             - name: MODEL_EXPRESS_URL
               value: "mx-server:8000"
@@ -134,12 +121,12 @@ spec:
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
               value: "0"
-            # MOONCAKE_DEVICE is intentionally NOT pinned here. The example
-            # manifest (examples/.../sglang-test-transfer-engine.yaml) hardcodes
+            # MOONCAKE_DEVICE is intentionally NOT pinned. The example manifest
+            # (examples/.../sglang-test-transfer-engine.yaml) hardcodes
             # mlx5_0..mlx5_11, but those are the NIC names on an 8-GPU H100
-            # node; the a100a single-GPU node pool exposes a different/smaller
-            # set. Following the NIXL variant's MX_RDMA_NIC_PIN=auto philosophy,
-            # we let Mooncake auto-discover. If the first CI run fails on device
+            # node; the a100a single-GPU node pool exposes a different set.
+            # Following the NIXL variant's MX_RDMA_NIC_PIN=auto philosophy, we
+            # let Mooncake auto-discover. If the first CI run fails on device
             # discovery, pin MOONCAKE_DEVICE to the a100a node's actual IB NIC.
             - name: HF_TOKEN
               valueFrom:
