@@ -17,16 +17,22 @@
 #       -f ci/k8s/client/sgl/Dockerfile.mooncake \
 #       -t <IMAGE> --push --load .
 #
-# TODO(mooncake): the pinned base below is the NIXL variant's base and is NOT
-# yet confirmed to carry SGLang's transfer_engine hook. Before this image can
-# actually exercise the Mooncake path, repin SGLANG_IMAGE to a base that
-# includes that hook (the example overlay pattern lives in
-# examples/p2p_transfer_k8s/client/sglang/Dockerfile.pr23105). The import
-# check below is the canary: it fails the build if the hook is absent, so a
-# green build here means the base is good.
-# TODO: Switch to an SGLang release image once the transfer_engine loader path is released.
-ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:6553f8288e848fd833a4d473eca7aa2c8f141f98c52f63a5f4684631de50f9f2
+# Base differs from the NIXL variant on purpose. The NIXL image's pinned digest
+# predates SGLang's transfer_engine remote-instance loader, so it has neither
+# the `--remote-instance-weight-loader-start-seed-via-transfer-engine` flag nor
+# the `transfer_engine`/`modelexpress` choices for
+# `--remote-instance-weight-loader-backend`. Those landed in SGLang v0.5.10, so
+# we pin a v0.5.12 release here. The cu129 (CUDA 12.9) variant is chosen over
+# the default cu13 image so it stays in the cu12 family that ModelExpress's
+# `nixl[cu12]` dependency targets (see docs/NIXL_UCX_COMPATIBILITY.md). The
+# build-time canary below verifies the hook is present.
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.12.post1-cu129
 FROM ${SGLANG_IMAGE}
+
+# Mooncake TransferEngine is not bundled in the SGLang base. SGLang's
+# transfer_engine path constructs a Mooncake TransferEngine, which requires the
+# mooncake-transfer-engine package; without it the client falls back / errors.
+RUN pip install mooncake-transfer-engine
 
 # Install ModelExpress Python client.
 # Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;
