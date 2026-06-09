@@ -4,23 +4,38 @@
 # Azure A100 single-job template for SGLang P2P weight-transfer CI tests over
 # the Mooncake TransferEngine transport (transport=transfer_engine).
 #
-# This is a near-exact clone of ci/k8s/client/sgl/manifest-azure.yaml (the NIXL
-# variant). The ONLY functional difference is the modelexpress-config transport:
-#   NIXL variant:    '{"url": "mx-server:8000", "transport": "nixl"}'
-#   this variant:    '{"url": "mx-server:8000", "transport": "transfer_engine"}'
+# Unlike the NIXL variant (ci/k8s/client/sgl/manifest-azure.yaml), source and
+# target run DIFFERENT commands here. The NIXL CI image predates SGLang's
+# in-tree ModelExpress rewrite and uses the symmetric "first replica becomes
+# source" flow. The v0.5.12 base this variant pins reimplemented ModelExpress
+# natively in SGLang as an ASYMMETRIC seed/client split
+# (model_executor/model_runner.py + model_loader/loader.py):
+#   - load_model_from_modelexpress() is a pure CLIENT: it ListSources(READY)
+#     and raises "no READY source found" if none exists -- it never self-
+#     promotes to source.
+#   - The seed publishes from a separate path, gated on modelexpress_source
+#     ("source": true in --modelexpress-config), which calls
+#     _publish_modelexpress_metadata() after a normal disk load.
 #
-# Per SGLang's server_args.remote_instance_weight_loader_use_transfer_engine(),
-# the modelexpress backend initializes the Mooncake TransferEngine iff
-# modelexpress-config carries "transport": "transfer_engine". With that set,
-# SGLang inits the TransferEngine and hands it (plus the session id) to
-# ModelExpress's MxModelLoader, which takes its _load_model_via_transfer_engine
-# path. mx-server is still the coordination point: the first replica finds no
-# READY source, loads natively, and publishes a WorkerMetadata carrying
-# transfer_engine_session_id; the second replica discovers it and pulls with
-# batch_transfer_sync_read. Same first-replica-becomes-source flow as the NIXL
-# variant, so source and target run the IDENTICAL command (no JOB_NAME branch,
-# no --remote-instance-weight-loader-start-seed-via-transfer-engine; that flag
-# is only for the bare transfer_engine backend with a hardcoded seed IP).
+# So for the Mooncake (transfer_engine) transport the seed needs all of:
+#   --load-format auto                                          (load from disk)
+#   --remote-instance-weight-loader-start-seed-via-transfer-engine
+#       (the ONLY way use_transfer_engine() is True for a non-remote_instance
+#        process, so the TransferEngine + session id get initialized)
+#   --modelexpress-config '{..., "source": true, "transport": "transfer_engine"}'
+#       ("source": true -> publish; "transport" -> publish the TE session id,
+#        not nixl metadata)
+# and the client needs:
+#   --load-format remote_instance
+#   --remote-instance-weight-loader-backend modelexpress
+#   --modelexpress-config '{..., "transport": "transfer_engine"}'
+#       (backend=modelexpress + transport=transfer_engine -> use_transfer_engine()
+#        True -> TE init -> _transfer_via_transfer_engine pulls from the seed)
+#
+# The manifest branches on ${JOB_NAME} (envsubst substitutes it at apply time,
+# so the bash `if` resolves to the right branch per apply). mx-server is the
+# coordination point: seed publishes transfer_engine_session_id, client
+# discovers it via ListSources/GetMetadata and pulls with batch_transfer_sync_read.
 #
 # Applied twice by the workflow with different envsubst values:
 #   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
@@ -94,22 +109,28 @@ spec:
           # Force re-pull on every pod creation so CI/dev iterations on the same
           # tag pick up freshly pushed images instead of the node's cached copy.
           imagePullPolicy: Always
-          command: ["python3", "-m", "sglang.launch_server"]
+          command: ["/bin/bash", "-c"]
           args:
-            - --model-path
-            - "${MX_CI_MODEL}"
-            - --host
-            - "0.0.0.0"
-            - --port
-            - "${WORKER_PORT}"
-            - --tp
-            - "1"
-            - --load-format
-            - remote_instance
-            - --remote-instance-weight-loader-backend
-            - modelexpress
-            - --modelexpress-config
-            - '{"url": "mx-server:8000", "transport": "transfer_engine"}'
+            - |
+              if [ "${JOB_NAME}" = "mx-source" ]; then
+                exec python3 -m sglang.launch_server \
+                  --model-path "${MX_CI_MODEL}" \
+                  --host 0.0.0.0 \
+                  --port "${WORKER_PORT}" \
+                  --tp 1 \
+                  --load-format auto \
+                  --remote-instance-weight-loader-start-seed-via-transfer-engine \
+                  --modelexpress-config '{"url": "mx-server:8000", "source": true, "transport": "transfer_engine"}'
+              else
+                exec python3 -m sglang.launch_server \
+                  --model-path "${MX_CI_MODEL}" \
+                  --host 0.0.0.0 \
+                  --port "${WORKER_PORT}" \
+                  --tp 1 \
+                  --load-format remote_instance \
+                  --remote-instance-weight-loader-backend modelexpress \
+                  --modelexpress-config '{"url": "mx-server:8000", "transport": "transfer_engine"}'
+              fi
           env:
             - name: MODEL_EXPRESS_URL
               value: "mx-server:8000"
