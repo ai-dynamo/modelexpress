@@ -594,7 +594,7 @@ func (x *TensorSourceMetadata) GetTensors() []*TensorDescriptor {
 
 // Sealed file-backed artifact manifest. The artifact_id in
 // ArtifactSourceMetadata and WorkerService artifact manifest responses is
-// CRC32C over the ModelExpress canonical artifact manifest JSON, encoded as
+// SHA-256 over the ModelExpress canonical artifact manifest JSON, encoded as
 // lowercase hex without an algorithm prefix. Because manifest file paths are
 // canonical absolute install paths, the artifact_id is install-path-specific,
 // not only file-content-specific.
@@ -1229,14 +1229,13 @@ type GetArtifactManifestHeaderResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Echoed mx_source_id for confirmation.
 	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
-	// SHA256 digest of the canonical sealed artifact manifest.
-	ArtifactId        string       `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
-	ManifestVersion   uint32       `protobuf:"varint,3,opt,name=manifest_version,json=manifestVersion,proto3" json:"manifest_version,omitempty"`
-	MxSourceType      MxSourceType `protobuf:"varint,4,opt,name=mx_source_type,json=mxSourceType,proto3,enum=model_express.p2p.MxSourceType" json:"mx_source_type,omitempty"`
-	TotalSize         uint64       `protobuf:"varint,5,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
-	FileCount         uint32       `protobuf:"varint,6,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
-	ChunkCount        uint32       `protobuf:"varint,7,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
-	ChecksumAlgorithm string       `protobuf:"bytes,8,opt,name=checksum_algorithm,json=checksumAlgorithm,proto3" json:"checksum_algorithm,omitempty"`
+	// SHA-256 digest of the canonical sealed artifact manifest.
+	ArtifactId      string       `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	ManifestVersion uint32       `protobuf:"varint,3,opt,name=manifest_version,json=manifestVersion,proto3" json:"manifest_version,omitempty"`
+	MxSourceType    MxSourceType `protobuf:"varint,4,opt,name=mx_source_type,json=mxSourceType,proto3,enum=model_express.p2p.MxSourceType" json:"mx_source_type,omitempty"`
+	TotalSize       uint64       `protobuf:"varint,5,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
+	FileCount       uint32       `protobuf:"varint,6,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
+	ChunkCount      uint32       `protobuf:"varint,7,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
 	// Self-describing worker info, matching GetTensorManifestResponse.
 	MetadataEndpoint string `protobuf:"bytes,9,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
 	AgentName        string `protobuf:"bytes,10,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
@@ -1324,13 +1323,6 @@ func (x *GetArtifactManifestHeaderResponse) GetChunkCount() uint32 {
 		return x.ChunkCount
 	}
 	return 0
-}
-
-func (x *GetArtifactManifestHeaderResponse) GetChecksumAlgorithm() string {
-	if x != nil {
-		return x.ChecksumAlgorithm
-	}
-	return ""
 }
 
 func (x *GetArtifactManifestHeaderResponse) GetMetadataEndpoint() string {
@@ -1437,7 +1429,7 @@ type GetArtifactManifestChunksResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Echoed mx_source_id for confirmation.
 	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
-	// SHA256 digest of the canonical sealed artifact manifest.
+	// SHA-256 digest of the canonical sealed artifact manifest.
 	ArtifactId string `protobuf:"bytes,2,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
 	// First global chunk index in this page.
 	StartChunkIndex uint32                   `protobuf:"varint,3,opt,name=start_chunk_index,json=startChunkIndex,proto3" json:"start_chunk_index,omitempty"`
@@ -2175,7 +2167,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
-	"artifactId\"\x92\x04\n" +
+	"artifactId\"\xe3\x03\n" +
 	"!GetArtifactManifestHeaderResponse\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2188,8 +2180,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"file_count\x18\x06 \x01(\rR\tfileCount\x12\x1f\n" +
 	"\vchunk_count\x18\a \x01(\rR\n" +
-	"chunkCount\x12-\n" +
-	"\x12checksum_algorithm\x18\b \x01(\tR\x11checksumAlgorithm\x12+\n" +
+	"chunkCount\x12+\n" +
 	"\x11metadata_endpoint\x18\t \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\n" +

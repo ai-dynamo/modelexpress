@@ -77,7 +77,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
             dtype: "bfloat16".to_string(),
         }],
         source_payload: Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata {
-            artifact_id: "sha256:artifact-manifest".to_string(),
+            artifact_id: "artifact-manifest".to_string(),
             total_size: 1_099_511_627_776,
             file_count: 42,
             chunk_count: 4096,
@@ -95,7 +95,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
         .artifact_source
         .as_ref()
         .expect("artifact payload should be preserved");
-    assert_eq!(artifact.artifact_id, "sha256:artifact-manifest");
+    assert_eq!(artifact.artifact_id, "artifact-manifest");
     assert_eq!(artifact.total_size, 1_099_511_627_776);
     assert_eq!(artifact.file_count, 42);
     assert_eq!(artifact.chunk_count, 4096);
@@ -105,7 +105,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
     assert!(matches!(
         back.source_payload,
         Some(SourcePayload::ArtifactSource(ref artifact))
-            if artifact.artifact_id == "sha256:artifact-manifest"
+            if artifact.artifact_id == "artifact-manifest"
                 && artifact.total_size == 1_099_511_627_776
                 && artifact.file_count == 42
                 && artifact.chunk_count == 4096
@@ -187,7 +187,7 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
         tensor_count: 0,
         tensor_config_map: None,
         artifact_source: Some(ArtifactSourceStatus {
-            artifact_id: "sha256:artifact-manifest".to_string(),
+            artifact_id: "artifact-manifest".to_string(),
             total_size: 1_099_511_627_776,
             file_count: 42,
             chunk_count: 4096,
@@ -198,10 +198,7 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
 
     assert_eq!(json["tensorCount"], 0);
     assert!(json["tensorConfigMap"].is_null());
-    assert_eq!(
-        json["artifactSource"]["artifactId"],
-        "sha256:artifact-manifest"
-    );
+    assert_eq!(json["artifactSource"]["artifactId"], "artifact-manifest");
     assert_eq!(json["artifactSource"]["totalSize"], 1_099_511_627_776_u64);
     assert_eq!(json["artifactSource"]["fileCount"], 42);
     assert_eq!(json["artifactSource"]["chunkCount"], 4096);

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Iterable
@@ -62,7 +63,7 @@ def artifact_manifest_id(manifest: p2p_pb2.ArtifactManifest) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
-    return _crc32c_hex(canonical)
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def artifact_source_metadata(

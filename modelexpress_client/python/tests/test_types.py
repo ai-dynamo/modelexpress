@@ -127,7 +127,7 @@ class TestWorkerMetadata:
         worker = p2p_pb2.WorkerMetadata(
             tensors=[legacy],
             artifact_source=p2p_pb2.ArtifactSourceMetadata(
-                artifact_id="sha256:artifact",
+                artifact_id="artifact",
                 total_size=128,
                 file_count=1,
                 chunk_count=1,

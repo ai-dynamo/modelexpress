@@ -11,6 +11,7 @@ use crate::grpc::p2p::{
 use anyhow::{Context, Result, anyhow, bail};
 use crc32c::{crc32c, crc32c_append};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, Read},
@@ -115,8 +116,9 @@ impl ArtifactManifest {
     pub fn seal(&self) -> Result<SealedArtifactManifest> {
         let canonical =
             serde_json::to_vec(self).context("failed to serialize artifact manifest")?;
+        let digest = Sha256::digest(&canonical);
         Ok(SealedArtifactManifest {
-            artifact_id: format!("{:08x}", crc32c(&canonical)),
+            artifact_id: format!("{digest:x}"),
             manifest: self.clone(),
         })
     }
@@ -179,7 +181,6 @@ impl SealedArtifactManifest {
             file_count: u32::try_from(self.manifest.files.len())
                 .context("artifact manifest file count exceeds u32")?,
             chunk_count: self.manifest.chunk_count()?,
-            checksum_algorithm: "crc32c".to_string(),
             metadata_endpoint: metadata_endpoint.into(),
             agent_name: agent_name.into(),
             worker_rank,
@@ -540,7 +541,7 @@ mod tests {
         .expect("right seal");
 
         assert_eq!(left.artifact_id, right.artifact_id);
-        assert_eq!(left.artifact_id.len(), 8);
+        assert_eq!(left.artifact_id.len(), 64);
 
         let metadata = left.source_metadata().expect("source metadata");
         assert_eq!(metadata.artifact_id, left.artifact_id);
@@ -651,7 +652,7 @@ mod tests {
 
         assert_eq!(
             manifest.seal().expect("seal manifest").artifact_id,
-            "c0789d08"
+            "a0f08392f2abc45f78bd59f0fe2c601750c2b270dc5cc37c2166d86a65398466"
         );
     }
 

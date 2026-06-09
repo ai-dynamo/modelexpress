@@ -149,7 +149,6 @@ def test_worker_service_serves_artifact_manifest(tmp_path):
     assert header.artifact_id == artifact_id
     assert header.manifest_version == manifest.manifest_version
     assert header.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
-    assert header.checksum_algorithm == "crc32c"
     assert list(header.files) == list(manifest.files)
     assert len(chunks.chunks) == 2
     assert chunks.next_page_token == "2"
@@ -371,7 +370,7 @@ def test_pinned_artifact_manifest_id_cross_checked_with_rust():
 
     assert (
         artifact_manifest_id(manifest)
-        == "c0789d08"
+        == "a0f08392f2abc45f78bd59f0fe2c601750c2b270dc5cc37c2166d86a65398466"
     )
 
 

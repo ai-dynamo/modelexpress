@@ -162,7 +162,7 @@ message TensorSourceMetadata {
 
 // Sealed file-backed artifact manifest. The artifact_id in
 // ArtifactSourceMetadata and WorkerService artifact manifest responses is
-// CRC32C over the ModelExpress canonical artifact manifest JSON, encoded as
+// SHA-256 over the ModelExpress canonical artifact manifest JSON, encoded as
 // lowercase hex without an algorithm prefix. Because manifest file paths are
 // canonical absolute install paths, the artifact_id is install-path-specific,
 // not only file-content-specific.
@@ -330,7 +330,7 @@ message GetArtifactManifestHeaderResponse {
   // Echoed mx_source_id for confirmation.
   string mx_source_id = 1;
 
-  // SHA256 digest of the canonical sealed artifact manifest.
+  // SHA-256 digest of the canonical sealed artifact manifest.
   string artifact_id = 2;
 
   uint32 manifest_version = 3;
@@ -338,7 +338,6 @@ message GetArtifactManifestHeaderResponse {
   uint64 total_size = 5;
   uint32 file_count = 6;
   uint32 chunk_count = 7;
-  string checksum_algorithm = 8;
 
   // Self-describing worker info, matching GetTensorManifestResponse.
   string metadata_endpoint = 9;
@@ -367,7 +366,7 @@ message GetArtifactManifestChunksResponse {
   // Echoed mx_source_id for confirmation.
   string mx_source_id = 1;
 
-  // SHA256 digest of the canonical sealed artifact manifest.
+  // SHA-256 digest of the canonical sealed artifact manifest.
   string artifact_id = 2;
 
   // First global chunk index in this page.
