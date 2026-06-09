@@ -1,0 +1,165 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Azure A100 single-job template for SGLang P2P weight-transfer CI tests over
+# the Mooncake TransferEngine transport (transport=transfer_engine).
+#
+# Mirror of ci/k8s/client/sgl/manifest-azure.yaml (the NIXL variant). Same
+# image build path (here: ci/k8s/client/sgl/Dockerfile.mooncake), same node
+# pool, RDMA resource, affinity, and IPC_LOCK. The ONLY differences are the
+# launch args and the transport:
+#
+#   - NIXL variant runs the SAME command on source and target and selects the
+#     transport via `--modelexpress-config '{... "transport": "nixl"}'`.
+#   - TransferEngine seed and client run DIFFERENT commands, so this manifest
+#     branches on ${JOB_NAME} (envsubst substitutes it at apply time, so the
+#     bash `if` resolves to the right branch per apply):
+#       seed   : --load-format auto
+#                --remote-instance-weight-loader-start-seed-via-transfer-engine
+#                --modelexpress-config '{"url": "mx-server:8000", "source": true}'
+#       client : --load-format remote_instance
+#                --remote-instance-weight-loader-backend modelexpress
+#                --modelexpress-config '{"url": "mx-server:8000"}'
+#     The transport is NOT passed in modelexpress-config here; the patched
+#     SGLang sets load_config.modelexpress_transport == "transfer_engine" off
+#     the seed flag / transfer-engine backend.
+#
+# mx-server is still the coordination point: the seed publishes a
+# WorkerMetadata carrying transfer_engine_session_id, the client discovers it
+# via ListSources/GetMetadata and pulls with batch_transfer_sync_read.
+#
+# Applied twice by the workflow with different envsubst values:
+#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
+#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
+#
+# Environment variables substituted by envsubst before each apply:
+#   JOB_NAME      - mx-source or mx-target
+#   WORKER_IMAGE  - image built from ci/k8s/client/sgl/Dockerfile.mooncake
+#   WORKER_PORT   - port the SGLang server listens on
+#   MX_CI_MODEL   - HuggingFace model id
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      # Pin to a specific GPU node pool rather than leaving the agentpool
+      # open. Other pools in the cluster may have too few active nodes for
+      # source + target anti-affinity to find a peer host, leaving target
+      # Pending forever. The agentpool podAffinity below becomes redundant
+      # (both pods already constrained here) but is kept for self-
+      # documentation + as defense if this nodeSelector is removed.
+      nodeSelector:
+        agentpool: a100a
+      affinity:
+        # Source and target on different hosts so we exercise true cross-host
+        # RDMA over IB, not intra-node loopback through the same NIC.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # Pin source + target to the SAME node pool. The test cluster splits
+        # GPU nodes across multiple InfiniBand partitions (different pools
+        # have different pkeys), and pods on different pkeys can't talk
+        # RDMA to each other. Combined with the hostname anti-affinity above,
+        # this forces source/target onto different hosts WITHIN the same
+        # IB partition.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              ulimit -l unlimited
+              if [ "${JOB_NAME}" = "mx-source" ]; then
+                exec python3 -m sglang.launch_server \
+                  --model-path "${MX_CI_MODEL}" \
+                  --host 0.0.0.0 \
+                  --port "${WORKER_PORT}" \
+                  --tp 1 \
+                  --load-format auto \
+                  --remote-instance-weight-loader-start-seed-via-transfer-engine \
+                  --modelexpress-config '{"url": "mx-server:8000", "source": true}'
+              else
+                exec python3 -m sglang.launch_server \
+                  --model-path "${MX_CI_MODEL}" \
+                  --host 0.0.0.0 \
+                  --port "${WORKER_PORT}" \
+                  --tp 1 \
+                  --load-format remote_instance \
+                  --remote-instance-weight-loader-backend modelexpress \
+                  --modelexpress-config '{"url": "mx-server:8000"}'
+              fi
+          env:
+            - name: MODEL_EXPRESS_URL
+              value: "mx-server:8000"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            # MOONCAKE_DEVICE is intentionally NOT pinned here. The example
+            # manifest (examples/.../sglang-test-transfer-engine.yaml) hardcodes
+            # mlx5_0..mlx5_11, but those are the NIC names on an 8-GPU H100
+            # node; the a100a single-GPU node pool exposes a different/smaller
+            # set. Following the NIXL variant's MX_RDMA_NIC_PIN=auto philosophy,
+            # we let Mooncake auto-discover. If the first CI run fails on device
+            # discovery, pin MOONCAKE_DEVICE to the a100a node's actual IB NIC.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

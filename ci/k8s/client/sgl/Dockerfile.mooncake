@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# AMD64 SGLang image for CI P2P tests over the Mooncake TransferEngine
+# transport (transport=transfer_engine).
+#
+# Mirrors ci/k8s/client/sgl/Dockerfile (the NIXL variant): same upstream
+# SGLang base, same ModelExpress client overlay. The only thing this variant
+# must additionally guarantee is that the SGLang in the base image exposes the
+# transfer_engine delegation hook (the `--remote-instance-weight-loader-
+# start-seed-via-transfer-engine` flag and the transfer_engine code path that
+# sets load_config.modelexpress_transport == "transfer_engine"). The NIXL CI
+# image does not need that hook.
+#
+# Build (from repo root):
+#   docker buildx build --platform linux/amd64 \
+#       -f ci/k8s/client/sgl/Dockerfile.mooncake \
+#       -t <IMAGE> --push --load .
+#
+# TODO(mooncake): the pinned base below is the NIXL variant's base and is NOT
+# yet confirmed to carry SGLang's transfer_engine hook. Before this image can
+# actually exercise the Mooncake path, repin SGLANG_IMAGE to a base that
+# includes that hook (the example overlay pattern lives in
+# examples/p2p_transfer_k8s/client/sglang/Dockerfile.pr23105). The import
+# check below is the canary: it fails the build if the hook is absent, so a
+# green build here means the base is good.
+# TODO: Switch to an SGLang release image once the transfer_engine loader path is released.
+ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:6553f8288e848fd833a4d473eca7aa2c8f141f98c52f63a5f4684631de50f9f2
+FROM ${SGLANG_IMAGE}
+
+# Install ModelExpress Python client.
+# Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;
+# regenerate with grpcio-tools when p2p.proto changes.
+#
+# Pip's default upgrade strategy (only-if-needed) keeps the base image's
+# pre-installed nixl untouched as long as the constraint in modelexpress's
+# pyproject.toml (`nixl[cu12]; sys_platform == 'linux'`) is unbounded.
+# If lmsysorg/sglang ships a nixl that's incompatible with this image's UCX,
+# see docs/NIXL_UCX_COMPATIBILITY.md for the resolution pattern.
+COPY modelexpress_client/python /opt/modelexpress/client
+WORKDIR /opt/modelexpress/client
+RUN pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
+    pip install .
+
+# Verify the client and the SGLang loader hook imported successfully.
+RUN python3 -c "from modelexpress.client import MxClient; print('MxClient OK')" && \
+    python3 -c "from modelexpress.engines.sglang import MxModelLoader; print('SGLang MxModelLoader OK')"
+
+# Canary: fail the build if the base SGLang lacks the transfer_engine hook,
+# so a green build guarantees this image can take the Mooncake path. Mirrors
+# the PR-detection check in the example Dockerfile.pr23105.
+RUN python3 -c "import importlib.metadata as m, pathlib; \
+        sg = pathlib.Path(m.distribution('sglang').locate_file('sglang/srt/server_args.py')); \
+        src = sg.read_text(); \
+        assert 'transfer_engine' in src or 'start_seed_via_transfer_engine' in src, \
+        'SGLang base lacks transfer_engine hook; repin SGLANG_IMAGE (see header TODO)'; \
+        print('OK: sglang', m.version('sglang'), 'has transfer_engine hook')"
+
+WORKDIR /workspace

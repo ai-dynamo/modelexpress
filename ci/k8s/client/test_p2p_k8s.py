@@ -60,6 +60,8 @@ import json
 import re
 import urllib.request
 
+import pytest
+
 from kube_utils import kubectl, port_forward
 
 
@@ -122,8 +124,13 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     )
 
 
-def test_per_rank_source_agents(namespace: str, tp_size: int) -> None:
+def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) -> None:
     """Target must connect to one distinct source NIXL agent per target rank.
+
+    NIXL-only: the assertion scans for `add_remote_agent` log lines that the
+    shared NixlTransferManager emits. The Mooncake TransferEngine path
+    (transport=transfer_engine) transfers via batch_transfer_sync_read and
+    never registers NIXL agents, so there is nothing to count — skip it there.
 
     Each source rank publishes exactly one NIXL agent. The shared
     NixlTransferManager.receive_from_source (in modelexpress.nixl_transfer)
@@ -142,6 +149,10 @@ def test_per_rank_source_agents(namespace: str, tp_size: int) -> None:
     same shape per rank, so the load succeeds with wrong values and produces
     plausible-but-garbage text — which the current non-empty assertion passes.
     """
+    if transport != "nixl":
+        pytest.skip(
+            f"per-rank NIXL agent assertion does not apply to transport={transport!r}"
+        )
     pod = _pod_name(namespace, "mx-target")
     result = kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
     matches = re.findall(

@@ -186,6 +186,8 @@ jobs:
             dockerfile: ci/k8s/client/trt-llm/Dockerfile
           - framework: sglang
             dockerfile: ci/k8s/client/sgl/Dockerfile
+          - framework: sglang-mooncake
+            dockerfile: ci/k8s/client/sgl/Dockerfile.mooncake
           - framework: dynamo-vllm
             dockerfile: ci/k8s/client/vllm/dynamo/Dockerfile
 
@@ -344,6 +346,20 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8005"
             worker_port: "8006"
+          # Same SGLang P2P test as above, but over the Mooncake TransferEngine
+          # transport instead of NIXL. Seed/client run different launch args
+          # (manifest branches on JOB_NAME); the per-rank NIXL agent assertion
+          # is skipped via --transport, and the transfer marker comes from the
+          # loader's "Receiving N tensors via TransferEngine" log line.
+          - framework: sglang-mooncake
+            namespace: mx-ci-sglang-mooncake-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure-mooncake.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--p2p-marker 'tensors via TransferEngine' --transport transfer_engine"
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8007"
+            worker_port: "8008"
 
     steps:
       - name: Checkout
