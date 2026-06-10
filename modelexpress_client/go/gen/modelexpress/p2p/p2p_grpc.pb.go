@@ -260,20 +260,23 @@ var P2PService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	WorkerService_GetTensorManifest_FullMethodName = "/model_express.p2p.WorkerService/GetTensorManifest"
+	WorkerService_GetTensorManifest_FullMethodName         = "/model_express.p2p.WorkerService/GetTensorManifest"
+	WorkerService_GetArtifactManifestHeader_FullMethodName = "/model_express.p2p.WorkerService/GetArtifactManifestHeader"
+	WorkerService_GetArtifactManifestChunks_FullMethodName = "/model_express.p2p.WorkerService/GetArtifactManifestChunks"
 )
 
 // WorkerServiceClient is the client API for WorkerService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Per-worker gRPC service for direct tensor manifest retrieval. Artifact
-// manifest retrieval is not part of this service yet.
-// Sources start this service when MX_P2P_METADATA=1. Targets call
-// GetTensorManifest to fetch tensor descriptors directly from the
-// source worker instead of from the central metadata server.
+// Per-worker gRPC service for direct manifest retrieval. Sources start this
+// service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
+// descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
+// file-backed artifact manifests.
 type WorkerServiceClient interface {
 	GetTensorManifest(ctx context.Context, in *GetTensorManifestRequest, opts ...grpc.CallOption) (*GetTensorManifestResponse, error)
+	GetArtifactManifestHeader(ctx context.Context, in *GetArtifactManifestHeaderRequest, opts ...grpc.CallOption) (*GetArtifactManifestHeaderResponse, error)
+	GetArtifactManifestChunks(ctx context.Context, in *GetArtifactManifestChunksRequest, opts ...grpc.CallOption) (*GetArtifactManifestChunksResponse, error)
 }
 
 type workerServiceClient struct {
@@ -294,17 +297,38 @@ func (c *workerServiceClient) GetTensorManifest(ctx context.Context, in *GetTens
 	return out, nil
 }
 
+func (c *workerServiceClient) GetArtifactManifestHeader(ctx context.Context, in *GetArtifactManifestHeaderRequest, opts ...grpc.CallOption) (*GetArtifactManifestHeaderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetArtifactManifestHeaderResponse)
+	err := c.cc.Invoke(ctx, WorkerService_GetArtifactManifestHeader_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) GetArtifactManifestChunks(ctx context.Context, in *GetArtifactManifestChunksRequest, opts ...grpc.CallOption) (*GetArtifactManifestChunksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetArtifactManifestChunksResponse)
+	err := c.cc.Invoke(ctx, WorkerService_GetArtifactManifestChunks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // WorkerServiceServer is the server API for WorkerService service.
 // All implementations must embed UnimplementedWorkerServiceServer
 // for forward compatibility.
 //
-// Per-worker gRPC service for direct tensor manifest retrieval. Artifact
-// manifest retrieval is not part of this service yet.
-// Sources start this service when MX_P2P_METADATA=1. Targets call
-// GetTensorManifest to fetch tensor descriptors directly from the
-// source worker instead of from the central metadata server.
+// Per-worker gRPC service for direct manifest retrieval. Sources start this
+// service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
+// descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
+// file-backed artifact manifests.
 type WorkerServiceServer interface {
 	GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error)
+	GetArtifactManifestHeader(context.Context, *GetArtifactManifestHeaderRequest) (*GetArtifactManifestHeaderResponse, error)
+	GetArtifactManifestChunks(context.Context, *GetArtifactManifestChunksRequest) (*GetArtifactManifestChunksResponse, error)
 	mustEmbedUnimplementedWorkerServiceServer()
 }
 
@@ -317,6 +341,12 @@ type UnimplementedWorkerServiceServer struct{}
 
 func (UnimplementedWorkerServiceServer) GetTensorManifest(context.Context, *GetTensorManifestRequest) (*GetTensorManifestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTensorManifest not implemented")
+}
+func (UnimplementedWorkerServiceServer) GetArtifactManifestHeader(context.Context, *GetArtifactManifestHeaderRequest) (*GetArtifactManifestHeaderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetArtifactManifestHeader not implemented")
+}
+func (UnimplementedWorkerServiceServer) GetArtifactManifestChunks(context.Context, *GetArtifactManifestChunksRequest) (*GetArtifactManifestChunksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetArtifactManifestChunks not implemented")
 }
 func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
 func (UnimplementedWorkerServiceServer) testEmbeddedByValue()                       {}
@@ -357,6 +387,42 @@ func _WorkerService_GetTensorManifest_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerService_GetArtifactManifestHeader_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetArtifactManifestHeaderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).GetArtifactManifestHeader(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_GetArtifactManifestHeader_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).GetArtifactManifestHeader(ctx, req.(*GetArtifactManifestHeaderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_GetArtifactManifestChunks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetArtifactManifestChunksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).GetArtifactManifestChunks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_GetArtifactManifestChunks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).GetArtifactManifestChunks(ctx, req.(*GetArtifactManifestChunksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -367,6 +433,14 @@ var WorkerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetTensorManifest",
 			Handler:    _WorkerService_GetTensorManifest_Handler,
+		},
+		{
+			MethodName: "GetArtifactManifestHeader",
+			Handler:    _WorkerService_GetArtifactManifestHeader_Handler,
+		},
+		{
+			MethodName: "GetArtifactManifestChunks",
+			Handler:    _WorkerService_GetArtifactManifestChunks_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

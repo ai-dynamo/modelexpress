@@ -206,6 +206,7 @@ mod tests {
             quantization: String::new(),
             extra_parameters: Default::default(),
             revision: String::new(),
+            ..Default::default()
         }
     }
 
@@ -213,7 +214,6 @@ mod tests {
         WorkerMetadata {
             worker_rank: rank,
             backend_metadata: None,
-            tensors: vec![],
             status: status as i32,
             updated_at: 0,
             ..Default::default()
