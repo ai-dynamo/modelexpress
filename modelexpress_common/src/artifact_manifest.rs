@@ -284,10 +284,7 @@ fn collect_regular_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> R
             .file_type()
             .with_context(|| format!("failed to inspect artifact path {}", path.display()))?;
         if file_type.is_symlink() {
-            bail!(
-                "artifact manifest does not support symlink {}",
-                path.display()
-            );
+            continue;
         }
         if file_type.is_dir() {
             collect_regular_files(root, &path, files)?;
@@ -668,7 +665,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn manifest_rejects_symlinks() {
+    fn manifest_skips_symlinks() {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TempDir::new().expect("create temp dir");
@@ -676,14 +673,15 @@ mod tests {
         fs::write(&target, b"target").expect("write target");
         symlink(&target, temp_dir.path().join("link")).expect("create symlink");
 
-        assert!(
-            ArtifactManifest::from_directory(
-                temp_dir.path(),
-                4,
-                MxSourceType::TorchCompileCache as i32,
-            )
-            .is_err()
-        );
+        let manifest = ArtifactManifest::from_directory(
+            temp_dir.path(),
+            4,
+            MxSourceType::TorchCompileCache as i32,
+        )
+        .expect("build manifest");
+
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files[0].path.ends_with("/target"));
     }
 
     fn chunk(
