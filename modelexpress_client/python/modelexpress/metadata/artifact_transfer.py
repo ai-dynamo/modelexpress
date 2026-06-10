@@ -42,6 +42,9 @@ from .worker_server import (
 logger = logging.getLogger("modelexpress.metadata.artifact_transfer")
 
 _DEFAULT_MAX_INFLIGHT_CHUNKS = 4
+# Source-side leases are released and their buffers may be reused after this TTL.
+# Keep it longer than the target transfer timeout so normal transfers complete
+# and explicitly release leases before the source expires them.
 _DEFAULT_LEASE_TTL_SECONDS = 300.0
 _RESOURCE_EXHAUSTED_PREPARE_ATTEMPTS = 3
 _RESOURCE_EXHAUSTED_PREPARE_DELAY_SECONDS = 0.05
