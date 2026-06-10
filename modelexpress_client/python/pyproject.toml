@@ -25,6 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "grpcio>=1.66.2",
+    "google-crc32c>=1.5.0",
     "huggingface_hub>=0.20.0",
     "nixl[cu12]; sys_platform == 'linux'",
     "numpy>=1.24.0",

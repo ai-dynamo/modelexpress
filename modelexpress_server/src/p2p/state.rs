@@ -188,7 +188,6 @@ impl P2pStateManager {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
@@ -240,6 +239,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_worker_record_conversion() {
         use modelexpress_common::grpc::p2p::TensorSourceMetadata;
         use modelexpress_common::grpc::p2p::worker_metadata::{BackendMetadata, SourcePayload};
@@ -294,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_worker_record_conversion_falls_back_to_legacy_tensors() {
         let meta = WorkerMetadata {
             worker_rank: 3,
@@ -347,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_worker_record_transfer_engine_roundtrip() {
         use modelexpress_common::grpc::p2p::worker_metadata::BackendMetadata;
 
@@ -486,7 +488,6 @@ mod tests {
                 WorkerMetadata {
                     worker_rank: 3,
                     backend_metadata: None,
-                    tensors: vec![],
                     status: SourceStatus::Initializing as i32,
                     updated_at: 0,
                     ..Default::default()

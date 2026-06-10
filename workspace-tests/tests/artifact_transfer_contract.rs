@@ -2,15 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![allow(clippy::expect_used)]
-#![allow(deprecated)]
 
-use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
-use modelexpress_common::grpc::p2p::{
-    ArtifactSourceMetadata, BackendFramework, MxSourceType, SourceIdentity, TensorDescriptor,
-    WorkerMetadata,
+use modelexpress_common::{
+    artifact_manifest::ArtifactManifest,
+    grpc::p2p::worker_metadata::SourcePayload,
+    grpc::p2p::{
+        ArtifactSourceMetadata, BackendFramework, MxSourceType, SourceIdentity, TensorDescriptor,
+        WorkerMetadata,
+    },
 };
 use modelexpress_server::p2p::backend::WorkerRecord;
 use modelexpress_server::p2p::k8s_types::{ArtifactSourceStatus, ModelMetadataSpec, WorkerStatus};
+use std::fs;
 
 fn base_identity() -> SourceIdentity {
     SourceIdentity {
@@ -62,6 +65,7 @@ fn artifact_source_identity_is_separate_from_weights() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn artifact_payload_does_not_publish_weight_tensors() {
     let worker = WorkerMetadata {
         worker_rank: 0,
@@ -73,7 +77,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
             dtype: "bfloat16".to_string(),
         }],
         source_payload: Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata {
-            artifact_id: "sha256:artifact-manifest".to_string(),
+            artifact_id: "artifact-manifest".to_string(),
             total_size: 1_099_511_627_776,
             file_count: 42,
             chunk_count: 4096,
@@ -91,7 +95,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
         .artifact_source
         .as_ref()
         .expect("artifact payload should be preserved");
-    assert_eq!(artifact.artifact_id, "sha256:artifact-manifest");
+    assert_eq!(artifact.artifact_id, "artifact-manifest");
     assert_eq!(artifact.total_size, 1_099_511_627_776);
     assert_eq!(artifact.file_count, 42);
     assert_eq!(artifact.chunk_count, 4096);
@@ -101,7 +105,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
     assert!(matches!(
         back.source_payload,
         Some(SourcePayload::ArtifactSource(ref artifact))
-            if artifact.artifact_id == "sha256:artifact-manifest"
+            if artifact.artifact_id == "artifact-manifest"
                 && artifact.total_size == 1_099_511_627_776
                 && artifact.file_count == 42
                 && artifact.chunk_count == 4096
@@ -109,6 +113,34 @@ fn artifact_payload_does_not_publish_weight_tensors() {
 }
 
 #[test]
+fn sealed_artifact_manifest_derives_discovery_summary() {
+    let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+    fs::create_dir(temp_dir.path().join("torchinductor")).expect("create artifact dir");
+    fs::write(
+        temp_dir.path().join("torchinductor/fxgraph"),
+        b"compiled-graph",
+    )
+    .expect("write compiled graph");
+    fs::write(temp_dir.path().join("triton.cubin"), b"cubin").expect("write cubin");
+
+    let sealed = ArtifactManifest::from_directory(
+        temp_dir.path(),
+        8,
+        MxSourceType::TorchCompileCache as i32,
+    )
+    .expect("build artifact manifest")
+    .seal()
+    .expect("seal artifact manifest");
+    let metadata = sealed.source_metadata().expect("derive source metadata");
+
+    assert_eq!(metadata.artifact_id, sealed.artifact_id);
+    assert_eq!(metadata.total_size, 19);
+    assert_eq!(metadata.file_count, 2);
+    assert_eq!(metadata.chunk_count, 3);
+}
+
+#[test]
+#[allow(deprecated)]
 fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
     let worker = WorkerMetadata {
         worker_rank: 0,
@@ -145,13 +177,17 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
         ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TorchCompileCache as i32),
         "torch_compile_cache"
     );
+    assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::DeepGemmCache as i32),
+        "deep_gemm_cache"
+    );
 
     let worker = WorkerStatus {
         worker_rank: 0,
         tensor_count: 0,
         tensor_config_map: None,
         artifact_source: Some(ArtifactSourceStatus {
-            artifact_id: "sha256:artifact-manifest".to_string(),
+            artifact_id: "artifact-manifest".to_string(),
             total_size: 1_099_511_627_776,
             file_count: 42,
             chunk_count: 4096,
@@ -162,10 +198,7 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
 
     assert_eq!(json["tensorCount"], 0);
     assert!(json["tensorConfigMap"].is_null());
-    assert_eq!(
-        json["artifactSource"]["artifactId"],
-        "sha256:artifact-manifest"
-    );
+    assert_eq!(json["artifactSource"]["artifactId"], "artifact-manifest");
     assert_eq!(json["artifactSource"]["totalSize"], 1_099_511_627_776_u64);
     assert_eq!(json["artifactSource"]["fileCount"], 42);
     assert_eq!(json["artifactSource"]["chunkCount"], 4096);

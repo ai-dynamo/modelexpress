@@ -80,6 +80,20 @@ def test_artifact_compatibility_fields_affect_id():
     assert compute_mx_source_id(artifact) != compute_mx_source_id(different_torch)
 
 
+def test_deep_gemm_cache_is_separate_artifact_source_type():
+    torch_compile = _base_identity()
+    torch_compile.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    torch_compile.gpu_arch = "SM90"
+    torch_compile.compile_config_digest = "kernel-cache-a"
+
+    deep_gemm = _base_identity()
+    deep_gemm.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE
+    deep_gemm.gpu_arch = "SM90"
+    deep_gemm.compile_config_digest = "kernel-cache-a"
+
+    assert compute_mx_source_id(torch_compile) != compute_mx_source_id(deep_gemm)
+
+
 def test_artifact_compatibility_fields_are_case_insensitive():
     upper = _base_identity()
     upper.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
