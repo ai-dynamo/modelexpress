@@ -22,6 +22,9 @@ repos:
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=1000"]
+        # Generated attribution files carry full upstream license texts and are
+        # intentionally large; they are reviewed compliance deliverables.
+        exclude: '^(NOTICES|ATTRIBUTIONS_Rust\.md)$'
       - id: check-case-conflict
       - id: mixed-line-ending
 

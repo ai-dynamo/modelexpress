@@ -56,3 +56,22 @@ RUN set -eux; \
 
 FROM scratch AS export
 COPY --from=builder /dist/ /
+
+# Resolve and license-inventory the wheel's runtime dependency tree for this
+# platform. Installing the pure-Python wheel pulls every runtime dependency
+# (torch and its nvidia-* CUDA wheels differ by arch), so the output is
+# platform specific. Heavy (multi-GB download); build only when needed:
+#   docker buildx build -f docker/Dockerfile.client-wheel --target pypi-export \
+#     --platform linux/amd64 --output type=local,dest=./compliance .
+FROM builder AS pypi-deps
+
+RUN /opt/python/cp312-cp312/bin/python -m venv /tmp/rt && \
+    /tmp/rt/bin/pip install --no-cache-dir /dist/modelexpress-*-py3-none-any.whl
+COPY scripts/generate_pypi_attributions.py /tmp/generate_pypi_attributions.py
+RUN mkdir -p /compliance && \
+    /tmp/rt/bin/python /tmp/generate_pypi_attributions.py \
+        --md-output /compliance/NOTICES_Python.md \
+        --csv-output /compliance/pypi_deps.csv
+
+FROM scratch AS pypi-export
+COPY --from=pypi-deps /compliance/ /

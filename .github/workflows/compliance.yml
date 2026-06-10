@@ -1,0 +1,149 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generates the OSRB compliance deliverables for the runtime dependencies of
+# the shipped artifacts:
+#   - Rust crates (server binaries)  -> ATTRIBUTIONS_Rust.md + rust_deps.csv
+#   - dpkg packages (server image)   -> dpkg_deps.csv (delta over the base image)
+#   - pypi packages (client wheel)   -> NOTICES_Python_<arch>.md + pypi_<arch>.csv
+#
+# The consolidate job merges these into the committed deliverables:
+#   - osrb_amd64.csv / osrb_arm64.csv  (rust + reviewed dpkg + pypi, per arch)
+#   - NOTICES                          (Rust + Python license texts, union)
+#
+# Heavy (the pypi job pulls torch and the nvidia-* CUDA wheels), so it runs on
+# integration branches and on demand, not on every PR.
+
+name: Compliance Attributions
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-dpkg:
+    name: Rust + dpkg attributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Rust attributions
+        run: |
+          docker build -f docker/Dockerfile --target attributions -t mx-attributions .
+          cid=$(docker create mx-attributions)
+          docker cp "$cid:/app/ATTRIBUTIONS_Rust.md" ATTRIBUTIONS_Rust.md
+          docker cp "$cid:/app/rust_deps.csv" rust_deps.csv
+          docker rm "$cid"
+
+      - name: Generate dpkg dependency delta
+        run: |
+          docker build -f docker/Dockerfile --target dpkg-deps -t mx-dpkg-deps .
+          cid=$(docker create mx-dpkg-deps)
+          docker cp "$cid:/app/dpkg_deps.csv" dpkg_deps.csv
+          docker rm "$cid"
+
+      - name: Note if committed Rust attributions are stale
+        run: |
+          if ! git diff --quiet -- ATTRIBUTIONS_Rust.md 2>/dev/null; then
+            echo "::warning::ATTRIBUTIONS_Rust.md differs from a fresh generation; commit the regenerated file before release."
+          fi
+
+      - name: Upload rust + dpkg artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-rust-dpkg
+          path: |
+            ATTRIBUTIONS_Rust.md
+            rust_deps.csv
+            dpkg_deps.csv
+
+  pypi:
+    name: pypi attributions (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: prod-modelexpress-builder-amd-v1
+            platform: linux/amd64
+          - arch: arm64
+            runner: prod-modelexpress-builder-arm-v1
+            platform: linux/arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate pypi attributions
+        run: |
+          mkdir -p out
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            -f docker/Dockerfile.client-wheel \
+            --target pypi-export \
+            --output type=local,dest=./out \
+            .
+          mv out/NOTICES_Python.md "NOTICES_Python_${{ matrix.arch }}.md"
+          mv out/pypi_deps.csv "pypi_${{ matrix.arch }}.csv"
+
+      - name: Upload pypi artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-pypi-${{ matrix.arch }}
+          path: |
+            NOTICES_Python_${{ matrix.arch }}.md
+            pypi_${{ matrix.arch }}.csv
+
+  consolidate:
+    name: Consolidate NOTICES + OSRB CSVs
+    runs-on: ubuntu-latest
+    needs: [rust-dpkg, pypi]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all compliance artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Consolidate per-arch OSRB CSVs and union NOTICES
+        run: |
+          R=artifacts/compliance-rust-dpkg
+          A=artifacts/compliance-pypi-amd64
+          B=artifacts/compliance-pypi-arm64
+
+          # Per-arch OSRB CSV = rust (shared) + reviewed dpkg (repo) + pypi (arch).
+          python3 scripts/consolidate_compliance.py \
+            --csv "$R/rust_deps.csv" --csv dpkg_amd64.csv --csv "$A/pypi_amd64.csv" \
+            --out-csv osrb_amd64.csv
+          python3 scripts/consolidate_compliance.py \
+            --csv "$R/rust_deps.csv" --csv dpkg_arm64.csv --csv "$B/pypi_arm64.csv" \
+            --out-csv osrb_arm64.csv
+
+          # Single NOTICES = Rust + Python texts, union across architectures.
+          python3 scripts/consolidate_compliance.py \
+            --md "$R/ATTRIBUTIONS_Rust.md" \
+            --md "$A/NOTICES_Python_amd64.md" --md "$B/NOTICES_Python_arm64.md" \
+            --out-notices NOTICES
+
+          echo "Rows: amd64=$(($(wc -l < osrb_amd64.csv) - 1)) arm64=$(($(wc -l < osrb_arm64.csv) - 1))"
+
+      - name: Upload consolidated OSRB deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-osrb
+          path: |
+            NOTICES
+            osrb_amd64.csv
+            osrb_arm64.csv

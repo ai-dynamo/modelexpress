@@ -58,6 +58,16 @@ docs/tmp
 *.egg-info/
 modelexpress_client/python/modelexpress.egg-info
 
+# Compliance: CI-transient intermediates. The committed deliverables are
+# ATTRIBUTIONS_Rust.md, the consolidated NOTICES and osrb.csv, and the
+# reviewed dpkg_*.csv; the per-source intermediates below are regenerated.
+/ATTRIBUTIONS_Rust.generated.md
+/compliance/
+/rust_deps.csv
+/dpkg_deps.csv
+/pypi_deps.csv
+/NOTICES_Python*.md
+
 # Local documentation (not for repo)
 docs/TRTLLM_*.md
 docs/disagg_*.md
