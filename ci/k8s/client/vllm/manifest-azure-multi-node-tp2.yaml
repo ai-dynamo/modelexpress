@@ -3,8 +3,6 @@
 
 # Multi-node vLLM TP=2 manifest for ModelExpress P2P CI tests.
 #
-# NOT YET WIRED INTO CI — see "Status" below.
-#
 # Topology vs ./manifest-azure-tp2.yaml (single-node TP=2):
 #   - StatefulSet (not Job): TP is split across 2 pods rather than 2 GPUs in
 #     one pod, so each pod owns one TP rank with 1 GPU + 1 IB device. Cross-
@@ -30,71 +28,21 @@
 # Each apply creates one Service + one StatefulSet, each managing 2 pods
 # (rank 0 + rank 1).
 #
-# Status: scaffolded, gated. Blockers before this can run in CI:
+# Cluster capacity assumed by this manifest: ≥2 A100 + IB nodes (each with
+# ≥2 GPUs) available concurrently in the Azure AKS test pool. The
+# matchLabelKeys anti-affinity (see Topology above) cross-pairs ranks across
+# the two hosts so source-0/target-1 share one node and source-1/target-0
+# share the other. K8s on the cluster must be ≥ 1.29 for matchLabelKeys.
 #
-#   1. ModelExpress device_id bug observed under vLLM's Ray distributed
-#      executor (--distributed-executor-backend=ray) with one-GPU-per-pod
-#      isolation, exactly the topology this manifest uses. Confirmed on
-#      vLLM 0.17.1: rank-1's NIXL registration fails with `CUDA error:
-#      invalid device ordinal` because the plugin reads `device_id` from
-#      `vllm_config.device_config.device.index` (see
-#      modelexpress_client/python/modelexpress/engines/vllm/adapter.py
-#      `_get_vllm_device_id`), which carries the GLOBAL rank under Ray
-#      multi-node TP. Each pod only exposes its assigned GPU as local
-#      device 0, so device_id=1 is invalid. Rank 1 then skips the NIXL
-#      register + publish step ("[Worker 1] No NIXL manager, skipping
-#      metadata publish"), only one ModelMetadata CR shows up server-
-#      side, and no P2P transfer is possible. Single-node TP=2 is
-#      unaffected because both devices (0 and 1) exist in the same pod.
-#      Whether other distributed setups (e.g. non-Ray multi-node) are
-#      affected is unverified — the failure mode is specific to how
-#      `device.index` maps to local CUDA visibility, so any executor that
-#      surfaces a local device index would dodge it; we haven't profiled.
-#      Likely fix in adapter.py: prefer `torch.cuda.current_device()`
-#      (reflects the worker process's actual visible CUDA context) over
-#      `target_device.index` whenever CUDA is available. Tracking ticket:
-#      TODO — file before re-enabling this manifest.
-#
-#   2. Cluster capacity. Requires ≥2 A100 + IB nodes (each with ≥2 GPUs)
-#      available concurrently in the Azure AKS test pool. The matchLabelKeys
-#      anti-affinity (see Topology above) cross-pairs ranks across the two
-#      hosts so source-0/target-1 share one node and source-1/target-0 share
-#      the other. K8s on the cluster must be ≥ 1.29 for matchLabelKeys.
-#
-#   3. action.yml envsubst. The action currently calls `envsubst` with no
-#      args, which substitutes ALL env vars present in the shell — including
-#      shell-only vars like ${HOSTNAME} and ${POD_NAME} that the Ray
-#      bootstrap script below relies on at runtime. Two fixes possible:
-#        a. Change action.yml to pass an explicit allowlist:
-#             envsubst '${JOB_NAME} ${WORKER_IMAGE} ${WORKER_PORT} ${MX_CI_MODEL}'
-#        b. Replace ${POD_NAME##*-} with a sed/awk pre-process step before
-#           apply. Option (a) is cleaner and only touches one file.
-#
-#   4. StatefulSet pod selection AND Service routing. Two related issues
-#      to land together when enabling multi-node TP:
-#        a. action.yml and test_p2p_k8s.py select pods by the auto-applied
-#           `job-name=` label (from K8s Jobs). The template below copies
-#           ${JOB_NAME} into a `job-name` label for compat, but
-#           `kubectl get pods -l job-name=mx-target -o ...items[0]...`
-#           does not guarantee ordinal order — it could return mx-target-1
-#           (the Ray worker pod, no API server) before mx-target-0 (the
-#           head pod). Pin selection to ordinal 0 in both action.yml's
-#           port checks and pytest's _pod_name helper.
-#        b. The headless Service below uses selector `job-name=${JOB_NAME}`,
-#           which matches BOTH pods. Ray's own use of the Service is fine
-#           (it dials `${JOB_NAME}-0.${JOB_NAME}` via the per-pod DNS A
-#           record), but anything dialing the Service name directly (e.g.
-#           `${JOB_NAME}:${WORKER_PORT}` from a future caller) would
-#           round-robin and possibly hit pod-1 which has no HTTP endpoint.
-#           Fix by adding a separate head-only Service whose selector is
-#           `statefulset.kubernetes.io/pod-name: ${JOB_NAME}-0` and routing
-#           HTTP callers to that name. Current callers use `kubectl exec`
-#           into the resolved pod so don't hit this today, but the fix
-#           should land with (a) so future callers aren't surprised.
-#
-#   5. Workflow matrix entry. Once 1–4 land, uncomment the
-#      `framework: vllm / multinode tp_size: 2` block under the `test-tp`
-#      job in .github/workflows/modelexpress-ci-tests.yml.
+# Known follow-up (won't surface today but worth noting): the headless
+# Service below uses selector `job-name=${JOB_NAME}`, which matches BOTH
+# pods. Ray's own use of the Service is fine (it dials
+# `${JOB_NAME}-0.${JOB_NAME}` via the per-pod DNS A record), and current
+# pytest/action callers resolve to pod-0 explicitly via _pod_name(..., ordinal=0)
+# + kubectl port-forward, so they don't hit this. A future caller dialing
+# `${JOB_NAME}:${WORKER_PORT}` directly would round-robin and possibly hit
+# pod-1 (no HTTP endpoint). Fix by adding a head-only Service whose
+# selector is `statefulset.kubernetes.io/pod-name: ${JOB_NAME}-0`.
 #
 # Environment variables substituted by envsubst before each apply:
 #   JOB_NAME      — mx-source or mx-target (drives STS name, Service name,
@@ -219,7 +167,12 @@ spec:
             medium: Memory
             sizeLimit: 64Gi
       containers:
-        - name: vllm
+        # Container name matches ${JOB_NAME} (mx-source / mx-target) to
+        # align with the single-node manifests and the shared
+        # `_all_pod_logs(..., container=job_name)` convention in
+        # test_p2p_k8s.py — otherwise `kubectl logs -c mx-target`
+        # against this StatefulSet's pods would 404 on container name.
+        - name: ${JOB_NAME}
           image: ${WORKER_IMAGE}
           imagePullPolicy: Always
           ports:

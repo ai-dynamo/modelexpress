@@ -26,34 +26,6 @@ Invoked by the workflow as:
 
 --tp-size default is 1 — every existing TP=1 P2P test still asserts exactly
 one source agent, which is the correct expectation and adds a free safety net.
-
-Known gaps for multi-node TP (manifest scaffolded at
-ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml but not yet wired in):
-
-  1. `_pod_name` returns `.items[0]` from a label-filtered list, which has no
-     ordinal ordering. Multi-node manifests are StatefulSets where pod-0 is
-     the Ray head + vLLM API server and pod-1 is a Ray worker (no HTTP
-     endpoint, no model). The inference + log-fetch helpers need to pin to
-     pod-0 — either filter by `statefulset.kubernetes.io/pod-name=<sts>-0`
-     or extend `_pod_name` with an `ordinal` arg.
-
-  2. Log-scanning tests (`test_rdma_transfer_logged`,
-     `test_per_rank_source_agents`) fetch logs from a single pod. With
-     vLLM `--distributed-executor-backend=ray` the rank-1 worker process
-     lives in pod-1, and Ray does not forward worker stdout into the head
-     pod's container logs by default. So rank 1's `add_remote_agent: ...`
-     line and rank 1's `[Worker 1] RDMA transfer complete` line both live
-     in pod-1's logs, not pod-0's. Need to concat logs from every pod in
-     the StatefulSet before running the regexes.
-
-  3. `_assert_inference` port-forwards to whichever pod `_pod_name` picks.
-     Same pod-0 pinning as (1) — pod-1 doesn't serve HTTP.
-
-  None of this affects TP=1 or single-node TP=2: those are Jobs with a
-  single pod per role, so `.items[0]` is unambiguous and all logs live in
-  one place. The cleanest fix is a helper like `_pods_in_order(ns, job)`
-  that returns ordinal-sorted pod names, plus an `ordinal` arg on the
-  existing helpers defaulting to 0 (backward-compatible).
 """
 
 import json
@@ -63,7 +35,38 @@ import urllib.request
 from kube_utils import kubectl, port_forward
 
 
-def _pod_name(namespace: str, job_name: str) -> str:
+def _pod_name(namespace: str, job_name: str, ordinal: int | None = None) -> str:
+    """Resolve the pod name for the given job/StatefulSet label.
+
+    `ordinal=None`: filter by `job-name=<job_name>` and return `.items[0]`.
+    Original Job-pod behavior, unchanged.
+
+    `ordinal=N`: prefer pods that have BOTH the `job-name` label and
+    `apps.kubernetes.io/pod-index=N` (K8s auto-applies the latter to
+    StatefulSet pods). If no match (e.g., a single-pod Job whose pod
+    doesn't carry the ordinal label), fall back to the plain
+    job-name selector — which returns the only pod that exists. So
+    callers can safely pass `ordinal=0` even when they don't know
+    whether they're hitting a StatefulSet or a single-pod Job; the
+    StatefulSet case is pinned to pod-0, the Job case is a no-op.
+    """
+    if ordinal is not None:
+        # Probe with `-o name` first (returns "pod/<name>" or empty for no
+        # match — exits 0 either way, unlike a jsonpath into an empty
+        # items array which crashes with "array index out of bounds" and
+        # would raise CalledProcessError before we get a chance to check.
+        ordinal_selector = f"job-name={job_name},apps.kubernetes.io/pod-index={ordinal}"
+        probe = kubectl(
+            "get", "pods",
+            "-l", ordinal_selector,
+            "-o", "name",
+            namespace=namespace,
+        )
+        probed = probe.stdout.strip().removeprefix("pod/")
+        if probed:
+            return probed
+        # No StatefulSet pod with that ordinal — fall through to plain
+        # job-name selector (single-pod Job case).
     result = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
@@ -75,8 +78,41 @@ def _pod_name(namespace: str, job_name: str) -> str:
     return name
 
 
+def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
+    """Concat the logs of every pod under the given `job-name` label.
+
+    Multi-pod StatefulSets distribute work across replicas. With
+    `--distributed-executor-backend=ray` on vLLM, rank-1's worker process
+    lives in pod-1 and Ray doesn't forward worker stdout to the head
+    pod's container logs by default. So lines like rank-1's
+    `[Worker 1] RDMA transfer complete` or `add_remote_agent: ...` only
+    appear in pod-1's logs, not pod-0's.
+
+    For single-pod Jobs (existing TP=1 / single-node TP>=2 cases) this
+    returns the same content as a single-pod `kubectl logs` would —
+    `.items[*]` has exactly one element and the regex/assertions in the
+    callers operate on one concatenated string either way.
+    """
+    pod_list = kubectl(
+        "get", "pods",
+        "-l", f"job-name={job_name}",
+        "-o", "jsonpath={.items[*].metadata.name}",
+        namespace=namespace,
+    ).stdout.split()
+    chunks = []
+    for pod in pod_list:
+        r = kubectl("logs", pod, "-c", container, "--tail=-1", namespace=namespace)
+        chunks.append(r.stdout)
+    return "\n".join(chunks)
+
+
 def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
-    pod = _pod_name(namespace, job_name)
+    # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
+    # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
+    # the worker pod has no HTTP listener. For single-pod Jobs, _pod_name
+    # falls back to the job-name selector since the ordinal label doesn't
+    # exist there — so this is a no-op for the existing single-node case.
+    pod = _pod_name(namespace, job_name, ordinal=0)
     print(f"\n[{job_name}] pod={pod} remote_port={remote_port} local_port={local_port}")
     # TODO: replace with a more complex prompt that exercises multi-token reasoning
     # to better validate model correctness beyond a single-word completion.
@@ -111,14 +147,17 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
 
     Absence means the target loaded weights via a fallback path, not RDMA.
     """
-    pod = _pod_name(namespace, "mx-target")
-    print(f"\n[mx-target] pod={pod}")
-    result = kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
-    marker_lines = [l for l in result.stdout.splitlines() if any(k in l for k in ("RDMA", "P2P", "transfer"))]
-    print(f"[mx-target] transfer log lines:\n" + "\n".join(marker_lines))
-    assert p2p_marker in result.stdout, (
+    # Concat logs across every pod under the job/StatefulSet label so the
+    # marker is found regardless of which rank/replica emitted it. For
+    # single-pod Jobs this is identical to logs of pod-0; for multi-node
+    # StatefulSets it captures the rank-1 worker's logs from pod-1, which
+    # Ray's distributed executor doesn't forward to the head pod's stdout.
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    marker_lines = [line for line in logs.splitlines() if any(k in line for k in ("RDMA", "P2P", "transfer"))]
+    print("[mx-target] transfer log lines:\n" + "\n".join(marker_lines))
+    assert p2p_marker in logs, (
         f"P2P marker {p2p_marker!r} not found in target logs.\n"
-        f"Last 50 log lines:\n" + "\n".join(result.stdout.splitlines()[-50:])
+        f"Last 50 log lines:\n" + "\n".join(logs.splitlines()[-50:])
     )
 
 
@@ -142,11 +181,12 @@ def test_per_rank_source_agents(namespace: str, tp_size: int) -> None:
     same shape per rank, so the load succeeds with wrong values and produces
     plausible-but-garbage text — which the current non-empty assertion passes.
     """
-    pod = _pod_name(namespace, "mx-target")
-    result = kubectl("logs", pod, "-c", "mx-target", "--tail=-1", namespace=namespace)
+    # Same multi-pod concat as test_rdma_transfer_logged — under multi-node
+    # TP each rank's `add_remote_agent` line lives in its own pod's logs.
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
     matches = re.findall(
         r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
-        result.stdout,
+        logs,
     )
 
     distinct_pairs = set(matches)

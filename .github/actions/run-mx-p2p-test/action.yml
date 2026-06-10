@@ -180,7 +180,20 @@ runs:
         while IFS= read -r line; do
           [ -n "$line" ] && export "$line"
         done <<< "${SOURCE_EXTRA_ENV}"
-        envsubst < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
+        # envsubst allowlist (single-quoted SHELL-FORMAT arg) so only the
+        # build-time variables get substituted. Manifests that embed
+        # pod-side shell vars in scripts (e.g. multi-node Ray bootstrap
+        # using ${POD_NAME} / ${HOSTNAME}) need those to be evaluated
+        # AT POD RUNTIME, not silently blanked at apply time.
+        #
+        # Every variable a manifest references at apply time must appear
+        # here. Anything passed via source_extra_env / extra_env that the
+        # manifest templates against (e.g. ${MODEL_EXPRESS_SOURCE} for the
+        # trt-llm source/target split) goes on the list too — otherwise
+        # the literal `${VAR}` survives into the pod env, which Python
+        # sees as a non-empty truthy string and reads as "set."
+        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE}' \
+          < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
     - name: Wait for source to publish metadata
@@ -243,7 +256,9 @@ runs:
         while IFS= read -r line; do
           [ -n "$line" ] && export "$line"
         done <<< "${EXTRA_ENV}"
-        envsubst < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
+        # See same-named source-apply step above for allowlist rationale.
+        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE}' \
+          < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
     - name: Wait for target /health to return 200
