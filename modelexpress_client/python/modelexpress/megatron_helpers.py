@@ -282,8 +282,61 @@ def split_gated_mlp(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     Megatron-Core's convention is ``[gate; up]`` along output dim 0; HF
     materializes them as separate ``mlp.gate_proj.weight`` and
     ``mlp.up_proj.weight``.
+
+    Use this helper when the input was assembled from a SINGLE Megatron
+    source rank (matched-TP or per-expert grouped). For inputs assembled
+    by concatenating multiple TP-sharded ranks, use
+    :func:`split_gated_mlp_tp` instead — the per-rank layout is
+    ``[gate_local; up_local]`` so a straight chunk-2 produces a mixed
+    ``[gate_r0; up_r0]`` / ``[gate_r1; up_r1]`` split rather than the
+    un-interleaved ``[gate_global]`` / ``[up_global]`` HF expects.
     """
     gate, up = tensor.chunk(2, dim=0)
+    return gate, up
+
+
+def split_gated_mlp_tp(
+    tensor: torch.Tensor, tp: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Un-interleave a TP-concatenated fused gate+up tensor into (gate, up).
+
+    Megatron-Core's fused gate+up ColumnParallelLinear stores each rank's
+    weight as ``[gate_local; up_local]`` (gate-then-up of that rank's
+    intermediate slice) along the output axis. When the receiver
+    assembles N TP-rank shards via ``concat_dim0``, the resulting tensor
+    has the interleaved layout::
+
+        [gate_r0; up_r0; gate_r1; up_r1; ...; gate_r(N-1); up_r(N-1)]
+
+    HF's ``mlp.gate_proj.weight`` and ``mlp.up_proj.weight`` want the
+    un-interleaved::
+
+        gate = [gate_r0; gate_r1; ...; gate_r(N-1)]
+        up   = [up_r0;   up_r1;   ...; up_r(N-1)]
+
+    This helper does the un-interleave via a single contiguous reshape +
+    advanced indexing (no per-rank copies). It's the inverse of the
+    Megatron publisher's per-rank ``merge_gated_mlp`` (which produces
+    ``[gate_local; up_local]`` per rank) followed by an axis-0 concat.
+
+    When ``tp == 1`` this is exactly :func:`split_gated_mlp`. The
+    receiver-side translator dispatches on ``len(plan.sources)`` to
+    choose between the two.
+    """
+    total_rows = tensor.shape[0]
+    rest = tensor.shape[1:]
+    if total_rows % (2 * tp) != 0:
+        raise ValueError(
+            f"split_gated_mlp_tp: leading dim {total_rows} not divisible by "
+            f"2 * tp = {2 * tp}"
+        )
+    inter_per_rank = total_rows // (2 * tp)
+    # Reshape into (tp, {gate=0, up=1}, inter_per_rank, ...rest).
+    reshaped = tensor.view(tp, 2, inter_per_rank, *rest)
+    # gate_per_rank is reshaped[:, 0]; up_per_rank is reshaped[:, 1].
+    # Flatten the (tp, inter_per_rank) dims back together.
+    gate = reshaped[:, 0].reshape(tp * inter_per_rank, *rest).contiguous()
+    up = reshaped[:, 1].reshape(tp * inter_per_rank, *rest).contiguous()
     return gate, up
 
 
@@ -299,5 +352,6 @@ __all__ = [
     "merge_qkv_weights",
     "merge_qkv_biases",
     "split_gated_mlp",
+    "split_gated_mlp_tp",
     "merge_gated_mlp",
 ]

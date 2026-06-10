@@ -708,3 +708,78 @@ def test_grouped_per_expert_invalid_hf_names_count_raises(env):
             plan, fused, transformer_config=cfg,
             hf_names=["a", "b", "c"],  # 3 names = invalid
         ))
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — gated_mlp_column TP=2 (target-narrower): receiver concatenates
+# two source ranks' [gate_local; up_local] shards and the translator
+# un-interleaves to (gate_global, up_global).
+# ---------------------------------------------------------------------------
+
+
+def test_gated_mlp_tp2_uninterleaves_correctly(env):
+    """Two source ranks each publish ``[gate_local; up_local]``. The
+    receiver concatenates along axis 0 → ``[gate_r0; up_r0; gate_r1;
+    up_r1]``. The translator must run ``split_gated_mlp_tp`` (not the
+    naive ``split_gated_mlp``) so the yielded gate / up are
+    byte-identical to the globals."""
+    v2 = env.v2
+    helpers = env.helpers
+    rcv = v2.MxV2RefitReceiver(agent_name="rcv", device_id=0,
+                                mx_server_url="stub:1", worker_rank=0)
+    rcv.initialize(model_tensors=None)
+
+    inter_per_rank, hidden = 256, 128
+    intermediate = inter_per_rank * 2
+    torch.manual_seed(0xFEEDBEEF)
+    gate_full = torch.randn(intermediate, hidden, dtype=torch.float32)
+    up_full = torch.randn(intermediate, hidden, dtype=torch.float32)
+
+    # Per-rank slices, exactly as a TP=2 Megatron trainer would publish.
+    gate_r0 = gate_full[:inter_per_rank]
+    gate_r1 = gate_full[inter_per_rank:]
+    up_r0 = up_full[:inter_per_rank]
+    up_r1 = up_full[inter_per_rank:]
+    fused_r0 = helpers.merge_gated_mlp(gate_r0, up_r0)
+    fused_r1 = helpers.merge_gated_mlp(gate_r1, up_r1)
+
+    layout = v2.TargetTpLayout(tp_size=1, tp_rank=0)
+    cands = [
+        _make_megatron_candidate(env, tp_rank=0, tp_size=2, sid="fc1-r0"),
+        _make_megatron_candidate(env, tp_rank=1, tp_size=2, sid="fc1-r1"),
+    ]
+    pull = _make_pull_callback({"fc1-r0": fused_r0, "fc1-r1": fused_r1})
+
+    # Target-narrower (target_tp=1, source_tp=2) — receiver sees the full
+    # 2 * intermediate rows.
+    spec = v2.MegatronTensorSpec(
+        role=v2.ROLE_MEGATRON_GATED_MLP_COLUMN,
+        target_shape=(2 * intermediate, hidden), target_dtype="float32",
+        shard_axis=0,
+        role_descriptor={"gated_mlp_order": "gate_then_up"},
+    )
+    plans = rcv.pick_megatron_slice_plans(
+        cands, target_tp_layout=layout,
+        target_tensor_specs={"linear_fc1": spec},
+    )
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan.assembly == "gated_mlp_split"
+    assert len(plan.sources) == 2  # multi-source
+
+    assembled = env.translator.assemble_into_destination(plan, pull=pull, device="cpu")
+    # Sanity: assembled is [gate_r0; up_r0; gate_r1; up_r1].
+    assert assembled.shape == (2 * intermediate, hidden)
+    cfg = helpers.MegatronTransformerConfig(
+        num_attention_heads=1, num_query_groups=1, kv_channels=1, hidden_size=hidden,
+    )
+    out = list(env.translator.translate_megatron_to_hf(
+        plan, assembled, transformer_config=cfg,
+        hf_names=["mlp.gate_proj.weight", "mlp.up_proj.weight"],
+    ))
+    assert len(out) == 2
+    assert out[0][0] == "mlp.gate_proj.weight"
+    assert out[1][0] == "mlp.up_proj.weight"
+    # Byte-identical to the globals.
+    assert torch.equal(out[0][1], gate_full)
+    assert torch.equal(out[1][1], up_full)

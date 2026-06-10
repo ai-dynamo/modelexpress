@@ -35,6 +35,7 @@ from .megatron_helpers import (
     split_qkv_biases,
     split_qkv_weights,
     split_gated_mlp,
+    split_gated_mlp_tp,
 )
 from .nemo_rl_v2 import (
     MegatronSlicePlan,
@@ -311,7 +312,15 @@ def translate_megatron_to_hf(
             raise ValueError(
                 f"gated_mlp_column expects 2 hf_names (gate, up); got {hf_names}"
             )
-        gate, up = split_gated_mlp(assembled)
+        # TP=1: simple chunk-2 along axis 0 gives [gate_global; up_global].
+        # TP>1: per-rank chunks are [gate_local; up_local] and the assembler
+        # has stacked them along axis 0 to ``[gate_r0; up_r0; gate_r1;
+        # up_r1; ...]``. Un-interleave to recover the global gate/up.
+        n_sources = len(plan.sources) if plan.sources else 1
+        if n_sources == 1:
+            gate, up = split_gated_mlp(assembled)
+        else:
+            gate, up = split_gated_mlp_tp(assembled, tp=n_sources)
         yield hf_names[0], gate
         yield hf_names[1], up
         return

@@ -156,6 +156,56 @@ def test_gated_mlp_roundtrip():
     assert torch.allclose(up, u2)
 
 
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_split_gated_mlp_tp_uninterleaves_per_rank_chunks(tp):
+    """Receiver-side un-interleave: per-rank chunks are [gate_local;
+    up_local]; concat_dim0 across TP ranks produces
+    [gate_r0; up_r0; gate_r1; up_r1; ...]. split_gated_mlp_tp must
+    recover ([gate_r0; gate_r1; ...], [up_r0; up_r1; ...]) — byte-
+    identical to what each rank held + concatenated.
+    """
+    torch.manual_seed(42 + tp)
+    inter_per_rank, hidden = 256, 128
+    intermediate = inter_per_rank * tp
+    # Build per-rank gates + ups, then the interleaved global the way
+    # an axis-0 concat of merge_gated_mlp(gate_rank, up_rank) would
+    # look on the wire.
+    gate_ranks = [torch.randn(inter_per_rank, hidden) for _ in range(tp)]
+    up_ranks = [torch.randn(inter_per_rank, hidden) for _ in range(tp)]
+    interleaved = torch.cat(
+        [HELPERS.merge_gated_mlp(g, u) for g, u in zip(gate_ranks, up_ranks)],
+        dim=0,
+    )
+    assert interleaved.shape == (2 * intermediate, hidden)
+
+    gate, up = HELPERS.split_gated_mlp_tp(interleaved, tp=tp)
+    assert gate.shape == (intermediate, hidden)
+    assert up.shape == (intermediate, hidden)
+    expected_gate = torch.cat(gate_ranks, dim=0)
+    expected_up = torch.cat(up_ranks, dim=0)
+    assert torch.equal(gate, expected_gate)
+    assert torch.equal(up, expected_up)
+
+
+def test_split_gated_mlp_tp_equals_split_gated_mlp_when_tp_eq_1():
+    """tp=1 should produce the same output as split_gated_mlp."""
+    torch.manual_seed(11)
+    intermediate, hidden = 512, 64
+    gate = torch.randn(intermediate, hidden)
+    up = torch.randn(intermediate, hidden)
+    fused = HELPERS.merge_gated_mlp(gate, up)
+    g_v1, u_v1 = HELPERS.split_gated_mlp(fused)
+    g_tp, u_tp = HELPERS.split_gated_mlp_tp(fused, tp=1)
+    assert torch.equal(g_v1, g_tp)
+    assert torch.equal(u_v1, u_tp)
+
+
+def test_split_gated_mlp_tp_rejects_bad_divisibility():
+    fused = torch.randn(7, 8)  # 7 % (2 * tp=2) != 0
+    with pytest.raises(ValueError, match="not divisible"):
+        HELPERS.split_gated_mlp_tp(fused, tp=2)
+
+
 def test_megatron_transformer_config_dict_roundtrip():
     cfg = MTC(num_attention_heads=8, num_query_groups=4,
               kv_channels=64, hidden_size=512)
