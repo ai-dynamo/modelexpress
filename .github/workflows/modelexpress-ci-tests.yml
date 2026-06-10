@@ -311,12 +311,10 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      # Raise alongside the matrix size as new frameworks land. Practical
-      # ceiling is min(matrix size, runner pool size, allocatable rdma/ib
-      # per node). Per-namespace podAntiAffinity lets matrix entries
-      # co-locate on the same hosts, so node count is not the binding
-      # constraint; IB device count per node is.
-      max-parallel: 3
+      # No max-parallel cap: all P2P framework entries run concurrently. The
+      # a100a pool (where every test-p2p entry's source+target land) has the
+      # headroom for the per-entry 2-GPU footprint; the scarce non-MIG pool
+      # that constrains test-tp is a separate concern handled in that job.
       matrix:
         include:
           - framework: vllm
