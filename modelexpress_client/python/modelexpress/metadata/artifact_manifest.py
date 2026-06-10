@@ -15,6 +15,7 @@ import google_crc32c
 from .. import p2p_pb2
 
 ARTIFACT_MANIFEST_VERSION = 1
+MAX_ARTIFACT_TRANSFER_CHUNK_SIZE = 64 * 1024 * 1024
 
 
 def build_artifact_manifest(
@@ -24,6 +25,11 @@ def build_artifact_manifest(
 ) -> p2p_pb2.ArtifactManifest:
     if chunk_size <= 0:
         raise ValueError("artifact manifest chunk_size must be greater than zero")
+    if chunk_size > MAX_ARTIFACT_TRANSFER_CHUNK_SIZE:
+        raise ValueError(
+            "artifact manifest chunk_size "
+            f"{chunk_size} exceeds maximum {MAX_ARTIFACT_TRANSFER_CHUNK_SIZE}"
+        )
 
     root_path = Path(root).resolve(strict=True)
     if not root_path.is_dir():

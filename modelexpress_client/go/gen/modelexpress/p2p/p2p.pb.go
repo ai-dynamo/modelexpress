@@ -611,7 +611,9 @@ type ArtifactManifest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ManifestVersion uint32                 `protobuf:"varint,1,opt,name=manifest_version,json=manifestVersion,proto3" json:"manifest_version,omitempty"`
 	MxSourceType    MxSourceType           `protobuf:"varint,2,opt,name=mx_source_type,json=mxSourceType,proto3,enum=model_express.p2p.MxSourceType" json:"mx_source_type,omitempty"`
-	ChunkSize       uint64                 `protobuf:"varint,3,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
+	// Artifact byte chunk size. Builders reject zero and values above the
+	// implementation maximum to avoid huge contiguous transfer buffers.
+	ChunkSize uint64 `protobuf:"varint,3,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
 	// Stable file table for the sealed snapshot. The full file table is returned
 	// by GetArtifactManifestHeader so targets can plan install paths without
 	// paginating by file count.
@@ -1236,11 +1238,17 @@ type GetArtifactManifestHeaderResponse struct {
 	TotalSize       uint64       `protobuf:"varint,5,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
 	FileCount       uint32       `protobuf:"varint,6,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
 	ChunkCount      uint32       `protobuf:"varint,7,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	// Artifact byte chunk size from the sealed manifest. Returned in the header
+	// so targets can reconstruct and verify the manifest identity after fetching
+	// chunk pages.
+	ChunkSize uint64 `protobuf:"varint,8,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
 	// Self-describing worker info, matching GetTensorManifestResponse.
 	MetadataEndpoint string `protobuf:"bytes,9,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
 	AgentName        string `protobuf:"bytes,10,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
 	WorkerRank       uint32 `protobuf:"varint,11,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
-	// File metadata is fetched in the header; chunk metadata is paged separately.
+	// File metadata is fetched as one table in the header; chunk metadata is
+	// paged separately. Very high file-count artifacts may need a future paged
+	// file-table RPC.
 	Files         []*ArtifactManifestFile `protobuf:"bytes,12,rep,name=files,proto3" json:"files,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1321,6 +1329,13 @@ func (x *GetArtifactManifestHeaderResponse) GetFileCount() uint32 {
 func (x *GetArtifactManifestHeaderResponse) GetChunkCount() uint32 {
 	if x != nil {
 		return x.ChunkCount
+	}
+	return 0
+}
+
+func (x *GetArtifactManifestHeaderResponse) GetChunkSize() uint64 {
+	if x != nil {
+		return x.ChunkSize
 	}
 	return 0
 }
@@ -2167,7 +2182,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
-	"artifactId\"\xe3\x03\n" +
+	"artifactId\"\x82\x04\n" +
 	"!GetArtifactManifestHeaderResponse\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2180,7 +2195,9 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"file_count\x18\x06 \x01(\rR\tfileCount\x12\x1f\n" +
 	"\vchunk_count\x18\a \x01(\rR\n" +
-	"chunkCount\x12+\n" +
+	"chunkCount\x12\x1d\n" +
+	"\n" +
+	"chunk_size\x18\b \x01(\x04R\tchunkSize\x12+\n" +
 	"\x11metadata_endpoint\x18\t \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\n" +

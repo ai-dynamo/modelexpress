@@ -6,7 +6,7 @@ This document describes the metadata storage and coordination layers for ModelEx
 
 ModelExpress stores two related classes of metadata:
 
-1. **P2P source metadata**: source workers publish tensor descriptors and transfer-engine metadata so target workers can receive weights over RDMA.
+1. **P2P source metadata**: source workers publish tensor descriptors or artifact summaries plus transfer-engine metadata so target workers can discover compatible sources and fetch detailed manifests.
 2. **Model-cache lifecycle metadata**: the server tracks model download state (`DOWNLOADING`, `DOWNLOADED`, `ERROR`) so replicas coordinate downloads and LRU eviction.
 
 Both layers are selected by `MX_METADATA_BACKEND`, but they use separate storage namespaces:
@@ -31,7 +31,7 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 | Field | Example | Purpose |
 |-------|---------|---------|
 | `mx_version` | `"0.5.0"` | Format compatibility across upgrades |
-| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH` | Type of tensors being served |
+| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE` | Type of source metadata being served |
 | `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
@@ -53,6 +53,17 @@ Each worker publishes independently -- no inter-worker coordination or barriers 
 
 Workers use `torch.distributed.get_rank()` as their global rank, which captures both tensor-parallel and pipeline-parallel position. This is stored as `worker_rank` in metadata so targets can find a peer with a matching rank.
 
+### Tensor and Artifact Source Payloads
+
+`WorkerMetadata.source_payload` selects the source-specific metadata shape:
+
+| Payload | Purpose |
+|---------|---------|
+| `tensor_source` | Tensor descriptors for weight transfer. Readers fall back to the deprecated top-level `tensors` field for old publishers. |
+| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, and `chunk_count`. |
+
+Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Because manifest file paths are canonical absolute install paths and are included in the sealed manifest, `artifact_id` is install-path-specific.
+
 ## gRPC API
 
 ```protobuf
@@ -61,6 +72,16 @@ service P2pService {
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
   rpc UpdateStatus(UpdateStatusRequest) returns (UpdateStatusResponse);
+}
+```
+
+Source workers may also expose a per-worker `WorkerService` when P2P metadata is enabled:
+
+```protobuf
+service WorkerService {
+  rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+  rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
+  rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
 }
 ```
 
@@ -100,12 +121,59 @@ SourceInstanceRef {
 
 ### GetMetadata
 
-Fetches full tensor metadata (MB-scale) for one specific worker. Called on demand after filtering `ListSources` results.
+Fetches full metadata for one specific worker. Called on demand after filtering `ListSources` results. In central metadata mode this can include tensor descriptors directly. In P2P metadata mode the central response carries endpoint pointers and source summaries; targets fetch tensor descriptors or artifact manifests from `WorkerService`.
 
 ```protobuf
 GetMetadataRequest {
   mx_source_id: string   // From ListSources or PublishMetadata response
   worker_id: string      // From ListSources or PublishMetadata response
+}
+```
+
+### WorkerService Artifact Manifest APIs
+
+`GetArtifactManifestHeader` returns identity and planning metadata for one sealed artifact:
+
+```protobuf
+GetArtifactManifestHeaderRequest {
+  mx_source_id: string
+  artifact_id: string       // Optional only when the worker has one artifact
+}
+
+GetArtifactManifestHeaderResponse {
+  mx_source_id: string
+  artifact_id: string
+  manifest_version: uint32
+  mx_source_type: MxSourceType
+  total_size: uint64
+  file_count: uint32
+  chunk_count: uint32
+  chunk_size: uint64
+  metadata_endpoint: string
+  agent_name: string
+  worker_rank: uint32
+  files: [ArtifactManifestFile]
+}
+```
+
+`files` is the full file table sorted by manifest path. This avoids paginating by file count for the initial v1 contract and lets a target plan install paths before fetching chunk metadata. Very high file-count artifacts can make the header large; if that becomes a production shape, the protocol should add a paged file-table RPC instead of increasing gRPC message limits.
+
+`GetArtifactManifestChunks` pages the flat chunk table:
+
+```protobuf
+GetArtifactManifestChunksRequest {
+  mx_source_id: string
+  artifact_id: string
+  start_chunk_index: uint32
+  max_chunks: uint32        // 0 means server default
+}
+
+GetArtifactManifestChunksResponse {
+  mx_source_id: string
+  artifact_id: string
+  start_chunk_index: uint32
+  chunks: [ArtifactManifestChunk]
+  next_page_token: string   // decimal next start_chunk_index, empty at end
 }
 ```
 
@@ -200,6 +268,10 @@ mx:source:a1b2c3d4e5f67890:f3a2b1c4
 mx:source:a1b2c3d4e5f67890:e7d6c5b8
   "1"  ->  {"worker_rank":1,"backend_type":"nixl","nixl_metadata":[...],"tensors":[...],"status":2,...}
 
+# Worker data -- artifact source summary
+mx:source:b2c3d4e5f67890a1:f3a2b1c4
+  "0"  ->  {"worker_rank":0,"backend_type":"none","artifact_source":{"artifact_id":"...","total_size":"67108864","file_count":1,"chunk_count":8},"status":2,...}
+
 # Model lifecycle -- download state for model-cache coordination
 mx:model:deepseek-ai/DeepSeek-V3
   provider     ->  "HuggingFace"
@@ -233,6 +305,26 @@ mx:model:deepseek-ai/DeepSeek-V3
 ```
 
 `addr` and `size` are serialized as strings to avoid JSON precision loss with large u64 values.
+
+Artifact workers use the same worker record shape with `artifact_source` instead of tensor descriptors:
+
+```json
+{
+  "worker_rank": 0,
+  "backend_type": "none",
+  "nixl_metadata": [],
+  "transfer_engine_session_id": null,
+  "tensors": [],
+  "status": 2,
+  "artifact_source": {
+    "artifact_id": "a0f08392f2abc45f78bd59f0fe2c601750c2b270dc5cc37c2166d86a65398466",
+    "total_size": "67108864",
+    "file_count": 1,
+    "chunk_count": 8
+  },
+  "updated_at": 1700000000000
+}
+```
 
 ### Kubernetes CRD Backend
 
@@ -282,6 +374,30 @@ status:
       lastTransitionTime: "2025-11-14T22:13:20Z"
   observedGeneration: 1
   publishedAt: "2025-11-14T22:13:20Z"
+```
+
+Artifact source CRDs carry an artifact summary instead of a tensor `ConfigMap` reference:
+
+```yaml
+apiVersion: modelexpress.nvidia.com/v1alpha1
+kind: ModelMetadata
+metadata:
+  name: mx-source-b2c3d4e5f67890a1-f3a2b1c4
+spec:
+  modelName: artifact-transfer-e2e
+  sourceType: deep_gemm_cache
+status:
+  worker:
+    workerRank: 0
+    backendType: none
+    artifactSource:
+      artifactId: a0f08392f2abc45f78bd59f0fe2c601750c2b270dc5cc37c2166d86a65398466
+      totalSize: 67108864
+      fileCount: 1
+      chunkCount: 8
+    tensorCount: 0
+    status: Ready
+    updatedAt: "2025-11-14T22:13:20Z"
 ```
 
 #### Example Model Lifecycle CRD

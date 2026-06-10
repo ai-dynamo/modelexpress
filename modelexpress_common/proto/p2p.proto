@@ -178,6 +178,8 @@ message TensorSourceMetadata {
 message ArtifactManifest {
   uint32 manifest_version = 1;
   MxSourceType mx_source_type = 2;
+  // Artifact byte chunk size. Builders reject zero and values above the
+  // implementation maximum to avoid huge contiguous transfer buffers.
   uint64 chunk_size = 3;
 
   // Stable file table for the sealed snapshot. The full file table is returned
@@ -339,12 +341,19 @@ message GetArtifactManifestHeaderResponse {
   uint32 file_count = 6;
   uint32 chunk_count = 7;
 
+  // Artifact byte chunk size from the sealed manifest. Returned in the header
+  // so targets can reconstruct and verify the manifest identity after fetching
+  // chunk pages.
+  uint64 chunk_size = 8;
+
   // Self-describing worker info, matching GetTensorManifestResponse.
   string metadata_endpoint = 9;
   string agent_name = 10;
   uint32 worker_rank = 11;
 
-  // File metadata is fetched in the header; chunk metadata is paged separately.
+  // File metadata is fetched as one table in the header; chunk metadata is
+  // paged separately. Very high file-count artifacts may need a future paged
+  // file-table RPC.
   repeated ArtifactManifestFile files = 12;
 }
 

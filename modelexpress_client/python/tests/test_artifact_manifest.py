@@ -15,6 +15,7 @@ from modelexpress.metadata.artifact_manifest import (
     artifact_manifest_id,
     artifact_source_metadata,
     build_artifact_manifest,
+    MAX_ARTIFACT_TRANSFER_CHUNK_SIZE,
 )
 from modelexpress.metadata.worker_server import (
     WorkerServiceServicer,
@@ -100,6 +101,12 @@ def test_build_artifact_manifest_rejects_invalid_chunk_size(tmp_path):
             chunk_size=0,
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         )
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        build_artifact_manifest(
+            tmp_path,
+            chunk_size=MAX_ARTIFACT_TRANSFER_CHUNK_SIZE + 1,
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        )
 
 
 def test_build_artifact_manifest_rejects_symlinks(tmp_path):
@@ -149,6 +156,7 @@ def test_worker_service_serves_artifact_manifest(tmp_path):
     assert header.artifact_id == artifact_id
     assert header.manifest_version == manifest.manifest_version
     assert header.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    assert header.chunk_size == manifest.chunk_size
     assert list(header.files) == list(manifest.files)
     assert len(chunks.chunks) == 2
     assert chunks.next_page_token == "2"

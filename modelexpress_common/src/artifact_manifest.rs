@@ -19,6 +19,7 @@ use std::{
 };
 
 pub const ARTIFACT_MANIFEST_VERSION: u32 = 1;
+pub const MAX_ARTIFACT_TRANSFER_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 // Number of chunk metadata records per GetArtifactManifestChunks response.
 // This is not the artifact byte chunk size; 1024 keeps metadata responses
 // bounded while avoiding one RPC per transfer chunk.
@@ -64,6 +65,13 @@ impl ArtifactManifest {
     ) -> Result<Self> {
         if chunk_size == 0 {
             bail!("artifact manifest chunk_size must be greater than zero");
+        }
+        if chunk_size > MAX_ARTIFACT_TRANSFER_CHUNK_SIZE {
+            bail!(
+                "artifact manifest chunk_size {} exceeds maximum {}",
+                chunk_size,
+                MAX_ARTIFACT_TRANSFER_CHUNK_SIZE
+            );
         }
 
         let root = root
@@ -181,6 +189,7 @@ impl SealedArtifactManifest {
             file_count: u32::try_from(self.manifest.files.len())
                 .context("artifact manifest file count exceeds u32")?,
             chunk_count: self.manifest.chunk_count()?,
+            chunk_size: self.manifest.chunk_size,
             metadata_endpoint: metadata_endpoint.into(),
             agent_name: agent_name.into(),
             worker_rank,
@@ -559,6 +568,14 @@ mod tests {
             ArtifactManifest::from_directory(
                 temp_dir.path(),
                 0,
+                MxSourceType::TorchCompileCache as i32,
+            )
+            .is_err()
+        );
+        assert!(
+            ArtifactManifest::from_directory(
+                temp_dir.path(),
+                MAX_ARTIFACT_TRANSFER_CHUNK_SIZE + 1,
                 MxSourceType::TorchCompileCache as i32,
             )
             .is_err()

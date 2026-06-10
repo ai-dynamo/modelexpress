@@ -78,6 +78,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             total_size=sum(file.size for file in manifest.files),
             file_count=len(manifest.files),
             chunk_count=len(manifest.chunks),
+            chunk_size=manifest.chunk_size,
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
