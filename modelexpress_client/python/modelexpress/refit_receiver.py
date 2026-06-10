@@ -396,6 +396,108 @@ class MxRefitReceiver:
                 tensor = tensor.view(tensor_shapes[name])
             yield name, tensor
 
+    def pull_to(
+        self,
+        source: SourceRef,
+        requests: list[tuple[str, tuple[int, int] | None, torch.Tensor]],
+        timeout_seconds: float = 300.0,
+    ) -> tuple[int, int, float]:
+        """Pull specific sub-slices of source tensors into specific dest views.
+
+        v1 sliced-pull primitive — the bandwidth-optimal mixed-TP data plane.
+        Each receiver pulls only the bytes it actually needs from each
+        source rank, instead of pulling the full source manifest and
+        slicing on the host (the v0 fallback in
+        :meth:`receive_weights_scratch`).
+
+        Args:
+            source: ``SourceRef`` from :meth:`discover_v2_sources` / poll.
+            requests: per-slice pull spec, each a tuple of:
+
+                * ``name``: source tensor name (must match an entry in the
+                  source's published manifest).
+                * ``source_subslice``: ``(lo_elements, hi_elements)`` along
+                  the source tensor's flat byte order, OR ``None`` to pull
+                  the full source tensor. The element unit lets callers
+                  express "rows [lo, hi)" naturally for axis-0 sharded
+                  tensors; the helper converts to bytes using the source's
+                  declared dtype. To pull at byte granularity, pass
+                  ``(byte_lo, byte_hi)`` and the dest_view's element size
+                  must agree.
+                * ``dest_view``: local destination, **must be contiguous**.
+                  Its byte size must equal the slice's byte size (after
+                  conversion). For axis-0 narrows of a pre-allocated dest
+                  buffer (e.g. ``buffers[name].narrow(0, lo, hi - lo)``)
+                  the view is contiguous and direct RDMA works. For
+                  axis-1 narrows the view is non-contiguous; the caller
+                  must fall back to ``receive_weights_scratch`` + host
+                  copy for those.
+            timeout_seconds: as for :meth:`receive_weights`.
+
+        Returns:
+            ``(total_bytes_transferred, num_slices, elapsed_seconds)``.
+        """
+        if not self._initialized:
+            raise RuntimeError("Call initialize() before pull_to()")
+
+        meta_resp = self._client.get_metadata(
+            mx_source_id=source.mx_source_id,
+            worker_id=source.worker_id,
+        )
+        if not meta_resp.found:
+            raise RuntimeError(
+                f"Source {source.mx_source_id}/{source.worker_id} not found on MX Server"
+            )
+        worker = meta_resp.worker
+        # Filter v2 sidecar descriptors.
+        source_tensors = [
+            TensorDescriptor(
+                name=t.name, addr=t.addr, size=t.size,
+                device_id=t.device_id, dtype=t.dtype,
+            )
+            for t in worker.tensors
+            if not t.name.startswith("__mx_") and t.size > 0
+        ]
+        by_name = {t.name: t for t in source_tensors}
+
+        # Build SlicedTransferRequest list. source_subslice is in elements
+        # along the FLAT byte order — we convert to bytes using the source
+        # tensor's dtype element size.
+        from .nixl_transfer import SlicedTransferRequest
+
+        slice_requests: list[SlicedTransferRequest] = []
+        for name, subslice, dest_view in requests:
+            src = by_name.get(name)
+            if src is None:
+                raise RuntimeError(f"pull_to: tensor {name!r} not in source manifest")
+            elem_size = torch.tensor([], dtype=_DTYPE_MAP.get(src.dtype, torch.bfloat16)).element_size()
+            if subslice is None:
+                source_offset_bytes = 0
+                slice_bytes = src.size
+            else:
+                lo, hi = subslice
+                source_offset_bytes = int(lo) * elem_size
+                slice_bytes = int(hi - lo) * elem_size
+            slice_requests.append(SlicedTransferRequest(
+                name=name,
+                source_offset_bytes=source_offset_bytes,
+                slice_bytes=slice_bytes,
+                dest_view=dest_view,
+            ))
+
+        transferred, num_slices, elapsed = self._nixl.receive_sliced_from_source(
+            source_metadata=worker.nixl_metadata,
+            source_tensors=source_tensors,
+            slice_requests=slice_requests,
+            timeout_seconds=timeout_seconds,
+        )
+        self._current_step = source.training_step
+        logger.info(
+            f"pull_to: {num_slices} slices, {transferred / 1e9:.2f} GB, "
+            f"{elapsed:.2f}s (step={source.training_step})"
+        )
+        return transferred, num_slices, elapsed
+
     def receive_weights_from_metadata(
         self,
         nixl_metadata: bytes,
