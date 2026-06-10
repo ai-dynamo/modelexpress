@@ -1037,10 +1037,35 @@ class MxV2RefitReceiver:
             )
 
         if role in (ROLE_MEGATRON_EXPERT_COLUMN, ROLE_MEGATRON_EXPERT_ROW):
-            # Per-expert: the receiver wants the experts in its local set
-            # (target_tp_layout.ep_rank). Each expert is owned by exactly
-            # one EP source rank. v0: pull all experts the receiver
-            # needs, dispatch per expert.
+            # Two MoE layouts in the wild:
+            #
+            # 1. ``expert_layout="grouped"`` — Megatron-Core TE-grouped
+            #    linears (``TEColumnParallelGroupedLinear``,
+            #    ``TERowParallelGroupedLinear``) expose **each local
+            #    expert's slice as a separate ``nn.Parameter``** named
+            #    ``weight0`` / ``weight1`` / .... The classifier emits one
+            #    Megatron-tensor-name per expert. The slice plan is
+            #    therefore identity / passthrough — one source per
+            #    Megatron tensor, no per-expert dict assembly.
+            # 2. ``expert_layout="leading_axis"`` (legacy / EP>1 single
+            #    ``.weight``) — one Megatron tensor holds ``ep_size``
+            #    experts stacked along axis 0. The legacy
+            #    ``_plan_per_expert`` covers this: one source per local
+            #    expert id, the assembler emits a ``dict[expert_id,
+            #    tensor]``.
+            #
+            # The per-source ``expert_layout`` lives in
+            # :attr:`MegatronTensorSpec.role_descriptor` so the receiver
+            # can dispatch. Default to ``leading_axis`` for backwards
+            # compatibility with v0 callers that don't set it.
+            expert_layout = spec.role_descriptor.get(
+                "expert_layout", "leading_axis"
+            )
+            if expert_layout == "grouped":
+                return self._plan_grouped_per_expert(
+                    source_name=source_name, spec=spec,
+                    relevant=relevant, target_tp_layout=target_tp_layout,
+                )
             return self._plan_per_expert(
                 source_name=source_name, spec=spec,
                 relevant=relevant, target_tp_layout=target_tp_layout,
@@ -1201,6 +1226,56 @@ class MxV2RefitReceiver:
             target_dtype=spec.target_dtype,
             sources=sources,
             assembly="per_expert",
+            role_descriptor=dict(spec.role_descriptor),
+        )
+
+    def _plan_grouped_per_expert(
+        self,
+        *,
+        source_name: str,
+        spec: "MegatronTensorSpec",
+        relevant: list[V2SourceCandidate],
+        target_tp_layout: TargetTpLayout,
+    ) -> MegatronSlicePlan:
+        """Plan one grouped TE per-expert parameter.
+
+        The publisher emits one Megatron tensor per (layer, expert) pair
+        (``...linear_fc1.weight0`` etc.), each carrying a single expert's
+        weights. So a slice plan is just identity: pick one fresh source
+        that publishes this tensor name and pass through. Bridge's name
+        map handles the per-expert HF naming (1 HF name for ``linear_fc2``
+        / down_proj, 2 HF names for ``linear_fc1`` / fused gate+up — the
+        translator splits the latter via ``split_gated_mlp``).
+
+        Mixed-TP within the expert's own TP dimension (each expert's
+        weight is column- or row-parallel across TP ranks) is a v1
+        extension. v0 treats grouped per-expert tensors as if TP=1 on the
+        expert axis — fine for ``expert_*`` roles on the standard
+        Megatron-Core grouped layout where each ``weight<N>`` is the
+        full per-expert tensor.
+        """
+        sources: list[MegatronSliceSource] = []
+        if relevant:
+            relevant.sort(key=lambda c: -c.updated_at)
+            c = relevant[0]
+            mm = c.megatron_meta
+            sources.append(
+                MegatronSliceSource(
+                    mx_source_id=c.ref.mx_source_id,
+                    worker_id=c.ref.worker_id,
+                    source_rank=mm.ep_rank,
+                    source_pp_rank=mm.pp_rank,
+                    target_local_range=(0, spec.target_shape[0]),
+                    role_extras=dict(spec.role_descriptor),
+                )
+            )
+        return MegatronSlicePlan(
+            tensor_name=source_name,
+            role=spec.role,
+            target_shape=spec.target_shape,
+            target_dtype=spec.target_dtype,
+            sources=sources,
+            assembly="passthrough",
             role_descriptor=dict(spec.role_descriptor),
         )
 

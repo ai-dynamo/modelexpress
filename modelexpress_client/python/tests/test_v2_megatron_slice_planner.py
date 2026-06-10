@@ -521,6 +521,114 @@ def test_expert_column_per_expert_routing(v2):
 
 
 # ---------------------------------------------------------------------------
+# Role: expert_column / expert_row — TE-grouped per-expert layout
+# (each Megatron tensor IS one expert's full weight, e.g. linear_fc1.weight0)
+# ---------------------------------------------------------------------------
+
+
+def test_grouped_expert_column_picks_passthrough_plan(v2):
+    """TE-grouped layout: each Megatron tensor is ONE expert's fused
+    gate+up. Plan should be passthrough with a single source — not
+    per_expert with N sources."""
+    rcv, layout = _make_receiver(v2, target_tp=1, target_rank=0)
+    # One trainer source publishes this expert's weight (EP=1).
+    cands = [
+        _make_megatron_candidate(
+            v2, role=v2.ROLE_MEGATRON_EXPERT_COLUMN,
+            tp_rank=0, tp_size=1, ep_rank=0, ep_size=1,
+            sid="trainer-0",
+        ),
+    ]
+    spec = v2.MegatronTensorSpec(
+        role=v2.ROLE_MEGATRON_EXPERT_COLUMN,
+        target_shape=(19456, 2048),  # fused gate+up shape for one expert (2 * intermediate, hidden)
+        target_dtype="bfloat16",
+        role_descriptor={
+            "expert_layout": "grouped",
+            "expert_id": "17",
+            "expert_axis": "0",
+        },
+    )
+    plan = rcv.pick_megatron_slice_plans(
+        cands, target_tp_layout=layout,
+        target_tensor_specs={"decoder.layers.0.mlp.experts.linear_fc1.weight17": spec},
+    )[0]
+    assert plan.assembly == "passthrough"
+    assert len(plan.sources) == 1
+    assert plan.sources[0].mx_source_id == "trainer-0"
+    assert plan.sources[0].target_local_range == (0, 19456)
+    # Source covers the full target tensor (no sub-slicing in v0).
+    assert plan.sources[0].source_subslice is None
+    # role_extras forwarded so the receiver knows this is grouped.
+    assert plan.sources[0].role_extras.get("expert_layout") == "grouped"
+    assert plan.sources[0].role_extras.get("expert_id") == "17"
+
+
+def test_grouped_expert_row_picks_passthrough_plan(v2):
+    """Row-parallel variant: linear_fc2.weight17 — one expert's
+    down_proj. Same passthrough shape, just a different role."""
+    rcv, layout = _make_receiver(v2, target_tp=1, target_rank=0)
+    cands = [
+        _make_megatron_candidate(
+            v2, role=v2.ROLE_MEGATRON_EXPERT_ROW,
+            tp_rank=0, tp_size=1, ep_rank=0, ep_size=1,
+            sid="trainer-0",
+        ),
+    ]
+    spec = v2.MegatronTensorSpec(
+        role=v2.ROLE_MEGATRON_EXPERT_ROW,
+        target_shape=(2048, 9728),  # down_proj shape (hidden, intermediate)
+        target_dtype="bfloat16",
+        role_descriptor={
+            "expert_layout": "grouped",
+            "expert_id": "17",
+            "expert_axis": "0",
+        },
+    )
+    plan = rcv.pick_megatron_slice_plans(
+        cands, target_tp_layout=layout,
+        target_tensor_specs={"decoder.layers.0.mlp.experts.linear_fc2.weight17": spec},
+    )[0]
+    assert plan.assembly == "passthrough"
+    assert plan.role == v2.ROLE_MEGATRON_EXPERT_ROW
+    assert len(plan.sources) == 1
+    assert plan.sources[0].target_local_range == (0, 2048)
+
+
+def test_legacy_expert_layout_still_uses_per_expert_assembly(v2):
+    """Sanity: when expert_layout is unset or == "leading_axis", the
+    planner falls back to the legacy _plan_per_expert path (multi-source,
+    per_expert assembly)."""
+    rcv, layout = _make_receiver(v2, target_tp=1, target_rank=0, ep_size=4, ep_rank=0)
+    cands = [
+        _make_megatron_candidate(
+            v2, role=v2.ROLE_MEGATRON_EXPERT_COLUMN,
+            tp_rank=0, tp_size=1, ep_rank=ep_rank, ep_size=4,
+            sid=f"e{ep_rank}",
+            owned_experts_per_layer={5: set(range(ep_rank * 2, (ep_rank + 1) * 2))},
+        )
+        for ep_rank in range(4)
+    ]
+    spec = v2.MegatronTensorSpec(
+        role=v2.ROLE_MEGATRON_EXPERT_COLUMN,
+        target_shape=(1024, 2048),
+        target_dtype="bfloat16",
+        role_descriptor={
+            # expert_layout intentionally omitted — defaults to leading_axis
+            "local_expert_ids": "0,3,5,7",
+            "layer_id": "5",
+        },
+    )
+    plan = rcv.pick_megatron_slice_plans(
+        cands, target_tp_layout=layout,
+        target_tensor_specs={"experts.gate": spec},
+    )[0]
+    assert plan.assembly == "per_expert"  # NOT passthrough
+    # The legacy path picks one source per expert id.
+    assert len(plan.sources) == 4
+
+
+# ---------------------------------------------------------------------------
 # Backwards compat: non-Megatron candidate set
 # ---------------------------------------------------------------------------
 

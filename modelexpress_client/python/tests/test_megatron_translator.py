@@ -550,3 +550,161 @@ def test_discover_megatron_context(env):
     cfg, m = translator.discover_megatron_context([non_mt, mt_cand])
     assert cfg == cfg_in
     assert m == {"a": ["b"]}
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — grouped per-expert linear_fc2 (row-parallel down_proj):
+# 1 hf_name, passthrough, identity copy
+# ---------------------------------------------------------------------------
+
+
+def test_grouped_per_expert_fc2_passthrough_yields_single_hf(env):
+    """TE-grouped MoE: each Megatron tensor is one expert's
+    linear_fc2.weight<N>. Plan = passthrough, len(hf_names) = 1,
+    translator should yield (hf_name, tensor) as-is."""
+    v2 = env.v2
+    helpers = env.helpers
+    rcv = v2.MxV2RefitReceiver(agent_name="rcv", device_id=0,
+                                mx_server_url="stub:1", worker_rank=0)
+    rcv.initialize(model_tensors=None)
+
+    # One expert's down_proj weight: shape (hidden, intermediate).
+    hidden, intermediate = 2048, 768
+    expert_id = 17
+    torch.manual_seed(0xEFFE0)
+    down = torch.randn(hidden, intermediate, dtype=torch.float32)
+
+    layout = v2.TargetTpLayout(tp_size=1, tp_rank=0, ep_size=1, ep_rank=0)
+    cands = [_make_megatron_candidate(env, tp_rank=0, tp_size=1, sid="trainer-0")]
+    pull = _make_pull_callback({"trainer-0": down})
+
+    spec = v2.MegatronTensorSpec(
+        role=v2.ROLE_MEGATRON_EXPERT_ROW,
+        target_shape=down.shape,
+        target_dtype="float32",
+        shard_axis=0,
+        role_descriptor={
+            "expert_layout": "grouped",
+            "expert_id": str(expert_id),
+            "expert_axis": "0",
+        },
+    )
+    m_name = f"decoder.layers.0.mlp.experts.linear_fc2.weight{expert_id}"
+    plans = rcv.pick_megatron_slice_plans(
+        cands, target_tp_layout=layout,
+        target_tensor_specs={m_name: spec},
+    )
+    assert len(plans) == 1
+    assert plans[0].assembly == "passthrough"
+    assert plans[0].role == v2.ROLE_MEGATRON_EXPERT_ROW
+    assert len(plans[0].sources) == 1
+
+    assembled = env.translator.assemble_into_destination(plans[0], pull=pull, device="cpu")
+    assert torch.equal(assembled, down)
+
+    cfg = helpers.MegatronTransformerConfig(
+        num_attention_heads=1, num_query_groups=1, kv_channels=1, hidden_size=hidden,
+    )
+    hf_name = f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight"
+    out = list(env.translator.translate_megatron_to_hf(
+        plans[0], assembled, transformer_config=cfg, hf_names=[hf_name],
+    ))
+    assert len(out) == 1
+    assert out[0][0] == hf_name
+    assert torch.equal(out[0][1], down)
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — grouped per-expert linear_fc1 (column-parallel fused gate+up):
+# 2 hf_names, passthrough, translator splits gate + up
+# ---------------------------------------------------------------------------
+
+
+def test_grouped_per_expert_fc1_passthrough_yields_gate_up(env):
+    """TE-grouped MoE: each Megatron tensor is one expert's fused
+    linear_fc1.weight<N> (gate concat'd with up along axis 0). Plan =
+    passthrough, len(hf_names) = 2, translator should run split_gated_mlp
+    and yield (gate_name, gate) + (up_name, up)."""
+    v2 = env.v2
+    helpers = env.helpers
+    rcv = v2.MxV2RefitReceiver(agent_name="rcv", device_id=0,
+                                mx_server_url="stub:1", worker_rank=0)
+    rcv.initialize(model_tensors=None)
+
+    intermediate, hidden = 768, 2048
+    expert_id = 42
+    torch.manual_seed(0xC0FFEE)
+    gate = torch.randn(intermediate, hidden, dtype=torch.float32)
+    up = torch.randn(intermediate, hidden, dtype=torch.float32)
+    fused = helpers.merge_gated_mlp(gate, up)
+    assert fused.shape == (2 * intermediate, hidden)
+
+    layout = v2.TargetTpLayout(tp_size=1, tp_rank=0, ep_size=1, ep_rank=0)
+    cands = [_make_megatron_candidate(env, tp_rank=0, tp_size=1, sid="trainer-0")]
+    pull = _make_pull_callback({"trainer-0": fused})
+
+    spec = v2.MegatronTensorSpec(
+        role=v2.ROLE_MEGATRON_EXPERT_COLUMN,
+        target_shape=fused.shape,
+        target_dtype="float32",
+        shard_axis=0,
+        role_descriptor={
+            "expert_layout": "grouped",
+            "expert_id": str(expert_id),
+            "expert_axis": "0",
+            "gated_mlp_order": "gate_then_up",
+        },
+    )
+    m_name = f"decoder.layers.0.mlp.experts.linear_fc1.weight{expert_id}"
+    plans = rcv.pick_megatron_slice_plans(
+        cands, target_tp_layout=layout,
+        target_tensor_specs={m_name: spec},
+    )
+    assert len(plans) == 1
+    assert plans[0].assembly == "passthrough"
+    assert plans[0].role == v2.ROLE_MEGATRON_EXPERT_COLUMN
+
+    assembled = env.translator.assemble_into_destination(plans[0], pull=pull, device="cpu")
+    assert torch.equal(assembled, fused)
+
+    cfg = helpers.MegatronTransformerConfig(
+        num_attention_heads=1, num_query_groups=1, kv_channels=1, hidden_size=hidden,
+    )
+    gate_name = f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+    up_name = f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+    out = list(env.translator.translate_megatron_to_hf(
+        plans[0], assembled, transformer_config=cfg, hf_names=[gate_name, up_name],
+    ))
+    assert len(out) == 2
+    assert out[0][0] == gate_name
+    assert out[1][0] == up_name
+    assert torch.equal(out[0][1], gate)
+    assert torch.equal(out[1][1], up)
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — invalid hf_names length for passthrough expert path
+# ---------------------------------------------------------------------------
+
+
+def test_grouped_per_expert_invalid_hf_names_count_raises(env):
+    """Passthrough expert path supports 1 or 2 hf_names only; 3+ is a
+    misconfiguration and should raise rather than silently produce
+    garbage HF output."""
+    v2 = env.v2
+    helpers = env.helpers
+
+    fused = torch.randn(64, 32, dtype=torch.float32)
+    cfg = helpers.MegatronTransformerConfig(
+        num_attention_heads=1, num_query_groups=1, kv_channels=1, hidden_size=32,
+    )
+    plan = v2.MegatronSlicePlan(
+        tensor_name="x", role=v2.ROLE_MEGATRON_EXPERT_COLUMN,
+        target_shape=fused.shape, target_dtype="float32",
+        sources=[], assembly="passthrough", role_descriptor={},
+    )
+    with pytest.raises(ValueError, match="passthrough expects 1 or 2 hf_names"):
+        list(env.translator.translate_megatron_to_hf(
+            plan, fused, transformer_config=cfg,
+            hf_names=["a", "b", "c"],  # 3 names = invalid
+        ))

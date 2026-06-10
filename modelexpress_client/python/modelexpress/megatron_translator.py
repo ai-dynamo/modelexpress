@@ -317,8 +317,45 @@ def translate_megatron_to_hf(
         return
 
     if role in (ROLE_MEGATRON_EXPERT_COLUMN, ROLE_MEGATRON_EXPERT_ROW):
+        # Two assembly shapes:
+        #
+        # (a) ``assembly == "passthrough"`` — the **grouped** layout (TE
+        #     per-expert ``nn.Parameter`` named ``weight0`` / ``weight1`` /
+        #     ...). The planner picks one source per Megatron tensor; the
+        #     ``assembled`` tensor is THIS expert's full per-expert
+        #     weight. Bridge's name map gives 1 HF name for plain
+        #     ``linear_fc2`` (row-parallel down_proj) and 2 HF names for
+        #     ``linear_fc1`` (column-parallel fused gate + up — needs
+        #     ``split_gated_mlp``).
+        #
+        # (b) ``assembly == "per_expert"`` — the **leading-axis** layout
+        #     (legacy EP>1 single ``.weight`` whose leading axis stacks
+        #     experts). ``assembled`` is a ``dict[expert_id, tensor]``;
+        #     ``hf_names`` is one-per-expert keyed by position OR routing
+        #     map in ``plan.role_descriptor['hf_names_by_expert_id']``.
+        if plan.assembly == "passthrough":
+            if not isinstance(assembled, torch.Tensor):
+                raise TypeError(
+                    f"{role} passthrough assembly expects a single tensor"
+                )
+            if len(hf_names) == 1:
+                yield hf_names[0], assembled
+                return
+            if len(hf_names) == 2:
+                # Per-expert fused gate+up: same math as
+                # ROLE_MEGATRON_GATED_MLP_COLUMN, just one expert at a
+                # time. The vendored helper does the axis-0 split.
+                gate, up = split_gated_mlp(assembled)
+                yield hf_names[0], gate
+                yield hf_names[1], up
+                return
+            raise ValueError(
+                f"{role} passthrough expects 1 or 2 hf_names, got {hf_names}"
+            )
+
+        # Legacy per_expert assembly path: stacked-experts dict.
         if not isinstance(assembled, dict):
-            raise TypeError(f"{role} assembly expects dict[expert_id, tensor]")
+            raise TypeError(f"{role} per_expert assembly expects dict[expert_id, tensor]")
         # hf_names is keyed by position in this v0; the caller provides
         # the names as ``["experts.0.<sub>.weight", "experts.1.<sub>.weight", ...]``
         # in expert-id order. For routing flexibility, also accept the
