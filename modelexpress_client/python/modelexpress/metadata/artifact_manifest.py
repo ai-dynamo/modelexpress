@@ -15,7 +15,7 @@ import google_crc32c
 from .. import p2p_pb2
 
 ARTIFACT_MANIFEST_VERSION = 1
-MAX_ARTIFACT_TRANSFER_CHUNK_SIZE = 64 * 1024 * 1024
+MAX_ARTIFACT_TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024 * 1024
 
 
 def build_artifact_manifest(

@@ -19,7 +19,7 @@ use std::{
 };
 
 pub const ARTIFACT_MANIFEST_VERSION: u32 = 1;
-pub const MAX_ARTIFACT_TRANSFER_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+pub const MAX_ARTIFACT_TRANSFER_CHUNK_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Number of chunk metadata records per GetArtifactManifestChunks response.
 // This is not the artifact byte chunk size; 1024 keeps metadata responses
 // bounded while avoiding one RPC per transfer chunk.

@@ -132,50 +132,9 @@ GetMetadataRequest {
 
 ### WorkerService Artifact Manifest APIs
 
-`GetArtifactManifestHeader` returns identity and planning metadata for one sealed artifact:
+Artifact targets use `GetArtifactManifestHeader` to fetch the sealed artifact identity, worker endpoints, aggregate counts, byte chunk size, and the file table for install planning. Chunk metadata is fetched separately through `GetArtifactManifestChunks`, which pages the flat chunk table by global `chunk_index`.
 
-```protobuf
-GetArtifactManifestHeaderRequest {
-  mx_source_id: string
-  artifact_id: string       // Optional only when the worker has one artifact
-}
-
-GetArtifactManifestHeaderResponse {
-  mx_source_id: string
-  artifact_id: string
-  manifest_version: uint32
-  mx_source_type: MxSourceType
-  total_size: uint64
-  file_count: uint32
-  chunk_count: uint32
-  chunk_size: uint64
-  metadata_endpoint: string
-  agent_name: string
-  worker_rank: uint32
-  files: [ArtifactManifestFile]
-}
-```
-
-`files` is the full file table sorted by manifest path. This avoids paginating by file count for the initial v1 contract and lets a target plan install paths before fetching chunk metadata. Very high file-count artifacts can make the header large; if that becomes a production shape, the protocol should add a paged file-table RPC instead of increasing gRPC message limits.
-
-`GetArtifactManifestChunks` pages the flat chunk table:
-
-```protobuf
-GetArtifactManifestChunksRequest {
-  mx_source_id: string
-  artifact_id: string
-  start_chunk_index: uint32
-  max_chunks: uint32        // 0 means server default
-}
-
-GetArtifactManifestChunksResponse {
-  mx_source_id: string
-  artifact_id: string
-  start_chunk_index: uint32
-  chunks: [ArtifactManifestChunk]
-  next_page_token: string   // decimal next start_chunk_index, empty at end
-}
-```
+The header currently returns the full file table sorted by manifest path, while chunk metadata is paged. Very high file-count artifacts can make the header large; if that becomes a production shape, the protocol should add a paged file-table RPC instead of increasing gRPC message limits.
 
 ### UpdateStatus
 
