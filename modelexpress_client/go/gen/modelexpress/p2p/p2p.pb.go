@@ -605,8 +605,8 @@ func (x *TensorSourceMetadata) GetTensors() []*TensorDescriptor {
 // transfer ranges, ordered by file_index and then file_offset; chunk_index is
 // the zero-based index into that flat table. Each chunk points back to its
 // containing file with file_index and describes the byte range [file_offset,
-// file_offset + length) within that file. Empty files are represented by one
-// zero-length chunk.
+// file_offset + length) within that file. Empty files are represented only in
+// the file table and do not have transfer chunks.
 type ArtifactManifest struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	ManifestVersion uint32                 `protobuf:"varint,1,opt,name=manifest_version,json=manifestVersion,proto3" json:"manifest_version,omitempty"`

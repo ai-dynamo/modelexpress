@@ -173,8 +173,8 @@ message TensorSourceMetadata {
 // transfer ranges, ordered by file_index and then file_offset; chunk_index is
 // the zero-based index into that flat table. Each chunk points back to its
 // containing file with file_index and describes the byte range [file_offset,
-// file_offset + length) within that file. Empty files are represented by one
-// zero-length chunk.
+// file_offset + length) within that file. Empty files are represented only in
+// the file table and do not have transfer chunks.
 message ArtifactManifest {
   uint32 manifest_version = 1;
   MxSourceType mx_source_type = 2;

@@ -343,14 +343,7 @@ fn chunks_for_file(
         .with_context(|| format!("failed to stat artifact file {}", path.display()))?
         .len();
     if size == 0 {
-        return Ok(vec![ArtifactManifestChunk {
-            chunk_index: u32::try_from(first_chunk_index)
-                .context("artifact manifest chunk index exceeds u32")?,
-            file_index,
-            file_offset: 0,
-            length: 0,
-            checksum: format!("{:08x}", crc32c(&[])),
-        }]);
+        return Ok(Vec::new());
     }
 
     let file = fs::File::open(path)
@@ -583,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_files_are_manifested_with_one_zero_length_chunk() {
+    fn empty_files_are_manifested_without_transfer_chunks() {
         let temp_dir = TempDir::new().expect("create temp dir");
         fs::write(temp_dir.path().join("empty"), b"").expect("write empty");
 
@@ -594,9 +587,9 @@ mod tests {
         )
         .expect("manifest");
 
-        assert_eq!(manifest.chunks, vec![chunk(0, 0, 0, 0, "00000000")]);
+        assert!(manifest.chunks.is_empty());
         assert_eq!(manifest.total_size().expect("total size"), 0);
-        assert_eq!(manifest.chunk_count().expect("chunk count"), 1);
+        assert_eq!(manifest.chunk_count().expect("chunk count"), 0);
     }
 
     #[test]

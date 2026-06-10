@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Iterable
 
@@ -16,6 +17,8 @@ from .. import p2p_pb2
 
 ARTIFACT_MANIFEST_VERSION = 1
 MAX_ARTIFACT_TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024 * 1024
+
+logger = logging.getLogger("modelexpress.metadata.artifact_manifest")
 
 
 def build_artifact_manifest(
@@ -89,15 +92,18 @@ def _collect_regular_files(root: Path) -> list[Path]:
     def visit(directory: Path) -> None:
         for path in sorted(directory.iterdir()):
             if path.is_symlink():
-                raise ValueError(f"artifact manifest does not support symlink {path}")
+                logger.warning("Skipping artifact symlink %s", path)
+                continue
             if path.is_dir():
                 visit(path)
             elif path.is_file():
                 resolved = path.resolve(strict=True)
                 if not resolved.is_relative_to(root):
-                    raise ValueError(
-                        f"artifact file resolves outside artifact root: {path}"
+                    logger.warning(
+                        "Skipping artifact file outside artifact root: %s",
+                        path,
                     )
+                    continue
                 files.append(resolved)
 
     visit(root)
@@ -123,13 +129,7 @@ def _chunks_for_file(
 ) -> Iterable[p2p_pb2.ArtifactManifestChunk]:
     size = path.stat().st_size
     if size == 0:
-        yield p2p_pb2.ArtifactManifestChunk(
-            chunk_index=first_chunk_index,
-            file_index=file_index,
-            file_offset=0,
-            length=0,
-            checksum=_crc32c_hex(b""),
-        )
+        del first_chunk_index, file_index
         return
 
     chunk_index = first_chunk_index

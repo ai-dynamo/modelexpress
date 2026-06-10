@@ -109,17 +109,32 @@ def test_build_artifact_manifest_rejects_invalid_chunk_size(tmp_path):
         )
 
 
-def test_build_artifact_manifest_rejects_symlinks(tmp_path):
+def test_build_artifact_manifest_skips_symlinks(tmp_path):
     target = tmp_path / "target"
     target.write_bytes(b"target")
     (tmp_path / "link").symlink_to(target)
 
-    with pytest.raises(ValueError, match="symlink"):
-        build_artifact_manifest(
-            tmp_path,
-            chunk_size=4,
-            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-        )
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=4,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+
+    assert [file.path for file in manifest.files] == [target.resolve().as_posix()]
+
+
+def test_build_artifact_manifest_keeps_empty_file_without_transfer_chunk(tmp_path):
+    (tmp_path / "empty.bin").write_bytes(b"")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=3,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+
+    assert [(file.path, file.size) for file in manifest.files] == [
+        ((tmp_path / "empty.bin").resolve().as_posix(), 0)
+    ]
+    assert list(manifest.chunks) == []
 
 
 def test_worker_service_serves_artifact_manifest(tmp_path):
