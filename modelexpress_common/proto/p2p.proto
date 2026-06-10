@@ -44,6 +44,7 @@ enum MxSourceType {
   MX_SOURCE_TYPE_CUDA_GRAPH = 2;          // CUDA graph artifacts
   MX_SOURCE_TYPE_TORCH_COMPILE_CACHE = 3; // torch.compile cache files
   MX_SOURCE_TYPE_TRITON_CACHE = 4;        // Triton cache files
+  MX_SOURCE_TYPE_DEEP_GEMM_CACHE = 5;     // DeepGEMM kernel cache files
 }
 
 // All fields that affect source compatibility for reusable model material.
@@ -137,8 +138,8 @@ message TensorDescriptor {
 }
 
 // Small discovery summary for file-backed artifact sources. This does not carry
-// full file or chunk manifests; artifact manifest and transfer RPCs are future
-// work outside this contract.
+// full file or chunk manifests; targets use WorkerService manifest header/page
+// RPCs for the sealed manifest before any future byte-transfer path.
 message ArtifactSourceMetadata {
   // Digest of the canonical sealed artifact manifest.
   string artifact_id = 1;
@@ -157,6 +158,69 @@ message ArtifactSourceMetadata {
 // field; readers fall back to WorkerMetadata.tensors for old metadata.
 message TensorSourceMetadata {
   repeated TensorDescriptor tensors = 1;
+}
+
+// Sealed file-backed artifact manifest. The artifact_id in
+// ArtifactSourceMetadata and WorkerService artifact manifest responses is
+// SHA-256 over the ModelExpress canonical artifact manifest JSON, encoded as
+// lowercase hex without an algorithm prefix. Because manifest file paths are
+// canonical absolute install paths, the artifact_id is install-path-specific,
+// not only file-content-specific.
+//
+// The manifest separates file metadata from transfer chunk metadata. `files` is
+// a stable table of all sealed files, sorted by manifest path; file_index is the
+// zero-based index into that table. `chunks` is a flat table of fixed-size
+// transfer ranges, ordered by file_index and then file_offset; chunk_index is
+// the zero-based index into that flat table. Each chunk points back to its
+// containing file with file_index and describes the byte range [file_offset,
+// file_offset + length) within that file. Empty files are represented only in
+// the file table and do not have transfer chunks.
+message ArtifactManifest {
+  uint32 manifest_version = 1;
+  MxSourceType mx_source_type = 2;
+  // Artifact byte chunk size. Builders reject zero and values above the
+  // implementation maximum to avoid huge contiguous transfer buffers.
+  uint64 chunk_size = 3;
+
+  // Stable file table for the sealed snapshot. The full file table is returned
+  // by GetArtifactManifestHeader so targets can plan install paths without
+  // paginating by file count.
+  repeated ArtifactManifestFile files = 4;
+
+  // Flat chunk table for artifact transfer. Large manifests are served through
+  // GetArtifactManifestChunks pages keyed by chunk_index.
+  repeated ArtifactManifestChunk chunks = 5;
+}
+
+message ArtifactManifestFile {
+  // File index used by ArtifactManifestChunk.file_index.
+  uint32 file_index = 1;
+
+  // Canonical absolute install path using "/" separators.
+  string path = 2;
+
+  // File size in bytes.
+  uint64 size = 3;
+
+  // CRC32C checksum of the file bytes, lowercase hex without a prefix.
+  string checksum = 4;
+}
+
+message ArtifactManifestChunk {
+  // Globally ordered chunk index within the artifact manifest.
+  uint32 chunk_index = 1;
+
+  // ArtifactManifestFile.file_index for the file containing this chunk.
+  uint32 file_index = 2;
+
+  // Byte offset within the file.
+  uint64 file_offset = 3;
+
+  // Chunk length in bytes.
+  uint64 length = 4;
+
+  // CRC32C checksum of the chunk bytes, lowercase hex without a prefix.
+  string checksum = 5;
 }
 
 // ============================================================================
@@ -203,9 +267,8 @@ message WorkerMetadata {
   // NIXL agent name (used by targets to identify the remote agent)
   string agent_name = 7;
 
-  // host:port for the worker's gRPC WorkerService, used today for tensor
-  // manifests. Artifact source payloads do not define a transfer endpoint in
-  // this contract.
+  // host:port for the worker's gRPC WorkerService, used for tensor and artifact
+  // manifests. Artifact byte transfer is not part of this endpoint yet.
   string worker_grpc_endpoint = 8;
 
   // Source-type-specific bounded metadata. This selects the metadata payload
@@ -219,16 +282,17 @@ message WorkerMetadata {
 }
 
 // ============================================================================
-// Worker Service (P2P tensor manifest exchange)
+// Worker Service (P2P manifest exchange)
 // ============================================================================
 
-// Per-worker gRPC service for direct tensor manifest retrieval. Artifact
-// manifest retrieval is not part of this service yet.
-// Sources start this service when MX_P2P_METADATA=1. Targets call
-// GetTensorManifest to fetch tensor descriptors directly from the
-// source worker instead of from the central metadata server.
+// Per-worker gRPC service for direct manifest retrieval. Sources start this
+// service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
+// descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
+// file-backed artifact manifests.
 service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
+  rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
+  rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
 }
 
 message GetTensorManifestRequest {
@@ -254,6 +318,74 @@ message GetTensorManifestResponse {
 
   // Rank of the serving worker (for rank-matched transfers)
   uint32 worker_rank = 5;
+}
+
+message GetArtifactManifestHeaderRequest {
+  // mx_source_id for validation (catches stale discovery)
+  string mx_source_id = 1;
+
+  // Optional artifact_id from ArtifactSourceMetadata for validation.
+  string artifact_id = 2;
+}
+
+message GetArtifactManifestHeaderResponse {
+  // Echoed mx_source_id for confirmation.
+  string mx_source_id = 1;
+
+  // SHA-256 digest of the canonical sealed artifact manifest.
+  string artifact_id = 2;
+
+  uint32 manifest_version = 3;
+  MxSourceType mx_source_type = 4;
+  uint64 total_size = 5;
+  uint32 file_count = 6;
+  uint32 chunk_count = 7;
+
+  // Artifact byte chunk size from the sealed manifest. Returned in the header
+  // so targets can reconstruct and verify the manifest identity after fetching
+  // chunk pages.
+  uint64 chunk_size = 8;
+
+  // Self-describing worker info, matching GetTensorManifestResponse.
+  string metadata_endpoint = 9;
+  string agent_name = 10;
+  uint32 worker_rank = 11;
+
+  // File metadata is fetched as one table in the header; chunk metadata is
+  // paged separately. Very high file-count artifacts may need a future paged
+  // file-table RPC.
+  repeated ArtifactManifestFile files = 12;
+}
+
+message GetArtifactManifestChunksRequest {
+  // mx_source_id for validation (catches stale discovery)
+  string mx_source_id = 1;
+
+  // Optional artifact_id from ArtifactSourceMetadata for validation.
+  string artifact_id = 2;
+
+  // First global chunk index to return.
+  uint32 start_chunk_index = 3;
+
+  // Maximum chunks to return. Zero means server default.
+  uint32 max_chunks = 4;
+}
+
+message GetArtifactManifestChunksResponse {
+  // Echoed mx_source_id for confirmation.
+  string mx_source_id = 1;
+
+  // SHA-256 digest of the canonical sealed artifact manifest.
+  string artifact_id = 2;
+
+  // First global chunk index in this page.
+  uint32 start_chunk_index = 3;
+
+  repeated ArtifactManifestChunk chunks = 4;
+
+  // Empty when this is the last page; otherwise the decimal string form of the
+  // next start_chunk_index.
+  string next_page_token = 5;
 }
 
 // ============================================================================
