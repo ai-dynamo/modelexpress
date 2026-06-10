@@ -37,6 +37,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Tensor-parallel size — the per-rank transfer test expects this many distinct ranks.",
     )
     parser.addoption(
+        "--transport",
+        default=os.environ.get("TRANSPORT", "nixl"),
+        help=(
+            "P2P transport under test. 'nixl' (default) enables the per-rank "
+            "NIXL agent assertion (add_remote_agent log lines). For "
+            "'transfer_engine' (Mooncake) that assertion is skipped — the "
+            "Mooncake path does not register NIXL agents."
+        ),
+    )
+    parser.addoption(
         "--dgd-name",
         default=os.environ.get("DGD_NAME", "mx-dynamo-vllm"),
         help=(
@@ -108,6 +118,11 @@ def p2p_marker(request: pytest.FixtureRequest) -> str:
 @pytest.fixture(scope="session")
 def tp_size(request: pytest.FixtureRequest) -> int:
     return request.config.getoption("--tp-size")
+
+
+@pytest.fixture(scope="session")
+def transport(request: pytest.FixtureRequest) -> str:
+    return request.config.getoption("--transport")
 
 
 @pytest.fixture(scope="session")
