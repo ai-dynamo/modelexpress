@@ -206,12 +206,7 @@ mod tests {
             quantization: String::new(),
             extra_parameters: Default::default(),
             revision: String::new(),
-            backend_framework_version: String::new(),
-            torch_version: String::new(),
-            cuda_version: String::new(),
-            triton_version: String::new(),
-            gpu_arch: String::new(),
-            compile_config_digest: String::new(),
+            ..Default::default()
         }
     }
 

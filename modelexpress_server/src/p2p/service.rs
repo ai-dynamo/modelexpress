@@ -35,6 +35,7 @@ fn worker_tensor_count(worker: &WorkerMetadata) -> usize {
 
     match &worker.source_payload {
         Some(SourcePayload::TensorSource(tensor_source)) => tensor_source.tensors.len(),
+        Some(SourcePayload::ArtifactSource(_)) => 0,
         _ => legacy_worker_tensor_count(worker),
     }
 }
@@ -297,7 +298,6 @@ impl P2pService for P2pServiceImpl {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;

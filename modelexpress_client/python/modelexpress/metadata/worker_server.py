@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Per-worker gRPC server for P2P tensor manifest exchange.
+Per-worker gRPC server for P2P manifest exchange.
 
 When MX_P2P_METADATA=1, each source worker starts a WorkerGrpcServer
 that serves its tensor descriptors directly to target workers via the
-GetTensorManifest RPC. This avoids storing MB-scale tensor lists in the
-central metadata server.
+GetTensorManifest RPC. Artifact sources can serve their sealed file manifest
+through GetArtifactManifestHeader/GetArtifactManifestChunks without adding byte
+transfer to this service.
 """
 
 from __future__ import annotations
 
 import logging
 from concurrent import futures
+from collections.abc import Mapping
 
 import grpc
 
@@ -22,9 +24,14 @@ from .. import p2p_pb2_grpc
 
 logger = logging.getLogger("modelexpress.metadata.worker_server")
 
+# Number of chunk metadata records per GetArtifactManifestChunks response.
+# This is not the artifact byte chunk size; 1024 keeps metadata responses bounded
+# while avoiding one RPC per transfer chunk.
+_ARTIFACT_CHUNK_METADATA_PAGE_SIZE = 1024
+
 
 class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
-    """Serves tensor descriptors for a single source worker."""
+    """Serves manifests for a single source worker."""
 
     def __init__(
         self,
@@ -33,20 +40,17 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
+        artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
         self._worker_rank = worker_rank
+        self._artifact_manifests = dict(artifact_manifests or {})
 
     def GetTensorManifest(self, request, context):
-        if request.mx_source_id and request.mx_source_id != self._mx_source_id:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
-                f"mx_source_id mismatch: expected {self._mx_source_id}, "
-                f"got {request.mx_source_id}",
-            )
+        self._validate_mx_source_id(request.mx_source_id, context)
         response = p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
             mx_source_id=self._mx_source_id,
@@ -60,9 +64,99 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         )
         return response
 
+    def GetArtifactManifestHeader(self, request, context):
+        self._validate_mx_source_id(request.mx_source_id, context)
+        artifact_id, manifest = self._select_artifact_manifest(
+            request.artifact_id,
+            context,
+        )
+        response = p2p_pb2.GetArtifactManifestHeaderResponse(
+            mx_source_id=self._mx_source_id,
+            artifact_id=artifact_id,
+            manifest_version=manifest.manifest_version,
+            mx_source_type=manifest.mx_source_type,
+            total_size=sum(file.size for file in manifest.files),
+            file_count=len(manifest.files),
+            chunk_count=len(manifest.chunks),
+            chunk_size=manifest.chunk_size,
+            metadata_endpoint=self._metadata_endpoint,
+            agent_name=self._agent_name,
+            worker_rank=self._worker_rank,
+            files=manifest.files,
+        )
+        logger.info(
+            f"GetArtifactManifestHeader served: {len(manifest.files)} files, "
+            f"{response.ByteSize()} bytes"
+        )
+        return response
+
+    def GetArtifactManifestChunks(self, request, context):
+        self._validate_mx_source_id(request.mx_source_id, context)
+        artifact_id, manifest = self._select_artifact_manifest(
+            request.artifact_id,
+            context,
+        )
+        start = request.start_chunk_index
+        if start > len(manifest.chunks):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"start_chunk_index {start} exceeds chunk_count {len(manifest.chunks)}",
+            )
+        max_chunks = min(
+            request.max_chunks or _ARTIFACT_CHUNK_METADATA_PAGE_SIZE,
+            _ARTIFACT_CHUNK_METADATA_PAGE_SIZE,
+        )
+        end = min(start + max_chunks, len(manifest.chunks))
+        response = p2p_pb2.GetArtifactManifestChunksResponse(
+            mx_source_id=self._mx_source_id,
+            artifact_id=artifact_id,
+            start_chunk_index=start,
+            chunks=manifest.chunks[start:end],
+            next_page_token=str(end) if end < len(manifest.chunks) else "",
+        )
+        logger.info(
+            f"GetArtifactManifestChunks served: chunks {start}:{end} of "
+            f"{len(manifest.chunks)}, {response.ByteSize()} bytes"
+        )
+        return response
+
+    def _select_artifact_manifest(
+        self,
+        artifact_id: str,
+        context,
+    ) -> tuple[str, p2p_pb2.ArtifactManifest]:
+        if not self._artifact_manifests:
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                "artifact manifest is not available for this worker",
+            )
+        if not artifact_id:
+            if len(self._artifact_manifests) != 1:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    "artifact_id is required when multiple artifact manifests are available",
+                )
+            artifact_id = next(iter(self._artifact_manifests))
+
+        manifest = self._artifact_manifests.get(artifact_id)
+        if manifest is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"artifact_id not available: {artifact_id}",
+            )
+        return artifact_id, manifest
+
+    def _validate_mx_source_id(self, mx_source_id: str, context) -> None:
+        if mx_source_id and mx_source_id != self._mx_source_id:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"mx_source_id mismatch: expected {self._mx_source_id}, "
+                f"got {mx_source_id}",
+            )
+
 
 class WorkerGrpcServer:
-    """Manages a gRPC server for the WorkerService on a source worker."""
+    """Manages a gRPC WorkerService on a source worker."""
 
     def __init__(
         self,
@@ -72,6 +166,7 @@ class WorkerGrpcServer:
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
+        artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
@@ -79,6 +174,7 @@ class WorkerGrpcServer:
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
         self._worker_rank = worker_rank
+        self._artifact_manifests = dict(artifact_manifests or {})
         self._server: grpc.Server | None = None
         self._port: int | None = None
 
@@ -95,6 +191,7 @@ class WorkerGrpcServer:
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
+            artifact_manifests=self._artifact_manifests,
         )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, self._server)
 
@@ -139,3 +236,52 @@ def fetch_tensor_manifest(
         f"({response_bytes} bytes)"
     )
     return list(response.tensors), response_bytes
+
+
+def fetch_artifact_manifest_header(
+    endpoint: str,
+    mx_source_id: str,
+    artifact_id: str = "",
+    timeout: float = 5.0,
+) -> tuple[p2p_pb2.GetArtifactManifestHeaderResponse, int]:
+    """Fetch a sealed artifact manifest header directly from a source worker."""
+    with grpc.insecure_channel(endpoint) as channel:
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        request = p2p_pb2.GetArtifactManifestHeaderRequest(
+            mx_source_id=mx_source_id,
+            artifact_id=artifact_id,
+        )
+        response = stub.GetArtifactManifestHeader(request, timeout=timeout)
+        response_bytes = response.ByteSize()
+    logger.info(
+        f"Fetched artifact manifest header {response.artifact_id} from worker at "
+        f"{endpoint} ({response_bytes} bytes)"
+    )
+    return response, response_bytes
+
+
+def fetch_artifact_manifest_chunks(
+    endpoint: str,
+    mx_source_id: str,
+    artifact_id: str,
+    start_chunk_index: int = 0,
+    max_chunks: int = 0,
+    timeout: float = 5.0,
+) -> tuple[p2p_pb2.GetArtifactManifestChunksResponse, int]:
+    """Fetch one sealed artifact manifest chunk page from a source worker."""
+    with grpc.insecure_channel(endpoint) as channel:
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        request = p2p_pb2.GetArtifactManifestChunksRequest(
+            mx_source_id=mx_source_id,
+            artifact_id=artifact_id,
+            start_chunk_index=start_chunk_index,
+            max_chunks=max_chunks,
+        )
+        response = stub.GetArtifactManifestChunks(request, timeout=timeout)
+        response_bytes = response.ByteSize()
+    logger.info(
+        f"Fetched artifact manifest chunks {start_chunk_index}:"
+        f"{start_chunk_index + len(response.chunks)} for {response.artifact_id} "
+        f"from worker at {endpoint} ({response_bytes} bytes)"
+    )
+    return response, response_bytes
