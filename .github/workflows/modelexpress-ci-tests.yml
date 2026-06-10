@@ -187,6 +187,8 @@ jobs:
             dockerfile: ci/k8s/client/trt-llm/Dockerfile
           - framework: sglang
             dockerfile: ci/k8s/client/sgl/Dockerfile
+          - framework: sglang-mooncake
+            dockerfile: ci/k8s/client/sgl/Dockerfile.mooncake
           - framework: dynamo-vllm
             dockerfile: ci/k8s/client/vllm/dynamo/Dockerfile
 
@@ -310,12 +312,10 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      # Raise alongside the matrix size as new frameworks land. Practical
-      # ceiling is min(matrix size, runner pool size, allocatable rdma/ib
-      # per node). Per-namespace podAntiAffinity lets matrix entries
-      # co-locate on the same hosts, so node count is not the binding
-      # constraint; IB device count per node is.
-      max-parallel: 3
+      # No max-parallel cap: all P2P framework entries run concurrently. The
+      # a100a pool (where every test-p2p entry's source+target land) has the
+      # headroom for the per-entry 2-GPU footprint; the scarce non-MIG pool
+      # that constrains test-tp is a separate concern handled in that job.
       matrix:
         include:
           - framework: vllm
@@ -345,6 +345,22 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8005"
             worker_port: "8006"
+          # Same SGLang P2P test as above, but over the Mooncake TransferEngine
+          # transport instead of NIXL. The v0.5.12 base reimplemented
+          # ModelExpress natively in SGLang as an asymmetric seed/client split,
+          # so the manifest branches on JOB_NAME (seed loads from disk + starts
+          # the TransferEngine + publishes; client pulls). The per-rank NIXL
+          # agent assertion is skipped via --transport, and the transfer marker
+          # is SGLang's client-side "ModelExpress: weight transfer complete" log.
+          - framework: sglang-mooncake
+            namespace: mx-ci-sglang-mooncake-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure-mooncake.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--p2p-marker 'ModelExpress: weight transfer complete' --transport transfer_engine"
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8007"
+            worker_port: "8008"
 
     steps:
       - name: Checkout
