@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# cargo-about configuration for generating the Rust section of NOTICES.
+# The accepted list is kept in lockstep with deny.toml's [licenses].allow so
+# the attribution generator and the cargo-deny CI gate agree on policy.
+
+# Resolve the dependency graph for the platforms the server binaries ship on.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Runtime dependencies only: build- and dev-only crates do not ship in the
+# release binaries, so they are excluded from attributions.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+accepted = [
+    "MIT-0",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "OpenSSL",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+]

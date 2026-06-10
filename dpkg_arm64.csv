@@ -1,0 +1,6 @@
+type,name,version,spdx_license
+dpkg,ca-certificates,20240203,GPL-2.0-or-later AND MPL-2.0
+dpkg,gpgv,2.4.4-2ubuntu17.4,GPL-3.0-or-later
+dpkg,libssl-dev,3.0.13-0ubuntu3.7,Apache-2.0
+dpkg,libssl3t64,3.0.13-0ubuntu3.7,Apache-2.0
+dpkg,openssl,3.0.13-0ubuntu3.7,Apache-2.0
