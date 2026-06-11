@@ -7,6 +7,11 @@ import re
 
 from google.protobuf import __version__ as _pb_version
 
+from modelexpress import p2p_pb2
+from modelexpress.metadata.payload import (
+    tensor_source_metadata,
+    worker_tensor_descriptors,
+)
 from modelexpress.types import TensorDescriptor, WorkerMetadata, GetMetadataResponse
 
 
@@ -94,6 +99,44 @@ class TestWorkerMetadata:
         assert metadata.worker_rank == 0
         assert len(metadata.tensors) == 3
         assert metadata.nixl_metadata == b"test_metadata"
+
+    def test_worker_tensor_descriptors_prefers_tensor_source(self):
+        legacy = p2p_pb2.TensorDescriptor(name="legacy", addr=1, size=1)
+        current = p2p_pb2.TensorDescriptor(name="current", addr=2, size=2)
+        worker = p2p_pb2.WorkerMetadata(
+            tensors=[legacy],
+            tensor_source=tensor_source_metadata([current]),
+        )
+
+        tensors = worker_tensor_descriptors(worker)
+
+        assert len(tensors) == 1
+        assert tensors[0].name == "current"
+
+    def test_worker_tensor_descriptors_falls_back_to_legacy_tensors(self):
+        legacy = p2p_pb2.TensorDescriptor(name="legacy", addr=1, size=1)
+        worker = p2p_pb2.WorkerMetadata(tensors=[legacy])
+
+        tensors = worker_tensor_descriptors(worker)
+
+        assert len(tensors) == 1
+        assert tensors[0].name == "legacy"
+
+    def test_worker_tensor_descriptors_returns_empty_for_artifact_source(self):
+        legacy = p2p_pb2.TensorDescriptor(name="legacy", addr=1, size=1)
+        worker = p2p_pb2.WorkerMetadata(
+            tensors=[legacy],
+            artifact_source=p2p_pb2.ArtifactSourceMetadata(
+                artifact_id="artifact",
+                total_size=128,
+                file_count=1,
+                chunk_count=1,
+            ),
+        )
+
+        tensors = worker_tensor_descriptors(worker)
+
+        assert len(tensors) == 0
 
 
 class TestGetMetadataResponse:

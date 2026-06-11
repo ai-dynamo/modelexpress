@@ -1,0 +1,738 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress K8s CI.
+#
+# Nine jobs:
+#   build-server        — builds and pushes the MX coordination server image
+#                         from ci/k8s/server/Dockerfile.server. Runs on the
+#                         self-hosted builder runner
+#                         (prod-modelexpress-builder-amd-v1).
+#
+#   build-client        — matrix over inference engine frameworks (vllm,
+#                         trt-llm, sglang, dynamo-vllm); builds and pushes
+#                         one worker image per framework. Runs on the
+#                         self-hosted builder runner. All build jobs run in
+#                         parallel.
+#
+#   ensure-vcluster     — bootstraps the persistent mx-ci-cluster vCluster on
+#                         first run (no-ops on re-runs). Runs in parallel with
+#                         the build jobs.
+#
+#   test-p2p            — matrix over frameworks; needs build-client,
+#                         build-server, and ensure-vcluster. Each matrix entry
+#                         creates its own isolated namespace, deploys a full
+#                         stack (mx-server + workers), runs pytest, then
+#                         deletes the namespace. Currently sequential
+#                         (max-parallel: 1); remove that line to run in
+#                         parallel once each framework has been validated
+#                         independently.
+#
+#   test-tp             — TP > 1 variant of test-p2p. Matrix covers
+#                         single-node TP=2 (one Job, two GPUs per pod,
+#                         pinned to a non-MIG GPU pool via nodeSelector)
+#                         and multi-node TP=2 (StatefulSet + Ray, one
+#                         GPU per pod, 2 pods per role). See TEST_PLAN
+#                         row 5.1 for the full topology rationale.
+#
+#   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
+#                         Matrix over serving topology (aggregated /
+#                         disaggregated). Different shape than test-p2p (DGD CR
+#                         + grove-managed pods, not a raw K8s Job), so it's
+#                         its own top-level job rather than a test-p2p matrix
+#                         entry. Relies on the cluster-wide Dynamo operator
+#                         installed in dynamo-system by setup-mx-vcluster.
+#
+#   test-stale-metadata — Reaper-correctness check. mx-server runs with the
+#                         Redis backend (sidecar) and compressed reaper knobs
+#                         (heartbeat=30s, scan=10s); a single source pod
+#                         publishes, the action force-kills it, and pytest
+#                         asserts ListSources(status_filter=READY) returns 0
+#                         after the heartbeat window. Matrix over framework
+#                         (vllm / sglang). No target pod — the assertion runs
+#                         against mx-server directly via gRPC.
+#
+#   model-streamer       — matrix over frameworks; single worker pod, no
+#                          vCluster, no P2P. Streams weights directly from S3
+#                          via runai-model-streamer + IRSA. Validates the
+#                          streamer path independently of the P2P plumbing.
+#                          Only vllm is active today — the SGLang adapter's
+#                          streamer path currently crashes inside
+#                          ModelStreamerStrategy.load on
+#                          `ctx.model_config.model` (vLLM-specific attribute),
+#                          and the composite action also hard-codes vLLM's
+#                          launch command. Uncomment the sglang matrix entry
+#                          once both are addressed.
+#
+#   ci-status-check     — umbrella job that needs every gating job above.
+#                         Single check that the branch-protection rule on
+#                         `main` requires; adding a new gating job means
+#                         appending it to this job's `needs:` list, no
+#                         branch-protection reconfigure needed.
+#
+# To add a new inference engine:
+#   1. Add ci/k8s/client/<engine>/Dockerfile
+#   2. Add ci/k8s/client/<engine>/manifest-*.yaml + test_p2p_k8s.py
+#   3. Add an entry to the build-client and test-p2p matrix include lists below.
+#   4. If the engine's S3 streamer path works end-to-end, add the framework to
+#      the model-streamer matrix and generalize the run-mx-streamer-test
+#      composite action to dispatch on framework.
+#   5. If the engine also runs under a Dynamo DGD (`dynamo-<engine>`), add it
+#      to the build-client matrix with the dynamo-specific Dockerfile and
+#      consider extending test-with-dynamo to a matrix.
+#   6. If you add a new top-level test job (not just a matrix entry), add
+#      its job key to `ci-status-check`'s `needs:` list so it's covered by
+#      the branch-protection gate.
+#
+# Required secrets:
+#   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
+#   NGC_API_KEY                   — push/pull registry images
+#   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
+
+name: ModelExpress CI Tests
+
+on:
+  # copy-pr-bot mediated trigger. Direct `pull_request:` events are forbidden
+  # on self-hosted runners (PR-head code is untrusted); copy-pr-bot
+  # copies a PR's content to `pull-request/<N>` in this repo AFTER a
+  # maintainer approves (or all commits are GPG-signed by Nvidians), and
+  # the push to that internal branch is what fires this workflow.
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+concurrency:
+  # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so
+  # consecutive pushes to the same PR cancel earlier runs but pushes to
+  # different PRs don't fight for the same group.
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  VCLUSTER_NAME: mx-ci-cluster
+  VCLUSTER_NAMESPACE: mx-ci
+  MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
+  MX_CI_S3_REGION: us-east-1
+  MX_IMAGE_REPO: nvcr.io/nvidian/dynamo-dev
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the MX coordination server image from source.
+  # Image tag convention: <MX_IMAGE_REPO>/mx-server:<sha>
+  # Uses a public ubuntu:24.04 runtime base — no NGC org access required.
+  # ---------------------------------------------------------------------------
+  build-server:
+    name: Build server image
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute SERVER_IMAGE
+        # Persist the tag in $GITHUB_ENV so both the build step and the
+        # cleanup step reference the same value without re-templating.
+        run: |
+          echo "SERVER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f ci/k8s/server/Dockerfile.server \
+            -t "${SERVER_IMAGE}" \
+            --push \
+            .
+
+      - name: Cleanup local image
+        # buildx with --push typically doesn't materialize a local image,
+        # but reap defensively in case the buildx driver was switched.
+        # `if: always()` survives failure + cancel-in-progress so the
+        # self-hosted builder runner's Docker daemon doesn't accumulate
+        # stale images across runs.
+        if: always()
+        run: |
+          docker image rm -f "${SERVER_IMAGE}" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Build one worker image per inference engine framework.
+  # Image tag convention: <MX_IMAGE_REPO>/mx-worker-<framework>:<sha>
+  # The test job reconstructs this tag from the same inputs — no job output needed.
+  # ---------------------------------------------------------------------------
+  build-client:
+    name: Build worker image (${{ matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            dockerfile: ci/k8s/client/vllm/Dockerfile
+          - framework: trt-llm
+            dockerfile: ci/k8s/client/trt-llm/Dockerfile
+          - framework: sglang
+            dockerfile: ci/k8s/client/sgl/Dockerfile
+          - framework: sglang-mooncake
+            dockerfile: ci/k8s/client/sgl/Dockerfile.mooncake
+          - framework: dynamo-vllm
+            dockerfile: ci/k8s/client/vllm/dynamo/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compute WORKER_IMAGE
+        # Persist the tag in $GITHUB_ENV so both the build step and the
+        # cleanup step reference the same value without re-templating.
+        run: |
+          echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build and push
+        # Build context is repo root — Dockerfiles COPY from modelexpress_client/python/.
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -f "${{ matrix.dockerfile }}" \
+            -t "${WORKER_IMAGE}" \
+            --push \
+            .
+
+      - name: Cleanup local image
+        # buildx with --push typically doesn't materialize a local image,
+        # but reap defensively in case the buildx driver was switched.
+        # `if: always()` survives failure + cancel-in-progress so the
+        # self-hosted builder runner's Docker daemon doesn't accumulate
+        # stale images across runs (each matrix entry adds a multi-GB image).
+        if: always()
+        run: |
+          docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Ensure the persistent vCluster is ready.
+  # Bootstraps on first run, no-ops on re-runs.  Runs in parallel with build
+  # jobs — the vCluster does not depend on any built image.
+  # ---------------------------------------------------------------------------
+  ensure-vcluster:
+    name: Ensure vCluster
+    runs-on: prod-modelexpress-builder-amd-v1
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check if vCluster exists
+        id: vcluster-check
+        uses: ./.github/actions/check-vcluster-exists
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Bootstrap vCluster (first run only)
+        if: steps.vcluster-check.outputs.exists != 'true'
+        uses: ./.github/actions/setup-mx-vcluster
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Connect to vCluster
+        # Always connect — verifies the vCluster is accessible on re-runs
+        # where bootstrap was skipped.
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: vCluster baseline health
+        # Snapshot vCluster control-plane state before any test job runs. When
+        # downstream jobs fail with "connection refused" mid-run, this baseline
+        # tells us whether the vCluster was already showing signs of strain
+        # (restarts, OOMs, evictions, low headroom) or was healthy at the start
+        # — pointing the investigation at either cluster-health or test-load.
+        # Same action is invoked with `if: failure()` from each test job to
+        # capture state at the moment a test failed (which may post-date
+        # this baseline).
+        if: always()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Run P2P weight-transfer test for each framework.
+  # Each matrix job creates its own namespace for full isolation, allowing
+  # parallel execution in the future (remove max-parallel: 1 to enable).
+  # ---------------------------------------------------------------------------
+  test-p2p:
+    name: P2P test (${{ matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # No max-parallel cap: all P2P framework entries run concurrently. The
+      # a100a pool (where every test-p2p entry's source+target land) has the
+      # headroom for the per-entry 2-GPU footprint; the scarce non-MIG pool
+      # that constrains test-tp is a separate concern handled in that job.
+      matrix:
+        include:
+          - framework: vllm
+            namespace: mx-ci-vllm-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8001"
+            worker_port: "8002"
+          - framework: trt-llm
+            namespace: mx-ci-trt-llm-${{ github.run_id }}
+            manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
+            source_extra_env: |
+              JOB_NAME=mx-source
+              MODEL_EXPRESS_SOURCE=1
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8003"
+            worker_port: "8004"
+          - framework: sglang
+            namespace: mx-ci-sglang-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8005"
+            worker_port: "8006"
+          # Same SGLang P2P test as above, but over the Mooncake TransferEngine
+          # transport instead of NIXL. The v0.5.12 base reimplemented
+          # ModelExpress natively in SGLang as an asymmetric seed/client split,
+          # so the manifest branches on JOB_NAME (seed loads from disk + starts
+          # the TransferEngine + publishes; client pulls). The per-rank NIXL
+          # agent assertion is skipped via --transport, and the transfer marker
+          # is SGLang's client-side "ModelExpress: weight transfer complete" log.
+          - framework: sglang-mooncake
+            namespace: mx-ci-sglang-mooncake-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure-mooncake.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--p2p-marker 'ModelExpress: weight transfer complete' --transport transfer_engine"
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8007"
+            worker_port: "8008"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P RDMA transfer test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ${{ matrix.test_script }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: ${{ matrix.source_extra_env }}
+          extra_env: ${{ matrix.extra_env }}
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          pytest_args: ${{ matrix.pytest_args }}
+
+      - name: Dump vCluster diagnostics on failure
+        # Captures vCluster control-plane state at the moment of failure
+        # (pod status, recent events, syncer logs, controller-identity
+        # overlay) — surfaces infra-side disruption that may be the real
+        # cause rather than the test itself.
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # P2P weight transfer with tensor parallelism > 1.
+  # Single-node TP: each pod has N GPUs and runs the engine with
+  # --tensor-parallel-size N. Source and target on different hosts (existing
+  # podAntiAffinity) so RDMA still goes over IB cross-host, not loopback.
+  # Multi-node TP coverage is a follow-up — would slot in here as additional
+  # matrix entries once the cluster + manifests support it.
+  #
+  # Pinned to the right agentpool (2 nodes, full physical GPUs,
+  # `mig.config=all-disabled`) via the nodeSelector in
+  # manifest-azure-tp2.yaml.
+  # ---------------------------------------------------------------------------
+  test-tp:
+    name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            tp_size: 2
+            topology: single-node
+            namespace: mx-ci-vllm-tp2-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
+
+          # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
+          # manifest header for the cross-host pod-pairing rationale.
+          - framework: vllm
+            tp_size: 2
+            topology: multi-node
+            namespace: mx-ci-vllm-multinode-tp2-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-multi-node-tp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P RDMA transfer test (TP > 1)
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          tp_size: ${{ matrix.tp_size }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Dynamo aggregated-serving P2P test — DGD lifecycle (apply / scale / wait)
+  # against the cluster-wide Dynamo operator installed in dynamo-system by
+  # setup-mx-vcluster. Different shape than test-p2p (DGD CR + grove-managed
+  # pods, not a raw Job), so it lives as its own top-level job rather than a
+  # matrix entry of test-p2p.
+  # ---------------------------------------------------------------------------
+  test-with-dynamo:
+    name: P2P test with Dynamo (${{ matrix.mode }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: aggregated
+            manifest: ci/k8s/client/vllm/dynamo/manifest-azure-aggregated.yaml
+            namespace: mx-ci-dynamo-agg-${{ github.run_id }}
+            dgd_name: mx-dynamo-agg-${{ github.run_id }}
+          - mode: disaggregated
+            manifest: ci/k8s/client/vllm/dynamo/manifest-azure-disaggregated.yaml
+            namespace: mx-ci-dynamo-disagg-${{ github.run_id }}
+            dgd_name: mx-dynamo-disagg-${{ github.run_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run Dynamo P2P test
+        uses: ./.github/actions/run-mx-dynamo-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          # DGD name shared with the action input AND the manifest's envsubst
+          # placeholder, so all three (kubectl patch/delete, manifest
+          # metadata.name, derived service refs) stay in sync.
+          namespace: ${{ matrix.namespace }}
+          dgd_name: ${{ matrix.dgd_name }}
+          manifest: ${{ matrix.manifest }}
+          mode: ${{ matrix.mode }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-dynamo-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stale-metadata test (row 18) — single source pod, no target, mx-server
+  # deployed with the Redis backend + compressed reaper knobs. After the
+  # source publishes, we force-kill it and assert that the server stops
+  # returning it as READY within ~60s. Matrix over framework so we catch
+  # framework-specific publish-path regressions in the reaper flow.
+  # ---------------------------------------------------------------------------
+  test-stale-metadata:
+    name: Stale metadata test (${{ matrix.framework }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            namespace: mx-ci-stale-vllm-${{ github.run_id }}
+            source_port: "8011"
+          - framework: sglang
+            manifest: ci/k8s/client/sgl/manifest-azure.yaml
+            namespace: mx-ci-stale-sgl-${{ github.run_id }}
+            source_port: "8012"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run stale-metadata test
+        uses: ./.github/actions/run-mx-stale-metadata-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          source_port: ${{ matrix.source_port }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Model Streamer S3 test — single worker pod, no vCluster, no P2P.
+  # Streams weights directly from S3 via runai-model-streamer.
+  # IRSA provides S3 access; first run uploads safetensors to the bucket.
+  #
+  # Matrix over inference engine frameworks. The composite action
+  # (run-mx-streamer-test) currently only knows how to launch vLLM; when
+  # adding a new framework, generalize the action (or add a per-framework
+  # variant) before un-commenting the matrix entry below.
+  # ---------------------------------------------------------------------------
+  model-streamer:
+    name: Model Streamer test (${{ matrix.framework }}, S3)
+    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    needs: [build-client]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+          # sglang — blocked on the SGLang streamer path crashing inside
+          # ModelStreamerStrategy.load on `ctx.model_config.model` (a
+          # vLLM-specific attribute). See the workflow header comment.
+          # The composite action also needs to grow a framework-aware
+          # launch command (currently hardcodes
+          # `-m vllm.entrypoints.openai.api_server`). Uncomment once both
+          # are addressed.
+          # - framework: sglang
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Run model streamer test
+        uses: ./.github/actions/run-mx-streamer-test
+        with:
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          model: ${{ env.MX_CI_MODEL }}
+          s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
+          s3_region: ${{ env.MX_CI_S3_REGION }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Umbrella status check for branch protection.
+  #
+  # Aggregates the result of every gating job in this workflow into a single
+  # check that GitHub's branch-protection rule on `main` requires. The
+  # indirection lets us add or remove gating jobs by editing only the `needs:`
+  # list below — no need to update the branch-protection configuration in the
+  # GitHub repo settings every time.
+  #
+  # `if: always()` is load-bearing: without it, a failed dependency would
+  # mark this job as `skipped`, which GitHub branch protection treats as
+  # `pending` indefinitely, blocking the PR forever. With `always()`, the
+  # job runs and the bash check below decides pass/fail based on each
+  # dependency's `.result`.
+  #
+  # `success` and `skipped` are both accepted as "passing":
+  #   - `success` is the happy path
+  #   - `skipped` accommodates conditional jobs (e.g., a job behind a
+  #     changed-files filter that legitimately didn't need to run). None of
+  #     our gating jobs are skippable today, but the allowance future-proofs
+  #     the gate without forcing a reconfigure.
+  # ---------------------------------------------------------------------------
+  ci-status-check:
+    name: CI status check
+    runs-on: ubuntu-latest
+    needs:
+      - build-server
+      - build-client
+      - ensure-vcluster
+      - test-p2p
+      - test-tp
+      - test-with-dynamo
+      - test-stale-metadata
+      - model-streamer
+    if: always()
+    steps:
+      - name: All dependent jobs succeeded (or skipped)
+        run: |
+          echo '${{ toJson(needs) }}' \
+            | jq -e 'to_entries | map(.value.result) | all(. as $r | ["success", "skipped"] | any($r == .))'

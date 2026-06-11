@@ -205,7 +205,6 @@ securityContext:
 
 env:
   HOME: /root                   # Fix SSH host key path mismatch
-  UCX_TLS: "self,sm,rc,cuda_copy,gdr_copy,tcp"
   UCX_IB_GID_INDEX: "3"        # GCP RoCEv2 GID selection
   TRTLLM_UCX_INTERFACE: eth0    # Prevent 169.254.x.x binding
   OMPI_MCA_pml: ob1             # Bypass UCX UD for MPI

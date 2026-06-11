@@ -275,6 +275,100 @@ class TestAbstractMethodCompleteness:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
 
+    def test_loader_import_does_not_register_mx(self, monkeypatch):
+        import importlib
+        import vllm.model_executor.model_loader as model_loader
+
+        registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
+        registry.pop("mx", None)
+        monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
+
+        importlib.import_module("modelexpress.engines.vllm.loader")
+
+        assert "mx" not in model_loader._LOAD_FORMAT_TO_MODEL_LOADER
+
+    def test_plugin_registration_preserves_native_modelexpress(self, monkeypatch):
+        import importlib
+        import vllm.model_executor.model_loader as model_loader
+
+        sentinel = object()
+        registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
+        registry["modelexpress"] = sentinel
+        registry.pop("mx", None)
+        monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
+
+        registration = importlib.import_module(
+            "modelexpress.engines.vllm.registration"
+        )
+        patch_check = MagicMock()
+        registered = {}
+
+        def fake_register_model_loader(load_format):
+            def register(loader_cls):
+                registered[load_format] = loader_cls
+                return loader_cls
+
+            return register
+
+        monkeypatch.setattr(registration, "_patch_vllm_s3_format_check", patch_check)
+        monkeypatch.setattr(
+            registration,
+            "register_model_loader",
+            fake_register_model_loader,
+        )
+
+        registration.register_plugin_model_loader()
+
+        from modelexpress.engines.vllm.loader import MxModelLoader
+
+        patch_check.assert_called_once_with()
+        assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["modelexpress"] is sentinel
+        assert registered["mx"] is MxModelLoader
+        assert "modelexpress" not in registered
+
+    def test_plugin_registration_registers_load_formats_without_native_vllm(
+        self, monkeypatch
+    ):
+        import importlib
+        import vllm.model_executor.model_loader as model_loader
+
+        registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
+        registry.pop("mx", None)
+        registry.pop("modelexpress", None)
+        monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
+
+        registration = importlib.import_module(
+            "modelexpress.engines.vllm.registration"
+        )
+        patch_check = MagicMock()
+        registered = {}
+
+        def fake_register_model_loader(load_format):
+            def register(loader_cls):
+                registered[load_format] = loader_cls
+                return loader_cls
+
+            return register
+
+        monkeypatch.setattr(
+            registration,
+            "_patch_vllm_s3_format_check",
+            patch_check,
+        )
+        monkeypatch.setattr(
+            registration,
+            "register_model_loader",
+            fake_register_model_loader,
+        )
+
+        registration.register_plugin_model_loader()
+
+        from modelexpress.engines.vllm.loader import MxModelLoader
+
+        patch_check.assert_called_once_with()
+        assert registered["modelexpress"] is MxModelLoader
+        assert registered["mx"] is MxModelLoader
+
 
 # ---------------------------------------------------------------------------
 # register_tensors (load_strategy.base)
@@ -356,6 +450,143 @@ class TestRegisterTensorsErrorHandling:
         model = MagicMock()
         with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
             register_tensors(model, ctx)
+
+
+class TestRegisterTensorsReuseDiscovered:
+    """Verify the reuse_discovered flag skips adapter discovery.
+
+    Used on wake / CRIU-restore paths where the weight set is unchanged
+    since initial load. Skipping discovery avoids tripping on
+    post-warmup artifacts (e.g. torch._dynamo AOT compiled functions).
+    """
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_reuse_skips_discovery_when_ctx_has_tensors(self, mock_init, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        ctx.adapter.discover_tensors = MagicMock()
+        cached = {"weight_0": MagicMock(), "weight_1": MagicMock()}
+        ctx.tensors = cached
+
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+        ctx.adapter.discover_tensors.assert_not_called()
+        assert ctx.tensors is cached
+        mock_mgr.register_tensors.assert_called_once_with(cached)
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_reuse_falls_back_to_discovery_when_ctx_tensors_empty(
+        self, mock_init, _avail,
+    ):
+        """If reuse requested but no cache, fall through to discovery."""
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        fresh = {"fresh_w": MagicMock()}
+        ctx.adapter.discover_tensors = MagicMock(return_value=fresh)
+        # ctx.tensors defaults to {} in LoadContext.
+
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx, reuse_discovered=True)
+
+        ctx.adapter.discover_tensors.assert_called_once()
+        assert ctx.tensors == fresh
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_default_behavior_unchanged(self, mock_init, _avail):
+        """Default (reuse_discovered=False) must still run discovery."""
+        from modelexpress.load_strategy.base import register_tensors
+        mock_mgr = MagicMock()
+        mock_mgr.tensor_descriptors = []
+        mock_init.return_value = mock_mgr
+
+        ctx = _make_load_context()
+        fresh = {"w": MagicMock()}
+        ctx.adapter.discover_tensors = MagicMock(return_value=fresh)
+        # Pre-populate ctx.tensors so we can prove discovery still runs.
+        ctx.tensors = {"stale": MagicMock()}
+
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx)
+
+        ctx.adapter.discover_tensors.assert_called_once()
+        assert ctx.tensors == fresh
+
+
+class TestNixlTransferManagerDictOwnership:
+    """Verify shutdown does not mutate the caller's tensor dict.
+
+    The reuse_discovered=True path on wake relies on the caller's
+    ``ctx.tensors`` surviving across ``shutdown()`` so the next
+    ``register_tensors`` can re-register them. Earlier code aliased
+    the caller's dict (``self._tensors = tensors``) and then called
+    ``self._tensors.clear()`` in shutdown, silently wiping the
+    caller's dict.
+    """
+
+    def _make_manager(self):
+        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr._agent = MagicMock()
+        return mgr
+
+    def test_register_takes_shallow_copy_of_caller_dict(self):
+        mgr = self._make_manager()
+        t = MagicMock()
+        t.is_contiguous.return_value = True
+        t.data_ptr.return_value = 0x1000
+        t.numel.return_value = 1
+        t.element_size.return_value = 1
+        t.dtype = torch.float32
+        caller = {"w": t}
+
+        mgr._agent.get_local_md.return_value = b"meta"
+        mgr.register_tensors(caller)
+
+        assert mgr._tensors is not caller
+        assert mgr._tensors == caller  # same tensor values
+
+    def test_shutdown_does_not_clear_caller_dict(self):
+        mgr = self._make_manager()
+        t = MagicMock()
+        t.is_contiguous.return_value = True
+        t.data_ptr.return_value = 0x1000
+        t.numel.return_value = 1
+        t.element_size.return_value = 1
+        t.dtype = torch.float32
+        caller = {"w": t}
+
+        mgr._agent.get_local_md.return_value = b"meta"
+        mgr.register_tensors(caller)
+        mgr.shutdown()
+
+        assert caller == {"w": t}, "caller dict was mutated by shutdown"
+
+    def test_shutdown_rebinds_internal_containers(self):
+        """Defense in depth: even if a future caller aliases _tensors
+        directly, shutdown should rebind rather than mutate."""
+        mgr = self._make_manager()
+        aliased = {"w": MagicMock()}
+        mgr._tensors = aliased  # simulate hostile / future caller alias
+        mgr._tensor_descriptors = [MagicMock()]
+
+        mgr.shutdown()
+
+        assert aliased == {"w": aliased["w"]}, (
+            "shutdown mutated the externally-held dict via shared reference"
+        )
+        assert mgr._tensors == {}
+        assert mgr._tensor_descriptors == []
 
 
 class TestPublishMetadataErrorHandling:

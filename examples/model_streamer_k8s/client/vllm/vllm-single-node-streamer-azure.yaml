@@ -2,24 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Single-node vLLM deployment with ModelExpress ModelStreamer.
-# Streams weights from S3 via runai-model-streamer — no disk, no PVC.
+# Streams weights from Azure Blob Storage via runai-model-streamer; no model PVC.
 #
 # Prerequisites:
-#   - Model weights uploaded to S3 bucket
-#   - A vLLM image with ModelExpress and ModelStreamer support
-#   - kubectl create secret generic aws-creds \
-#       --from-literal=AWS_ACCESS_KEY_ID=<key> \
-#       --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
-#       --from-literal=AWS_SESSION_TOKEN=<token>
+#   - Model weights uploaded to Azure Blob Storage
+#   - A vLLM image with ModelExpress and vLLM >= 0.18.0
+#   - Azure credentials available to DefaultAzureCredential, for example:
+#     kubectl create secret generic azure-storage-creds \
+#       --from-literal=AZURE_STORAGE_ACCOUNT_NAME=<storage-account> \
+#       --from-literal=AZURE_CLIENT_ID=<client-id> \
+#       --from-literal=AZURE_TENANT_ID=<tenant-id> \
+#       --from-literal=AZURE_CLIENT_SECRET=<client-secret>
 #
-# For P2P RDMA serving after S3 load, also set MX_SERVER_ADDRESS
-# and add RDMA resources (rdma/ib), UCX env vars — see vllm-single-node-p2p.yaml.
+# The Azure identity needs at least Storage Blob Data Reader on the storage account
+# or container. For AKS workload identity, replace envFrom with the appropriate
+# serviceAccountName/annotations and keep AZURE_STORAGE_ACCOUNT_NAME available.
+#
+# For P2P RDMA serving after Azure Blob load, also set MX_SERVER_ADDRESS
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/vllm/.
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-vllm-s3
+  name: mx-vllm-azure
   labels:
-    app: mx-vllm-s3
+    app: mx-vllm-azure
 spec:
   type: ClusterIP
   ports:
@@ -27,23 +34,23 @@ spec:
       targetPort: 8000
       name: http
   selector:
-    app: mx-vllm-s3
+    app: mx-vllm-azure
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-vllm-s3
+  name: mx-vllm-azure
   labels:
-    app: mx-vllm-s3
+    app: mx-vllm-azure
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-vllm-s3
+      app: mx-vllm-azure
   template:
     metadata:
       labels:
-        app: mx-vllm-s3
+        app: mx-vllm-azure
     spec:
       tolerations:
         - key: nvidia.com/gpu
@@ -52,7 +59,7 @@ spec:
       containers:
         - name: vllm
           # Use a vLLM + ModelExpress client image.
-          image: <your-registry>/modelexpress-client:latest
+          image: <your-registry>/modelexpress-client-vllm0180:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
@@ -63,31 +70,30 @@ spec:
               value: "7200000"
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
-            # S3 path format: s3://<bucket>/<model-prefix>
+            # Azure Blob path format: az://<container>/<model-prefix>
             - name: MX_MODEL_URI
-              value: "s3://my-bucket/deepseek-ai/DeepSeek-V3"
-            - name: AWS_DEFAULT_REGION
-              value: "us-west-2"
+              value: "az://models/models/deepseek-ai/DeepSeek-V3"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_MS_DISTRIBUTED
               value: "1"
             - name: RUNAI_STREAMER_CONCURRENCY
               value: "32"
-            # Optional: enable P2P serving after S3 load (requires MX server + RDMA)
+            # Optional: enable P2P serving after Azure Blob load (requires MX server + RDMA)
             # - name: MX_SERVER_ADDRESS
             #   value: "modelexpress-server:8001"
-          # AWS credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)
+          # Azure credentials for DefaultAzureCredential.
+          # For workload identity, use serviceAccountName/annotations instead.
           envFrom:
             - secretRef:
-                name: aws-creds
+                name: azure-storage-creds
           args:
             - --model
             - $(MX_MODEL_URI)
             - --served-model-name
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "8"
             - --enable-expert-parallel

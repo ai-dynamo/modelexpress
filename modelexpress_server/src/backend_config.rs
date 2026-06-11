@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared backend selection for distributed stores (Redis and Kubernetes CRDs).
+//! Shared backend selection for the metadata stores (Redis, Kubernetes CRDs, and an
+//! in-memory backend behind the `memory-backend` feature for tests and local dev).
 //!
 //! A single `BackendConfig` type and a single env var (`MX_METADATA_BACKEND`) drive both
 //! the P2P metadata backend and the model registry backend. Deployments that need one
@@ -17,6 +18,9 @@ pub enum BackendConfig {
     Redis { url: String },
     /// Kubernetes CRD backend — native K8s integration
     Kubernetes { namespace: String },
+    /// In-memory backend for tests and local dev (off in production).
+    #[cfg(feature = "memory-backend")]
+    Memory,
 }
 
 impl std::fmt::Display for BackendConfig {
@@ -24,6 +28,8 @@ impl std::fmt::Display for BackendConfig {
         match self {
             Self::Redis { .. } => write!(f, "redis"),
             Self::Kubernetes { .. } => write!(f, "kubernetes"),
+            #[cfg(feature = "memory-backend")]
+            Self::Memory => write!(f, "memory"),
         }
     }
 }
@@ -32,7 +38,7 @@ impl BackendConfig {
     /// Create backend config from `MX_METADATA_BACKEND`. Used by both the P2P state
     /// manager and the registry manager so they share a single env-var contract.
     ///
-    /// Valid values: `redis`, `kubernetes` | `k8s` | `crd`.
+    /// Valid values: `redis`, `kubernetes` | `k8s` | `crd`, `memory`.
     ///
     /// Errors if `MX_METADATA_BACKEND` is unset/invalid, or if the connection env for
     /// the selected backend is missing (no silent fallback to `localhost:6379` /
@@ -46,9 +52,20 @@ impl BackendConfig {
             "kubernetes" | "k8s" | "crd" => Ok(Self::Kubernetes {
                 namespace: Self::k8s_namespace_from_env()?,
             }),
+            #[cfg(feature = "memory-backend")]
+            "memory" => Ok(Self::Memory),
             other => Err(format!(
-                "MX_METADATA_BACKEND='{other}' is not valid. Use 'redis' or 'kubernetes'."
+                "MX_METADATA_BACKEND='{other}' is not valid. {}",
+                Self::valid_backends_hint()
             )),
+        }
+    }
+
+    fn valid_backends_hint() -> &'static str {
+        if cfg!(feature = "memory-backend") {
+            "Use 'redis', 'kubernetes', or 'memory'."
+        } else {
+            "Use 'redis' or 'kubernetes'."
         }
     }
 
@@ -69,8 +86,11 @@ impl BackendConfig {
             "kubernetes" | "k8s" | "crd" => Ok(Self::Kubernetes {
                 namespace: k8s_namespace.to_string(),
             }),
+            #[cfg(feature = "memory-backend")]
+            "memory" => Ok(Self::Memory),
             other => Err(format!(
-                "{env_name}='{other}' is not valid. Use 'redis' or 'kubernetes'."
+                "{env_name}='{other}' is not valid. {}",
+                Self::valid_backends_hint()
             )),
         }
     }
@@ -134,16 +154,24 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_includes_env_name() {
-        let err = BackendConfig::from_type_str("MX_WHATEVER", "memory", "", "")
+        let err = BackendConfig::from_type_str("MX_WHATEVER", "sqlite", "", "")
             .expect_err("should reject");
         assert!(
             err.contains("MX_WHATEVER"),
             "error should name the env var: {err}"
         );
         assert!(
-            err.contains("'memory'"),
+            err.contains("'sqlite'"),
             "error should echo bad value: {err}"
         );
+    }
+
+    #[cfg(feature = "memory-backend")]
+    #[test]
+    fn parses_memory_backend() {
+        let cfg = BackendConfig::from_type_str("X", "memory", "", "").expect("memory");
+        assert!(matches!(cfg, BackendConfig::Memory));
+        assert_eq!(cfg.to_string(), "memory");
     }
 
     #[test]

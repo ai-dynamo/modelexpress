@@ -20,6 +20,15 @@ import json
 
 from .. import p2p_pb2
 
+_OPTIONAL_SOURCE_ID_FIELDS = (
+    "backend_framework_version",
+    "torch_version",
+    "cuda_version",
+    "triton_version",
+    "gpu_arch",
+    "compile_config_digest",
+)
+
 
 def compute_mx_source_id(identity: p2p_pb2.SourceIdentity) -> str:
     """Compute the 16-char hex ``mx_source_id`` for a ``SourceIdentity``.
@@ -60,6 +69,13 @@ def _canonical_json(identity: p2p_pb2.SourceIdentity) -> str:
         "extra_parameters": sorted_extra,
         "revision": identity.revision.lower(),
     }
+    # Include optional compatibility fields only when set. That preserves
+    # existing weight source IDs while letting artifact/cache sources split IDs
+    # by framework, compiler, CUDA, and GPU compatibility constraints.
+    for field in _OPTIONAL_SOURCE_ID_FIELDS:
+        value = getattr(identity, field)
+        if value:
+            payload[field] = value.lower()
     # Rust's serde_json::json! stores keys in a BTreeMap, which sorts
     # them alphabetically on serialization. Match that ordering with
     # sort_keys=True so both sides produce the exact same bytes for

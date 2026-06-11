@@ -1,0 +1,280 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Setup ModelExpress vCluster'
+description: |
+  Bootstraps a persistent vCluster on the host AKS cluster.
+  Only runs on first use — idempotent on re-runs via --upgrade.
+
+  Installs:
+    - ModelExpress CRD (cluster-scoped, one-time).
+    - Dynamo operator in `dynamo-system` (cluster-wide singleton). Per-run
+      actions (run-mx-dynamo-test) just apply DGDs into their own
+      namespace and rely on this operator to reconcile them. To upgrade
+      the operator on an existing vCluster without recreating it,
+      temporarily comment out the `if:` gate on the workflow's
+      "Bootstrap vCluster" step, push, then restore the gate.
+
+  All namespace-scoped resources (RBAC, secrets, mx-server) are managed
+  per test run by run-mx-p2p-test / run-mx-dynamo-test.
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for host cluster access'
+    required: true
+  vcluster_name:
+    description: 'Name for the vCluster instance'
+    required: false
+    default: 'mx-ci-cluster'
+  vcluster_namespace:
+    description: 'Host namespace where the vCluster will be created'
+    required: false
+    default: 'mx-ci'
+  vcluster_k8s_version:
+    description: 'Kubernetes version for the vCluster control plane'
+    required: false
+    default: 'v1.32.13'
+  dynamo_ref:
+    description: 'Git ref of the ai-dynamo/dynamo repo to clone for the helm chart'
+    required: false
+    default: 'main'
+  dynamo_operator_image:
+    description: |
+      Full Dynamo operator image repo (without tag). Defaults to the chart's
+      own default (the public NVIDIA release at
+      nvcr.io/nvidia/ai-dynamo/kubernetes-operator).
+    required: false
+    default: 'nvcr.io/nvidia/ai-dynamo/kubernetes-operator'
+  dynamo_operator_tag:
+    description: |
+      Tag for the Dynamo operator image. Pinned to a known-published
+      release because `dynamo_ref` defaults to `main`, where the chart's
+      AppVersion is a future-version-in-preparation that hasn't been
+      published to nvcr.io/nvidia/ai-dynamo/kubernetes-operator yet. Bump
+      to a newer version from https://github.com/ai-dynamo/dynamo/releases
+      when also bumping `dynamo_ref` to that release tag.
+    required: false
+    default: '1.0.2'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup host kubeconfig
+      shell: bash
+      env:
+        KUBECONFIG_BASE64: ${{ inputs.kubeconfig_base64 }}
+      run: |
+        echo "${KUBECONFIG_BASE64}" | base64 -d > "${GITHUB_WORKSPACE}/.kubeconfig-host"
+        chmod 600 "${GITHUB_WORKSPACE}/.kubeconfig-host"
+        echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-host" >> $GITHUB_ENV
+
+    - name: Install vCluster CLI
+      uses: ./.github/actions/install-vcluster-cli
+
+    - name: Create host namespace
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Create host namespace ${NAMESPACE}"
+        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label namespaces ${NAMESPACE} \
+          nscleanup/enabled=true \
+          nscleanup/ttl=604800 \
+          ngc-api=enabled \
+          nvcr-imagepull=enabled \
+          --overwrite
+        echo "::endgroup::"
+
+    - name: Delete existing vCluster (if any)
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Delete existing vCluster ${VCLUSTER_NAME} in ${NAMESPACE} (if present)"
+        # Idempotent: `vcluster delete` succeeds on a missing vCluster with
+        # `--ignore-not-found`.
+        vcluster delete "${VCLUSTER_NAME}" \
+          --namespace "${NAMESPACE}" \
+          --delete-namespace=false \
+          --ignore-not-found \
+          --wait || true
+        echo "::endgroup::"
+
+    - name: Create vCluster
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+        VCLUSTER_K8S_VERSION: ${{ inputs.vcluster_k8s_version }}
+      run: |
+        echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
+        # GPU workloads require syncing host nodes into the vCluster so the GPU
+        # device plugin and resource limits are visible to the scheduler.
+        vcluster create ${VCLUSTER_NAME} \
+          --namespace ${NAMESPACE} \
+          --connect=false \
+          --upgrade \
+          --set controlPlane.distro.k8s.enabled=true \
+          --set controlPlane.distro.k8s.version=${VCLUSTER_K8S_VERSION} \
+          --set sync.fromHost.nodes.enabled=true \
+          --set sync.fromHost.nodes.selector.all=true
+        echo "::endgroup::"
+
+    - name: Wait for vCluster pod to be ready
+      shell: bash
+      env:
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+      run: |
+        echo "::group::Wait for vCluster pod"
+        sleep 20
+        kubectl wait --for=condition=ready pod \
+          -l app=vcluster,release=${VCLUSTER_NAME} \
+          -n ${NAMESPACE} \
+          --timeout=900s
+        echo "::endgroup::"
+
+    - name: Connect to vCluster
+      uses: ./.github/actions/connect-vcluster
+      with:
+        host_kubeconfig_base64: ${{ inputs.kubeconfig_base64 }}
+        vcluster_name: ${{ inputs.vcluster_name }}
+        vcluster_namespace: ${{ inputs.vcluster_namespace }}
+
+    - name: Install ModelExpress CRD
+      shell: bash
+      run: |
+        echo "::group::Apply ModelExpress CRD inside vCluster"
+        # CRD is cluster-scoped — applied once here on bootstrap.
+        # run-mx-p2p-test also applies it on every run for idempotency.
+        kubectl --kubeconfig="${GITHUB_WORKSPACE}/.kubeconfig-vcluster" apply \
+          -f ci/k8s/server/crd-modelmetadata.yaml
+        echo "::endgroup::"
+
+    - name: Clone dynamo repo for operator helm chart
+      shell: bash
+      env:
+        DYNAMO_REF: ${{ inputs.dynamo_ref }}
+      run: |
+        echo "::group::Clone ai-dynamo/dynamo @ ${DYNAMO_REF} (shallow, sparse)"
+        DYNAMO_DIR="${RUNNER_TEMP}/dynamo"
+        rm -rf "${DYNAMO_DIR}"
+        git clone --depth 1 --filter=blob:none --sparse \
+          --branch "${DYNAMO_REF}" \
+          https://github.com/ai-dynamo/dynamo.git "${DYNAMO_DIR}"
+        cd "${DYNAMO_DIR}"
+        git sparse-checkout set deploy/helm
+        echo "DYNAMO_DIR=${DYNAMO_DIR}" >> "$GITHUB_ENV"
+        echo "::endgroup::"
+
+    - name: Install Dynamo operator (cluster-wide singleton)
+      shell: bash
+      env:
+        KUBECONFIG: ${{ github.workspace }}/.kubeconfig-vcluster
+        OPERATOR_IMAGE: ${{ inputs.dynamo_operator_image }}
+        OPERATOR_TAG: ${{ inputs.dynamo_operator_tag }}
+      run: |
+        echo "::group::Install Dynamo operator into dynamo-system"
+        # `helm dep build` needs every HTTP repository the platform chart
+        # references registered locally first. `file://` deps resolve from
+        # the working tree and `oci://` deps don't need a repo add (Helm
+        # 3.8+ pulls OCI inline). Current Chart.yaml lists bitnami + nats;
+        # keep this list in sync if upstream adds more.
+        helm repo add bitnami https://charts.bitnami.com/bitnami
+        helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+        helm repo update
+        cd "${DYNAMO_DIR}/deploy/helm/charts/platform"
+        helm dep build .
+
+        # Singleton install in dynamo-system. The operator's default
+        # WATCH_NAMESPACE is empty (cluster-wide), so it'll reconcile DGDs
+        # in any namespace that per-run actions later create. Cluster-
+        # scoped resources (ClusterRole, ClusterRoleBinding, CRDs) are
+        # owned by this single release — avoids the ownership conflicts
+        # that a per-run install would cause on the persistent vCluster.
+        # No imagePullSecret needed: the default operator image
+        # (nvcr.io/nvidia/ai-dynamo/kubernetes-operator) lives under the
+        # public `nvidia` NGC org and is pullable anonymously. The
+        # `worker-registry` secret used by test pods is created per-run by
+        # the test actions for our private nvcr.io/nvidian/dynamo-dev/*
+        # images, separately from this operator install.
+        kubectl create namespace dynamo-system --dry-run=client -o yaml \
+          | kubectl apply -f -
+
+        # Only override image.tag if explicitly provided; otherwise let
+        # the chart fall through to its AppVersion default (which matches
+        # the published release for the public kubernetes-operator path).
+        TAG_OVERRIDE=()
+        if [ -n "${OPERATOR_TAG}" ]; then
+          TAG_OVERRIDE=(--set "dynamo-operator.controllerManager.manager.image.tag=${OPERATOR_TAG}")
+        fi
+
+        helm upgrade --install dynamo-platform . \
+          --namespace dynamo-system \
+          --set dynamo-operator.controllerManager.manager.image.repository="${OPERATOR_IMAGE}" \
+          "${TAG_OVERRIDE[@]}" \
+          --set dynamo-operator.gpuDiscovery.enabled=false \
+          --set global.grove.install=true \
+          --set global.kai-scheduler.install=false \
+          --wait --timeout 10m --debug
+        echo "::endgroup::"
+
+    - name: Debug failure
+      if: failure()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.vcluster_namespace }}
+        VCLUSTER_NAME: ${{ inputs.vcluster_name }}
+      run: |
+        set +eo pipefail
+        echo "::group::Pod status (host namespace)"
+        kubectl get pods -n ${NAMESPACE} -o wide 2>&1 || true
+        echo "::endgroup::"
+        echo "::group::Events (host namespace)"
+        kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' 2>&1 || true
+        echo "::endgroup::"
+        VC_KC="${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
+        if [ -f "${VC_KC}" ]; then
+          echo "::group::Pod status (vCluster, all namespaces)"
+          kubectl --kubeconfig=${VC_KC} get pods -A -o wide 2>&1 || true
+          echo "::endgroup::"
+
+          # Dynamo-platform helm install often fails because:
+          #   1. No default StorageClass → etcd/NATS PVCs unbound forever.
+          #   2. Webhook cert-gen Job stuck → operator pod never Ready.
+          #   3. Image pulls (NGC / Docker Hub) timing out.
+          # Dump everything in dynamo-system so we can attribute the failure.
+          echo "::group::dynamo-system: helm release"
+          helm --kubeconfig=${VC_KC} list -n dynamo-system -a 2>&1 || true
+          helm --kubeconfig=${VC_KC} status dynamo-platform -n dynamo-system 2>&1 | head -60 || true
+          echo "::endgroup::"
+
+          echo "::group::dynamo-system: pods"
+          kubectl --kubeconfig=${VC_KC} get pods -n dynamo-system -o wide 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::dynamo-system: jobs (cert-gen, ca-inject, etc.)"
+          kubectl --kubeconfig=${VC_KC} get jobs -n dynamo-system 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::dynamo-system: PVCs (etcd / NATS need storage)"
+          kubectl --kubeconfig=${VC_KC} get pvc -n dynamo-system 2>&1 || true
+          echo "--- cluster StorageClasses ---"
+          kubectl --kubeconfig=${VC_KC} get storageclass 2>&1 || true
+          echo "::endgroup::"
+
+          echo "::group::dynamo-system: events (last 50, by time)"
+          kubectl --kubeconfig=${VC_KC} get events -n dynamo-system --sort-by='.lastTimestamp' 2>&1 | tail -50 || true
+          echo "::endgroup::"
+
+          echo "::group::dynamo-system: describe non-Running / non-Completed pods"
+          for POD in $(kubectl --kubeconfig=${VC_KC} get pods -n dynamo-system --no-headers 2>/dev/null \
+              | awk '$3 != "Running" && $3 != "Completed" {print $1}'); do
+            echo "--- ${POD} ---"
+            kubectl --kubeconfig=${VC_KC} describe pod -n dynamo-system "${POD}" 2>&1 | tail -40
+            echo ""
+          done
+          echo "::endgroup::"
+        fi

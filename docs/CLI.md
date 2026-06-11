@@ -72,7 +72,7 @@ modelexpress-cli --format json health
 ```
 Server Health Status
   Status: ok
-  Version: 0.1.0
+  Version: 0.4.0
   Uptime: 120 seconds
 ```
 
@@ -119,7 +119,11 @@ modelexpress-cli model list --detailed
 # Check model storage status
 modelexpress-cli model status
 
-# Clear specific model from storage
+# Clear specific model from storage. This removes the local files and also
+# deletes the model's record from the server-side registry, so a later
+# `model download` re-fetches the model instead of returning a false cache hit.
+# If the server is unreachable, the local files are still cleared and a warning
+# notes that the registry record may remain.
 modelexpress-cli model clear google-t5/t5-small
 
 # Clear a Google Cloud Storage model from storage
@@ -196,7 +200,7 @@ Colorized, structured output optimized for terminal viewing.
 Compact JSON output suitable for scripting:
 ```bash
 modelexpress-cli --format json health
-# Output: {"version":"0.1.0","status":"ok","uptime":120}
+# Output: {"version":"0.4.0","status":"ok","uptime":120}
 ```
 
 #### Pretty JSON
@@ -205,7 +209,7 @@ Formatted JSON with indentation:
 modelexpress-cli --format json-pretty health
 # Output:
 # {
-#   "version": "0.1.0",
+#   "version": "0.4.0",
 #   "status": "ok",
 #   "uptime": 120
 # }
@@ -386,7 +390,20 @@ modelexpress-cli model status
 
 ### Configuration File Support
 
-While the CLI doesn't currently support configuration files, you can create wrapper scripts:
+The CLI loads a YAML configuration file via `-c, --config <FILE>` (default
+`~/.model-express/config.yaml`). Values are merged in this order of precedence,
+highest first:
+
+1. Command line arguments
+2. Environment variables (`MODEL_EXPRESS_*`)
+3. Configuration file
+4. Built-in defaults
+
+```bash
+modelexpress-cli --config /etc/modelexpress/client.yaml health
+```
+
+Wrapper scripts remain a convenient option when you prefer fixed flags:
 
 ```bash
 #!/bin/bash
@@ -402,8 +419,10 @@ exec modelexpress-cli --endpoint "https://prod-server.com:8001" "$@"
 # Test with verbose output
 modelexpress-cli -vv health
 
-# Check network connectivity
-curl -v http://localhost:8001/health 2>&1 | grep -i connect
+# Check that the server's gRPC port is reachable. The server speaks gRPC,
+# not REST, so `curl http://localhost:8001/health` will not work; use a
+# TCP probe (or the CLI health command above).
+nc -vz localhost 8001
 ```
 
 ### Server Not Running
@@ -456,9 +475,9 @@ cargo test --bin modelexpress-cli
 
 The CLI is built using the `clap` crate with derive macros. To add new commands:
 
-1. Add the command to the `Commands` enum in `src/bin/cli.rs`
-2. Implement the handler function
-3. Add the handler to the main match statement
+1. Add the command to the `Commands` (or `ModelCommands`) enum in `modelexpress_client/src/bin/modules/args.rs`. Shared client arguments live in `ClientArgs` in `modelexpress_common/src/client_config.rs`.
+2. Implement the handler in `modelexpress_client/src/bin/modules/handlers.rs`
+3. Wire the handler into the dispatch `match cli.command` in `modelexpress_client/src/bin/cli.rs`
 
 ## License
 

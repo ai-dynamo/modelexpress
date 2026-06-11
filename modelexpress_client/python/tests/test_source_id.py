@@ -17,7 +17,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
-        mx_version="0.3.0",
+        mx_version="0.5.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name="deepseek-ai/DeepSeek-V3",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -59,6 +59,55 @@ def test_different_revision_gives_different_id():
     assert compute_mx_source_id(_base_identity()) != compute_mx_source_id(pinned)
 
 
+def test_empty_artifact_fields_preserve_existing_id():
+    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
+
+
+def test_artifact_compatibility_fields_affect_id():
+    artifact = _base_identity()
+    artifact.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    artifact.backend_framework_version = "0.10.0"
+    artifact.torch_version = "2.8.0+cu128"
+    artifact.cuda_version = "12.8"
+    artifact.triton_version = "3.4.0"
+    artifact.gpu_arch = "SM90"
+    artifact.compile_config_digest = "abc123"
+
+    different_torch = p2p_pb2.SourceIdentity()
+    different_torch.CopyFrom(artifact)
+    different_torch.torch_version = "2.9.0+cu128"
+
+    assert compute_mx_source_id(artifact) != compute_mx_source_id(different_torch)
+
+
+def test_deep_gemm_cache_is_separate_artifact_source_type():
+    torch_compile = _base_identity()
+    torch_compile.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    torch_compile.gpu_arch = "SM90"
+    torch_compile.compile_config_digest = "kernel-cache-a"
+
+    deep_gemm = _base_identity()
+    deep_gemm.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE
+    deep_gemm.gpu_arch = "SM90"
+    deep_gemm.compile_config_digest = "kernel-cache-a"
+
+    assert compute_mx_source_id(torch_compile) != compute_mx_source_id(deep_gemm)
+
+
+def test_artifact_compatibility_fields_are_case_insensitive():
+    upper = _base_identity()
+    upper.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    upper.backend_framework_version = "VLLM-0.10.0"
+    upper.gpu_arch = "SM90"
+
+    lower = _base_identity()
+    lower.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    lower.backend_framework_version = "vllm-0.10.0"
+    lower.gpu_arch = "sm90"
+
+    assert compute_mx_source_id(upper) == compute_mx_source_id(lower)
+
+
 def test_extra_parameters_sorted():
     a = _base_identity()
     a.extra_parameters["z_key"] = "val"
@@ -75,13 +124,13 @@ def test_extra_parameters_sorted():
 # ---------------------------------------------------------------------------
 
 def test_pinned_hash_base_identity():
-    assert compute_mx_source_id(_base_identity()) == "b0c2c67edeaefc20"
+    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
 
 
 def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
-    assert compute_mx_source_id(pinned) == "40704b34e4b7deaa"
+    assert compute_mx_source_id(pinned) == "d0c184b2a9a34c82"
 
 
 def test_case_colliding_extra_parameters_are_deterministic():
@@ -97,4 +146,4 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["foo"] = "b"
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
-    assert compute_mx_source_id(a) == "bd9ea6c70d83fef1"
+    assert compute_mx_source_id(a) == "bf71fb9340cd940a"

@@ -17,6 +17,7 @@ from ... import p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...load_strategy.context import LoadResult
 from ...metadata.heartbeat import HeartbeatThread
+from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
 from ...nixl_transfer import NixlTransferManager
 from .adapter import build_sglang_load_context
@@ -238,7 +239,7 @@ class MxModelLoader:
     ) -> None:
         seed_weight_info = {
             tensor.name: (tensor.addr, tensor.size)
-            for tensor in source_worker.tensors
+            for tensor in worker_tensor_descriptors(source_worker)
         }
 
         seed_ptr_list = []
@@ -322,7 +323,7 @@ class MxModelLoader:
             worker = p2p_pb2.WorkerMetadata(
                 worker_rank=ctx.worker_rank,
                 transfer_engine_session_id=session_id,
-                tensors=tensors,
+                tensor_source=tensor_source_metadata(tensors),
             )
         except Exception:
             logger.exception(

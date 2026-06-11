@@ -15,6 +15,21 @@ service ModelService {
 
   // Get list of files for a model (useful for resumable transfers)
   rpc ListModelFiles(ModelFilesRequest) returns (ModelFileList);
+
+  // Delete a model record from the server-side registry (used by `model clear`)
+  rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
+}
+
+// Request to delete a model record from the registry
+message DeleteModelRequest {
+  string model_name = 1;
+  ModelProvider provider = 2;
+}
+
+// Response for a model deletion request
+message DeleteModelResponse {
+  bool success = 1;
+  optional string message = 2;
 }
 
 // Request to ensure a model is downloaded
@@ -55,6 +70,14 @@ message ModelFilesRequest {
   ModelProvider provider = 2;
   // Chunk size in bytes for streaming (0 = use server default)
   uint32 chunk_size = 3;
+  // Optional file selector. If unset, all files are streamed.
+  ModelFileSelector file_selector = 4;
+}
+
+// Selects files within a model directory
+message ModelFileSelector {
+  // Exact paths relative to the model root.
+  repeated string paths = 1;
 }
 
 // A chunk of file data for streaming transfers

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error as StdError;
 
+pub mod artifact_manifest;
 pub mod cache;
 pub mod client_config;
 pub mod config;

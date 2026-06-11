@@ -3,16 +3,14 @@
 
 //! Kubernetes CRD backend for the model registry.
 //!
-//! One `ModelCacheEntry` CR per cached model, with lifecycle state stored in the status
-//! subresource. etcd's name-uniqueness enforces the claim atomicity that Redis gets from
-//! `HSETNX`: the first replica to `create` a given CR wins; others see a 409 Conflict and
-//! read back the existing status.
+//! One `ModelCacheEntry` CR per (provider, cached model), state in the status subresource.
+//! etcd name-uniqueness gives claim atomicity (first to `create` wins; others see 409), the
+//! analogue of Redis `HSETNX`.
 //!
-//! CR names must be DNS-1123 compliant; model names like `meta-llama/Llama-3.1-70B` run
-//! through [`sanitize_registry_name`] (lowercase + `/` -> `--`, trailing dashes
-//! trimmed, sha256 suffix when over the 253-char budget) and gain a `mx-cache-` prefix
-//! so they don't share a name space with the P2P `ModelMetadata` CRs. The original
-//! model name lives in `spec.modelName` for human readability.
+//! CR name: `mx-cache-{sanitize(provider/model_name)}` (DNS-1123, sha256 suffix). The
+//! provider is in the name so the same model under different providers maps to distinct CRs;
+//! `spec.modelName`/`spec.provider` keep the originals. Pre-0.5.0 name-only CRs are migrated
+//! lazily on claim (see `try_claim_for_download`); name-addressed reads cover both forms.
 
 use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use crate::registry::k8s_types::{ModelCacheEntry, ModelCacheEntrySpec, phase};
@@ -28,6 +26,13 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 const CR_NAME_PREFIX: &str = "mx-cache-";
+
+/// Every provider, for enumerating candidate CR names in name-addressed lookups.
+const ALL_PROVIDERS: [ModelProvider; 3] = [
+    ModelProvider::HuggingFace,
+    ModelProvider::Ngc,
+    ModelProvider::Gcs,
+];
 
 /// DNS-1123 `metadata.name` hard limit.
 const K8S_NAME_MAX: usize = 253;
@@ -102,8 +107,110 @@ impl KubernetesRegistryBackend {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    fn cr_name_for(model_name: &str) -> String {
+    /// Provider-scoped CR name: `sanitize("{provider}/{model_name}")`, so the sha256 suffix
+    /// binds (provider, name) and providers never collide.
+    fn cr_name_for(provider: ModelProvider, model_name: &str) -> String {
+        format!(
+            "{CR_NAME_PREFIX}{}",
+            sanitize_registry_name(&format!("{}/{model_name}", Self::provider_str(provider)))
+        )
+    }
+
+    /// Legacy name-only CR name, pre-provider-scoped CRs.
+    /// TODO(0.5.0 migration): remove once no deployment has pre-0.5.0 CRs; see
+    /// `try_claim_for_download`.
+    fn legacy_cr_name_for(model_name: &str) -> String {
         format!("{CR_NAME_PREFIX}{}", sanitize_registry_name(model_name))
+    }
+
+    /// CR names a record for `model_name` may live under when the provider isn't known up
+    /// front: the provider-scoped name for every provider, plus the legacy name-only name.
+    fn candidate_cr_names(model_name: &str) -> Vec<String> {
+        let mut names: Vec<String> = ALL_PROVIDERS
+            .iter()
+            .map(|p| Self::cr_name_for(*p, model_name))
+            .collect();
+        names.push(Self::legacy_cr_name_for(model_name));
+        names
+    }
+
+    /// First existing CR among the candidates (provider-scoped keys, then legacy). Used by
+    /// name-addressed reads; in practice a name maps to a single provider.
+    async fn find_existing_cr(&self, model_name: &str) -> RegistryResult<Option<ModelCacheEntry>> {
+        for cr_name in Self::candidate_cr_names(model_name) {
+            if let Some(cr) = self.get_cr(&cr_name).await? {
+                return Ok(Some(cr));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Lazy migration: if a matching-provider legacy CR exists, recreate it under the
+    /// provider-scoped name (copying status), delete the legacy CR, return `AlreadyExists`.
+    /// `None` if no legacy CR or it's a different provider (caller then claims fresh).
+    /// TODO(0.5.0 migration): remove once all deployments have drained legacy CRs.
+    async fn adopt_legacy_cr(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        scoped_name: &str,
+    ) -> RegistryResult<Option<ClaimOutcome>> {
+        let legacy_name = Self::legacy_cr_name_for(model_name);
+        let Some(legacy_cr) = self.get_cr(&legacy_name).await? else {
+            return Ok(None);
+        };
+        if Self::provider_from_str(&legacy_cr.spec.provider)? != provider {
+            return Ok(None);
+        }
+
+        let legacy_status = legacy_cr.status.clone().unwrap_or_default();
+        let new_cr = ModelCacheEntry::new(
+            scoped_name,
+            ModelCacheEntrySpec {
+                model_name: legacy_cr.spec.model_name.clone(),
+                provider: legacy_cr.spec.provider.clone(),
+            },
+        );
+        // create is atomic; a 409 means a concurrent claim/migration already made the
+        // provider-scoped CR, so we adopt whatever it holds.
+        match self.api().create(&PostParams::default(), &new_cr).await {
+            Ok(_) => {
+                self.patch_status(
+                    scoped_name,
+                    Some(Self::phase_from_status(Self::status_from_phase(
+                        &legacy_status.phase,
+                    ))),
+                    legacy_status.last_used_at.as_deref(),
+                    legacy_status.created_at.as_deref(),
+                    Some(legacy_status.message.as_deref()),
+                )
+                .await?;
+            }
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                debug!("{scoped_name} already exists during legacy migration; adopting it");
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // Best-effort delete of the now-migrated legacy CR (idempotent; tolerate 404).
+        if let Err(e) = self
+            .api()
+            .delete(&legacy_name, &kube::api::DeleteParams::default())
+            .await
+            && !matches!(&e, kube::Error::Api(a) if a.code == 404)
+        {
+            warn!("Failed to delete legacy CR {legacy_name} after migration: {e}");
+        }
+
+        let phase = self
+            .get_cr(scoped_name)
+            .await?
+            .and_then(|cr| cr.status)
+            .unwrap_or_default()
+            .phase;
+        Ok(Some(ClaimOutcome::AlreadyExists(Self::status_from_phase(
+            &phase,
+        ))))
     }
 
     fn provider_str(p: ModelProvider) -> &'static str {
@@ -237,8 +344,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
     }
 
     async fn get_status(&self, model_name: &str) -> RegistryResult<Option<ModelStatus>> {
-        let cr_name = Self::cr_name_for(model_name);
-        match self.get_cr(&cr_name).await? {
+        match self.find_existing_cr(model_name).await? {
             Some(cr) => {
                 let phase = cr.status.unwrap_or_default().phase;
                 Ok(Some(Self::status_from_phase(&phase)))
@@ -248,8 +354,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
     }
 
     async fn get_model_record(&self, model_name: &str) -> RegistryResult<Option<ModelRecord>> {
-        let cr_name = Self::cr_name_for(model_name);
-        match self.get_cr(&cr_name).await? {
+        match self.find_existing_cr(model_name).await? {
             Some(cr) => Ok(Some(Self::record_from_cr(&cr)?)),
             None => Ok(None),
         }
@@ -262,7 +367,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         status: ModelStatus,
         message: Option<String>,
     ) -> RegistryResult<()> {
-        let cr_name = Self::cr_name_for(model_name);
+        let cr_name = Self::cr_name_for(provider, model_name);
         let now = Utc::now().to_rfc3339();
 
         // Track whether the CR is brand new so we only stamp createdAt on first write —
@@ -305,27 +410,33 @@ impl RegistryBackend for KubernetesRegistryBackend {
     }
 
     async fn touch_model(&self, model_name: &str) -> RegistryResult<()> {
-        let cr_name = Self::cr_name_for(model_name);
-        if self.get_cr(&cr_name).await?.is_none() {
+        // Provider-agnostic: patch lastUsedAt on whichever candidate CR holds the record.
+        let Some(cr) = self.find_existing_cr(model_name).await? else {
             return Ok(()); // no-op on missing record
-        }
+        };
+        let Some(cr_name) = cr.metadata.name.as_deref() else {
+            return Ok(());
+        };
         let now = Utc::now().to_rfc3339();
-        self.patch_status(&cr_name, None, Some(&now), None, None)
+        self.patch_status(cr_name, None, Some(&now), None, None)
             .await?;
         Ok(())
     }
 
     async fn delete_model(&self, model_name: &str) -> RegistryResult<()> {
-        let cr_name = Self::cr_name_for(model_name);
-        match self
-            .api()
-            .delete(&cr_name, &kube::api::DeleteParams::default())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()), // no-op
-            Err(e) => Err(e.into()),
+        // Delete every variant (all providers + legacy); 404 is a no-op.
+        for cr_name in Self::candidate_cr_names(model_name) {
+            match self
+                .api()
+                .delete(&cr_name, &kube::api::DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(e)) if e.code == 404 => {}
+                Err(e) => return Err(e.into()),
+            }
         }
+        Ok(())
     }
 
     async fn get_models_by_last_used(
@@ -375,7 +486,21 @@ impl RegistryBackend for KubernetesRegistryBackend {
         model_name: &str,
         provider: ModelProvider,
     ) -> RegistryResult<ClaimOutcome> {
-        let cr_name = Self::cr_name_for(model_name);
+        let cr_name = Self::cr_name_for(provider, model_name);
+
+        // Fast path (mirrors Redis's scoped-first check): a non-mutating GET returns the
+        // existing status without committing a claim, skipping the legacy lookup in steady state.
+        if let Some(cr) = self.get_cr(&cr_name).await? {
+            let phase = cr.status.unwrap_or_default().phase;
+            return Ok(ClaimOutcome::AlreadyExists(Self::status_from_phase(&phase)));
+        }
+
+        // Scoped CR absent: adopt a matching-provider legacy CR if present; a different-provider
+        // legacy CR is left untouched (the fix: a GCS record can't answer a HuggingFace claim).
+        if let Some(outcome) = self.adopt_legacy_cr(model_name, provider, &cr_name).await? {
+            return Ok(outcome);
+        }
+
         let cr = ModelCacheEntry::new(
             &cr_name,
             ModelCacheEntrySpec {
@@ -423,8 +548,8 @@ impl RegistryBackend for KubernetesRegistryBackend {
                 Ok(ClaimOutcome::Claimed)
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {
-                // Already exists: someone else claimed it (or an earlier run did). Read
-                // back the current phase.
+                // Lost a race: another replica created the scoped CR between our fast-path
+                // GET and this create. Read back the current phase.
                 let existing = self
                     .get_cr(&cr_name)
                     .await?
@@ -441,9 +566,11 @@ impl RegistryBackend for KubernetesRegistryBackend {
     async fn try_reset_error_for_retry(
         &self,
         model_name: &str,
-        _provider: ModelProvider,
+        provider: ModelProvider,
     ) -> RegistryResult<bool> {
-        let cr_name = Self::cr_name_for(model_name);
+        // Retry only runs after a claim observed AlreadyExists (which already migrated any
+        // legacy CR), so the CAS targets the provider-scoped CR directly.
+        let cr_name = Self::cr_name_for(provider, model_name);
         let Some(existing) = self.get_cr(&cr_name).await? else {
             return Ok(false);
         };
@@ -543,9 +670,44 @@ mod tests {
     #[test]
     fn cr_name_stays_within_k8s_limit() {
         let long = "a".repeat(300);
-        let name = KubernetesRegistryBackend::cr_name_for(&long);
+        let name = KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, &long);
         assert!(name.len() <= K8S_NAME_MAX);
         assert!(name.starts_with(CR_NAME_PREFIX));
+    }
+
+    #[test]
+    fn cr_name_distinguishes_provider_and_legacy() {
+        let n = "google-t5/t5-small";
+        let hf = KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, n);
+        let ngc = KubernetesRegistryBackend::cr_name_for(ModelProvider::Ngc, n);
+        let gcs = KubernetesRegistryBackend::cr_name_for(ModelProvider::Gcs, n);
+        let legacy = KubernetesRegistryBackend::legacy_cr_name_for(n);
+        // Same name, different provider -> distinct CR names, all distinct from legacy.
+        assert_ne!(hf, ngc);
+        assert_ne!(hf, gcs);
+        assert_ne!(ngc, gcs);
+        assert_ne!(hf, legacy);
+        assert_ne!(ngc, legacy);
+        assert_ne!(gcs, legacy);
+        for name in [&hf, &ngc, &gcs, &legacy] {
+            assert!(name.starts_with(CR_NAME_PREFIX));
+            assert!(name.len() <= K8S_NAME_MAX);
+        }
+    }
+
+    #[test]
+    fn candidate_cr_names_cover_all_providers_and_legacy() {
+        let n = "org/model";
+        let candidates = KubernetesRegistryBackend::candidate_cr_names(n);
+        assert_eq!(candidates.len(), 4);
+        for p in [
+            ModelProvider::HuggingFace,
+            ModelProvider::Ngc,
+            ModelProvider::Gcs,
+        ] {
+            assert!(candidates.contains(&KubernetesRegistryBackend::cr_name_for(p, n)));
+        }
+        assert!(candidates.contains(&KubernetesRegistryBackend::legacy_cr_name_for(n)));
     }
 
     #[test]

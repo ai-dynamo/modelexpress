@@ -11,9 +11,11 @@ use modelexpress_common::{
     download,
 };
 use serde_json::Value;
+use std::borrow::Cow;
+use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
-use tracing::{debug, error, info};
+use std::path::{Path, PathBuf};
+use tracing::{debug, error, info, warn};
 
 fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> String {
     if detailed {
@@ -51,6 +53,59 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
             "formatted_size": stats.format_model_size(model)
         })
     }
+}
+
+fn infer_provider_from_model_name(model_name: &str) -> ModelProvider {
+    let model_name = model_name.trim_start();
+    if strip_ascii_prefix_ignore_case(model_name, "gs://").is_some() {
+        ModelProvider::Gcs
+    } else if strip_ascii_prefix_ignore_case(model_name, "ngc://").is_some() {
+        ModelProvider::Ngc
+    } else {
+        ModelProvider::HuggingFace
+    }
+}
+
+fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    if candidate.eq_ignore_ascii_case(prefix) {
+        value.get(prefix.len()..)
+    } else {
+        None
+    }
+}
+
+fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
+    let model_name = model_name.trim_start();
+    if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "gs://") {
+        Cow::Owned(format!("gs://{rest}"))
+    } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "ngc://") {
+        Cow::Owned(format!("ngc://{rest}"))
+    } else {
+        Cow::Borrowed(model_name)
+    }
+}
+
+fn resolve_validation_model_path(cache_root: &Path, model_name: &str) -> (ModelProvider, PathBuf) {
+    let normalized_name = normalize_model_name_scheme(model_name);
+    let provider = infer_provider_from_model_name(normalized_name.as_ref());
+    let model_path = resolve_model_path(cache_root, provider, normalized_name.as_ref(), None)
+        .unwrap_or_else(|_| cache_root.join(normalized_name.as_ref()));
+    (provider, model_path)
+}
+
+fn has_huggingface_weights(model_path: &Path) -> bool {
+    if model_path.join("pytorch_model.bin").exists() {
+        return true;
+    }
+
+    fs::read_dir(model_path).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.ends_with(".safetensors") || name == "model.safetensors.index.json"
+            })
+        })
+    })
 }
 
 /// Handle the health check command
@@ -123,9 +178,18 @@ pub async fn handle_model_command(
         ModelCommands::Clear {
             provider,
             model_name,
-        } => clear_model(storage_path_override, provider, &model_name, format).await,
+        } => {
+            clear_model(
+                storage_path_override,
+                provider,
+                &model_name,
+                server_config,
+                format,
+            )
+            .await
+        }
         ModelCommands::ClearAll { yes } => {
-            clear_all_models(storage_path_override, yes, format).await
+            clear_all_models(storage_path_override, yes, server_config, format).await
         }
         ModelCommands::Validate { model_name } => {
             validate_models(storage_path_override, model_name, format).await
@@ -440,15 +504,45 @@ async fn show_model_status(
     Ok(())
 }
 
+/// Best-effort deletion of a model's server-side registry record. Removing the local
+/// files is the primary intent of `model clear`, so a server that is unreachable or
+/// returns an error is surfaced as a warning rather than failing the command. Returns
+/// `Ok(())` when the record was deleted, `Err(reason)` otherwise.
+async fn delete_model_registry_record(
+    server_config: &ClientConfig,
+    model_name: &str,
+    provider: ModelProvider,
+) -> Result<(), String> {
+    let mut client = Client::new(server_config.clone())
+        .await
+        .map_err(|e| format!("could not connect to server: {e}"))?;
+    client
+        .delete_model_on_server(model_name, provider)
+        .await
+        .map_err(|e| format!("server registry delete failed: {e}"))
+}
+
 async fn clear_model(
     storage_path_override: Option<PathBuf>,
     provider: ModelProvider,
     model_name: &str,
+    server_config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
 
     storage_config.clear_model(model_name, provider)?;
+
+    // Also drop the server-side registry record so a later `model download` re-fetches
+    // the files instead of hitting a stale DOWNLOADED record and returning a false success.
+    let registry_warning =
+        match delete_model_registry_record(&server_config, model_name, provider).await {
+            Ok(()) => None,
+            Err(reason) => {
+                warn!("Cleared local files for '{model_name}' but {reason}");
+                Some(reason)
+            }
+        };
 
     match format {
         OutputFormat::Human => {
@@ -456,13 +550,22 @@ async fn clear_model(
                 "✅ Model '{model_name}' cleared from storage for provider {}",
                 provider
             );
+            match &registry_warning {
+                None => println!("   Server registry record removed"),
+                Some(reason) => println!(
+                    "{}",
+                    format!("⚠️  Server registry record NOT removed: {reason}").yellow()
+                ),
+            }
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
                 "message": format!("Model '{}' cleared from storage", model_name),
                 "model_name": model_name,
-                "provider": provider.to_string()
+                "provider": provider.to_string(),
+                "registry_cleared": registry_warning.is_none(),
+                "registry_warning": registry_warning,
             });
             print_output(&output, format);
         }
@@ -474,6 +577,7 @@ async fn clear_model(
 async fn clear_all_models(
     storage_path_override: Option<PathBuf>,
     yes: bool,
+    server_config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_config = get_storage_config(storage_path_override)?;
@@ -491,16 +595,49 @@ async fn clear_all_models(
         }
     }
 
+    // Capture the cached models before clearing so we can drop their registry records too.
+    let cached = storage_config
+        .get_cache_stats()
+        .map(|stats| {
+            stats
+                .models
+                .into_iter()
+                .map(|model| (model.name, model.provider))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     storage_config.clear_all()?;
+
+    let mut registry_failures = 0usize;
+    for (name, provider) in &cached {
+        if let Err(reason) = delete_model_registry_record(&server_config, name, *provider).await {
+            warn!("Cleared local files for '{name}' but {reason}");
+            registry_failures = registry_failures.saturating_add(1);
+        }
+    }
 
     match format {
         OutputFormat::Human => {
             println!("✅ All models cleared from storage");
+            if registry_failures == 0 {
+                println!("   Server registry records removed");
+            } else {
+                println!(
+                    "{}",
+                    format!(
+                        "⚠️  {registry_failures} server registry record(s) NOT removed (see warnings)"
+                    )
+                    .yellow()
+                );
+            }
         }
         _ => {
             let output = serde_json::json!({
                 "success": true,
-                "message": "All models cleared from storage"
+                "message": "All models cleared from storage",
+                "registry_records_cleared": cached.len().saturating_sub(registry_failures),
+                "registry_records_failed": registry_failures,
             });
             print_output(&output, format);
         }
@@ -517,16 +654,8 @@ async fn validate_models(
     let storage_config = get_storage_config(storage_path_override)?;
 
     if let Some(name) = model_name {
-        // Validate specific model.
-        // Try the HuggingFace cache layout first (models--org--name/snapshots/...),
-        // then fall back to a plain path join for other providers.
-        let model_path = resolve_model_path(
-            &storage_config.local_path,
-            ModelProvider::HuggingFace,
-            &name,
-            None,
-        )
-        .unwrap_or_else(|_| storage_config.local_path.join(&name));
+        let (provider, model_path) =
+            resolve_validation_model_path(&storage_config.local_path, &name);
         let exists = model_path.exists();
 
         match format {
@@ -535,14 +664,22 @@ async fn validate_models(
                 if exists {
                     println!("✅ Model '{name}' found in storage");
 
-                    // Check for common model files
-                    let required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"];
-                    for file in &required_files {
-                        let file_path = model_path.join(file);
-                        if file_path.exists() {
-                            debug!("  ✅ {} found", file);
-                        } else {
-                            println!("  ⚠️  {file} missing");
+                    if provider == ModelProvider::HuggingFace {
+                        // Check for common HuggingFace model files.
+                        let required_files = ["config.json", "tokenizer.json"];
+                        for file in &required_files {
+                            let file_path = model_path.join(file);
+                            if file_path.exists() {
+                                debug!("  ✅ {} found", file);
+                            } else {
+                                println!("  ⚠️  {file} missing");
+                            }
+                        }
+
+                        if !has_huggingface_weights(&model_path) {
+                            println!(
+                                "  ⚠️  missing model weights (expected pytorch_model.bin or safetensors)"
+                            );
                         }
                     }
                 } else {
@@ -654,4 +791,60 @@ fn get_storage_config(
     // Otherwise, try to discover configuration
     CacheConfig::discover()
         .map_err(|e| format!("Failed to discover storage configuration: {e}").into())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_validate_resolves_gcs_model_name_to_gcs_cache_path() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_name = "GS://bucket/foo/bar";
+        let expected_path = temp_dir
+            .path()
+            .join("gcs")
+            .join("bucket")
+            .join("foo")
+            .join("bar");
+        fs::create_dir_all(&expected_path).expect("Failed to create GCS cache path");
+
+        let (provider, model_path) = resolve_validation_model_path(temp_dir.path(), model_name);
+
+        assert_eq!(provider, ModelProvider::Gcs);
+        assert_eq!(model_path, expected_path);
+        assert!(model_path.exists());
+        assert!(!temp_dir.path().join("GS://bucket/foo/bar").exists());
+    }
+
+    #[test]
+    fn test_validate_provider_inference_keeps_ambiguous_names_hugging_face() {
+        assert_eq!(
+            infer_provider_from_model_name("nvidia/model/version"),
+            ModelProvider::HuggingFace
+        );
+        assert_eq!(
+            infer_provider_from_model_name("ngc://nvidia/model/version"),
+            ModelProvider::Ngc
+        );
+        assert_eq!(
+            infer_provider_from_model_name("NgC://nvidia/model/version"),
+            ModelProvider::Ngc
+        );
+    }
+
+    #[test]
+    fn test_huggingface_weights_accepts_safetensors() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        fs::write(
+            temp_dir.path().join("model-00001-of-00002.safetensors"),
+            b"",
+        )
+        .expect("Failed to write safetensors shard");
+
+        assert!(has_huggingface_weights(temp_dir.path()));
+    }
 }

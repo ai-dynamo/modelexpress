@@ -15,6 +15,7 @@ For technical architecture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). 
 - **Cargo**: Rust's package manager (included with Rust)
 - **protoc**: Protocol Buffers compiler
 - **Python 3.10+** (optional): For the P2P client library
+- **C++ compiler** (optional, `g++` or any compiler in `$CXX`): To build the `modelexpress.vmm._alloc_ext` extension that enables the `MX_VMM_ARENA=1` fast path. Without a working compiler the Python install still succeeds and `MX_VMM_ARENA=1` falls back to the pool-reg path at runtime with a warning
 - **Docker** (optional): For containerized deployment
 - **Redis** (optional): For P2P metadata coordination
 - **pre-commit**: For automated code quality checks
@@ -68,6 +69,8 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `./run_integration_tests.sh` | Integration tests (starts server) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
+| `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
+| `(cd modelexpress_client/go && go test ./...)` | Run Go binding compilation tests |
 | `pre-commit run` | Run hooks on staged files |
 | `pre-commit run --all-files` | Run hooks on all files |
 
@@ -131,8 +134,8 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx vLLM loader |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
@@ -142,10 +145,10 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 
 ```bash
 # Build production image
-docker build -t model-express .
+docker build -f docker/Dockerfile -t model-express .
 
 # Run with docker-compose
-docker-compose up --build
+docker compose -f docker/docker-compose.yml up --build
 
 # Build P2P client image
 docker build -f examples/p2p_transfer_k8s/Dockerfile.client \

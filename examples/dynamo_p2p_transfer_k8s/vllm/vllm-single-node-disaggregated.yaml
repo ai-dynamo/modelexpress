@@ -100,14 +100,14 @@ spec:
           value: "nvidia/Kimi-K2.5-NVFP4"
         - name: VLLM_PLUGINS
           value: "modelexpress"
-        - name: MX_SERVER_ADDRESS
+        # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
+        # standardizing on MX_SERVER_ADDRESS going forward (see README).
+        - name: MODEL_EXPRESS_URL
           value: "mx-vllm-disagg-sn-modelexpress:8000"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL
           value: "INFO"
-        - name: UCX_TLS
-          value: "rc_x,rc,dc_x,dc,cuda_copy"
         # Optional: pin UCX to specific compute-fabric HCAs if your cluster
         # exposes multiple IB fabrics. Device list is cluster-specific.
         # - name: UCX_NET_DEVICES
@@ -140,7 +140,7 @@ spec:
             - --model
             - nvidia/Kimi-K2.5-NVFP4
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "4"
             - --max-model-len
@@ -174,15 +174,15 @@ spec:
           value: "nvidia/Kimi-K2.5-NVFP4"
         - name: VLLM_PLUGINS
           value: "modelexpress"
-        - name: MX_SERVER_ADDRESS
+        # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
+        # standardizing on MX_SERVER_ADDRESS going forward (see README).
+        - name: MODEL_EXPRESS_URL
           value: "mx-vllm-disagg-sn-modelexpress:8000"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL
           value: "INFO"
-        - name: UCX_TLS
-          value: "rc_x,rc,dc_x,dc,cuda_copy"
-        # Optional UCX_NET_DEVICES — see decode block.
+        # Optional UCX_NET_DEVICES - see decode block.
         - name: UCX_RNDV_SCHEME
           value: "get_zcopy"
         - name: UCX_RNDV_THRESH
@@ -211,7 +211,7 @@ spec:
             - --model
             - nvidia/Kimi-K2.5-NVFP4
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "4"
             - --max-model-len

@@ -10,7 +10,8 @@ use modelexpress_common::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
         health::{HealthRequest, HealthResponse, health_service_server::HealthService},
         model::{
-            FileChunk, ModelDownloadRequest, ModelFileInfo, ModelFileList, ModelFilesRequest,
+            DeleteModelRequest, DeleteModelResponse, FileChunk, ModelDownloadRequest,
+            ModelFileInfo, ModelFileList, ModelFileSelector, ModelFilesRequest,
             ModelProvider as GrpcModelProvider, ModelStatusUpdate,
             model_service_server::ModelService,
         },
@@ -41,6 +42,25 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
             .ok()
             .map(std::path::PathBuf::from)
     }
+}
+
+/// Returns true if the model's files are present in the given cache directory. Used to
+/// guard against stale `DOWNLOADED` registry records that point at a cache entry which no
+/// longer exists on disk (e.g. left behind by a client-side `model clear`). When no cache
+/// directory is configured we cannot verify, so we assume the files are present to preserve
+/// existing behavior rather than loop re-downloading forever.
+async fn model_files_present(
+    cache_dir: Option<std::path::PathBuf>,
+    model_name: &str,
+    provider: ModelProvider,
+) -> bool {
+    let Some(cache_dir) = cache_dir else {
+        return true;
+    };
+    download::get_provider(provider)
+        .get_model_path(model_name, cache_dir)
+        .await
+        .is_ok()
 }
 
 /// Health service implementation
@@ -110,7 +130,11 @@ impl ApiService for ApiServiceImpl {
 pub struct ModelServiceImpl;
 
 /// Helper function to collect all files in a model directory recursively
-fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u64)> {
+fn collect_model_files(
+    base_path: &Path,
+    current_path: &Path,
+    file_selector: Option<&ModelFileSelector>,
+) -> Vec<(PathBuf, u64)> {
     let mut files = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(current_path) {
@@ -134,24 +158,50 @@ fn collect_model_files(base_path: &Path, current_path: &Path) -> Vec<(PathBuf, u
                                 _ => {}
                             }
                         }
-                        if is_safe {
-                            files.push((relative.to_path_buf(), metadata.len()));
-                        } else {
+                        if !is_safe {
                             tracing::warn!(
                                 "Skipping potentially unsafe file path: {:?} (relative: {:?})",
                                 path,
                                 relative
                             );
+                        } else if file_selector.is_none_or(|selector| {
+                            selector
+                                .paths
+                                .iter()
+                                .any(|selector_path| Path::new(selector_path) == relative)
+                        }) {
+                            files.push((relative.to_path_buf(), metadata.len()));
                         }
                     }
                 }
             } else if path.is_dir() {
-                files.extend(collect_model_files(base_path, &path));
+                files.extend(collect_model_files(base_path, &path, file_selector));
             }
         }
     }
 
     files
+}
+
+fn ensure_selected_files_exist(
+    files: &[(PathBuf, u64)],
+    file_selector: Option<&ModelFileSelector>,
+) -> Result<(), String> {
+    let Some(selector) = file_selector else {
+        return Ok(());
+    };
+
+    if let Some(missing_path) = selector.paths.iter().find(|selector_path| {
+        !files
+            .iter()
+            .any(|(path, _)| Path::new(selector_path) == path.as_path())
+    }) {
+        Err(format!(
+            "Selected file not found in model directory: {missing_path}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -292,7 +342,13 @@ impl ModelService for ModelServiceImpl {
         }
 
         // Collect all files to stream
-        let files = collect_model_files(&model_path, &model_path);
+        let files = collect_model_files(
+            &model_path,
+            &model_path,
+            files_request.file_selector.as_ref(),
+        );
+        ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
+            .map_err(Status::not_found)?;
 
         if files.is_empty() {
             return Err(Status::not_found("No files found in model directory"));
@@ -434,7 +490,13 @@ impl ModelService for ModelServiceImpl {
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
         // Collect all files
-        let files = collect_model_files(&model_path, &model_path);
+        let files = collect_model_files(
+            &model_path,
+            &model_path,
+            files_request.file_selector.as_ref(),
+        );
+        ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
+            .map_err(Status::not_found)?;
 
         let file_infos: Vec<ModelFileInfo> = files
             .iter()
@@ -450,6 +512,37 @@ impl ModelService for ModelServiceImpl {
             model_name,
             files: file_infos,
             total_size,
+        }))
+    }
+
+    async fn delete_model(
+        &self,
+        request: Request<DeleteModelRequest>,
+    ) -> Result<Response<DeleteModelResponse>, Status> {
+        let delete_request = request.into_inner();
+
+        let grpc_provider = GrpcModelProvider::try_from(delete_request.provider).map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid provider value: {}",
+                delete_request.provider
+            ))
+        })?;
+        let provider = ModelProvider::from(grpc_provider);
+        let model_name = download::canonical_model_name(&delete_request.model_name, provider)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let Some(tracker) = model_tracker() else {
+            return Err(Status::unavailable(
+                "server startup incomplete: model tracker not initialized",
+            ));
+        };
+
+        tracker.delete_status(&model_name).await;
+        info!("Deleted registry record for model '{model_name}'");
+
+        Ok(Response::new(DeleteModelResponse {
+            success: true,
+            message: Some(format!("Model '{model_name}' removed from registry")),
         }))
     }
 }
@@ -628,24 +721,49 @@ impl ModelDownloadTracker {
         // Atomically try to claim this model for download. The `ClaimOutcome` tells us
         // whether THIS replica won the claim or is observing someone else's claim —
         // status alone (`DOWNLOADING`) can't distinguish those cases across replicas.
-        let (status, is_owner) = match self
-            .registry
-            .try_claim_for_download(model_name, provider)
-            .await
-        {
-            Ok(ClaimOutcome::Claimed) => (ModelStatus::DOWNLOADING, true),
-            Ok(ClaimOutcome::AlreadyExists(existing)) => (existing, false),
-            Err(e) => {
-                error!("Failed to claim model for download: {e}");
-                let error_update = ModelStatusUpdate {
-                    model_name: model_name.to_string(),
-                    status: modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::ERROR)
-                        as i32,
-                    message: Some("Registry error occurred".to_string()),
-                    provider: GrpcModelProvider::from(provider) as i32,
-                };
-                let _ = tx.send(Ok(error_update)).await;
-                return ModelStatus::ERROR;
+        // A claim may report an existing `DOWNLOADED` record whose files no longer exist
+        // on disk (e.g. after a client-side `model clear` that only removed local files).
+        // When that happens we drop the stale record and re-claim once, so the download
+        // path runs instead of returning a false success. Bounded to two attempts to
+        // avoid looping if the delete or a concurrent re-claim keeps the record around.
+        const MAX_CLAIM_ATTEMPTS: usize = 2;
+        let mut attempt: usize = 0;
+        let (status, is_owner) = loop {
+            attempt = attempt.saturating_add(1);
+            match self
+                .registry
+                .try_claim_for_download(model_name, provider)
+                .await
+            {
+                Ok(ClaimOutcome::Claimed) => break (ModelStatus::DOWNLOADING, true),
+                Ok(ClaimOutcome::AlreadyExists(existing)) => {
+                    if existing == ModelStatus::DOWNLOADED
+                        && attempt < MAX_CLAIM_ATTEMPTS
+                        && !model_files_present(get_server_cache_dir(), model_name, provider).await
+                    {
+                        error!(
+                            "Registry reports model '{model_name}' as DOWNLOADED but its files \
+                             are missing from the cache; clearing the stale record and \
+                             re-downloading"
+                        );
+                        self.delete_status(model_name).await;
+                        continue;
+                    }
+                    break (existing, false);
+                }
+                Err(e) => {
+                    error!("Failed to claim model for download: {e}");
+                    let error_update = ModelStatusUpdate {
+                        model_name: model_name.to_string(),
+                        status: modelexpress_common::grpc::model::ModelStatus::from(
+                            ModelStatus::ERROR,
+                        ) as i32,
+                        message: Some("Registry error occurred".to_string()),
+                        provider: GrpcModelProvider::from(provider) as i32,
+                    };
+                    let _ = tx.send(Ok(error_update)).await;
+                    return ModelStatus::ERROR;
+                }
             }
         };
 
@@ -1009,7 +1127,7 @@ mod tests {
     #[test]
     fn test_collect_model_files_empty_dir() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
         assert!(files.is_empty());
     }
 
@@ -1024,7 +1142,7 @@ mod tests {
         let file2_path = temp_dir.path().join("model.bin");
         std::fs::write(&file2_path, vec![0u8; 100]).expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
 
         assert_eq!(files.len(), 2);
 
@@ -1055,7 +1173,7 @@ mod tests {
         let file2_path = subdir.join("nested_file.txt");
         std::fs::write(&file2_path, "nested content").expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path());
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
 
         assert_eq!(files.len(), 2);
 
@@ -1067,6 +1185,223 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("nested_file")));
     }
 
+    #[test]
+    fn test_collect_model_files_with_selector_filters_exact_paths() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let subdir = temp_dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("Failed to create subdir");
+        std::fs::write(temp_dir.path().join("config.json"), "{}").expect("Failed to write config");
+        std::fs::write(temp_dir.path().join("model.bin"), vec![0u8; 100])
+            .expect("Failed to write model");
+        std::fs::write(temp_dir.path().join("ignored.txt"), "ignore")
+            .expect("Failed to write ignored");
+        std::fs::write(subdir.join("nested.txt"), "nested").expect("Failed to write nested");
+
+        let selector = ModelFileSelector {
+            paths: vec!["config.json".to_string(), "subdir/nested.txt".to_string()],
+        };
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), Some(&selector));
+
+        let mut paths: Vec<_> = files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["config.json".to_string(), "subdir/nested.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_collect_model_files_with_selector_empty_and_nonmatching_paths() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        std::fs::write(temp_dir.path().join("config.json"), "{}").expect("Failed to write config");
+
+        let empty_selector = ModelFileSelector { paths: vec![] };
+        assert!(
+            collect_model_files(temp_dir.path(), temp_dir.path(), Some(&empty_selector)).is_empty()
+        );
+
+        let nonmatching_selector = ModelFileSelector {
+            paths: vec!["missing.json".to_string(), "../config.json".to_string()],
+        };
+        assert!(
+            collect_model_files(
+                temp_dir.path(),
+                temp_dir.path(),
+                Some(&nonmatching_selector)
+            )
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_list_model_files_hf_honors_file_selector() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(model_dir.join("subdir")).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
+            .expect("Failed to write config");
+        std::fs::write(model_dir.join("model.bin"), vec![0u8; 100]).expect("Failed to write model");
+        std::fs::write(model_dir.join("subdir/nested.txt"), b"nested")
+            .expect("Failed to write nested");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 0,
+            file_selector: Some(ModelFileSelector {
+                paths: vec!["config.json".to_string(), "subdir/nested.txt".to_string()],
+            }),
+        });
+
+        let response = service
+            .list_model_files(request)
+            .await
+            .expect("Expected file list")
+            .into_inner();
+        let mut paths: Vec<_> = response
+            .files
+            .iter()
+            .map(|file| file.relative_path.clone())
+            .collect();
+        paths.sort();
+
+        assert_eq!(
+            paths,
+            vec!["config.json".to_string(), "subdir/nested.txt".to_string()]
+        );
+        assert_eq!(
+            response.total_size,
+            br#"{"model":"test"}"#.len() as u64 + b"nested".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_model_files_present_reflects_disk_state() {
+        let env_lock = acquire_env_mutex();
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_dir = temp_dir.path().to_path_buf();
+
+        // No files on disk: a stale DOWNLOADED record must not be honored.
+        assert!(
+            !model_files_present(
+                Some(cache_dir.clone()),
+                "test/model",
+                ModelProvider::HuggingFace
+            )
+            .await
+        );
+
+        // Once the snapshot exists, the cache hit is real.
+        let model_dir = cache_dir.join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+        assert!(
+            model_files_present(Some(cache_dir), "test/model", ModelProvider::HuggingFace).await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_model_files_present_assumes_present_without_cache_dir() {
+        // With no configured cache directory we cannot verify, so we must not force a
+        // re-download loop: assume the files are present.
+        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace).await);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_hf_honors_file_selector() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
+            .expect("Failed to write config");
+        std::fs::write(model_dir.join("model.bin"), vec![0u8; 100]).expect("Failed to write model");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+            file_selector: Some(ModelFileSelector {
+                paths: vec!["config.json".to_string()],
+            }),
+        });
+
+        let response = service
+            .stream_model_files(request)
+            .await
+            .expect("Expected stream response");
+        let chunks: Vec<_> = response
+            .into_inner()
+            .map(|chunk| chunk.expect("Expected chunk"))
+            .collect()
+            .await;
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].relative_path, "config.json");
+        assert_eq!(chunks[0].commit_hash.as_deref(), Some("abc123"));
+        assert!(chunks[0].is_last_file);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_hf_returns_not_found_for_missing_selector_path() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), br#"{"model":"test"}"#)
+            .expect("Failed to write config");
+
+        let service = ModelServiceImpl;
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+            file_selector: Some(ModelFileSelector {
+                paths: vec!["config.json".to_string(), "missing.json".to_string()],
+            }),
+        });
+
+        let result = service.stream_model_files(request).await;
+        let status = result.expect_err("Expected not found");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(
+            status.message(),
+            "Selected file not found in model directory: missing.json"
+        );
+    }
+
     #[tokio::test]
     async fn test_list_model_files_not_found() {
         let service = ModelServiceImpl;
@@ -1075,6 +1410,7 @@ mod tests {
             model_name: "non-existent-model-12345".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 0,
+            file_selector: None,
         });
 
         let result = service.list_model_files(request).await;
@@ -1091,6 +1427,7 @@ mod tests {
             model_name: "non-existent-model-12345".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1124,6 +1461,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             chunk_size: 0,
+            file_selector: None,
         });
 
         let result = service.list_model_files(request).await;
@@ -1141,6 +1479,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1172,6 +1511,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let response = service
@@ -1212,6 +1552,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
+            file_selector: None,
         });
 
         let response = service

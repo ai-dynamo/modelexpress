@@ -13,6 +13,11 @@ repository.workspace = true
 keywords.workspace = true
 
 
+[features]
+# In-memory backend for tests and local dev (MX_METADATA_BACKEND=memory). Off by
+# default; enable explicitly with `--features memory-backend` to run its unit tests.
+memory-backend = []
+
 [dependencies]
 modelexpress-common = { workspace = true }
 anyhow = { workspace = true }
@@ -51,6 +56,7 @@ mockall = { workspace = true }
 tempfile = "3.20"
 tokio-test = "0.4"
 tonic-build = { workspace = true }
+modelexpress-client.workspace = true
 
 [lints]
 workspace = true

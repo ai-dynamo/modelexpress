@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Utils, constants,
+    Utils,
+    config::normalize_grpc_endpoint,
+    constants,
     models::ModelProvider,
     providers::{
         gcs::GcsProviderCache, huggingface::HuggingFaceProviderCache, ngc::NgcProviderCache,
@@ -97,7 +99,9 @@ impl CacheConfig {
 
         Ok(Self {
             local_path,
-            server_endpoint: server_endpoint.unwrap_or_else(Self::get_default_server_endpoint),
+            server_endpoint: normalize_grpc_endpoint(
+                server_endpoint.unwrap_or_else(Self::get_default_server_endpoint),
+            ),
             timeout_secs: None,
             shared_storage: constants::DEFAULT_SHARED_STORAGE,
             transfer_chunk_size: constants::DEFAULT_TRANSFER_CHUNK_SIZE,
@@ -132,8 +136,10 @@ impl CacheConfig {
         let content = fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config file: {config_path:?}"))?;
 
-        let config: Self = serde_yaml::from_str(&content)
+        let mut config: Self = serde_yaml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {config_path:?}"))?;
+        config.server_endpoint =
+            normalize_grpc_endpoint(std::mem::take(&mut config.server_endpoint));
 
         Ok(config)
     }
@@ -209,8 +215,10 @@ impl CacheConfig {
 
     /// Get default server endpoint
     fn get_default_server_endpoint() -> String {
-        env::var("MODEL_EXPRESS_SERVER_ENDPOINT")
-            .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT))
+        normalize_grpc_endpoint(
+            env::var("MODEL_EXPRESS_SERVER_ENDPOINT")
+                .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT)),
+        )
     }
 
     /// Get configuration file path
@@ -477,6 +485,19 @@ mod tests {
             config.transfer_chunk_size,
             constants::DEFAULT_TRANSFER_CHUNK_SIZE
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_cache_config_new_accepts_bare_host_port() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let config = CacheConfig::new(
+            temp_dir.path().join("cache"),
+            Some("modelexpress-server:8001".to_string()),
+        )
+        .expect("Failed to create cache config");
+
+        assert_eq!(config.server_endpoint, "http://modelexpress-server:8001");
     }
 
     #[test]

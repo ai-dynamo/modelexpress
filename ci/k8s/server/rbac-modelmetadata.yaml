@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI version of examples/dynamo_p2p_transfer_k8s/vllm/rbac-modelmetadata.yaml.
+#
+# Grants the `modelexpress` ServiceAccount permissions on both CRDs the
+# mx-server uses with MX_METADATA_BACKEND=kubernetes:
+#   * modelmetadatas    — P2P worker discovery / heartbeats
+#   * modelcacheentries — model-download registry (LRU eviction state)
+# Missing either causes server startup to fail with a 403 against the
+# corresponding API group.
+#
+# The upstream file hardcodes namespace: default in the RoleBinding subject,
+# which causes a 403 when the MX server runs in any other namespace. This
+# file uses ${NAMESPACE} so envsubst substitutes the correct value before
+# kubectl apply.
+#
+# Apply with:
+#   NAMESPACE=<your-ns> envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
+#     kubectl apply -n <your-ns> -f -
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+  labels:
+    app.kubernetes.io/name: modelexpress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: modelexpress-metadata
+  labels:
+    app.kubernetes.io/name: modelexpress
+rules:
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelmetadatas
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelmetadatas/status
+    verbs:
+      - get
+      - update
+      - patch
+  # ModelCacheEntry CRD — used by the mx-server registry backend (also
+  # selected via MX_METADATA_BACKEND=kubernetes). Without this rule, server
+  # startup fails with `Failed to connect to model registry backend:
+  # modelcacheentries.modelexpress.nvidia.com is forbidden`. The CRD itself
+  # is expected to already be installed cluster-wide (in our test vCluster
+  # the dynamo-platform install provides it).
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelcacheentries
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - modelexpress.nvidia.com
+    resources:
+      - modelcacheentries/status
+    verbs:
+      - get
+      - update
+      - patch
+  # NOTE: grants access to ALL ConfigMaps in the namespace — use a dedicated
+  # namespace for ModelExpress workloads in shared clusters.
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: modelexpress-metadata
+  labels:
+    app.kubernetes.io/name: modelexpress
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: modelexpress-metadata
+subjects:
+  - kind: ServiceAccount
+    name: modelexpress
+    namespace: ${NAMESPACE}

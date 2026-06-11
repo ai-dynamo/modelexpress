@@ -72,7 +72,7 @@ spec:
       replicas: 1
       extraPodSpec:
         mainContainer:
-          # Build using Dockerfile.client or dynamo repo (see README)
+          # Build using examples/dynamo_p2p_transfer_k8s/Dockerfile
           image: <your-registry>/modelexpress-vllm-runtime:latest
           command:
             - python3
@@ -109,7 +109,9 @@ spec:
           value: "nvidia/Kimi-K2.5-NVFP4"
         - name: VLLM_PLUGINS
           value: "modelexpress"
-        - name: MX_SERVER_ADDRESS
+        # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
+        # standardizing on MX_SERVER_ADDRESS going forward (see README).
+        - name: MODEL_EXPRESS_URL
           value: "mx-vllm-modelexpress:8000"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN
@@ -118,8 +120,6 @@ spec:
           value: "INFO"
         - name: UCX_LOG_LEVEL
           value: "INFO"
-        - name: UCX_TLS
-          value: "rc_x,rc,dc_x,dc,cuda_copy"
         # Optional: pin UCX to specific compute-fabric HCAs if your cluster
         # exposes multiple IB fabrics. Device list is cluster-specific.
         # - name: UCX_NET_DEVICES
@@ -130,7 +130,7 @@ spec:
           value: "0"
       extraPodSpec:
         mainContainer:
-          # Build using Dockerfile.client or dynamo repo (see README)
+          # Build using examples/dynamo_p2p_transfer_k8s/Dockerfile
           image: <your-registry>/modelexpress-vllm-runtime:latest
           securityContext:
             capabilities:
@@ -144,7 +144,7 @@ spec:
             - --model
             - nvidia/Kimi-K2.5-NVFP4
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "4"
             - --pipeline-parallel-size

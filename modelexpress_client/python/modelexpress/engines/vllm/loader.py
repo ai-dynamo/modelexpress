@@ -18,7 +18,8 @@ Uses LoadStrategyChain to auto-detect the best loading strategy:
     4. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
-    --load-format mx  (auto-detect: RDMA -> ModelStreamer -> GDS -> default)
+    --load-format modelexpress
+    --load-format mx  (backward-compatible alias)
 """
 
 from __future__ import annotations
@@ -32,54 +33,17 @@ import torch.nn as nn
 from ... import configure_vllm_logging
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...nixl_transfer import NixlTransferManager
+from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import build_vllm_load_context
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
-from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import initialize_model
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-logger = logging.getLogger("modelexpress.engines.vllm.loader")
-
-
-def _patch_vllm_s3_format_check() -> None:
-    """Allow 'mx' as a valid load format when model weights use object storage.
-
-    vLLM's verification path only allows object-storage `model_weights` for its
-    native RunAI load formats. The MX loader still delegates the ModelStreamer
-    path back to vLLM after strategy selection, so verification needs to accept
-    the temporary `load_format == "mx"` configuration.
-    """
-    try:
-        from vllm.transformers_utils.runai_utils import is_runai_obj_uri
-    except ImportError:
-        return
-
-    original = VllmConfig.try_verify_and_update_config
-
-    def patched(self: VllmConfig) -> None:
-        if (
-            self.load_config.load_format == "mx"
-            and hasattr(self.model_config, "model_weights")
-            and is_runai_obj_uri(self.model_config.model_weights)
-        ):
-            saved = self.model_config.model_weights
-            del self.model_config.model_weights
-            try:
-                original(self)
-            finally:
-                self.model_config.model_weights = saved
-        else:
-            original(self)
-
-    VllmConfig.try_verify_and_update_config = patched
-    logger.debug(
-        "Patched VllmConfig.try_verify_and_update_config to allow 'mx' "
-        "for object storage URIs"
-    )
+logger = logging.getLogger(__name__)
 
 
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
@@ -87,12 +51,6 @@ _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
 
 
-# Install eagerly: vllm calls try_verify_and_update_config during engine init,
-# before LoadStrategyChain.run() would lazily import the strategy module.
-_patch_vllm_s3_format_check()
-
-
-@register_model_loader("mx")
 class MxModelLoader(BaseModelLoader):
     """
     Auto-detecting model loader for ModelExpress.
@@ -109,30 +67,46 @@ class MxModelLoader(BaseModelLoader):
         self._ctx: LoadContext | None = None
 
     def load_model(
-        self, vllm_config: VllmConfig, model_config: ModelConfig
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str = "",
     ) -> nn.Module:
-        """Load model, auto-detecting the best loading strategy."""
+        """Load model, auto-detecting the best loading strategy.
+
+        `prefix` is vLLM's BaseModelLoader.load_model argument for initializing
+        a model subtree. ModelExpress does not interpret it; it is passed through
+        to vLLM's initialize_model().
+        """
         load_start = time.perf_counter()
 
         ctx = build_vllm_load_context(vllm_config, model_config)
         self._ctx = ctx
 
-        logger.info(f"[Worker {ctx.global_rank}] MxModelLoader starting (model={ctx.identity.model_name})")
+        logger.info(
+            f"[Worker {ctx.global_rank}] MxModelLoader starting "
+            f"(model={ctx.identity.model_name})"
+        )
 
-        with set_default_torch_dtype(model_config.dtype):
-            with ctx.target_device:
-                model = initialize_model(
-                    vllm_config=vllm_config, model_config=model_config
-                )
+        with maybe_enter_vmm_arena(ctx):
+            with set_default_torch_dtype(model_config.dtype):
+                with ctx.target_device:
+                    model = initialize_model(
+                        vllm_config=vllm_config,
+                        model_config=model_config,
+                        prefix=prefix,
+                    )
 
-            model = LoadStrategyChain.run(model, ctx)
+                model = LoadStrategyChain.run(model, ctx)
 
-            # Update global registries
-            _tensor_registry[ctx.device_id] = ctx.tensors
-            if ctx.nixl_manager is not None:
-                _nixl_managers[ctx.device_id] = ctx.nixl_manager
-            else:
-                _nixl_managers.pop(ctx.device_id, None)
+                # Update global registries
+                _tensor_registry[ctx.device_id] = ctx.tensors
+                if ctx.nixl_manager is not None:
+                    _nixl_managers[ctx.device_id] = ctx.nixl_manager
+                else:
+                    _nixl_managers.pop(ctx.device_id, None)
+
+        log_arena_post_load(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
@@ -144,6 +118,7 @@ class MxModelLoader(BaseModelLoader):
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
         import copy
+
         disk_config = copy.copy(self.load_config)
         try:
             disk_config.load_format = "auto"
@@ -154,6 +129,7 @@ class MxModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into an already-initialized model (standalone API)."""
         import copy
+
         disk_config = copy.copy(self.load_config)
         try:
             disk_config.load_format = "auto"

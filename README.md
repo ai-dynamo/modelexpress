@@ -20,7 +20,7 @@ SPDX-License-Identifier: Apache-2.0
 
 <p align="center">
   <a href="#features">Features</a> •
-  <a href="#dynamo-modelexpress-architecture">Architecture</a> •
+  <a href="#modelexpress-architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#deployment">Deployment</a> •
   <a href="#documentation">Docs</a> •
@@ -55,7 +55,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `mx` loader and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
+- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
@@ -64,8 +64,8 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 | Runtime | Integration |
 |---------|-------------|
-| vLLM | `--load-format mx` for P2P weight transfer |
-| NVIDIA Dynamo (vLLM) | `get_model_path` API; [aggregated K8s example](examples/aggregated_k8s/README.md) |
+| vLLM | `--load-format modelexpress` for P2P weight transfer; `mx` is a backward-compatible alias |
+| NVIDIA Dynamo (vLLM) | `get_model_path` API; [Dynamo model cache K8s example](examples/dynamo_model_cache_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
 | SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
 
@@ -75,7 +75,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](model-express-architecture.png)
 
-*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format mx` for inference.
+*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format modelexpress` for inference.
 
 ```
                     ┌─────────────────────────────────────────────────────────────────┐
@@ -116,7 +116,8 @@ cd modelexpress
 docker run -d --name redis -p 6379:6379 redis:8-alpine
 
 cargo build
-MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server
+# REDIS_URL is required; the server does not fall back to localhost:6379.
+REDIS_URL=redis://localhost:6379 MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server
 ```
 
 Server listens on `0.0.0.0:8001`. In another terminal:
@@ -130,7 +131,7 @@ modelexpress-cli health
 ```
 
 **Without shared storage:** use `--no-shared-storage` for gRPC streaming.  
-**Air-gapped:** `HF_HUB_OFFLINE=1 modelexpress-cli model get <model-id>`.
+**Air-gapped:** with the model already in the local HF cache, `HF_HUB_OFFLINE=1 modelexpress-cli model download <model-id>` resolves it without network access.
 
 ---
 
@@ -150,15 +151,20 @@ Override [values-production.yaml](helm/values-production.yaml) for your env. Ful
 ```python
 from modelexpress import register_modelexpress_loaders
 register_modelexpress_loaders()
-# vllm serve <model> --load-format mx --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
+# vllm serve <model> --load-format modelexpress
+# The mx load format is kept as a backward-compatible alias.
 ```
 
 First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
 
+### ModelStreamer on Kubernetes
+
+Load model weights directly from Azure Blob Storage, S3, or a PVC-backed local path through ModelStreamer. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
+
 ### Docker
 
 ```bash
-docker-compose up --build
+docker compose -f docker/docker-compose.yml up --build
 ```
 
 ---
@@ -172,9 +178,9 @@ docker-compose up --build
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
 | `MX_METADATA_BACKEND` | (required) | `redis` \| `kubernetes` |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (`redis` backend only) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server (P2P) |
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | InfiniBand transports |
+| `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 
 ```bash
 cargo run --bin config_gen -- --output model-express.yaml

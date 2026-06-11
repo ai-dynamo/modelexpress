@@ -7,7 +7,7 @@ This worker ensures ModelExpress loaders are registered in spawned worker proces
 When vLLM uses multiprocess executor with spawn method, worker processes start fresh
 and don't inherit registered loaders from the main process.
 
-Usage:
+Compatibility usage:
     Set --worker-cls=modelexpress.vllm_worker.ModelExpressWorker
 """
 

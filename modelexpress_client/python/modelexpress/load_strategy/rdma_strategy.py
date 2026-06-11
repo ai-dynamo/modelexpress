@@ -21,6 +21,7 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
+from ..metadata.payload import worker_tensor_count, worker_tensor_descriptors
 from ..nixl_transfer import is_nixl_available
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
@@ -113,7 +114,7 @@ class RdmaStrategy(LoadStrategy):
 
             logger.info(
                 f"[Worker {ctx.global_rank}] Trying source worker {worker_id} "
-                f"({len(source_worker.tensors)} tensors)"
+                f"({worker_tensor_count(source_worker)} tensors)"
             )
 
             # Do not try another source after target preparation starts. The
@@ -180,7 +181,7 @@ class RdmaStrategy(LoadStrategy):
             )
             return None
         worker = metadata_resp.worker
-        if not worker.tensors and not worker.worker_grpc_endpoint:
+        if not worker_tensor_descriptors(worker) and not worker.worker_grpc_endpoint:
             logger.debug(
                 f"[Worker {ctx.global_rank}] Worker {worker_id} has no tensors "
                 f"and no P2P endpoint, skipping"
@@ -188,7 +189,7 @@ class RdmaStrategy(LoadStrategy):
             return None
         fetch_time = time.perf_counter() - fetch_start
         mode = "P2P (lightweight)" if worker.worker_grpc_endpoint else "centralized"
-        tensor_count = len(worker.tensors)
+        tensor_count = worker_tensor_count(worker)
         logger.info(
             f"[Worker {ctx.global_rank}] [TIMING] GetMetadata ({mode}): "
             f"{fetch_time:.3f}s, {tensor_count} tensors"
@@ -274,7 +275,7 @@ class RdmaStrategy(LoadStrategy):
                     name=t.name, addr=t.addr, size=t.size,
                     device_id=t.device_id, dtype=t.dtype,
                 )
-                for t in source_worker.tensors
+                for t in worker_tensor_descriptors(source_worker)
             ]
 
         logger.info(

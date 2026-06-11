@@ -115,19 +115,19 @@ spec:
           args:
             - $(MODEL_NAME)
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
-            - "1"
+            - "8"
           ports:
             - name: http
               containerPort: 8000
           resources:
             limits:
-              nvidia.com/gpu: 1
+              nvidia.com/gpu: 8
               # Number of EFA NICs to expose to the pod. p6e-gb200.36xlarge
               # has 4 EFA NICs per node; p5.48xlarge has 32. Pick a count
               # that matches what your workload can saturate.
               vpc.amazonaws.com/efa: 4
             requests:
-              nvidia.com/gpu: 1
+              nvidia.com/gpu: 8
               vpc.amazonaws.com/efa: 4

@@ -64,8 +64,10 @@ graph TD
 ModelExpress/
 ├── Cargo.toml                          # Workspace root (4 members)
 ├── Cargo.lock
-├── Dockerfile                          # Multi-stage production image
-├── docker-compose.yml                  # Single-service dev setup
+├── docker/
+│   ├── Dockerfile                      # Multi-stage production image
+│   ├── Dockerfile.client-wheel         # Builds Python client wheels + sdist
+│   └── docker-compose.yml              # Single-service dev setup
 ├── run_integration_tests.sh            # Integration test runner
 ├── test_client.sh                      # Client test script
 ├── test_grpc_transfer_k8s.sh           # K8s gRPC transfer test
@@ -132,7 +134,7 @@ ModelExpress/
 │       │   ├── __init__.py
 │       │   ├── publish.py              # Source identity + metadata publication
 │       │   ├── heartbeat.py            # Client-side heartbeat for source liveness
-│       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor manifest)
+│       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor/artifact manifests)
 │       │   ├── source_id.py            # Python mx_source_id computation
 │       │   ├── client_factory.py       # Selects central vs k8s-service metadata client
 │       │   └── k8s_service_client.py   # Decentralized k8s-service metadata client
@@ -156,7 +158,7 @@ ModelExpress/
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
 │       ├── rank_utils.py               # Rank detection utilities
-│       ├── vllm_worker.py              # ModelExpressWorker (custom vLLM worker)
+│       ├── vllm_worker.py              # Compatibility worker for older manual registration
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
 │       └── p2p_pb2_grpc.py             # Generated gRPC stubs
@@ -207,17 +209,28 @@ ModelExpress/
 ├── examples/
 │   ├── p2p_transfer_k8s/               # GPU-to-GPU weight transfer example
 │   │   ├── README.md
-│   │   ├── Dockerfile.client           # vLLM + ModelExpress client image
 │   │   ├── model-download.yaml         # Model weights download job
 │   │   ├── server/
 │   │   │   ├── kubernetes_backend/     # CRD-based metadata (crd, rbac, server)
 │   │   │   └── redis_backend/          # Redis-based metadata (redis, server)
 │   │   └── client/
+│   │       ├── vllm/
+│   │       │   ├── Dockerfile          # vLLM + ModelExpress client image
+│   │       │   ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
+│   │       │   └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
+│   │       └── sglang/
+│   │           ├── Dockerfile          # SGLang + ModelExpress client image
+│   │           └── sglang-single-node-p2p.yaml
+│   ├── model_streamer_k8s/             # ModelStreamer startup examples
+│   │   ├── README.md
+│   │   └── client/
 │   │       └── vllm/
-│   │           ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
-│   │           └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
+│   │           ├── README.md
+│   │           ├── vllm-single-node-streamer-azure.yaml
+│   │           ├── vllm-single-node-streamer-s3.yaml
+│   │           └── vllm-single-node-streamer-local.yaml
 │   ├── crds.yaml                       # ModelMetadata + ModelCacheEntry CRDs (cluster-admin)
-│   ├── aggregated_k8s/                 # Dynamo aggregated serving example
+│   ├── dynamo_model_cache_k8s/         # Dynamo model-cache serving example
 │   │   ├── README.md
 │   │   └── agg.yaml
 │   └── dynamo_p2p_transfer_k8s/        # Dynamo DGD with P2P weight transfer
@@ -286,8 +299,11 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `EnsureModelDownloaded` | `ModelDownloadRequest` | stream `ModelStatusUpdate` | Trigger download, stream progress |
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
+| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model record from the registry (used by `model clear`) |
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
+
+`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
 
 ### p2p.proto - P2pService
 
@@ -305,8 +321,10 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
 | `GetTensorManifest` | `GetTensorManifestRequest` | `GetTensorManifestResponse` | Fetch tensor descriptors directly from a source worker |
+| `GetArtifactManifestHeader` | `GetArtifactManifestHeaderRequest` | `GetArtifactManifestHeaderResponse` | Fetch artifact identity, counts, file table, and worker endpoints |
+| `GetArtifactManifestChunks` | `GetArtifactManifestChunksRequest` | `GetArtifactManifestChunksResponse` | Fetch artifact chunk metadata pages by `chunk_index` |
 
-Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors from the central server. Validates `mx_source_id` to catch stale discovery.
+Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. Validates `mx_source_id` to catch stale discovery.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
@@ -490,7 +508,7 @@ pub trait ModelProviderTrait: Send + Sync {
 
 Three implementations:
 - `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode.
-- `NgcProvider` - downloads from NVIDIA NGC via the V2 artifact API (Bearer-authenticated `/files/{path}` for team artifacts; presigned S3 URLs for org-level artifacts). Falls back to `checksums.blake3` manifest enumeration when bulk file listing returns 400. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
+- `NgcProvider` - downloads from NVIDIA NGC via the files-manifest endpoint `…/v2/org/{org}[/team/{team}]/{type}/{name}/{version}/files` (no `versions/` segment), which returns self-authenticating presigned URLs paired with relative paths for every file, for both V1 and V2 storage and both org and team scopes (so nested paths and downloads need no per-file URL construction or Authorization forwarding). Falls back to `checksums.blake3` manifest enumeration against the versioned `…/versions/{version}/files` endpoint (Bearer-authenticated `/files/{path}` downloads) when the listing returns 400/401, as some UAM-gated orgs (e.g. the `nim` catalog) do. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 - `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
 
 ### ClientConfig / ClientArgs
@@ -505,7 +523,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 
 | Module | Purpose |
 |--------|---------|
-| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `mx` loader with vLLM |
+| `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
@@ -518,7 +536,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
-| `vllm_worker.py` | `ModelExpressWorker` - custom vLLM worker class (use `--worker-cls=modelexpress.vllm_worker.ModelExpressWorker`) |
+| `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
 
@@ -542,6 +560,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 |--------|---------|
 | `__init__(agent_name, device_id, listen_port)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread |
 | `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1`, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually |
+| `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf, then publish every tensor descriptor against that single MR |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
@@ -550,7 +569,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 ### vLLM Loader
 
-**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format mx`):
+**MxModelLoader** (extends `BaseModelLoader`, registered as `--load-format modelexpress`; `mx` alias):
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
@@ -573,7 +592,7 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
-| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). On `SourceTransferError` or `ManifestMismatchError`, try next. |
+| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). Candidate retry covers pre-transfer metadata misses only (no metadata found, fetch error). Once the RDMA receive starts, a `SourceTransferError` or `ManifestMismatchError` aborts RDMA and the chain falls through to the next strategy (GDS, then disk), not the next source. |
 | p1 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
 | p3 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
@@ -586,7 +605,7 @@ Strategies handle the loading path and NIXL tensor registration. Adapter hooks h
 
 NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned CUDA tensors and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4 and on DeepSeek-V3 (MLA + FP8).
 
-During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match. This triggers trying the next source candidate rather than marking the source as stale, which is important during rolling updates where pods may run different image versions.
+During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match (a likely symptom of a rolling update where pods run different image versions). The receive path converts it, like any receive failure, into a `SourceTransferError`, which the chain treats as a mutated RDMA failure: RDMA is abandoned and loading falls through to the next strategy (GDS, then disk) rather than retrying another source. Source-candidate retry happens only for pre-transfer metadata misses, before any target tensor is prepared.
 
 After loading by any strategy, the worker starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged but do not crash the worker.
 
@@ -605,6 +624,27 @@ The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full 
 This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. MLA's `W_UV` and `W_UK_T` sharing a dequantized intermediate) are registered as flat byte views of their underlying storage via `storage_view()`. Multiple views into the same storage are deduplicated by `data_ptr()` so tied weights are only transferred once.
 
 Before tensor collection, `adopt_hidden_tensors()` scans each module's non-Module attributes recursively for CUDA tensors not already in `named_parameters()`/`named_buffers()`. These "orphaned" tensors (e.g. `FusedMoEQuantConfig.a1_gscale`, FlashInfer workspace buffers) are registered as non-persistent buffers so they appear in the manifest. Without this, the target's quant method objects retain values computed from dummy weights, causing incorrect inference despite all registered tensor bytes matching.
+
+### VMM Arena (CUDAPluggableAllocator hook)
+
+`MX_VMM_ARENA=1` installs a `CUDAPluggableAllocator` that routes every CUDA allocation issued during `initialize_model`, `load_weights`, and `process_weights_after_loading` into a CUDA VMM arena. The arena reserves 16.0 TiB of virtual address space up front via `cuMemAddressReserve`. The reservation consumes VA only. Physical memory is committed later, one PyTorch allocator call at a time, when the backend creates and maps a VMM handle.
+
+The `modelexpress.vmm` subpackage implements the arena (see `modelexpress_client/python/modelexpress/vmm/README.md` for the user-facing overview):
+
+| Module | Role |
+|--------|------|
+| `vmm/arena.py` | `VmmArena` reserves the large VA range, bump-assigns each `mx_malloc` a stable address, tracks live allocations by VA, and exposes the used high-water range for registration |
+| `vmm/backend.py` | `CudaVmmBackend` implements the CUDA VMM calls: reserve VA, `cuMemCreate`, `cuMemMap`, `cuMemSetAccess`, `cuMemUnmap`, `cuMemRelease`, and reserve release. Each allocation rolls back cleanly if a later CUDA call fails |
+| `vmm/hook.py` + `vmm/_alloc_ext.cpp` | `use_arena` combines `torch.cuda.use_mem_pool` with the C extension's `mx_malloc` and `mx_free` shims. The C extension is built best-effort by `setup.py`; if compilation fails the install still succeeds, `vmm.ARENA_AVAILABLE` is `False` at runtime, and the loader logs a warning and falls back when `MX_VMM_ARENA=1` is requested |
+| `vmm/runtime.py` | Engine-agnostic lifecycle helpers: `maybe_enter_vmm_arena(ctx)` is the contextmanager each engine adapter wraps around its load envelope (env-var handling, per-device arena dict, `use_arena` wrapping). `log_arena_post_load(ctx)` emits a diagnostic line after the load body returns |
+
+The allocation model matches PyTorch's caching allocator boundary. PyTorch already groups tensors into allocator segments before it calls the plugin, so ModelExpress gives each plugin allocation its own VMM physical handle instead of sub-allocating again inside larger chunks. `mx_malloc(size)` rounds to CUDA VMM granularity, calls `cuMemCreate`, maps that handle at the next arena VA, and returns the mapped address. `mx_free(ptr)` looks up the allocation, calls `cuMemUnmap`, then `cuMemRelease`, so selective frees during post-processing return physical memory before NIXL registration.
+
+After the load strategy succeeds and the engine has finished post-processing, `LoadStrategyChain` registers the arena instead of registering tensors one by one. `register_arena` calls `cuMemGetHandleForAddressRange` over `[arena.base, arena.base + arena.used_bytes)`, then performs one dmabuf-backed registration for the used range. Tensor descriptors still list every tensor by name and offset, but all offsets share one lkey from the arena MR.
+
+The arena path does not require `MX_POOL_REG=1`. Pool-reg remains the optimization for normal cudaMalloc deployments. Arena deployments use the direct `register_arena` seam because they already know the contiguous VA range and do not need `cuMemGetAddressRange` to rediscover allocation boundaries.
+
+Empirical validation on B200 + ConnectX on 2026-05-14 showed that a dmabuf MR over a multi-handle VMM range remains valid when holes exist inside the registered VA range. That is the property that lets `process_weights_after_loading` allocate replacement tensors, free discarded tensors, and still finish with one MR for the surviving used arena range.
 
 ## NIXL Integration
 
@@ -680,10 +720,10 @@ graph TD
 ### Flow
 
 1. **Source loads**: Loads weights from storage (S3/GCS/Azure/local via ModelStreamer, GDS, or disk), runs `process_weights_after_loading()`
-2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifest serving.
+2. **Source publishes**: Registers tensors with NIXL, calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor and artifact manifest serving.
 3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
-5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Auto-detects P2P mode if `worker_grpc_endpoint` is populated - fetches tensors from the source worker's `WorkerService` and NIXL metadata via the listen thread instead of from the central server.
+5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Auto-detects P2P mode if `worker_grpc_endpoint` is populated - fetches tensors or artifact manifest metadata from the source worker's `WorkerService` and NIXL metadata via the listen thread instead of from the central server.
 6. **Target transfers**: Executes RDMA reads from source; on `SourceTransferError` tries next candidate (max 3)
 7. **Target becomes source**: After receiving weights, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; GC deletes after 1 hour
@@ -696,18 +736,19 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_REGISTER_LOADERS` | `1` | Auto-register the mx loader with vLLM |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | gRPC server address |
-| `MX_SERVER_ADDRESS` | `localhost:8001` | Backward-compat alias for `MODEL_EXPRESS_URL` |
+| `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
-| `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged |
+| `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
+| `MX_VMM_ARENA` | `0` | Install a `CUDAPluggableAllocator` that routes weight-loading allocations into a CUDA VMM arena, then registers the used arena range once through dmabuf at end-of-load. Reserves 16.0 TiB of VA by default and commits physical memory only for mapped allocations. See [VMM Arena](#vmm-arena-cudapluggableallocator-hook) |
+| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers. Opt-in on central-coordinator backends; auto-enabled (env var ignored) on decentralized backends |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
-| `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor manifest serving |
+| `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
@@ -719,7 +760,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 | Variable | Recommended | Description |
 |----------|-------------|-------------|
-| `UCX_TLS` | `rc_x,rc,dc_x,dc,cuda_copy` | Transport layers for InfiniBand |
 | `UCX_RNDV_SCHEME` | `get_zcopy` | Zero-copy RDMA reads |
 | `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
 | `NIXL_LOG_LEVEL` | `INFO` | NIXL logging (DEBUG for troubleshooting) |

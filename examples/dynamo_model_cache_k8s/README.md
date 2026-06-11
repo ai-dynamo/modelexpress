@@ -1,4 +1,4 @@
-# Model Express with Aggregated Dynamo Inference on K8s
+# Model Express with Dynamo Model Cache on K8s
 
 
 ## Prerequisites
@@ -13,7 +13,7 @@
    
    ```bash
    # Build the Model Express image
-   docker build -t model-express:latest .
+   docker build -f docker/Dockerfile -t model-express:latest .
    
    # Tag for your registry (replace with your registry)
    docker tag model-express:latest your-registry/model-express:latest

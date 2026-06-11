@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# ModelExpress gRPC coordination server. Deployed PER TEST: run-mx-p2p-test
+# applies this manifest into each test's own namespace (mx-ci-<framework>-<run_id>)
+# and tears it down at the end, so every P2P test gets its own isolated
+# mx-server instance (the stale-metadata test uses mx-server-redis.yaml
+# instead). Uses the Kubernetes CRD backend, so the CRD from
+# crd-modelmetadata.yaml must be applied before this manifest.
+#
+# Accessed by test pods via the stable in-cluster DNS name: mx-server:8000
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-server
+  labels:
+    app: mx-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-server
+  template:
+    metadata:
+      labels:
+        app: mx-server
+    spec:
+      serviceAccountName: modelexpress
+      imagePullSecrets:
+        - name: worker-registry
+      containers:
+        - name: mx-server
+          image: ${MX_SERVER_IMAGE}
+          # Force re-pull on every pod creation so CI/dev iterations on the same
+          # tag pick up freshly pushed images instead of the node's cached copy.
+          imagePullPolicy: Always
+          command: ["/app/modelexpress-server"]
+          args: ["--port", "8000"]
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "kubernetes"
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # Widen the reaper staleness window past the default 90s. The
+            # vllm/trt/sglang-nixl sources refresh their heartbeat continuously
+            # (ModelExpress MxModelLoader's HeartbeatThread), so they are
+            # unaffected. But SGLang's in-tree (v0.5.12+) transfer_engine source
+            # publishes READY exactly once and never heartbeats, so a target
+            # that cold-starts slowly (model init + flashinfer + TransferEngine
+            # init can take >90s to reach the weight-load step) would otherwise
+            # find the source already reaped to STALE -> "no READY source found".
+            # 900s matches pod_ready_timeout_seconds: the source stays READY for
+            # as long as the test is willing to wait for the target anyway.
+            # The stale-metadata test uses mx-server-redis.yaml (its own short
+            # reaper knobs), so this does not weaken that coverage.
+            - name: MX_HEARTBEAT_TIMEOUT_SECS
+              value: "900"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              memory: "8Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-server
+spec:
+  selector:
+    app: mx-server
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -184,6 +184,29 @@ class TestModelStreamerLoad:
         mock_stream.assert_called_once_with("/models/llama", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    def test_success_path_sglang_model_path_without_model(self, mock_register):
+        """SGLang ModelConfig exposes model_path, not model."""
+        model = MagicMock()
+        model_config = SimpleNamespace(
+            model_weights=None,
+            model_path="/models/deepseek",
+        )
+        ctx = _make_load_context(model_config=model_config)
+        strategy = self._make_strategy()
+
+        with patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy._stream_weights"
+        ) as mock_stream:
+            mock_stream.return_value = iter([
+                ("layer.0.weight", torch.randn(4, 4)),
+            ])
+            result = strategy.load(model, ctx)
+
+        assert isinstance(result, LoadResult)
+        mock_stream.assert_called_once_with("/models/deepseek", ctx, model)
+
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_uri_from_model_weights_not_from_env(self, mock_register):
         """The streaming URI comes from model_config, not from MX_MODEL_URI."""
         model = MagicMock()

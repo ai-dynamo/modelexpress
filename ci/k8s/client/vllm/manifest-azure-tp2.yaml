@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Azure single-job template for P2P RDMA weight-transfer CI tests with
+# tensor parallelism = 2 (vLLM).
+#
+# Differences vs manifest-azure.yaml (TP=1):
+#   - nvidia.com/gpu / rdma/ib: 2 each (one IB device per GPU)
+#   - --tensor-parallel-size 2 in vLLM args
+#   - cpu/memory bumped to accommodate 2 GPUs of orchestration
+#
+# Source and target each schedule on different hosts (existing podAntiAffinity)
+# and each pod uses NVLink intra-node for TP comms, with NIXL/IB RDMA pulling
+# rank 0 + rank 1 worth of weights from the corresponding source pod's ranks.
+#
+# CLUSTER REQUIREMENT — MUST RUN ON NON-MIG GPU NODES.
+# When `nvidia.com/gpu: 2` is requested on a MIG node, K8s scheduler assigns
+# 2 MIG slices, NOT 2 full GPUs. NVIDIA hardware enforces:
+#   - NVML can't query topology across slices (PyTorch asserts on init)
+#   - NCCL peer-to-peer is blocked between slices
+#   - NVLink is blocked between slices
+# Net result: TP=2 fails during vLLM `compile_or_warm_up_model` with
+# `RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED`.
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      # Pin to a non-MIG GPU pool (mig.config=all-disabled, full physical
+      # GPUs per node), required for TP=2 NCCL / NVLink / NVML to work —
+      # MIG-sliced nodes expose slices, not GPUs, and hardware blocks
+      # NCCL/NVLink/NVML across slices. The agentpool podAffinity below
+      # becomes redundant under this nodeSelector but is kept for self-
+      # documentation + as defense if this nodeSelector is removed.
+      nodeSelector:
+        agentpool: a100b
+      affinity:
+        # podAntiAffinity on hostname: keep source and target on different
+        # physical hosts so RDMA still exercises true cross-host IB.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # podAffinity on agentpool: keep source and target in the SAME node
+        # pool. The Azure AKS test cluster splits GPU nodes across multiple
+        # InfiniBand partitions, and pods on different pkeys can't talk RDMA
+        # to each other. Combined with hostname anti-affinity, forces
+        # source/target onto different hosts WITHIN the same IB partition.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "2"
+            - --trust-remote-code
+            - --port
+            - "${WORKER_PORT}"
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
+            limits:
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]

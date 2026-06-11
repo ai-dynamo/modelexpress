@@ -247,13 +247,13 @@ class P2pService(object):
 
 class WorkerServiceStub(object):
     """============================================================================
-    Worker Service (P2P tensor manifest exchange)
+    Worker Service (P2P manifest exchange)
     ============================================================================
 
-    Per-worker gRPC service for direct tensor manifest retrieval.
-    Sources start this service when MX_P2P_METADATA=1. Targets call
-    GetTensorManifest to fetch tensor descriptors directly from the
-    source worker instead of from the central metadata server.
+    Per-worker gRPC service for direct manifest retrieval. Sources start this
+    service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
+    descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
+    file-backed artifact manifests.
     """
 
     def __init__(self, channel):
@@ -267,20 +267,42 @@ class WorkerServiceStub(object):
                 request_serializer=p2p__pb2.GetTensorManifestRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetTensorManifestResponse.FromString,
                 _registered_method=True)
+        self.GetArtifactManifestHeader = channel.unary_unary(
+                '/model_express.p2p.WorkerService/GetArtifactManifestHeader',
+                request_serializer=p2p__pb2.GetArtifactManifestHeaderRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetArtifactManifestHeaderResponse.FromString,
+                _registered_method=True)
+        self.GetArtifactManifestChunks = channel.unary_unary(
+                '/model_express.p2p.WorkerService/GetArtifactManifestChunks',
+                request_serializer=p2p__pb2.GetArtifactManifestChunksRequest.SerializeToString,
+                response_deserializer=p2p__pb2.GetArtifactManifestChunksResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
     """============================================================================
-    Worker Service (P2P tensor manifest exchange)
+    Worker Service (P2P manifest exchange)
     ============================================================================
 
-    Per-worker gRPC service for direct tensor manifest retrieval.
-    Sources start this service when MX_P2P_METADATA=1. Targets call
-    GetTensorManifest to fetch tensor descriptors directly from the
-    source worker instead of from the central metadata server.
+    Per-worker gRPC service for direct manifest retrieval. Sources start this
+    service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
+    descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
+    file-backed artifact manifests.
     """
 
     def GetTensorManifest(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetArtifactManifestHeader(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetArtifactManifestChunks(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -294,6 +316,16 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     request_deserializer=p2p__pb2.GetTensorManifestRequest.FromString,
                     response_serializer=p2p__pb2.GetTensorManifestResponse.SerializeToString,
             ),
+            'GetArtifactManifestHeader': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetArtifactManifestHeader,
+                    request_deserializer=p2p__pb2.GetArtifactManifestHeaderRequest.FromString,
+                    response_serializer=p2p__pb2.GetArtifactManifestHeaderResponse.SerializeToString,
+            ),
+            'GetArtifactManifestChunks': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetArtifactManifestChunks,
+                    request_deserializer=p2p__pb2.GetArtifactManifestChunksRequest.FromString,
+                    response_serializer=p2p__pb2.GetArtifactManifestChunksResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'model_express.p2p.WorkerService', rpc_method_handlers)
@@ -304,13 +336,13 @@ def add_WorkerServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class WorkerService(object):
     """============================================================================
-    Worker Service (P2P tensor manifest exchange)
+    Worker Service (P2P manifest exchange)
     ============================================================================
 
-    Per-worker gRPC service for direct tensor manifest retrieval.
-    Sources start this service when MX_P2P_METADATA=1. Targets call
-    GetTensorManifest to fetch tensor descriptors directly from the
-    source worker instead of from the central metadata server.
+    Per-worker gRPC service for direct manifest retrieval. Sources start this
+    service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
+    descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
+    file-backed artifact manifests.
     """
 
     @staticmethod
@@ -330,6 +362,60 @@ class WorkerService(object):
             '/model_express.p2p.WorkerService/GetTensorManifest',
             p2p__pb2.GetTensorManifestRequest.SerializeToString,
             p2p__pb2.GetTensorManifestResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetArtifactManifestHeader(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/GetArtifactManifestHeader',
+            p2p__pb2.GetArtifactManifestHeaderRequest.SerializeToString,
+            p2p__pb2.GetArtifactManifestHeaderResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetArtifactManifestChunks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/GetArtifactManifestChunks',
+            p2p__pb2.GetArtifactManifestChunksRequest.SerializeToString,
+            p2p__pb2.GetArtifactManifestChunksResponse.FromString,
             options,
             channel_credentials,
             insecure,

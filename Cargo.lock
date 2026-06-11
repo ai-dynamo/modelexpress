@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "model-express-workspace-tests"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-client"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-common"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2432,6 +2432,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
@@ -2444,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-server"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2458,6 +2459,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "mockall 0.14.0",
+ "modelexpress-client",
  "modelexpress-common",
  "once_cell",
  "prost 0.13.5",
