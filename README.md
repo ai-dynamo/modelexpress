@@ -59,10 +59,9 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
-- **ModelStreamer integration**: pull weights from cold storage with multi-cloud and multi-engine support
+- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS) with multi-engine support
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
-- **Multi-cloud storage backends**: AWS S3, Azure Blob, and NFS as model pull sources
 
 ### Integrations
 
