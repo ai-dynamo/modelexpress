@@ -387,9 +387,26 @@ class MxV2TrainingPublisher:
         return mx_source_id
 
     def mark_ready(self) -> bool:
-        """Mark this source as READY. Starts heartbeat if enabled."""
+        """Mark this source as READY and (re)arm the liveness heartbeat.
+
+        Each :meth:`publish` mints a NEW ``mx_source_id`` (the training step is
+        encoded into the agent_name), so the heartbeat — which refreshes a
+        single snapshotted ``mx_source_id`` — must be re-armed onto the source
+        we just published. Without re-arming, only the *first* published version
+        stays heartbeated; every later version is marked READY once and then
+        reaped to STALE by the server after ``MX_HEARTBEAT_TIMEOUT_SECS``
+        (default 90s), so receivers' :meth:`discover_v2_sources` find no source
+        for ``version>=N`` on the second and subsequent refits. (Mirrors the
+        stop-then-restart logic already used in :meth:`publish_self_as_source`.)
+        """
         ok = self._publisher.mark_ready(worker_rank=self._worker_rank)
-        if ok and self._heartbeat_enabled and self._heartbeat is None:
+        if ok and self._heartbeat_enabled:
+            # Restart the heartbeat onto the source we just published. Stop the
+            # prior one first (it tracked a now-superseded source_id) to avoid a
+            # leaked thread and a lingering READY status on the old version.
+            if self._heartbeat is not None:
+                self._heartbeat.stop()
+                self._heartbeat = None
             self._start_heartbeat()
         return ok
 
