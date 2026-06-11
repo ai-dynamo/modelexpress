@@ -252,8 +252,9 @@ class WorkerServiceStub(object):
 
     Per-worker gRPC service for direct manifest retrieval. Sources start this
     service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
-    descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
-    file-backed artifact manifests.
+    descriptors or artifact manifest RPCs for sealed file-backed artifacts.
+    Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
+    source-side registered DRAM range and returns its transfer descriptor.
     """
 
     def __init__(self, channel):
@@ -277,6 +278,16 @@ class WorkerServiceStub(object):
                 request_serializer=p2p__pb2.GetArtifactManifestChunksRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetArtifactManifestChunksResponse.FromString,
                 _registered_method=True)
+        self.PrepareArtifactChunk = channel.unary_unary(
+                '/model_express.p2p.WorkerService/PrepareArtifactChunk',
+                request_serializer=p2p__pb2.PrepareArtifactChunkRequest.SerializeToString,
+                response_deserializer=p2p__pb2.PrepareArtifactChunkResponse.FromString,
+                _registered_method=True)
+        self.ReleaseArtifactChunk = channel.unary_unary(
+                '/model_express.p2p.WorkerService/ReleaseArtifactChunk',
+                request_serializer=p2p__pb2.ReleaseArtifactChunkRequest.SerializeToString,
+                response_deserializer=p2p__pb2.ReleaseArtifactChunkResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerServiceServicer(object):
@@ -286,8 +297,9 @@ class WorkerServiceServicer(object):
 
     Per-worker gRPC service for direct manifest retrieval. Sources start this
     service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
-    descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
-    file-backed artifact manifests.
+    descriptors or artifact manifest RPCs for sealed file-backed artifacts.
+    Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
+    source-side registered DRAM range and returns its transfer descriptor.
     """
 
     def GetTensorManifest(self, request, context):
@@ -303,6 +315,18 @@ class WorkerServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def GetArtifactManifestChunks(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PrepareArtifactChunk(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseArtifactChunk(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -326,6 +350,16 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     request_deserializer=p2p__pb2.GetArtifactManifestChunksRequest.FromString,
                     response_serializer=p2p__pb2.GetArtifactManifestChunksResponse.SerializeToString,
             ),
+            'PrepareArtifactChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrepareArtifactChunk,
+                    request_deserializer=p2p__pb2.PrepareArtifactChunkRequest.FromString,
+                    response_serializer=p2p__pb2.PrepareArtifactChunkResponse.SerializeToString,
+            ),
+            'ReleaseArtifactChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseArtifactChunk,
+                    request_deserializer=p2p__pb2.ReleaseArtifactChunkRequest.FromString,
+                    response_serializer=p2p__pb2.ReleaseArtifactChunkResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'model_express.p2p.WorkerService', rpc_method_handlers)
@@ -341,8 +375,9 @@ class WorkerService(object):
 
     Per-worker gRPC service for direct manifest retrieval. Sources start this
     service when MX_P2P_METADATA=1. Targets call GetTensorManifest for tensor
-    descriptors or GetArtifactManifestHeader/GetArtifactManifestChunks for sealed
-    file-backed artifact manifests.
+    descriptors or artifact manifest RPCs for sealed file-backed artifacts.
+    Artifact bytes move through NIXL; PrepareArtifactChunk only creates a
+    source-side registered DRAM range and returns its transfer descriptor.
     """
 
     @staticmethod
@@ -416,6 +451,60 @@ class WorkerService(object):
             '/model_express.p2p.WorkerService/GetArtifactManifestChunks',
             p2p__pb2.GetArtifactManifestChunksRequest.SerializeToString,
             p2p__pb2.GetArtifactManifestChunksResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrepareArtifactChunk(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/PrepareArtifactChunk',
+            p2p__pb2.PrepareArtifactChunkRequest.SerializeToString,
+            p2p__pb2.PrepareArtifactChunkResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseArtifactChunk(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/ReleaseArtifactChunk',
+            p2p__pb2.ReleaseArtifactChunkRequest.SerializeToString,
+            p2p__pb2.ReleaseArtifactChunkResponse.FromString,
             options,
             channel_credentials,
             insecure,

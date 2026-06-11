@@ -8,8 +8,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Iterable
 
 import google_crc32c
 
@@ -17,15 +17,20 @@ from .. import p2p_pb2
 
 ARTIFACT_MANIFEST_VERSION = 1
 MAX_ARTIFACT_TRANSFER_CHUNK_SIZE = 4 * 1024 * 1024 * 1024
+DEFAULT_ARTIFACT_TRANSFER_CHUNK_SIZE = 64 * 1024 * 1024
+MX_ARTIFACT_TRANSFER_CHUNK_SIZE_ENV = "MX_ARTIFACT_TRANSFER_CHUNK_SIZE"
 
 logger = logging.getLogger("modelexpress.metadata.artifact_manifest")
 
 
 def build_artifact_manifest(
     root: str | Path,
-    chunk_size: int,
+    *,
+    chunk_size: int | None = None,
     mx_source_type: int,
 ) -> p2p_pb2.ArtifactManifest:
+    if chunk_size is None:
+        chunk_size = artifact_transfer_chunk_size()
     if chunk_size <= 0:
         raise ValueError("artifact manifest chunk_size must be greater than zero")
     if chunk_size > MAX_ARTIFACT_TRANSFER_CHUNK_SIZE:
@@ -47,15 +52,21 @@ def build_artifact_manifest(
     chunks = []
     for file_index, (manifest_path, path) in enumerate(manifest_files):
         size = path.stat().st_size
+        file_checksum, file_chunks = _checksums_for_file(
+            path,
+            file_index,
+            len(chunks),
+            chunk_size,
+        )
         files.append(
             p2p_pb2.ArtifactManifestFile(
                 file_index=file_index,
                 path=manifest_path,
                 size=size,
-                checksum=_file_checksum(path),
+                checksum=file_checksum,
             )
         )
-        chunks.extend(_chunks_for_file(path, file_index, len(chunks), chunk_size))
+        chunks.extend(file_chunks)
 
     return p2p_pb2.ArtifactManifest(
         manifest_version=ARTIFACT_MANIFEST_VERSION,
@@ -66,7 +77,33 @@ def build_artifact_manifest(
     )
 
 
+def artifact_transfer_chunk_size(
+    default: int = DEFAULT_ARTIFACT_TRANSFER_CHUNK_SIZE,
+) -> int:
+    raw = os.environ.get(MX_ARTIFACT_TRANSFER_CHUNK_SIZE_ENV)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid artifact transfer chunk size %r; using %d",
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive artifact transfer chunk size %d; using %d",
+            value,
+            default,
+        )
+        return default
+    return value
+
+
 def artifact_manifest_id(manifest: p2p_pb2.ArtifactManifest) -> str:
+    # Compact UTF-8 JSON is the canonical byte representation for artifact_id.
     canonical = json.dumps(
         _manifest_to_dict(manifest),
         ensure_ascii=False,
@@ -121,17 +158,19 @@ def _manifest_path(path: Path) -> str:
     return path.as_posix()
 
 
-def _chunks_for_file(
+def _checksums_for_file(
     path: Path,
     file_index: int,
     first_chunk_index: int,
     chunk_size: int,
-) -> Iterable[p2p_pb2.ArtifactManifestChunk]:
+) -> tuple[str, list[p2p_pb2.ArtifactManifestChunk]]:
     size = path.stat().st_size
     if size == 0:
         del first_chunk_index, file_index
-        return
+        return _crc32c_hex(b""), []
 
+    chunks = []
+    file_crc = google_crc32c.Checksum()
     chunk_index = first_chunk_index
     offset = 0
     with path.open("rb") as file:
@@ -139,29 +178,24 @@ def _chunks_for_file(
             data = file.read(min(chunk_size, size - offset))
             if not data:
                 break
-            yield p2p_pb2.ArtifactManifestChunk(
-                chunk_index=chunk_index,
-                file_index=file_index,
-                file_offset=offset,
-                length=len(data),
-                checksum=_crc32c_hex(data),
+            file_crc.update(data)
+            chunks.append(
+                p2p_pb2.ArtifactManifestChunk(
+                    chunk_index=chunk_index,
+                    file_index=file_index,
+                    file_offset=offset,
+                    length=len(data),
+                    checksum=_crc32c_hex(data),
+                )
             )
             offset += len(data)
             chunk_index += 1
+    return file_crc.hexdigest().decode("ascii"), chunks
 
 
-def _file_checksum(path: Path) -> str:
-    checksum = google_crc32c.Checksum()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(64 * 1024), b""):
-            checksum.update(chunk)
-    digest = checksum.hexdigest()
-    if isinstance(digest, bytes):
-        digest = digest.decode("ascii")
-    return digest.lower()
-
-
-def _crc32c_hex(data: bytes) -> str:
+def _crc32c_hex(data) -> str:
+    if isinstance(data, memoryview):
+        data = data.tobytes()
     return f"{google_crc32c.value(data):08x}"
 
 
