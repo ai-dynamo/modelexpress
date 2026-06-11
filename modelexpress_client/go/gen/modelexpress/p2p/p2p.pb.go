@@ -2593,11 +2593,11 @@ const file_p2p_proto_rawDesc = "" +
 	"artifactId\x12*\n" +
 	"\x11start_chunk_index\x18\x03 \x01(\rR\x0fstartChunkIndex\x12@\n" +
 	"\x06chunks\x18\x04 \x03(\v2(.model_express.p2p.ArtifactManifestChunkR\x06chunks\x12&\n" +
-	"\x0fnext_page_token\x18\x05 \x01(\tR\rnextPageToken\"z\n" +
+	"\x0fnext_page_token\x18\x05 \x01(\tR\rnextPageToken\"j\n" +
 	"\x1fArtifactChunkTransferDescriptor\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\x04R\x04addr\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1b\n" +
-	"\tdevice_id\x18\x03 \x01(\rR\bdeviceIdJ\x04\b\x04\x10\x05R\bmem_type\"\x81\x01\n" +
+	"\tdevice_id\x18\x03 \x01(\rR\bdeviceId\"\x81\x01\n" +
 	"\x1bPrepareArtifactChunkRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +

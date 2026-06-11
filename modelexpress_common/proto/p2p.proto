@@ -405,9 +405,6 @@ message ArtifactChunkTransferDescriptor {
 
   // NIXL device id for the prepared DRAM range.
   uint32 device_id = 3;
-
-  reserved 4;
-  reserved "mem_type";
 }
 
 message PrepareArtifactChunkRequest {
