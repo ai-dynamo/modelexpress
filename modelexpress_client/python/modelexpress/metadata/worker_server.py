@@ -113,9 +113,6 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             lease_id=lease_id,
             chunk=chunk,
             source=source,
-            metadata_endpoint=self._metadata_endpoint,
-            agent_name=self._agent_name,
-            worker_rank=self._worker_rank,
             source_metadata=source_metadata,
         )
         logger.info(

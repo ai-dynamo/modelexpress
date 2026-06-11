@@ -434,14 +434,9 @@ message PrepareArtifactChunkResponse {
   // NIXL DRAM source descriptor for this chunk.
   ArtifactChunkTransferDescriptor source = 5;
 
-  // Self-describing worker info, matching GetArtifactManifestHeaderResponse.
-  string metadata_endpoint = 6;
-  string agent_name = 7;
-  uint32 worker_rank = 8;
-
   // NIXL metadata for the source agent after this chunk has been prepared.
   // This describes agent registration state, not one byte range.
-  bytes source_metadata = 9;
+  bytes source_metadata = 6;
 }
 
 message ReleaseArtifactChunkRequest {

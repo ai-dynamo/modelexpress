@@ -297,9 +297,6 @@ def test_worker_service_prepares_and_releases_artifact_chunk(tmp_path):
     assert response.source.addr > 0
     assert response.source.length == 3
     assert response.source.device_id == 0
-    assert response.metadata_endpoint == "10.0.0.1:5555"
-    assert response.agent_name == "source-agent"
-    assert response.worker_rank == 4
     assert response.source_metadata == b"fake-nixl-metadata"
     assert fake_nixl.registered_sizes == [3]
     assert fake_nixl.deregistered_count == 0

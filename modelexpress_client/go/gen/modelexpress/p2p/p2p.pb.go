@@ -1664,13 +1664,9 @@ type PrepareArtifactChunkResponse struct {
 	Chunk *ArtifactManifestChunk `protobuf:"bytes,4,opt,name=chunk,proto3" json:"chunk,omitempty"`
 	// NIXL DRAM source descriptor for this chunk.
 	Source *ArtifactChunkTransferDescriptor `protobuf:"bytes,5,opt,name=source,proto3" json:"source,omitempty"`
-	// Self-describing worker info, matching GetArtifactManifestHeaderResponse.
-	MetadataEndpoint string `protobuf:"bytes,6,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
-	AgentName        string `protobuf:"bytes,7,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
-	WorkerRank       uint32 `protobuf:"varint,8,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
 	// NIXL metadata for the source agent after this chunk has been prepared.
 	// This describes agent registration state, not one byte range.
-	SourceMetadata []byte `protobuf:"bytes,9,opt,name=source_metadata,json=sourceMetadata,proto3" json:"source_metadata,omitempty"`
+	SourceMetadata []byte `protobuf:"bytes,6,opt,name=source_metadata,json=sourceMetadata,proto3" json:"source_metadata,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1738,27 +1734,6 @@ func (x *PrepareArtifactChunkResponse) GetSource() *ArtifactChunkTransferDescrip
 		return x.Source
 	}
 	return nil
-}
-
-func (x *PrepareArtifactChunkResponse) GetMetadataEndpoint() string {
-	if x != nil {
-		return x.MetadataEndpoint
-	}
-	return ""
-}
-
-func (x *PrepareArtifactChunkResponse) GetAgentName() string {
-	if x != nil {
-		return x.AgentName
-	}
-	return ""
-}
-
-func (x *PrepareArtifactChunkResponse) GetWorkerRank() uint32 {
-	if x != nil {
-		return x.WorkerRank
-	}
-	return 0
 }
 
 func (x *PrepareArtifactChunkResponse) GetSourceMetadata() []byte {
@@ -2604,7 +2579,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
 	"artifactId\x12\x1f\n" +
 	"\vchunk_index\x18\x03 \x01(\rR\n" +
-	"chunkIndex\"\x9e\x03\n" +
+	"chunkIndex\"\xb1\x02\n" +
 	"\x1cPrepareArtifactChunkResponse\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2612,13 +2587,8 @@ const file_p2p_proto_rawDesc = "" +
 	"artifactId\x12\x19\n" +
 	"\blease_id\x18\x03 \x01(\tR\aleaseId\x12>\n" +
 	"\x05chunk\x18\x04 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\x12J\n" +
-	"\x06source\x18\x05 \x01(\v22.model_express.p2p.ArtifactChunkTransferDescriptorR\x06source\x12+\n" +
-	"\x11metadata_endpoint\x18\x06 \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
-	"\n" +
-	"agent_name\x18\a \x01(\tR\tagentName\x12\x1f\n" +
-	"\vworker_rank\x18\b \x01(\rR\n" +
-	"workerRank\x12'\n" +
-	"\x0fsource_metadata\x18\t \x01(\fR\x0esourceMetadata\"{\n" +
+	"\x06source\x18\x05 \x01(\v22.model_express.p2p.ArtifactChunkTransferDescriptorR\x06source\x12'\n" +
+	"\x0fsource_metadata\x18\x06 \x01(\fR\x0esourceMetadata\"{\n" +
 	"\x1bReleaseArtifactChunkRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
