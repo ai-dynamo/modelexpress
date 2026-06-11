@@ -64,6 +64,8 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 
 Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker, then use `PrepareArtifactChunk` and `ReleaseArtifactChunk` around each NIXL transfer. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Manifest file paths are canonical absolute publisher paths and are included in the sealed manifest; transfer helpers may rewrite them to target-local staging paths before installing the artifact.
 
+Artifact source discovery currently requires a central-coordinator backend (`redis` or `kubernetes`). The decentralized `k8s-service` backend fetches tensor manifests with `GetTensorManifest` and does not yet expose `artifact_source` discovery.
+
 ## gRPC API
 
 ```protobuf
@@ -139,6 +141,8 @@ Artifact targets use `GetArtifactManifestHeader` to fetch the sealed artifact id
 Artifact bytes move through NIXL, not through the metadata service. For each chunk, the target calls `PrepareArtifactChunk` so the source reads that file range into a registered DRAM buffer and returns a NIXL transfer descriptor plus a lease. The target receives that range into a local registered DRAM buffer, verifies the chunk CRC32C, writes it to the target staging file, and then calls `ReleaseArtifactChunk` to free the source lease.
 
 The header currently returns the full file table sorted by manifest path, while chunk metadata is paged. Very high file-count artifacts can make the header large; if that becomes a production shape, the protocol should add a paged file-table RPC instead of increasing gRPC message limits.
+
+`MX_ARTIFACT_TRANSFER_CHUNK_SIZE` controls the manifest chunk size for artifact transfer. The default is 64 MiB and the maximum accepted value is 4 GiB. Larger chunks reduce manifest size and per-chunk RPC overhead, but each source and target worker allocates registered DRAM buffers sized by roughly `chunk_size * max_inflight_chunks`; smaller chunks reduce buffer memory at the cost of more RPCs and checksum work.
 
 ### Tarred Cache Artifact Helpers
 

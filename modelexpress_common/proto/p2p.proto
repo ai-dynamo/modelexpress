@@ -199,8 +199,9 @@ message ArtifactManifestFile {
   // File index used by ArtifactManifestChunk.file_index.
   uint32 file_index = 1;
 
-  // Canonical absolute publisher path using "/" separators. Transfer targets
-  // may rewrite this to a target-local staging path before installation.
+  // Canonical absolute publisher path using "/" separators. Targets may
+  // rewrite this to a target-local staging path after validating the sealed
+  // source manifest.
   string path = 2;
 
   // File size in bytes.
@@ -396,17 +397,17 @@ message GetArtifactManifestChunksResponse {
 }
 
 message ArtifactChunkTransferDescriptor {
-  // Registered source buffer address for the prepared chunk.
+  // Registered source DRAM buffer address for the prepared chunk.
   uint64 addr = 1;
 
   // Prepared range length in bytes.
   uint64 length = 2;
 
-  // NIXL device id for the prepared range. DRAM buffers use 0.
+  // NIXL device id for the prepared DRAM range.
   uint32 device_id = 3;
 
-  // NIXL memory type for prep_xfer_dlist, for example "DRAM".
-  string mem_type = 4;
+  reserved 4;
+  reserved "mem_type";
 }
 
 message PrepareArtifactChunkRequest {
@@ -433,7 +434,7 @@ message PrepareArtifactChunkResponse {
   // Metadata for the prepared chunk.
   ArtifactManifestChunk chunk = 4;
 
-  // NIXL source descriptor for this chunk.
+  // NIXL DRAM source descriptor for this chunk.
   ArtifactChunkTransferDescriptor source = 5;
 
   // Self-describing worker info, matching GetArtifactManifestHeaderResponse.
@@ -442,6 +443,7 @@ message PrepareArtifactChunkResponse {
   uint32 worker_rank = 8;
 
   // NIXL metadata for the source agent after this chunk has been prepared.
+  // This describes agent registration state, not one byte range.
   bytes source_metadata = 9;
 }
 

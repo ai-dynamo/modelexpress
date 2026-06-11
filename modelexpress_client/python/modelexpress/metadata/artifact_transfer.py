@@ -18,6 +18,7 @@ from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 import grpc
+import google_crc32c
 import torch
 
 from .. import p2p_pb2
@@ -280,6 +281,8 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
                 raise ValueError(
                     f"artifact bundle_root must be dedicated; found {child}"
                 )
+        if tar_path.is_symlink():
+            raise ValueError(f"artifact target bundle path must not be a symlink: {tar_path}")
         return tar_path
 
 
@@ -569,7 +572,6 @@ class NixlArtifactChunkManager:
             addr=slot.buffer.data_ptr(),
             length=chunk.length,
             device_id=0,
-            mem_type=NIXL_DRAM_MEM_TYPE,
         )
         return lease_id, descriptor, self._nixl_manager.nixl_metadata
 
@@ -656,18 +658,29 @@ def transfer_artifact_from_worker(
         mx_source_id=mx_source_id,
         artifact_id=artifact_id,
     )
-    chunks = _fetch_all_chunks(endpoint, mx_source_id, header.artifact_id)
+    chunks = _fetch_all_chunks(
+        endpoint,
+        mx_source_id,
+        header.artifact_id,
+        expected_chunk_count=header.chunk_count,
+    )
+    _validate_fetched_artifact_manifest(header, chunks, artifact_id)
     target_header = _header_with_target_file_paths(header, target_file_paths)
     target_files = target_header.files
     _prepare_target_files(target_files)
     if not chunks:
-        logger.info(
-            "Transferred artifact %s from %s (%d files, 0 chunks)",
-            header.artifact_id,
-            endpoint,
-            header.file_count,
-        )
-        return target_header
+        try:
+            _verify_transferred_files(target_files)
+            logger.info(
+                "Transferred artifact %s from %s (%d files, 0 chunks)",
+                header.artifact_id,
+                endpoint,
+                header.file_count,
+            )
+            return target_header
+        except Exception:
+            _cleanup_target_files(target_files)
+            raise
 
     target_slots = _register_target_buffers(
         nixl_manager,
@@ -706,6 +719,7 @@ def transfer_artifact_from_worker(
                     prepared,
                 )
             next_chunk += len(prepared)
+        _verify_transferred_files(target_files)
     except Exception:
         _cleanup_target_files(target_files)
         raise
@@ -768,7 +782,7 @@ def _transfer_prepared_chunk(
         local_buffer=target_slot.buffer,
         size=response.source.length,
         remote_device_id=response.source.device_id,
-        remote_mem_type=response.source.mem_type,
+        remote_mem_type=NIXL_DRAM_MEM_TYPE,
         timeout_seconds=timeout,
     )
     tensor = target_slot.buffer.narrow(0, 0, int(response.source.length))
@@ -873,7 +887,7 @@ def _header_with_target_file_paths(
     for source_file, target_path in zip(header.files, target_file_paths, strict=True):
         target_file = p2p_pb2.ArtifactManifestFile()
         target_file.CopyFrom(source_file)
-        target_file.path = Path(target_path).resolve().as_posix()
+        target_file.path = Path(target_path).absolute().as_posix()
         target_header.files.append(target_file)
     return target_header
 
@@ -944,7 +958,12 @@ def _prepare_target_files(files) -> None:
     for file in files:
         path = Path(file.path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as output:
+        if path.is_symlink():
+            raise ValueError(f"artifact target file must not be a symlink: {path}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o666)
+        with os.fdopen(fd, "wb") as output:
             output.truncate(file.size)
 
 
@@ -952,7 +971,11 @@ def _fetch_all_chunks(
     endpoint: str,
     mx_source_id: str,
     artifact_id: str,
+    *,
+    expected_chunk_count: int,
 ) -> list[p2p_pb2.ArtifactManifestChunk]:
+    if expected_chunk_count == 0:
+        return []
     chunks: list[p2p_pb2.ArtifactManifestChunk] = []
     start = 0
     while True:
@@ -962,10 +985,167 @@ def _fetch_all_chunks(
             artifact_id=artifact_id,
             start_chunk_index=start,
         )
+        if response.mx_source_id != mx_source_id:
+            raise RuntimeError(
+                "artifact chunk page mx_source_id mismatch: "
+                f"{response.mx_source_id} != {mx_source_id}"
+            )
+        if response.artifact_id != artifact_id:
+            raise RuntimeError(
+                "artifact chunk page artifact_id mismatch: "
+                f"{response.artifact_id} != {artifact_id}"
+            )
+        if response.start_chunk_index != start:
+            raise RuntimeError(
+                "artifact chunk page start mismatch: "
+                f"{response.start_chunk_index} != {start}"
+            )
         chunks.extend(response.chunks)
+        if len(chunks) > expected_chunk_count:
+            raise RuntimeError(
+                "artifact chunk pages exceeded expected chunk_count: "
+                f"{len(chunks)} > {expected_chunk_count}"
+            )
         if not response.next_page_token:
             return chunks
-        start = int(response.next_page_token)
+        try:
+            next_start = int(response.next_page_token)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"invalid artifact chunk page token: {response.next_page_token!r}"
+            ) from exc
+        if next_start <= start:
+            raise RuntimeError(
+                "artifact chunk page token did not advance: "
+                f"{next_start} <= {start}"
+            )
+        if next_start > expected_chunk_count:
+            raise RuntimeError(
+                "artifact chunk page token exceeds expected chunk_count: "
+                f"{next_start} > {expected_chunk_count}"
+            )
+        start = next_start
+
+
+def _validate_fetched_artifact_manifest(
+    header: p2p_pb2.GetArtifactManifestHeaderResponse,
+    chunks: list[p2p_pb2.ArtifactManifestChunk],
+    expected_artifact_id: str,
+) -> None:
+    if expected_artifact_id and header.artifact_id != expected_artifact_id:
+        raise RuntimeError(
+            "artifact header id mismatch: "
+            f"{header.artifact_id} != {expected_artifact_id}"
+        )
+    if header.file_count != len(header.files):
+        raise RuntimeError(
+            "artifact header file_count mismatch: "
+            f"{header.file_count} != {len(header.files)}"
+        )
+    if header.chunk_count != len(chunks):
+        raise RuntimeError(
+            "artifact header chunk_count mismatch: "
+            f"{header.chunk_count} != {len(chunks)}"
+        )
+    if header.total_size != sum(file.size for file in header.files):
+        raise RuntimeError("artifact header total_size does not match file table")
+    if header.chunk_size <= 0:
+        raise RuntimeError("artifact header chunk_size must be positive")
+
+    files = list(header.files)
+    for file_index, file in enumerate(files):
+        if file.file_index != file_index:
+            raise RuntimeError(
+                "artifact file_index mismatch: "
+                f"{file.file_index} != {file_index}"
+            )
+
+    coverage: list[list[tuple[int, int]]] = [[] for _ in files]
+    for chunk_index, chunk in enumerate(chunks):
+        if chunk.chunk_index != chunk_index:
+            raise RuntimeError(
+                "artifact chunk_index mismatch: "
+                f"{chunk.chunk_index} != {chunk_index}"
+            )
+        if chunk.file_index >= len(files):
+            raise RuntimeError(
+                f"artifact chunk {chunk.chunk_index} references missing file "
+                f"{chunk.file_index}"
+            )
+        if chunk.length == 0:
+            raise RuntimeError(f"artifact chunk {chunk.chunk_index} has zero length")
+        if chunk.length > header.chunk_size:
+            raise RuntimeError(
+                f"artifact chunk {chunk.chunk_index} length {chunk.length} exceeds "
+                f"chunk_size {header.chunk_size}"
+            )
+        file = files[chunk.file_index]
+        end = chunk.file_offset + chunk.length
+        if end > file.size:
+            raise RuntimeError(
+                f"artifact chunk {chunk.chunk_index} exceeds file {chunk.file_index} "
+                f"size {file.size}"
+            )
+        coverage[chunk.file_index].append((int(chunk.file_offset), int(end)))
+
+    for file, ranges in zip(files, coverage, strict=True):
+        if file.size == 0:
+            if ranges:
+                raise RuntimeError(f"empty artifact file {file.file_index} has chunks")
+            if file.checksum != _crc32c_hex(b""):
+                raise RuntimeError(f"empty artifact file {file.file_index} checksum mismatch")
+            continue
+        cursor = 0
+        for start, end in sorted(ranges):
+            if start != cursor:
+                raise RuntimeError(
+                    f"artifact file {file.file_index} coverage gap or overlap at "
+                    f"offset {cursor}"
+                )
+            cursor = end
+        if cursor != file.size:
+            raise RuntimeError(
+                f"artifact file {file.file_index} incomplete coverage: "
+                f"{cursor} != {file.size}"
+            )
+
+    manifest = p2p_pb2.ArtifactManifest(
+        manifest_version=header.manifest_version,
+        mx_source_type=header.mx_source_type,
+        chunk_size=header.chunk_size,
+        files=header.files,
+        chunks=chunks,
+    )
+    computed_artifact_id = artifact_manifest_id(manifest)
+    if computed_artifact_id != header.artifact_id:
+        raise RuntimeError(
+            "artifact manifest id mismatch: "
+            f"{computed_artifact_id} != {header.artifact_id}"
+        )
+
+
+def _verify_transferred_files(files) -> None:
+    for file in files:
+        path = Path(file.path)
+        if path.stat().st_size != file.size:
+            raise RuntimeError(f"artifact file size mismatch after transfer: {path}")
+        checksum = _file_crc32c_hex(path)
+        if checksum != file.checksum:
+            raise RuntimeError(
+                f"artifact file crc32c mismatch after transfer: "
+                f"expected {file.checksum}, got {checksum}"
+            )
+
+
+def _file_crc32c_hex(path: Path) -> str:
+    checksum = google_crc32c.Checksum()
+    with path.open("rb") as file:
+        while True:
+            data = file.read(1024 * 1024)
+            if not data:
+                break
+            checksum.update(data)
+    return checksum.hexdigest().decode("ascii")
 
 
 def _read_file_range_into_buffer(

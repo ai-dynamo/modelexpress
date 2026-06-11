@@ -697,8 +697,9 @@ type ArtifactManifestFile struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// File index used by ArtifactManifestChunk.file_index.
 	FileIndex uint32 `protobuf:"varint,1,opt,name=file_index,json=fileIndex,proto3" json:"file_index,omitempty"`
-	// Canonical absolute publisher path using "/" separators. Transfer targets
-	// may rewrite this to a target-local staging path before installation.
+	// Canonical absolute publisher path using "/" separators. Targets may
+	// rewrite this to a target-local staging path after validating the sealed
+	// source manifest.
 	Path string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
 	// File size in bytes.
 	Size uint64 `protobuf:"varint,3,opt,name=size,proto3" json:"size,omitempty"`
@@ -1527,14 +1528,12 @@ func (x *GetArtifactManifestChunksResponse) GetNextPageToken() string {
 
 type ArtifactChunkTransferDescriptor struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Registered source buffer address for the prepared chunk.
+	// Registered source DRAM buffer address for the prepared chunk.
 	Addr uint64 `protobuf:"varint,1,opt,name=addr,proto3" json:"addr,omitempty"`
 	// Prepared range length in bytes.
 	Length uint64 `protobuf:"varint,2,opt,name=length,proto3" json:"length,omitempty"`
-	// NIXL device id for the prepared range. DRAM buffers use 0.
-	DeviceId uint32 `protobuf:"varint,3,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
-	// NIXL memory type for prep_xfer_dlist, for example "DRAM".
-	MemType       string `protobuf:"bytes,4,opt,name=mem_type,json=memType,proto3" json:"mem_type,omitempty"`
+	// NIXL device id for the prepared DRAM range.
+	DeviceId      uint32 `protobuf:"varint,3,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1588,13 +1587,6 @@ func (x *ArtifactChunkTransferDescriptor) GetDeviceId() uint32 {
 		return x.DeviceId
 	}
 	return 0
-}
-
-func (x *ArtifactChunkTransferDescriptor) GetMemType() string {
-	if x != nil {
-		return x.MemType
-	}
-	return ""
 }
 
 type PrepareArtifactChunkRequest struct {
@@ -1670,13 +1662,14 @@ type PrepareArtifactChunkResponse struct {
 	LeaseId string `protobuf:"bytes,3,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
 	// Metadata for the prepared chunk.
 	Chunk *ArtifactManifestChunk `protobuf:"bytes,4,opt,name=chunk,proto3" json:"chunk,omitempty"`
-	// NIXL source descriptor for this chunk.
+	// NIXL DRAM source descriptor for this chunk.
 	Source *ArtifactChunkTransferDescriptor `protobuf:"bytes,5,opt,name=source,proto3" json:"source,omitempty"`
 	// Self-describing worker info, matching GetArtifactManifestHeaderResponse.
 	MetadataEndpoint string `protobuf:"bytes,6,opt,name=metadata_endpoint,json=metadataEndpoint,proto3" json:"metadata_endpoint,omitempty"`
 	AgentName        string `protobuf:"bytes,7,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
 	WorkerRank       uint32 `protobuf:"varint,8,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
 	// NIXL metadata for the source agent after this chunk has been prepared.
+	// This describes agent registration state, not one byte range.
 	SourceMetadata []byte `protobuf:"bytes,9,opt,name=source_metadata,json=sourceMetadata,proto3" json:"source_metadata,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -2600,12 +2593,11 @@ const file_p2p_proto_rawDesc = "" +
 	"artifactId\x12*\n" +
 	"\x11start_chunk_index\x18\x03 \x01(\rR\x0fstartChunkIndex\x12@\n" +
 	"\x06chunks\x18\x04 \x03(\v2(.model_express.p2p.ArtifactManifestChunkR\x06chunks\x12&\n" +
-	"\x0fnext_page_token\x18\x05 \x01(\tR\rnextPageToken\"\x85\x01\n" +
+	"\x0fnext_page_token\x18\x05 \x01(\tR\rnextPageToken\"z\n" +
 	"\x1fArtifactChunkTransferDescriptor\x12\x12\n" +
 	"\x04addr\x18\x01 \x01(\x04R\x04addr\x12\x16\n" +
 	"\x06length\x18\x02 \x01(\x04R\x06length\x12\x1b\n" +
-	"\tdevice_id\x18\x03 \x01(\rR\bdeviceId\x12\x19\n" +
-	"\bmem_type\x18\x04 \x01(\tR\amemType\"\x81\x01\n" +
+	"\tdevice_id\x18\x03 \x01(\rR\bdeviceIdJ\x04\b\x04\x10\x05R\bmem_type\"\x81\x01\n" +
 	"\x1bPrepareArtifactChunkRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +

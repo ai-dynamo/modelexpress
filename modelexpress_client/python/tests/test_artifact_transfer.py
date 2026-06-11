@@ -170,6 +170,79 @@ def test_transfer_artifact_from_worker_cleans_partial_files_on_checksum_error(tm
     assert target_nixl.deregistered_count == 1
 
 
+def test_validate_fetched_manifest_rejects_missing_chunk(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"0123456789abcdef")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=5,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    header = _artifact_header_from_manifest(manifest)
+
+    with pytest.raises(RuntimeError, match="chunk_count mismatch"):
+        artifact_transfer_module._validate_fetched_artifact_manifest(
+            header,
+            list(manifest.chunks[:-1]),
+            header.artifact_id,
+        )
+
+
+def test_validate_fetched_manifest_rejects_overlapping_chunks(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"0123456789abcdef")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=8,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    chunks = [p2p_pb2.ArtifactManifestChunk() for _ in manifest.chunks]
+    for target, source in zip(chunks, manifest.chunks, strict=True):
+        target.CopyFrom(source)
+    chunks[1].file_offset = 0
+    header = _artifact_header_from_manifest(manifest, chunks=chunks)
+
+    with pytest.raises(RuntimeError, match="coverage gap or overlap"):
+        artifact_transfer_module._validate_fetched_artifact_manifest(
+            header,
+            chunks,
+            header.artifact_id,
+        )
+
+
+def test_validate_fetched_manifest_rejects_manifest_id_mismatch(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"0123456789abcdef")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=8,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    header = _artifact_header_from_manifest(manifest)
+    header.artifact_id = "bad-artifact-id"
+
+    with pytest.raises(RuntimeError, match="artifact header id mismatch"):
+        artifact_transfer_module._validate_fetched_artifact_manifest(
+            header,
+            list(manifest.chunks),
+            artifact_manifest_id(manifest),
+        )
+
+
+def test_verify_transferred_files_rejects_final_file_crc_mismatch(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"0123456789abcdef")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=8,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    artifact_file.write_bytes(b"xxxxxxxxxxxxxxxx")
+
+    with pytest.raises(RuntimeError, match="file crc32c mismatch"):
+        artifact_transfer_module._verify_transferred_files(manifest.files)
+
+
 def test_tarred_p2p_artifact_transfer_prepares_single_file_bundle(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -227,6 +300,30 @@ def test_tarred_p2p_artifact_transfer_rejects_stale_bundle_files(tmp_path):
 
     with pytest.raises(ValueError, match="dedicated"):
         transfer.prepare_source()
+
+
+def test_tarred_p2p_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    bundle = tmp_path / "target-bundle"
+    bundle.mkdir()
+    outside = tmp_path / "outside.tar"
+    outside.write_bytes(b"keep-me")
+    (bundle / "artifact.tar").symlink_to(outside)
+    transfer = torch_compile_cache_artifact_transfer(
+        source,
+        tmp_path / "target",
+        bundle,
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        transfer.transfer_from_worker(
+            "127.0.0.1:1",
+            mx_source_id="source-123",
+            artifact_id="artifact",
+            nixl_manager=object(),
+        )
+    assert outside.read_bytes() == b"keep-me"
 
 
 def test_tarred_p2p_artifact_transfer_rejects_symlink(tmp_path):
@@ -605,6 +702,61 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
     }
 
 
+def test_fetch_all_chunks_rejects_non_advancing_page_token(monkeypatch):
+    def fake_fetch_artifact_manifest_chunks(*args, **kwargs):
+        del args, kwargs
+        return (
+            p2p_pb2.GetArtifactManifestChunksResponse(
+                mx_source_id="source-123",
+                artifact_id="artifact",
+                start_chunk_index=0,
+                next_page_token="0",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(
+        artifact_transfer_module,
+        "fetch_artifact_manifest_chunks",
+        fake_fetch_artifact_manifest_chunks,
+    )
+
+    with pytest.raises(RuntimeError, match="did not advance"):
+        artifact_transfer_module._fetch_all_chunks(
+            "127.0.0.1:1",
+            "source-123",
+            "artifact",
+            expected_chunk_count=1,
+        )
+
+
+def _artifact_header_from_manifest(
+    manifest: p2p_pb2.ArtifactManifest,
+    *,
+    chunks: list[p2p_pb2.ArtifactManifestChunk] | None = None,
+) -> p2p_pb2.GetArtifactManifestHeaderResponse:
+    if chunks is None:
+        chunks = list(manifest.chunks)
+    reconstructed = p2p_pb2.ArtifactManifest(
+        manifest_version=manifest.manifest_version,
+        mx_source_type=manifest.mx_source_type,
+        chunk_size=manifest.chunk_size,
+        files=manifest.files,
+        chunks=chunks,
+    )
+    return p2p_pb2.GetArtifactManifestHeaderResponse(
+        mx_source_id="source-123",
+        artifact_id=artifact_manifest_id(reconstructed),
+        manifest_version=manifest.manifest_version,
+        mx_source_type=manifest.mx_source_type,
+        total_size=sum(file.size for file in manifest.files),
+        file_count=len(manifest.files),
+        chunk_count=len(chunks),
+        chunk_size=manifest.chunk_size,
+        files=manifest.files,
+    )
+
+
 def _start_server(servicer) -> tuple[grpc.Server, int]:
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, server)
@@ -642,7 +794,6 @@ class _FakeArtifactChunkManager:
                 addr=addr,
                 length=chunk.length,
                 device_id=0,
-                mem_type="DRAM",
             ),
             b"fake-source-metadata",
         )
