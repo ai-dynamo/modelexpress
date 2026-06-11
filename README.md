@@ -59,6 +59,9 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
+- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS) with multi-engine support
+- **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
+- **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
 
 ### Integrations
 
@@ -242,19 +245,16 @@ cargo bench
 ### Priorities Under Development
 
 - **P2P compile/warmup caching**: torch.compile/deepGEMM cache for follower workers. Leader performs full warmup; followers consume caches and skip full warmup.
-- **ModelStreamer Integration**: Pull weights from cold storage with multi-cloud and multi-engine support.
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
 - **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
-- **Expanded model pull providers**: Support NGC in addition to Hugging Face.
-- **GDS (GPUDirect Storage) integration**: Load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
 - **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
 - **Metrics and observability**: Cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
 - **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
 - **P2P transfer fault tolerance**: Auto-recovery from stale rkeys on source restart; retry and fallback to storage loading.
-- **Multi-cloud storage backends**: Native support for AWS S3, Azure Blob, and NFS as model pull sources.
+- **Dynamic EPLB (Expert Parallelism Load Balancer)**: Rebalance MoE expert placement across GPUs at runtime via P2P transfer of expert weights as load shifts.
 
 ---
 
