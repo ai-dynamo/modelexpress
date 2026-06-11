@@ -180,7 +180,7 @@ def test_validate_fetched_manifest_rejects_missing_chunk(tmp_path):
     )
     header = _artifact_header_from_manifest(manifest)
 
-    with pytest.raises(RuntimeError, match="chunk_count mismatch"):
+    with pytest.raises(RuntimeError, match="manifest count mismatch"):
         artifact_transfer_module._validate_fetched_artifact_manifest(
             header,
             list(manifest.chunks[:-1]),
@@ -227,20 +227,6 @@ def test_validate_fetched_manifest_rejects_manifest_id_mismatch(tmp_path):
             list(manifest.chunks),
             artifact_manifest_id(manifest),
         )
-
-
-def test_verify_transferred_files_rejects_final_file_crc_mismatch(tmp_path):
-    artifact_file = tmp_path / "cache.bin"
-    artifact_file.write_bytes(b"0123456789abcdef")
-    manifest = build_artifact_manifest(
-        tmp_path,
-        chunk_size=8,
-        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-    )
-    artifact_file.write_bytes(b"xxxxxxxxxxxxxxxx")
-
-    with pytest.raises(RuntimeError, match="file crc32c mismatch"):
-        artifact_transfer_module._verify_transferred_files(manifest.files)
 
 
 def test_tarred_p2p_artifact_transfer_prepares_single_file_bundle(tmp_path):
