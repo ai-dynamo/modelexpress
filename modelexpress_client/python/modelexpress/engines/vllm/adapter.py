@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from ...adapter import EngineAdapter
+from ...accelerator_backend import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...metadata.publish import build_source_identity
@@ -41,6 +42,7 @@ class VllmAdapter(EngineAdapter):
         self.model_config = model_config
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
+        self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self):
         return build_source_identity(self.vllm_config, self.model_config)
@@ -147,7 +149,7 @@ class VllmAdapter(EngineAdapter):
         result.value = None
         result.model = None
         del old_value
-        torch.cuda.empty_cache()
+        self.accelerator_backend.empty_cache()
         self._reset_compilation_state()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
@@ -306,4 +308,5 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
         adapter=adapter,
+        accelerator_backend=adapter.accelerator_backend,
     )

@@ -5,9 +5,9 @@
 
 import pytest
 
+from modelexpress.accelerator_backend import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.nixl_transfer import (
     DEFAULT_NIXL_BACKEND,
-    NIXL_ACCELERATOR_MEM_TYPE,
     NixlTransferManager,
     SUPPORTED_NIXL_BACKENDS,
     _resolve_nixl_backend,

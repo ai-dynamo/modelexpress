@@ -22,6 +22,8 @@ from typing import Any
 
 import torch
 
+from .accelerator_backend import AcceleratorBackend, CudaAcceleratorBackend
+
 logger = logging.getLogger("modelexpress.gds_transfer")
 
 NIXL_AVAILABLE = False
@@ -96,10 +98,11 @@ class GdsTransferManager:
             gds.batch_load_file(fd, file_size, tensor_list, device)
     """
 
-    def __init__(self, agent_name: str):
+    def __init__(self, agent_name: str, accelerator_backend: AcceleratorBackend | None = None):
         self._agent_name = agent_name
         self._device_id: int | None = None
         self._agent: Any = None
+        self._accelerator_backend = accelerator_backend or CudaAcceleratorBackend()
         override = os.environ.get("MX_GDS_MAX_CHUNK_KB")
         self._max_chunk_size = int(override) * 1024 if override else _DEFAULT_MAX_CHUNK
 
@@ -124,7 +127,7 @@ class GdsTransferManager:
         if self._agent is not None:
             return
 
-        self._device_id = torch.cuda.current_device()
+        self._device_id = self._accelerator_backend.current_device()
 
         thread_count = int(os.environ.get("MX_GDS_THREADS", "8"))
         config = NixlAgentConfig(backends=["GDS_MT"], num_threads=thread_count)

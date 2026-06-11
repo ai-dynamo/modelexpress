@@ -11,7 +11,6 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
-import torch
 import torch.nn as nn
 
 from ..nixl_transfer import is_nixl_available
@@ -20,6 +19,7 @@ from ..metadata.publish import publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
+    from ..accelerator_backend import AcceleratorBackend
     from ..nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.load_strategy")
@@ -82,7 +82,11 @@ class LoadStrategy(ABC):
 
 
 def _init_nixl_manager(
-    global_rank: int, device_id: int, role: str, listen_port: int = 0,
+    global_rank: int,
+    device_id: int,
+    role: str,
+    listen_port: int = 0,
+    accelerator_backend: AcceleratorBackend | None = None,
 ) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     from ..nixl_transfer import NixlTransferManager
@@ -93,6 +97,7 @@ def _init_nixl_manager(
         agent_name=agent_name,
         device_id=device_id,
         listen_port=listen_port,
+        accelerator_backend=accelerator_backend,
     )
     manager.initialize()
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
@@ -181,7 +186,11 @@ def register_tensors(
             base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
             listen_port = base_port + ctx.device_id
             ctx.nixl_manager = _init_nixl_manager(
-                ctx.global_rank, ctx.device_id, "auto", listen_port
+                ctx.global_rank,
+                ctx.device_id,
+                "auto",
+                listen_port,
+                ctx.accelerator_backend,
             )
 
         if not ctx.nixl_manager.tensor_descriptors:
