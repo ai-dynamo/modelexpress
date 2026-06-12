@@ -5,10 +5,9 @@
 
 import torch
 import torch.nn as nn
-import pytest
 
 from modelexpress.tensor_utils import (
-    _find_hidden_cuda_tensors,
+    _find_hidden_accel_tensors,
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
@@ -68,34 +67,34 @@ class ModuleWithNested(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# _find_hidden_cuda_tensors
+# _find_hidden_accel_tensors
 # ---------------------------------------------------------------------------
 
 
-class TestFindHiddenCudaTensors:
-    def test_finds_tensor_on_plain_object(self):
+class TestFindHiddenAccelTensors:
+    def test_default_cuda_backend_ignores_cpu_tensor(self):
         config = QuantConfig(device="cpu")
-        # CPU tensors are not CUDA, so shouldn't be found
-        results = _find_hidden_cuda_tensors(config, visited=set())
+        # Default CUDA backend: CPU tensors must be ignored.
+        results = _find_hidden_accel_tensors(config, visited=set())
         assert len(results) == 0
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_finds_cuda_tensor_on_plain_object(self):
-        config = QuantConfig(device="cuda")
-        results = _find_hidden_cuda_tensors(config, visited=set())
+    def test_finds_backend_tensor_on_plain_object(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        config = QuantConfig(device="cpu")
+        results = _find_hidden_accel_tensors(config, visited=set(), accelerator_backend=backend)
         assert len(results) == 2  # a1_gscale, a2_gscale
 
-    def test_finds_tensors_in_nested_dicts_and_lists(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-        nested = NestedObj(device="cuda")
-        results = _find_hidden_cuda_tensors(nested, visited=set())
+    def test_finds_tensors_in_nested_dicts_and_lists(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        nested = NestedObj(device="cpu")
+        results = _find_hidden_accel_tensors(nested, visited=set(), accelerator_backend=backend)
         assert len(results) == 3  # w1, w2, buffers[0]
 
     def test_skips_non_tensor_attrs(self):
         config = QuantConfig(device="cpu")
-        results = _find_hidden_cuda_tensors(config, visited=set())
-        # CPU tensors are not CUDA; some_int and some_string are not tensors.
+        # Default CUDA backend: CPU tensors must be ignored.
+        results = _find_hidden_accel_tensors(config, visited=set())
+        # CPU tensors are not CUDA by default; ints and strings are not tensors.
         # Nothing should be found.
         assert len(results) == 0
 
@@ -105,10 +104,13 @@ class TestFindHiddenCudaTensors:
 
         obj = Circular()
         obj.self_ref = obj
-        results = _find_hidden_cuda_tensors(obj, visited=set())
+        # Default CUDA backend: this no-op CPU object graph must stay ignored.
+        results = _find_hidden_accel_tensors(obj, visited=set())
         assert len(results) == 0
 
-    def test_respects_depth_limit(self):
+    def test_respects_depth_limit(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+
         class Deep:
             pass
 
@@ -119,10 +121,9 @@ class TestFindHiddenCudaTensors:
             child = Deep()
             current.child = child
             current = child
-        if torch.cuda.is_available():
-            current.tensor = torch.randn(4, device="cuda")
+        current.tensor = torch.randn(4)
 
-        results = _find_hidden_cuda_tensors(root, visited=set())
+        results = _find_hidden_accel_tensors(root, visited=set(), accelerator_backend=backend)
         # Depth 20 limit should prevent finding the deep tensor
         assert len(results) == 0
 
@@ -135,14 +136,14 @@ class TestFindHiddenCudaTensors:
 class TestAdoptHiddenTensors:
     def test_no_hidden_tensors(self):
         model = SimpleModule()
+        # Default CUDA backend: CPU tensors must be ignored.
         count = adopt_hidden_tensors(model)
         assert count == 0
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_adopts_cuda_tensors_from_quant_method(self):
+    def test_adopts_backend_tensors_from_quant_method(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         module = ModuleWithQuant()
-        module.quant_method = FakeQuant(device="cuda")
-        count = adopt_hidden_tensors(module)
+        count = adopt_hidden_tensors(module, backend)
         assert count == 2  # a1_gscale, a2_gscale
 
         # Verify they're now in named_buffers
@@ -150,10 +151,10 @@ class TestAdoptHiddenTensors:
         assert any("a1_gscale" in name for name in buffer_names)
         assert any("a2_gscale" in name for name in buffer_names)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_skips_already_registered_tensors(self):
+    def test_skips_already_registered_tensors(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         module = nn.Module()
-        tensor = torch.randn(4, device="cuda")
+        tensor = torch.randn(4)
         module.register_buffer("existing", tensor)
 
         class Holder:
@@ -163,31 +164,32 @@ class TestAdoptHiddenTensors:
         holder.ref = tensor  # same tensor, already registered
         module.holder = holder
 
-        count = adopt_hidden_tensors(module)
-        assert count == 0  # should skip since data_ptr already registered
+        # The CPU mock marks holder.ref as accelerator-owned; zero means dedup skipped it.
+        count = adopt_hidden_tensors(module, backend)
+        assert count == 0
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_adopts_nested_tensors(self):
+    def test_adopts_nested_tensors(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         module = ModuleWithNested()
-        module.nested = NestedObj(device="cuda")
-        count = adopt_hidden_tensors(module)
+        count = adopt_hidden_tensors(module, backend)
         assert count == 3  # w1, w2, buffers[0]
 
     def test_cpu_tensors_ignored(self):
         module = ModuleWithQuant()  # CPU tensors by default
+        # Default CUDA backend: CPU tensors must be ignored.
         count = adopt_hidden_tensors(module)
         assert count == 0
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_buffer_name_collisions_disambiguated(self):
+    def test_buffer_name_collisions_disambiguated(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         module = nn.Module()
 
         class A:
             def __init__(self):
-                self.scale = torch.randn(4, device="cuda")
+                self.scale = torch.randn(4)
 
         a = A()
-        b_dict = {"scale": torch.randn(4, device="cuda")}
+        b_dict = {"scale": torch.randn(4)}
         # Both attributes normalize to `_mx_<attr>_scale`; with "__dot__" the
         # attr prefix differs, but we also want collision handling if two
         # hidden tensors under one attr share a sanitized suffix.
@@ -195,9 +197,9 @@ class TestAdoptHiddenTensors:
         module.b = b_dict
         # Second hidden tensor on `a` whose path collides after sanitization:
         # "scale.x" and "scale[x]" both normalize similarly.
-        a.__dict__["inner"] = {"k": torch.randn(4, device="cuda")}
+        a.__dict__["inner"] = {"k": torch.randn(4)}
 
-        count = adopt_hidden_tensors(module)
+        count = adopt_hidden_tensors(module, backend)
         assert count == 3
         buffer_ptrs = {buf.data_ptr() for _, buf in module.named_buffers()}
         assert len(buffer_ptrs) == 3  # no overwrite, all tensors survived
@@ -209,12 +211,11 @@ class TestAdoptHiddenTensors:
 
 
 class TestCaptureTensorAttrs:
-    def test_promotes_bare_cuda_tensor_to_buffer(self):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
+    def test_promotes_bare_backend_tensor_to_buffer(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         module = nn.Module()
-        tensor = torch.randn(4, device="cuda")
-        with capture_tensor_attrs():
+        tensor = torch.randn(4)
+        with capture_tensor_attrs(backend):
             module.my_tensor = tensor
 
         assert "my_tensor" in dict(module.named_buffers())
@@ -309,28 +310,28 @@ class TestStorageView:
 
 
 class TestCollectModuleTensors:
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_collects_parameters(self):
-        model = nn.Linear(4, 4, device="cuda")
-        tensors = collect_module_tensors(model)
+    def test_collects_backend_parameters(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        model = nn.Linear(4, 4)
+        tensors = collect_module_tensors(model, backend)
         assert "weight" in tensors
         assert "bias" in tensors
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_deduplicates_tied_weights(self):
+    def test_deduplicates_tied_weights(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         model = nn.Module()
-        shared = nn.Parameter(torch.randn(4, 4, device="cuda"))
+        shared = nn.Parameter(torch.randn(4, 4))
         model.register_parameter("a", shared)
         model.register_parameter("b", shared)
-        tensors = collect_module_tensors(model)
+        tensors = collect_module_tensors(model, backend)
         # Only one should be collected (same data_ptr)
         assert len(tensors) == 1
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_non_contiguous_registered_as_storage(self):
+    def test_non_contiguous_registered_as_storage(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         model = nn.Module()
-        base = torch.randn(4, 4, device="cuda")
+        base = torch.randn(4, 4)
         view = base.T  # non-contiguous
         model.register_buffer("nc_view", view, persistent=False)
-        tensors = collect_module_tensors(model)
+        tensors = collect_module_tensors(model, backend)
         assert "nc_view.__storage" in tensors
