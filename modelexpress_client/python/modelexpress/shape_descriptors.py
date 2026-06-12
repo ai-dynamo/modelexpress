@@ -80,6 +80,13 @@ class TensorDescriptorV2:
     is_expert: bool = False
     expert_axis: int = 0
     owned_expert_ids: tuple[int, ...] = ()
+    # Per-tensor Megatron role + role-specific descriptor extras. None /
+    # empty for DTensor / PrimeRL publishers; populated by Megatron-Core
+    # publishers so the receiver can dispatch on the role per tensor.
+    # See temp/NemoRL_Megatron_MX_Design.md §4 for the role enum and
+    # the extras keys per role.
+    megatron_role: str | None = None
+    megatron_extras: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -95,6 +102,10 @@ class TensorDescriptorV2:
             d["is_expert"] = True
             d["expert_axis"] = self.expert_axis
             d["owned_expert_ids"] = list(self.owned_expert_ids)
+        if self.megatron_role is not None:
+            d["megatron_role"] = self.megatron_role
+        if self.megatron_extras:
+            d["megatron_extras"] = dict(self.megatron_extras)
         return d
 
     @classmethod
@@ -110,6 +121,8 @@ class TensorDescriptorV2:
             is_expert=bool(d.get("is_expert", False)),
             expert_axis=int(d.get("expert_axis", 0)),
             owned_expert_ids=tuple(d.get("owned_expert_ids", [])),
+            megatron_role=d.get("megatron_role"),
+            megatron_extras=dict(d.get("megatron_extras") or {}),
         )
 
 
@@ -253,18 +266,40 @@ def encode_registry(
     *,
     version: int,
     trainer_world_layout: str,
+    extras: dict[str, Any] | None = None,
 ) -> str:
-    """Serialize a registry to a string for ``extra_parameters``."""
-    payload = {
+    """Serialize a registry to a string for ``extra_parameters``.
+
+    ``extras`` is an optional dict of additional top-level keys to merge
+    into the registry payload. Used by Megatron-Core publishes to carry
+    the transformer config + Megatron→HF name map alongside the
+    per-tensor descriptors. Receivers pick the keys up via
+    :func:`decode_registry` (which round-trips unknown top-level keys
+    unchanged).
+    """
+    payload: dict[str, Any] = {
         "version": int(version),
         "trainer_world_layout": trainer_world_layout,
         "tensors": [d.to_dict() for d in descriptors],
     }
+    if extras:
+        for key, value in extras.items():
+            # Don't let extras shadow the structural keys.
+            if key in ("version", "trainer_world_layout", "tensors"):
+                continue
+            payload[key] = value
     return json.dumps(payload, separators=(",", ":"))
 
 
 def decode_registry(blob: str) -> dict[str, Any]:
-    """Inverse of ``encode_registry``. Returns ``{version, trainer_world_layout, tensors}``."""
+    """Inverse of :func:`encode_registry`.
+
+    Returns the full registry dict — at minimum ``{version,
+    trainer_world_layout, tensors}``, plus any extras the publisher
+    attached (round-tripped unchanged). Receivers inspect the dict
+    directly for the keys they care about; unknown keys are preserved
+    so future fields don't require coordinated upgrades.
+    """
     parsed = json.loads(blob)
     parsed["tensors"] = [
         TensorDescriptorV2.from_dict(t) for t in parsed.get("tensors", [])

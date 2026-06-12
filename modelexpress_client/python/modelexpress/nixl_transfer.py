@@ -43,6 +43,29 @@ SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
 DEFAULT_NIXL_BACKEND = "UCX"
 
 
+from dataclasses import dataclass
+
+
+@dataclass
+class SlicedTransferRequest:
+    """One per-tensor sub-slice pull request for :meth:`receive_sliced_from_source`.
+
+    Each request says "read ``slice_bytes`` bytes starting at offset
+    ``source_offset_bytes`` from the remote tensor named ``name``, and
+    write them into the local memory backing ``dest_view`` (which must be
+    a contiguous tensor of exactly ``slice_bytes`` bytes — typically a
+    ``narrow`` of a pre-registered destination buffer)."
+
+    The combined transfer is built from a list of these — N requests
+    produces one NIXL transfer with N (remote, local) descriptor pairs.
+    """
+
+    name: str
+    source_offset_bytes: int
+    slice_bytes: int
+    dest_view: torch.Tensor
+
+
 def is_nixl_available() -> bool:
     """Check if NIXL is available."""
     return NIXL_AVAILABLE
@@ -635,6 +658,159 @@ class NixlTransferManager:
             self._agent.deregister_memory(reg_descs)
         except Exception as e:  # noqa: BLE001
             logger.warning("NIXL deregister_memory failed: %s", e)
+
+    def receive_sliced_from_source(
+        self,
+        source_metadata: bytes,
+        source_tensors: list[TensorDescriptor],
+        slice_requests: list["SlicedTransferRequest"],
+        timeout_seconds: float | None = None,
+        remote_agent_name: str | None = None,
+    ) -> tuple[int, int, float]:
+        """Pull sub-slices of remote tensors directly into local dest views.
+
+        Unlike :meth:`receive_from_source` (which transfers full tensors into
+        pre-registered named buffers), this primitive transfers per-tensor
+        sub-ranges directly into caller-provided dest views — one combined
+        NIXL transfer with N (source slice, dest view) descriptor pairs.
+
+        This is the v1 "sliced pull" needed for bandwidth-optimal mixed-TP
+        in the target-wider direction: each receiver pulls only the bytes
+        it actually needs from each source rank, instead of pulling the
+        full source manifest and slicing on the host (the v0 fallback in
+        :func:`MxRefitReceiver.receive_weights_scratch`).
+
+        Args:
+            source_metadata: NIXL agent metadata from the remote source.
+            source_tensors: source manifest (one ``TensorDescriptor`` per
+                published tensor, ``addr`` + ``size`` referring to the
+                source's GPU memory). The request's ``name`` field is
+                looked up against this list.
+            slice_requests: each request specifies a single (source tensor,
+                source byte offset, byte count, local dest view) tuple.
+                The local dest view must be **contiguous** in memory — if
+                the caller wants a non-contiguous slice (e.g. a row-parallel
+                axis-1 ``narrow``), it must use the v0 scratch+copy path
+                instead, since RDMA writes need a flat byte range.
+            timeout_seconds: as for :meth:`receive_from_source`.
+            remote_agent_name: as for :meth:`receive_from_source`. When
+                None, ``add_remote_agent(source_metadata)`` is called once
+                up front.
+
+        Returns:
+            ``(total_bytes_transferred, num_slices, elapsed_seconds)``.
+
+        Raises:
+            RuntimeError: if any dest view is non-contiguous, if a request
+                names a tensor not in the source manifest, or if the
+                source offset/size goes past the source tensor's end.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        if not slice_requests:
+            return 0, 0, 0.0
+
+        start_time = time.perf_counter()
+        torch.cuda.set_device(self._device_id)
+
+        if remote_agent_name is None:
+            remote_agent_name = self._agent.add_remote_agent(source_metadata)
+
+        # Index source tensors by name for fast lookup.
+        by_name: dict[str, TensorDescriptor] = {t.name: t for t in source_tensors}
+
+        remote_descs: list[tuple[int, int, int]] = []
+        local_descs: list[tuple[int, int, int]] = []
+        total_bytes = 0
+
+        for req in slice_requests:
+            src = by_name.get(req.name)
+            if src is None:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: tensor {req.name!r} not in "
+                    f"source manifest (have {len(by_name)} tensors)"
+                )
+            if req.source_offset_bytes < 0:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: negative source_offset_bytes "
+                    f"on {req.name!r}"
+                )
+            if req.source_offset_bytes + req.slice_bytes > src.size:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: slice on {req.name!r} runs "
+                    f"past end of source (offset={req.source_offset_bytes} + "
+                    f"size={req.slice_bytes} > src.size={src.size})"
+                )
+            dest = req.dest_view
+            if not dest.is_contiguous():
+                raise RuntimeError(
+                    f"receive_sliced_from_source: dest view for {req.name!r} "
+                    f"is non-contiguous (shape={tuple(dest.shape)}, "
+                    f"stride={dest.stride()}). Use receive_weights_scratch + "
+                    f"host-side copy for non-contiguous slices (e.g. "
+                    f"row-parallel axis-1 narrows)."
+                )
+            dest_bytes = dest.numel() * dest.element_size()
+            if dest_bytes != req.slice_bytes:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: dest view size {dest_bytes} "
+                    f"!= slice_bytes {req.slice_bytes} on {req.name!r}"
+                )
+
+            remote_descs.append(
+                (src.addr + req.source_offset_bytes, req.slice_bytes, src.device_id)
+            )
+            local_descs.append(
+                (dest.data_ptr(), req.slice_bytes, self._device_id)
+            )
+            total_bytes += req.slice_bytes
+
+        # One combined transfer.
+        src_prepped = self._agent.prep_xfer_dlist(
+            agent_name=remote_agent_name,
+            xfer_list=remote_descs,
+            mem_type="cuda",
+            backends=self._backends,
+        )
+        dst_prepped = self._agent.prep_xfer_dlist(
+            agent_name="",
+            xfer_list=local_descs,
+            mem_type="cuda",
+            backends=self._backends,
+        )
+        indices = list(range(len(remote_descs)))
+        handle = self._agent.make_prepped_xfer(
+            operation="READ",
+            local_xfer_side=dst_prepped,
+            local_indices=indices,
+            remote_xfer_side=src_prepped,
+            remote_indices=indices,
+            backends=self._backends,
+        )
+        self._agent.transfer(handle)
+
+        start_wait = time.perf_counter()
+        while True:
+            if timeout_seconds is not None and time.perf_counter() - start_wait >= timeout_seconds:
+                self._agent.release_xfer_handle(handle)
+                raise TimeoutError("Sliced transfer timed out")
+            status = self._agent.check_xfer_state(handle)
+            if status in ("DONE", "SUCCESS"):
+                self._agent.release_xfer_handle(handle)
+                break
+            if status in ("ERR", "ERROR", "FAIL"):
+                self._agent.release_xfer_handle(handle)
+                raise RuntimeError(f"Sliced transfer failed with status {status}")
+            time.sleep(0.001)
+
+        torch.cuda.synchronize(self._device_id)
+        duration = time.perf_counter() - start_time
+        bw_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
+        logger.info(
+            f"Sliced transfer complete: {len(slice_requests)} slices, "
+            f"{total_bytes / 1e9:.2f} GB in {duration:.2f}s ({bw_gbps:.1f} Gbps)"
+        )
+        return total_bytes, len(slice_requests), duration
 
     def is_healthy(self) -> bool:
         """Check if the NIXL agent is initialized and has registered metadata."""
