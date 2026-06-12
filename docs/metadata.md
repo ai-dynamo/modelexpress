@@ -62,7 +62,9 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 | `tensor_source` | Tensor descriptors for weight transfer. Readers fall back to the deprecated top-level `tensors` field for old publishers. |
 | `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, and `chunk_count`. |
 
-Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Because manifest file paths are canonical absolute install paths and are included in the sealed manifest, `artifact_id` is install-path-specific.
+Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker, then use `PrepareArtifactChunk` and `ReleaseArtifactChunk` around each NIXL transfer. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Manifest file paths are canonical absolute publisher paths and are included in the sealed manifest; transfer helpers may rewrite them to target-local staging paths before installing the artifact.
+
+Artifact source discovery currently requires a central-coordinator backend (`redis` or `kubernetes`). The decentralized `k8s-service` backend fetches tensor manifests with `GetTensorManifest` and does not yet expose `artifact_source` discovery.
 
 ## gRPC API
 
@@ -82,6 +84,8 @@ service WorkerService {
   rpc GetTensorManifest(GetTensorManifestRequest) returns (GetTensorManifestResponse);
   rpc GetArtifactManifestHeader(GetArtifactManifestHeaderRequest) returns (GetArtifactManifestHeaderResponse);
   rpc GetArtifactManifestChunks(GetArtifactManifestChunksRequest) returns (GetArtifactManifestChunksResponse);
+  rpc PrepareArtifactChunk(PrepareArtifactChunkRequest) returns (PrepareArtifactChunkResponse);
+  rpc ReleaseArtifactChunk(ReleaseArtifactChunkRequest) returns (ReleaseArtifactChunkResponse);
 }
 ```
 
@@ -134,7 +138,29 @@ GetMetadataRequest {
 
 Artifact targets use `GetArtifactManifestHeader` to fetch the sealed artifact identity, worker endpoints, aggregate counts, byte chunk size, and the file table for install planning. Chunk metadata is fetched separately through `GetArtifactManifestChunks`, which pages the flat chunk table by global `chunk_index`.
 
+Artifact bytes move through NIXL, not through the metadata service. For each chunk, the target calls `PrepareArtifactChunk` so the source reads that file range into a registered DRAM buffer and returns a NIXL transfer descriptor plus a lease. The target receives that range into a local registered DRAM buffer, verifies the chunk CRC32C, writes it to the target staging file, and then calls `ReleaseArtifactChunk` to free the source lease.
+
 The header currently returns the full file table sorted by manifest path, while chunk metadata is paged. Very high file-count artifacts can make the header large; if that becomes a production shape, the protocol should add a paged file-table RPC instead of increasing gRPC message limits.
+
+`MX_ARTIFACT_TRANSFER_CHUNK_SIZE` controls the manifest chunk size for artifact transfer. The default is 64 MiB and the maximum accepted value is 4 GiB. Larger chunks reduce manifest size and per-chunk RPC overhead, but each source and target worker allocates registered DRAM buffers sized by roughly `chunk_size * max_inflight_chunks`; smaller chunks reduce buffer memory at the cost of more RPCs and checksum work.
+
+### Tarred Cache Artifact Helpers
+
+The Python `P2PArtifactTransfer` interface is the shared lifecycle for cache artifact transfer helpers:
+
+1. Source worker creates a transfer helper, calls `prepare_source()`, and publishes the returned bundle with `publish_artifact_source()`.
+2. Target worker creates the same helper type with its own `target_root` and `bundle_root`, calls `discover_and_transfer()` or `transfer_from_worker()`, and receives a target-local staged artifact.
+3. Target worker calls `install()` to unpack the staged artifact into the runtime cache directory before the framework starts using that cache.
+
+The current implementation, `TarredP2PArtifactTransfer`, packages the source cache directory into one uncompressed tar file before building the artifact manifest. The source manifest records the publisher's tar path and therefore contributes that path to `artifact_id`. During transfer, the target rewrites the received file table to its own `bundle_root / artifact.tar`, then extracts that tar into `target_root`. This keeps the published manifest sealed while avoiding any requirement that source and target share the same absolute staging path.
+
+Factory helpers provide the three cache source types currently expected by loaders:
+
+| Helper | `mx_source_type` | Target cache shape |
+|--------|------------------|--------------------|
+| `torch_compile_cache_artifact_transfer()` | `TORCH_COMPILE_CACHE` | TorchInductor/vLLM torch compile cache directory |
+| `triton_cache_artifact_transfer()` | `TRITON_CACHE` | Triton kernel cache directory |
+| `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM cache directory |
 
 ### UpdateStatus
 

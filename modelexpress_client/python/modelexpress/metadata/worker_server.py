@@ -7,8 +7,8 @@ Per-worker gRPC server for P2P manifest exchange.
 When MX_P2P_METADATA=1, each source worker starts a WorkerGrpcServer
 that serves its tensor descriptors directly to target workers via the
 GetTensorManifest RPC. Artifact sources can serve their sealed file manifest
-through GetArtifactManifestHeader/GetArtifactManifestChunks without adding byte
-transfer to this service.
+through GetArtifactManifestHeader/GetArtifactManifestChunks and coordinate NIXL
+file chunk transfers through PrepareArtifactChunk/ReleaseArtifactChunk.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from concurrent import futures
 from collections.abc import Mapping
+from typing import Any
 
 import grpc
 
@@ -41,6 +42,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         agent_name: str = "",
         worker_rank: int = 0,
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
+        artifact_chunk_manager: Any | None = None,
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
@@ -48,6 +50,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._agent_name = agent_name
         self._worker_rank = worker_rank
         self._artifact_manifests = dict(artifact_manifests or {})
+        self._artifact_chunk_manager = artifact_chunk_manager
 
     def GetTensorManifest(self, request, context):
         self._validate_mx_source_id(request.mx_source_id, context)
@@ -61,6 +64,94 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         logger.info(
             f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
             f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
+        )
+        return response
+
+    def PrepareArtifactChunk(self, request, context):
+        self._validate_mx_source_id(request.mx_source_id, context)
+        if self._artifact_chunk_manager is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "artifact chunk transfer is not enabled for this worker",
+            )
+        artifact_id, manifest = self._select_artifact_manifest(
+            request.artifact_id,
+            context,
+        )
+        if request.chunk_index >= len(manifest.chunks):
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"chunk_index {request.chunk_index} exceeds chunk_count "
+                f"{len(manifest.chunks)}",
+            )
+
+        chunk = manifest.chunks[request.chunk_index]
+        try:
+            lease_id, source, source_metadata = self._artifact_chunk_manager.prepare(
+                manifest,
+                artifact_id,
+                chunk,
+            )
+        except FileNotFoundError as exc:
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"failed to prepare artifact chunk {chunk.chunk_index}: {exc}",
+            )
+        except OSError as exc:
+            context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"failed to prepare artifact chunk {chunk.chunk_index}: {exc}",
+            )
+        except ValueError as exc:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+        except RuntimeError as exc:
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(exc))
+
+        response = p2p_pb2.PrepareArtifactChunkResponse(
+            mx_source_id=self._mx_source_id,
+            artifact_id=artifact_id,
+            lease_id=lease_id,
+            chunk=chunk,
+            source=source,
+            source_metadata=source_metadata,
+        )
+        logger.info(
+            f"PrepareArtifactChunk served: chunk {chunk.chunk_index} "
+            f"({source.length} bytes, lease_id={lease_id})"
+        )
+        return response
+
+    def ReleaseArtifactChunk(self, request, context):
+        self._validate_mx_source_id(request.mx_source_id, context)
+        if self._artifact_chunk_manager is None:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "artifact chunk transfer is not enabled for this worker",
+            )
+        artifact_id, _ = self._select_artifact_manifest(request.artifact_id, context)
+        try:
+            released_artifact_id, chunk = self._artifact_chunk_manager.release(
+                request.lease_id,
+            )
+        except KeyError:
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"artifact chunk lease not found: {request.lease_id}",
+            )
+        if released_artifact_id != artifact_id:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"artifact_id mismatch for lease {request.lease_id}",
+            )
+
+        response = p2p_pb2.ReleaseArtifactChunkResponse(
+            mx_source_id=self._mx_source_id,
+            artifact_id=artifact_id,
+            chunk=chunk,
+        )
+        logger.info(
+            f"ReleaseArtifactChunk served: chunk {chunk.chunk_index} "
+            f"(lease_id={request.lease_id})"
         )
         return response
 
@@ -167,7 +258,11 @@ class WorkerGrpcServer:
         agent_name: str = "",
         worker_rank: int = 0,
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
+        artifact_chunk_manager: Any | None = None,
+        max_workers: int = 4,
     ):
+        if max_workers <= 0:
+            raise ValueError("worker gRPC max_workers must be positive")
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
         self._requested_port = port
@@ -175,6 +270,8 @@ class WorkerGrpcServer:
         self._agent_name = agent_name
         self._worker_rank = worker_rank
         self._artifact_manifests = dict(artifact_manifests or {})
+        self._artifact_chunk_manager = artifact_chunk_manager
+        self._max_workers = max_workers
         self._server: grpc.Server | None = None
         self._port: int | None = None
 
@@ -184,7 +281,9 @@ class WorkerGrpcServer:
 
     def start(self) -> int:
         """Start the gRPC server. Returns the actual bound port."""
-        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        self._server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=self._max_workers)
+        )
         servicer = WorkerServiceServicer(
             tensor_protos=self._tensor_protos,
             mx_source_id=self._mx_source_id,
@@ -192,6 +291,7 @@ class WorkerGrpcServer:
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
             artifact_manifests=self._artifact_manifests,
+            artifact_chunk_manager=self._artifact_chunk_manager,
         )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(servicer, self._server)
 
@@ -282,6 +382,54 @@ def fetch_artifact_manifest_chunks(
     logger.info(
         f"Fetched artifact manifest chunks {start_chunk_index}:"
         f"{start_chunk_index + len(response.chunks)} for {response.artifact_id} "
+        f"from worker at {endpoint} ({response_bytes} bytes)"
+    )
+    return response, response_bytes
+
+
+def prepare_artifact_chunk(
+    endpoint: str,
+    mx_source_id: str,
+    artifact_id: str,
+    chunk_index: int,
+    timeout: float = 5.0,
+) -> tuple[p2p_pb2.PrepareArtifactChunkResponse, int]:
+    """Prepare one artifact chunk for NIXL transfer on a source worker."""
+    with grpc.insecure_channel(endpoint) as channel:
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        request = p2p_pb2.PrepareArtifactChunkRequest(
+            mx_source_id=mx_source_id,
+            artifact_id=artifact_id,
+            chunk_index=chunk_index,
+        )
+        response = stub.PrepareArtifactChunk(request, timeout=timeout)
+        response_bytes = response.ByteSize()
+    logger.info(
+        f"Prepared artifact chunk {chunk_index} for {response.artifact_id} "
+        f"from worker at {endpoint} ({response_bytes} bytes)"
+    )
+    return response, response_bytes
+
+
+def release_artifact_chunk(
+    endpoint: str,
+    mx_source_id: str,
+    artifact_id: str,
+    lease_id: str,
+    timeout: float = 5.0,
+) -> tuple[p2p_pb2.ReleaseArtifactChunkResponse, int]:
+    """Release a prepared artifact chunk lease on a source worker."""
+    with grpc.insecure_channel(endpoint) as channel:
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        request = p2p_pb2.ReleaseArtifactChunkRequest(
+            mx_source_id=mx_source_id,
+            artifact_id=artifact_id,
+            lease_id=lease_id,
+        )
+        response = stub.ReleaseArtifactChunk(request, timeout=timeout)
+        response_bytes = response.ByteSize()
+    logger.info(
+        f"Released artifact chunk lease {lease_id} for {response.artifact_id} "
         f"from worker at {endpoint} ({response_bytes} bytes)"
     )
     return response, response_bytes

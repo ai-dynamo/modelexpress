@@ -307,7 +307,7 @@ mod tests {
     use crate::p2p::state::P2pStateManager;
     use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
     use modelexpress_common::grpc::p2p::{
-        MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
+        ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
     };
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
@@ -339,6 +339,13 @@ mod tests {
             triton_version: String::new(),
             gpu_arch: String::new(),
             compile_config_digest: String::new(),
+        }
+    }
+
+    fn test_artifact_identity() -> SourceIdentity {
+        SourceIdentity {
+            mx_source_type: MxSourceType::TorchCompileCache as i32,
+            ..test_identity()
         }
     }
 
@@ -663,6 +670,94 @@ mod tests {
         assert_eq!(resp.instances[0].worker_rank, 0);
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_filters_artifact_sources_by_worker_status() {
+        let identity = test_artifact_identity();
+        let expected_source_id = compute_mx_source_id(&identity);
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers()
+            .withf(move |source_id, status_filter| {
+                source_id.as_deref() == Some(expected_source_id.as_str())
+                    && *status_filter == Some(SourceStatus::Ready)
+            })
+            .once()
+            .returning(|source_id, _| {
+                Ok(vec![SourceInstanceInfo {
+                    source_id: source_id.expect("source id"),
+                    worker_id: "artifact-worker".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
+                }])
+            });
+
+        let svc = make_service(mock);
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(identity),
+                status_filter: Some(SourceStatus::Ready as i32),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+
+        assert_eq!(resp.instances.len(), 1);
+        assert_eq!(resp.instances[0].worker_id, "artifact-worker");
+    }
+
+    #[tokio::test]
+    async fn test_get_metadata_preserves_artifact_source_status() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_get_metadata()
+            .once()
+            .returning(|source_id, worker_id| {
+                Ok(Some(ModelMetadataRecord {
+                    source_id: source_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    model_name: "my-model".to_string(),
+                    workers: vec![WorkerRecord {
+                        worker_rank: 0,
+                        backend_metadata: BackendMetadataRecord::None,
+                        tensors: vec![],
+                        status: SourceStatus::Ready as i32,
+                        updated_at: 1234567890000,
+                        metadata_endpoint: "10.0.0.1:5555".to_string(),
+                        agent_name: "artifact-agent".to_string(),
+                        worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
+                        artifact_source: Some(
+                            ArtifactSourceMetadata {
+                                artifact_id: "sha256:artifact".to_string(),
+                                total_size: 1024,
+                                file_count: 1,
+                                chunk_count: 2,
+                            }
+                            .into(),
+                        ),
+                    }],
+                    published_at: 1234567890,
+                }))
+            });
+
+        let svc = make_service(mock);
+        let resp = svc
+            .get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "artifact-source-id".to_string(),
+                worker_id: "artifact-worker".to_string(),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+
+        let worker = resp.worker.expect("worker should be present");
+        assert_eq!(worker.status, SourceStatus::Ready as i32);
+        assert!(matches!(
+            worker.source_payload,
+            Some(SourcePayload::ArtifactSource(ref artifact))
+                if artifact.artifact_id == "sha256:artifact"
+        ));
     }
 
     #[tokio::test]

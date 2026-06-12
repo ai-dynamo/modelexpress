@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-NIXL Transfer Manager for GPU-to-GPU weight transfers.
+NIXL Transfer Manager for weight and artifact transfers.
 
 This module provides the NixlTransferManager class that handles all NIXL-related
-operations including agent creation, tensor registration, and RDMA transfers.
+operations including agent creation, memory registration, and RDMA transfers.
 
 Each vLLM worker creates its own NixlTransferManager instance to manage
-a single NIXL agent for that worker's GPU.
+a single NIXL agent. The primary path is GPU tensor transfer; artifact transfer
+also uses the same agent for host DRAM chunk staging.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ except ImportError:
 
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
 DEFAULT_NIXL_BACKEND = "UCX"
+NIXL_DRAM_MEM_TYPE = "DRAM"
 
 
 def is_nixl_available() -> bool:
@@ -73,12 +75,13 @@ def _pool_reg_enabled() -> bool:
 
 class NixlTransferManager:
     """
-    Manages a single NIXL agent and RDMA transfers for GPU tensors.
+    Manages a single NIXL agent and RDMA transfers.
 
     Each vLLM worker creates its own instance of this class to handle:
     - Creating and managing a NIXL agent for the worker's GPU
     - Registering tensors with NIXL for RDMA access
     - Executing transfers to receive weights from remote sources
+    - Registering host DRAM buffers for artifact chunk transfer
 
     Args:
         agent_name: Name for the NIXL agent
@@ -438,6 +441,18 @@ class NixlTransferManager:
                 return
             time.sleep(0.01)
 
+    def add_remote_agent(self, source_metadata: bytes) -> str:
+        """Load a remote NIXL agent from a metadata blob."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        remote_agent_name = self._agent.add_remote_agent(source_metadata)
+        logger.info(
+            "Loaded remote NIXL agent %s from metadata blob (%d bytes)",
+            remote_agent_name,
+            len(source_metadata),
+        )
+        return remote_agent_name
+
     def receive_from_source(
         self,
         source_metadata: bytes,
@@ -591,6 +606,113 @@ class NixlTransferManager:
         )
 
         return total_bytes, matched_tensors, duration
+
+    def register_dram_buffer(self, buffer: torch.Tensor) -> Any:
+        """Register one CPU buffer as NIXL DRAM and refresh agent metadata."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        if buffer.device.type != "cpu":
+            raise RuntimeError("NIXL DRAM buffer must be a CPU tensor")
+        if buffer.dtype != torch.uint8:
+            raise RuntimeError("NIXL DRAM buffer must use torch.uint8")
+        if not buffer.is_contiguous():
+            raise RuntimeError("NIXL DRAM buffer must be contiguous")
+
+        registered = self._agent.register_memory([buffer], backends=self._backends)
+        self._metadata = self._agent.get_agent_metadata()
+        return registered
+
+    def refresh_agent_metadata(self) -> bytes:
+        """Refresh and return agent metadata without registering new memory."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        self._metadata = self._agent.get_agent_metadata()
+        return self._metadata
+
+    def deregister_memory(self, registered: Any) -> None:
+        """Deregister a memory descriptor returned by register_memory."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        if registered is not None:
+            self._agent.deregister_memory(registered)
+            self._metadata = self._agent.get_agent_metadata()
+
+    def receive_dram_into_buffer(
+        self,
+        remote_agent_name: str,
+        remote_addr: int,
+        local_buffer: torch.Tensor,
+        size: int,
+        remote_device_id: int = 0,
+        remote_mem_type: str = NIXL_DRAM_MEM_TYPE,
+        timeout_seconds: float | None = None,
+    ) -> float:
+        """Read a remote DRAM range into a registered local CPU uint8 buffer."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        if size < 0:
+            raise ValueError("NIXL DRAM transfer size must be non-negative")
+        if local_buffer.device.type != "cpu":
+            raise RuntimeError("NIXL DRAM destination must be a CPU tensor")
+        if local_buffer.dtype != torch.uint8:
+            raise RuntimeError("NIXL DRAM destination must use torch.uint8")
+        if not local_buffer.is_contiguous():
+            raise RuntimeError("NIXL DRAM destination must be contiguous")
+        if size > local_buffer.numel():
+            raise ValueError(
+                f"NIXL DRAM transfer size {size} exceeds destination buffer "
+                f"size {local_buffer.numel()}"
+            )
+        if size == 0:
+            return 0.0
+
+        start_time = time.perf_counter()
+        handle = None
+        try:
+            src_prepped = self._agent.prep_xfer_dlist(
+                agent_name=remote_agent_name,
+                xfer_list=[(remote_addr, size, remote_device_id)],
+                mem_type=remote_mem_type,
+                backends=self._backends,
+            )
+            dst_prepped = self._agent.prep_xfer_dlist(
+                agent_name="",
+                xfer_list=[(local_buffer.data_ptr(), size, 0)],
+                mem_type=NIXL_DRAM_MEM_TYPE,
+                backends=self._backends,
+            )
+            handle = self._agent.make_prepped_xfer(
+                operation="READ",
+                local_xfer_side=dst_prepped,
+                local_indices=[0],
+                remote_xfer_side=src_prepped,
+                remote_indices=[0],
+                backends=self._backends,
+            )
+            self._agent.transfer(handle)
+
+            wait_start = time.perf_counter()
+            while True:
+                if (
+                    timeout_seconds is not None
+                    and time.perf_counter() - wait_start >= timeout_seconds
+                ):
+                    raise TimeoutError("NIXL DRAM transfer timed out")
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    duration = time.perf_counter() - start_time
+                    logger.info(
+                        "NIXL DRAM READ complete: %.2f MiB in %.3fs",
+                        size / (1024 * 1024),
+                        duration,
+                    )
+                    return duration
+                if status in ("ERR", "ERROR", "FAIL"):
+                    raise RuntimeError(f"NIXL DRAM transfer failed with status {status}")
+                time.sleep(0.001)
+        finally:
+            if handle is not None:
+                self._agent.release_xfer_handle(handle)
 
     def is_healthy(self) -> bool:
         """Check if the NIXL agent is initialized and has registered metadata."""
