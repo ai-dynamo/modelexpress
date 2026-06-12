@@ -70,6 +70,126 @@ SIDECAR_TRANSFORMER_CONFIG_KEY = "megatron_transformer_config"
 SIDECAR_HF_NAME_MAP_KEY = "megatron_hf_name_map"
 
 
+def _ordered_hf_names(hf_names: list[str]) -> list[str]:
+    """Deduplicate HF names and enforce fused-tensor output order."""
+    unique: list[str] = []
+    for name in hf_names:
+        if name not in unique:
+            unique.append(name)
+
+    def _priority(name: str, markers: tuple[str, ...]) -> int:
+        for index, marker in enumerate(markers):
+            if marker in name:
+                return index
+        return len(markers)
+
+    if any(
+        marker in name
+        for name in unique
+        for marker in ("q_proj", "k_proj", "v_proj")
+    ):
+        return sorted(
+            unique,
+            key=lambda name: _priority(name, ("q_proj", "k_proj", "v_proj")),
+        )
+    if any(marker in name for name in unique for marker in ("gate_proj", "up_proj")):
+        return sorted(
+            unique,
+            key=lambda name: _priority(name, ("gate_proj", "up_proj")),
+        )
+    return unique
+
+
+def _descriptor_int(descriptor: dict[str, str], key: str) -> int | None:
+    value = descriptor.get(key)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _qkv_total_dim(assembled: torch.Tensor, head_dim: int) -> int:
+    if assembled.ndim == 1:
+        rows = assembled.shape[0]
+    else:
+        rows = assembled.shape[0]
+    if rows % head_dim != 0:
+        raise ValueError(
+            f"qkv rows ({rows}) are not divisible by head_dim ({head_dim})"
+        )
+    return rows // head_dim
+
+
+def _qkv_config_for_plan(
+    plan: MegatronSlicePlan,
+    assembled: torch.Tensor,
+    transformer_config: MegatronTransformerConfig,
+) -> MegatronTransformerConfig:
+    """Build the receiver-local QKV config for an assembled tensor."""
+    descriptor = plan.role_descriptor or {}
+    head_dim = _descriptor_int(descriptor, "head_dim") or transformer_config.head_size
+    num_heads = _descriptor_int(descriptor, "num_heads_local")
+    num_query_groups = _descriptor_int(descriptor, "num_kv_heads_local")
+
+    if num_heads is not None and num_query_groups is not None:
+        return MegatronTransformerConfig(
+            num_attention_heads=num_heads,
+            num_query_groups=num_query_groups,
+            kv_channels=head_dim,
+            hidden_size=transformer_config.hidden_size,
+        )
+
+    total_heads = (
+        _descriptor_int(descriptor, "num_heads_total")
+        or transformer_config.num_attention_heads
+    )
+    total_query_groups = (
+        _descriptor_int(descriptor, "num_kv_heads_total")
+        or transformer_config.num_query_groups
+    )
+    local_total_dim = _qkv_total_dim(assembled, head_dim)
+    global_total_dim = total_heads + 2 * total_query_groups
+
+    if local_total_dim == global_total_dim:
+        return MegatronTransformerConfig(
+            num_attention_heads=total_heads,
+            num_query_groups=total_query_groups,
+            kv_channels=head_dim,
+            hidden_size=transformer_config.hidden_size,
+        )
+
+    if global_total_dim <= 0:
+        raise ValueError(
+            f"invalid QKV global dimension from heads={total_heads}, "
+            f"kv_heads={total_query_groups}"
+        )
+
+    scaled_heads, heads_remainder = divmod(
+        total_heads * local_total_dim,
+        global_total_dim,
+    )
+    scaled_query_groups, groups_remainder = divmod(
+        total_query_groups * local_total_dim,
+        global_total_dim,
+    )
+    if (
+        heads_remainder
+        or groups_remainder
+        or scaled_heads + 2 * scaled_query_groups != local_total_dim
+    ):
+        raise ValueError(
+            "could not infer receiver-local QKV head counts from "
+            f"local_total_dim={local_total_dim}, total_heads={total_heads}, "
+            f"total_kv_heads={total_query_groups}"
+        )
+
+    return MegatronTransformerConfig(
+        num_attention_heads=scaled_heads,
+        num_query_groups=scaled_query_groups,
+        kv_channels=head_dim,
+        hidden_size=transformer_config.hidden_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Receiver-spec dataclass
 # ---------------------------------------------------------------------------
@@ -163,7 +283,12 @@ def parse_megatron_sidecar(
             for entry in map_blob:
                 # Each entry is [megatron_name, [hf_name_1, hf_name_2, ...]]
                 if isinstance(entry, (list, tuple)) and len(entry) == 2:
-                    hf_name_map[str(entry[0])] = [str(x) for x in entry[1]]
+                    megatron_name = str(entry[0])
+                    merged = hf_name_map.setdefault(megatron_name, [])
+                    for hf_name in entry[1]:
+                        merged.append(str(hf_name))
+            for megatron_name, hf_names in hf_name_map.items():
+                hf_name_map[megatron_name] = _ordered_hf_names(hf_names)
         except Exception as exc:  # noqa: BLE001
             logger.warning("failed to parse megatron_hf_name_map sidecar: %s", exc)
 
@@ -296,10 +421,11 @@ def translate_megatron_to_hf(
             raise ValueError(
                 f"qkv_column expects 3 hf_names (q, k, v); got {hf_names}"
             )
+        qkv_config = _qkv_config_for_plan(plan, assembled, transformer_config)
         if assembled.ndim == 1:
-            q, k, v = split_qkv_biases(transformer_config, assembled)
+            q, k, v = split_qkv_biases(qkv_config, assembled)
         else:
-            q, k, v = split_qkv_weights(transformer_config, assembled)
+            q, k, v = split_qkv_weights(qkv_config, assembled)
         yield hf_names[0], q
         yield hf_names[1], k
         yield hf_names[2], v
@@ -308,6 +434,13 @@ def translate_megatron_to_hf(
     if role == ROLE_MEGATRON_GATED_MLP_COLUMN:
         if not isinstance(assembled, torch.Tensor):
             raise TypeError("gated_mlp_column assembly expects a single tensor")
+        if len(hf_names) == 1:
+            # Some architectures, including Nemotron-H, use Megatron's
+            # ``linear_fc1`` name for a non-gated MLP. Bridge then publishes a
+            # single HF ``up_proj`` target, and the tensor must pass through
+            # unchanged rather than being split into synthetic gate/up halves.
+            yield hf_names[0], assembled
+            return
         if len(hf_names) != 2:
             raise ValueError(
                 f"gated_mlp_column expects 2 hf_names (gate, up); got {hf_names}"

@@ -328,13 +328,9 @@ def test_qkv_column_e2e_gqa(env):
     ]
     pull = _make_pull_callback({"qkv0": rank0, "qkv1": rank1})
 
-    # Receiver target spec: target_rank=0 sees half the rows. Build a
-    # config-for-half (half the heads) so the QKV un-interleave happens
-    # against the receiver's local view.
-    half_cfg = helpers.MegatronTransformerConfig(
-        num_attention_heads=nh // 2, num_query_groups=nkv // 2,
-        kv_channels=hd, hidden_size=hs,
-    )
+    # Receiver target spec: target_rank=0 sees half the rows. The runtime
+    # sidecar carries the full config; the translator derives the local
+    # QKV config from the assembled tensor and descriptor.
     spec = v2.MegatronTensorSpec(
         role=v2.ROLE_MEGATRON_QKV_COLUMN,
         target_shape=qkv_global.shape, target_dtype="float32", shard_axis=0,
@@ -351,10 +347,11 @@ def test_qkv_column_e2e_gqa(env):
     # Receiver sees half the rows.
     assert assembled.shape == (half, hs)
 
-    # Translate using the half-config — yields q, k, v for the receiver's half.
+    # Translate using the full sidecar config — yields q, k, v for the
+    # receiver's half.
     out = list(env.translator.translate_megatron_to_hf(
         plans[0], assembled,
-        transformer_config=half_cfg,
+        transformer_config=cfg,
         hf_names=["q_proj.weight", "k_proj.weight", "v_proj.weight"],
     ))
     assert len(out) == 3
@@ -363,6 +360,10 @@ def test_qkv_column_e2e_gqa(env):
     # Ground truth: split the original (full) qkv_global with the half-config
     # is wrong; instead, split the half-tensor directly and compare with the
     # corresponding half of the original q, k, v.
+    half_cfg = helpers.MegatronTransformerConfig(
+        num_attention_heads=nh // 2, num_query_groups=nkv // 2,
+        kv_channels=hd, hidden_size=hs,
+    )
     q_half_expected, k_half_expected, v_half_expected = helpers.split_qkv_weights(
         half_cfg, assembled,
     )
@@ -469,6 +470,40 @@ def test_gated_mlp_tp1_roundtrip(env):
     assert torch.equal(out[1][1], up)
 
 
+def test_gated_mlp_single_hf_name_passthroughs_non_gated_mlp(env):
+    v2 = env.v2
+    helpers = env.helpers
+
+    hidden, intermediate = 32, 64
+    up = torch.randn(intermediate, hidden, dtype=torch.float32)
+    plan = v2.MegatronSlicePlan(
+        tensor_name="linear_fc1",
+        role=v2.ROLE_MEGATRON_GATED_MLP_COLUMN,
+        target_shape=up.shape,
+        target_dtype="float32",
+        sources=[],
+        assembly="gated_mlp_split",
+        role_descriptor={"gated_mlp_order": "gate_then_up"},
+    )
+    cfg = helpers.MegatronTransformerConfig(
+        num_attention_heads=1,
+        num_query_groups=1,
+        kv_channels=1,
+        hidden_size=hidden,
+    )
+
+    out = list(env.translator.translate_megatron_to_hf(
+        plan,
+        up,
+        transformer_config=cfg,
+        hf_names=["backbone.layers.1.mixer.up_proj.weight"],
+    ))
+    assert [name for name, _tensor in out] == [
+        "backbone.layers.1.mixer.up_proj.weight",
+    ]
+    assert torch.equal(out[0][1], up)
+
+
 # ---------------------------------------------------------------------------
 # Test 6 — sidecar parsing
 # ---------------------------------------------------------------------------
@@ -513,6 +548,46 @@ def test_parse_megatron_sidecar(env):
         "model.layers.0.self_attn.q_proj.weight",
         "model.layers.0.self_attn.k_proj.weight",
         "model.layers.0.self_attn.v_proj.weight",
+    ]
+
+
+def test_parse_megatron_sidecar_merges_duplicate_hf_name_entries(env):
+    v2 = env.v2
+    translator = env.translator
+
+    registry = {
+        translator.SIDECAR_HF_NAME_MAP_KEY: [
+            (
+                "decoder.layers.1.mlp.linear_fc1.weight",
+                ["backbone.layers.1.mixer.up_proj.weight"],
+            ),
+            (
+                "decoder.layers.1.mlp.linear_fc1.weight",
+                ["backbone.layers.1.mixer.gate_proj.weight"],
+            ),
+        ],
+    }
+    ref_cls = sys.modules["modelexpress.refit_receiver"].SourceRef
+    cand = v2.V2SourceCandidate(
+        ref=ref_cls(
+            mx_source_id="x",
+            worker_id="y",
+            model_name="m",
+            worker_rank=0,
+            training_step=1,
+        ),
+        role=v2.ROLE_TRAINER,
+        worker_rank=0,
+        registry=registry,
+        owned_experts_per_layer={},
+        updated_at=0,
+        megatron_meta=v2.MegatronSourceMeta(tp_rank=0, tp_size=1),
+    )
+
+    _cfg, parsed_map = translator.parse_megatron_sidecar(cand)
+    assert parsed_map["decoder.layers.1.mlp.linear_fc1.weight"] == [
+        "backbone.layers.1.mixer.gate_proj.weight",
+        "backbone.layers.1.mixer.up_proj.weight",
     ]
 
 
