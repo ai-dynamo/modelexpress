@@ -181,6 +181,8 @@ spec:
             - containerPort: 6379
               name: ray-gcs
           env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -226,11 +228,15 @@ spec:
                     | grep -qE "/2\.0 GPU"; do
                   sleep 2
                 done
+                # Keep KV fixed and small so VRAM parity stays sensitive to
+                # weight residency instead of vLLM auto-sizing cache around leaks.
                 RAY_ADDRESS=127.0.0.1:6379 exec python3 -m vllm.entrypoints.openai.api_server \
                   --model "${MX_CI_MODEL}" \
                   --load-format mx \
                   --tensor-parallel-size 2 \
                   --distributed-executor-backend ray \
+                  --max-model-len 1024 \
+                  --kv-cache-memory-bytes 1073741824 \
                   --trust-remote-code \
                   --port "${WORKER_PORT}"
               else

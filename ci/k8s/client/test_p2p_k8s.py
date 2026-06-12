@@ -10,6 +10,7 @@ have reached Running state.  Asserts:
      0..tp_size-1 (catches TP collapse and source-rank-pairing regressions).
   3. Both source and target servers respond to /v1/completions — confirms weights
      are loaded and the model is serving correctly on each.
+  4. Target peak and final VRAM do not materially exceed source VRAM.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -223,3 +224,61 @@ def test_source_inference_produces_output(namespace: str, model: str, source_por
 def test_target_inference_produces_output(namespace: str, model: str, worker_port: int) -> None:
     """Target server must return a valid completion response after P2P transfer."""
     _assert_inference(namespace, "mx-target", model, remote_port=worker_port, local_port=18000)
+
+
+def _assert_target_vram_matches_source(
+    *,
+    metric: str,
+    source_vram_mib: int | None,
+    target_vram_mib: int | None,
+    vram_tolerance_percent: float,
+) -> None:
+    assert source_vram_mib is not None, f"Missing source {metric} VRAM measurement"
+    assert target_vram_mib is not None, f"Missing target {metric} VRAM measurement"
+
+    delta_mib = target_vram_mib - source_vram_mib
+    allowed_delta_mib = source_vram_mib * vram_tolerance_percent / 100.0
+    print(
+        f"{metric.title()} VRAM: "
+        f"source={source_vram_mib} MiB "
+        f"target={target_vram_mib} MiB "
+        f"delta={delta_mib} MiB "
+        f"allowed_delta={allowed_delta_mib:.1f} MiB "
+        f"tolerance={vram_tolerance_percent}%"
+    )
+    assert delta_mib <= allowed_delta_mib, (
+        f"Target RDMA path used too much extra {metric} VRAM: "
+        f"source={source_vram_mib} MiB, "
+        f"target={target_vram_mib} MiB, "
+        f"delta={delta_mib} MiB, "
+        f"allowed_delta={allowed_delta_mib:.1f} MiB "
+        f"({vram_tolerance_percent}% of source {metric} VRAM)."
+    )
+
+
+def test_target_peak_vram_matches_source(
+    source_peak_vram_mib: int | None,
+    target_peak_vram_mib: int | None,
+    vram_tolerance_percent: float,
+) -> None:
+    """Target RDMA load must not use materially more peak VRAM than source load."""
+    _assert_target_vram_matches_source(
+        metric="peak",
+        source_vram_mib=source_peak_vram_mib,
+        target_vram_mib=target_peak_vram_mib,
+        vram_tolerance_percent=vram_tolerance_percent,
+    )
+
+
+def test_target_final_vram_matches_source(
+    source_final_vram_mib: int | None,
+    target_final_vram_mib: int | None,
+    vram_tolerance_percent: float,
+) -> None:
+    """Target RDMA load must not use materially more final VRAM than source load."""
+    _assert_target_vram_matches_source(
+        metric="final",
+        source_vram_mib=source_final_vram_mib,
+        target_vram_mib=target_final_vram_mib,
+        vram_tolerance_percent=vram_tolerance_percent,
+    )

@@ -3,7 +3,7 @@
 
 # ModelExpress K8s CI.
 #
-# Nine jobs:
+# Ten jobs:
 #   build-server        — builds and pushes the MX coordination server image
 #                         from ci/k8s/server/Dockerfile.server. Runs on the
 #                         self-hosted builder runner
@@ -34,6 +34,10 @@
 #                         and multi-node TP=2 (StatefulSet + Ray, one
 #                         GPU per pod, 2 pods per role). See TEST_PLAN
 #                         row 5.1 for the full topology rationale.
+#
+#   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
+#                        Uses a TP=8 DeepSeek MLA + MoE model and also runs
+#                        the standard source/target VRAM parity assertions.
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
@@ -417,6 +421,66 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # Dedicated P2P MLA/MoE model test.
+  # Runs on the full-GPU A100b pool with TP=8 and a DeepSeek MLA + MoE model.
+  # It also runs the standard source/target VRAM parity assertions.
+  # ---------------------------------------------------------------------------
+  test-p2p-mla-model:
+    name: P2P MLA model test (vllm TP=8)
+    runs-on: prod-modelexpress-builder-amd-v1
+    # The TP=8 source and target each reserve a full A100b node.
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P MLA model test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: mx-ci-vllm-mla-${{ github.run_id }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ci/k8s/client/vllm/manifest-azure-tp8.yaml
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: deepseek-ai/DeepSeek-V2
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: "8001"
+          worker_port: "8002"
+          tp_size: "8"
+          pod_ready_timeout_seconds: "3600"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
   # P2P weight transfer with tensor parallelism > 1.
   # Single-node TP: each pod has N GPUs and runs the engine with
   # --tensor-parallel-size N. Source and target on different hosts (existing
@@ -726,6 +790,7 @@ jobs:
       - build-client
       - ensure-vcluster
       - test-p2p
+      - test-p2p-mla-model
       - test-tp
       - test-with-dynamo
       - test-stale-metadata

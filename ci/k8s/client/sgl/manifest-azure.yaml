@@ -105,6 +105,8 @@ spec:
             - --modelexpress-config
             - '{"url": "mx-server:8000", "transport": "nixl"}'
           env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
             - name: MODEL_EXPRESS_URL
               value: "mx-server:8000"
             - name: MX_SERVER_ADDRESS

@@ -1,28 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Azure GB200 single-job template for P2P RDMA weight-transfer CI tests.
+# Azure single-job template for large-model P2P RDMA weight-transfer CI tests
+# with tensor parallelism = 8 (vLLM).
 #
-# Applied twice by the workflow — once for the source, once for the target —
-# with different env var substitutions each time:
-#
-#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
-#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
-#
-# The workflow (via run-mx-test) gates target apply on the ModelMetadata CR
-# appearing in the namespace, replacing the need for an initContainer.
-#
-# Azure-specific differences vs manifest-gcp.yaml:
-#   - No GKE multi-network annotations (not supported on AKS)
-#   - rdma/ib resource limit exposes InfiniBand RDMA device (A100 SXM4 nodes)
-#   - MX_RDMA_NIC_PIN=auto for per-rank IB NIC pinning (workaround for ucx#11259)
-#   - nvidia.com/gpu + no-datadog tolerations for AKS A100 node pools (amd64)
-#
-# Environment variables substituted by envsubst before each apply:
-#   JOB_NAME      — mx-source or mx-target
-#   WORKER_IMAGE  — image built from ci/k8s/client/vllm/Dockerfile
-#   WORKER_PORT   — port the vLLM server listens on
-#   MX_CI_MODEL   — HuggingFace model id
+# This manifest is intentionally pinned to the full-GPU A100b pool. Source and
+# target each consume a whole 8-GPU node, so the job validates a realistic
+# large-model TP shape while preserving cross-host IB transfer via anti-affinity.
 
 ---
 apiVersion: batch/v1
@@ -39,32 +23,15 @@ spec:
       restartPolicy: Never
       imagePullSecrets:
         - name: worker-registry
-      # Pin to a specific GPU node pool rather than leaving the agentpool
-      # open. Other pools in the cluster may have too few active nodes for
-      # source + target anti-affinity to find a peer host, leaving target
-      # Pending forever. The agentpool podAffinity below becomes redundant
-      # (both pods already constrained here) but is kept for self-
-      # documentation + as defense if this nodeSelector is removed.
       nodeSelector:
-        agentpool: a100a
+        agentpool: a100b
       affinity:
-        # podAntiAffinity on hostname: keep source and target on different
-        # physical hosts so RDMA still exercises true cross-host IB, not
-        # intra-node loopback.
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
                 matchLabels:
                   app: mx-p2p-worker
               topologyKey: kubernetes.io/hostname
-        # podAffinity on agentpool: keep source and target in the SAME node
-        # pool. The test cluster splits GPU nodes across multiple
-        # InfiniBand partitions — pools have different pkeys, and pods on
-        # different pkeys can't talk RDMA to each other (UCX error:
-        # "local pkey 0xXXXX differs from remote pkey 0xYYYY",
-        # NIXL_ERR_BACKEND on the receive). Combined with hostname anti-
-        # affinity, this forces source/target onto different hosts WITHIN
-        # the same IB partition.
         podAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -82,12 +49,10 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 64Gi
+            sizeLimit: 128Gi
       containers:
         - name: ${JOB_NAME}
           image: ${WORKER_IMAGE}
-          # Force re-pull on every pod creation so CI/dev iterations on the same
-          # tag pick up freshly pushed images instead of the node's cached copy.
           imagePullPolicy: Always
           command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
@@ -96,13 +61,14 @@ spec:
             - --load-format
             - mx
             - --tensor-parallel-size
-            - "1"
+            - "8"
             # Keep KV fixed and small so VRAM parity stays sensitive to
             # weight residency instead of vLLM auto-sizing cache around leaks.
             - --max-model-len
             - "1024"
             - --kv-cache-memory-bytes
             - "1073741824"
+            - --enforce-eager
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"
@@ -130,13 +96,13 @@ spec:
             - containerPort: ${WORKER_PORT}
           resources:
             requests:
-              cpu: "4"
-              memory: "16Gi"
-              nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              cpu: "32"
+              memory: "128Gi"
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
             limits:
-              nvidia.com/gpu: "1"
-              rdma/ib: "1"
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
           volumeMounts:
             - name: shm
               mountPath: /dev/shm

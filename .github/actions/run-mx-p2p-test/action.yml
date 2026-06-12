@@ -90,7 +90,6 @@ inputs:
       Catches silent TP collapse and rank-pairing regressions.
     required: false
     default: '1'
-
 runs:
   using: "composite"
   steps:
@@ -201,11 +200,13 @@ runs:
       shell: bash
       env:
         NAMESPACE: ${{ inputs.namespace }}
+        SOURCE_PORT: ${{ inputs.source_port }}
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
         TP_SIZE: ${{ inputs.tp_size }}
       run: |
         [[ "${TP_SIZE}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: tp_size must be a positive integer, got '${TP_SIZE}'"; exit 1; }
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        source .github/actions/run-mx-p2p-test/vram-sampling.sh
         echo "::group::Wait for source to publish ${TP_SIZE} ModelMetadata CR(s)"
         # Wait for one CR per source rank. Under TP=N each rank publishes
         # its own ModelMetadata CR (worker_rank=0..N-1), and the target's
@@ -215,7 +216,16 @@ runs:
         # load — which surfaces later as the rank-distinct-agent assertion
         # failing in test_per_rank_source_agents.
         deadline=$((SECONDS + TIMEOUT))
+        SOURCE_POD=""
+        SOURCE_PEAK_VRAM_MIB=0
+        SOURCE_FINAL_VRAM_MIB=0
+        SOURCE_VRAM_SAMPLES=0
+
         while [ $SECONDS -lt $deadline ]; do
+          # Peak often equals final in healthy runs, but it catches transient
+          # duplicate/staging allocations that are freed before /health.
+          sample_peak_vram "Source" "job-name=mx-source" "mx-source" \
+            SOURCE_POD SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB
           CR_COUNT=$(kubectl get modelmetadata -n ${NAMESPACE} --no-headers 2>/dev/null | wc -l | tr -d ' ')
           if [ "${CR_COUNT}" -ge "${TP_SIZE}" ]; then
             echo "Source published ${CR_COUNT}/${TP_SIZE} ModelMetadata CRs."
@@ -227,8 +237,8 @@ runs:
             echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
             exit 1
           fi
-          echo "Have ${CR_COUNT}/${TP_SIZE} ModelMetadata CRs, retrying in 10s..."
-          sleep 10
+          echo "Have ${CR_COUNT}/${TP_SIZE} ModelMetadata CRs, retrying in 5s..."
+          sleep 5
         done
         # The loop exits without error when the deadline fires. Without this
         # final check, the next step would apply the target manifest against
@@ -240,6 +250,14 @@ runs:
           echo "ERROR: source published only ${FINAL}/${TP_SIZE} ModelMetadata CRs within ${TIMEOUT}s"
           exit 1
         fi
+        echo "Source published metadata; continue sampling until source /health returns 200."
+        wait_for_health "Source" "job-name=mx-source" "mx-source" \
+          "${SOURCE_PORT}" SOURCE_POD SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB \
+          "${TIMEOUT}" " after metadata publish"
+        echo "SOURCE_PEAK_VRAM_MIB=${SOURCE_PEAK_VRAM_MIB}" >> "$GITHUB_ENV"
+        echo "SOURCE_FINAL_VRAM_MIB=${SOURCE_FINAL_VRAM_MIB}" >> "$GITHUB_ENV"
+        echo "Source peak VRAM: ${SOURCE_PEAK_VRAM_MIB} MiB across ${SOURCE_VRAM_SAMPLES} sample(s)."
+        echo "Source final VRAM after /health: ${SOURCE_FINAL_VRAM_MIB} MiB."
         echo "::endgroup::"
 
     - name: Apply target manifest
@@ -269,6 +287,7 @@ runs:
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        source .github/actions/run-mx-p2p-test/vram-sampling.sh
         echo "::group::Waiting for target /health to return 200"
         # Only wait on the target — source was already gated by the
         # `Wait for source to publish metadata` step (publishing requires
@@ -294,42 +313,23 @@ runs:
         # rather than port-forward: avoids the port-leak failure mode
         # we hit with vCluster and works on any framework whose container
         # ships curl (vllm/vllm-openai + sglang base images both do).
-        deadline=$((SECONDS + TIMEOUT))
         TARGET_POD=""
-        while [ $SECONDS -lt $deadline ]; do
-          # Refresh pod name each iteration — covers the Pending → Running
-          # transition where the pod name doesn't exist yet at first.
-          TARGET_POD=$(kubectl get pods -n ${NAMESPACE} \
-            -l job-name=mx-target \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-
-          if [ -n "${TARGET_POD}" ] && kubectl exec -n ${NAMESPACE} "${TARGET_POD}" -- \
-               curl -sf -m 5 "http://localhost:${WORKER_PORT}/health" >/dev/null 2>&1; then
-            echo "Target ${TARGET_POD} /health returned 200."
-            break
-          fi
-
-          # Surface known failure states proactively rather than spinning
-          # until timeout for a pod that's already broken.
-          FAILED=$(kubectl get pods -n ${NAMESPACE} \
-              -l job-name=mx-target --no-headers 2>/dev/null \
-            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
-          if [ -n "${FAILED}" ]; then
-            echo "ERROR: target pod entered failure state: ${FAILED}"
-            exit 1
-          fi
-
-          echo "Target /health not ready yet (pod=${TARGET_POD:-<not-created>})..."
-          sleep 10
-        done
-
-        # Post-loop guard — loop exits on deadline OR success. Re-probe
-        # to distinguish the two.
-        if ! kubectl exec -n ${NAMESPACE} "${TARGET_POD}" -- \
-             curl -sf -m 5 "http://localhost:${WORKER_PORT}/health" >/dev/null 2>&1; then
-          echo "ERROR: target /health did not return 200 within ${TIMEOUT}s"
-          exit 1
-        fi
+        TARGET_PEAK_VRAM_MIB=0
+        TARGET_FINAL_VRAM_MIB=0
+        TARGET_VRAM_SAMPLES=0
+        wait_for_health "Target" "job-name=mx-target" "mx-target" \
+          "${WORKER_PORT}" TARGET_POD TARGET_PEAK_VRAM_MIB TARGET_VRAM_SAMPLES TARGET_FINAL_VRAM_MIB \
+          "${TIMEOUT}"
+        VRAM_MEASUREMENTS_PATH="${GITHUB_WORKSPACE}/.mx-vram-measurements.json"
+        write_vram_measurements "${VRAM_MEASUREMENTS_PATH}" \
+          "${SOURCE_PEAK_VRAM_MIB}" "${SOURCE_FINAL_VRAM_MIB}" \
+          "${TARGET_PEAK_VRAM_MIB}" "${TARGET_FINAL_VRAM_MIB}" \
+          "0.5"
+        echo "MX_VRAM_MEASUREMENTS_PATH=${VRAM_MEASUREMENTS_PATH}" >> "$GITHUB_ENV"
+        echo "VRAM measurements written to ${VRAM_MEASUREMENTS_PATH}:"
+        cat "${VRAM_MEASUREMENTS_PATH}"
+        echo "Target peak VRAM: ${TARGET_PEAK_VRAM_MIB} MiB across ${TARGET_VRAM_SAMPLES} sample(s)."
+        echo "Target final VRAM after /health: ${TARGET_FINAL_VRAM_MIB} MiB."
         echo "::endgroup::"
 
     - name: Set up Python

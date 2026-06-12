@@ -100,6 +100,8 @@ spec:
           # Do NOT set `command:` here — that would skip nvidia_entrypoint.sh and
           # break TensorRT shared library lookup (libnvonnxparser.so.10 etc.).
           env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
             - name: MODEL_NAME
               value: "${MX_CI_MODEL}"
             - name: WORKER_PORT
