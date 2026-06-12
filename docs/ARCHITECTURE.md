@@ -671,16 +671,16 @@ config = nixl_agent_config(backends=["UCX"])
 agent = nixl_agent("worker-0", config)
 
 # 2. Register GPU tensors for RDMA access
-tensors = [(tensor.data_ptr(), tensor.numel() * tensor.element_size(), device_id, "cuda")]
-agent.register_memory(tensors, "VRAM")
+tensors = [(tensor.data_ptr(), tensor.numel() * tensor.element_size(), device_id, "")]
+agent.register_memory(tensors, "VRAM")  # NIXL accelerator memory segment
 
 # 3. Get metadata for remote agent connection
 metadata = agent.get_local_md()  # Share this with target
 
 # 4. On target: connect to source and transfer
 agent.add_remote_agent("source-worker-0", source_metadata)
-src_descs = agent.prep_xfer_dlist("source-worker-0", source_tensors, "cuda", ["UCX"])
-dst_descs = agent.prep_xfer_dlist("", local_tensors, "cuda", ["UCX"])
+src_descs = agent.prep_xfer_dlist("source-worker-0", source_tensors, "VRAM", ["UCX"])
+dst_descs = agent.prep_xfer_dlist("", local_tensors, "VRAM", ["UCX"])
 handle = agent.make_prepped_xfer("READ", dst_descs, indices, src_descs, indices, ["UCX"])
 agent.transfer(handle)
 

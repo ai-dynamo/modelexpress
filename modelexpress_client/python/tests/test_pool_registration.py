@@ -6,12 +6,13 @@ and receive_from_source manifest validation."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
 
 from modelexpress.nixl_transfer import (
+    NIXL_ACCELERATOR_MEM_TYPE,
     NixlTransferManager,
     _pool_reg_enabled,
 )
@@ -187,6 +188,86 @@ class TestFindCudaAllocations:
             NixlTransferManager._find_cuda_allocations(
                 [_desc("w_named", 0x1000, 64)]
             )
+
+
+class TestRawDescriptorMemType:
+    def _make_manager(self) -> NixlTransferManager:
+        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b"metadata"
+        return mgr
+
+    def test_pool_registration_uses_vram_segment(self, monkeypatch, fake_driver):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        tensor = torch.zeros(4, dtype=torch.float32)
+        fake_driver([(tensor.data_ptr(), tensor.numel() * tensor.element_size())])
+
+        mgr = self._make_manager()
+        assert mgr.register_tensors({"w": tensor}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_arena_registration_uses_vram_segment(self):
+        class FakeArena:
+            def registered_range(self):
+                return 0x1000, 0x2000
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(FakeArena(), {"w": torch.zeros(1)}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(0x1000, 0x2000, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_receive_transfer_descriptors_use_vram_segment(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+        local = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._tensors = {"w": local}
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[
+                TensorDescriptor(
+                    name="w",
+                    addr=0x1000,
+                    size=local.numel() * local.element_size(),
+                    device_id=0,
+                    dtype=str(local.dtype),
+                )
+            ],
+            remote_agent_name="source",
+        )
+
+        assert result[0] == local.numel() * local.element_size()
+        assert result[1] == 1
+        assert mgr._agent.prep_xfer_dlist.call_args_list == [
+            call(
+                agent_name="source",
+                xfer_list=[(0x1000, local.numel() * local.element_size(), 0)],
+                mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+                backends=["UCX"],
+            ),
+            call(
+                agent_name="",
+                xfer_list=[
+                    (local.data_ptr(), local.numel() * local.element_size(), 0),
+                ],
+                mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+                backends=["UCX"],
+            ),
+        ]
 
 
 class TestReceiveFromSourceManifestValidation:

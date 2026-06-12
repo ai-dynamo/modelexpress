@@ -42,6 +42,7 @@ except ImportError:
 
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
 DEFAULT_NIXL_BACKEND = "UCX"
+NIXL_ACCELERATOR_MEM_TYPE = "VRAM"
 NIXL_DRAM_MEM_TYPE = "DRAM"
 
 
@@ -268,7 +269,11 @@ class NixlTransferManager:
                 (base, size, self._device_id, "")
                 for base, size in allocations
             ]
-            self._agent.register_memory(alloc_tuples, mem_type="cuda", backends=self._backends)
+            self._agent.register_memory(
+                alloc_tuples,
+                mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+                backends=self._backends,
+            )
             reg_count = len(allocations)
         else:
             tensor_list = list(tensors.values())
@@ -304,7 +309,7 @@ class NixlTransferManager:
         The arena owns a contiguous VA range; at end-of-load the bump
         pointer's [base, base+used) covers every allocation we've ever
         made (including holes from intervening frees). NIXL's
-        `register_memory` with `mem_type="cuda"` over this range
+        `register_memory` with `mem_type="VRAM"` over this range
         consumes a dmabuf via `ibv_reg_dmabuf_mr` and produces ONE
         lkey/rkey covering all live tensors.
 
@@ -341,7 +346,7 @@ class NixlTransferManager:
         nixl_reg_start = time.perf_counter()
         self._agent.register_memory(
             [(base, used, self._device_id, "")],
-            mem_type="cuda",
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=self._backends,
         )
         nixl_reg_time = time.perf_counter() - nixl_reg_start
@@ -551,13 +556,13 @@ class NixlTransferManager:
         src_prepped = self._agent.prep_xfer_dlist(
             agent_name=remote_agent_name,
             xfer_list=remote_descs,
-            mem_type="cuda",
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=self._backends,
         )
         dst_prepped = self._agent.prep_xfer_dlist(
             agent_name="",
             xfer_list=local_descs,
-            mem_type="cuda",
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=self._backends,
         )
         prep_time = time.perf_counter() - prep_start

@@ -7,6 +7,7 @@ import pytest
 
 from modelexpress.nixl_transfer import (
     DEFAULT_NIXL_BACKEND,
+    NIXL_ACCELERATOR_MEM_TYPE,
     NixlTransferManager,
     SUPPORTED_NIXL_BACKENDS,
     _resolve_nixl_backend,
@@ -39,6 +40,10 @@ class TestResolveNixlBackend:
     def test_supported_backends_contains_both(self):
         assert "UCX" in SUPPORTED_NIXL_BACKENDS
         assert "LIBFABRIC" in SUPPORTED_NIXL_BACKENDS
+
+
+def test_raw_accelerator_descriptors_use_nixl_vram_segment():
+    assert NIXL_ACCELERATOR_MEM_TYPE == "VRAM"
 
 
 class TestNixlTransferManagerBackend:
