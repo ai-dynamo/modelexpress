@@ -99,6 +99,8 @@ spec:
             - --port
             - "${WORKER_PORT}"
           env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_SERVER_ADDRESS

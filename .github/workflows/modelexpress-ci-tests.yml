@@ -36,7 +36,7 @@
 #                         row 5.1 for the full topology rationale.
 #
 #   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
-#                        Uses a TP=8 DeepSeek MLA + MoE model and also runs
+#                        Uses a TP=2 DeepSeek MLA + MoE model and also runs
 #                        the standard source/target VRAM parity assertions.
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
@@ -422,13 +422,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Dedicated P2P MLA/MoE model test.
-  # Runs on the full-GPU A100b pool with TP=8 and a DeepSeek MLA + MoE model.
-  # It also runs the standard source/target VRAM parity assertions.
+  # Runs on the full-GPU A100b pool with TP=2 and a DeepSeek MLA + MoE model.
+  # It also runs the source/target VRAM parity assertions.
   # ---------------------------------------------------------------------------
   test-p2p-mla-model:
-    name: P2P MLA model test (vllm TP=8)
+    name: P2P MLA model test (vllm TP=2)
     runs-on: prod-modelexpress-builder-amd-v1
-    # The TP=8 source and target each reserve a full A100b node.
+    # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
       contents: read
@@ -452,18 +452,18 @@ jobs:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: mx-ci-vllm-mla-${{ github.run_id }}
           server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          manifest: ci/k8s/client/vllm/manifest-azure-tp8.yaml
+          manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
           test_script: ci/k8s/client/test_p2p_k8s.py
           worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
-          model: deepseek-ai/DeepSeek-V2
+          model: deepseek-ai/DeepSeek-V2-Lite
           hf_token: ${{ secrets.HF_TOKEN }}
           source_extra_env: "JOB_NAME=mx-source"
           extra_env: "JOB_NAME=mx-target"
           source_port: "8001"
           worker_port: "8002"
-          tp_size: "8"
+          tp_size: "2"
           pod_ready_timeout_seconds: "3600"
           measure_vram: "true"
 
