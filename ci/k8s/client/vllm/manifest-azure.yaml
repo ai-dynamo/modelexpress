@@ -97,6 +97,12 @@ spec:
             - mx
             - --tensor-parallel-size
             - "1"
+            # Keep KV fixed and small so VRAM parity stays sensitive to
+            # weight residency instead of vLLM auto-sizing cache around leaks.
+            - --max-model-len
+            - "1024"
+            - --kv-cache-memory-bytes
+            - "1073741824"
             - --trust-remote-code
             - --port
             - "${WORKER_PORT}"

@@ -85,6 +85,10 @@ jobs:
     - name: Run server memory-backend unit tests
       run: cargo test -p modelexpress-server --features memory-backend --lib
 
+    - name: Run integration tests
+      if: matrix.rust == 'stable'
+      run: cargo test -p modelexpress-server --features integration-tests --test in_process_server
+
     - name: Build release
       run: cargo build --release --verbose
 

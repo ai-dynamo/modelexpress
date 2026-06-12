@@ -3,6 +3,7 @@
 
 use clap::Parser;
 use modelexpress_server::{
+    backend_config::BackendConfig,
     config::{ServerArgs, ServerConfig},
     run_server,
 };
@@ -50,5 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Received CTRL+C, shutting down gracefully...");
     };
 
-    run_server(config, shutdown).await
+    let backend = BackendConfig::from_env()?;
+
+    run_server(config, backend, shutdown).await
 }

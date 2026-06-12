@@ -17,6 +17,9 @@ keywords.workspace = true
 # In-memory backend for tests and local dev (MX_METADATA_BACKEND=memory). Off by
 # default; enable explicitly with `--features memory-backend` to run its unit tests.
 memory-backend = []
+# Gates the in-process integration tests, which boot a server and are slower. Enables
+# memory-backend because the test boots run_server with MX_METADATA_BACKEND=memory.
+integration-tests = ["memory-backend"]
 
 [dependencies]
 modelexpress-common = { workspace = true }
@@ -57,6 +60,11 @@ tempfile = "3.20"
 tokio-test = "0.4"
 tonic-build = { workspace = true }
 modelexpress-client.workspace = true
+
+[[test]]
+name = "in_process_server"
+path = "tests/in_process_server.rs"
+required-features = ["integration-tests"]
 
 [lints]
 workspace = true

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import json
 import os
 import pytest
 
@@ -11,6 +12,20 @@ def _positive_int(value: str) -> int:
     if ivalue < 1:
         raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {ivalue}")
     return ivalue
+
+
+def _nonnegative_int(value: str) -> int:
+    ivalue = int(value)
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer, got {ivalue}")
+    return ivalue
+
+
+def _nonnegative_float(value: str) -> float:
+    fvalue = float(value)
+    if fvalue < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative number, got {fvalue}")
+    return fvalue
 
 
 def _port(value: str) -> int:
@@ -123,6 +138,49 @@ def tp_size(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def transport(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--transport")
+
+
+@pytest.fixture(scope="session")
+def vram_measurements() -> dict:
+    path = os.environ.get("MX_VRAM_MEASUREMENTS_PATH")
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as f:
+        measurements = json.load(f)
+    assert isinstance(measurements, dict), f"Invalid VRAM measurements in {path}: {measurements!r}"
+    return measurements
+
+
+def _vram_mib(measurements: dict, side: str, metric: str) -> int | None:
+    value = measurements.get(side, {}).get(metric)
+    if value is None:
+        return None
+    return _nonnegative_int(str(value))
+
+
+@pytest.fixture(scope="session")
+def source_peak_vram_mib(vram_measurements: dict) -> int | None:
+    return _vram_mib(vram_measurements, "source", "peak_mib")
+
+
+@pytest.fixture(scope="session")
+def target_peak_vram_mib(vram_measurements: dict) -> int | None:
+    return _vram_mib(vram_measurements, "target", "peak_mib")
+
+
+@pytest.fixture(scope="session")
+def source_final_vram_mib(vram_measurements: dict) -> int | None:
+    return _vram_mib(vram_measurements, "source", "final_mib")
+
+
+@pytest.fixture(scope="session")
+def target_final_vram_mib(vram_measurements: dict) -> int | None:
+    return _vram_mib(vram_measurements, "target", "final_mib")
+
+
+@pytest.fixture(scope="session")
+def vram_tolerance_percent(vram_measurements: dict) -> float:
+    return _nonnegative_float(str(vram_measurements.get("tolerance_percent", 0.5)))
 
 
 @pytest.fixture(scope="session")
