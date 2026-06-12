@@ -181,8 +181,6 @@ spec:
             - containerPort: 6379
               name: ray-gcs
           env:
-            - name: NVIDIA_DRIVER_CAPABILITIES
-              value: "compute,utility"
             - name: POD_NAME
               valueFrom:
                 fieldRef:

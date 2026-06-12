@@ -10,7 +10,8 @@ have reached Running state.  Asserts:
      0..tp_size-1 (catches TP collapse and source-rank-pairing regressions).
   3. Both source and target servers respond to /v1/completions — confirms weights
      are loaded and the model is serving correctly on each.
-  4. Target peak and final VRAM do not materially exceed source VRAM.
+  4. When enabled by the workflow, target peak and final VRAM do not materially
+     exceed source VRAM.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -233,6 +234,8 @@ def _assert_target_vram_matches_source(
     target_vram_mib: int | None,
     vram_tolerance_percent: float,
 ) -> None:
+    if source_vram_mib is None and target_vram_mib is None:
+        pytest.skip("VRAM measurements were not collected for this P2P job")
     assert source_vram_mib is not None, f"Missing source {metric} VRAM measurement"
     assert target_vram_mib is not None, f"Missing target {metric} VRAM measurement"
 

@@ -62,11 +62,15 @@ wait_for_health() {
   local container="$3"
   local port="$4"
   local pod_var="$5"
-  local peak_var="$6"
-  local samples_var="$7"
-  local final_var="$8"
-  local timeout="$9"
-  local timeout_detail="${10:-}"
+  local timeout="$6"
+  local timeout_detail="${7:-}"
+  local peak_var="${8:-}"
+  local samples_var="${9:-}"
+  local final_var="${10:-}"
+  local measure_vram=false
+  if [ -n "${peak_var}" ]; then
+    measure_vram=true
+  fi
 
   local deadline failed pod
   deadline=$((SECONDS + timeout))
@@ -76,8 +80,10 @@ wait_for_health() {
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     printf -v "${pod_var}" '%s' "${pod}"
 
-    sample_peak_vram "${label}" "${selector}" "${container}" \
-      "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
+    if [ "${measure_vram}" = "true" ]; then
+      sample_peak_vram "${label}" "${selector}" "${container}" \
+        "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
+    fi
     if [ -n "${pod}" ] && kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
          curl -sf -m 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
       echo "${label} ${pod} /health returned 200."
@@ -95,15 +101,17 @@ wait_for_health() {
     sleep 5
   done
 
-  sample_peak_vram "${label}" "${selector}" "${container}" \
-    "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
+  if [ "${measure_vram}" = "true" ]; then
+    sample_peak_vram "${label}" "${selector}" "${container}" \
+      "${pod_var}" "${peak_var}" "${samples_var}" "${final_var}"
+  fi
   pod="${!pod_var}"
   if [ -z "${pod}" ] || ! kubectl exec -n "${NAMESPACE}" "${pod}" -c "${container}" -- \
        curl -sf -m 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
     echo "ERROR: ${label} /health did not return 200 within ${timeout}s${timeout_detail}"
     exit 1
   fi
-  if [ "${!samples_var}" -eq 0 ]; then
+  if [ "${measure_vram}" = "true" ] && [ "${!samples_var}" -eq 0 ]; then
     echo "ERROR: sampled no ${label} GPU memory values with nvidia-smi"
     exit 1
   fi

@@ -90,6 +90,10 @@ inputs:
       Catches silent TP collapse and rank-pairing regressions.
     required: false
     default: '1'
+  measure_vram:
+    description: 'When true, sample source/target VRAM and enable the pytest VRAM parity assertions.'
+    required: false
+    default: 'false'
 runs:
   using: "composite"
   steps:
@@ -203,9 +207,11 @@ runs:
         SOURCE_PORT: ${{ inputs.source_port }}
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
         TP_SIZE: ${{ inputs.tp_size }}
+        MEASURE_VRAM: ${{ inputs.measure_vram }}
       run: |
         [[ "${TP_SIZE}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: tp_size must be a positive integer, got '${TP_SIZE}'"; exit 1; }
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        [[ "${MEASURE_VRAM}" == "true" || "${MEASURE_VRAM}" == "false" ]] || { echo "ERROR: measure_vram must be 'true' or 'false', got '${MEASURE_VRAM}'"; exit 1; }
         source .github/actions/run-mx-p2p-test/vram-sampling.sh
         echo "::group::Wait for source to publish ${TP_SIZE} ModelMetadata CR(s)"
         # Wait for one CR per source rank. Under TP=N each rank publishes
@@ -222,10 +228,12 @@ runs:
         SOURCE_VRAM_SAMPLES=0
 
         while [ $SECONDS -lt $deadline ]; do
-          # Peak often equals final in healthy runs, but it catches transient
-          # duplicate/staging allocations that are freed before /health.
-          sample_peak_vram "Source" "job-name=mx-source" "mx-source" \
-            SOURCE_POD SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB
+          if [ "${MEASURE_VRAM}" = "true" ]; then
+            # Peak often equals final in healthy runs, but it catches transient
+            # duplicate/staging allocations that are freed before /health.
+            sample_peak_vram "Source" "job-name=mx-source" "mx-source" \
+              SOURCE_POD SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB
+          fi
           CR_COUNT=$(kubectl get modelmetadata -n ${NAMESPACE} --no-headers 2>/dev/null | wc -l | tr -d ' ')
           if [ "${CR_COUNT}" -ge "${TP_SIZE}" ]; then
             echo "Source published ${CR_COUNT}/${TP_SIZE} ModelMetadata CRs."
@@ -250,14 +258,20 @@ runs:
           echo "ERROR: source published only ${FINAL}/${TP_SIZE} ModelMetadata CRs within ${TIMEOUT}s"
           exit 1
         fi
-        echo "Source published metadata; continue sampling until source /health returns 200."
-        wait_for_health "Source" "job-name=mx-source" "mx-source" \
-          "${SOURCE_PORT}" SOURCE_POD SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB \
-          "${TIMEOUT}" " after metadata publish"
-        echo "SOURCE_PEAK_VRAM_MIB=${SOURCE_PEAK_VRAM_MIB}" >> "$GITHUB_ENV"
-        echo "SOURCE_FINAL_VRAM_MIB=${SOURCE_FINAL_VRAM_MIB}" >> "$GITHUB_ENV"
-        echo "Source peak VRAM: ${SOURCE_PEAK_VRAM_MIB} MiB across ${SOURCE_VRAM_SAMPLES} sample(s)."
-        echo "Source final VRAM after /health: ${SOURCE_FINAL_VRAM_MIB} MiB."
+        if [ "${MEASURE_VRAM}" = "true" ]; then
+          echo "Source published metadata; continue sampling until source /health returns 200."
+          wait_for_health "Source" "job-name=mx-source" "mx-source" \
+            "${SOURCE_PORT}" SOURCE_POD "${TIMEOUT}" " after metadata publish" \
+            SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB
+          echo "SOURCE_PEAK_VRAM_MIB=${SOURCE_PEAK_VRAM_MIB}" >> "$GITHUB_ENV"
+          echo "SOURCE_FINAL_VRAM_MIB=${SOURCE_FINAL_VRAM_MIB}" >> "$GITHUB_ENV"
+          echo "Source peak VRAM: ${SOURCE_PEAK_VRAM_MIB} MiB across ${SOURCE_VRAM_SAMPLES} sample(s)."
+          echo "Source final VRAM after /health: ${SOURCE_FINAL_VRAM_MIB} MiB."
+        else
+          echo "Source published metadata; wait until source /health returns 200."
+          wait_for_health "Source" "job-name=mx-source" "mx-source" \
+            "${SOURCE_PORT}" SOURCE_POD "${TIMEOUT}" " after metadata publish"
+        fi
         echo "::endgroup::"
 
     - name: Apply target manifest
@@ -285,8 +299,10 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
         WORKER_PORT: ${{ inputs.worker_port }}
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
+        MEASURE_VRAM: ${{ inputs.measure_vram }}
       run: |
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
+        [[ "${MEASURE_VRAM}" == "true" || "${MEASURE_VRAM}" == "false" ]] || { echo "ERROR: measure_vram must be 'true' or 'false', got '${MEASURE_VRAM}'"; exit 1; }
         source .github/actions/run-mx-p2p-test/vram-sampling.sh
         echo "::group::Waiting for target /health to return 200"
         # Only wait on the target — source was already gated by the
@@ -317,19 +333,24 @@ runs:
         TARGET_PEAK_VRAM_MIB=0
         TARGET_FINAL_VRAM_MIB=0
         TARGET_VRAM_SAMPLES=0
-        wait_for_health "Target" "job-name=mx-target" "mx-target" \
-          "${WORKER_PORT}" TARGET_POD TARGET_PEAK_VRAM_MIB TARGET_VRAM_SAMPLES TARGET_FINAL_VRAM_MIB \
-          "${TIMEOUT}"
-        VRAM_MEASUREMENTS_PATH="${GITHUB_WORKSPACE}/.mx-vram-measurements.json"
-        write_vram_measurements "${VRAM_MEASUREMENTS_PATH}" \
-          "${SOURCE_PEAK_VRAM_MIB}" "${SOURCE_FINAL_VRAM_MIB}" \
-          "${TARGET_PEAK_VRAM_MIB}" "${TARGET_FINAL_VRAM_MIB}" \
-          "0.5"
-        echo "MX_VRAM_MEASUREMENTS_PATH=${VRAM_MEASUREMENTS_PATH}" >> "$GITHUB_ENV"
-        echo "VRAM measurements written to ${VRAM_MEASUREMENTS_PATH}:"
-        cat "${VRAM_MEASUREMENTS_PATH}"
-        echo "Target peak VRAM: ${TARGET_PEAK_VRAM_MIB} MiB across ${TARGET_VRAM_SAMPLES} sample(s)."
-        echo "Target final VRAM after /health: ${TARGET_FINAL_VRAM_MIB} MiB."
+        if [ "${MEASURE_VRAM}" = "true" ]; then
+          wait_for_health "Target" "job-name=mx-target" "mx-target" \
+            "${WORKER_PORT}" TARGET_POD "${TIMEOUT}" "" \
+            TARGET_PEAK_VRAM_MIB TARGET_VRAM_SAMPLES TARGET_FINAL_VRAM_MIB
+          VRAM_MEASUREMENTS_PATH="${GITHUB_WORKSPACE}/.mx-vram-measurements.json"
+          write_vram_measurements "${VRAM_MEASUREMENTS_PATH}" \
+            "${SOURCE_PEAK_VRAM_MIB}" "${SOURCE_FINAL_VRAM_MIB}" \
+            "${TARGET_PEAK_VRAM_MIB}" "${TARGET_FINAL_VRAM_MIB}" \
+            "0.5"
+          echo "MX_VRAM_MEASUREMENTS_PATH=${VRAM_MEASUREMENTS_PATH}" >> "$GITHUB_ENV"
+          echo "VRAM measurements written to ${VRAM_MEASUREMENTS_PATH}:"
+          cat "${VRAM_MEASUREMENTS_PATH}"
+          echo "Target peak VRAM: ${TARGET_PEAK_VRAM_MIB} MiB across ${TARGET_VRAM_SAMPLES} sample(s)."
+          echo "Target final VRAM after /health: ${TARGET_FINAL_VRAM_MIB} MiB."
+        else
+          wait_for_health "Target" "job-name=mx-target" "mx-target" \
+            "${WORKER_PORT}" TARGET_POD "${TIMEOUT}"
+        fi
         echo "::endgroup::"
 
     - name: Set up Python

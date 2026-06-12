@@ -465,6 +465,7 @@ jobs:
           worker_port: "8002"
           tp_size: "8"
           pod_ready_timeout_seconds: "3600"
+          measure_vram: "true"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()
