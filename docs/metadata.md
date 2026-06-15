@@ -43,6 +43,8 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 
 The server computes `mx_source_id = SHA256(canonical_json(identity))[:16]` -- a 16-char hex key used to address all metadata for sources with identical configuration. This is content-addressed: two sources with the same identity hash to the same `mx_source_id`, enabling automatic peer discovery.
 
+Runtime accelerator compatibility is deliberately not part of `SourceIdentity` or `mx_source_id`. The source worker's active accelerator backend is stored as runtime `WorkerMetadata.accelerator` so rolling upgrades and existing pinned source-ID hash tests remain stable.
+
 ### Multi-Instance Support
 
 Multiple replicas of the same model (same `SourceIdentity`) can coexist. Each GPU worker process generates a unique `worker_id` (`uuid4().hex[:8]`) at startup. The combination `(mx_source_id, worker_id)` uniquely identifies one worker's metadata.
@@ -52,6 +54,12 @@ Each worker publishes independently -- no inter-worker coordination or barriers 
 ### Worker Rank
 
 Workers use `torch.distributed.get_rank()` as their global rank, which captures both tensor-parallel and pipeline-parallel position. This is stored as `worker_rank` in metadata so targets can find a peer with a matching rank.
+
+### Runtime Accelerator Compatibility
+
+`WorkerMetadata.accelerator` records the source worker's runtime accelerator family, such as `cuda`, from the active `AcceleratorBackend.name`. This field is used only for source compatibility filtering. It is not folded into `SourceIdentity`, does not affect `mx_source_id`, and does not change the Rust/Python pinned source-ID cross-check hashes.
+
+Targets treat an empty `accelerator` value as unknown and do not reject it, which keeps transfers backward compatible with metadata published before this field existed. If both source and target publish non-empty accelerator values and they differ, the target skips that source after fetching metadata and before target preparation or RDMA receive.
 
 ### Tensor and Artifact Source Payloads
 
@@ -96,7 +104,7 @@ Called once per GPU worker after loading weights and registering with the transf
 ```protobuf
 PublishMetadataRequest {
   identity: SourceIdentity    // Server computes mx_source_id from this
-  worker: WorkerMetadata       // One worker per call (rank, backend metadata, tensors)
+  worker: WorkerMetadata       // One worker per call (rank, accelerator, backend metadata, tensors)
   worker_id: string            // Unique per GPU process (uuid4 hex[:8])
 }
 ```
@@ -126,6 +134,8 @@ SourceInstanceRef {
 ### GetMetadata
 
 Fetches full metadata for one specific worker. Called on demand after filtering `ListSources` results. In central metadata mode this can include tensor descriptors directly. In P2P metadata mode the central response carries endpoint pointers and source summaries; targets fetch tensor descriptors or artifact manifests from `WorkerService`.
+
+Accelerator compatibility filtering happens after this metadata fetch because `ListSources` returns lightweight `SourceInstanceRef` values without the `accelerator` field. A target skips a source before target preparation if both source and target publish non-empty, different accelerator values.
 
 ```protobuf
 GetMetadataRequest {
@@ -451,6 +461,8 @@ sequenceDiagram
         MX-->>W: WorkerMetadata (tensors, nixl_metadata)
         alt Metadata missing or fetch error
             W->>W: Try next candidate
+        else Accelerator mismatch and both values known
+          W->>W: Skip candidate before target preparation
         end
     end
     W->>W: Add remote NIXL agent, execute RDMA transfers
@@ -465,7 +477,7 @@ sequenceDiagram
 
 The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
 
-1. **RDMA** -- If `ListSources` returns READY instances with matching rank, receive weights via NIXL/Mooncake
+1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights via NIXL/Mooncake
 2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU
 3. **Disk** -- Standard vLLM `DefaultModelLoader` as final fallback
 
@@ -473,7 +485,7 @@ After loading by any path, the worker registers its tensors and publishes metada
 
 ## Transfer Backends
 
-`WorkerMetadata` uses a `oneof backend_metadata` field supporting multiple transfer backends:
+`WorkerMetadata` stores runtime compatibility metadata plus a `oneof backend_metadata` field supporting multiple transfer backends. The `accelerator` field records the source worker's accelerator family for target-side filtering; empty means unknown and is accepted for backward compatibility.
 
 | Backend | Field | Description |
 |---------|-------|-------------|

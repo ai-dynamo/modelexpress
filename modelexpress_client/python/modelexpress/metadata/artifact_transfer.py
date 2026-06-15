@@ -499,6 +499,7 @@ def publish_artifact_source(
     node_rank: int = 0,
     max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     host: str | None = None,
+    accelerator: str = "cuda",
 ) -> PublishedArtifactSource:
     """Publish a prepared artifact source to the MX server for discovery."""
     if identity.mx_source_type != transfer.mx_source_type:
@@ -530,6 +531,7 @@ def publish_artifact_source(
         agent_name=nixl_manager.agent_name,
         worker_grpc_endpoint=worker_grpc_endpoint,
         artifact_source=artifact_source_metadata(bundle.manifest, node_rank=node_rank),
+        accelerator=accelerator,
     )
     try:
         mx_source_id = _publish_metadata_to_server(

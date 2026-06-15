@@ -422,6 +422,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    accelerator: String::new(),
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -439,6 +440,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    accelerator: String::new(),
                     artifact_source: None,
                 },
             ],

@@ -282,6 +282,11 @@ message WorkerMetadata {
   // artifact manifests, and artifact chunk transfer coordination.
   string worker_grpc_endpoint = 8;
 
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // This is runtime metadata, not SourceIdentity hash material. Empty means
+  // unknown and must be accepted for backward compatibility with old writers.
+  string accelerator = 9;
+
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
   // deprecated tensors when both are present, and fall back to tensors for old
@@ -332,6 +337,10 @@ message GetTensorManifestResponse {
 
   // Rank of the serving worker (for rank-matched transfers)
   uint32 worker_rank = 5;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Empty means unknown and must be accepted for backward compatibility.
+  string accelerator = 6;
 }
 
 message GetArtifactManifestHeaderRequest {

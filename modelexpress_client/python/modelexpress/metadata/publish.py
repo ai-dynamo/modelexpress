@@ -120,6 +120,7 @@ def publish_metadata_and_ready(
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
+    accelerator: str = "cuda",
 ) -> None:
     """Prepare tensor metadata publication and start the publisher thread."""
     logger.info(
@@ -149,6 +150,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_rank=worker_rank,
+            accelerator=accelerator,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
@@ -158,6 +160,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
+            accelerator=accelerator,
         )
 
         def publish_fn() -> str:
@@ -184,6 +187,7 @@ def publish_metadata_and_ready(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensor_source=tensor_source_metadata(tensor_protos),
+            accelerator=accelerator,
         )
 
         def publish_fn() -> str:

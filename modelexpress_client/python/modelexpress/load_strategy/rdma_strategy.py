@@ -130,6 +130,9 @@ class RdmaStrategy(LoadStrategy):
                 selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
+            if not self._accelerator_compatible(ctx, source_worker, worker_id):
+                continue
+
             logger.info(
                 f"[Worker {ctx.global_rank}] Trying source worker {worker_id} "
                 f"({worker_tensor_count(source_worker)} tensors)"
@@ -221,6 +224,31 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
             )
             return []
+
+    @staticmethod
+    def _accelerator_compatible(
+        ctx: LoadContext,
+        source_worker: p2p_pb2.WorkerMetadata,
+        worker_id: str,
+    ) -> bool:
+        """Return whether source and target accelerator metadata are compatible.
+
+        Empty values mean unknown and are accepted for backward compatibility
+        with workers published before accelerator metadata existed.
+        """
+        target_accelerator = ctx.accelerator_backend.name
+        source_accelerator = source_worker.accelerator
+        if not target_accelerator or not source_accelerator:
+            return True
+        if target_accelerator == source_accelerator:
+            return True
+
+        logger.info(
+            f"[Worker {ctx.global_rank}] Skipping source worker {worker_id}: "
+            f"accelerator mismatch source={source_accelerator!r}, "
+            f"target={target_accelerator!r}"
+        )
+        return False
 
     def _fetch_worker_metadata(
         self,

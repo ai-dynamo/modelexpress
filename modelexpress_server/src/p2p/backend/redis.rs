@@ -238,6 +238,9 @@ struct WorkerRecordJson {
     /// P2P: Worker gRPC endpoint for tensor manifest
     #[serde(default)]
     pub worker_grpc_endpoint: String,
+    /// Runtime accelerator family for compatibility filtering.
+    #[serde(default)]
+    pub accelerator: String,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -281,6 +284,7 @@ impl WorkerRecordJson {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            accelerator: record.accelerator,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -301,6 +305,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             metadata_endpoint: json.metadata_endpoint,
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
+            accelerator: json.accelerator,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -722,6 +727,7 @@ mod tests {
             metadata_endpoint: String::new(),
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
+            accelerator: "cuda".to_string(),
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,

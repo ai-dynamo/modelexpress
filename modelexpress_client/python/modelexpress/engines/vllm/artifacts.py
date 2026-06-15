@@ -268,6 +268,7 @@ def _publish_vllm_cache_artifact(
         worker_grpc_server=worker_grpc_server,
         worker_rank=ctx.worker_rank,
         node_rank=ctx.node_rank,
+        accelerator=ctx.accelerator_backend.name,
     )
     _published_sources[key] = published
     elapsed = time.perf_counter() - start

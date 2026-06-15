@@ -27,6 +27,7 @@ class WorkerMetadata:
     metadata_endpoint: str = ""
     agent_name: str = ""
     worker_grpc_endpoint: str = ""
+    accelerator: str = ""
 
 
 @dataclass

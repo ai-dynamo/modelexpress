@@ -496,6 +496,7 @@ mod tests {
                         metadata_endpoint: String::new(),
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
+                        accelerator: String::new(),
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -727,6 +728,7 @@ mod tests {
                         metadata_endpoint: "10.0.0.1:5555".to_string(),
                         agent_name: "artifact-agent".to_string(),
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
+                        accelerator: "cuda".to_string(),
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),

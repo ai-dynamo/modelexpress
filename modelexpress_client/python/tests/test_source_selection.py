@@ -252,6 +252,7 @@ def test_load_metadata_miss_tries_next_candidate():
     strat._fetch_worker_metadata = MagicMock(side_effect=[None, worker])
     strat._load_as_target = MagicMock(return_value="loaded")
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
@@ -277,6 +278,7 @@ def test_load_transfer_failure_does_not_try_next_source():
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
@@ -364,8 +366,10 @@ def test_load_records_success_metrics(monkeypatch):
     strat._find_source_instances = MagicMock(return_value=cands)
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
     strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
-    assert strat.load(MagicMock(), MagicMock(global_rank=0)) == "loaded"
+    assert strat.load(MagicMock(), ctx) == "loaded"
     m.record_selection.assert_called_once_with("random", cands[0].worker_id)
     m.record_attempt.assert_any_call("random", "success")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "success")
@@ -379,9 +383,11 @@ def test_load_records_transfer_fallback_metrics(monkeypatch):
     strat._load_as_target = MagicMock(
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.raises(StrategyFailed):
-        strat.load(MagicMock(), MagicMock(global_rank=0))
+        strat.load(MagicMock(), ctx)
     m.record_attempt.assert_any_call("random", "transfer_fallback")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "fallback")
 

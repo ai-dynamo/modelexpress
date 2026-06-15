@@ -456,6 +456,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
         worker_id="worker-a",
         mx_client=object(),
         nixl_manager=object(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source-id"))
     worker_server = object()
@@ -472,6 +473,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
     publish.assert_called_once()
     assert publish.call_args.kwargs["worker_id"] == "worker-a"
     assert publish.call_args.kwargs["node_rank"] == 2
+    assert publish.call_args.kwargs["accelerator"] == "cuda"
     assert publish.call_args.kwargs["worker_grpc_server"] is worker_server
     artifacts._published_sources.pop(
         (ctx.device_id, transfer.mx_source_type),
