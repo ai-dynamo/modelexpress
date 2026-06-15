@@ -1,7 +1,10 @@
 name: Copyright Checks
 
 on:
-  pull_request
+  push:
+    branches:
+      - main
+      - 'pull-request/*'
 
 jobs:
   copyright-checks:
