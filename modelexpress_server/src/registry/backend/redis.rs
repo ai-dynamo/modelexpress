@@ -39,10 +39,11 @@ mod fields {
 }
 
 /// Every provider, for enumerating candidate keys in name-addressed lookups.
-const ALL_PROVIDERS: [ModelProvider; 3] = [
+const ALL_PROVIDERS: [ModelProvider; 4] = [
     ModelProvider::HuggingFace,
     ModelProvider::Ngc,
     ModelProvider::Gcs,
+    ModelProvider::S3,
 ];
 
 /// Provider-scoped key: `mx:model:{Provider}:{model_name}`.
@@ -72,6 +73,7 @@ fn provider_str(p: ModelProvider) -> &'static str {
         ModelProvider::HuggingFace => "HuggingFace",
         ModelProvider::Ngc => "Ngc",
         ModelProvider::Gcs => "Gcs",
+        ModelProvider::S3 => "S3",
     }
 }
 
@@ -80,6 +82,7 @@ fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         "HuggingFace" => Ok(ModelProvider::HuggingFace),
         "Ngc" => Ok(ModelProvider::Ngc),
         "Gcs" => Ok(ModelProvider::Gcs),
+        "S3" => Ok(ModelProvider::S3),
         other => Err(format!("unknown provider in Redis record: {other:?}").into()),
     }
 }

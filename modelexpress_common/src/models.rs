@@ -34,6 +34,8 @@ pub enum ModelProvider {
     Ngc,
     /// Google Cloud Storage
     Gcs,
+    /// S3-compatible object storage
+    S3,
 }
 
 impl ModelProvider {
@@ -43,6 +45,30 @@ impl ModelProvider {
             Self::HuggingFace => "hugging-face",
             Self::Ngc => "ngc",
             Self::Gcs => "gcs",
+            Self::S3 => "s3",
+        }
+    }
+
+    #[must_use]
+    pub fn resolve_for_model_name(model_name: &str, default_provider: Self) -> Self {
+        let model_name = model_name.trim_start();
+        if model_name
+            .get(.."s3://".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3://"))
+        {
+            Self::S3
+        } else if model_name
+            .get(.."gs://".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gs://"))
+        {
+            Self::Gcs
+        } else if model_name
+            .get(.."ngc://".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ngc://"))
+        {
+            Self::Ngc
+        } else {
+            default_provider
         }
     }
 }
@@ -55,7 +81,7 @@ impl Display for ModelProvider {
 
 impl ValueEnum for ModelProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::HuggingFace, Self::Ngc, Self::Gcs]
+        &[Self::HuggingFace, Self::Ngc, Self::Gcs, Self::S3]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -91,6 +117,7 @@ mod tests {
             ModelProvider::HuggingFace,
             ModelProvider::Ngc,
             ModelProvider::Gcs,
+            ModelProvider::S3,
         ] {
             let serialized =
                 serde_json::to_string(&provider).expect("Failed to serialize ModelProvider");
@@ -111,6 +138,27 @@ mod tests {
         assert_eq!(ModelProvider::HuggingFace.to_string(), "hugging-face");
         assert_eq!(ModelProvider::Ngc.to_string(), "ngc");
         assert_eq!(ModelProvider::Gcs.to_string(), "gcs");
+        assert_eq!(ModelProvider::S3.to_string(), "s3");
+    }
+
+    #[test]
+    fn test_model_provider_resolve_for_model_name() {
+        assert_eq!(
+            ModelProvider::resolve_for_model_name("s3://bucket/model", ModelProvider::HuggingFace),
+            ModelProvider::S3
+        );
+        assert_eq!(
+            ModelProvider::resolve_for_model_name(" gs://bucket/model", ModelProvider::HuggingFace),
+            ModelProvider::Gcs
+        );
+        assert_eq!(
+            ModelProvider::resolve_for_model_name("NGC://org/model", ModelProvider::HuggingFace),
+            ModelProvider::Ngc
+        );
+        assert_eq!(
+            ModelProvider::resolve_for_model_name("org/model", ModelProvider::Ngc),
+            ModelProvider::Ngc
+        );
     }
 
     #[test]
@@ -119,6 +167,7 @@ mod tests {
             ModelProvider::HuggingFace,
             ModelProvider::Ngc,
             ModelProvider::Gcs,
+            ModelProvider::S3,
         ] {
             let parsed = ModelProvider::from_str(provider.as_str(), false)
                 .expect("Failed to parse ModelProvider from clap value");

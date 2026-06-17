@@ -28,10 +28,11 @@ use tracing::{debug, info, warn};
 const CR_NAME_PREFIX: &str = "mx-cache-";
 
 /// Every provider, for enumerating candidate CR names in name-addressed lookups.
-const ALL_PROVIDERS: [ModelProvider; 3] = [
+const ALL_PROVIDERS: [ModelProvider; 4] = [
     ModelProvider::HuggingFace,
     ModelProvider::Ngc,
     ModelProvider::Gcs,
+    ModelProvider::S3,
 ];
 
 /// DNS-1123 `metadata.name` hard limit.
@@ -218,6 +219,7 @@ impl KubernetesRegistryBackend {
             ModelProvider::HuggingFace => "HuggingFace",
             ModelProvider::Ngc => "Ngc",
             ModelProvider::Gcs => "Gcs",
+            ModelProvider::S3 => "S3",
         }
     }
 
@@ -226,6 +228,7 @@ impl KubernetesRegistryBackend {
             "HuggingFace" => Ok(ModelProvider::HuggingFace),
             "Ngc" => Ok(ModelProvider::Ngc),
             "Gcs" => Ok(ModelProvider::Gcs),
+            "S3" => Ok(ModelProvider::S3),
             other => Err(format!("unknown provider in CR spec: {other:?}").into()),
         }
     }

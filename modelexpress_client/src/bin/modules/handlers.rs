@@ -59,6 +59,8 @@ fn infer_provider_from_model_name(model_name: &str) -> ModelProvider {
     let model_name = model_name.trim_start();
     if strip_ascii_prefix_ignore_case(model_name, "gs://").is_some() {
         ModelProvider::Gcs
+    } else if strip_ascii_prefix_ignore_case(model_name, "s3://").is_some() {
+        ModelProvider::S3
     } else if strip_ascii_prefix_ignore_case(model_name, "ngc://").is_some() {
         ModelProvider::Ngc
     } else {
@@ -79,6 +81,8 @@ fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
     let model_name = model_name.trim_start();
     if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "gs://") {
         Cow::Owned(format!("gs://{rest}"))
+    } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "s3://") {
+        Cow::Owned(format!("s3://{rest}"))
     } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "ngc://") {
         Cow::Owned(format!("ngc://{rest}"))
     } else {
