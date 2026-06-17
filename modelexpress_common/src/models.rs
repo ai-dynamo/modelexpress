@@ -50,7 +50,7 @@ impl ModelProvider {
     }
 
     #[must_use]
-    pub fn resolve_for_model_name(model_name: &str, default_provider: Self) -> Self {
+    pub fn resolve_provider_for_model_name(model_name: &str, default_provider: Self) -> Self {
         let model_name = model_name.trim_start();
         if model_name
             .get(.."s3://".len())
@@ -142,21 +142,30 @@ mod tests {
     }
 
     #[test]
-    fn test_model_provider_resolve_for_model_name() {
+    fn test_model_provider_resolve_provider_for_model_name() {
         assert_eq!(
-            ModelProvider::resolve_for_model_name("s3://bucket/model", ModelProvider::HuggingFace),
+            ModelProvider::resolve_provider_for_model_name(
+                "s3://bucket/model",
+                ModelProvider::HuggingFace,
+            ),
             ModelProvider::S3
         );
         assert_eq!(
-            ModelProvider::resolve_for_model_name(" gs://bucket/model", ModelProvider::HuggingFace),
+            ModelProvider::resolve_provider_for_model_name(
+                " gs://bucket/model",
+                ModelProvider::HuggingFace,
+            ),
             ModelProvider::Gcs
         );
         assert_eq!(
-            ModelProvider::resolve_for_model_name("NGC://org/model", ModelProvider::HuggingFace),
+            ModelProvider::resolve_provider_for_model_name(
+                "NGC://org/model",
+                ModelProvider::HuggingFace,
+            ),
             ModelProvider::Ngc
         );
         assert_eq!(
-            ModelProvider::resolve_for_model_name("org/model", ModelProvider::Ngc),
+            ModelProvider::resolve_provider_for_model_name("org/model", ModelProvider::Ngc),
             ModelProvider::Ngc
         );
     }

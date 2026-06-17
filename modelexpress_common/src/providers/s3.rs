@@ -207,9 +207,11 @@ impl ModelProviderTrait for S3Provider {
 
         let cache_dir = cache_dir
             .ok_or_else(|| anyhow::anyhow!("S3 download requires cache_dir to be provided"))?;
-        fs::create_dir_all(&cache_dir).with_context(|| {
-            format!("Failed to create cache directory: {}", cache_dir.display())
-        })?;
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .with_context(|| {
+                format!("Failed to create cache directory: {}", cache_dir.display())
+            })?;
 
         let model = S3ModelName::parse(model_name)?;
         let model_dir = model.model_dir(&cache_dir);

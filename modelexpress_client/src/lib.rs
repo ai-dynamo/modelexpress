@@ -278,7 +278,7 @@ impl Client {
         model_name: &str,
         provider: ModelProvider,
     ) -> anyhow::Result<PathBuf> {
-        let provider = ModelProvider::resolve_for_model_name(model_name, provider);
+        let provider = ModelProvider::resolve_provider_for_model_name(model_name, provider);
         let cache_dir = self
             .cache_config
             .as_ref()
@@ -632,7 +632,7 @@ impl Client {
         ignore_weights: bool,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
-        let provider = ModelProvider::resolve_for_model_name(&model_name, provider);
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
         info!(
             "Requesting model: {} from provider: {:?}",
             model_name, provider
@@ -703,7 +703,7 @@ impl Client {
         ignore_weights: bool,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
-        let provider = ModelProvider::resolve_for_model_name(&model_name, provider);
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
         self.request_model_on_server(&model_name, provider, ignore_weights)
             .await?;
@@ -738,7 +738,7 @@ impl Client {
         ignore_weights: bool,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
-        let provider = ModelProvider::resolve_for_model_name(&model_name, provider);
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
         match Client::new(config.clone()).await {
             Ok(mut client) => {
