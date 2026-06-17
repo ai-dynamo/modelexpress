@@ -684,15 +684,20 @@ mod tests {
         let hf = KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, n);
         let ngc = KubernetesRegistryBackend::cr_name_for(ModelProvider::Ngc, n);
         let gcs = KubernetesRegistryBackend::cr_name_for(ModelProvider::Gcs, n);
+        let s3 = KubernetesRegistryBackend::cr_name_for(ModelProvider::S3, n);
         let legacy = KubernetesRegistryBackend::legacy_cr_name_for(n);
         // Same name, different provider -> distinct CR names, all distinct from legacy.
         assert_ne!(hf, ngc);
         assert_ne!(hf, gcs);
         assert_ne!(ngc, gcs);
+        assert_ne!(hf, s3);
+        assert_ne!(ngc, s3);
+        assert_ne!(gcs, s3);
         assert_ne!(hf, legacy);
         assert_ne!(ngc, legacy);
         assert_ne!(gcs, legacy);
-        for name in [&hf, &ngc, &gcs, &legacy] {
+        assert_ne!(s3, legacy);
+        for name in [&hf, &ngc, &gcs, &s3, &legacy] {
             assert!(name.starts_with(CR_NAME_PREFIX));
             assert!(name.len() <= K8S_NAME_MAX);
         }
@@ -702,12 +707,8 @@ mod tests {
     fn candidate_cr_names_cover_all_providers_and_legacy() {
         let n = "org/model";
         let candidates = KubernetesRegistryBackend::candidate_cr_names(n);
-        assert_eq!(candidates.len(), 4);
-        for p in [
-            ModelProvider::HuggingFace,
-            ModelProvider::Ngc,
-            ModelProvider::Gcs,
-        ] {
+        assert_eq!(candidates.len(), ALL_PROVIDERS.len() + 1);
+        for p in ALL_PROVIDERS {
             assert!(candidates.contains(&KubernetesRegistryBackend::cr_name_for(p, n)));
         }
         assert!(candidates.contains(&KubernetesRegistryBackend::legacy_cr_name_for(n)));

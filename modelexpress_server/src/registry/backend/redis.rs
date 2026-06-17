@@ -591,10 +591,10 @@ mod tests {
     #[test]
     fn candidate_keys_cover_all_providers_and_legacy() {
         let keys = candidate_keys("org/model");
-        assert_eq!(keys.len(), 4);
-        assert!(keys.contains(&"mx:model:HuggingFace:org/model".to_string()));
-        assert!(keys.contains(&"mx:model:Ngc:org/model".to_string()));
-        assert!(keys.contains(&"mx:model:Gcs:org/model".to_string()));
+        assert_eq!(keys.len(), ALL_PROVIDERS.len() + 1);
+        for provider in ALL_PROVIDERS {
+            assert!(keys.contains(&model_key(provider, "org/model")));
+        }
         assert!(keys.contains(&"mx:model:org/model".to_string())); // legacy
     }
 
