@@ -69,6 +69,18 @@ def test_sglang_adapter_builds_identity_from_sglang_configs():
     assert identity.revision == "abc123"
 
 
+def test_sglang_adapter_prefers_modelexpress_model_name_override():
+    adapter = SglangAdapter(
+        _load_config(modelexpress_model_name="Qwen/Qwen3.5-9B"),
+        _model_config(model_path="/app/models/Qwen/Qwen3.5-9B"),
+        _device_config(),
+    )
+
+    identity = adapter.build_identity()
+
+    assert identity.model_name == "Qwen/Qwen3.5-9B"
+
+
 def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
     ctx = build_sglang_load_context(
         _load_config(tp_rank=5, modelexpress_url="mx.example:9000"),

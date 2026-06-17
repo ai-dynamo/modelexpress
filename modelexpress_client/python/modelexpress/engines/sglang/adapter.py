@@ -44,6 +44,7 @@ class SglangAdapter(EngineAdapter):
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
             model_config=self.model_config,
+            load_config=self.load_config,
         )
 
     def get_worker_rank(self) -> int:
@@ -241,7 +242,10 @@ def collect_sglang_tensors(model) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
+def build_sglang_source_identity(
+    model_config: ModelConfig,
+    load_config: LoadConfig | None = None,
+) -> p2p_pb2.SourceIdentity:
     """Build a ModelExpress SourceIdentity from SGLang model state."""
     try:
         mx_version = pkg_version("modelexpress")
@@ -251,7 +255,7 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
     return p2p_pb2.SourceIdentity(
         mx_version=mx_version,
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
-        model_name=_get_model_name(model_config),
+        model_name=_get_model_name(model_config, load_config),
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         tensor_parallel_size=_get_parallel_size(
             "get_tensor_model_parallel_world_size"
@@ -268,7 +272,14 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
     )
 
 
-def _get_model_name(model_config: ModelConfig) -> str:
+def _get_model_name(
+    model_config: ModelConfig,
+    load_config: LoadConfig | None = None,
+) -> str:
+    if load_config is not None:
+        override = getattr(load_config, "modelexpress_model_name", None)
+        if override:
+            return str(override)
     return str(
         getattr(
             model_config,
