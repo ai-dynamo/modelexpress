@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ import torch
 
 from modelexpress.accelerators import (
     CudaAcceleratorBackend,
+    XpuAcceleratorBackend,
     accelerator_backend_for,
 )
 from modelexpress.adapter import EngineAdapter
@@ -83,8 +85,120 @@ class TestCudaAcceleratorBackend:
         )
 
     def test_accelerator_backend_for_rejects_unsupported_device(self):
-        with pytest.raises(ValueError, match="Unsupported accelerator backend"):
+        with pytest.raises(ValueError, match="supported device types"):
             accelerator_backend_for(torch.device("cpu"))
+
+
+class TestXpuAcceleratorBackend:
+    def test_xpu_backend_uses_nixl_vram_segment_and_disables_cuda_fast_paths(self):
+        backend = XpuAcceleratorBackend()
+
+        assert backend.name == "xpu"
+        assert backend.torch_device_type == "xpu"
+        assert backend.nixl_mem_type == "VRAM"
+        assert backend.supports_rdma_p2p() is True
+        assert backend.supports_pool_reg() is False
+        assert backend.supports_vmm() is False
+        assert backend.supports_gds() is False
+
+    def test_xpu_backend_delegates_torch_calls(self, monkeypatch):
+        calls = []
+
+        class FakeXpu:
+            def set_device(self, device_id):
+                calls.append(("set", device_id))
+
+            def current_device(self):
+                return 3
+
+            def synchronize(self, device_id=None):
+                calls.append(("sync", device_id))
+
+            def empty_cache(self):
+                calls.append(("empty", None))
+
+        monkeypatch.setattr(torch, "xpu", FakeXpu(), raising=False)
+
+        backend = XpuAcceleratorBackend()
+        backend.set_device(2)
+        assert backend.current_device() == 3
+        backend.synchronize(2)
+        backend.synchronize()
+        backend.empty_cache()
+
+        assert calls == [
+            ("set", 2),
+            ("sync", 2),
+            ("sync", None),
+            ("empty", None),
+        ]
+
+    def test_xpu_backend_synchronize_falls_back_when_device_arg_unsupported(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        class FakeXpu:
+            def set_device(self, device_id):
+                calls.append(("set", device_id))
+
+            def current_device(self):
+                return 7
+
+            def synchronize(self):
+                calls.append(("sync", None))
+
+        monkeypatch.setattr(torch, "xpu", FakeXpu(), raising=False)
+
+        XpuAcceleratorBackend().synchronize(2)
+
+        assert calls == [
+            ("set", 2),
+            ("sync", None),
+            ("set", 7),
+        ]
+
+    def test_xpu_backend_empty_cache_noops_when_optional_api_absent(self, monkeypatch):
+        class FakeXpu:
+            pass
+
+        monkeypatch.setattr(torch, "xpu", FakeXpu(), raising=False)
+
+        XpuAcceleratorBackend().empty_cache()
+
+    def test_xpu_backend_is_accel_tensor_uses_device_type(self):
+        backend = XpuAcceleratorBackend()
+
+        class FakeTensor:
+            def __init__(self, device_type):
+                self.device = SimpleNamespace(type=device_type)
+
+        assert backend.is_accel_tensor(FakeTensor("xpu")) is True
+        assert backend.is_accel_tensor(FakeTensor("cuda")) is False
+        assert backend.is_accel_tensor(FakeTensor("cpu")) is False
+
+    def test_xpu_backend_torch_device(self):
+        assert XpuAcceleratorBackend().torch_device(1) == torch.device("xpu", 1)
+
+    def test_accelerator_backend_for_xpu_when_available(self, monkeypatch):
+        fake_xpu = SimpleNamespace(is_available=lambda: True)
+        monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+
+        assert isinstance(
+            accelerator_backend_for(torch.device("xpu:0")),
+            XpuAcceleratorBackend,
+        )
+
+    def test_accelerator_backend_for_xpu_rejects_unavailable_runtime(
+        self,
+        monkeypatch,
+    ):
+        fake_xpu = SimpleNamespace(is_available=lambda: False)
+        monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+
+        with pytest.raises(ValueError, match="torch.xpu is not available"):
+            accelerator_backend_for(torch.device("xpu:0"))
 
 
 class TestAcceleratorCapabilityGates:
