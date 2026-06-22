@@ -18,7 +18,7 @@ openssl = ["tls-native"]
 gcs = ["dep:google-cloud-storage", "dep:rustls", "rustls/ring", "rustls/std"]
 test-support = []
 tls-native = ["reqwest/native-tls"]
-tls-rustls = ["hf-hub/rustls-tls", "reqwest/rustls-tls"]
+tls-rustls = ["reqwest/rustls-tls"]
 
 [dependencies]
 serde = { workspace = true }

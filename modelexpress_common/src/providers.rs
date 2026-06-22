@@ -94,53 +94,21 @@ pub use ngc::NgcProvider;
 
 #[cfg(not(feature = "gcs"))]
 pub mod gcs {
+    //! Stub provider compiled when the `gcs` feature is off. `ModelProvider::Gcs`
+    //! is part of the gRPC/serde contract, so the variant always exists and these
+    //! types must too; without the feature every GCS operation just reports that
+    //! it's disabled. No path/cache logic lives here, that belongs to the real
+    //! `gcs.rs` module behind the feature.
     use super::ModelProviderTrait;
     use crate::cache::{ModelInfo, ProviderCache};
-    use crate::models::ModelProvider;
-    use anyhow::{Context, Result};
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
-    use tracing::info;
+    use anyhow::Result;
+    use std::path::{Path, PathBuf};
 
-    const CACHE_ROOT_DIR_NAME: &str = "gcs";
+    const FEATURE_DISABLED: &str = "GCS support is disabled; rebuild with the `gcs` feature";
 
     pub struct GcsProvider;
 
     pub struct GcsProviderCache;
-
-    fn model_dir(cache_dir: &Path, model_name: &str) -> Result<PathBuf> {
-        let Some(full_url) = model_name.strip_prefix("gs://") else {
-            anyhow::bail!("GCS model name must be a full gs://<bucket>/<path> URL");
-        };
-        let (bucket, object_prefix) = full_url
-            .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("GCS model URL must include bucket and object path"))?;
-        if bucket.is_empty() || object_prefix.is_empty() {
-            anyhow::bail!("GCS model URL must include bucket and object path");
-        }
-
-        let mut path = cache_dir.join(CACHE_ROOT_DIR_NAME).join(bucket);
-        for component in object_prefix.trim_end_matches('/').split('/') {
-            if component.is_empty() || component == "." || component == ".." {
-                anyhow::bail!("GCS model path must not contain empty or relative path segments");
-            }
-            path = path.join(component);
-        }
-
-        Ok(path)
-    }
-
-    fn canonical_model_name(model_name: &str) -> Result<String> {
-        let path = model_dir(Path::new(""), model_name)?;
-        let normalized = path
-            .strip_prefix(CACHE_ROOT_DIR_NAME)
-            .context("Failed to normalize GCS model name")?
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        Ok(format!("gs://{normalized}"))
-    }
 
     #[async_trait::async_trait]
     impl ModelProviderTrait for GcsProvider {
@@ -150,34 +118,15 @@ pub mod gcs {
             _cache_dir: Option<PathBuf>,
             _ignore_weights: bool,
         ) -> Result<PathBuf> {
-            anyhow::bail!("GCS downloads are disabled; rebuild with the `gcs` feature")
+            anyhow::bail!(FEATURE_DISABLED)
         }
 
-        async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
-            let path = model_dir(&cache_dir, model_name)?;
-            if path.exists() {
-                fs::remove_dir_all(&path).with_context(|| {
-                    format!("Failed to remove GCS cache directory '{}'", path.display())
-                })?;
-                info!(
-                    "Deleted cached GCS model '{}' from '{}'",
-                    model_name,
-                    path.display()
-                );
-            }
-            Ok(())
+        async fn delete_model(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<()> {
+            anyhow::bail!(FEATURE_DISABLED)
         }
 
-        async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
-            let path = model_dir(&cache_dir, model_name)?;
-            if !path.is_dir() {
-                anyhow::bail!("GCS model '{model_name}' not found in cache");
-            }
-            Ok(path)
-        }
-
-        fn canonical_model_name(&self, model_name: &str) -> Result<String> {
-            canonical_model_name(model_name)
+        async fn get_model_path(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
         }
 
         fn provider_name(&self) -> &'static str {
@@ -186,32 +135,25 @@ pub mod gcs {
     }
 
     impl ProviderCache for GcsProviderCache {
-        fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()> {
-            let path = model_dir(cache_root, model_name)?;
-            if path.exists() {
-                fs::remove_dir_all(&path).with_context(|| {
-                    format!("Failed to remove GCS cache directory '{}'", path.display())
-                })?;
-            }
-            Ok(())
+        fn clear_model(&self, _cache_root: &Path, _model_name: &str) -> Result<()> {
+            anyhow::bail!(FEATURE_DISABLED)
         }
 
         fn resolve_model_path(
             &self,
-            cache_root: &Path,
-            model_name: &str,
+            _cache_root: &Path,
+            _model_name: &str,
             _revision: Option<&str>,
         ) -> Result<PathBuf> {
-            model_dir(cache_root, model_name)
+            anyhow::bail!(FEATURE_DISABLED)
         }
 
+        // Returns empty so listing every provider's cache stays infallible in a
+        // build without GCS; there are no GCS models to report.
         fn list_models(&self, _cache_root: &Path) -> Result<Vec<ModelInfo>> {
             Ok(Vec::new())
         }
     }
-
-    #[allow(dead_code)]
-    const _: ModelProvider = ModelProvider::Gcs;
 }
 
 #[cfg(test)]
@@ -283,6 +225,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_canonical_model_name_gcs_trims_trailing_slash() {
         let provider = GcsProvider;
@@ -293,5 +236,23 @@ mod tests {
                 .is_ok_and(|model_name| model_name == "gs://test-bucket/org/model/rev-1"),
             "Expected canonical model name, got {canonical:?}"
         );
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn test_gcs_rejects_path_traversal_segments() {
+        let provider = GcsProvider;
+        let escapes = [
+            "gs://bucket/org/../../../etc/passwd",
+            "gs://bucket/org/./model",
+            "gs://bucket/org//model",
+        ];
+        for model_name in escapes {
+            let result = provider.canonical_model_name(model_name);
+            assert!(
+                result.is_err(),
+                "Expected '{model_name}' to be rejected, got {result:?}"
+            );
+        }
     }
 }
