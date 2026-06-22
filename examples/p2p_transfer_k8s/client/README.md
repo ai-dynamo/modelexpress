@@ -22,7 +22,12 @@ For ModelStreamer-only examples that load from Azure Blob Storage, S3, or a loca
 
 | Topology | Manifest | Model | Configuration |
 |----------|----------|-------|---------------|
-| **Single-node** | [`sglang/sglang-single-node-p2p.yaml`](sglang/sglang-single-node-p2p.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
+| **Single-node NIXL** | [`sglang/sglang-single-node-p2p.yaml`](sglang/sglang-single-node-p2p.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
+| **Single-node Mooncake TransferEngine** | [`sglang/sglang-single-node-transfer-engine.yaml`](sglang/sglang-single-node-transfer-engine.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
+
+The SGLang manifests use the same `remote_instance` command for the first and
+later replicas. `modelexpress-config` selects `nixl` or `transfer_engine`; the
+ModelExpress server endpoint is provided through `MX_SERVER_ADDRESS`.
 
 ## How It Works
 

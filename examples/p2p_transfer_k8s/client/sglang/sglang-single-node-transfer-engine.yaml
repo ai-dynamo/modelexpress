@@ -1,19 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Single-node SGLang deployment with ModelExpress P2P weight transfer.
+# Single-node SGLang deployment with ModelExpress P2P weight transfer over
+# Mooncake TransferEngine.
 #
 # Prerequisites:
 #   - ModelExpress server deployed (see ../../server/)
-#   - SGLang image with modelexpress installed
+#   - SGLang image built with:
+#       docker build -f examples/p2p_transfer_k8s/client/sglang/Dockerfile \
+#         --build-arg INSTALL_MOONCAKE=true \
+#         -t <your-registry>/sglang-modelexpress-mooncake:latest .
 #   - PVC with model weights pre-downloaded
 #   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 apiVersion: v1
 kind: Service
 metadata:
-  name: mx-sglang
+  name: mx-sglang-transfer-engine
   labels:
-    app: mx-sglang
+    app: mx-sglang-transfer-engine
 spec:
   type: ClusterIP
   ports:
@@ -21,29 +25,30 @@ spec:
       targetPort: 8000
       name: http
   selector:
-    app: mx-sglang
+    app: mx-sglang-transfer-engine
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mx-sglang
+  name: mx-sglang-transfer-engine
   labels:
-    app: mx-sglang
+    app: mx-sglang-transfer-engine
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: mx-sglang
+      app: mx-sglang-transfer-engine
   template:
     metadata:
       labels:
-        app: mx-sglang
+        app: mx-sglang-transfer-engine
     spec:
       containers:
         - name: sglang
-          # Build an SGLang + ModelExpress image using
-          # examples/p2p_transfer_k8s/client/sglang/Dockerfile
-          image: <your-registry>/sglang-modelexpress:latest
+          # Build an SGLang + ModelExpress + Mooncake image using
+          # examples/p2p_transfer_k8s/client/sglang/Dockerfile with
+          # --build-arg INSTALL_MOONCAKE=true.
+          image: <your-registry>/sglang-modelexpress-mooncake:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             capabilities:
@@ -66,7 +71,7 @@ spec:
             - --remote-instance-weight-loader-backend
             - modelexpress
             - --modelexpress-config
-            - '{"transport":"nixl"}'
+            - '{"transport":"transfer_engine"}'
             - --tp-size
             - "8"
             - --context-length
@@ -77,8 +82,6 @@ spec:
           ports:
             - containerPort: 8000
               protocol: TCP
-          # SGLang's /health does a 1-token generation (~1s), so timeoutSeconds
-          # must exceed the 1s K8s default or the pod never becomes Ready.
           readinessProbe:
             httpGet:
               path: /health
@@ -93,10 +96,12 @@ spec:
               value: "modelexpress-server:8001"
             - name: MX_CONTIGUOUS_REG
               value: "0"
-            # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
-            # This also filters out bonded interfaces such as mlx5_bond_0.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
+            # Optional: pin Mooncake to a specific RDMA device if auto-discovery
+            # is not correct for the target node pool.
+            # - name: MOONCAKE_DEVICE
+            #   value: "mlx5_0"
             - name: NIXL_LOG_LEVEL
               value: "INFO"
             - name: UCX_LOG_LEVEL

@@ -21,8 +21,8 @@ an existing ModelExpress source.
 
 Use an SGLang image that contains the upstream ModelExpress delegation hook:
 
-- **Pull the official image** — use a recent `lmsysorg/sglang` tag from
-  Docker Hub after PR #24723 or an equivalent delegation patch is included.
+- **Pull the official image** — `lmsysorg/sglang:v0.5.13.post1` and later
+  include PR #24723.
 - **Build from `main`** — follow SGLang's official install guide at
   [docs.sglang.io/docs/get_started/install](https://docs.sglang.io/docs/get_started/install).
 
@@ -31,8 +31,22 @@ examples provide a Dockerfile at
 `examples/p2p_transfer_k8s/client/sglang/Dockerfile`.
 
 ```dockerfile
-FROM lmsysorg/sglang:<tag-with-modelexpress-delegation>
+FROM lmsysorg/sglang:v0.5.13.post1
 
+RUN python3 -m pip install --no-cache-dir --no-deps \
+    "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python"
+```
+
+Use `--no-deps` inside SGLang images because the base image already owns the
+CUDA, NIXL, Torch, gRPC, and protobuf stack. Letting pip resolve ModelExpress
+dependencies can downgrade engine-provided runtime packages.
+
+For Mooncake TransferEngine, install the Mooncake package into the same image:
+
+```dockerfile
+FROM lmsysorg/sglang:v0.5.13.post1
+
+RUN python3 -m pip install --no-cache-dir mooncake-transfer-engine
 RUN python3 -m pip install --no-cache-dir --no-deps \
     "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python"
 ```
@@ -53,7 +67,7 @@ Confirm the SGLang delegation flag is present before running:
 python -m sglang.launch_server --help | grep modelexpress-config
 ```
 
-For local SGLang source builds before the delegation patch is upstream:
+For unreleased SGLang source builds:
 
 ```bash
 cd /path/to/sglang
@@ -90,13 +104,15 @@ python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30000 \
   --load-format remote_instance \
   --remote-instance-weight-loader-backend modelexpress \
-  --modelexpress-config '{"url": "modelexpress-server:8001", "transport": "nixl"}'
+  --modelexpress-config '{"transport": "nixl"}'
 ```
 
 `modelexpress-config` is intentionally small and only controls the SGLang
 handoff into ModelExpress:
 
-- `url` sets or overrides the ModelExpress server URL for this SGLang process.
+- `url` optionally overrides the ModelExpress server URL for this SGLang
+  process. Prefer `MX_SERVER_ADDRESS` in deployments so endpoint configuration
+  stays in environment variables.
 - `transport` selects the ModelExpress package transport. Supported values are
   `nixl` and `transfer_engine`.
 
@@ -105,14 +121,17 @@ All other ModelExpress settings are environment variables, matching vLLM:
 `MX_NIXL_BACKEND`, `MX_RDMA_NIC_PIN`, `MX_METADATA_PORT`,
 `MX_WORKER_GRPC_PORT`, and `MODEL_EXPRESS_LOG_LEVEL`.
 
-For TransferEngine, use the same command shape and change only the transport:
+For Mooncake TransferEngine, use the same command shape and change only the
+transport. The SGLang image must include `mooncake-transfer-engine`.
 
 ```bash
+export MX_SERVER_ADDRESS=modelexpress-server:8001
+
 python -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30000 \
   --load-format remote_instance \
   --remote-instance-weight-loader-backend modelexpress \
-  --modelexpress-config '{"url": "modelexpress-server:8001", "transport": "transfer_engine"}'
+  --modelexpress-config '{"transport": "transfer_engine"}'
 ```
 
 ## See also

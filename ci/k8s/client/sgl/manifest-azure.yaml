@@ -103,10 +103,8 @@ spec:
             - --remote-instance-weight-loader-backend
             - modelexpress
             - --modelexpress-config
-            - '{"url": "mx-server:8000", "transport": "nixl"}'
+            - '{"transport": "nixl"}'
           env:
-            - name: MODEL_EXPRESS_URL
-              value: "mx-server:8000"
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
             - name: MX_RDMA_NIC_PIN

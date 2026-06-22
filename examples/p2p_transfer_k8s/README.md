@@ -51,9 +51,13 @@ See [`server/`](server/) for backend-specific server manifests:
 See [`client/`](client/) for engine deployment manifests:
 - **Single-node** (TP only): [`client/vllm/vllm-single-node.yaml`](client/vllm/vllm-single-node.yaml)
 - **Multi-node** (TP + PP): [`client/vllm/vllm-multi-node.yaml`](client/vllm/vllm-multi-node.yaml)
-- **SGLang single-node**: [`client/sglang/sglang-single-node-p2p.yaml`](client/sglang/sglang-single-node-p2p.yaml)
+- **SGLang single-node NIXL**: [`client/sglang/sglang-single-node-p2p.yaml`](client/sglang/sglang-single-node-p2p.yaml)
+- **SGLang single-node Mooncake TransferEngine**: [`client/sglang/sglang-single-node-transfer-engine.yaml`](client/sglang/sglang-single-node-transfer-engine.yaml)
 
 The ModelExpress loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from storage and becomes a source for future nodes.
+
+For SGLang, use an image based on `lmsysorg/sglang:v0.5.13.post1` or newer so
+the upstream ModelExpress delegation hook is present.
 
 For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
 

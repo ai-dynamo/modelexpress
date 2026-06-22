@@ -2,7 +2,9 @@
 
 Python client for ModelExpress -- high-performance GPU-to-GPU model weight transfers using NVIDIA NIXL over RDMA/InfiniBand.
 
-Instead of each vLLM instance loading model weights from storage, one "source" instance loads the model and transfers weights directly to "target" instances via GPUDirect RDMA, bypassing the CPU entirely.
+Instead of each inference engine instance loading model weights from storage,
+one instance loads the model and transfers weights directly to later instances
+via GPUDirect RDMA, bypassing the CPU entirely.
 
 ## Installation
 
@@ -37,7 +39,25 @@ vllm serve deepseek-ai/DeepSeek-V3 \
 ```
 
 Starting the vLLM engine with the `modelexpress` load format on the source worker will load the weights from disk and register/publish the NIXL and tensor metadata to the MX server. The `mx` load format is kept as a backward-compatible alias.
-And on the target worker, it will retrieve these metadata from MX serverand stream weights over RDMA from GPU to GPU.
+On the target worker, it retrieves metadata from the MX server and streams weights over RDMA from GPU to GPU.
+
+## Quick Start with SGLang
+
+SGLang integrates through its `remote_instance` loader with the `modelexpress`
+backend. Use an SGLang image that includes upstream sgl-project/sglang#24723,
+such as `lmsysorg/sglang:v0.5.13.post1`, and install the ModelExpress package
+into that image.
+
+```bash
+export MX_SERVER_ADDRESS="modelexpress-server:8001"
+
+python -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-V3 \
+    --tp 8 \
+    --load-format remote_instance \
+    --remote-instance-weight-loader-backend modelexpress \
+    --modelexpress-config '{"transport": "nixl"}'
+```
 
 ## Programmatic Usage
 
@@ -101,6 +121,7 @@ register_modelexpress_loaders()
 | `modelexpress.client` | `MxClient` -- gRPC client for the ModelExpress server |
 | `modelexpress.metadata` | Metadata clients, source identity, heartbeat, and worker manifest serving |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
+| `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |

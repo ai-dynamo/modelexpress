@@ -277,6 +277,13 @@ docker build -f examples/p2p_transfer_k8s/client/sglang/Dockerfile \
 docker push your-registry/sglang-modelexpress:TAG
 ```
 
+The SGLang example image starts from `lmsysorg/sglang:v0.5.13.post1` or newer
+and installs the ModelExpress Python package with `--no-deps` so the base
+image's CUDA/NIXL/Torch dependency stack stays intact.
+
+For the Mooncake TransferEngine SGLang example, add
+`--build-arg INSTALL_MOONCAKE=true` to install `mooncake-transfer-engine`.
+
 The Dynamo examples use their own runtime image Dockerfile:
 `examples/dynamo_p2p_transfer_k8s/Dockerfile`.
 
@@ -698,7 +705,8 @@ See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_source
 
 ModelExpress also works as the remote-instance weight loader for SGLang via
 upstream [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723),
-supporting both Mooncake TransferEngine and NIXL transports. See
+included in `lmsysorg/sglang:v0.5.13.post1` and later. The integration supports
+both NIXL and Mooncake TransferEngine transports. See
 [`SGLANG.md`](SGLANG.md) for the user-facing guide.
 
 ## Debugging
