@@ -580,8 +580,12 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when
 `--remote-instance-weight-loader-backend modelexpress` is used. SGLang
 initializes the model, then delegates to this loader. The loader builds a
-`LoadContext` from SGLang config, runs `LoadStrategyChain.run()`, and updates
-global registries.
+`LoadContext` from SGLang config and dispatches by `modelexpress-config`
+transport. For `transport=nixl`, it runs `LoadStrategyChain.run()` and updates
+global registries. For `transport=transfer_engine`, it uses SGLang's initialized
+TransferEngine and ModelExpress metadata directly: first replica loads natively,
+registers TransferEngine memory, and publishes its session; later replicas
+discover that source and pull with `batch_transfer_sync_read`.
 `SglangAdapter` owns SGLang-specific rank/device mapping, native fallback
 loading, quantized-weight post-processing, and tensor discovery, including the
 storage-view naming used for non-contiguous SGLang parameters.

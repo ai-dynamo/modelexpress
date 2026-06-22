@@ -45,8 +45,8 @@ On the target worker, it retrieves metadata from the MX server and streams weigh
 
 SGLang integrates through its `remote_instance` loader with the `modelexpress`
 backend. Use an SGLang image that includes upstream sgl-project/sglang#24723,
-such as `lmsysorg/sglang:v0.5.13.post1`, and install the ModelExpress package
-into that image.
+such as the known-good release image `lmsysorg/sglang:v0.5.13.post1`, and
+install the ModelExpress package into that image.
 
 ```bash
 export MX_SERVER_ADDRESS="modelexpress-server:8001"

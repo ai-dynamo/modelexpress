@@ -12,17 +12,17 @@ added by upstream [sgl-project/sglang#24723](https://github.com/sgl-project/sgla
 it adds the `--modelexpress-config` flag and delegates ModelExpress loading to
 the ModelExpress package.
 
-SGLang does not run separate source and target modes. Every server uses the
-same `remote_instance` command, and `modelexpress.engines.sglang.MxModelLoader`
-decides whether to load natively and publish metadata or receive weights from
-an existing ModelExpress source.
+With `remote_instance` + `backend=modelexpress`, SGLang does not run separate
+source and target modes. Every server uses the same command, and
+`modelexpress.engines.sglang.MxModelLoader` decides whether to load natively
+and publish metadata or receive weights from an existing ModelExpress source.
 
 ## 1. Build an SGLang image
 
 Use an SGLang image that contains the upstream ModelExpress delegation hook:
 
-- **Pull the official image** — `lmsysorg/sglang:v0.5.13.post1` and later
-  include PR #24723.
+- **Pull the official image** — `lmsysorg/sglang:v0.5.13.post1` is a
+  known-good release image that includes PR #24723.
 - **Build from `main`** — follow SGLang's official install guide at
   [docs.sglang.io/docs/get_started/install](https://docs.sglang.io/docs/get_started/install).
 
@@ -41,12 +41,13 @@ Use `--no-deps` inside SGLang images because the base image already owns the
 CUDA, NIXL, Torch, gRPC, and protobuf stack. Letting pip resolve ModelExpress
 dependencies can downgrade engine-provided runtime packages.
 
-For Mooncake TransferEngine, install the Mooncake package into the same image:
+For Mooncake TransferEngine with the CUDA 13 SGLang image, install the
+CUDA 13 Mooncake package into the same image.
 
 ```dockerfile
 FROM lmsysorg/sglang:v0.5.13.post1
 
-RUN python3 -m pip install --no-cache-dir mooncake-transfer-engine
+RUN python3 -m pip install --no-cache-dir mooncake-transfer-engine-cuda13
 RUN python3 -m pip install --no-cache-dir --no-deps \
     "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git#subdirectory=modelexpress_client/python"
 ```
@@ -122,7 +123,7 @@ All other ModelExpress settings are environment variables, matching vLLM:
 `MX_WORKER_GRPC_PORT`, and `MODEL_EXPRESS_LOG_LEVEL`.
 
 For Mooncake TransferEngine, use the same command shape and change only the
-transport. The SGLang image must include `mooncake-transfer-engine`.
+transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.
 
 ```bash
 export MX_SERVER_ADDRESS=modelexpress-server:8001

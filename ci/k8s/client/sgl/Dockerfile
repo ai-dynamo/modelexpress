@@ -10,8 +10,8 @@
 #       -t <IMAGE> --push --load .
 #
 # lmsysorg/sglang:v0.5.13.post1 includes the upstream ModelExpress delegation
-# hook from sgl-project/sglang#24723. Pin by digest for reproducible CI builds.
-ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:74084d80c3b7e5649f4b3433b1169db3da26c9b1e31752a43045a34cc26ba5d5
+# hook from sgl-project/sglang#24723.
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.13.post1
 FROM ${SGLANG_IMAGE}
 
 # Install ModelExpress Python client from this repository.

@@ -7,12 +7,12 @@ This example demonstrates how to set up ModelExpress for P2P GPU weight transfer
 ```mermaid
 graph TD
     subgraph "Node A"
-        A[Engine + MxModelLoader<br/>- Loads weights from storage<br/>- Registers tensors with NIXL<br/>- PublishMetadata + UpdateStatus]
+        A[Engine + MxModelLoader<br/>- Loads weights from storage<br/>- Registers tensors with selected transport<br/>- PublishMetadata + UpdateStatus]
     end
     subgraph "Node B"
-        B[Engine + MxModelLoader<br/>- Discovers READY source<br/>- Receives weights via NIXL<br/>- Runs engine post-load hooks]
+        B[Engine + MxModelLoader<br/>- Discovers READY source<br/>- Receives weights via NIXL or TransferEngine<br/>- Runs engine post-load hooks]
     end
-    A -- "RDMA via NIXL" --> B
+    A -- "RDMA via selected transport" --> B
     A --> S
     B --> S
     S[ModelExpress Server - gRPC<br/>PublishMetadata / GetMetadata / UpdateStatus]
@@ -23,7 +23,7 @@ graph TD
 1. **Engine loader integration**: vLLM uses `--load-format modelexpress`; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with backend `modelexpress`.
 2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly).
 3. **Engine post-load hooks**: The ModelExpress adapter handles engine-specific post-load processing and tensor discovery.
-4. **Tensor Parallelism**: Full TP support with rank-matched transfers (one NIXL agent per GPU).
+4. **Tensor Parallelism**: Full TP support with rank-matched transfers. NIXL uses one agent per GPU; TransferEngine publishes one session per SGLang worker.
 
 ## Prerequisites
 
@@ -56,8 +56,8 @@ See [`client/`](client/) for engine deployment manifests:
 
 The ModelExpress loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from storage and becomes a source for future nodes.
 
-For SGLang, use an image based on `lmsysorg/sglang:v0.5.13.post1` or newer so
-the upstream ModelExpress delegation hook is present.
+For SGLang, `lmsysorg/sglang:v0.5.13.post1` is the known-good release image
+with the upstream ModelExpress delegation hook.
 
 For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
 
@@ -67,7 +67,7 @@ For ModelStreamer-only startup examples that stream weights from Azure Blob Stor
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration (recommended). `MODEL_EXPRESS_URL` is deprecated and pending removal, but is still required by some paths today and takes precedence when both are set; set both during the transition. | `modelexpress-server:8001` |
+| `MX_SERVER_ADDRESS` | ModelExpress server address used by the engine integration (recommended). `MODEL_EXPRESS_URL` is deprecated and pending removal; keep it only for legacy paths that have not switched to `MX_SERVER_ADDRESS`. | `modelexpress-server:8001` |
 | `MX_RDMA_NIC_PIN` | Per-rank NIC pinning for RDMA-capable deployments | `auto` |
 
 ### ModelExpress Server
