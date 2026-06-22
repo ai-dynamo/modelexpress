@@ -108,10 +108,14 @@ pub(crate) async fn review_token(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::auth::test_util::{
+        fake_kube_client, review_without_user, token_review_for, unauthenticated_review,
+    };
     use secrecy::ExposeSecret;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn extracts_bearer_token_both_cases() {
@@ -197,5 +201,56 @@ mod tests {
             ..Default::default()
         };
         assert!(caller_from_userinfo(&user).is_none());
+    }
+
+    #[tokio::test]
+    async fn review_token_accepts_service_account_identity() {
+        let (client, calls) =
+            fake_kube_client(vec![token_review_for("system:serviceaccount:vllm:worker")]);
+        let audiences = vec!["modelexpress".to_string()];
+
+        let caller = review_token(&client, "token", &audiences)
+            .await
+            .expect("authenticated TokenReview");
+
+        assert_eq!(caller.namespace, "vllm");
+        assert_eq!(caller.service_account, "worker");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn review_token_rejects_unauthenticated_status() {
+        let (client, _calls) = fake_kube_client(vec![unauthenticated_review("expired")]);
+
+        let error = review_token(&client, "token", &[])
+            .await
+            .expect_err("unauthenticated TokenReview");
+
+        assert!(matches!(
+            error,
+            TokenError::NotAuthenticated(Some(message)) if message == "expired"
+        ));
+    }
+
+    #[tokio::test]
+    async fn review_token_rejects_missing_status() {
+        let (client, _calls) = fake_kube_client(vec![TokenReview::default()]);
+
+        let error = review_token(&client, "token", &[])
+            .await
+            .expect_err("missing TokenReview status");
+
+        assert!(matches!(error, TokenError::NoStatus));
+    }
+
+    #[tokio::test]
+    async fn review_token_rejects_missing_user() {
+        let (client, _calls) = fake_kube_client(vec![review_without_user()]);
+
+        let error = review_token(&client, "token", &[])
+            .await
+            .expect_err("missing TokenReview user");
+
+        assert!(matches!(error, TokenError::NoUser));
     }
 }
