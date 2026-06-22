@@ -14,15 +14,20 @@ keywords.workspace = true
 
 
 [features]
+default = ["gcs", "tls-rustls"]
+openssl = ["tls-openssl"]
+gcs = ["modelexpress-common/gcs"]
 # In-memory backend for tests and local dev (MX_METADATA_BACKEND=memory). Off by
 # default; enable explicitly with `--features memory-backend` to run its unit tests.
 memory-backend = []
 # Gates the in-process integration tests, which boot a server and are slower. Enables
 # memory-backend because the test boots run_server with MX_METADATA_BACKEND=memory.
 integration-tests = ["memory-backend"]
+tls-openssl = ["modelexpress-common/tls-native", "kube/openssl-tls"]
+tls-rustls = ["modelexpress-common/tls-rustls", "kube/rustls-tls"]
 
 [dependencies]
-modelexpress-common = { workspace = true }
+modelexpress-common = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -54,7 +59,7 @@ sha2 = { workspace = true }
 tonic-health = { workspace = true }
 
 [dev-dependencies]
-modelexpress-common = { workspace = true, features = ["test-support"] }
+modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
 mockall = { workspace = true }
 tempfile = "3.20"
 tokio-test = "0.4"

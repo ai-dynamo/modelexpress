@@ -13,7 +13,12 @@ repository.workspace = true
 keywords.workspace = true
 
 [features]
+default = ["gcs", "tls-rustls"]
+openssl = ["tls-native"]
+gcs = ["dep:google-cloud-storage", "dep:rustls", "rustls/ring", "rustls/std"]
 test-support = []
+tls-native = ["reqwest/native-tls"]
+tls-rustls = ["hf-hub/rustls-tls", "reqwest/rustls-tls"]
 
 [dependencies]
 serde = { workspace = true }
@@ -34,8 +39,8 @@ config = { workspace = true }
 futures = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true }
-google-cloud-storage = { workspace = true }
-rustls = { workspace = true }
+google-cloud-storage = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 crc32c = { workspace = true }
 fd-lock = { workspace = true }
 
