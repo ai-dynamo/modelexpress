@@ -13,10 +13,31 @@ repository.workspace = true
 keywords.workspace = true
 publish = false
 
+[features]
+default = ["gcs", "tls-rustls"]
+openssl = ["tls-openssl"]
+gcs = [
+    "modelexpress-client/gcs",
+    "modelexpress-common/gcs",
+    "modelexpress-server/gcs",
+]
+tls-openssl = [
+    "kube/openssl-tls",
+    "modelexpress-client/tls-native",
+    "modelexpress-common/tls-native",
+    "modelexpress-server/tls-openssl",
+]
+tls-rustls = [
+    "kube/rustls-tls",
+    "modelexpress-client/tls-rustls",
+    "modelexpress-common/tls-rustls",
+    "modelexpress-server/tls-rustls",
+]
+
 [dependencies]
-modelexpress-client = { workspace = true }
-modelexpress-common = { workspace = true }
-modelexpress-server = { workspace = true }
+modelexpress-client = { workspace = true, default-features = false }
+modelexpress-common = { workspace = true, default-features = false }
+modelexpress-server = { workspace = true, default-features = false }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
