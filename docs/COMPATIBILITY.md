@@ -12,6 +12,25 @@ see [`ci/TEST_PLAN.md`](../ci/TEST_PLAN.md).
 Use the documentation from the release tag you deploy. The values below track
 the current `main` branch.
 
+## Support Matrix
+
+| Capability | Engine / mode | Status | Validation |
+|------------|---------------|--------|------------|
+| Server + CLI model-cache management | Standalone | Supported | Rust integration tests and CLI docs |
+| P2P weight transfer | vLLM | Supported | In CI |
+| Multi-node tensor parallel P2P | vLLM | Supported | In CI for TP=2 |
+| Dynamo integration | Dynamo + vLLM | Supported | In CI for aggregated and disaggregated vLLM paths |
+| P2P weight transfer | SGLang + NIXL | Supported | In CI with a known-good SGLang release image |
+| P2P weight transfer | SGLang + Mooncake TransferEngine | Supported | In CI |
+| P2P weight transfer | TensorRT-LLM | Beta | In CI, requires TRT-LLM/Dynamo-specific image and patches |
+| ModelStreamer storage loading | vLLM | Supported | In CI for S3; examples cover S3, Azure Blob, and local/PVC |
+| ModelStreamer storage loading | SGLang | Experimental | Adapter and launch coverage still gated |
+| Metadata backend | Redis or Kubernetes CRD | Supported | Used by P2P and model-cache examples |
+| Metadata backend | `k8s-service` | Specialized | Stable-weight inference only; no central MX server |
+| Metadata backend | In-memory | Dev/test only | Feature-gated; not for production deployments |
+| GPUDirect Storage | vLLM/TRT-LLM/SGLang | Experimental | Hardware-dependent; CI coverage pending |
+| RL/live refit workflows | Framework integrations | Emerging | Use Redis or Kubernetes CRD; APIs and examples are still evolving |
+
 ## ModelExpress Artifacts
 
 | Artifact | Current pin | Source |

@@ -20,7 +20,6 @@ SPDX-License-Identifier: Apache-2.0
 
 <p align="center">
   <a href="#start-here">Start Here</a> •
-  <a href="#support-matrix">Support Matrix</a> •
   <a href="docs/COMPATIBILITY.md">Compatibility</a> •
   <a href="#features">Features</a> •
   <a href="#modelexpress-architecture">Architecture</a> •
@@ -67,28 +66,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 | Evaluate TRT-LLM P2P | [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) | Beta path; requires a TRT-LLM/Dynamo image and patch flow described in the example. |
 | Stream from object storage | [ModelStreamer examples](examples/model_streamer_k8s/README.md) | Storage-loading path for S3, Azure Blob, GCS, or local/PVC sources. |
 | Choose a metadata backend | [Deployment backend guide](docs/DEPLOYMENT.md#choosing-a-metadata-backend) | Redis/Kubernetes for coordinated fleets; `k8s-service` for stable-weight inference only. |
-
-## Support Matrix
-
-| Capability | Engine / mode | Status | Validation |
-|------------|---------------|--------|------------|
-| Server + CLI model-cache management | Standalone | Supported | Rust integration tests and CLI docs |
-| P2P weight transfer | vLLM | Supported | In CI |
-| Multi-node tensor parallel P2P | vLLM | Supported | In CI for TP=2 |
-| Dynamo integration | Dynamo + vLLM | Supported | In CI for aggregated and disaggregated vLLM paths |
-| P2P weight transfer | SGLang + NIXL | Supported | In CI with a known-good SGLang release image |
-| P2P weight transfer | SGLang + Mooncake TransferEngine | Supported | In CI |
-| P2P weight transfer | TensorRT-LLM | Beta | In CI, requires TRT-LLM/Dynamo-specific image and patches |
-| ModelStreamer storage loading | vLLM | Supported | In CI for S3; examples cover S3, Azure Blob, and local/PVC |
-| ModelStreamer storage loading | SGLang | Experimental | Adapter and launch coverage still gated |
-| Metadata backend | Redis or Kubernetes CRD | Supported | Used by P2P and model-cache examples |
-| Metadata backend | `k8s-service` | Specialized | Stable-weight inference only; no central MX server |
-| Metadata backend | In-memory | Dev/test only | Feature-gated; not for production deployments |
-| GPUDirect Storage | vLLM/TRT-LLM/SGLang | Experimental | Hardware-dependent; CI coverage pending |
-| RL/live refit workflows | Framework integrations | Emerging | Use Redis or Kubernetes CRD; APIs and examples are still evolving |
-
-See [Compatibility](docs/COMPATIBILITY.md) for tested runtime pins and
-[CI Test Plan](ci/TEST_PLAN.md) for the detailed coverage matrix and open gaps.
+| Check support and tested versions | [Compatibility](docs/COMPATIBILITY.md) | Support status, runtime pins, and platform pins. |
 
 ---
 
