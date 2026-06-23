@@ -110,6 +110,28 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     return "\n".join(chunks)
 
 
+def _artifact_source_count(namespace: str) -> int:
+    result = kubectl(
+        "get", "modelmetadata",
+        "-o", "json",
+        namespace=namespace,
+    )
+    payload = json.loads(result.stdout)
+    count = 0
+    for item in payload.get("items", []):
+        spec = item.get("spec") or {}
+        status = item.get("status") or {}
+        worker = status.get("worker") or {}
+        artifact = worker.get("artifactSource") or {}
+        if (
+            spec.get("sourceType") != "weights"
+            and worker.get("status") == "Ready"
+            and artifact.get("artifactId")
+        ):
+            count += 1
+    return count
+
+
 def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
     # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
     # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
@@ -215,6 +237,26 @@ def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) ->
     assert source_ranks == list(range(tp_size)), (
         f"Expected source ranks {list(range(tp_size))}, got {source_ranks}."
     )
+
+
+def test_artifact_transfer(
+    namespace: str,
+    require_artifact_transfer: bool,
+    expected_artifact_sources: int,
+) -> None:
+    if not require_artifact_transfer:
+        pytest.skip("artifact transfer assertion not enabled")
+
+    source_count = _artifact_source_count(namespace)
+    assert source_count >= expected_artifact_sources, (
+        f"Expected at least {expected_artifact_sources} ready artifact source(s), "
+        f"got {source_count}"
+    )
+
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    install_lines = [line for line in logs.splitlines() if "vLLM artifact install complete" in line]
+    print("[mx-target] artifact install lines:\n" + "\n".join(install_lines))
+    assert install_lines, "Target did not log vLLM artifact installation"
 
 
 def test_source_inference_produces_output(namespace: str, model: str, source_port: int) -> None:

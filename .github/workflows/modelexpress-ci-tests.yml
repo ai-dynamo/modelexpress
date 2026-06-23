@@ -330,6 +330,7 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8001"
             worker_port: "8002"
+            expected_artifact_sources: "1"
           - framework: trt-llm
             namespace: mx-ci-trt-llm-${{ github.run_id }}
             manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
@@ -396,6 +397,7 @@ jobs:
           source_port: ${{ matrix.source_port }}
           worker_port: ${{ matrix.worker_port }}
           pytest_args: ${{ matrix.pytest_args }}
+          expected_artifact_sources: ${{ matrix.expected_artifact_sources || '0' }}
 
       - name: Dump vCluster diagnostics on failure
         # Captures vCluster control-plane state at the moment of failure

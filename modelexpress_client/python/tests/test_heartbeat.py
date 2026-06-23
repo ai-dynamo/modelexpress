@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from modelexpress.metadata.heartbeat import HeartbeatThread
+from modelexpress.metadata.heartbeat import HeartbeatThread, PublisherThread
 
 
 @pytest.fixture
@@ -89,6 +89,64 @@ class TestHeartbeatSendsReady:
             )
         ]
         assert len(ready_calls) >= 2
+
+
+class TestPublisherPublishAndReady:
+    def test_first_tick_publishes_then_sends_ready(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+        )
+
+        publisher._tick()
+
+        assert publisher.mx_source_id == "abc123"
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+            )
+        ]
+
+    def test_ready_gate_blocks_publish(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="abc123")
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            ready_fn=lambda: False,
+            interval_secs=1,
+        )
+
+        publisher._tick()
+
+        publish.assert_not_called()
+        mx_client.update_status.assert_not_called()
+
+    def test_can_stop_after_publish_without_heartbeat(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            heartbeat_after_publish=False,
+            interval_secs=1,
+        )
+
+        publisher._tick()
+
+        assert publisher.mx_source_id == "abc123"
+        mx_client.update_status.assert_not_called()
+        assert publisher._stop_event.is_set()
 
 
 class TestHeartbeatStop:

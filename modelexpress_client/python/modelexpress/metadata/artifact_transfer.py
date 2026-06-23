@@ -30,7 +30,6 @@ from .artifact_manifest import (
 )
 from .heartbeat import HeartbeatThread
 from .publish import _get_worker_host, _publish_metadata_to_server
-from .source_id import compute_mx_source_id
 from .worker_server import (
     WorkerGrpcServer,
     fetch_artifact_manifest_chunks,
@@ -103,7 +102,10 @@ class PublishedArtifactSource:
 
     def stop(self) -> None:
         self.heartbeat.stop()
-        self.grpc_server.stop()
+        self.grpc_server.unregister_artifact_source(
+            self.endpoint.mx_source_id,
+            self.endpoint.artifact_id,
+        )
         self.artifact_chunk_manager.close()
 
 
@@ -143,7 +145,7 @@ class P2PArtifactTransfer(Protocol):
         identity: p2p_pb2.SourceIdentity,
         nixl_manager: NixlTransferManager,
         *,
-        worker_rank: int = 0,
+        worker_rank: int | None = 0,
         artifact_id: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
@@ -171,6 +173,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
 
     def prepare_source(self) -> ArtifactBundle:
         """Tar the source directory into bundle_root and build its manifest."""
+        start = time.perf_counter()
         source_path = self.source_root.resolve(strict=True)
         if not source_path.is_dir():
             raise ValueError(f"artifact source root is not a directory: {source_path}")
@@ -197,12 +200,25 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
             chunk_size=self.chunk_size,
             mx_source_type=self.mx_source_type,
         )
+        artifact_id = artifact_manifest_id(manifest)
+        elapsed = time.perf_counter() - start
+        total_size = sum(file.size for file in manifest.files)
+        logger.info(
+            "[TIMING] Artifact prepare complete: name=%s artifact_id=%s "
+            "files=%d chunks=%d size=%.2f MiB elapsed=%.3fs",
+            self.name,
+            artifact_id,
+            len(manifest.files),
+            len(manifest.chunks),
+            _mib(total_size),
+            elapsed,
+        )
         return ArtifactBundle(
             source_root=source_path,
             bundle_root=bundle_path,
             tar_path=tar_path,
             manifest=manifest,
-            artifact_id=artifact_manifest_id(manifest),
+            artifact_id=artifact_id,
         )
 
     def transfer_from_worker(
@@ -232,7 +248,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         identity: p2p_pb2.SourceIdentity,
         nixl_manager: NixlTransferManager,
         *,
-        worker_rank: int = 0,
+        worker_rank: int | None = 0,
         artifact_id: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
@@ -256,6 +272,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
     ) -> None:
+        start = time.perf_counter()
         if len(header.files) != 1:
             raise ValueError(
                 f"artifact bundle must contain exactly one file, got {len(header.files)}"
@@ -265,6 +282,15 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         output_path.mkdir(parents=True, exist_ok=True)
         _validate_tar_members(tar_file)
         _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "[TIMING] Artifact install complete: artifact_id=%s target=%s "
+            "size=%.2f MiB elapsed=%.3fs",
+            header.artifact_id,
+            output_path,
+            _mib(header.total_size),
+            elapsed,
+        )
 
     def _target_tar_path(self) -> Path:
         if Path(self.tar_name).name != self.tar_name:
@@ -344,8 +370,8 @@ def publish_artifact_source(
     nixl_manager: NixlTransferManager,
     worker_id: str,
     *,
+    worker_grpc_server: WorkerGrpcServer,
     worker_rank: int = 0,
-    worker_grpc_port: int | None = None,
     max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     host: str | None = None,
 ) -> PublishedArtifactSource:
@@ -364,30 +390,14 @@ def publish_artifact_source(
         )
 
     worker_host = host or _get_worker_host()
-    expected_mx_source_id = compute_mx_source_id(identity)
     metadata_endpoint = _nixl_metadata_endpoint(worker_host, nixl_manager)
-    port = (
-        worker_grpc_port
-        if worker_grpc_port is not None
-        else int(os.environ.get("MX_WORKER_GRPC_PORT", "6555")) + worker_rank
-    )
+    if worker_grpc_server.port is None:
+        raise RuntimeError("worker gRPC server must be started before artifact publish")
+    worker_grpc_endpoint = f"{worker_host}:{worker_grpc_server.port}"
     artifact_chunk_manager = NixlArtifactChunkManager(
         nixl_manager,
         max_buffers=max_inflight_chunks,
     )
-    grpc_server = WorkerGrpcServer(
-        tensor_protos=[],
-        mx_source_id=expected_mx_source_id,
-        port=port,
-        metadata_endpoint=metadata_endpoint,
-        agent_name=nixl_manager.agent_name,
-        worker_rank=worker_rank,
-        artifact_manifests={bundle.artifact_id: bundle.manifest},
-        artifact_chunk_manager=artifact_chunk_manager,
-        max_workers=max_inflight_chunks,
-    )
-    actual_port = grpc_server.start()
-    worker_grpc_endpoint = f"{worker_host}:{actual_port}"
 
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=worker_rank,
@@ -405,14 +415,18 @@ def publish_artifact_source(
             worker_rank=worker_rank,
         )
     except Exception:
-        grpc_server.stop()
+        artifact_chunk_manager.close()
         raise
-    if mx_source_id != expected_mx_source_id:
-        grpc_server.stop()
-        raise RuntimeError(
-            "MX server returned unexpected artifact source id: "
-            f"{mx_source_id} != {expected_mx_source_id}"
+    try:
+        worker_grpc_server.register_artifact_source(
+            mx_source_id,
+            bundle.artifact_id,
+            bundle.manifest,
+            artifact_chunk_manager,
         )
+    except Exception:
+        artifact_chunk_manager.close()
+        raise
 
     heartbeat = HeartbeatThread(
         mx_client=mx_client,
@@ -425,10 +439,10 @@ def publish_artifact_source(
         nixl_manager.refresh_agent_metadata()
         heartbeat.start()
     except Exception:
-        grpc_server.stop()
+        worker_grpc_server.unregister_artifact_source(mx_source_id, bundle.artifact_id)
         artifact_chunk_manager.close()
         raise
-    logger.info(
+    logger.debug(
         "Published artifact source to MX server "
         "(mx_source_id=%s, artifact_id=%s, worker_grpc=%s)",
         mx_source_id,
@@ -443,7 +457,7 @@ def publish_artifact_source(
             worker_grpc_endpoint=worker_grpc_endpoint,
             artifact_id=bundle.artifact_id,
         ),
-        grpc_server=grpc_server,
+        grpc_server=worker_grpc_server,
         heartbeat=heartbeat,
         artifact_chunk_manager=artifact_chunk_manager,
     )
@@ -453,7 +467,7 @@ def discover_artifact_source(
     mx_client,
     identity: p2p_pb2.SourceIdentity,
     *,
-    worker_rank: int = 0,
+    worker_rank: int | None = 0,
     artifact_id: str = "",
 ) -> ArtifactSourceEndpoint:
     """Find a ready artifact source through the MX server."""
@@ -462,7 +476,7 @@ def discover_artifact_source(
         status_filter=p2p_pb2.SOURCE_STATUS_READY,
     )
     for source in sources.instances:
-        if source.worker_rank != worker_rank:
+        if worker_rank is not None and source.worker_rank != worker_rank:
             continue
         metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
         if not metadata.found:
@@ -650,6 +664,7 @@ def transfer_artifact_from_worker(
     target_file_paths: list[str | Path] | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
     """Transfer all files in an artifact from one source worker via NIXL."""
+    start = time.perf_counter()
     if max_inflight_chunks <= 0:
         raise ValueError("max_inflight_chunks must be positive")
     header, _ = fetch_artifact_manifest_header(
@@ -668,11 +683,16 @@ def transfer_artifact_from_worker(
     target_files = target_header.files
     _prepare_target_files(target_files)
     if not chunks:
+        elapsed = time.perf_counter() - start
         logger.info(
-            "Transferred artifact %s from %s (%d files, 0 chunks)",
+            "[TIMING] Artifact transfer complete: artifact_id=%s source=%s "
+            "files=%d chunks=0 size=%.2f MiB elapsed=%.3fs throughput=%.2f Gbps",
             header.artifact_id,
             endpoint,
             header.file_count,
+            _mib(header.total_size),
+            elapsed,
+            _gbps(header.total_size, elapsed),
         )
         return target_header
 
@@ -719,12 +739,17 @@ def transfer_artifact_from_worker(
     finally:
         _close_target_buffers(nixl_manager, target_slots)
 
+    elapsed = time.perf_counter() - start
     logger.info(
-        "Transferred artifact %s from %s (%d files, %d chunks)",
+        "[TIMING] Artifact transfer complete: artifact_id=%s source=%s "
+        "files=%d chunks=%d size=%.2f MiB elapsed=%.3fs throughput=%.2f Gbps",
         header.artifact_id,
         endpoint,
         header.file_count,
         header.chunk_count,
+        _mib(header.total_size),
+        elapsed,
+        _gbps(header.total_size, elapsed),
     )
     return target_header
 
@@ -1028,6 +1053,16 @@ def _validate_fetched_artifact_manifest(
     computed_artifact_id = artifact_manifest_id(manifest)
     if computed_artifact_id != header.artifact_id:
         raise RuntimeError("artifact manifest id mismatch")
+
+
+def _mib(size_bytes: int) -> float:
+    return size_bytes / (1024 * 1024)
+
+
+def _gbps(size_bytes: int, elapsed_secs: float) -> float:
+    if elapsed_secs <= 0:
+        return 0.0
+    return size_bytes * 8 / elapsed_secs / 1_000_000_000
 
 
 def _read_file_range_into_buffer(

@@ -62,6 +62,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     parser.addoption(
+        "--require-artifact-transfer",
+        action="store_true",
+        default=os.environ.get("REQUIRE_ARTIFACT_TRANSFER", "").lower() in {"1", "true", "yes"},
+        help="Assert that a vLLM artifact source was published and installed by the target.",
+    )
+    parser.addoption(
+        "--expected-artifact-sources",
+        default=_nonnegative_int(os.environ.get("EXPECTED_ARTIFACT_SOURCES", "0")),
+        type=_nonnegative_int,
+        help="Minimum ready non-weight artifact ModelMetadata CRs expected at pytest time.",
+    )
+    parser.addoption(
         "--dgd-name",
         default=os.environ.get("DGD_NAME", "mx-dynamo-vllm"),
         help=(
@@ -138,6 +150,16 @@ def tp_size(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def transport(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--transport")
+
+
+@pytest.fixture(scope="session")
+def require_artifact_transfer(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--require-artifact-transfer")
+
+
+@pytest.fixture(scope="session")
+def expected_artifact_sources(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--expected-artifact-sources")
 
 
 @pytest.fixture(scope="session")
