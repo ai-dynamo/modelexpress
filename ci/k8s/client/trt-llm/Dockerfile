@@ -40,13 +40,12 @@ USER root
 # Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;
 # regenerate with grpcio-tools when p2p.proto changes.
 #
-# Pip's default upgrade strategy (only-if-needed) keeps the base image's
-# pre-installed nixl 0.10.1 untouched because modelexpress's constraint
-# `nixl[cu12]; sys_platform == 'linux'` is unbounded and 0.10.1 satisfies it.
-# Do NOT add a `>=` lower bound to that constraint in pyproject.toml without
-# updating this Dockerfile — it would force pip to upgrade nixl to 1.1.0 here,
-# which would re-introduce the UCX ABI mismatch the base image was chosen
-# to avoid. See docs/NIXL_UCX_COMPATIBILITY.md.
+# MX does not pin a NIXL distribution; it imports `nixl._api` against
+# whatever variant the base image provides. This image's pre-installed
+# nixl-cu12 0.10.1 stays untouched and satisfies MX's runtime path,
+# and the layer keeps working unchanged if Dynamo's tensorrtllm-runtime
+# ever switches its bundled NIXL to a different version or to
+# nixl-cu13. See docs/NIXL_UCX_COMPATIBILITY.md for the UCX ABI story.
 COPY modelexpress_client/python /opt/modelexpress/client
 WORKDIR /opt/modelexpress/client
 RUN pip uninstall -y modelexpress 2>/dev/null || true && \
