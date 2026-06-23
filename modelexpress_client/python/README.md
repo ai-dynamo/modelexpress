@@ -17,6 +17,11 @@ pip install -e .
 pip install -e ".[dev]"
 ```
 
+NIXL is expected to be supplied by the runtime environment (TRT-LLM,
+SGLang, Dynamo, and NemoRL runtime images all ship `nixl-cu12` or
+`nixl-cu13`). For a bare-environment install, run `pip install nixl-cu12`
+or `pip install nixl-cu13` separately, matching your host CUDA toolkit.
+
 ### Requirements
 
 - Python >= 3.10
