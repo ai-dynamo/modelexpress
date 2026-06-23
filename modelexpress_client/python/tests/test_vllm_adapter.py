@@ -29,6 +29,14 @@ def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
+
+
 def test_worker_rank_uses_torch_distributed_global_rank():
     config = _vllm_config(rank=2, tp_size=4, pp_size=2)
     device = torch.device("cuda", 0)
