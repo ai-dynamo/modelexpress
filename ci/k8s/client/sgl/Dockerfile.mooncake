@@ -5,61 +5,36 @@
 # transport (transport=transfer_engine).
 #
 # Mirrors ci/k8s/client/sgl/Dockerfile (the NIXL variant): same upstream
-# SGLang base, same ModelExpress client overlay. The only thing this variant
-# must additionally guarantee is that the SGLang in the base image exposes the
-# transfer_engine delegation hook (the `--remote-instance-weight-loader-
-# start-seed-via-transfer-engine` flag and the transfer_engine code path that
-# sets load_config.modelexpress_transport == "transfer_engine"). The NIXL CI
-# image does not need that hook.
+# SGLang base, same ModelExpress client overlay. This variant additionally
+# installs Mooncake TransferEngine for transport=transfer_engine tests.
 #
 # Build (from repo root):
 #   docker buildx build --platform linux/amd64 \
 #       -f ci/k8s/client/sgl/Dockerfile.mooncake \
 #       -t <IMAGE> --push --load .
 #
-# Base differs from the NIXL variant on purpose. The NIXL image's pinned digest
-# predates SGLang's transfer_engine remote-instance loader, so it has neither
-# the `--remote-instance-weight-loader-start-seed-via-transfer-engine` flag nor
-# the `transfer_engine`/`modelexpress` choices for
-# `--remote-instance-weight-loader-backend`. Those landed in SGLang v0.5.10, so
-# we pin a v0.5.12 release here. The cu129 (CUDA 12.9) variant is chosen over
-# the default cu13 image so it stays in the cu12 family that ModelExpress's
-# `nixl[cu12]` dependency targets (see docs/NIXL_UCX_COMPATIBILITY.md). The
-# build-time canary below verifies the hook is present.
-ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.12.post1-cu129
+# lmsysorg/sglang:v0.5.13.post1 includes the upstream ModelExpress delegation
+# hook from sgl-project/sglang#24723.
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.13.post1
 FROM ${SGLANG_IMAGE}
 
-# Mooncake TransferEngine is not bundled in the SGLang base. SGLang's
-# transfer_engine path constructs a Mooncake TransferEngine, which requires the
-# mooncake-transfer-engine package; without it the client falls back / errors.
-RUN pip install mooncake-transfer-engine
+RUN pip install mooncake-transfer-engine-cuda13
 
-# Install ModelExpress Python client.
+# Install ModelExpress Python client from this repository.
 # Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;
 # regenerate with grpcio-tools when p2p.proto changes.
 #
-# Pip's default upgrade strategy (only-if-needed) keeps the base image's
-# pre-installed nixl untouched as long as the constraint in modelexpress's
-# pyproject.toml (`nixl[cu12]; sys_platform == 'linux'`) is unbounded.
-# If lmsysorg/sglang ships a nixl that's incompatible with this image's UCX,
-# see docs/NIXL_UCX_COMPATIBILITY.md for the resolution pattern.
+# The SGLang base image owns the CUDA/NIXL/Torch/protobuf stack. Install the MX
+# package without dependency resolution so pip does not downgrade or replace
+# engine-provided runtime packages.
 COPY modelexpress_client/python /opt/modelexpress/client
 WORKDIR /opt/modelexpress/client
 RUN pip uninstall -y modelexpress 2>/dev/null || true && \
     rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
-    pip install .
+    pip install --no-cache-dir --no-deps .
 
 # Verify the client and the SGLang loader hook imported successfully.
 RUN python3 -c "from modelexpress.client import MxClient; print('MxClient OK')" && \
     python3 -c "from modelexpress.engines.sglang import MxModelLoader; print('SGLang MxModelLoader OK')"
-
-# Canary: fail the build if the base SGLang lacks the transfer_engine hook,
-# so a green build guarantees this image can take the Mooncake path. Mirrors
-# the PR-detection check in the example Dockerfile.pr23105.
-RUN python3 -c "import importlib.metadata as m, pathlib, sglang.srt.server_args as sa; \
-        src = pathlib.Path(sa.__file__).read_text(); \
-        assert 'transfer_engine' in src or 'start_seed_via_transfer_engine' in src, \
-        'SGLang base lacks transfer_engine hook; repin SGLANG_IMAGE (see header TODO)'; \
-        print('OK: sglang', m.version('sglang'), 'has transfer_engine hook')"
 
 WORKDIR /workspace

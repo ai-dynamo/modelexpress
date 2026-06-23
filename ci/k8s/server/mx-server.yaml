@@ -45,16 +45,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            # Widen the reaper staleness window past the default 90s. The
-            # vllm/trt/sglang-nixl sources refresh their heartbeat continuously
-            # (ModelExpress MxModelLoader's HeartbeatThread), so they are
-            # unaffected. But SGLang's in-tree (v0.5.12+) transfer_engine source
-            # publishes READY exactly once and never heartbeats, so a target
-            # that cold-starts slowly (model init + flashinfer + TransferEngine
-            # init can take >90s to reach the weight-load step) would otherwise
-            # find the source already reaped to STALE -> "no READY source found".
-            # 900s matches pod_ready_timeout_seconds: the source stays READY for
-            # as long as the test is willing to wait for the target anyway.
+            # Widen the reaper staleness window past the default 90s for slow
+            # cold-starting engine tests. ModelExpress loader paths heartbeat
+            # continuously after publishing, so this mainly prevents aggressive
+            # reaping from masking startup and scheduling delays in CI.
             # The stale-metadata test uses mx-server-redis.yaml (its own short
             # reaper knobs), so this does not weaken that coverage.
             - name: MX_HEARTBEAT_TIMEOUT_SECS

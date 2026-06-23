@@ -1,9 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# TODO: Switch to an SGLang release image once the ModelExpress loader PR is released.
-ARG SGLANG_IMAGE=lmsysorg/sglang@sha256:6553f8288e848fd833a4d473eca7aa2c8f141f98c52f63a5f4684631de50f9f2
+# SGLang v0.5.13.post1 includes the upstream ModelExpress delegation hook from
+# sgl-project/sglang#24723.
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.13.post1
 FROM ${SGLANG_IMAGE}
+
+ARG INSTALL_MOONCAKE=false
+RUN if [ "${INSTALL_MOONCAKE}" = "true" ]; then \
+        python3 -m pip install --no-cache-dir mooncake-transfer-engine-cuda13; \
+    fi
 
 # The SGLang base image owns the CUDA/NIXL/Torch stack. Install only the
 # ModelExpress package from this repository so dependency resolution does not

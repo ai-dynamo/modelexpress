@@ -106,20 +106,29 @@ def test_stale_metadata_excluded_after_heartbeat_timeout(
             f"sources from a previous test run."
         )
 
-        # Force-delete the source Job (not just its pod). Deleting only the
-        # pod via label would leave the Job controller active — it would
-        # spawn a replacement pod that re-publishes metadata, defeating the
-        # whole point of the test. --cascade=foreground makes kubectl wait
-        # for the child pod to terminate before considering the Job deleted.
-        # --grace-period=0 simulates sudden death (no graceful shutdown =
-        # the modelexpress client can't deregister itself with the server,
-        # which is exactly the failure mode the reaper is supposed to handle).
-        result = subprocess.run(
-            ["kubectl", "-n", namespace, "delete", "job", SOURCE_JOB_NAME,
-             "--grace-period=0", "--cascade=foreground", "--timeout=30s"],
-            capture_output=True, text=True, check=True, timeout=60,
+        # Delete the Job so the controller cannot spawn a replacement, then
+        # force-delete its pod. Do not wait for foreground cascading: on busy
+        # vCluster runs, pod termination can outlive kubectl's timeout even
+        # though the source process is already stopping, which is enough for
+        # this heartbeat-staleness test.
+        job_delete = subprocess.run(
+            [
+                "kubectl", "-n", namespace, "delete", "job", SOURCE_JOB_NAME,
+                "--cascade=orphan", "--ignore-not-found", "--wait=false",
+            ],
+            capture_output=True, text=True, check=True, timeout=30,
         )
-        print(f"[kill] {result.stdout.strip()}")
+        pod_delete = subprocess.run(
+            [
+                "kubectl", "-n", namespace, "delete", "pod",
+                "-l", f"job-name={SOURCE_JOB_NAME}",
+                "--grace-period=0", "--force",
+                "--ignore-not-found", "--wait=false",
+            ],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        print(f"[kill-job] {job_delete.stdout.strip()}")
+        print(f"[kill-pod] {pod_delete.stdout.strip()}")
 
         # Wait for the heartbeat-timeout + one reaper scan + a buffer scan.
         # The reaper polls on a fixed interval, so a missed deadline can
