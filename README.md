@@ -57,16 +57,21 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ## Start Here
 
-| Goal | Start here | Notes |
-|------|------------|-------|
-| Try the server and CLI locally | [Quick Start](#quick-start) and [CLI reference](docs/CLI.md) | No GPUs required for basic server health and model-cache commands. |
-| Speed up vLLM replica startup | [Kubernetes P2P examples](examples/p2p_transfer_k8s/README.md) | Uses `--load-format modelexpress` with Redis or Kubernetes CRD metadata. |
-| Use ModelExpress with Dynamo | [Dynamo model cache](examples/dynamo_model_cache_k8s/README.md) or [Dynamo P2P](examples/dynamo_p2p_transfer_k8s/README.md) | Dynamo is an integration path, not a requirement. |
-| Use ModelExpress with SGLang | [SGLang guide](docs/SGLANG.md) | Uses SGLang `remote_instance` with the `modelexpress` backend. |
-| Evaluate TRT-LLM P2P | [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) | Beta path; requires a TRT-LLM/Dynamo image and patch flow described in the example. |
-| Stream from object storage | [ModelStreamer examples](examples/model_streamer_k8s/README.md) | Storage-loading path for S3, Azure Blob, GCS, or local/PVC sources. |
-| Choose a metadata backend | [Deployment backend guide](docs/DEPLOYMENT.md#choosing-a-metadata-backend) | Redis/Kubernetes for coordinated fleets; `k8s-service` for stable-weight inference only. |
-| Check support and tested versions | [Compatibility](docs/COMPATIBILITY.md) | Support status, runtime pins, and platform pins. |
+New to ModelExpress? Follow this path:
+
+1. **Run the server and CLI locally:** [Quick Start](#quick-start) gets a local server running and verifies it with `modelexpress-cli health`. No GPU required.
+2. **Check what is supported:** [Compatibility](docs/COMPATIBILITY.md) lists tested engines, image pins, and beta/experimental paths.
+3. **Pick one deployment path:**
+
+| If your goal is... | Start here |
+|--------------------|------------|
+| Faster vLLM replica startup with P2P RDMA | [Kubernetes P2P examples](examples/p2p_transfer_k8s/README.md) |
+| Loading weights directly from S3, Azure Blob, GCS, or PVC | [ModelStreamer examples](examples/model_streamer_k8s/README.md) |
+| Using ModelExpress inside Dynamo | [Dynamo model cache](examples/dynamo_model_cache_k8s/README.md) or [Dynamo P2P](examples/dynamo_p2p_transfer_k8s/README.md) |
+| Using SGLang | [SGLang guide](docs/SGLANG.md) |
+| Evaluating TensorRT-LLM P2P | [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
+
+For Kubernetes deployments, choose a metadata backend before rollout: see the [deployment backend guide](docs/DEPLOYMENT.md#choosing-a-metadata-backend).
 
 ---
 
