@@ -19,6 +19,9 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 <p align="center">
+  <a href="#start-here">Start Here</a> •
+  <a href="#support-matrix">Support Matrix</a> •
+  <a href="docs/COMPATIBILITY.md">Compatibility</a> •
   <a href="#features">Features</a> •
   <a href="#modelexpress-architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
@@ -31,7 +34,9 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-ModelExpress is a Rust-based service that manages the complete model weight lifecycle in the cluster—from acquisition to GPU memory. It accelerates LLM inference by caching, routing, and transferring weights through the fastest available path. Deploy standalone or as a sidecar alongside vLLM, NVIDIA Dynamo, and other inference runtimes.
+ModelExpress is a Rust-based service that manages the complete model weight lifecycle in the cluster—from acquisition to GPU memory. It accelerates LLM inference by caching, routing, and transferring weights through the fastest available path.
+
+ModelExpress is not tied to NVIDIA Dynamo. You can run it standalone as a model-weight service, integrate it directly with stock inference runtimes such as vLLM and recent SGLang releases through their loader/plugin hooks, or let higher-level systems such as Dynamo, llm-d, Prime-RL, and similar orchestration layers use it as the weight lifecycle and transfer substrate.
 
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
@@ -51,17 +56,53 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ---
 
+## Start Here
+
+| Goal | Start here | Notes |
+|------|------------|-------|
+| Try the server and CLI locally | [Quick Start](#quick-start) and [CLI reference](docs/CLI.md) | No GPUs required for basic server health and model-cache commands. |
+| Speed up vLLM replica startup | [Kubernetes P2P examples](examples/p2p_transfer_k8s/README.md) | Uses `--load-format modelexpress` with Redis or Kubernetes CRD metadata. |
+| Use ModelExpress with Dynamo | [Dynamo model cache](examples/dynamo_model_cache_k8s/README.md) or [Dynamo P2P](examples/dynamo_p2p_transfer_k8s/README.md) | Dynamo is an integration target, not a requirement. |
+| Use ModelExpress with SGLang | [SGLang guide](docs/SGLANG.md) | Uses SGLang `remote_instance` with the `modelexpress` backend. |
+| Evaluate TRT-LLM P2P | [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) | Beta path; requires the TRT-LLM/Dynamo image and patch flow described in the example. |
+| Stream from object storage | [ModelStreamer examples](examples/model_streamer_k8s/README.md) | Storage-loading path for S3, Azure Blob, GCS, or local/PVC sources. |
+| Choose a metadata backend | [Deployment backend guide](docs/DEPLOYMENT.md#choosing-a-metadata-backend) | Redis/Kubernetes for coordinated fleets; `k8s-service` for stable-weight inference only. |
+
+## Support Matrix
+
+| Capability | Engine / mode | Status | Validation |
+|------------|---------------|--------|------------|
+| Server + CLI model-cache management | Standalone | Supported | Rust integration tests and CLI docs |
+| P2P weight transfer | vLLM | Supported | In CI |
+| Multi-node tensor parallel P2P | vLLM | Supported | In CI for TP=2 |
+| Dynamo integration | Dynamo + vLLM | Supported | In CI for aggregated and disaggregated vLLM paths |
+| P2P weight transfer | SGLang + NIXL | Supported | In CI with a known-good SGLang release image |
+| P2P weight transfer | SGLang + Mooncake TransferEngine | Supported | In CI |
+| P2P weight transfer | TensorRT-LLM | Beta | In CI, requires TRT-LLM/Dynamo-specific image and patches |
+| ModelStreamer storage loading | vLLM | Supported | In CI for S3; examples cover S3, Azure Blob, and local/PVC |
+| ModelStreamer storage loading | SGLang | Experimental | Adapter and launch coverage still gated |
+| Metadata backend | Redis or Kubernetes CRD | Supported | Used by P2P and model-cache examples |
+| Metadata backend | `k8s-service` | Specialized | Stable-weight inference only; no central MX server |
+| Metadata backend | In-memory | Dev/test only | Feature-gated; not for production deployments |
+| GPUDirect Storage | vLLM/TRT-LLM/SGLang | Experimental | Hardware-dependent; CI coverage pending |
+| RL/live refit workflows | Framework integrations | Emerging | Use Redis or Kubernetes CRD; APIs and examples are still evolving |
+
+See [Compatibility](docs/COMPATIBILITY.md) for tested runtime pins and
+[CI Test Plan](ci/TEST_PLAN.md) for the detailed coverage matrix and open gaps.
+
+---
+
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
-- **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
+- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias), SGLang `remote_instance` backend, and TRT-LLM `PRESHARDED` beta path
+- **Metadata backends** — Redis or Kubernetes CRD for coordinated deployments; feature-gated in-memory backend for local development and tests
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
-- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS) with multi-engine support
+- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS), with vLLM support today and additional engine coverage evolving
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
-- **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
+- **GDS (GPUDirect Storage)**: hardware-dependent path for loading model weights directly from NVMe into GPU memory
 
 ### Integrations
 
@@ -225,6 +266,7 @@ cargo bench
 | Doc | Description |
 |-----|-------------|
 | [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
+| [Compatibility](docs/COMPATIBILITY.md) | Tested runtime and platform pins |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [CLI](docs/CLI.md) | Full CLI reference |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |

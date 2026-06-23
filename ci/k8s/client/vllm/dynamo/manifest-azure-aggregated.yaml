@@ -40,7 +40,7 @@
 #   WORKER_IMAGE       — image built from ci/k8s/client/vllm/dynamo/Dockerfile
 #                        (dynamo vllm-runtime + modelexpress client)
 #   MX_SERVER_IMAGE    — image built from ci/k8s/server/Dockerfile.server
-#                        (our own MX server, not the public nvcr.io/0.3.0)
+#                        (our own MX server, not a published release image)
 
 ---
 # apiVersion: nvidia.com/v1alpha1 is deprecated in favor of v1beta1, but the

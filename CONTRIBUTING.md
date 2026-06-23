@@ -221,4 +221,5 @@ Signed-off-by: Jane Smith <jane.smith@email.com>
 
 You can use `-s` or `--signoff` to add the `Signed-off-by` line automatically.
 
-If your pull request fails the DCO check, see the [DCO Troubleshooting Guide](DCO.md).
+If your pull request fails the DCO check, confirm each commit includes a valid
+`Signed-off-by` line and review the [Developer Certificate of Origin](https://developercertificate.org/).

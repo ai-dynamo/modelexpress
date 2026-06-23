@@ -54,12 +54,11 @@ imagePullSecrets:
 
 If you're using a custom values file, ensure it includes this configuration or the deployment will fail with image pull errors.
 
-### 3. Add the Helm repository (if using a repository)
+### 3. Use the local chart
 
-```bash
-helm repo add modelexpress https://your-repo-url
-helm repo update
-```
+The public repository includes the chart under `helm/`. If your organization mirrors
+it to a Helm repository, add that repository according to your environment's
+instructions before installing.
 
 ### 4. Install the chart
 
@@ -101,7 +100,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `replicaCount`                               | Number of ModelExpress replicas                | `1`     |
 | `image.repository`                           | ModelExpress image repository                  | `nvcr.io/nvidia/ai-dynamo/modelexpress-server` |
 | `image.pullPolicy`                           | Image pull policy                              | `IfNotPresent` |
-| `image.tag`                                  | ModelExpress image tag                         | `0.3.0` |
+| `image.tag`                                  | ModelExpress image tag                         | `0.5.0` |
 | `imagePullSecrets`                           | Image pull secrets for nvcr.io access          | `[]`     |
 | `nameOverride`                               | Override the chart name                        | `""`     |
 | `fullnameOverride`                           | Override the full app name                     | `""`     |
@@ -295,7 +294,7 @@ The Helm chart uses the official NVIDIA ModelExpress image from the NVIDIA Conta
 docker login nvcr.io -u '$oauthtoken' -p 'YOUR_NVCR_API_KEY'
 
 # Pull the image
-docker pull nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.3.0
+docker pull nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.5.0
 ```
 
 **Note:** The default image requires authentication. See the [Installation](#installation) section for creating the required Kubernetes secret.
