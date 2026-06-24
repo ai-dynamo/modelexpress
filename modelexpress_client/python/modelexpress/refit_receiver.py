@@ -410,6 +410,157 @@ class MxRefitReceiver:
             if td.name in self._nixl._tensors:
                 yield td.name, self._nixl._tensors[td.name]
 
+    # ------------------------------------------------------------------
+    # Rank-to-rank fast path (Gen 3) — used by VerlMxRolloutLoader and the
+    # PrimeRL mx_v2 worker; safe to ignore for v1 callers.
+    # ------------------------------------------------------------------
+
+    def prefetch_source(self, mx_source_id: str, worker_id: str) -> str:
+        """Resolve + cache the NIXL remote-agent handle for a published source.
+
+        Calls ``MxClient.get_metadata`` once to obtain the source's NIXL
+        metadata blob, then loads it into the local NIXL agent via
+        ``add_remote_agent``. Returns the resulting remote-agent-name —
+        the caller passes this string to :meth:`receive_segment` so per-
+        segment RDMA reads avoid the gRPC round-trip + metadata load.
+
+        Caches results in ``self._remote_agents`` keyed by ``(source_id,
+        worker_id)`` so repeated calls for the same source are O(1).
+
+        This is the metadata-plane half of the rank-to-rank contract; the
+        data-plane half is :meth:`receive_segment`.
+        """
+        if not self._initialized:
+            raise RuntimeError("Call initialize() before prefetch_source()")
+        if not hasattr(self, "_remote_agents"):
+            self._remote_agents: dict[tuple[str, str], str] = {}
+
+        key = (mx_source_id, worker_id)
+        if key in self._remote_agents:
+            return self._remote_agents[key]
+
+        meta_resp = self._client.get_metadata(
+            mx_source_id=mx_source_id, worker_id=worker_id
+        )
+        if not meta_resp.found:
+            raise RuntimeError(
+                f"prefetch_source: source {mx_source_id}/{worker_id} not on MX server"
+            )
+        remote_agent_name = self._nixl._agent.add_remote_agent(
+            meta_resp.worker.nixl_metadata
+        )
+        self._remote_agents[key] = remote_agent_name
+        logger.info(
+            "prefetch_source: cached agent=%s for source_id=%s worker_id=%s "
+            "(metadata=%d bytes)",
+            remote_agent_name,
+            mx_source_id,
+            worker_id,
+            len(meta_resp.worker.nixl_metadata),
+        )
+        return remote_agent_name
+
+    def receive_segment(
+        self,
+        *,
+        remote_agent_name: str,
+        source_addr: int,
+        byte_count: int,
+        target_addr: int,
+        source_device_id: int = 0,
+        timeout_seconds: float = 60.0,
+    ) -> float:
+        """One-shot rank-to-rank RDMA READ — the Gen 3 data-plane primitive.
+
+        Issues a single NIXL READ for ``byte_count`` bytes from
+        ``source_addr`` (on the remote GPU identified by ``remote_agent_name``
+        + ``source_device_id``) into ``target_addr`` on the local GPU.
+
+        Unlike :meth:`receive_weights` this is name-free and tensor-free —
+        the caller pre-computes the absolute byte addresses on both sides
+        and the segment count is exactly 1. This is what
+        :class:`VerlMxRolloutLoader` (and the PrimeRL ``mx_v2`` worker)
+        iterates over once per :class:`SegmentPlan` after the planner has
+        intersected source ownerships with receiver requests.
+
+        Args:
+            remote_agent_name: Cached agent string from
+                :meth:`prefetch_source`.
+            source_addr: Absolute GPU address on the source side, in bytes.
+                For a sharded source this is typically
+                ``ownership.nixl_addr + source_range[0] * row_stride``.
+            byte_count: Bytes to read. Must match a contiguous range on
+                both sides (the receiver does no scatter).
+            target_addr: Absolute GPU address on the local side, in bytes.
+                Typically ``request.target_addr + request.target_offset +
+                target_range[0] * row_stride``.
+            source_device_id: CUDA device index on the source side.
+                Defaults to 0 (matches how MxTrainingPublisher writes its
+                shard descriptors today).
+            timeout_seconds: Max time to wait for the transfer.
+
+        Returns:
+            Elapsed seconds for the transfer.
+
+        Raises:
+            TimeoutError: if NIXL doesn't complete within ``timeout_seconds``.
+            RuntimeError: if NIXL reports an error state.
+        """
+        if not self._initialized:
+            raise RuntimeError("Call initialize() before receive_segment()")
+        if self._nixl is None:
+            raise RuntimeError("NIXL not initialized")
+
+        torch.cuda.set_device(self._device_id)
+        start = time.perf_counter()
+
+        # Build the 1-entry descriptor list for both sides.
+        remote_desc = [(source_addr, byte_count, source_device_id)]
+        local_desc = [(target_addr, byte_count, self._device_id)]
+
+        src_prepped = self._nixl._agent.prep_xfer_dlist(
+            agent_name=remote_agent_name,
+            xfer_list=remote_desc,
+            mem_type="cuda",
+            backends=["UCX"],
+        )
+        dst_prepped = self._nixl._agent.prep_xfer_dlist(
+            agent_name="",
+            xfer_list=local_desc,
+            mem_type="cuda",
+            backends=["UCX"],
+        )
+
+        handle = self._nixl._agent.make_prepped_xfer(
+            operation="READ",
+            local_xfer_side=dst_prepped,
+            local_indices=[0],
+            remote_xfer_side=src_prepped,
+            remote_indices=[0],
+            backends=["UCX"],
+        )
+        self._nixl._agent.transfer(handle)
+
+        wait_start = time.perf_counter()
+        while True:
+            if time.perf_counter() - wait_start >= timeout_seconds:
+                self._nixl._agent.release_xfer_handle(handle)
+                raise TimeoutError(
+                    f"receive_segment: transfer of {byte_count} bytes timed out"
+                )
+            status = self._nixl._agent.check_xfer_state(handle)
+            if status in ("DONE", "SUCCESS"):
+                self._nixl._agent.release_xfer_handle(handle)
+                break
+            if status in ("ERR", "ERROR", "FAIL"):
+                self._nixl._agent.release_xfer_handle(handle)
+                raise RuntimeError(f"receive_segment: transfer failed status={status}")
+            time.sleep(0.0005)
+
+        # RDMA writes bypass CUDA streams — sync so subsequent kernels see them.
+        torch.cuda.synchronize(self._device_id)
+        return time.perf_counter() - start
+
     def shutdown(self) -> None:
         """Release NIXL agent and close gRPC channel."""
         if self._nixl is not None:
