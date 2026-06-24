@@ -7,8 +7,9 @@ This document covers how ModelExpress (MX) plugs into [verl](https://github.com/
 
 > **Two implementations exist.** This document describes the architecture; the *implementation* has gone through two generations:
 >
-> - **Gen 1 (April 2026, `kavink/RL`):** `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 LOC, inside a verl fork). Validated on Qwen2.5-1.5B BF16 / GB200 / ~1.25 s avg. Architecturally proves the design.
-> - **Gen 2 (June 2026, `athreesh/modelexpress-private @ athreesh/docs-reproduce-from-fresh-devbox`):** `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` + 3 sibling modules + 14 test modules. Lives inside MX, loaded into upstream verl via `checkpoint_engine.custom_backend_module` — **no verl fork required**. Validated at Qwen3-235B-A22B FP8 / B200 + IB / 41.7 s. Adds leases, recovery, reshard, FP8 + per-expert layouts. See [§7 — Implementation evolution](#7-implementation-evolution-gen-1--gen-2) below.
+> - **Gen 1 (April 2026):** `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 LOC, inside a verl fork). Validated on Qwen2.5-1.5B BF16 / GB200 / ~1.25 s avg. Architecturally proves the design.
+> - **Gen 2 (June 2026):** `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` + sibling modules. Lives inside MX, loaded into upstream verl via `checkpoint_engine.custom_backend_module` — **no verl fork required**. Validated at Qwen3-235B-A22B FP8 / B200 + IB / 41.7 s. Adds leases, recovery, reshard, FP8 + per-expert layouts. See [§7 — Implementation evolution](#7-implementation-evolution-gen-1--gen-2) below.
+> - **Gen 3 (June 2026):** rank-to-rank publishing without allgather — drops the trainer-side `full_tensor()` gather, drives one-sided NIXL READs through a planner. See [§8](#8-gen-3--rank-to-rank-publishing-without-allgather) below.
 
 ---
 
@@ -22,7 +23,7 @@ verl is a Ray-orchestrated RL framework. Its `CheckpointEngine` plugin system is
 |-------|------|----------------|
 | Metadata plane | Source discovery, version tracking, topology coordination, **transfer leases**, **versioning + retention** | MX Server (gRPC) + Redis |
 | Data plane | GPU-to-GPU tensor transport | NIXL (UCX / `rc_mlx5` / RoCE) |
-| verl integration | `CheckpointEngine` ABC implementation, registered as backend `modelexpress` | **Gen 2:** `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` + `verl_publish_metadata.py` + `verl_receive_metadata.py` + `verl_rollout_preflight.py`. Loaded via verl's `checkpoint_engine.custom_backend_module` plugin hook — **no verl fork required**. <br>**Gen 1:** `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 LOC, inside verl fork; archived on `kavink/RL`). |
+| verl integration | `CheckpointEngine` ABC implementation, registered as backend `modelexpress` | **Gen 2:** `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py` + `verl_publish_metadata.py` + `verl_receive_metadata.py` + `verl_rollout_preflight.py`. Loaded via verl's `checkpoint_engine.custom_backend_module` plugin hook — **no verl fork required**. <br>**Gen 1:** `verl/checkpoint_engine/mx_checkpoint_engine.py` (461 LOC, inside verl fork; archived). |
 | Transport choreography | Bucket metadata handshake per transfer | ZMQ PUSH/PULL |
 | Production-scale features (Gen 2) | Transfer leases · source-death recovery · per-expert FSDP source for MoE · FP8 + Cutlass per-channel layouts · multi-source dense fan-in · tree fan-out with peer-republish | `rl_reshard.py`, `rl_metadata.py`, lease RPCs in `modelexpress_server` |
 
@@ -583,7 +584,7 @@ This proved publisher/receiver correctness before moving to cross-node.
 
 The architecture in §1 has stayed stable; what's changed between April 2026 and June 2026 is the packaging, the production-scale features layered on top, and the validation surface.
 
-### 7.1 Gen 1 (April 2026, `kavink/RL`) — architectural PoC
+### 7.1 Gen 1 (April 2026) — architectural PoC
 
 | Property | Value |
 |----------|-------|
@@ -596,7 +597,7 @@ The architecture in §1 has stayed stable; what's changed between April 2026 and
 
 **What it proved:** the architectural pattern works. Star topology + catalog-driven discovery is a viable alternative to verl-native NIXL's driver-wired ring. Cross-node RoCE RDMA at ~210 Gbps cold-start is real.
 
-### 7.2 Gen 2 (June 2026, `athreesh/modelexpress-private @ athreesh/docs-reproduce-from-fresh-devbox`) — production hardening
+### 7.2 Gen 2 (June 2026) — production hardening
 
 | Property | Value |
 |----------|-------|
@@ -620,16 +621,147 @@ Gen 1 required a **verl fork** — every verl version bump meant re-rebasing the
 
 ### 7.4 Where the Gen 2 code lives
 
-- Branch: [`athreesh/modelexpress-private:athreesh/docs-reproduce-from-fresh-devbox`](https://github.com/athreesh/modelexpress-private/tree/athreesh/docs-reproduce-from-fresh-devbox) (~192 commits ahead of `main`)
 - Entry-point file: `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py`
-- Validation artifacts: `.k8s-test/artifacts/qwen235-fp8-scaling-summary-20260602.md`, `nixl-broadcast-fault-qwen05-1e2212f-20260602.compact.json`
-- veRL config knob: `actor_rollout_ref.rollout.checkpoint_engine.backend: modelexpress` + `actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module: modelexpress.integrations.verl_checkpoint_engine`
+- veRL config knobs: `actor_rollout_ref.rollout.checkpoint_engine.backend: modelexpress` + `actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module: modelexpress.integrations.verl_checkpoint_engine`
 
 ### 7.5 Roadmap to upstream
 
-Gen 2 currently lives in a private fork. The path to consolidation:
+Path to consolidation:
 
-1. Merge the Gen 2 integration into `ai-dynamo/modelexpress` (likely on `kavink/nemo_rl_moe` or a new branch).
+1. Merge the Gen 2 integration into `ai-dynamo/modelexpress`.
 2. Retire `verl/checkpoint_engine/mx_checkpoint_engine.py` from the verl fork in favor of the `custom_backend_module` path.
 3. Update this doc's component diagram to drop the "in-verl-fork" boxes and show `custom_backend_module` as the loading mechanism.
-4. Cross-link this doc and the `NEMORL_MX_OVERVIEW.md` to make the "same MX, different framework integration depth" story explicit (verl uses fat clients; NemoRL uses v2 fat clients; prime-rl uses thin client + reimplements rendezvous).
+4. Cross-link this doc and `NEMORL_MX_OVERVIEW.md` to make the "same MX, different framework integration depth" story explicit (verl uses fat clients; NemoRL uses v2 fat clients; prime-rl uses thin client + reimplements rendezvous).
+5. Adopt the Gen 3 rank-to-rank contract on top of Gen 2 once `receive_segment` ships and the cluster validation in §8.8 completes.
+
+---
+
+## 8. Gen 3 — rank-to-rank publishing without allgather
+
+**Status:** code in the MX tree at `modelexpress_client/python/modelexpress/{rl_slice_descriptors,rl_reshard_planner,rank_local_publisher}.py` + `modelexpress_client/python/modelexpress/integrations/verl_checkpoint_engine.py`. 53 unit tests pass on CPU; cluster validation results captured in §8.8 below.
+
+### 8.1 Motivation
+
+The prior verl integrations (and the original NemoRL Dynamo integration) publish weights via a path that materializes the full tensor before NIXL registration:
+
+- The FSDP trainer calls `tensor.full_tensor()` on every sharded parameter before `MxTrainingPublisher.publish_weights(...)`. That is an explicit world-size allgather on the trainer side per refit, plus rank 0 holding the full model in memory during publish.
+- All MX framework adapters that consume that publisher inherit the same gather cost — the gather is the call site where the FSDP DTensor is unwrapped before being handed to the v1 fat client.
+
+The rank-to-rank contract removes the gather. Each trainer rank publishes only its own local shard; each inference rank pulls only the bytes it owns; the planner intersects the two layouts. This brings verl onto the same data-plane contract that the PrimeRL `mx_v2` broadcast and the NemoRL DTensor / Megatron-Core paths use.
+
+### 8.2 What Gen 3 adds
+
+Five new pure-Python modules:
+
+| Module | Role | Torch required |
+|--------|------|----------------|
+| `modelexpress.rl_slice_descriptors` | Contract types: `SliceOwnership`, `SliceRequest`, `SegmentPlan`, `CoveragePlan`; `PlanIncompleteError` + `QuantizationMetadataError` exceptions. | no |
+| `modelexpress.rl_reshard_planner` | Pure-function `plan_coverage(sources, requests) -> CoveragePlan`. Intersects per-request, prefers same-rank, refuses zero-copy on `quantization_scope='global-required'`. | no |
+| `modelexpress.rank_local_publisher` | `RankLocalPublisher` wrapper around `MxTrainingPublisher`. `add_dtensor(...)` calls `.to_local()` (no gather). `add_explicit_shard(...)` accepts a `PlacementDescriptor` for Megatron-Core. Both build `SliceOwnership` entries from the local shard. | yes (only `.to_local()` path) |
+| `modelexpress.integrations.verl_checkpoint_engine` | `VerlMxCheckpointEngine` (trainer side) + `VerlMxRolloutLoader` (inference side). Drop-in replacement for the gather-based `full_tensor()` publish + `collective_rpc("load_weights")` pull. | yes |
+
+Plus two extensions on the existing v1 surface:
+
+| Addition | Module | Role |
+|----------|--------|------|
+| `MxRefitReceiver.receive_segment(remote_agent_name, source_addr, byte_count, target_addr, source_device_id)` | `modelexpress.refit_receiver` | One-sided NIXL READ for one contiguous segment. The data-plane primitive the planner drives. |
+| `MxRefitReceiver.prefetch_source(mx_source_id, worker_id)` | `modelexpress.refit_receiver` | One-time per-source NIXL remote-agent registration + caching, so the per-segment hot loop avoids gRPC round-trips. |
+
+Re-exported from `modelexpress.__init__`, so callers do
+`from modelexpress import RankLocalPublisher, plan_coverage, SliceOwnership`.
+
+### 8.3 The rank-to-rank contract
+
+The headline change is the trainer↔inference *contract*, not the data plane (NIXL stays the same):
+
+```
+Trainer rank N (FSDP shard along axis 0, rows [N*S, (N+1)*S))
+  └──> publish bytes of THIS local shard only (no allgather)
+  └──> register SliceOwnership(
+            tensor_name="model.layers.0.q_proj.weight",
+            global_shape=(4096, 4096),
+            placement_kind=SHARD,
+            shard_axis=0,
+            local_shard_range=(N*S, (N+1)*S),
+            worker_rank=N,
+            nixl_addr=<this rank's NIXL register address>,
+            compile_target="bf16_cast",
+        )
+
+Inference rank M (TP shard along axis 0, rows [M*T, (M+1)*T))
+  └──> emit SliceRequest(
+            tensor_name="model.layers.0.q_proj.weight",
+            global_range=(M*T, (M+1)*T),
+            shard_axis=0,
+            receiver_rank=M,
+            target_addr=<local buffer address>,
+        )
+
+Planner (pure function, no IO, no tensor bytes):
+  for each request:
+    candidates = sources_by_tensor_name[req.tensor_name]
+    eligible   = filter(candidates, by dtype + compile_target + compile_metadata)
+    eligible.sort(by same-rank-first, then worker_rank)
+    greedily walk req.global_range; emit one SegmentPlan per covered region
+
+Receiver:
+  remote_agent = receiver.prefetch_source(source_id, worker_id)   # cached
+  for each SegmentPlan:
+    receiver.receive_segment(
+        remote_agent_name=remote_agent,
+        source_addr=seg.source.nixl_addr + seg.source_range[0] * row_stride,
+        byte_count=seg.byte_count,
+        target_addr=seg.request.target_addr + ... ,
+        source_device_id=seg.source.device_id,
+    )
+```
+
+**Properties the contract gives the integrator:**
+
+1. **No global allgather on trainer side.** Each FSDP rank publishes only its `to_local()` shard. World-size allgather cost vanishes from the refit critical path.
+2. **No "rank 0 holds the full model" memory spike.** Each rank registers `~(model_bytes / world_size)` of NIXL memory.
+3. **Cross-parallelism reshard is by construction.** FSDP=4 → TP=2 is two segments per receiver, no gather. FSDP=2 → TP=4 is one segment per receiver, sourced from the matching trainer rank.
+4. **Same-rank routing happens at planning time.** The planner orders candidates same-rank-first, which composes with the multi-NIC routing policies the existing MX integrations already use. No runtime peer-filter heuristic needed.
+5. **Compile-target filtering is the safety net.** A receiver that hasn't been upgraded to read `cutlass_fp8` advertises `compile_target_filter=frozenset({"bf16_cast"})` and the planner skips FP8 sources.
+6. **Quantization that needs global metadata fails loud.** `quantization_scope="global-required"` on a source raises `QuantizationMetadataError` at planning time so the caller can fall back to a full-copy install path for the affected tensors (`weight_scale_inv` and friends).
+7. **The fallback path is the existing gather-based code.** If the receiver doesn't expose `receive_segment` (older MX install, receiver-only deployment), `VerlMxRolloutLoader._execute_plan` falls back to `MxRefitReceiver.receive_weights(source_id)` — the legacy gather-equivalent path stays intact. Zero risk to existing deployments.
+
+### 8.4 Adopting the rank-to-rank contract from a gather-based integration
+
+This is fully additive — the existing gather path keeps working, the rank-to-rank path sits beside it:
+
+1. In the verl `CheckpointEngine` implementation, replace the `.full_tensor()` call site with `_is_dtensor(t) ? VerlMxCheckpointEngine.publish_weights(...) : full_tensor()-path`. The DTensor branch routes through `RankLocalPublisher.add_dtensor`; the non-DTensor branch (Megatron-Core) keeps the legacy code or wires `add_explicit_shard(...)` per the framework's native shard layout.
+2. On the rollout side, swap `collective_rpc("load_weights", ...)` for `VerlMxRolloutLoader.load_step(local_state_dict)` when `receiver.receive_segment` exists, else keep the existing path.
+3. Add a backend toggle (e.g. `actor_rollout_ref.rollout.checkpoint_engine.rank_to_rank_publish: bool`) so the gather path and the rank-to-rank path can A/B on the same cluster.
+
+### 8.5 What's deliberately out of scope for this drop
+
+- **No NIXL allocator changes.** The publisher still uses the v1 `MxTrainingPublisher` underneath; the only difference is that the tensors it sees are local shards instead of `full_tensor()` outputs. NIXL still maps each tensor as one contiguous range — the multi-segment receiver issues N reads against that one mapping, not N maps.
+- **No new server proto.** `SliceOwnership` lives in the Python wrapper today; it gets stamped into the existing v1 `TensorDescriptor` metadata blob on publish. Server-side proto changes (so the planner can run server-side) are a follow-up.
+- **No Megatron-Core wiring in this drop.** `PlacementDescriptor` is the seam for it; the prototype validates the path with `add_explicit_shard` unit tests but doesn't depend on Megatron at runtime. The NemoRL Megatron path (PR #429) is the reference shape for a future Megatron×verl integration.
+- **No mesh-multi-dim DTensor.** FSDP+TP composite meshes raise `NotImplementedError` with a clear pointer to use `PlacementDescriptor` instead.
+
+### 8.6 Test surface
+
+53 unit tests under `modelexpress_client/python/tests/`. None require GPU or `torch.distributed`.
+
+| File | Tests | What it covers |
+|------|-------|----------------|
+| `test_rl_slice_descriptors.py` | 15 | `SliceOwnership` validation (SHARD requires axis+range, PARTIAL rejected, out-of-bounds rejected), `covers()` intersection in 7 parametrized cases, `SliceRequest` validation, `CoveragePlan.raise_if_incomplete`. |
+| `test_rl_reshard_planner.py` | 14 | Happy path (FSDP=4 → TP=2 four-segment reshard, FSDP=2 → TP=4 four-receiver case), same-rank tiebreaker, dtype mismatch rejection, compile_target filter, compile_metadata subset check, partial coverage gap reporting, REPLICATE path, `QuantizationMetadataError` on global-required, summary + byte-savings (4× factor for FSDP=4 → TP=1). |
+| `test_rank_local_publisher.py` | 15 | `RankLocalPublisher.add_explicit_shard` records correct `SliceOwnership`, REPLICATE path, empty-publish raises, `drain` clears pending, compile target + metadata propagate. End-to-end `VerlMxCheckpointEngine` for plain-tensor and explicit-placement-override paths, rollout-actor notification, ack timeout + ack-arrives-in-time. End-to-end `VerlMxRolloutLoader` executes the right `SegmentPlan` via `receive_segment`, falls back to v1 `receive_weights`, times out cleanly when no source arrives, skips stale notifications, sends ack on completion. |
+| `test_receive_segment.py` | 9 | `prefetch_source` caches the remote-agent handle, raises on missing source, separates per-(source_id, worker_id) cache entries. `receive_segment` wires correct `(addr, byte_count, device_id)` tuples into NIXL, issues a single READ, releases the handle on success, raises on NIXL error, times out cleanly, refuses to run before `initialize()`. |
+
+### 8.7 Benchmark harness
+
+`modelexpress_client/python/benchmarks/bench_verl_rank_to_rank.py` exercises the contract end-to-end against the live MX server:
+
+- Two `MxTrainingPublisher` instances (each holding only its FSDP shard of a synthetic tensor, no allgather) + two `MxRefitReceiver` instances (each pulling its TP slice via the planner + `receive_segment`) — all four roles colocated as threads on one GPU pod to keep the deployment footprint small.
+- Per cycle: build the planner's `SliceOwnership` / `SliceRequest` inputs, call `plan_coverage`, drive the resulting `SegmentPlan`s through `receive_segment`, checksum-verify the bytes landed correctly, report per-cycle Gbps + per-source bytes + savings factor vs the v1 `receive_weights` (gather-equivalent) baseline.
+- Single self-contained file; configurable cycle count, model dimensions, publisher/receiver counts via CLI flags or env vars.
+
+### 8.8 Cluster validation
+
+_(populated after Tier 2 cluster run completes)_
+
+

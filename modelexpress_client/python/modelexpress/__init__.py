@@ -74,13 +74,45 @@ from .heartbeat import HeartbeatThread  # noqa: F401
 from .training_publisher import MxTrainingPublisher  # noqa: F401
 from .refit_receiver import MxRefitReceiver  # noqa: F401
 
+# Rank-to-rank reshard contract (used by verl + NemoRL v2 + PrimeRL mx_v2).
+# These are pure-Python modules with no torch / NIXL dependency at import
+# time, so they're safe to re-export here even when torch isn't available.
+from .rl_slice_descriptors import (  # noqa: F401
+    CoveragePlan,
+    PlanIncompleteError,
+    QuantizationMetadataError,
+    SegmentPlan,
+    SliceOwnership,
+    SliceRequest,
+)
+from .rl_reshard_planner import (  # noqa: F401
+    collect_byte_savings_vs_allgather,
+    plan_coverage,
+    summarize_plan,
+)
+from .rank_local_publisher import (  # noqa: F401
+    PlacementDescriptor,
+    RankLocalPublisher,
+)
+
 __all__ = [
+    "CoveragePlan",
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
     "MxRefitReceiver",
     "MxTrainingPublisher",
+    "PlacementDescriptor",
+    "PlanIncompleteError",
+    "QuantizationMetadataError",
+    "RankLocalPublisher",
+    "SegmentPlan",
+    "SliceOwnership",
+    "SliceRequest",
+    "collect_byte_savings_vs_allgather",
     "configure_vllm_logging",
+    "plan_coverage",
     "register_modelexpress_loaders",
+    "summarize_plan",
 ]
