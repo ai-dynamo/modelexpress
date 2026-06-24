@@ -351,6 +351,13 @@ def test_vllm_health_url_honors_non_default_config(monkeypatch):
     assert artifacts._vllm_health_url() == "http://vllm-head:8000/health"
 
 
+def test_vllm_health_url_rejects_non_http_config(monkeypatch):
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "file:///tmp/health")
+    monkeypatch.delenv("HOSTNAME", raising=False)
+
+    assert artifacts._vllm_health_url() == "http://127.0.0.1:8000/health"
+
+
 def test_vllm_health_url_uses_statefulset_head_from_worker_pod(monkeypatch):
     monkeypatch.setenv("MX_ARTIFACT_READY_URL", "http://127.0.0.1:8000/health")
     monkeypatch.setenv("HOSTNAME", "mx-vllm-1")

@@ -176,7 +176,8 @@ def publish_metadata_and_ready(
             return mx_source_id
 
         def cleanup_fn() -> None:
-            _worker_servers.pop(device_id, None)
+            if _worker_servers.get(device_id) is grpc_server:
+                _worker_servers.pop(device_id, None)
             grpc_server.stop()
     else:
         worker = p2p_pb2.WorkerMetadata(

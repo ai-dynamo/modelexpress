@@ -76,17 +76,22 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         artifact_chunk_manager: Any,
     ) -> None:
         with self._artifact_lock:
-            self._artifact_sources[mx_source_id] = _ArtifactSource(
-                manifests={artifact_id: manifest},
-                chunk_manager=artifact_chunk_manager,
-            )
+            source = self._artifact_sources.get(mx_source_id)
+            if source is None:
+                self._artifact_sources[mx_source_id] = _ArtifactSource(
+                    manifests={artifact_id: manifest},
+                    chunk_manager=artifact_chunk_manager,
+                )
+            else:
+                source.manifests[artifact_id] = manifest
 
     def unregister_artifact_source(self, mx_source_id: str, artifact_id: str) -> None:
         with self._artifact_lock:
             source = self._artifact_sources.get(mx_source_id)
             if source is None:
                 return
-            if artifact_id in source.manifests:
+            source.manifests.pop(artifact_id, None)
+            if not source.manifests:
                 self._artifact_sources.pop(mx_source_id, None)
 
     def GetTensorManifest(self, request, context):
@@ -408,7 +413,11 @@ class WorkerGrpcServer:
 
     def stop(self, grace: float = 5.0) -> None:
         if self._server is not None:
-            self._server.stop(grace)
+            server = self._server
+            self._server = None
+            self._servicer = None
+            self._port = None
+            server.stop(grace)
             logger.info("WorkerGrpcServer stopped")
 
 

@@ -205,6 +205,8 @@ class PublisherThread:
 
     def _try_publish(self) -> bool:
         """Attempt readiness-gated publication."""
+        if self._stop_event.is_set():
+            return False
         if self._publish_fn is None:
             return self._mx_source_id is not None
 
@@ -224,6 +226,8 @@ class PublisherThread:
                 )
                 return False
 
+        if self._stop_event.is_set():
+            return False
         try:
             self._mx_source_id = self._publish_fn()
             log = logger.debug if self._one_shot_publisher else logger.info
@@ -244,6 +248,8 @@ class PublisherThread:
         """Single tick: publish if needed, then send READY if healthy."""
         from .. import p2p_pb2
 
+        if self._stop_event.is_set():
+            return
         if self._mx_source_id is None:
             if not self._try_publish():
                 return
@@ -254,6 +260,8 @@ class PublisherThread:
         if self._nixl_manager is not None and not self._nixl_manager.is_healthy():
             return
 
+        if self._stop_event.is_set():
+            return
         self._update_status(p2p_pb2.SOURCE_STATUS_READY)
         if not self._started:
             logger.info(

@@ -89,7 +89,7 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     `--distributed-executor-backend=ray` on vLLM, rank-1's worker process
     lives in pod-1 and Ray doesn't forward worker stdout to the head
     pod's container logs by default. So lines like rank-1's
-    `[Worker 1] RDMA transfer complete` or `add_remote_agent: ...` only
+    `[Worker 1] RDMA transfer complete` or remote-agent load logs only
     appear in pod-1's logs, not pod-0's.
 
     For single-pod Jobs (existing TP=1 / single-node TP>=2 cases) this
@@ -190,19 +190,17 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
 def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) -> None:
     """Target must connect to one distinct source NIXL agent per target rank.
 
-    NIXL-only: the assertion scans for `add_remote_agent` log lines that the
-    shared NixlTransferManager emits. The Mooncake TransferEngine path
+    NIXL-only: the assertion scans for remote-agent log lines that the shared
+    NixlTransferManager emits. The Mooncake TransferEngine path
     (transport=transfer_engine) transfers via batch_transfer_sync_read and
     never registers NIXL agents, so there is nothing to count — skip it there.
 
     Each source rank publishes exactly one NIXL agent. The shared
     NixlTransferManager.receive_from_source (in modelexpress.nixl_transfer)
-    logs `add_remote_agent: ... (agent=b'<name>')` for every target→source
-    connection in both engine paths (vLLM via rdma_strategy.py and TRT-LLM
-    via trtllm_live_transfer.py), though the agent-name format differs per
-    engine (see regex below). Failure modes:
+    logs either `add_remote_agent: ... (agent=b'<name>')` for central metadata
+    or `Using pre-loaded remote agent <name>` for P2P metadata. Failure modes:
 
-      - TP collapse: fewer than `tp_size` add_remote_agent lines.
+      - TP collapse: fewer than `tp_size` remote-agent lines.
       - Source-rank collapse (e.g. all target ranks pulling from source rank 0
         because the rank filter regressed in _find_source_instances): same agent
         name repeats across target ranks → distinct-count < tp_size.
@@ -217,12 +215,14 @@ def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) ->
             f"per-rank NIXL agent assertion does not apply to transport={transport!r}"
         )
     # Same multi-pod concat as test_rdma_transfer_logged — under multi-node
-    # TP each rank's `add_remote_agent` line lives in its own pod's logs.
+    # TP each rank's remote-agent line lives in its own pod's logs.
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    matches = re.findall(
+    matches = []
+    for pattern in (
         r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
-        logs,
-    )
+        r"Using pre-loaded remote agent ((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)",
+    ):
+        matches.extend(re.findall(pattern, logs))
 
     distinct_pairs = set(matches)
     distinct_agents = {name for name, _ in distinct_pairs}

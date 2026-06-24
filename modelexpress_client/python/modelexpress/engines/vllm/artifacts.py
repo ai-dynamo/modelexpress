@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from fcntl import flock, LOCK_EX, LOCK_UN
@@ -346,7 +347,7 @@ def _p2p_metadata_enabled_for_artifacts(ctx: LoadContext) -> bool:
 def _ensure_nixl_manager(ctx: LoadContext) -> None:
     if ctx.nixl_manager is not None:
         return
-    base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+    base_port = _env_int("MX_METADATA_PORT", 5555)
     try:
         ctx.nixl_manager = _init_nixl_manager(
             ctx.global_rank,
@@ -519,9 +520,18 @@ def _vllm_health_ready() -> bool:
 
 def _vllm_health_url() -> str:
     configured = os.environ.get(_READY_URL_ENV, "").strip()
-    if configured and configured != _DEFAULT_READY_URL:
+    fallback = _statefulset_head_health_url() or _DEFAULT_READY_URL
+    if not configured or configured == _DEFAULT_READY_URL:
+        return fallback
+    if _is_http_url(configured):
         return configured
-    return _statefulset_head_health_url() or configured or _DEFAULT_READY_URL
+    logger.warning("Invalid %s=%r; using %s", _READY_URL_ENV, configured, fallback)
+    return fallback
+
+
+def _is_http_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def _statefulset_head_health_url() -> str | None:
@@ -536,7 +546,18 @@ def _statefulset_head_health_url() -> str | None:
 
 
 def _ready_timeout_secs() -> int:
-    return int(os.environ.get(_READY_TIMEOUT_ENV, "1800"))
+    return _env_int(_READY_TIMEOUT_ENV, 1800)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
 
 
 def _vllm_version() -> str:

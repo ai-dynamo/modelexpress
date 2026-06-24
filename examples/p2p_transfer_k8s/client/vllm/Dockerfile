@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM vllm/vllm-openai:v0.23.0
+FROM vllm/vllm-openai:v0.17.1
 
 # Copy and install ModelExpress Python client
 # Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;
