@@ -634,6 +634,42 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
     assert mx_client.published_worker.artifact_source.file_count == 1
 
 
+def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "kernel.bin").write_bytes(b"compiled-cache")
+    transfer = torch_compile_cache_artifact_transfer(
+        source,
+        tmp_path / "target",
+        tmp_path / "bundle",
+        chunk_size=8,
+    )
+    bundle = transfer.prepare_source()
+    identity = p2p_pb2.SourceIdentity(
+        mx_version="0.5.0",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        model_name="test/model",
+    )
+    mx_client = _FakeMxClient()
+    published = publish_artifact_source(
+        mx_client,
+        transfer,
+        bundle,
+        identity,
+        _FakeSourceNixlManager(listen_port=7010),
+        worker_id="source-worker-3",
+        worker_rank=3,
+        worker_grpc_server=_FakeWorkerGrpcServer(),
+        host="127.0.0.1",
+    )
+    try:
+        assert discover_artifact_source(mx_client, identity) == published.endpoint
+        with pytest.raises(LookupError):
+            discover_artifact_source(mx_client, identity, worker_rank=0)
+    finally:
+        published.stop()
+
+
 def test_publish_artifact_source_stops_server_when_refresh_fails(
     tmp_path,
 ):

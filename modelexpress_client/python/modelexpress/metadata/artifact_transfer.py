@@ -145,12 +145,16 @@ class P2PArtifactTransfer(Protocol):
         identity: p2p_pb2.SourceIdentity,
         nixl_manager: NixlTransferManager,
         *,
-        worker_rank: int | None = 0,
+        worker_rank: int | None = None,
         artifact_id: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
-        """Discover an artifact source, then transfer from its worker."""
+        """Discover an artifact source, then transfer from its worker.
+
+        By default artifact discovery does not rank-match. Pass worker_rank only
+        for artifact types whose contents are worker/rank-specific.
+        """
 
     def install(
         self,
@@ -248,7 +252,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         identity: p2p_pb2.SourceIdentity,
         nixl_manager: NixlTransferManager,
         *,
-        worker_rank: int | None = 0,
+        worker_rank: int | None = None,
         artifact_id: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
@@ -467,10 +471,14 @@ def discover_artifact_source(
     mx_client,
     identity: p2p_pb2.SourceIdentity,
     *,
-    worker_rank: int | None = 0,
+    worker_rank: int | None = None,
     artifact_id: str = "",
 ) -> ArtifactSourceEndpoint:
-    """Find a ready artifact source through the MX server."""
+    """Find a ready artifact source through the MX server.
+
+    Artifact sources are not rank-matched by default. Pass worker_rank only for
+    artifact types whose contents are worker/rank-specific.
+    """
     sources = mx_client.list_sources(
         identity=identity,
         status_filter=p2p_pb2.SOURCE_STATUS_READY,

@@ -184,6 +184,8 @@ def _mark_vllm_cache_artifact_publish_scheduled(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> Path | None:
+    # vLLM JIT cache artifacts are pod-scoped, so only one local process should
+    # publish each cache type for the pod.
     marker_path = _artifact_marker_path(transfer, identity, "publish-scheduled")
     with _artifact_lock(marker_path):
         if marker_path.exists():
@@ -207,6 +209,8 @@ def _install_vllm_cache_artifact_once(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
+    # vLLM JIT cache artifacts are pod-scoped, so one successful install per pod
+    # is enough for all local workers.
     marker_path = _artifact_marker_path(transfer, identity, "install")
     with _artifact_lock(marker_path):
         if marker_path.exists():
@@ -380,15 +384,13 @@ def _vllm_artifact_transfers(
             p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
             _triton_cache_root(),
         ),
-    ]
-    transfer_specs.append(
         (
             "deep_gemm_cache",
             deep_gemm_cache_artifact_transfer,
             p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
             _deep_gemm_cache_root(),
-        )
-    )
+        ),
+    ]
 
     return [
         (
