@@ -110,26 +110,28 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     return "\n".join(chunks)
 
 
-def _artifact_source_count(namespace: str) -> int:
+def _ready_artifact_source_types(namespace: str) -> set[str]:
     result = kubectl(
         "get", "modelmetadata",
         "-o", "json",
         namespace=namespace,
     )
     payload = json.loads(result.stdout)
-    count = 0
+    source_types = set()
     for item in payload.get("items", []):
         spec = item.get("spec") or {}
         status = item.get("status") or {}
         worker = status.get("worker") or {}
         artifact = worker.get("artifactSource") or {}
+        source_type = spec.get("sourceType")
         if (
-            spec.get("sourceType") != "weights"
+            source_type
+            and source_type != "weights"
             and worker.get("status") == "Ready"
             and artifact.get("artifactId")
         ):
-            count += 1
-    return count
+            source_types.add(source_type)
+    return source_types
 
 
 def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
@@ -243,20 +245,29 @@ def test_artifact_transfer(
     namespace: str,
     require_artifact_transfer: bool,
     expected_artifact_sources: int,
+    expected_artifact_source_types: set[str],
 ) -> None:
     if not require_artifact_transfer:
         pytest.skip("artifact transfer assertion not enabled")
 
-    source_count = _artifact_source_count(namespace)
-    assert source_count >= expected_artifact_sources, (
+    source_types = _ready_artifact_source_types(namespace)
+    assert len(source_types) >= expected_artifact_sources, (
         f"Expected at least {expected_artifact_sources} ready artifact source(s), "
-        f"got {source_count}"
+        f"got {len(source_types)}: {sorted(source_types)}"
+    )
+    assert expected_artifact_source_types <= source_types, (
+        f"Expected ready artifact source types {sorted(expected_artifact_source_types)}, "
+        f"got {sorted(source_types)}"
     )
 
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
     install_lines = [line for line in logs.splitlines() if "vLLM artifact install complete" in line]
     print("[mx-target] artifact install lines:\n" + "\n".join(install_lines))
     assert install_lines, "Target did not log vLLM artifact installation"
+    for source_type in expected_artifact_source_types:
+        assert f"name={source_type}" in logs, (
+            f"Target did not log vLLM artifact installation for {source_type}"
+        )
 
 
 def test_source_inference_produces_output(namespace: str, model: str, source_port: int) -> None:

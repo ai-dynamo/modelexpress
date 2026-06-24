@@ -65,11 +65,13 @@ def test_install_vllm_cache_artifacts_skips_when_nixl_init_fails(monkeypatch):
     transfers.assert_not_called()
 
 
-def test_artifact_identity_sets_cache_compatibility_fields(monkeypatch):
+def test_torch_compile_artifact_identity_uses_model_cache_criteria(monkeypatch):
     monkeypatch.setenv("MX_ARTIFACT_COMPILE_CONFIG_DIGEST", "compile-digest")
     monkeypatch.setattr(artifacts, "_vllm_version", lambda: "0.17.1")
     monkeypatch.setattr(artifacts, "_triton_version", lambda: "3.4.0")
+    monkeypatch.setattr(artifacts, "_triton_key", lambda: "triton-key")
     monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: f"sm90-{device_id}")
+    base_extra_parameters = {"weight_only": "not-artifact"}
     ctx = SimpleNamespace(
         device_id=2,
         identity=p2p_pb2.SourceIdentity(
@@ -79,6 +81,8 @@ def test_artifact_identity_sets_cache_compatibility_fields(monkeypatch):
             backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
             tensor_parallel_size=4,
             dtype="bfloat16",
+            revision="abc123",
+            extra_parameters=base_extra_parameters,
         ),
     )
 
@@ -89,11 +93,120 @@ def test_artifact_identity_sets_cache_compatibility_fields(monkeypatch):
 
     assert identity.model_name == "test/model"
     assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    assert identity.mx_version == ""
     assert identity.tensor_parallel_size == 4
+    assert identity.dtype == "bfloat16"
+    assert identity.revision == "abc123"
     assert identity.backend_framework_version == "0.17.1"
     assert identity.triton_version == "3.4.0"
     assert identity.gpu_arch == "sm90-2"
     assert identity.compile_config_digest == "compile-digest"
+    assert identity.extra_parameters["triton_key"] == "triton-key"
+    assert "weight_only" not in identity.extra_parameters
+
+
+def test_triton_artifact_identity_uses_runtime_cache_criteria(monkeypatch):
+    monkeypatch.setattr(artifacts, "_triton_version", lambda: "3.4.0")
+    monkeypatch.setattr(artifacts, "_triton_key", lambda: "triton-key")
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm90")
+    monkeypatch.setattr(artifacts.torch.version, "cuda", "12.8")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            mx_version="0.5.0",
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+            model_name="test/model",
+            tensor_parallel_size=8,
+            dtype="bfloat16",
+            revision="abc123",
+            extra_parameters={"weight_only": "not-artifact"},
+        ),
+    )
+
+    identity = artifacts._artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE)
+
+    assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
+    assert identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_VLLM
+    assert identity.cuda_version == "12.8"
+    assert identity.triton_version == "3.4.0"
+    assert identity.gpu_arch == "sm90"
+    assert identity.extra_parameters["triton_key"] == "triton-key"
+    assert identity.model_name == ""
+    assert identity.tensor_parallel_size == 0
+    assert identity.dtype == ""
+    assert identity.revision == ""
+    assert identity.backend_framework_version == ""
+    assert identity.torch_version == ""
+    assert "weight_only" not in identity.extra_parameters
+
+
+def test_deep_gemm_artifact_identity_uses_deep_gemm_cache_criteria(monkeypatch):
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm90")
+    monkeypatch.setattr(artifacts, "_deep_gemm_jit_key", lambda: "deep-gemm-key")
+    monkeypatch.setattr(artifacts.torch.version, "cuda", "12.8")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            mx_version="0.5.0",
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+            model_name="test/model",
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+            tensor_parallel_size=8,
+            dtype="bfloat16",
+            revision="abc123",
+            extra_parameters={"weight_only": "not-artifact"},
+        ),
+    )
+
+    identity = artifacts._artifact_identity(
+        ctx,
+        p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+    )
+
+    assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE
+    assert identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_VLLM
+    assert identity.cuda_version == "12.8"
+    assert identity.gpu_arch == "sm90"
+    assert identity.extra_parameters["deep_gemm_jit_key"] == "deep-gemm-key"
+    assert identity.model_name == ""
+    assert identity.tensor_parallel_size == 0
+    assert identity.dtype == ""
+    assert identity.revision == ""
+    assert identity.backend_framework_version == ""
+    assert identity.torch_version == ""
+    assert identity.triton_version == ""
+    assert "weight_only" not in identity.extra_parameters
+
+
+def test_triton_artifact_identity_omits_internal_key_when_unavailable(monkeypatch):
+    monkeypatch.setattr(artifacts, "_triton_version", lambda: "3.4.0")
+    monkeypatch.setattr(artifacts, "_triton_key", lambda: "")
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm90")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(),
+    )
+
+    identity = artifacts._artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE)
+
+    assert identity.triton_version == "3.4.0"
+    assert "triton_key" not in identity.extra_parameters
+
+
+def test_deep_gemm_artifact_identity_omits_jit_key_when_unavailable(monkeypatch):
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm90")
+    monkeypatch.setattr(artifacts, "_deep_gemm_jit_key", lambda: "")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(),
+    )
+
+    identity = artifacts._artifact_identity(
+        ctx,
+        p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+    )
+
+    assert "deep_gemm_jit_key" not in identity.extra_parameters
 
 
 def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tmp_path):
@@ -103,7 +216,7 @@ def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tm
     monkeypatch.delenv("DEEP_GEMM_CACHE_DIR", raising=False)
     monkeypatch.setenv("MX_ARTIFACT_BUNDLE_ROOT", str(tmp_path / "bundles"))
     monkeypatch.setattr(artifacts, "_vllm_version", lambda: "0.17.1")
-    monkeypatch.setattr(artifacts, "_triton_version", lambda: "3.4.0")
+    monkeypatch.setattr(artifacts, "_triton_key", lambda: "triton-key")
     monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: f"sm90-{device_id}")
     ctx = SimpleNamespace(
         worker_rank=1,

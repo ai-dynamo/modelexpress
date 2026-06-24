@@ -98,6 +98,10 @@ inputs:
     description: 'Number of ready non-weight artifact ModelMetadata CRs expected before target starts.'
     required: false
     default: '0'
+  expected_artifact_source_types:
+    description: 'Comma-separated non-weight artifact sourceType values expected by pytest.'
+    required: false
+    default: ''
 runs:
   using: "composite"
   steps:
@@ -421,6 +425,7 @@ runs:
         TP_SIZE: ${{ inputs.tp_size }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
         EXPECTED_ARTIFACT_SOURCES: ${{ inputs.expected_artifact_sources }}
+        EXPECTED_ARTIFACT_SOURCE_TYPES: ${{ inputs.expected_artifact_source_types }}
       run: |
         # Parse PYTEST_ARGS via shlex so values with internal spaces
         # (e.g. --p2p-marker 'TRT-LLM marker with spaces') are honored,
@@ -431,8 +436,14 @@ runs:
             python3 -c 'import shlex,sys; [sys.stdout.buffer.write(a.encode()+b"\0") for a in shlex.split(sys.argv[1])]' "${PYTEST_ARGS}"
           )
         fi
+        if [ "${EXPECTED_ARTIFACT_SOURCES}" != "0" ] || [ -n "${EXPECTED_ARTIFACT_SOURCE_TYPES}" ]; then
+          EXTRA+=(--require-artifact-transfer)
+        fi
         if [ "${EXPECTED_ARTIFACT_SOURCES}" != "0" ]; then
-          EXTRA+=(--require-artifact-transfer --expected-artifact-sources "${EXPECTED_ARTIFACT_SOURCES}")
+          EXTRA+=(--expected-artifact-sources "${EXPECTED_ARTIFACT_SOURCES}")
+        fi
+        if [ -n "${EXPECTED_ARTIFACT_SOURCE_TYPES}" ]; then
+          EXTRA+=(--expected-artifact-source-types "${EXPECTED_ARTIFACT_SOURCE_TYPES}")
         fi
         pytest "${TEST_SCRIPT}" -v \
           --namespace "${NAMESPACE}" \

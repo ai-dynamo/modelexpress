@@ -74,6 +74,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Minimum ready non-weight artifact ModelMetadata CRs expected at pytest time.",
     )
     parser.addoption(
+        "--expected-artifact-source-types",
+        default=os.environ.get("EXPECTED_ARTIFACT_SOURCE_TYPES", ""),
+        help=(
+            "Comma-separated artifact sourceType values expected to be ready "
+            "and installed, for example 'torch_compile_cache,triton_cache'."
+        ),
+    )
+    parser.addoption(
         "--dgd-name",
         default=os.environ.get("DGD_NAME", "mx-dynamo-vllm"),
         help=(
@@ -160,6 +168,12 @@ def require_artifact_transfer(request: pytest.FixtureRequest) -> bool:
 @pytest.fixture(scope="session")
 def expected_artifact_sources(request: pytest.FixtureRequest) -> int:
     return request.config.getoption("--expected-artifact-sources")
+
+
+@pytest.fixture(scope="session")
+def expected_artifact_source_types(request: pytest.FixtureRequest) -> set[str]:
+    raw = request.config.getoption("--expected-artifact-source-types")
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 @pytest.fixture(scope="session")

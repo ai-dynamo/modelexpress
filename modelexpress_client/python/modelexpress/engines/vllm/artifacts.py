@@ -442,16 +442,70 @@ def _artifact_identity(
     ctx: LoadContext,
     mx_source_type: int,
 ) -> p2p_pb2.SourceIdentity:
-    identity = p2p_pb2.SourceIdentity()
-    identity.CopyFrom(ctx.identity)
-    identity.mx_source_type = mx_source_type
-    identity.backend_framework_version = _vllm_version()
-    identity.torch_version = torch.__version__
-    identity.cuda_version = torch.version.cuda or ""
-    identity.triton_version = _triton_version()
-    identity.gpu_arch = _gpu_arch(ctx.device_id)
-    identity.compile_config_digest = os.environ.get(_COMPILE_CONFIG_DIGEST_ENV, "")
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE:
+        return _torch_compile_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE:
+        return _triton_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE:
+        return _deep_gemm_cache_identity(ctx)
+    raise ValueError(f"unknown vLLM artifact source type: {mx_source_type}")
+
+
+def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    # TorchInductor cache entries are tied to the model graph and compiler stack.
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        tensor_parallel_size=ctx.identity.tensor_parallel_size,
+        pipeline_parallel_size=ctx.identity.pipeline_parallel_size,
+        expert_parallel_size=ctx.identity.expert_parallel_size,
+        dtype=ctx.identity.dtype,
+        quantization=ctx.identity.quantization,
+        revision=ctx.identity.revision,
+        backend_framework_version=_vllm_version(),
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda or "",
+        triton_version=_triton_version(),
+        gpu_arch=_gpu_arch(ctx.device_id),
+        compile_config_digest=os.environ.get(_COMPILE_CONFIG_DIGEST_ENV, ""),
+    )
+    _set_extra_if_present(identity, "triton_key", _triton_key())
     return identity
+
+
+def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    # Triton cache entries are self-keyed by source/options; share by runtime stack.
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version=torch.version.cuda or "",
+        triton_version=_triton_version(),
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "triton_key", _triton_key())
+    return identity
+
+
+def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    # DeepGEMM cache entries are self-keyed by JIT source/compiler; share by runtime.
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "deep_gemm_jit_key", _deep_gemm_jit_key())
+    return identity
+
+
+def _set_extra_if_present(
+    identity: p2p_pb2.SourceIdentity,
+    key: str,
+    value: str,
+) -> None:
+    if value:
+        identity.extra_parameters[key] = value
 
 
 def _has_files(path: Path) -> bool:
@@ -581,6 +635,27 @@ def _triton_version() -> str:
 
         version = getattr(triton, "__version__", "")
         return version if isinstance(version, str) else str(version)
+    except Exception:
+        return ""
+
+
+def _triton_key() -> str:
+    try:
+        from triton.runtime.cache import triton_key
+
+        key = triton_key()
+        if isinstance(key, str) and key:
+            return key
+    except Exception:
+        return ""
+    return ""
+
+
+def _deep_gemm_jit_key() -> str:
+    try:
+        from deep_gemm.jit.compiler import get_deep_gemm_version
+
+        return get_deep_gemm_version()
     except Exception:
         return ""
 
