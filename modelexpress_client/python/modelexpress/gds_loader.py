@@ -26,7 +26,7 @@ from typing import Iterator
 
 import torch
 
-from .accelerators import AcceleratorBackend, CudaAcceleratorBackend
+from .accelerators import AcceleratorBackend
 from .gds_transfer import GdsTransferManager, is_gds_available
 
 logger = logging.getLogger("modelexpress.gds_loader")
@@ -57,7 +57,7 @@ class MxGdsLoader:
 
     Usage::
 
-        loader = MxGdsLoader()
+        loader = MxGdsLoader(accelerator_backend)
         tensors = loader.load("/path/to/model")
 
         # Or stream per-file:
@@ -65,10 +65,10 @@ class MxGdsLoader:
             process(name, tensor)
     """
 
-    def __init__(self, accelerator_backend: AcceleratorBackend | None = None):
+    def __init__(self, accelerator_backend: AcceleratorBackend):
         self._gds_manager: GdsTransferManager | None = None
         self._device_id: int | None = None
-        self._accelerator_backend = accelerator_backend or CudaAcceleratorBackend()
+        self._accelerator_backend = accelerator_backend
 
     # ------------------------------------------------------------------
     # Public API

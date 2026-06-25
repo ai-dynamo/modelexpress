@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from .accelerators import AcceleratorBackend, CudaAcceleratorBackend
+from .accelerators import AcceleratorBackend
 
 logger = logging.getLogger("modelexpress.gds_transfer")
 
@@ -94,15 +94,15 @@ class GdsTransferManager:
     a single NIXL transfer so GDS_MT threads work in parallel.
 
     Usage as context manager:
-        with GdsTransferManager(agent_name="mx-gds-0") as gds:
+        with GdsTransferManager(agent_name="mx-gds-0", accelerator_backend=backend) as gds:
             gds.batch_load_file(fd, file_size, tensor_list, device)
     """
 
-    def __init__(self, agent_name: str, accelerator_backend: AcceleratorBackend | None = None):
+    def __init__(self, agent_name: str, accelerator_backend: AcceleratorBackend):
         self._agent_name = agent_name
         self._device_id: int | None = None
         self._agent: Any = None
-        self._accelerator_backend = accelerator_backend or CudaAcceleratorBackend()
+        self._accelerator_backend = accelerator_backend
         override = os.environ.get("MX_GDS_MAX_CHUNK_KB")
         self._max_chunk_size = int(override) * 1024 if override else _DEFAULT_MAX_CHUNK
 
