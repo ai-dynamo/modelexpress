@@ -237,7 +237,7 @@ cargo bench
 - **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
 - **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
 - **Large model gRPC stream** — May not close automatically; use client timeout.
-- **GDS reads full tensors under TP** — The GDS load path reads each whole checkpoint tensor on every rank and slices for tensor parallelism afterward, so disk bytes read scale with TP degree. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
+- **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
 
 ---
 
