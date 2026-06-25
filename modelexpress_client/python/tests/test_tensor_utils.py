@@ -184,25 +184,20 @@ class TestAdoptHiddenTensors:
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         module = nn.Module()
 
-        class A:
-            def __init__(self):
-                self.scale = torch.randn(4)
-
-        a = A()
-        b_dict = {"scale": torch.randn(4)}
-        # Both attributes normalize to `_mx_<attr>_scale`; with "__dot__" the
-        # attr prefix differs, but we also want collision handling if two
-        # hidden tensors under one attr share a sanitized suffix.
-        module.a = a
-        module.b = b_dict
-        # Second hidden tensor on `a` whose path collides after sanitization:
-        # "scale.x" and "scale[x]" both normalize similarly.
-        a.__dict__["inner"] = {"k": torch.randn(4)}
+        # Two hidden tensors under one module attribute whose paths sanitize
+        # to the same base name: sanitization strips "[" and "]", so dict keys
+        # "k[0]" and "k0" both normalize to `_mx_q_k0_t`. The second adoption
+        # must hit the `while hasattr(...)` suffix branch instead of
+        # overwriting the first buffer.
+        module.q = {"k[0]": torch.randn(4), "k0": torch.randn(4)}
 
         count = adopt_hidden_tensors(module, backend)
-        assert count == 3
+        assert count == 2
         buffer_ptrs = {buf.data_ptr() for _, buf in module.named_buffers()}
-        assert len(buffer_ptrs) == 3  # no overwrite, all tensors survived
+        assert len(buffer_ptrs) == 2  # both survived, neither overwritten
+        # The collision forced a numeric suffix onto the second buffer.
+        buf_names = {name for name, _ in module.named_buffers()}
+        assert any(name.endswith("_0") for name in buf_names)
 
 
 # ---------------------------------------------------------------------------
