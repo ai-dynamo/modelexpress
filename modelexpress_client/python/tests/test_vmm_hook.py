@@ -13,6 +13,20 @@ from __future__ import annotations
 import pytest
 
 
+class _StubBackend:
+    """Minimal accelerator backend for VMM hook tests.
+
+    maybe_enter_vmm_arena only reads name + supports_vmm_arena(); these
+    tests exercise the path past the capability gate, so the gate returns
+    True.
+    """
+
+    name = "stub"
+
+    def supports_vmm_arena(self) -> bool:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # C extension loadable on any host where it built
 # ---------------------------------------------------------------------------
@@ -273,6 +287,7 @@ class TestOptionalExtension:
         class _Ctx:
             global_rank = 0
             device_id = 0
+            accelerator_backend = _StubBackend()
 
         with caplog.at_level("WARNING", logger=vmm_runtime.logger.name):
             # Entering the context manager must not raise; the body must
@@ -302,6 +317,7 @@ class TestOptionalExtension:
         class _Ctx:
             global_rank = 0
             device_id = 0
+            accelerator_backend = _StubBackend()
 
         entered = False
         with vmm_runtime.maybe_enter_vmm_arena(_Ctx()):
@@ -329,6 +345,7 @@ class _StubCtx:
     device_id = 0
     target_device = _StubTargetDevice()
     vmm_arena = None
+    accelerator_backend = _StubBackend()
 
 
 class _StubCudaVmmBackend:

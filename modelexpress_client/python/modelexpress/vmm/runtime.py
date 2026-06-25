@@ -107,13 +107,12 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
         yield
         return
 
-    accelerator_backend = getattr(ctx, "accelerator_backend", None)
-    if accelerator_backend is not None and not accelerator_backend.supports_vmm_arena():
+    if not ctx.accelerator_backend.supports_vmm_arena():
         logger.warning(
             "[Worker %d] MX_VMM_ARENA=1 set but %s does not support VMM "
             "arena; falling back to the non-arena load path.",
             ctx.global_rank,
-            accelerator_backend.name,
+            ctx.accelerator_backend.name,
         )
         yield
         return
