@@ -16,6 +16,7 @@ import torch
 
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
+from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 
@@ -40,6 +41,7 @@ class SglangAdapter(EngineAdapter):
         self.model_config = model_config
         self.device_config = device_config
         self.target_device = torch.device(device_config.device)
+        self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self) -> p2p_pb2.SourceIdentity:
         return build_sglang_source_identity(
@@ -147,8 +149,7 @@ class SglangAdapter(EngineAdapter):
         result.value = None
         result.model = None
         del old_value
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self.accelerator_backend.empty_cache()
 
         logger.info(
             "[Worker %s] Re-initializing SGLang model after failed strategy",
@@ -341,4 +342,5 @@ def build_sglang_load_context(
         ),
         worker_id=uuid.uuid4().hex[:8],
         adapter=adapter,
+        accelerator_backend=adapter.accelerator_backend,
     )

@@ -7,8 +7,8 @@ Framework-agnostic GDS model loader.
 Loads model weights from safetensors files directly to GPU memory via NIXL's
 GDS (GPUDirect Storage) backend, bypassing CPU bounce buffers entirely.
 
-The target GPU is determined from torch.cuda.current_device(), matching
-the behavior of vLLM/sglang default loaders.
+The target GPU is determined from the active accelerator backend, matching the
+behavior of vLLM/sglang default loaders on CUDA.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from typing import Iterator
 
 import torch
 
+from .accelerators import AcceleratorBackend
 from .gds_transfer import GdsTransferManager, is_gds_available
 
 logger = logging.getLogger("modelexpress.gds_loader")
@@ -56,7 +57,7 @@ class MxGdsLoader:
 
     Usage::
 
-        loader = MxGdsLoader()
+        loader = MxGdsLoader(accelerator_backend)
         tensors = loader.load("/path/to/model")
 
         # Or stream per-file:
@@ -64,9 +65,10 @@ class MxGdsLoader:
             process(name, tensor)
     """
 
-    def __init__(self):
+    def __init__(self, accelerator_backend: AcceleratorBackend):
         self._gds_manager: GdsTransferManager | None = None
         self._device_id: int | None = None
+        self._accelerator_backend = accelerator_backend
 
     # ------------------------------------------------------------------
     # Public API
@@ -100,7 +102,7 @@ class MxGdsLoader:
                 "GDS is not available. Check nvidia_fs module and libcufile."
             )
 
-        self._device_id = torch.cuda.current_device()
+        self._device_id = self._accelerator_backend.current_device()
         self._ensure_gds_manager()
 
         file_tensor_map = self._resolve_safetensors_files(model_path)
@@ -177,7 +179,10 @@ class MxGdsLoader:
             return
 
         agent_name = f"mx-gds-{self._device_id}-{uuid.uuid4().hex[:8]}"
-        self._gds_manager = GdsTransferManager(agent_name=agent_name)
+        self._gds_manager = GdsTransferManager(
+            agent_name=agent_name,
+            accelerator_backend=self._accelerator_backend,
+        )
         self._gds_manager.initialize()
         logger.info("GDS manager initialized for device %d", self._device_id)
 
@@ -287,7 +292,7 @@ class MxGdsLoader:
         All tensors are submitted in a single batch so GDS_MT threads
         work in parallel. Reads go directly into result tensors.
         """
-        device = torch.device("cuda", self._device_id)
+        device = self._accelerator_backend.torch_device(self._device_id)
 
         sorted_names = sorted(
             tensor_infos.keys(),
