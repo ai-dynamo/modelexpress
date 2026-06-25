@@ -27,7 +27,7 @@ class MockAcceleratorBackend:
     nixl_mem_type: str = "VRAM"
     rdma_p2p: bool = False
     pool_reg: bool = False
-    vmm_arena: bool = False
+    vmm: bool = False
     gds: bool = False
     set_device_calls: list[int] = field(default_factory=list)
     synchronize_calls: list[int | None] = field(default_factory=list)
@@ -58,7 +58,7 @@ class MockAcceleratorBackend:
         return self.pool_reg
 
     def supports_vmm(self) -> bool:
-        return self.vmm_arena
+        return self.vmm
 
     def supports_gds(self) -> bool:
         return self.gds

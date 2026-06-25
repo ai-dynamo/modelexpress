@@ -128,7 +128,7 @@ class TestAcceleratorCapabilityGates:
             def registered_range(self):
                 return 0x1000, 0x2000
 
-        backend = mock_accelerator_backend_cls(vmm_arena=False)
+        backend = mock_accelerator_backend_cls(vmm=False)
         mgr = self._make_manager(backend)
         tensor = torch.zeros(1)
 
@@ -216,7 +216,7 @@ class TestAcceleratorCapabilityGates:
             target_device = nullcontext()
 
         ctx = Ctx()
-        ctx.accelerator_backend = mock_accelerator_backend_cls(vmm_arena=False)
+        ctx.accelerator_backend = mock_accelerator_backend_cls(vmm=False)
 
         entered = False
         with vmm_runtime.maybe_enter_vmm_arena(ctx):
