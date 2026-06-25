@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from modelexpress.accelerator_backend import (
+from modelexpress.accelerators import (
     CudaAcceleratorBackend,
     accelerator_backend_for,
 )

@@ -26,7 +26,7 @@ from typing import Iterator
 
 import torch
 
-from .accelerator_backend import AcceleratorBackend, CudaAcceleratorBackend
+from .accelerators import AcceleratorBackend, CudaAcceleratorBackend
 from .gds_transfer import GdsTransferManager, is_gds_available
 
 logger = logging.getLogger("modelexpress.gds_loader")

@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from .accelerator_backend import AcceleratorBackend, CudaAcceleratorBackend
+from .accelerators import AcceleratorBackend, CudaAcceleratorBackend
 
 logger = logging.getLogger("modelexpress.gds_transfer")
 

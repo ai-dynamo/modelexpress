@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
-from modelexpress.accelerator_backend import NIXL_ACCELERATOR_MEM_TYPE
+from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.nixl_transfer import (
     NixlTransferManager,
     _pool_reg_enabled,

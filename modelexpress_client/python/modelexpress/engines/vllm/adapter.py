@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from ...adapter import EngineAdapter
-from ...accelerator_backend import accelerator_backend_for
+from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...metadata.publish import build_source_identity

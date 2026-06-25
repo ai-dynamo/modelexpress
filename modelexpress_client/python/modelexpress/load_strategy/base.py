@@ -19,7 +19,7 @@ from ..metadata.publish import publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
-    from ..accelerator_backend import AcceleratorBackend
+    from ..accelerators import AcceleratorBackend
     from ..nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.load_strategy")

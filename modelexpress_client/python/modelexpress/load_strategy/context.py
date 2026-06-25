@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from .. import p2p_pb2
 from ..client import MxClientBase
-from ..accelerator_backend import AcceleratorBackend, CudaAcceleratorBackend
+from ..accelerators import AcceleratorBackend, CudaAcceleratorBackend
 
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter

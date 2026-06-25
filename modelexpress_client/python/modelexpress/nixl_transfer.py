@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from . import ucx_utils
-from .accelerator_backend import (
+from .accelerators import (
     AcceleratorBackend,
     CudaAcceleratorBackend,
 )
