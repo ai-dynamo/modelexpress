@@ -16,14 +16,14 @@ import pytest
 class _StubBackend:
     """Minimal accelerator backend for VMM hook tests.
 
-    maybe_enter_vmm_arena only reads name + supports_vmm_arena(); these
+    maybe_enter_vmm_arena only reads name + supports_vmm(); these
     tests exercise the path past the capability gate, so the gate returns
     True.
     """
 
     name = "stub"
 
-    def supports_vmm_arena(self) -> bool:
+    def supports_vmm(self) -> bool:
         return True
 
 

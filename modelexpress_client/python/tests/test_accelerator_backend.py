@@ -30,7 +30,7 @@ class TestCudaAcceleratorBackend:
         assert backend.nixl_mem_type == "VRAM"
         assert backend.supports_rdma_p2p() is True
         assert backend.supports_pool_reg() is True
-        assert backend.supports_vmm_arena() is True
+        assert backend.supports_vmm() is True
         assert backend.supports_gds() is True
 
     def test_cuda_backend_delegates_torch_calls(self, monkeypatch):

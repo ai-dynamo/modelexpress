@@ -64,7 +64,7 @@ class AcceleratorBackend(Protocol):
         """Return whether allocation-level NIXL pool registration is supported."""
         ...
 
-    def supports_vmm_arena(self) -> bool:
+    def supports_vmm(self) -> bool:
         """Return whether the CUDA VMM arena fast path is supported."""
         ...
 
@@ -116,7 +116,7 @@ class CudaAcceleratorBackend:
     def supports_pool_reg(self) -> bool:
         return True
 
-    def supports_vmm_arena(self) -> bool:
+    def supports_vmm(self) -> bool:
         return True
 
     def supports_gds(self) -> bool:

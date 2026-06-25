@@ -57,7 +57,7 @@ class MockAcceleratorBackend:
     def supports_pool_reg(self) -> bool:
         return self.pool_reg
 
-    def supports_vmm_arena(self) -> bool:
+    def supports_vmm(self) -> bool:
         return self.vmm_arena
 
     def supports_gds(self) -> bool:

@@ -361,7 +361,7 @@ class NixlTransferManager:
             )
             return self.register_tensors(tensors)
 
-        if not self._accelerator_backend.supports_vmm_arena():
+        if not self._accelerator_backend.supports_vmm():
             logger.warning(
                 "%s does not support VMM arena registration; falling back "
                 "to per-tensor registration",
