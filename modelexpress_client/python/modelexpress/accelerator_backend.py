@@ -56,6 +56,10 @@ class AcceleratorBackend(Protocol):
         """Return whether ``tensor`` lives on this backend's accelerator memory."""
         ...
 
+    def supports_rdma_p2p(self) -> bool:
+        """Return whether this backend supports NIXL RDMA P2P transfers."""
+        ...
+
     def supports_pool_reg(self) -> bool:
         """Return whether allocation-level NIXL pool registration is supported."""
         ...
@@ -105,6 +109,9 @@ class CudaAcceleratorBackend:
 
     def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
         return bool(tensor.is_cuda)
+
+    def supports_rdma_p2p(self) -> bool:
+        return True
 
     def supports_pool_reg(self) -> bool:
         return True

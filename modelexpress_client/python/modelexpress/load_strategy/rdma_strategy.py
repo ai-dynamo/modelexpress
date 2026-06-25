@@ -58,6 +58,13 @@ class RdmaStrategy(LoadStrategy):
         if not is_nixl_available():
             return False
 
+        if not ctx.accelerator_backend.supports_rdma_p2p():
+            logger.info(
+                f"[Worker {ctx.global_rank}] Backend "
+                f"{ctx.accelerator_backend.name} does not support RDMA P2P, skipping"
+            )
+            return False
+
         # Decentralized backends (k8s-service) serve their own
         # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't

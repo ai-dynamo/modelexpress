@@ -25,6 +25,7 @@ class MockAcceleratorBackend:
     name: str = "mock"
     torch_device_type: str = "mock"
     nixl_mem_type: str = "VRAM"
+    rdma_p2p: bool = False
     pool_reg: bool = False
     vmm_arena: bool = False
     gds: bool = False
@@ -49,6 +50,9 @@ class MockAcceleratorBackend:
 
     def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
         return tensor.device.type == self.torch_device_type
+
+    def supports_rdma_p2p(self) -> bool:
+        return self.rdma_p2p
 
     def supports_pool_reg(self) -> bool:
         return self.pool_reg

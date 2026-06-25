@@ -28,6 +28,7 @@ class TestCudaAcceleratorBackend:
         assert backend.name == "cuda"
         assert backend.torch_device_type == "cuda"
         assert backend.nixl_mem_type == "VRAM"
+        assert backend.supports_rdma_p2p() is True
         assert backend.supports_pool_reg() is True
         assert backend.supports_vmm_arena() is True
         assert backend.supports_gds() is True
