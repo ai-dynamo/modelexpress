@@ -19,6 +19,8 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 <p align="center">
+  <a href="#start-here">Start Here</a> •
+  <a href="docs/COMPATIBILITY.md">Compatibility</a> •
   <a href="#features">Features</a> •
   <a href="#modelexpress-architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
@@ -31,7 +33,9 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-ModelExpress is a Rust-based service that manages the complete model weight lifecycle in the cluster—from acquisition to GPU memory. It accelerates LLM inference by caching, routing, and transferring weights through the fastest available path. Deploy standalone or as a sidecar alongside vLLM, NVIDIA Dynamo, and other inference runtimes.
+ModelExpress (MX) is a Rust-based service that manages the complete model weight lifecycle in a GPU cluster — from acquisition to GPU memory. It accelerates the startup times of new LLM inference deployments by caching, routing, and transferring model weights through the fastest available path(s). 
+
+ModelExpress works beyond NVIDIA Dynamo. You can run it standalone as a model-weight service, integrate it directly with stock inference runtimes such as vLLM and  SGLang, or let higher-level systems such as Dynamo, llm-d, Prime-RL, and similar orchestration layers use MX as the weight lifecycle and transfer substrate.
 
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
@@ -42,7 +46,7 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 
 ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads a model from external sources (e.g., HuggingFace); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
 
-1. **Download from HuggingFace** — One node pulls the model; ModelExpress coordinates so no other node duplicates this download, reducing external ingress. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
+1. **Download from HuggingFace/S3** — One node pulls the model; ModelExpress coordinates so no other node duplicates this download, reducing external ingress. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
 2. **Persist to disk** — Store in a cache backed by disk:
    - **Host-attached disk** — Local disk on the node (single-node or per-node cache).
    - **PVC** — RWO (ReadWriteOnce) for single-node; RWX (ReadWriteMany) for shared access across nodes.
@@ -51,17 +55,37 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ---
 
+## Start Here
+
+New to ModelExpress? Follow this path:
+
+1. **Run the server and CLI locally:** [Quick Start](#quick-start) gets a local server running and verifies it with `modelexpress-cli health`. No GPU required.
+2. **Check what is supported:** [Compatibility](docs/COMPATIBILITY.md) lists tested engines, image pins, and beta/experimental paths.
+3. **Pick one deployment path:**
+
+| If your goal is... | Start here |
+|--------------------|------------|
+| Faster vLLM replica startup with P2P RDMA | [Kubernetes P2P examples](examples/p2p_transfer_k8s/README.md) |
+| Loading weights directly from S3, Azure Blob, GCS, or PVC | [ModelStreamer examples](examples/model_streamer_k8s/README.md) |
+| Using ModelExpress inside Dynamo | [Dynamo model cache](examples/dynamo_model_cache_k8s/README.md) or [Dynamo P2P](examples/dynamo_p2p_transfer_k8s/README.md) |
+| Using SGLang | [SGLang guide](docs/SGLANG.md) |
+| Evaluating TensorRT-LLM P2P | [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
+
+For Kubernetes deployments, choose a metadata backend before rollout: see the [deployment backend guide](docs/DEPLOYMENT.md#choosing-a-metadata-backend).
+
+---
+
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
-- **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
+- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias), SGLang `remote_instance` backend, and TRT-LLM `PRESHARDED` beta path
+- **Metadata backends** — Redis or Kubernetes CRD for coordinated deployments; feature-gated in-memory backend for local development and tests
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
-- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS) with multi-engine support
+- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS), with vLLM support today and additional engine coverage evolving
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
-- **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
+- **GDS (GPUDirect Storage)**: hardware-dependent path for loading model weights directly from NVMe into GPU memory
 
 ### Integrations
 
@@ -225,6 +249,7 @@ cargo bench
 | Doc | Description |
 |-----|-------------|
 | [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
+| [Compatibility](docs/COMPATIBILITY.md) | Tested runtime and platform pins |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [CLI](docs/CLI.md) | Full CLI reference |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
