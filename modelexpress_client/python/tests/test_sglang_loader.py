@@ -8,6 +8,7 @@ from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -44,6 +45,14 @@ def _device_config(**overrides):
     defaults = dict(device="cpu", gpu_id=0)
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
 
 
 def test_sglang_adapter_builds_identity_from_sglang_configs():

@@ -23,6 +23,12 @@ class GdsStrategy(LoadStrategy):
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):
             return False
+        if not ctx.accelerator_backend.supports_gds():
+            logger.info(
+                f"[Worker {ctx.global_rank}] GDS not supported on "
+                f"{ctx.accelerator_backend.name}, skipping"
+            )
+            return False
         from ..gds_transfer import is_gds_available
         available = is_gds_available()
         if not available:
@@ -34,7 +40,7 @@ class GdsStrategy(LoadStrategy):
         from ..gds_loader import MxGdsLoader
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting GDS loading...")
-        gds_loader = MxGdsLoader()
+        gds_loader = MxGdsLoader(accelerator_backend=ctx.accelerator_backend)
         try:
             try:
                 use_tqdm = getattr(ctx.load_config, "use_tqdm_on_load", True)

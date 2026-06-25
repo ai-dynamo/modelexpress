@@ -29,6 +29,14 @@ def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
+
+
 def test_worker_rank_uses_torch_distributed_global_rank():
     config = _vllm_config(rank=2, tp_size=4, pp_size=2)
     device = torch.device("cuda", 0)
@@ -79,13 +87,20 @@ def test_vllm_device_id_uses_current_platform_device(monkeypatch):
     assert _get_vllm_device_id(torch.device("cuda")) == 2
 
 
-def test_vllm_is_cuda_alike_uses_current_platform(monkeypatch):
+def test_vllm_is_cuda_alike_uses_current_platform(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
             is_cuda_alike=lambda: True,
         ),
     )
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
 
     assert adapter.is_cuda_alike() is True

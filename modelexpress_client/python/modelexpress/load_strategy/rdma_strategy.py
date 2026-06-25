@@ -10,8 +10,6 @@ import os
 import random
 import time
 
-import torch
-
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import (
     LoadContext,
@@ -58,6 +56,13 @@ class RdmaStrategy(LoadStrategy):
         if not super().is_available(ctx):
             return False
         if not is_nixl_available():
+            return False
+
+        if not ctx.accelerator_backend.supports_rdma_p2p():
+            logger.info(
+                f"[Worker {ctx.global_rank}] Backend "
+                f"{ctx.accelerator_backend.name} does not support RDMA P2P, skipping"
+            )
             return False
 
         # Decentralized backends (k8s-service) serve their own
@@ -302,7 +307,7 @@ class RdmaStrategy(LoadStrategy):
             f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
         )
 
-        torch.cuda.synchronize()
+        ctx.accelerator_backend.synchronize()
 
         total_time = time.perf_counter() - receive_start
         logger.info(f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s")

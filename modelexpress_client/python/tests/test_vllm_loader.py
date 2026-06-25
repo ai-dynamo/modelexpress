@@ -922,6 +922,28 @@ class TestRdmaStrategyAvailability:
         assert strategy.is_available(ctx) is False
 
     @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_unavailable_when_backend_lacks_rdma_p2p(
+        self, _mock, mock_accelerator_backend_cls
+    ):
+        strategy = self._make_strategy()
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(rdma_p2p=False)
+        )
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert strategy.is_available(ctx) is False
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_available_when_backend_supports_rdma_p2p(
+        self, _mock, mock_accelerator_backend_cls
+    ):
+        strategy = self._make_strategy()
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(rdma_p2p=True)
+        )
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert strategy.is_available(ctx) is True
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
     def test_available_when_decentralized_backend_and_no_server_address(self, _mock):
         # Decentralized backends (REQUIRES_P2P_METADATA=True) don't need
         # a central server, so the "no server configured" gate shouldn't

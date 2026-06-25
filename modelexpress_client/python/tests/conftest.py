@@ -12,9 +12,61 @@ validation works correctly.
 
 import sys
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
+import pytest
+import torch
 import torch.nn as nn
+
+
+@dataclass
+class MockAcceleratorBackend:
+    name: str = "mock"
+    torch_device_type: str = "mock"
+    nixl_mem_type: str = "VRAM"
+    rdma_p2p: bool = False
+    pool_reg: bool = False
+    vmm: bool = False
+    gds: bool = False
+    set_device_calls: list[int] = field(default_factory=list)
+    synchronize_calls: list[int | None] = field(default_factory=list)
+    empty_cache_calls: int = 0
+
+    def set_device(self, device_id: int) -> None:
+        self.set_device_calls.append(device_id)
+
+    def current_device(self) -> int:
+        return 0
+
+    def synchronize(self, device_id: int | None = None) -> None:
+        self.synchronize_calls.append(device_id)
+
+    def empty_cache(self) -> None:
+        self.empty_cache_calls += 1
+
+    def torch_device(self, device_id: int) -> torch.device:
+        return torch.device("cpu")
+
+    def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
+        return tensor.device.type == self.torch_device_type
+
+    def supports_rdma_p2p(self) -> bool:
+        return self.rdma_p2p
+
+    def supports_pool_reg(self) -> bool:
+        return self.pool_reg
+
+    def supports_vmm(self) -> bool:
+        return self.vmm
+
+    def supports_gds(self) -> bool:
+        return self.gds
+
+
+@pytest.fixture
+def mock_accelerator_backend_cls():
+    return MockAcceleratorBackend
 
 
 def _maybe_mock_vllm():

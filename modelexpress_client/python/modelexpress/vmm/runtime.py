@@ -107,6 +107,16 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
         yield
         return
 
+    if not ctx.accelerator_backend.supports_vmm():
+        logger.warning(
+            "[Worker %d] MX_VMM_ARENA=1 set but %s does not support VMM "
+            "arena; falling back to the non-arena load path.",
+            ctx.global_rank,
+            ctx.accelerator_backend.name,
+        )
+        yield
+        return
+
     # The previous chunked-arena design accepted MX_VMM_ARENA_BYTES and
     # MX_VMM_ARENA_CHUNK_BYTES env vars. The current design ignores
     # both (16 TiB VA reserve is unconditional, no chunked
