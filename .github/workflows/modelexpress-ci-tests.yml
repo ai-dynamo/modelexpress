@@ -35,6 +35,15 @@
 #                         GPU per pod, 2 pods per role). See TEST_PLAN
 #                         row 5.1 for the full topology rationale.
 #
+#   test-dp             — DP > 1 variant of test-p2p. vLLM native data
+#                         parallelism (--data-parallel-size 2): N full model
+#                         copies, not sharded weights. Runs with tp_size=1
+#                         because the ModelExpress identity carries no DP
+#                         dimension and DP cores are interchangeable — the
+#                         target's DP cores each pull the full rank-0 weight
+#                         set over RDMA (N concurrent pulls from one source).
+#                         See TEST_PLAN row 5.2.
+#
 #   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
 #                        Uses a TP=2 DeepSeek MLA + MoE model and also runs
 #                        the standard source/target VRAM parity assertions.
@@ -570,6 +579,92 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # P2P weight transfer with data parallelism > 1 (vLLM native DP).
+  # Single pod, --data-parallel-size 2: two full model copies, each pinned to
+  # one GPU. Unlike TP (which shards weights and pairs ranks), DP cores are
+  # interchangeable full copies, so the ModelExpress identity carries no DP
+  # dimension and every DP core resolves to worker_rank 0. The source publishes
+  # a single rank-0 ModelMetadata CR and the target's DP cores each pull the
+  # full rank-0 weight set over RDMA — N concurrent pulls from one source.
+  #
+  # Hence tp_size is left at the default 1: the per-rank agent assertion expects
+  # exactly one distinct source agent (rank 0), which is correct for DP. See
+  # TEST_PLAN row 5.2.
+  #
+  # Pinned to the same non-MIG agentpool as test-tp via the nodeSelector in
+  # manifest-azure-dp2.yaml.
+  # ---------------------------------------------------------------------------
+  test-dp:
+    name: P2P DP test (${{ matrix.framework }} DP=${{ matrix.dp_size }} ${{ matrix.topology }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            dp_size: 2
+            topology: single-node
+            namespace: mx-ci-vllm-dp2-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-dp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P RDMA transfer test (DP > 1)
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          # tp_size omitted — defaults to 1. DP cores are full, interchangeable
+          # copies at worker_rank 0; the source publishes one CR and the target
+          # pulls a single rank-0 weight set per DP core.
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
   # Dynamo aggregated-serving P2P test — DGD lifecycle (apply / scale / wait)
   # against the cluster-wide Dynamo operator installed in dynamo-system by
   # setup-mx-vcluster. Different shape than test-p2p (DGD CR + grove-managed
@@ -791,6 +886,7 @@ jobs:
       - test-p2p
       - test-p2p-mla-model
       - test-tp
+      - test-dp
       - test-with-dynamo
       - test-stale-metadata
       - model-streamer

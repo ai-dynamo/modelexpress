@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Azure single-job template for P2P RDMA weight-transfer CI tests with
+# data parallelism = 2 (vLLM native DP, --data-parallel-size 2).
+#
+# DP vs TP — why this is a distinct test from manifest-azure-tp2.yaml:
+#   - TP shards one model's weights across GPUs; each rank owns a DISTINCT
+#     slice, so source publishes one ModelMetadata CR per rank and the target
+#     pairs rank-for-rank (TEST_PLAN row 5.1).
+#   - DP runs N FULL model copies. Each DP core loads the entire weight set
+#     and the copies are interchangeable, so the ModelExpress identity carries
+#     no DP dimension (build_source_identity has tp/pp/ep, not dp) and every
+#     DP core resolves to the same worker_rank (0). The transfer pattern is
+#     therefore "N concurrent full-weight pulls from a single source," not
+#     rank-paired transfers (TEST_PLAN row 5.2).
+#
+# Consequence for the CI wiring: this job runs with tp_size=1. The source
+# publishes a single rank-0 CR, and the target's DP cores each pull the full
+# rank-0 weight set over RDMA. The per-rank agent assertion expects exactly
+# one distinct source agent (rank 0), which is correct for DP — it is not the
+# TP fan-out.
+#
+# Differences vs manifest-azure-tp2.yaml:
+#   - --data-parallel-size 2 + --tensor-parallel-size 1 (was --tensor-parallel-size 2)
+#   - everything else (2 GPUs, 2 IB devices, non-MIG nodeSelector, affinity,
+#     KV sizing) is identical: DP=2 still wants one full GPU per DP core.
+#
+# CLUSTER REQUIREMENT — MUST RUN ON NON-MIG GPU NODES.
+# Same rationale as the TP=2 manifest: requesting `nvidia.com/gpu: 2` on a MIG
+# node yields 2 slices, not 2 full GPUs, and NVIDIA hardware blocks NVML
+# topology / NCCL / NVLink across slices, which vLLM's DP coordination trips on
+# at startup.
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      # Pin to a non-MIG GPU pool (mig.config=all-disabled, full physical
+      # GPUs per node). See header — DP=2 wants one full GPU per DP core and
+      # MIG-sliced nodes break vLLM's DP coordination at startup. The
+      # agentpool podAffinity below becomes redundant under this nodeSelector
+      # but is kept for self-documentation + as defense if it is removed.
+      nodeSelector:
+        agentpool: a100b
+      affinity:
+        # podAntiAffinity on hostname: keep source and target on different
+        # physical hosts so RDMA still exercises true cross-host IB.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+        # podAffinity on agentpool: keep source and target in the SAME node
+        # pool. The Azure AKS test cluster splits GPU nodes across multiple
+        # InfiniBand partitions, and pods on different pkeys can't talk RDMA
+        # to each other. Combined with hostname anti-affinity, forces
+        # source/target onto different hosts WITHIN the same IB partition.
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: agentpool
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --data-parallel-size
+            - "2"
+            - --tensor-parallel-size
+            - "1"
+            # Keep KV fixed and small so VRAM stays predictable per DP core.
+            - --max-model-len
+            - "1024"
+            - --kv-cache-memory-bytes
+            - "1073741824"
+            - --trust-remote-code
+            - --port
+            - "${WORKER_PORT}"
+          env:
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
+            limits:
+              nvidia.com/gpu: "2"
+              rdma/ib: "2"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
