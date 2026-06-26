@@ -85,6 +85,28 @@ from .shape_descriptors import (  # noqa: F401
     compile_target_matches,
 )
 
+# Rank-to-rank reshard contract (used by verl + NemoRL v2 + PrimeRL mx_v2).
+# These three modules are pure-Python (dataclasses + collections only);
+# torch is lazy-imported inside method bodies in rank_local_publisher, so
+# they're safe to re-export eagerly even on torch-free CI runners.
+from .rl_slice_descriptors import (  # noqa: F401
+    CoveragePlan,
+    PlanIncompleteError,
+    QuantizationMetadataError,
+    SegmentPlan,
+    SliceOwnership,
+    SliceRequest,
+)
+from .rl_reshard_planner import (  # noqa: F401
+    collect_byte_savings_vs_allgather,
+    plan_coverage,
+    summarize_plan,
+)
+from .rank_local_publisher import (  # noqa: F401
+    PlacementDescriptor,
+    RankLocalPublisher,
+)
+
 # The v2 RL helpers (training_publisher, refit_receiver, nemo_rl_v2) all
 # import torch. Keeping them as eager top-level re-exports makes
 # ``import modelexpress`` fail in environments that don't ship torch
@@ -132,6 +154,7 @@ __all__ = [
     "COMPILE_TARGET_HF_RAW",
     "COMPILE_TARGET_TRTLLM",
     "COMPILE_TARGET_VLLM_FUSED",
+    "CoveragePlan",
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
@@ -140,14 +163,24 @@ __all__ = [
     "MxTrainingPublisher",
     "MxV2RefitReceiver",
     "MxV2TrainingPublisher",
+    "PlacementDescriptor",
+    "PlanIncompleteError",
+    "QuantizationMetadataError",
+    "RankLocalPublisher",
+    "SegmentPlan",
     "SliceCoveragePlan",
+    "SliceOwnership",
+    "SliceRequest",
     "SliceSource",
     "TargetTPLayout",
     "TensorDescriptorV2",
     "TrainerWorldLayout",
     "TransferStats",
     "V2SourceCandidate",
+    "collect_byte_savings_vs_allgather",
     "compile_target_matches",
     "configure_vllm_logging",
+    "plan_coverage",
     "register_modelexpress_loaders",
+    "summarize_plan",
 ]
