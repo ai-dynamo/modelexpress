@@ -166,6 +166,9 @@ def vllm_wt():
         def receive_weights_scratch(self, ref, timeout_seconds=300.0, tensor_shapes=None):
             return iter([])
 
+        def shutdown(self):
+            pass
+
     refit_mod.MxRefitReceiver = _RefitStub
     refit_mod.SourceRef = _SourceRef
     refit_mod.TransferStats = _TransferStats

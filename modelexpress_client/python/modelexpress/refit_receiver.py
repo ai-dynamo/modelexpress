@@ -448,14 +448,16 @@ class MxRefitReceiver:
             f"({sum(t.numel() * t.element_size() for t in scratch_tensors.values()) / 1e9:.2f} GB)"
         )
 
-        self._nixl.register_tensors(scratch_tensors)
-
         # See `receive_weights` above for tuple-semantics rationale.
-        transferred, matched_tensors, elapsed = self._nixl.receive_from_source(
-            source_metadata=worker.nixl_metadata,
-            source_tensors=source_tensors,
-            timeout_seconds=timeout_seconds,
-        )
+        # Scratch buffers are only RDMA targets for this receive. Keep their
+        # NIXL registration scoped to the transfer so repeated refits do not
+        # accumulate stale registrations or replace pre-registered model buffers.
+        with self._nixl.temporary_registered_tensors(scratch_tensors):
+            transferred, matched_tensors, elapsed = self._nixl.receive_from_source(
+                source_metadata=worker.nixl_metadata,
+                source_tensors=source_tensors,
+                timeout_seconds=timeout_seconds,
+            )
         advertised_bytes = sum(td.size for td in source_tensors)
 
         stats = TransferStats(

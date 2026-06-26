@@ -538,19 +538,24 @@ class TestNixlTransferManagerDictOwnership:
     def _make_manager(self):
         mgr = NixlTransferManager(agent_name="test", device_id=0)
         mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b"meta"
         return mgr
+
+    @staticmethod
+    def _tensor(addr: int = 0x1000):
+        tensor = MagicMock()
+        tensor.is_contiguous.return_value = True
+        tensor.data_ptr.return_value = addr
+        tensor.numel.return_value = 1
+        tensor.element_size.return_value = 1
+        tensor.dtype = torch.float32
+        return tensor
 
     def test_register_takes_shallow_copy_of_caller_dict(self):
         mgr = self._make_manager()
-        t = MagicMock()
-        t.is_contiguous.return_value = True
-        t.data_ptr.return_value = 0x1000
-        t.numel.return_value = 1
-        t.element_size.return_value = 1
-        t.dtype = torch.float32
+        t = self._tensor()
         caller = {"w": t}
 
-        mgr._agent.get_local_md.return_value = b"meta"
         mgr.register_tensors(caller)
 
         assert mgr._tensors is not caller
@@ -558,15 +563,9 @@ class TestNixlTransferManagerDictOwnership:
 
     def test_shutdown_does_not_clear_caller_dict(self):
         mgr = self._make_manager()
-        t = MagicMock()
-        t.is_contiguous.return_value = True
-        t.data_ptr.return_value = 0x1000
-        t.numel.return_value = 1
-        t.element_size.return_value = 1
-        t.dtype = torch.float32
+        t = self._tensor()
         caller = {"w": t}
 
-        mgr._agent.get_local_md.return_value = b"meta"
         mgr.register_tensors(caller)
         mgr.shutdown()
 
@@ -587,6 +586,76 @@ class TestNixlTransferManagerDictOwnership:
         )
         assert mgr._tensors == {}
         assert mgr._tensor_descriptors == []
+
+    def test_re_register_tracks_each_tensor_registration(self, monkeypatch):
+        monkeypatch.delenv("MX_POOL_REG", raising=False)
+        mgr = self._make_manager()
+        mgr._agent.register_memory.side_effect = ["reg-1", "reg-2"]
+
+        first = {"w1": self._tensor(0x1000)}
+        second = {"w2": self._tensor(0x2000)}
+
+        mgr.register_tensors(first)
+        mgr.register_tensors(second)
+
+        mgr._agent.deregister_memory.assert_not_called()
+        assert mgr._tensor_registrations == ["reg-1", "reg-2"]
+        assert mgr._tensors == second
+
+    def test_failed_re_register_keeps_previous_tensor_registrations(self, monkeypatch):
+        monkeypatch.delenv("MX_POOL_REG", raising=False)
+        mgr = self._make_manager()
+        mgr._agent.register_memory.side_effect = ["reg-1", RuntimeError("boom")]
+
+        first = {"w1": self._tensor(0x1000)}
+        second = {"w2": self._tensor(0x2000)}
+
+        mgr.register_tensors(first)
+        with pytest.raises(RuntimeError, match="boom"):
+            mgr.register_tensors(second)
+
+        mgr._agent.deregister_memory.assert_not_called()
+        assert mgr._tensor_registrations == ["reg-1"]
+        assert mgr._tensors == first
+
+    def test_shutdown_deregisters_tensor_registrations(self, monkeypatch):
+        monkeypatch.delenv("MX_POOL_REG", raising=False)
+        mgr = self._make_manager()
+        mgr._agent.register_memory.side_effect = ["reg-1", "reg-2"]
+
+        mgr.register_tensors({"w1": self._tensor(0x1000)})
+        mgr.register_tensors({"w2": self._tensor(0x2000)})
+        agent = mgr._agent
+        mgr.shutdown()
+
+        assert agent.deregister_memory.call_args_list == [
+            call("reg-2"),
+            call("reg-1"),
+        ]
+        assert mgr._tensor_registrations == []
+
+    def test_temporary_registered_tensors_restores_previous_registry(self, monkeypatch):
+        monkeypatch.delenv("MX_POOL_REG", raising=False)
+        mgr = self._make_manager()
+        persistent = {"model": self._tensor(0x1000)}
+        persistent_descs = [MagicMock()]
+        mgr._tensors = persistent
+        mgr._tensor_descriptors = persistent_descs
+        mgr._metadata = b"persistent-meta"
+        mgr._agent.register_memory.return_value = "scratch-reg"
+        mgr._agent.get_agent_metadata.side_effect = [b"scratch-meta", b"after-deregister"]
+
+        scratch = {"scratch": self._tensor(0x2000)}
+        with mgr.temporary_registered_tensors(scratch) as metadata:
+            assert metadata == b"scratch-meta"
+            assert mgr._tensors == scratch
+            assert mgr._metadata == b"scratch-meta"
+
+        mgr._agent.deregister_memory.assert_called_once_with("scratch-reg")
+        assert mgr._tensors is persistent
+        assert mgr._tensor_descriptors is persistent_descs
+        assert mgr._metadata == b"persistent-meta"
+        assert mgr._tensor_registrations == []
 
 
 class TestPublishMetadataErrorHandling:
