@@ -855,6 +855,43 @@ jobs:
           hf_token: ${{ secrets.HF_TOKEN }}
 
   # ---------------------------------------------------------------------------
+  # TEMPORARY: validate the prod-modelexpress-tester-amd-h100-v1 runner.
+  # Non-gating (not in ci-status-check). Remove once validated.
+  # ---------------------------------------------------------------------------
+  validate-h100-runner:
+    name: Validate H100 runner
+    runs-on: prod-modelexpress-tester-amd-h100-v1
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Print runner info
+        run: |
+          echo "Runner name: ${RUNNER_NAME}"
+          echo "Runner OS/arch: ${RUNNER_OS}/${RUNNER_ARCH}"
+          hostname
+          uname -a
+
+      - name: Host nvidia-smi
+        run: nvidia-smi
+
+      - name: Log in to image registry
+        run: |
+          echo "${{ secrets.NGC_API_KEY }}" | \
+            docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Docker --gpus all GPU runtime check
+        run: |
+          docker run --rm --gpus all \
+            nvcr.io/nvidia/cuda:12.6.2-base-ubuntu24.04 \
+            nvidia-smi
+
+  # ---------------------------------------------------------------------------
   # Umbrella status check for branch protection.
   #
   # Aggregates the result of every gating job in this workflow into a single
