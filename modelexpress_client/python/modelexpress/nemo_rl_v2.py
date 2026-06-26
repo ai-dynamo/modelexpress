@@ -1335,9 +1335,7 @@ class MxV2RefitReceiver:
         return mx_source_id
 
     def shutdown(self) -> None:
-        # MxRefitReceiver has no shutdown method in the existing code; the
-        # NIXL transfer manager and MxClient are torn down by Python's gc.
-        # Future: when refit_receiver gains a shutdown(), call it here.
+        self._receiver.shutdown()
         self._initialized = False
 
 
