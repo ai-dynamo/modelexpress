@@ -113,6 +113,8 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
+      # TEMP: H100 runner validation. Remove with the validate-h100-runner job.
+      - "anants/validate-h100-runner"
 
 concurrency:
   # github.ref_name is the bot-created branch (e.g. `pull-request/123`), so
@@ -137,6 +139,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-server:
     name: Build server image
+    if: ${{ false }} # TEMP: disabled during H100 runner validation
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
@@ -187,6 +190,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-client:
     name: Build worker image (${{ matrix.framework }})
+    if: ${{ false }} # TEMP: disabled during H100 runner validation
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
@@ -252,6 +256,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ensure-vcluster:
     name: Ensure vCluster
+    if: ${{ false }} # TEMP: disabled during H100 runner validation
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
@@ -853,6 +858,32 @@ jobs:
           s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
           s3_region: ${{ env.MX_CI_S3_REGION }}
           hf_token: ${{ secrets.HF_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # TEMPORARY: validate the prod-modelexpress-tester-amd-h100-v1 runner.
+  # Non-gating (not in ci-status-check). Remove once validated.
+  # ---------------------------------------------------------------------------
+  validate-h100-runner:
+    name: Validate H100 runner
+    runs-on: prod-modelexpress-tester-amd-h100-v1
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    container:
+      image: nvcr.io/nvidia/cuda:13.0.0-base-ubuntu24.04
+      options: --gpus all
+      credentials:
+        username: "$oauthtoken"
+        password: ${{ secrets.NGC_API_KEY }}
+    steps:
+      - name: Runner and container info
+        run: |
+          echo "Runner: ${RUNNER_NAME:-unknown} (${RUNNER_OS}/${RUNNER_ARCH})"
+          uname -a
+          head -2 /etc/os-release || true
+
+      - name: nvidia-smi
+        run: nvidia-smi
 
   # ---------------------------------------------------------------------------
   # Umbrella status check for branch protection.
