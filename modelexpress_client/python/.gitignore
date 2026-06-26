@@ -1,2 +1,6 @@
 *.egg-info
 build/
+
+# Benchmark run outputs (transient, per-cluster-session artifacts —
+# keep in pensieve or downstream consumer's data tree, not in source).
+benchmarks/results-*/

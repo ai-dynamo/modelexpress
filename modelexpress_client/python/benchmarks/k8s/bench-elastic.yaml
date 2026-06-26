@@ -1,0 +1,279 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Kubernetes Job for the MX v2 transport-layer benchmark.
+#
+# This manifest is a template — substitute the placeholders below before
+# applying. See `modelexpress_client/python/benchmarks/README.md` ("k8s
+# cluster runs") for the canonical envsubst / sed invocation.
+#
+# Placeholders:
+#
+#   <NAMESPACE>             — the K8s namespace that hosts the trainer
+#                             and inference pods + the MX server (e.g.
+#                             "my-rl-ns"). Used for `metadata.namespace`
+#                             AND the MX_SERVER_URL DNS resolution.
+#   <IMAGE>                 — full image ref, e.g. "registry/name:tag".
+#                             Must have the modelexpress client + NIXL
+#                             stack installed at /app/.venv. We test
+#                             with the prime-rl-mx-on-nixl image series.
+#   <IMAGE_PULL_SECRET>     — name of the K8s imagePullSecret that has
+#                             credentials for <IMAGE>'s registry. Leave
+#                             the imagePullSecrets block empty if your
+#                             image is public.
+#
+# The Job:
+#   1. Pulls <IMAGE>.
+#   2. At startup, layers our v2 branch's modelexpress + benchmark
+#      files in via a ConfigMap mounted at /mx_v2_overlay.
+#   3. Runs all three benchmark scenarios in sequence, writing JSON
+#      to /results inside the pod.
+#
+# The ConfigMap (mx-v2-overlay) is created out-of-band by:
+#
+#    kubectl -n <NAMESPACE> create configmap mx-v2-overlay \
+#        --from-file=...
+#
+# (Or via the helper script run_cluster_bench.sh which handles this.)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mx-bench-elastic
+  namespace: <NAMESPACE>
+  annotations:
+    nscleanup/ttl: "4h"
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-bench-elastic
+    spec:
+      restartPolicy: Never
+      # Use the namespace's imagePullSecret if <IMAGE> is on a private
+      # registry. Delete this block if your image is public.
+      imagePullSecrets:
+        - name: <IMAGE_PULL_SECRET>
+      # Match the trainer/inference pods' scheduling: GB200 arm64 nodes.
+      nodeSelector:
+        cloud.google.com/gke-ephemeral-storage-local-ssd: "true"
+        kubernetes.io/arch: arm64
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - {effect: NoSchedule, key: nvidia.com/gpu, operator: Exists}
+        - {effect: NoSchedule, key: dedicated, operator: Equal, value: user-workload}
+        - {effect: NoExecute,  key: dedicated, operator: Equal, value: user-workload}
+        - {effect: NoSchedule, key: kubernetes.io/arch, operator: Exists}
+        - {effect: NoSchedule, key: kubernetes.io/arch, operator: Equal, value: arm64}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-0, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-0.IP, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-1, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-1.IP, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-2, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-2.IP, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-3, operator: Exists}
+        - {effect: NoSchedule, key: networking.gke.io.networks/rdma-3.IP, operator: Exists}
+      # Pod-level security defaults. Drop root by default and disallow
+      # privilege escalation. ``IPC_LOCK`` is the only capability we need
+      # for RDMA registration (NIC-side ibv_reg_mr). The image is multi-
+      # user-aware so non-root works; if it ever needs to be root the
+      # container-level securityContext can override this.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bench
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          # Container-level security context. RDMA pinning needs IPC_LOCK;
+          # SYS_RESOURCE is needed to bump RLIMIT_MEMLOCK above default.
+          # Everything else is dropped, and the root filesystem stays
+          # writable for now (the harness writes to /tmp and /results).
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["IPC_LOCK", "SYS_RESOURCE"]
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              mkdir -p /results
+              cd /tmp
+
+              # The image installs deps into the venv at /app/.venv; the
+              # system Python (/usr/bin/python) lacks grpc/torch. Use the
+              # venv as the canonical interpreter and ensure subprocesses
+              # spawned by multiprocessing inherit it.
+              export PATH=/app/.venv/bin:$PATH
+              PY=/app/.venv/bin/python
+
+              # Build a writable overlay of the image's modelexpress
+              # package, then copy our v2 patch files on top. This lets
+              # us layer additive changes on the image without rebuilding.
+              SITE=$($PY -c "import modelexpress, os; print(os.path.dirname(modelexpress.__file__))")
+              echo "Base modelexpress at: $SITE"
+              mkdir -p /tmp/mx_overlay
+              cp -r "$SITE" /tmp/mx_overlay/modelexpress
+              # Overlay our patched files (v2 ConfigMap mount). We
+              # leave the image's __init__.py alone — it doesn't try to
+              # import the v2 modules, and our v2 __init__ imports
+              # things the v0.5 image lacks.
+              for f in vllm_weight_transfer.py nemo_rl_v2.py refit_receiver.py training_publisher.py shape_descriptors.py; do
+                  if [[ -f /mx_v2_files/$f ]]; then
+                      echo "  overlay: $f"
+                      cp "/mx_v2_files/$f" "/tmp/mx_overlay/modelexpress/$f"
+                  fi
+              done
+              # Subdirectory overlays (preserve path inside modelexpress/).
+              # The ConfigMap is flat, so we map mangled names back to
+              # subdirectory destinations here.
+              mkdir -p /tmp/mx_overlay/modelexpress/engines/vllm
+              if [[ -f /mx_v2_files/engines_vllm_weight_transfer.py ]]; then
+                  echo "  overlay: engines/vllm/weight_transfer.py"
+                  cp /mx_v2_files/engines_vllm_weight_transfer.py \
+                     /tmp/mx_overlay/modelexpress/engines/vllm/weight_transfer.py
+              fi
+
+              export PYTHONPATH="/tmp/mx_overlay${PYTHONPATH:+:$PYTHONPATH}"
+              export MX_SERVER_URL=modelexpress-server.<NAMESPACE>.svc.cluster.local:8001
+              export MX_WEIGHT_TRANSFER_AUTOREGISTER=0
+              export PYTHONUNBUFFERED=1
+              # Match the trainer/inference pods' LD_PRELOAD so NIXL/UCX
+              # find the right CUDA runtime.
+              export LD_PRELOAD="/app/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12${LD_PRELOAD:+:$LD_PRELOAD}"
+
+              echo "=== Environment ==="
+              echo "PATH=$PATH"
+              echo "PYTHONPATH=$PYTHONPATH"
+              echo "MX_SERVER_URL=$MX_SERVER_URL"
+              $PY -c "import sys; print('python:', sys.executable, sys.version)"
+              $PY -c "import modelexpress; print('modelexpress at:', modelexpress.__file__)"
+              $PY -c "from modelexpress.engines.vllm.weight_transfer import MxWeightTransferEngine; print('engine class:', MxWeightTransferEngine)"
+              $PY -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.cuda.is_available(), 'gpus:', torch.cuda.device_count())"
+
+              HARNESS=/mx_v2_overlay/benchmarks/bench_elastic_scaling.py
+
+              # Capture per-scenario exit status so the Job fails loudly if
+              # any scenario broke. Don't ``set -e`` because we still want
+              # later scenarios to run for partial-result triage.
+              SCENARIO_FAILURES=0
+
+              echo
+              echo "=============================================="
+              echo "=== Scenario 1/3: elastic_scale"
+              echo "=============================================="
+              if ! $PY "$HARNESS" \
+                  --mx-server-url=$MX_SERVER_URL \
+                  --scenario=elastic_scale \
+                  --num-receivers=3 --steps=3 \
+                  --trainer-device-id=0 --receiver-device-base=1 \
+                  --join-interval=2.0 --step-interval=3.0 \
+                  --trainer-warmup=4.0 \
+                  --num-tensors=64 --tensor-bytes=$((8*1024*1024)) \
+                  --deadline=180 \
+                  --output=/results/elastic_scale.json; then
+                  rc=$?
+                  echo "scenario 1 (elastic_scale) FAILED with exit code $rc"
+                  SCENARIO_FAILURES=$((SCENARIO_FAILURES + 1))
+              fi
+
+              echo
+              echo "=============================================="
+              echo "=== Scenario 2/3: compile_target"
+              echo "=============================================="
+              if ! $PY "$HARNESS" \
+                  --mx-server-url=$MX_SERVER_URL \
+                  --scenario=compile_target \
+                  --trainer-compile-target=cutlass_fp8 \
+                  --trainer-device-id=0 --receiver-device-base=1 \
+                  --num-tensors=16 --tensor-bytes=$((4*1024*1024)) \
+                  --trainer-warmup=4.0 \
+                  --deadline=120 \
+                  --output=/results/compile_target.json; then
+                  rc=$?
+                  echo "scenario 2 (compile_target) FAILED with exit code $rc"
+                  SCENARIO_FAILURES=$((SCENARIO_FAILURES + 1))
+              fi
+
+              echo
+              echo "=============================================="
+              echo "=== Scenario 3/3: tree_fanout"
+              echo "=============================================="
+              if ! $PY "$HARNESS" \
+                  --mx-server-url=$MX_SERVER_URL \
+                  --scenario=tree_fanout \
+                  --num-receivers=3 --steps=3 \
+                  --trainer-device-id=0 --receiver-device-base=1 \
+                  --join-interval=2.0 --step-interval=3.0 \
+                  --trainer-warmup=4.0 \
+                  --num-tensors=64 --tensor-bytes=$((8*1024*1024)) \
+                  --deadline=180 \
+                  --output=/results/tree_fanout.json; then
+                  rc=$?
+                  echo "scenario 3 (tree_fanout) FAILED with exit code $rc"
+                  SCENARIO_FAILURES=$((SCENARIO_FAILURES + 1))
+              fi
+
+              echo
+              echo "=== All scenarios complete. /results contents: ==="
+              ls -la /results
+              echo
+              for scen in elastic_scale compile_target tree_fanout; do
+                  if [[ -f /results/$scen.json ]]; then
+                      echo "--- $scen derived ---"
+                      $PY -c "import json; d=json.load(open('/results/$scen.json')); print(json.dumps(d['derived'], indent=2))"
+                  fi
+              done
+
+              if [[ $SCENARIO_FAILURES -gt 0 ]]; then
+                  echo
+                  echo "!!! $SCENARIO_FAILURES of 3 scenarios FAILED !!!"
+              fi
+
+              # Keep the pod alive long enough for kubectl cp to grab files,
+              # but record the failure count for the post-sleep exit.
+              echo "Sleeping 600s for result collection..."
+              sleep 600
+
+              if [[ $SCENARIO_FAILURES -gt 0 ]]; then
+                  exit 1
+              fi
+          resources:
+            requests:
+              nvidia.com/gpu: "4"   # 1 trainer + 3 receivers (per node has 4 GPUs)
+              memory: "32Gi"
+              cpu: "8"
+            limits:
+              nvidia.com/gpu: "4"
+              memory: "64Gi"
+              cpu: "16"
+          volumeMounts:
+            - mountPath: /mx_v2_files
+              name: mx-v2-files
+            - mountPath: /mx_v2_overlay/benchmarks
+              name: mx-v2-benchmarks
+            - mountPath: /results
+              name: results
+            - mountPath: /dev/shm
+              name: dshm
+      volumes:
+        - name: mx-v2-files
+          configMap:
+            name: mx-v2-files
+        - name: mx-v2-benchmarks
+          configMap:
+            name: mx-v2-benchmarks
+        - name: results
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
