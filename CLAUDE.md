@@ -79,6 +79,16 @@ cadences. **Confusing them is the most common mistake** — public-image
 references on `main` pointing at a tag that doesn't yet exist sends users
 at a broken pull.
 
+> The on-`main` procedure below is automated by
+> [`scripts/bump_version.py`](scripts/bump_version.py)
+> (see [`scripts/README.md`](scripts/README.md)). Prefer it:
+> `python scripts/bump_version.py <new_version>` (add `--dry-run` to
+> preview). It edits the literals, regenerates both lock files, regenerates the
+> pinned source-id hashes in Python and Rust, and verifies. The manual steps
+> below are the spec it implements and the fallback when the toolchain is
+> unavailable. The script never touches the public-image tag references covered
+> in the separate-cadence section.
+
 ### On `main` (e.g. 0.4.0 → 0.5.0)
 
 Bump the workspace/chart version and the protocol-version fixtures. **Do
