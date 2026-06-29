@@ -279,7 +279,16 @@ jobs:
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
       - name: Bootstrap vCluster (first run only)
-        if: steps.vcluster-check.outputs.exists != 'true'
+        # TEMP: forced on (was `if: steps.vcluster-check.outputs.exists != 'true'`)
+        # to re-bootstrap the existing persistent vCluster so it picks up the
+        # control-plane `system`-pool nodeSelector added in setup-mx-vcluster
+        # (MX-359). setup-mx-vcluster deletes + recreates the vCluster
+        # (--delete-namespace=false) and reinstalls the CRD + Dynamo operator,
+        # so one forced run is enough. RESTORE this gate to
+        # `if: steps.vcluster-check.outputs.exists != 'true'` once the
+        # re-bootstrap has run, otherwise every run will tear down and rebuild
+        # the shared vCluster.
+        if: always()
         uses: ./.github/actions/setup-mx-vcluster
         with:
           kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
@@ -336,36 +345,6 @@ jobs:
               --field-selector "spec.nodeName=${NODE_NAME}" \
               -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,PHASE:.status.phase,START:.metadata.creationTimestamp,GPU_REQ:.spec.containers[*].resources.requests.nvidia\.com/gpu' \
               2>&1 | grep -vE '<none>$' || echo "(no GPU pods)"
-          done
-          echo "::endgroup::"
-
-          echo "::group::TEMP reclaim - delete orphaned namespaces from dead runs"
-          # One-shot reclaim of a100b GPUs leaked by runs whose vCluster
-          # connection was lost mid-run, so their cleanup never ran. Deleting
-          # the vCluster namespace cascades to the Job/pod and the syncer then
-          # tears down the host pod, freeing the GPUs. Idempotent
-          # (--ignore-not-found), so this no-ops once reclaimed. Remove with
-          # the rest of this TEMP step.
-          VKC="${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
-          for NS in mx-ci-vllm-tp2-28389916388 mx-ci-vllm-mla-28389590420; do
-            echo "--- vCluster namespace ${NS} ---"
-            kubectl --kubeconfig="${VKC}" delete namespace "${NS}" --ignore-not-found --timeout=120s
-            # Force-clear finalizers if the namespace hangs (ModelMetadata CRs).
-            if kubectl --kubeconfig="${VKC}" get ns "${NS}" --no-headers 2>/dev/null | grep -q .; then
-              echo "${NS} stuck; force-clearing finalizers"
-              kubectl --kubeconfig="${VKC}" get ns "${NS}" -o json 2>/dev/null \
-                | jq '.spec.finalizers = []' \
-                | kubectl --kubeconfig="${VKC}" replace --raw "/api/v1/namespaces/${NS}/finalize" -f - || true
-            fi
-          done
-          # Fallback: if the vCluster no longer tracks those namespaces, the
-          # host pods are pure orphans. With the owning Job already gone (above),
-          # force-deleting them on the host frees the GPUs without recreation.
-          for RUN in 28389916388 28389590420; do
-            for POD in $(kubectl --kubeconfig="${HKC}" get pods -n mx-ci --no-headers 2>/dev/null | awk -v r="${RUN}" '$1 ~ r {print $1}'); do
-              echo "force-deleting orphaned host pod mx-ci/${POD}"
-              kubectl --kubeconfig="${HKC}" delete pod -n mx-ci "${POD}" --ignore-not-found --force --grace-period=0
-            done
           done
           echo "::endgroup::"
           rm -f "${HKC}"

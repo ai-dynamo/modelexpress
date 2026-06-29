@@ -112,6 +112,15 @@ runs:
         echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
         # GPU workloads require syncing host nodes into the vCluster so the GPU
         # device plugin and resource limits are visible to the scheduler.
+        #
+        # Pin the vCluster control-plane pod to the `system` agentpool
+        # (CPU-only, spacious, static — not Karpenter-managed). Per the ops
+        # team, this stops the intermittent Karpenter `Drifted` evictions of
+        # mx-ci-cluster-0 that were killing the control plane mid-run (MX-359):
+        # losing the vCluster mid-test breaks the kubectl port-forward AND
+        # skips per-run cleanup, leaking GPU pods onto the a100b pool. Keeping
+        # the control plane on a static pool removes the disruption at its
+        # source.
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -119,7 +128,8 @@ runs:
           --set controlPlane.distro.k8s.enabled=true \
           --set controlPlane.distro.k8s.version=${VCLUSTER_K8S_VERSION} \
           --set sync.fromHost.nodes.enabled=true \
-          --set sync.fromHost.nodes.selector.all=true
+          --set sync.fromHost.nodes.selector.all=true \
+          --set 'controlPlane.statefulSet.scheduling.nodeSelector.kubernetes\.azure\.com/agentpool=system'
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready
