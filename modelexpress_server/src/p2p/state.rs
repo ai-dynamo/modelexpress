@@ -442,6 +442,7 @@ mod tests {
                 },
             ],
             published_at: 1234567890,
+            identity: None,
         };
 
         assert_eq!(record.model_name, "meta-llama/Llama-3.1-70B");

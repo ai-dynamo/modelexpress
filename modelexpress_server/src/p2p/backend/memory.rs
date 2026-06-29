@@ -94,6 +94,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             model_name: source.model_name.clone(),
             workers: entry.ranks.values().cloned().collect(),
             published_at: 0,
+            identity: None,
         }))
     }
 

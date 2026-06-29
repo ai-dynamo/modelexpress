@@ -74,11 +74,113 @@ from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.heartbeat import HeartbeatThread  # noqa: F401
 
+# shape_descriptors is torch-free; safe to import eagerly.
+from .shape_descriptors import (  # noqa: F401
+    COMPILE_TARGET_CUTLASS_FP8,
+    COMPILE_TARGET_DEEPGEMM_FP8,
+    COMPILE_TARGET_HF_RAW,
+    COMPILE_TARGET_TRTLLM,
+    COMPILE_TARGET_VLLM_FUSED,
+    TensorDescriptorV2,
+    compile_target_matches,
+)
+
+# Rank-to-rank reshard contract (used by verl + NemoRL v2 + PrimeRL mx_v2).
+# These three modules are pure-Python (dataclasses + collections only);
+# torch is lazy-imported inside method bodies in rank_local_publisher, so
+# they're safe to re-export eagerly even on torch-free CI runners.
+from .rl_slice_descriptors import (  # noqa: F401
+    CoveragePlan,
+    PlanIncompleteError,
+    QuantizationMetadataError,
+    SegmentPlan,
+    SliceOwnership,
+    SliceRequest,
+)
+from .rl_reshard_planner import (  # noqa: F401
+    collect_byte_savings_vs_allgather,
+    plan_coverage,
+    summarize_plan,
+)
+from .rank_local_publisher import (  # noqa: F401
+    PlacementDescriptor,
+    RankLocalPublisher,
+)
+
+# The v2 RL helpers (training_publisher, refit_receiver, nemo_rl_v2) all
+# import torch. Keeping them as eager top-level re-exports makes
+# ``import modelexpress`` fail in environments that don't ship torch
+# (e.g. the ``[dev]`` Python Tests CI runner, vLLM plugin discovery on
+# CPU-only images). Expose them lazily via PEP 562 ``__getattr__`` so
+# they only load on demand:
+#
+#     from modelexpress import MxV2TrainingPublisher  # imports torch here
+#
+# is preserved, while ``import modelexpress`` stays light.
+_LAZY_ATTRS = {
+    "MxRefitReceiver": ".refit_receiver",
+    "TransferStats": ".refit_receiver",
+    "MxTrainingPublisher": ".training_publisher",
+    "MxV2RefitReceiver": ".nemo_rl_v2",
+    "MxV2TrainingPublisher": ".nemo_rl_v2",
+    "SliceCoveragePlan": ".nemo_rl_v2",
+    "SliceSource": ".nemo_rl_v2",
+    "TargetTPLayout": ".nemo_rl_v2",
+    "TrainerWorldLayout": ".nemo_rl_v2",
+    "V2SourceCandidate": ".nemo_rl_v2",
+}
+
+
+def __getattr__(name):
+    """Lazy-import attributes that pull torch (PEP 562)."""
+    module_name = _LAZY_ATTRS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module 'modelexpress' has no attribute {name!r}")
+    from importlib import import_module
+
+    mod = import_module(module_name, __name__)
+    attr = getattr(mod, name)
+    globals()[name] = attr
+    return attr
+
+
+def __dir__():
+    return sorted(list(globals()) + list(_LAZY_ATTRS))
+
+
 __all__ = [
+    "COMPILE_TARGET_CUTLASS_FP8",
+    "COMPILE_TARGET_DEEPGEMM_FP8",
+    "COMPILE_TARGET_HF_RAW",
+    "COMPILE_TARGET_TRTLLM",
+    "COMPILE_TARGET_VLLM_FUSED",
+    "CoveragePlan",
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
+    "MxRefitReceiver",
+    "MxTrainingPublisher",
+    "MxV2RefitReceiver",
+    "MxV2TrainingPublisher",
+    "PlacementDescriptor",
+    "PlanIncompleteError",
+    "QuantizationMetadataError",
+    "RankLocalPublisher",
+    "SegmentPlan",
+    "SliceCoveragePlan",
+    "SliceOwnership",
+    "SliceRequest",
+    "SliceSource",
+    "TargetTPLayout",
+    "TensorDescriptorV2",
+    "TrainerWorldLayout",
+    "TransferStats",
+    "V2SourceCandidate",
+    "collect_byte_savings_vs_allgather",
+    "compile_target_matches",
     "configure_vllm_logging",
+    "plan_coverage",
     "register_modelexpress_loaders",
+    "summarize_plan",
 ]
