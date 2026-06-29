@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import grpc
 import torch
 
-from .heartbeat import PublisherThread
+from .publisher import PublisherThread
 from .payload import tensor_source_metadata
 from ..client import MxClient
 from .. import p2p_pb2

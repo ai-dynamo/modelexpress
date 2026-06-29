@@ -28,7 +28,7 @@ from .artifact_manifest import (
     artifact_manifest_id,
     build_artifact_manifest,
 )
-from .heartbeat import HeartbeatThread
+from .publisher import PublisherThread
 from .publish import _get_worker_host, _publish_metadata_to_server
 from .worker_server import (
     WorkerGrpcServer,
@@ -97,7 +97,7 @@ class PublishedArtifactSource:
 
     endpoint: ArtifactSourceEndpoint
     grpc_server: WorkerGrpcServer
-    heartbeat: HeartbeatThread
+    heartbeat: PublisherThread
     artifact_chunk_manager: "NixlArtifactChunkManager"
 
     def stop(self) -> None:
@@ -432,7 +432,7 @@ def publish_artifact_source(
         artifact_chunk_manager.close()
         raise
 
-    heartbeat = HeartbeatThread(
+    heartbeat = PublisherThread(
         mx_client=mx_client,
         mx_source_id=mx_source_id,
         worker_id=worker_id,

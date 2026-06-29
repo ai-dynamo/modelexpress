@@ -1556,12 +1556,12 @@ class TestConfigureVllmLogging:
             self._reset_mx_logger()
             configure_vllm_logging()
 
-            child = logging.getLogger("modelexpress.metadata.heartbeat")
+            child = logging.getLogger("modelexpress.metadata.publisher")
             child.info("Heartbeat started")
 
             assert len(buf.buffer) == 1
             assert "Heartbeat started" in buf.buffer[0].getMessage()
-            assert buf.buffer[0].name == "modelexpress.metadata.heartbeat"
+            assert buf.buffer[0].name == "modelexpress.metadata.publisher"
         finally:
             vllm_logger.removeHandler(buf)
             self._cleanup(vllm_logger)

@@ -35,7 +35,7 @@ from ...metadata.artifact_transfer import (
     triton_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
-from ...metadata.heartbeat import PublisherThread
+from ...metadata.publisher import PublisherThread
 from ...metadata.publish import _get_worker_server, _is_p2p_metadata_enabled
 from ...nixl_transfer import is_nixl_available
 

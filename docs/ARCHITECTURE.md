@@ -133,7 +133,7 @@ ModelExpress/
 │       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
 │       │   ├── __init__.py
 │       │   ├── publish.py              # Source identity + metadata publication
-│       │   ├── heartbeat.py            # Client-side heartbeat for source liveness
+│       │   ├── publisher.py            # Source publication and heartbeat signaling
 │       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor/artifact manifests)
 │       │   ├── source_id.py            # Python mx_source_id computation
 │       │   ├── client_factory.py       # Selects central vs k8s-service metadata client

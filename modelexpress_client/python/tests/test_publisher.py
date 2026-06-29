@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for HeartbeatThread."""
+"""Tests for source publication and heartbeat signaling."""
 
 import threading
 import time
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from modelexpress.metadata.heartbeat import HeartbeatThread, PublisherThread
+from modelexpress.metadata.publisher import PublisherThread
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def nixl_manager():
 @pytest.fixture
 def heartbeat(mx_client, nixl_manager):
     with patch.dict("os.environ", {"MX_HEARTBEAT_INTERVAL_SECS": "1"}):
-        hb = HeartbeatThread(
+        hb = PublisherThread(
             mx_client=mx_client,
             mx_source_id="abc123",
             worker_id="w1",

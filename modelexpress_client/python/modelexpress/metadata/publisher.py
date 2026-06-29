@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from ..client import MxClient
     from ..nixl_transfer import NixlTransferManager
 
-logger = logging.getLogger("modelexpress.metadata.heartbeat")
+logger = logging.getLogger("modelexpress.metadata.publisher")
 
 PUBLISH_TIMEOUT_SECS_DEFAULT = 30 * 60
 
@@ -281,6 +281,3 @@ class PublisherThread:
                     f"[Worker {self._worker_rank}] Publisher tick failed"
                 )
             self._stop_event.wait(timeout=self._interval)
-
-
-HeartbeatThread = PublisherThread
