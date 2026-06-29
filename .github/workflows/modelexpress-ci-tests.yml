@@ -295,6 +295,35 @@ jobs:
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
+      - name: TEMP - a100b pool capacity (contention investigation)
+        # TEMPORARY: prints the full-GPU a100b pool's GPU headroom at the start
+        # of a run, to confirm/deny the capacity-contention theory (four
+        # concurrent full-GPU jobs demanding 16 GPUs on a 16-GPU pool). Queries
+        # the HOST cluster (not the vCluster) because the a100b nodes live on
+        # the host and that's where synced test pods actually consume GPUs.
+        # Remove once the contention question is settled.
+        if: always()
+        env:
+          HOST_KUBECONFIG_B64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+        run: |
+          set +e
+          HKC="${RUNNER_TEMP}/.kubeconfig-host-cap"
+          echo "${HOST_KUBECONFIG_B64}" | base64 -d > "${HKC}"
+          chmod 600 "${HKC}"
+          echo "::group::a100b nodes - allocatable nvidia.com/gpu"
+          kubectl --kubeconfig="${HKC}" get nodes -l agentpool=a100b \
+            -o custom-columns='NODE:.metadata.name,GPU_ALLOCATABLE:.status.allocatable.nvidia\.com/gpu' 2>&1
+          echo "a100b node count: $(kubectl --kubeconfig="${HKC}" get nodes -l agentpool=a100b --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+          echo "::endgroup::"
+          echo "::group::a100b nodes - allocated nvidia.com/gpu (sum of pod requests)"
+          for N in $(kubectl --kubeconfig="${HKC}" get nodes -l agentpool=a100b -o name 2>/dev/null); do
+            echo "--- ${N} ---"
+            kubectl --kubeconfig="${HKC}" describe "${N}" 2>/dev/null \
+              | sed -n '/Allocated resources/,/Events/p' | grep -E "nvidia.com/gpu|Resource " || echo "(no gpu allocation line)"
+          done
+          echo "::endgroup::"
+          rm -f "${HKC}"
+
       - name: vCluster baseline health
         # Snapshot vCluster control-plane state before any test job runs. When
         # downstream jobs fail with "connection refused" mid-run, this baseline
