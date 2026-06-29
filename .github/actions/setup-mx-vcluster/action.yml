@@ -222,7 +222,7 @@ runs:
         # (nvcr.io/nvidia/ai-dynamo/kubernetes-operator) lives under the
         # public `nvidia` NGC org and is pullable anonymously. The
         # `worker-registry` secret used by test pods is created per-run by
-        # the test actions for our private nvcr.io/nvidian/dynamo-dev/*
+        # the test actions for our private nvcr.io/0980761089281446/*
         # images, separately from this operator install.
         kubectl create namespace dynamo-system --dry-run=client -o yaml \
           | kubectl apply -f -

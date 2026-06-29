@@ -138,7 +138,7 @@ env:
   VCLUSTER_NAMESPACE: mx-ci
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
   MX_CI_S3_REGION: us-east-1
-  MX_IMAGE_REPO: nvcr.io/nvidian/dynamo-dev
+  MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
   # ---------------------------------------------------------------------------
