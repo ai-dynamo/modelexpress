@@ -28,12 +28,12 @@
 #                         parallel once each framework has been validated
 #                         independently.
 #
-#   test-tp             — TP > 1 variant of test-p2p. Matrix covers
-#                         single-node TP=2 (one Job, two GPUs per pod,
-#                         pinned to a non-MIG GPU pool via nodeSelector)
-#                         and multi-node TP=2 (StatefulSet + Ray, one
-#                         GPU per pod, 2 pods per role). See TEST_PLAN
-#                         row 5.1 for the full topology rationale.
+#   test-tp             — TP > 1 variant of test-p2p. Multi-node TP=2 only
+#                         (StatefulSet + Ray, one GPU per pod on a100a, 2 pods
+#                         per role). Single-node TP=2 is covered by
+#                         test-p2p-mla-model (same manifest, plus VRAM parity)
+#                         and was dropped here to avoid doubling a100b demand.
+#                         See TEST_PLAN row 5.1.
 #
 #   test-dp             — DP > 1 variant of test-p2p. vLLM native data
 #                         parallelism (--data-parallel-size 2): N full model
@@ -44,9 +44,20 @@
 #                         set over RDMA (N concurrent pulls from one source).
 #                         See TEST_PLAN row 5.2.
 #
+#   test-ep             — EP > 1 variant of test-p2p. vLLM expert parallelism
+#                         (--enable-expert-parallel over a TP=2 world) on an
+#                         MoE model (DeepSeek-V2-Lite). EP shards experts per
+#                         rank, so weights stay rank-distinct and transfers are
+#                         rank-paired like TP (tp_size=2). The new coverage is
+#                         the identity hash carrying expert_parallel_size > 0.
+#                         See TEST_PLAN row 5.3.
+#
 #   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
 #                        Uses a TP=2 DeepSeek MLA + MoE model and also runs
 #                        the standard source/target VRAM parity assertions.
+#                        Doubles as the single-node TP=2 coverage (same
+#                        manifest-azure-tp2.yaml + test_p2p_k8s.py as the
+#                        dropped test-tp single-node entry).
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
@@ -494,15 +505,17 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # P2P weight transfer with tensor parallelism > 1.
-  # Single-node TP: each pod has N GPUs and runs the engine with
-  # --tensor-parallel-size N. Source and target on different hosts (existing
-  # podAntiAffinity) so RDMA still goes over IB cross-host, not loopback.
-  # Multi-node TP coverage is a follow-up — would slot in here as additional
-  # matrix entries once the cluster + manifests support it.
   #
-  # Pinned to the right agentpool (2 nodes, full physical GPUs,
-  # `mig.config=all-disabled`) via the nodeSelector in
-  # manifest-azure-tp2.yaml.
+  # Multi-node TP only: StatefulSet + Ray, 1 GPU per pod on the a100a pool,
+  # so this job does NOT contend for the scarce full-GPU a100b pool. See the
+  # manifest header for the cross-host pod-pairing rationale.
+  #
+  # Single-node TP=2 is intentionally NOT a separate entry here: the
+  # `test-p2p-mla-model` job already exercises the single-node TP=2 path
+  # (same manifest-azure-tp2.yaml + test_p2p_k8s.py on the a100b full-GPU
+  # pool) and adds VRAM-parity assertions on top. Running both was redundant
+  # and doubled the a100b demand, so the Qwen single-node TP=2 entry was
+  # dropped in favor of the MLA one. See TEST_PLAN row 5.1.
   # ---------------------------------------------------------------------------
   test-tp:
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
@@ -514,14 +527,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - framework: vllm
-            tp_size: 2
-            topology: single-node
-            namespace: mx-ci-vllm-tp2-${{ github.run_id }}
-            manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
-            source_port: "8001"
-            worker_port: "8002"
-
           # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
           # manifest header for the cross-host pod-pairing rationale.
           - framework: vllm
@@ -669,6 +674,100 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # P2P weight transfer with expert parallelism > 1 (vLLM, MoE model).
+  # Single pod, --tensor-parallel-size 2 --enable-expert-parallel against an
+  # MoE model (deepseek-ai/DeepSeek-V2-Lite). In vLLM, EP layers on top of the
+  # TP world: attention stays TP-sharded while the MoE experts are distributed
+  # expert-parallel across the same ranks. Each rank therefore owns distinct
+  # weights, the source publishes one ModelMetadata CR per rank, and the target
+  # pairs rank-for-rank — so this runs with tp_size=2 just like the TP test.
+  #
+  # The coverage beyond test-tp is the identity hash: enabling EP sets
+  # parallel_config.expert_parallel_size > 0, which build_source_identity folds
+  # into mx_source_id. This is the first job to exercise rank pairing with
+  # expert_parallel_size > 0 (TEST_PLAN row 5.3) — a source/target mismatch in
+  # that field would force a disk fallback and fail the RDMA marker assertion.
+  #
+  # Runs on the full-GPU a100b pool (non-MIG) via the nodeSelector in
+  # manifest-azure-ep2.yaml, with the longer MoE-model pod-ready timeout used
+  # by the MLA model test.
+  # ---------------------------------------------------------------------------
+  test-ep:
+    name: P2P EP test (${{ matrix.framework }} EP=${{ matrix.ep_size }} ${{ matrix.topology }})
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            ep_size: 2
+            topology: single-node
+            namespace: mx-ci-vllm-ep2-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-ep2.yaml
+            model: deepseek-ai/DeepSeek-V2-Lite
+            source_port: "8001"
+            worker_port: "8002"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P RDMA transfer test (EP > 1)
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ matrix.model }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
+          # EP shards experts per rank, so each rank owns distinct weights and
+          # the transfer is rank-paired just like TP — expect tp_size distinct
+          # source agents.
+          tp_size: "2"
+          # MoE model is larger than the default dense CI model; give it the
+          # same headroom as the MLA model test.
+          pod_ready_timeout_seconds: "3600"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        # connect-vcluster backgrounds a `kubectl port-forward` and exports
+        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
+        # the next job on this self-hosted runner doesn't inherit an orphan.
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
   # Dynamo aggregated-serving P2P test — DGD lifecycle (apply / scale / wait)
   # against the cluster-wide Dynamo operator installed in dynamo-system by
   # setup-mx-vcluster. Different shape than test-p2p (DGD CR + grove-managed
@@ -725,6 +824,60 @@ jobs:
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Fleet scale test (row 20) — ~15 workers, CRD backend, NIXL-over-TCP.
+  # Raw Deployment (no Dynamo), no anti-affinity (pack a100a MIG slices),
+  # NIXL_UCX_TLS=tcp (MIG slices GPU but not RDMA — one IB NIC per node).
+  # Scales in waves (1→5→10→15) so CI failures localise to a wave.
+  # ---------------------------------------------------------------------------
+  test-fleet-scale:
+    name: Fleet scale test (vLLM, 15 workers)
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run fleet scale test
+        uses: ./.github/actions/run-mx-fleet-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: mx-ci-fleet-${{ github.run_id }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          fleet_size: "15"
+          wave_sizes: "5 10 15"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()
@@ -891,7 +1044,9 @@ jobs:
       - test-p2p-mla-model
       - test-tp
       - test-dp
+      - test-ep
       - test-with-dynamo
+      - test-fleet-scale
       - test-stale-metadata
       - model-streamer
     if: always()
