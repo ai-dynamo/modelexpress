@@ -35,9 +35,16 @@ inputs:
     required: false
     default: 'v1.32.13'
   dynamo_ref:
-    description: 'Git ref of the ai-dynamo/dynamo repo to clone for the helm chart'
+    description: |
+      Git ref of the ai-dynamo/dynamo repo to clone for the helm chart.
+      Pinned to the `v1.0.2` release tag so the chart matches the operator
+      image tag below. Previously `main`, but that drifted: a re-bootstrap
+      pulled a `main` chart against the `1.0.2` image and the operator's
+      init container crash-looped on the version skew. Keep this and
+      `dynamo_operator_tag` in lockstep — bump both together to a newer
+      published release from https://github.com/ai-dynamo/dynamo/releases.
     required: false
-    default: 'main'
+    default: 'v1.0.2'
   dynamo_operator_image:
     description: |
       Full Dynamo operator image repo (without tag). Defaults to the chart's
@@ -47,12 +54,10 @@ inputs:
     default: 'nvcr.io/nvidia/ai-dynamo/kubernetes-operator'
   dynamo_operator_tag:
     description: |
-      Tag for the Dynamo operator image. Pinned to a known-published
-      release because `dynamo_ref` defaults to `main`, where the chart's
-      AppVersion is a future-version-in-preparation that hasn't been
-      published to nvcr.io/nvidia/ai-dynamo/kubernetes-operator yet. Bump
-      to a newer version from https://github.com/ai-dynamo/dynamo/releases
-      when also bumping `dynamo_ref` to that release tag.
+      Tag for the Dynamo operator image. Matches `dynamo_ref` (v1.0.2) so the
+      chart and image are the same release — a mismatch crash-loops the
+      operator's init container. Bump together with `dynamo_ref` to a newer
+      release from https://github.com/ai-dynamo/dynamo/releases.
     required: false
     default: '1.0.2'
 
