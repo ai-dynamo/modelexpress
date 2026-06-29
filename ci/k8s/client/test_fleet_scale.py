@@ -6,9 +6,9 @@
 run-mx-fleet-test has already:
   1. Deployed mx-server with the Kubernetes CRD backend.
   2. Applied the fleet workers Deployment at replicas=1.
-  3. Waited for the source worker to publish 1 ModelMetadata CR.
+  3. Waited for the source worker to reach Ready status.
   4. Scaled in waves to fleet_size total replicas.
-  5. Waited for all fleet_size ModelMetadata CRs to appear.
+  5. Waited for all fleet_size workers to reach Ready status.
 
 Asserts:
   1. At least fleet_size ModelMetadata CRs exist and every one is
@@ -69,15 +69,16 @@ def test_fleet_crs_published_and_ready(namespace: str, expected_cr_count: int) -
     )
 
 
-def test_fleet_p2p_engagement(namespace: str, expected_cr_count: int) -> None:
+def test_fleet_p2p_engagement(namespace: str, expected_cr_count: int, p2p_marker: str) -> None:
     """At least fleet_size - 1 workers must have logged P2P transfer.
 
     The source worker downloads from HF and never logs the marker; every
     other worker must pull via NIXL (TCP transport). Counting occurrences
-    of "RDMA transfer complete" across all pod logs — each receiving worker
-    logs it exactly once — gives the number of successful P2P transfers.
-    A count below fleet_size - 1 means at least one non-source worker fell
-    back to the HF disk path, which is the failure mode this test guards.
+    of the P2P marker (--p2p-marker, default "RDMA transfer complete") across
+    all pod logs — each receiving worker logs it exactly once — gives the
+    number of successful P2P transfers. A count below fleet_size - 1 means at
+    least one non-source worker fell back to the HF disk path, which is the
+    failure mode this test guards.
     """
     all_logs = ""
     for pod in _worker_pod_names(namespace):
@@ -90,10 +91,9 @@ def test_fleet_p2p_engagement(namespace: str, expected_cr_count: int) -> None:
         except Exception as exc:
             print(f"WARN: failed to fetch logs from {pod}: {exc}")
 
-    marker = "RDMA transfer complete"
-    transfer_count = all_logs.count(marker)
+    transfer_count = all_logs.count(p2p_marker)
     min_expected = expected_cr_count - 1
-    print(f"[fleet] '{marker}' occurrences across all worker logs: {transfer_count}")
+    print(f"[fleet] '{p2p_marker}' occurrences across all worker logs: {transfer_count}")
     assert transfer_count >= min_expected, (
         f"Expected at least {min_expected} P2P transfers (fleet_size - 1), "
         f"got {transfer_count}. At least one non-source worker fell back to "

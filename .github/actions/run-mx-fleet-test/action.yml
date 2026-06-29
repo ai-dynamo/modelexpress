@@ -8,10 +8,12 @@ description: |
     1. Apply ModelExpress CRDs + namespace RBAC + secrets.
     2. Deploy mx-server (CRD backend).
     3. Apply the fleet workers Deployment at replicas=1.
-    4. Wait for the first worker to load weights from HF and publish
-       its ModelMetadata CR (this worker becomes the P2P source).
+    4. Wait for the first worker to load weights from HF and reach Ready
+       (status.worker.status == Ready). This worker becomes the P2P source;
+       gating on Ready rather than CR existence ensures wave-1 workers find
+       a live source instead of falling back to HF disk load.
     5. Scale in waves: for each value in wave_sizes, patch the Deployment
-       to that replica count and wait for that many ModelMetadata CRs.
+       to that replica count and wait for that many workers to reach Ready.
        Waves serialise scaling so intermediate-size failures are visible
        (wave 1 of 3 failed vs wave 3 of 3 failed).
     6. Run pytest against ci/k8s/client/test_fleet_scale.py.
@@ -146,7 +148,7 @@ runs:
           kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
-    - name: Wait for source worker to publish metadata
+    - name: Wait for source worker to become Ready
       shell: bash
       env:
         NAMESPACE: ${{ inputs.namespace }}
@@ -156,25 +158,36 @@ runs:
           echo "ERROR: source_load_timeout_seconds must be a positive integer, got '${TIMEOUT}'"
           exit 1
         }
-        echo "::group::Wait for source worker to publish ModelMetadata CR"
+        # Gate on status.worker.status == Ready, not just CR existence. A
+        # worker publishes its ModelMetadata CR before the model is fully
+        # loaded; if the wave scaling starts before the source is Ready, the
+        # wave-1 workers query mx-server, find no Ready source, and fall back
+        # to HF disk load. Counting only Ready CRs makes the gate match the
+        # actual healthy state test_fleet_scale.py asserts.
+        ready_count() {
+          kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | grep -c '^Ready$' || true
+        }
+        echo "::group::Wait for source worker to reach Ready"
         deadline=$((SECONDS + TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${CR_COUNT}" -ge 1 ]; then
-            echo "Source worker published metadata (${CR_COUNT} CR)."
+          READY=$(ready_count)
+          if [ "${READY}" -ge 1 ]; then
+            echo "Source worker is Ready (${READY} Ready CR)."
             break
           fi
           FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
-            echo "ERROR: worker pod failed before publishing metadata: ${FAILED}"
+            echo "ERROR: worker pod failed before becoming Ready: ${FAILED}"
             exit 1
           fi
-          echo "No ModelMetadata CR yet, retrying in 15s..."
+          echo "Source not Ready yet (${READY} Ready), retrying in 15s..."
           sleep 15
         done
-        if [ "$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')" -lt 1 ]; then
-          echo "ERROR: source worker did not publish metadata within ${TIMEOUT}s"
+        if [ "$(ready_count)" -lt 1 ]; then
+          echo "ERROR: source worker did not become Ready within ${TIMEOUT}s"
           exit 1
         fi
         echo "::endgroup::"
@@ -191,14 +204,23 @@ runs:
           echo "ERROR: wave_timeout_seconds must be a positive integer, got '${WAVE_TIMEOUT}'"
           exit 1
         }
+        # Each wave waits until WAVE workers are Ready (not just CR-published),
+        # so a wave only "completes" when its workers are actually healthy.
+        # This is what makes wave isolation real: a failure shows up in the
+        # wave that caused it, not several waves later.
+        ready_count() {
+          kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | grep -c '^Ready$' || true
+        }
         for WAVE in ${WAVE_SIZES}; do
           echo "::group::Scale to replicas=${WAVE}"
           kubectl scale deployment/mx-fleet-workers -n "${NAMESPACE}" --replicas="${WAVE}"
           deadline=$((SECONDS + WAVE_TIMEOUT))
           while [ $SECONDS -lt $deadline ]; do
-            CR_COUNT=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-            if [ "${CR_COUNT}" -ge "${WAVE}" ]; then
-              echo "Wave complete: ${CR_COUNT}/${WAVE} ModelMetadata CRs."
+            READY=$(ready_count)
+            if [ "${READY}" -ge "${WAVE}" ]; then
+              echo "Wave complete: ${READY}/${WAVE} workers Ready."
               break
             fi
             FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
@@ -207,23 +229,23 @@ runs:
               echo "ERROR: a worker pod failed during wave ${WAVE}: ${FAILED}"
               exit 1
             fi
-            echo "Have ${CR_COUNT}/${WAVE} CRs, retrying in 15s..."
+            echo "Have ${READY}/${WAVE} Ready, retrying in 15s..."
             sleep 15
           done
-          FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-          if [ "${FINAL}" -lt "${WAVE}" ]; then
-            echo "ERROR: only ${FINAL}/${WAVE} ModelMetadata CRs after ${WAVE_TIMEOUT}s"
+          READY=$(ready_count)
+          if [ "${READY}" -lt "${WAVE}" ]; then
+            echo "ERROR: only ${READY}/${WAVE} workers Ready after ${WAVE_TIMEOUT}s"
             exit 1
           fi
           echo "::endgroup::"
         done
-        # Confirm the last wave reached fleet_size.
-        FINAL=$(kubectl get modelmetadata -n "${NAMESPACE}" --no-headers 2>/dev/null | wc -l | tr -d ' ')
-        if [ "${FINAL}" -lt "${FLEET_SIZE}" ]; then
-          echo "ERROR: only ${FINAL}/${FLEET_SIZE} ModelMetadata CRs after all waves"
+        # Confirm the last wave reached fleet_size Ready workers.
+        READY=$(ready_count)
+        if [ "${READY}" -lt "${FLEET_SIZE}" ]; then
+          echo "ERROR: only ${READY}/${FLEET_SIZE} workers Ready after all waves"
           exit 1
         fi
-        echo "All ${FLEET_SIZE} workers have published metadata."
+        echo "All ${FLEET_SIZE} workers are Ready."
 
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
