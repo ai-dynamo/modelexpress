@@ -35,9 +35,16 @@ inputs:
     required: false
     default: 'v1.32.13'
   dynamo_ref:
-    description: 'Git ref of the ai-dynamo/dynamo repo to clone for the helm chart'
+    description: |
+      Git ref of the ai-dynamo/dynamo repo to clone for the helm chart.
+      Pinned to the `v1.0.2` release tag so the chart matches the operator
+      image tag below. Previously `main`, but that drifted: a re-bootstrap
+      pulled a `main` chart against the `1.0.2` image and the operator's
+      init container crash-looped on the version skew. Keep this and
+      `dynamo_operator_tag` in lockstep — bump both together to a newer
+      published release from https://github.com/ai-dynamo/dynamo/releases.
     required: false
-    default: 'main'
+    default: 'v1.0.2'
   dynamo_operator_image:
     description: |
       Full Dynamo operator image repo (without tag). Defaults to the chart's
@@ -47,12 +54,10 @@ inputs:
     default: 'nvcr.io/nvidia/ai-dynamo/kubernetes-operator'
   dynamo_operator_tag:
     description: |
-      Tag for the Dynamo operator image. Pinned to a known-published
-      release because `dynamo_ref` defaults to `main`, where the chart's
-      AppVersion is a future-version-in-preparation that hasn't been
-      published to nvcr.io/nvidia/ai-dynamo/kubernetes-operator yet. Bump
-      to a newer version from https://github.com/ai-dynamo/dynamo/releases
-      when also bumping `dynamo_ref` to that release tag.
+      Tag for the Dynamo operator image. Matches `dynamo_ref` (v1.0.2) so the
+      chart and image are the same release — a mismatch crash-loops the
+      operator's init container. Bump together with `dynamo_ref` to a newer
+      release from https://github.com/ai-dynamo/dynamo/releases.
     required: false
     default: '1.0.2'
 
@@ -112,6 +117,21 @@ runs:
         echo "::group::Create vCluster ${VCLUSTER_NAME} in ${NAMESPACE}"
         # GPU workloads require syncing host nodes into the vCluster so the GPU
         # device plugin and resource limits are visible to the scheduler.
+        #
+        # Pin the vCluster control-plane pod to the `system` agentpool
+        # (CPU-only, spacious, static — not Karpenter-managed). Per the ops
+        # team, this stops the intermittent Karpenter `Drifted` evictions of
+        # mx-ci-cluster-0 that were killing the control plane mid-run (MX-359):
+        # losing the vCluster mid-test breaks the kubectl port-forward AND
+        # skips per-run cleanup, leaking GPU pods onto the a100b pool. Keeping
+        # the control plane on a static pool removes the disruption at its
+        # source.
+        #
+        # The AKS `system` pool nodes carry the `CriticalAddonsOnly=true`
+        # taint, so the nodeSelector alone leaves the pod Pending
+        # ("untolerated taint {CriticalAddonsOnly: true}"). The matching
+        # toleration below lets it schedule there. operator=Exists avoids
+        # helm coercing the string value "true" into a bool.
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -119,7 +139,11 @@ runs:
           --set controlPlane.distro.k8s.enabled=true \
           --set controlPlane.distro.k8s.version=${VCLUSTER_K8S_VERSION} \
           --set sync.fromHost.nodes.enabled=true \
-          --set sync.fromHost.nodes.selector.all=true
+          --set sync.fromHost.nodes.selector.all=true \
+          --set 'controlPlane.statefulSet.scheduling.nodeSelector.kubernetes\.azure\.com/agentpool=system' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].key=CriticalAddonsOnly' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].operator=Exists' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].effect=NoSchedule'
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready

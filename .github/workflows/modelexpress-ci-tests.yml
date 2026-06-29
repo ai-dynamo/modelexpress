@@ -28,12 +28,12 @@
 #                         parallel once each framework has been validated
 #                         independently.
 #
-#   test-tp             — TP > 1 variant of test-p2p. Matrix covers
-#                         single-node TP=2 (one Job, two GPUs per pod,
-#                         pinned to a non-MIG GPU pool via nodeSelector)
-#                         and multi-node TP=2 (StatefulSet + Ray, one
-#                         GPU per pod, 2 pods per role). See TEST_PLAN
-#                         row 5.1 for the full topology rationale.
+#   test-tp             — TP > 1 variant of test-p2p. Multi-node TP=2 only
+#                         (StatefulSet + Ray, one GPU per pod on a100a, 2 pods
+#                         per role). Single-node TP=2 is covered by
+#                         test-p2p-mla-model (same manifest, plus VRAM parity)
+#                         and was dropped here to avoid doubling a100b demand.
+#                         See TEST_PLAN row 5.1.
 #
 #   test-dp             — DP > 1 variant of test-p2p. vLLM native data
 #                         parallelism (--data-parallel-size 2): N full model
@@ -55,6 +55,9 @@
 #   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
 #                        Uses a TP=2 DeepSeek MLA + MoE model and also runs
 #                        the standard source/target VRAM parity assertions.
+#                        Doubles as the single-node TP=2 coverage (same
+#                        manifest-azure-tp2.yaml + test_p2p_k8s.py as the
+#                        dropped test-tp single-node entry).
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
@@ -498,15 +501,17 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # P2P weight transfer with tensor parallelism > 1.
-  # Single-node TP: each pod has N GPUs and runs the engine with
-  # --tensor-parallel-size N. Source and target on different hosts (existing
-  # podAntiAffinity) so RDMA still goes over IB cross-host, not loopback.
-  # Multi-node TP coverage is a follow-up — would slot in here as additional
-  # matrix entries once the cluster + manifests support it.
   #
-  # Pinned to the right agentpool (2 nodes, full physical GPUs,
-  # `mig.config=all-disabled`) via the nodeSelector in
-  # manifest-azure-tp2.yaml.
+  # Multi-node TP only: StatefulSet + Ray, 1 GPU per pod on the a100a pool,
+  # so this job does NOT contend for the scarce full-GPU a100b pool. See the
+  # manifest header for the cross-host pod-pairing rationale.
+  #
+  # Single-node TP=2 is intentionally NOT a separate entry here: the
+  # `test-p2p-mla-model` job already exercises the single-node TP=2 path
+  # (same manifest-azure-tp2.yaml + test_p2p_k8s.py on the a100b full-GPU
+  # pool) and adds VRAM-parity assertions on top. Running both was redundant
+  # and doubled the a100b demand, so the Qwen single-node TP=2 entry was
+  # dropped in favor of the MLA one. See TEST_PLAN row 5.1.
   # ---------------------------------------------------------------------------
   test-tp:
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
@@ -518,14 +523,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - framework: vllm
-            tp_size: 2
-            topology: single-node
-            namespace: mx-ci-vllm-tp2-${{ github.run_id }}
-            manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
-            source_port: "8001"
-            worker_port: "8002"
-
           # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
           # manifest header for the cross-host pod-pairing rationale.
           - framework: vllm
