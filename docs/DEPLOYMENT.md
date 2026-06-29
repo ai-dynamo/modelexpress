@@ -521,6 +521,12 @@ Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in 
 
 For vLLM cache artifact transfer, set both `MX_ARTIFACT_TRANSFER=1` and `MX_P2P_METADATA=1` on source and target workers. The loader installs compatible artifacts before model initialization, then schedules publisher threads after successful load. Each publisher waits for readiness before publishing local torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), and DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) caches. In multi-pod StatefulSet deployments, non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`).
 
+Cache artifacts may contain executable code. Transfer checksums detect corruption
+but do not authenticate the publishing replica or attest the artifact. Enable
+artifact transfer only within a trusted deployment, and network-isolate the MX
+server and worker gRPC endpoints from untrusted clients. ModelExpress does not
+currently sign cache artifacts.
+
 ### ModelStreamer (Object Storage & Local Disk)
 
 ModelStreamer streams safetensors directly to GPU memory via `runai-model-streamer`. Supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. This is a storage-loading path and does not require P2P by itself. If the same deployment also enables ModelExpress P2P metadata and RDMA resources, later replicas can receive weights from an already-loaded source instead of streaming from storage again.

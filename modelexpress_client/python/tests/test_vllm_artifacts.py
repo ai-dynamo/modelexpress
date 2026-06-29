@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from modelexpress import p2p_pb2
 from modelexpress.engines.vllm import artifacts
 
@@ -131,7 +133,7 @@ def test_triton_artifact_identity_uses_runtime_cache_criteria(monkeypatch):
     assert identity.triton_version == "3.4.0"
     assert identity.gpu_arch == "sm90"
     assert identity.extra_parameters["triton_key"] == "triton-key"
-    assert identity.model_name == ""
+    assert identity.model_name == "test/model"
     assert identity.tensor_parallel_size == 0
     assert identity.dtype == ""
     assert identity.revision == ""
@@ -168,7 +170,7 @@ def test_deep_gemm_artifact_identity_uses_deep_gemm_cache_criteria(monkeypatch):
     assert identity.cuda_version == "12.8"
     assert identity.gpu_arch == "sm90"
     assert identity.extra_parameters["deep_gemm_jit_key"] == "deep-gemm-key"
-    assert identity.model_name == ""
+    assert identity.model_name == "test/model"
     assert identity.tensor_parallel_size == 0
     assert identity.dtype == ""
     assert identity.revision == ""
@@ -184,7 +186,7 @@ def test_triton_artifact_identity_omits_internal_key_when_unavailable(monkeypatc
     monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm90")
     ctx = SimpleNamespace(
         device_id=0,
-        identity=p2p_pb2.SourceIdentity(),
+        identity=p2p_pb2.SourceIdentity(model_name="test/model"),
     )
 
     identity = artifacts._artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE)
@@ -198,7 +200,7 @@ def test_deep_gemm_artifact_identity_omits_jit_key_when_unavailable(monkeypatch)
     monkeypatch.setattr(artifacts, "_deep_gemm_jit_key", lambda: "")
     ctx = SimpleNamespace(
         device_id=0,
-        identity=p2p_pb2.SourceIdentity(),
+        identity=p2p_pb2.SourceIdentity(model_name="test/model"),
     )
 
     identity = artifacts._artifact_identity(
@@ -347,6 +349,33 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         worker_rank=None,
     )
     transfer.install.assert_called_once_with(first)
+
+
+def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(artifacts.tempfile, "gettempdir", lambda: str(tmp_path))
+    transfer = SimpleNamespace(
+        name="triton_cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        source_root=tmp_path / "cache",
+        target_root=tmp_path / "cache",
+        discover_and_transfer=MagicMock(side_effect=RuntimeError("transfer failed")),
+        install=MagicMock(),
+    )
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name="test/model",
+    )
+    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object())
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
+
+    assert artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity) is None
+    transfer.discover_and_transfer.assert_called_once()
+    transfer.install.assert_not_called()
 
 
 def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(

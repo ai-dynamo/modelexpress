@@ -735,6 +735,12 @@ graph TD
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; GC deletes after 1 hour
 
+Cache artifact checksums protect transfer integrity but do not authenticate the
+source or attest the contents. TorchInductor, Triton, and DeepGEMM caches may
+contain executable code, so artifact transfer must be limited to trusted
+replicas and a trusted MX server, with MX and worker gRPC endpoints isolated
+from untrusted networks. ModelExpress does not currently sign cache artifacts.
+
 See [`metadata.md`](metadata.md) for the full storage schema and debugging guide.
 
 ## Environment Variables

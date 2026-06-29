@@ -103,6 +103,7 @@ class PublisherThread:
             else int(os.environ.get("MX_HEARTBEAT_INTERVAL_SECS", "30"))
         )
         self._stop_event = threading.Event()
+        self._status_lock = threading.Lock()
         self._started = False
         self._thread: threading.Thread | None = None
 
@@ -147,19 +148,20 @@ class PublisherThread:
 
     def _mark_stale(self) -> None:
         """Best-effort UpdateStatus(STALE). Swallows all errors."""
-        if not self._started:
-            return
-        try:
-            from .. import p2p_pb2
-            self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
-            logger.info(f"[Worker {self._worker_rank}] Marked STALE on shutdown")
-            self._started = False
-        except Exception:
-            logger.debug(
-                f"[Worker {self._worker_rank}] Failed to mark STALE on shutdown",
-                exc_info=True,
-            )
-            self._started = False
+        with self._status_lock:
+            if not self._started:
+                return
+            try:
+                from .. import p2p_pb2
+                self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
+                logger.info(f"[Worker {self._worker_rank}] Marked STALE on shutdown")
+                self._started = False
+            except Exception:
+                logger.debug(
+                    f"[Worker {self._worker_rank}] Failed to mark STALE on shutdown",
+                    exc_info=True,
+                )
+                self._started = False
 
     def _update_status(self, status: int) -> None:
         """Send UpdateStatus RPC."""
@@ -260,14 +262,15 @@ class PublisherThread:
         if self._nixl_manager is not None and not self._nixl_manager.is_healthy():
             return
 
-        if self._stop_event.is_set():
-            return
-        self._update_status(p2p_pb2.SOURCE_STATUS_READY)
-        if not self._started:
-            logger.info(
-                f"[Worker {self._worker_rank}] Status -> READY"
-            )
-            self._started = True
+        with self._status_lock:
+            if self._stop_event.is_set():
+                return
+            self._update_status(p2p_pb2.SOURCE_STATUS_READY)
+            if not self._started:
+                logger.info(
+                    f"[Worker {self._worker_rank}] Status -> READY"
+                )
+                self._started = True
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

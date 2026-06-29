@@ -225,6 +225,30 @@ class TestHeartbeatOnExit:
         mx_client.update_status.side_effect = RuntimeError("connection lost")
         heartbeat._on_exit()  # Should not raise
 
+    def test_on_exit_orders_stale_after_inflight_ready(self, heartbeat, mx_client):
+        ready_started = threading.Event()
+        release_ready = threading.Event()
+
+        def update_status(**kwargs):
+            if kwargs["status"] == 2:
+                ready_started.set()
+                release_ready.wait(timeout=5)
+            return True
+
+        mx_client.update_status.side_effect = update_status
+        heartbeat.start()
+        assert ready_started.wait(timeout=5)
+
+        exit_thread = threading.Thread(target=heartbeat._on_exit)
+        exit_thread.start()
+        assert heartbeat._stop_event.wait(timeout=5)
+        release_ready.set()
+        exit_thread.join(timeout=5)
+
+        assert not exit_thread.is_alive()
+        statuses = [call.kwargs["status"] for call in mx_client.update_status.call_args_list]
+        assert statuses == [2, 3]
+
 
 class TestHeartbeatDaemon:
     def test_thread_is_daemon(self, heartbeat):

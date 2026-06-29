@@ -87,7 +87,7 @@ def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
             elapsed = time.perf_counter() - start
             if header is None:
                 logger.debug(
-                    "[Worker %s] vLLM artifact %s already installed in this pod",
+                    "[Worker %s] vLLM artifact %s already attempted in this pod",
                     ctx.global_rank,
                     transfer.name,
                 )
@@ -117,7 +117,11 @@ def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
 
 
 def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
-    """Schedule readiness-gated publication of local vLLM cache artifacts."""
+    """Schedule publication of local artifacts after the vLLM server is ready.
+
+    Artifact readiness is independent of the primary weight source: each cache
+    becomes discoverable only after its own publisher succeeds.
+    """
     if not _artifact_transfer_enabled():
         return
     if not _p2p_metadata_enabled_for_artifacts(ctx):
@@ -209,14 +213,15 @@ def _install_vllm_cache_artifact_once(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
-    # vLLM JIT cache artifacts are pod-scoped, so one successful install per pod
-    # is enough for all local workers.
-    marker_path = _artifact_marker_path(transfer, identity, "install")
+    # Cache artifacts are pod-scoped. Mark before transfer so a failure is not
+    # retried serially by every local worker.
+    marker_path = _artifact_marker_path(transfer, identity, "install-attempted")
     with _artifact_lock(marker_path):
         if marker_path.exists():
             return None
         if ctx.nixl_manager is None:
             raise RuntimeError("NIXL manager is required for vLLM artifact install")
+        _write_marker(marker_path, "attempted")
         header = transfer.discover_and_transfer(
             ctx.mx_client,
             identity,
@@ -477,9 +482,10 @@ def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
 
 
 def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
-    # Triton cache entries are self-keyed by source/options; share by runtime stack.
+    # MX requires model_name; the other fields describe Triton runtime compatibility.
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         triton_version=_triton_version(),
@@ -490,9 +496,10 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
 
 
 def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
-    # DeepGEMM cache entries are self-keyed by JIT source/compiler; share by runtime.
+    # MX requires model_name; the other fields describe DeepGEMM compatibility.
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+        model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
         cuda_version=torch.version.cuda or "",
         gpu_arch=_gpu_arch(ctx.device_id),
