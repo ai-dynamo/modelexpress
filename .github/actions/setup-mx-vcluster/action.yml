@@ -121,6 +121,12 @@ runs:
         # skips per-run cleanup, leaking GPU pods onto the a100b pool. Keeping
         # the control plane on a static pool removes the disruption at its
         # source.
+        #
+        # The AKS `system` pool nodes carry the `CriticalAddonsOnly=true`
+        # taint, so the nodeSelector alone leaves the pod Pending
+        # ("untolerated taint {CriticalAddonsOnly: true}"). The matching
+        # toleration below lets it schedule there. operator=Exists avoids
+        # helm coercing the string value "true" into a bool.
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -129,7 +135,10 @@ runs:
           --set controlPlane.distro.k8s.version=${VCLUSTER_K8S_VERSION} \
           --set sync.fromHost.nodes.enabled=true \
           --set sync.fromHost.nodes.selector.all=true \
-          --set 'controlPlane.statefulSet.scheduling.nodeSelector.kubernetes\.azure\.com/agentpool=system'
+          --set 'controlPlane.statefulSet.scheduling.nodeSelector.kubernetes\.azure\.com/agentpool=system' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].key=CriticalAddonsOnly' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].operator=Exists' \
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].effect=NoSchedule'
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready
