@@ -356,6 +356,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-p2p:
     name: P2P test (${{ matrix.framework }})
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -471,6 +472,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-p2p-mla-model:
     name: P2P MLA model test (vllm TP=2)
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
     needs: [build-client, build-server, ensure-vcluster]
@@ -539,6 +541,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-tp:
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -633,6 +636,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-dp:
     name: P2P DP test (${{ matrix.framework }} DP=${{ matrix.dp_size }} ${{ matrix.topology }})
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -722,6 +726,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-ep:
     name: P2P EP test (${{ matrix.framework }} EP=${{ matrix.ep_size }} ${{ matrix.topology }})
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -804,6 +809,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-with-dynamo:
     name: P2P test with Dynamo (${{ matrix.mode }})
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -876,6 +882,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-stale-metadata:
     name: Stale metadata test (${{ matrix.framework }})
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -947,6 +954,7 @@ jobs:
   # ---------------------------------------------------------------------------
   model-streamer:
     name: Model Streamer test (${{ matrix.framework }}, S3)
+    if: false  # TEMP: disabled for capacity probe run (do not merge)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client]
     permissions:
