@@ -57,6 +57,19 @@ def _make_instance_ref(mx_source_id="abc123def456abcd", worker_id="inst-1", mode
     )
 
 
+class _IdentitySelector:
+    """Deterministic passthrough selector: preserves input candidate order.
+
+    Replaces the old ``random.shuffle`` no-op patch so candidate ordering is
+    stable for assertions that depend on attempt order.
+    """
+
+    name = "random"
+
+    def order(self, candidates, context):
+        return list(candidates)
+
+
 class _FakeAdapter(EngineAdapter):
     def build_identity(self):
         return _make_identity()
@@ -961,7 +974,7 @@ class TestFindSourceInstances:
             _make_instance_ref(worker_id="w-2", worker_rank=0),
         ]
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=insts)
-        with patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+        with patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy._find_source_instances(ctx)
         assert len(result) == 2
         assert all(r.worker_rank == 0 for r in result)
@@ -971,7 +984,7 @@ class TestFindSourceInstances:
         ctx = _make_load_context()
         inst = _make_instance_ref()
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[inst])
-        with patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+        with patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy._find_source_instances(ctx)
         assert len(result) == 1
         assert result[0].mx_source_id == inst.mx_source_id
@@ -1045,7 +1058,7 @@ class TestRdmaStrategyLoad:
         strategy, attempts = self._setup(ctx, candidates, [_make_metadata_resp(rank=0, worker_id="w-1")])
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy.load(MagicMock(), ctx)
 
         assert isinstance(result, LoadResult)
@@ -1065,7 +1078,7 @@ class TestRdmaStrategyLoad:
         )
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             with pytest.raises(StrategyFailed, match="transfer failed: w-1") as exc:
                 strategy.load(MagicMock(), ctx)
 
@@ -1095,7 +1108,7 @@ class TestRdmaStrategyLoad:
         )
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
                 strategy.load(MagicMock(), ctx)
 

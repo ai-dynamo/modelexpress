@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import random
 import time
 from typing import TYPE_CHECKING
 
@@ -20,6 +19,7 @@ from ...metadata.heartbeat import HeartbeatThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
 from ...nixl_transfer import NixlTransferManager
+from ...source_selection import SourceSelectionContext, get_configured_selector
 from .adapter import build_sglang_load_context
 
 logger = logging.getLogger("modelexpress.engines.sglang.loader")
@@ -217,7 +217,22 @@ class MxModelLoader:
         candidates = [
             inst for inst in response.instances if inst.worker_rank == ctx.worker_rank
         ]
-        random.shuffle(candidates)
+        selection_ctx = SourceSelectionContext(
+            worker_rank=ctx.worker_rank,
+            global_rank=ctx.global_rank,
+            worker_id=ctx.worker_id,
+            model_name=ctx.identity.model_name,
+        )
+        selector = get_configured_selector(selection_ctx)
+        candidates = selector.order(candidates, selection_ctx)
+        logger.info(
+            "[Worker %s] TransferEngine source selection: source_selector=%s "
+            "source_candidates_total=%d source_candidates_rank_matched=%d",
+            ctx.global_rank,
+            selector.name,
+            len(response.instances),
+            len(candidates),
+        )
         for source_ref in candidates:
             metadata = ctx.mx_client.get_metadata(
                 mx_source_id=source_ref.mx_source_id,

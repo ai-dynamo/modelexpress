@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import random
 import time
 
 from ..adapter import EngineAdapter, StrategyFailed
@@ -21,6 +20,12 @@ from .base import (
 from .context import LoadResult
 from ..metadata.payload import worker_tensor_count, worker_tensor_descriptors
 from ..nixl_transfer import is_nixl_available
+from ..source_selection import (
+    SourceSelectionContext,
+    configured_policy_label,
+    get_configured_selector,
+)
+from ..source_selection_metrics import metrics as selection_metrics
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
 from .. import p2p_pb2
@@ -99,9 +104,15 @@ class RdmaStrategy(LoadStrategy):
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
             raise StrategyFailed("No RDMA source available", mutated=False)
 
-        for instance in candidates[:MAX_SOURCE_RETRIES]:
+        policy = configured_policy_label()
+        for attempt_index, instance in enumerate(candidates[:MAX_SOURCE_RETRIES]):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
+            logger.info(
+                f"[Worker {ctx.global_rank}] Source attempt: "
+                f"source_attempt_index={attempt_index} "
+                f"source_worker_id={worker_id} mx_source_id={mx_source_id}"
+            )
 
             try:
                 source_worker = self._fetch_worker_metadata(
@@ -112,9 +123,12 @@ class RdmaStrategy(LoadStrategy):
                     f"[Worker {ctx.global_rank}] Failed to fetch metadata for worker {worker_id}: {e}. "
                     f"Trying next candidate."
                 )
+                selection_metrics.record_metadata_failure(policy)
+                selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
             if source_worker is None:
+                selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
             logger.info(
@@ -126,9 +140,23 @@ class RdmaStrategy(LoadStrategy):
             # adapter may have initialized or transformed model tensors, and a
             # failed receive may have partially written weights. The chain will
             # re-initialize the model before trying the next loading strategy.
-            return self._load_as_target(
-                result, ctx, source_worker, mx_source_id, worker_id,
+            selection_metrics.record_selection(policy, worker_id)
+            transfer_start = time.perf_counter()
+            try:
+                out = self._load_as_target(
+                    result, ctx, source_worker, mx_source_id, worker_id,
+                )
+            except BaseException:
+                selection_metrics.observe_transfer_seconds(
+                    policy, "fallback", time.perf_counter() - transfer_start
+                )
+                selection_metrics.record_attempt(policy, "transfer_fallback")
+                raise
+            selection_metrics.observe_transfer_seconds(
+                policy, "success", time.perf_counter() - transfer_start
             )
+            selection_metrics.record_attempt(policy, "success")
+            return out
 
         tried = min(len(candidates), MAX_SOURCE_RETRIES)
         logger.warning(
@@ -142,7 +170,13 @@ class RdmaStrategy(LoadStrategy):
     def _find_source_instances(
         self, ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
-        """Return all READY source instances (shuffled for load balancing)."""
+        """Return READY source instances ranked by the configured selector.
+
+        Filters listed instances to the target's worker_rank, then delegates
+        ordering to the policy named by MX_P2P_SOURCE_SELECTOR (default
+        ``random``). The retry slice (MAX_SOURCE_RETRIES) is applied by the
+        caller in load(), so the selector controls ordering only.
+        """
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -156,11 +190,38 @@ class RdmaStrategy(LoadStrategy):
                 inst for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
             ]
-            random.shuffle(candidates)
-            logger.info(
-                f"[Worker {ctx.global_rank}] Found {len(candidates)} ready source worker(s)"
+
+            selection_ctx = SourceSelectionContext(
+                worker_rank=ctx.worker_rank,
+                global_rank=ctx.global_rank,
+                worker_id=ctx.worker_id,
+                model_name=ctx.identity.model_name,
             )
-            return candidates
+            selector = get_configured_selector(selection_ctx)
+            select_start = time.perf_counter()
+            ordered = selector.order(candidates, selection_ctx)
+            select_seconds = time.perf_counter() - select_start
+
+            selection_metrics.observe_candidates(
+                selector.name, "listed", len(list_resp.instances)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "rank_matched", len(ordered)
+            )
+            selection_metrics.observe_selection_seconds(selector.name, select_seconds)
+
+            logger.info(
+                f"[Worker {ctx.global_rank}] Source selection: "
+                f"source_selector={selector.name} "
+                f"source_candidates_total={len(list_resp.instances)} "
+                f"source_candidates_rank_matched={len(ordered)}"
+            )
+            if ordered:
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] Ranked source workers: "
+                    f"{[inst.worker_id for inst in ordered]}"
+                )
+            return ordered
 
         except Exception as e:
             logger.warning(
