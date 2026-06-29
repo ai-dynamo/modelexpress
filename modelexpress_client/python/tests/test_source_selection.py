@@ -320,6 +320,22 @@ def test_configured_policy_label_unknown_falls_back(monkeypatch):
     assert configured_policy_label() == "random"
 
 
+def test_configured_policy_label_failing_factory_falls_back(monkeypatch):
+    # A registered-but-raising factory resolves to "random" at runtime, so the
+    # label must too (else load() metrics would be split from selection metrics).
+    def _boom(_ctx):
+        raise RuntimeError("broken factory")
+
+    register_selector("broken-label", _boom)
+    monkeypatch.setenv(ENV_SELECTOR, "broken-label")
+    try:
+        assert configured_policy_label() == "random"
+    finally:
+        from modelexpress.source_selection import SELECTORS
+
+        SELECTORS.pop("broken-label", None)
+
+
 def test_rendezvous_hash_stable_on_score_tie():
     # Identical hash-key fields (mx_source_id/worker_id/worker_rank) tie on
     # score; model_name is not hashed, so it distinguishes order. sorted() is

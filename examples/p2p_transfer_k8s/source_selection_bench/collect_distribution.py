@@ -54,13 +54,16 @@ def main() -> None:
     per_source = list(counts.values()) + [0] * max(0, m - len(counts))
     total = sum(per_source)
     mean = (total / m) if m else 0
+    # Discrete baseline over the recorded targets (robust to missing logs and
+    # uneven splits), matching the offline benchmark's ceil(N/M)/N.
+    ideal_share = (((total + m - 1) // m) / total) if total and m else 0
     print(f"\n=== on-cluster source distribution: policy={policy} M={m} N={n} ===")
     print(f"targets with a recorded source: {total}/{n}")
     print(f"fan-out makespan: {makespan}s")
     for src, c in counts.most_common():
         print(f"  {src}: {c}")
     if total:
-        print(f"max-source share: {max(per_source) / total:.3f}  (ideal {1 / m:.3f})")
+        print(f"max-source share: {max(per_source) / total:.3f}  (ideal {ideal_share:.3f})")
         if mean:
             print(f"CoV: {statistics.pstdev(per_source) / mean:.3f}")
         print(f"Gini: {gini(per_source):.3f}")

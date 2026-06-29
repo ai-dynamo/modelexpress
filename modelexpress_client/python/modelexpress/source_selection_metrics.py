@@ -186,9 +186,14 @@ def push_metrics_if_enabled(job: str = "mx_p2p") -> None:
     if not gateway:
         return
     try:
+        import socket
+
         from prometheus_client import REGISTRY, push_to_gateway
 
-        push_to_gateway(gateway, job=job, registry=REGISTRY)
-        logger.info("Pushed P2P metrics to %s (job=%s)", gateway, job)
+        # push_to_gateway (PUT) replaces the whole group for a job+grouping_key.
+        # Key by host so concurrent workers don't overwrite each other's metrics.
+        grouping_key = {"instance": socket.gethostname()}
+        push_to_gateway(gateway, job=job, grouping_key=grouping_key, registry=REGISTRY)
+        logger.info("Pushed P2P metrics to %s (job=%s, %s)", gateway, job, grouping_key)
     except Exception as e:
         logger.warning("Failed to push P2P metrics to %s: %s", gateway, e)

@@ -210,11 +210,17 @@ def get_configured_selector(context: SourceSelectionContext) -> SourceSelector:
 
 
 def configured_policy_label() -> str:
-    """Resolved policy name for metric/label use, matching get_selector fallback.
+    """Resolved policy name for metric/label use, matching get_selector.
 
-    Returns the configured name when it is registered, else ``random`` (the
-    fallback get_selector would apply), so labels never claim a policy that did
-    not actually run.
+    Resolves through the same registry path selection uses, including the
+    fallback to ``random`` when the configured policy is unknown *or* its factory
+    raises -- so emitted labels never claim a policy that did not actually run.
     """
     name = os.environ.get(ENV_SELECTOR, DEFAULT_SELECTOR)
-    return name if name in SELECTORS else DEFAULT_SELECTOR
+    factory = SELECTORS.get(name)
+    if factory is None:
+        return DEFAULT_SELECTOR
+    try:
+        return factory(SourceSelectionContext(0, 0, "", "")).name
+    except Exception:
+        return DEFAULT_SELECTOR

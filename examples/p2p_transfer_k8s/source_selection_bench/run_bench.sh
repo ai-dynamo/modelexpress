@@ -113,8 +113,13 @@ echo "[bench] waiting for control plane..."
 kc rollout status deploy/mx-oss-redis --timeout=120s
 kc rollout status deploy/mx-oss-server --timeout=180s
 
-# Flush stale metadata before a run (CLAUDE.md: stale metadata breaks P2P).
-kc exec deploy/mx-oss-redis -- redis-cli FLUSHALL >/dev/null 2>&1 || true
+# Flush stale metadata before a run (stale metadata breaks P2P). Fail fast --
+# proceeding with a polluted Redis would mix prior-run sources into the results.
+for attempt in 1 2 3; do
+  kc exec deploy/mx-oss-redis -- redis-cli FLUSHALL >/dev/null && break
+  [ "$attempt" -eq 3 ] && { echo "[bench] failed to flush redis state" >&2; exit 1; }
+  sleep 2
+done
 
 # --- worker pod factory (role=source|target, index, optional policy) ---
 make_worker() {
@@ -154,6 +159,10 @@ spec:
             --model ${MODEL_PATH} --served-model-name ${SERVED_NAME} \
             --load-format modelexpress --tensor-parallel-size 1 --trust-remote-code
       securityContext: { runAsUser: 0, capabilities: { add: [IPC_LOCK, SYS_PTRACE] } }
+      # condition=Ready (below) gates on this probe: vLLM /health only passes once
+      # the engine is up, i.e. model load + any P2P transfer are complete -- so the
+      # makespan and log collection run after the real work, not at container start.
+      readinessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 20, periodSeconds: 10, failureThreshold: 180 }
       resources:
         requests: { cpu: "8", memory: 48Gi, nvidia.com/gpu: "1", rdma/ib: "1" }
         limits: { cpu: "16", memory: 96Gi, nvidia.com/gpu: "1", rdma/ib: "1" }
@@ -181,11 +190,11 @@ END_EPOCH=$(date +%s)
 echo "[bench] fan-out makespan: $((END_EPOCH - START_EPOCH))s"
 
 # --- collect each target's selected source from its log ---
-mkdir -p "/tmp/bench-${POLICY}"
+LOGDIR="$(mktemp -d)"
 for i in $(seq 0 $((N - 1))); do
-  kc logs mx-oss-target-"$i" > "/tmp/bench-${POLICY}/target-${i}.log" 2>&1 || true
+  kc logs mx-oss-target-"$i" > "$LOGDIR/target-${i}.log" 2>&1 || true
 done
-python3 "$(dirname "$0")/collect_distribution.py" "/tmp/bench-${POLICY}" "$POLICY" "$M" "$N" "$((END_EPOCH - START_EPOCH))"
+python3 "$(dirname "$0")/collect_distribution.py" "$LOGDIR" "$POLICY" "$M" "$N" "$((END_EPOCH - START_EPOCH))"
 
 if [ "$K" = "1" ]; then
   kc delete pod -l app=mx-oss-source --wait=false

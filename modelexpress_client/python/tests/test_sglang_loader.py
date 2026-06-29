@@ -608,7 +608,18 @@ def test_te_find_source_iterates_in_selector_order_and_none_when_no_match(monkey
 
 
 def test_te_find_source_skips_not_found(monkeypatch):
-    monkeypatch.delenv("MX_P2P_SOURCE_SELECTOR", raising=False)
+    # Force identity order so w0 (not-found) is queried first and the
+    # `if not metadata.found: continue` branch is actually exercised.
+    class _IdentitySelector:
+        name = "identity"
+
+        def order(self, candidates, context):
+            return list(candidates)
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda _ctx: _IdentitySelector(),
+    )
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = _te_ctx(
         [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
@@ -619,3 +630,6 @@ def test_te_find_source_skips_not_found(monkeypatch):
     worker = loader._find_transfer_engine_source(ctx)
     assert worker is not None
     assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    assert [
+        c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list
+    ] == ["w0", "w1"]
