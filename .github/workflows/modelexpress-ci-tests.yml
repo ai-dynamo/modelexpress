@@ -322,6 +322,22 @@ jobs:
               | sed -n '/Allocated resources/,/Events/p' | grep -E "nvidia.com/gpu|Resource " || echo "(no gpu allocation line)"
           done
           echo "::endgroup::"
+          echo "::group::a100b nodes - GPU-consuming pods (who is holding them)"
+          # List every pod scheduled on each a100b node with its GPU request,
+          # namespace, and start time. Distinguishes a live concurrent CI run
+          # (fresh START, mx-ci-* namespace matching an active run) from
+          # orphaned/leaked pods left by a prior failed or vCluster-evicted run
+          # (old START, namespace from a run that already ended).
+          for NODE_NAME in $(kubectl --kubeconfig="${HKC}" get nodes -l agentpool=a100b -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "--- ${NODE_NAME} ---"
+            # GPU_REQ kept last so the trailing-<none> filter (drops pods that
+            # request no GPU, e.g. daemonsets) is reliable.
+            kubectl --kubeconfig="${HKC}" get pods -A \
+              --field-selector "spec.nodeName=${NODE_NAME}" \
+              -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,PHASE:.status.phase,START:.metadata.creationTimestamp,GPU_REQ:.spec.containers[*].resources.requests.nvidia\.com/gpu' \
+              2>&1 | grep -vE '<none>$' || echo "(no GPU pods)"
+          done
+          echo "::endgroup::"
           rm -f "${HKC}"
 
       - name: vCluster baseline health
