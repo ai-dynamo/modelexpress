@@ -414,10 +414,14 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service`. |
-| `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
-| `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor and artifact manifest serving |
+| `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, and DeepGEMM caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
+| `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
+| `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
+| `MX_ARTIFACT_READY_URL` | `http://127.0.0.1:8000/health` | Readiness endpoint polled before source workers prepare and publish cache artifact bundles. Kubernetes StatefulSet vLLM worker pods using the default localhost URL infer pod-0's stable DNS endpoint. |
+| `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -514,6 +518,14 @@ fix notes in this gist:
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
+
+For vLLM cache artifact transfer, set both `MX_ARTIFACT_TRANSFER=1` and `MX_P2P_METADATA=1` on source and target workers. The loader installs compatible artifacts before model initialization, then schedules publisher threads after successful load. Each publisher waits for readiness before publishing local torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), and DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) caches. In multi-pod StatefulSet deployments, non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`).
+
+Cache artifacts may contain executable code. Transfer checksums detect corruption
+but do not authenticate the publishing replica or attest the artifact. Enable
+artifact transfer only within a trusted deployment, and network-isolate the MX
+server and worker gRPC endpoints from untrusted clients. ModelExpress does not
+currently sign cache artifacts.
 
 ### ModelStreamer (Object Storage & Local Disk)
 

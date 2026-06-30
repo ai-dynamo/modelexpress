@@ -160,11 +160,11 @@ Factory helpers provide the three cache source types currently expected by loade
 |--------|------------------|--------------------|
 | `torch_compile_cache_artifact_transfer()` | `TORCH_COMPILE_CACHE` | TorchInductor/vLLM torch compile cache directory |
 | `triton_cache_artifact_transfer()` | `TRITON_CACHE` | Triton kernel cache directory |
-| `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM cache directory |
+| `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM JIT cache directory (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) |
 
 ### UpdateStatus
 
-Transitions a worker's lifecycle status. Called periodically by the client-side heartbeat thread to refresh `updated_at`, and on shutdown to mark `STALE`.
+Transitions a worker's lifecycle status. Called periodically by the client-side publisher thread to refresh `updated_at`, and on shutdown to mark `STALE`.
 
 ```protobuf
 UpdateStatusRequest {
@@ -424,7 +424,7 @@ sequenceDiagram
     W->>MX: PublishMetadata(identity, worker, worker_id)
     MX->>Backend: Store worker metadata (status=INITIALIZING)
     MX-->>W: mx_source_id
-    W->>W: Start HeartbeatThread
+    W->>W: Start PublisherThread
     loop Every MX_HEARTBEAT_INTERVAL_SECS
         W->>MX: UpdateStatus(mx_source_id, worker_id, rank, READY)
         MX->>Backend: Patch status + updated_at

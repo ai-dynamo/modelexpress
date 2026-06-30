@@ -72,13 +72,13 @@ def register_modelexpress_loaders():
 from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
-from .metadata.heartbeat import HeartbeatThread  # noqa: F401
+from .metadata.publisher import PublisherThread  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
-    "HeartbeatThread",
     "MxClient",
     "MxGdsLoader",
+    "PublisherThread",
     "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]

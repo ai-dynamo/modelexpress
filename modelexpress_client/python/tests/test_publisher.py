@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for HeartbeatThread."""
+"""Tests for source publication and heartbeat signaling."""
 
 import threading
 import time
@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from modelexpress.metadata.heartbeat import HeartbeatThread
+from modelexpress.metadata.publisher import PublisherThread
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def nixl_manager():
 @pytest.fixture
 def heartbeat(mx_client, nixl_manager):
     with patch.dict("os.environ", {"MX_HEARTBEAT_INTERVAL_SECS": "1"}):
-        hb = HeartbeatThread(
+        hb = PublisherThread(
             mx_client=mx_client,
             mx_source_id="abc123",
             worker_id="w1",
@@ -89,6 +89,64 @@ class TestHeartbeatSendsReady:
             )
         ]
         assert len(ready_calls) >= 2
+
+
+class TestPublisherPublishAndReady:
+    def test_first_tick_publishes_then_sends_ready(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+        )
+
+        publisher._tick()
+
+        assert publisher.mx_source_id == "abc123"
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+            )
+        ]
+
+    def test_ready_gate_blocks_publish(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="abc123")
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            ready_fn=lambda: False,
+            interval_secs=1,
+        )
+
+        publisher._tick()
+
+        publish.assert_not_called()
+        mx_client.update_status.assert_not_called()
+
+    def test_can_stop_after_publish_without_heartbeat(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            heartbeat_after_publish=False,
+            interval_secs=1,
+        )
+
+        publisher._tick()
+
+        assert publisher.mx_source_id == "abc123"
+        mx_client.update_status.assert_not_called()
+        assert publisher._stop_event.is_set()
 
 
 class TestHeartbeatStop:
@@ -166,6 +224,30 @@ class TestHeartbeatOnExit:
         time.sleep(1.5)
         mx_client.update_status.side_effect = RuntimeError("connection lost")
         heartbeat._on_exit()  # Should not raise
+
+    def test_on_exit_orders_stale_after_inflight_ready(self, heartbeat, mx_client):
+        ready_started = threading.Event()
+        release_ready = threading.Event()
+
+        def update_status(**kwargs):
+            if kwargs["status"] == 2:
+                ready_started.set()
+                release_ready.wait(timeout=5)
+            return True
+
+        mx_client.update_status.side_effect = update_status
+        heartbeat.start()
+        assert ready_started.wait(timeout=5)
+
+        exit_thread = threading.Thread(target=heartbeat._on_exit)
+        exit_thread.start()
+        assert heartbeat._stop_event.wait(timeout=5)
+        release_ready.set()
+        exit_thread.join(timeout=5)
+
+        assert not exit_thread.is_alive()
+        statuses = [call.kwargs["status"] for call in mx_client.update_status.call_args_list]
+        assert statuses == [2, 3]
 
 
 class TestHeartbeatDaemon:

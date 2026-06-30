@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import tarfile
 from concurrent import futures
 from pathlib import Path
@@ -31,7 +32,11 @@ from modelexpress.metadata.artifact_transfer import (
     torch_compile_cache_artifact_transfer,
 )
 from modelexpress.metadata.source_id import compute_mx_source_id
-from modelexpress.metadata.worker_server import WorkerServiceServicer
+from modelexpress.metadata.worker_server import (
+    WorkerGrpcServer,
+    WorkerServiceServicer,
+    fetch_tensor_manifest,
+)
 
 
 def test_transfer_artifact_from_worker_reconstructs_file_and_releases_leases(tmp_path):
@@ -82,6 +87,64 @@ def test_transfer_artifact_from_worker_reconstructs_file_and_releases_leases(tmp
     assert target_nixl.deregistered_count == 4
     assert not chunk_manager.leases
     assert chunk_manager.released_chunks == [0, 1, 2, 3]
+
+
+def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path):
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"compiled-cache")
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=8,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    artifact_id = artifact_manifest_id(manifest)
+    server = WorkerGrpcServer(
+        tensor_protos=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=8,
+                device_id=0,
+                dtype="torch.float16",
+            )
+        ],
+        mx_source_id=None,
+        port=0,
+        metadata_endpoint="127.0.0.1:5555",
+        agent_name="source-agent",
+        worker_rank=0,
+    )
+    port = server.start()
+    endpoint = f"127.0.0.1:{port}"
+    server.set_mx_source_id("weight-source")
+    server.register_artifact_source(
+        "artifact-source",
+        artifact_id,
+        manifest,
+        object(),
+    )
+
+    try:
+        tensors, _ = fetch_tensor_manifest(endpoint, "weight-source", timeout=1.0)
+        header, _ = artifact_transfer_module.fetch_artifact_manifest_header(
+            endpoint,
+            "artifact-source",
+            artifact_id,
+            timeout=1.0,
+        )
+        with pytest.raises(grpc.RpcError):
+            artifact_transfer_module.fetch_artifact_manifest_header(
+                endpoint,
+                "weight-source",
+                artifact_id,
+                timeout=1.0,
+            )
+    finally:
+        server.stop(grace=None)
+
+    assert [tensor.name for tensor in tensors] == ["weight"]
+    assert header.mx_source_id == "artifact-source"
+    assert header.artifact_id == artifact_id
 
 
 def test_transfer_artifact_from_worker_retries_after_source_buffer_exhaustion(
@@ -348,7 +411,7 @@ def test_extract_tarred_artifact_rejects_unsafe_member(tmp_path):
         transfer.install(header)
 
 
-def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path):
+def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, caplog):
     source = tmp_path / "source"
     source.mkdir()
     (source / "bucket-000").mkdir()
@@ -367,7 +430,11 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path):
         tmp_path / "target-bundle",
         chunk_size=5,
     )
-    bundle = source_transfer.prepare_source()
+    with caplog.at_level(
+        logging.INFO,
+        logger="modelexpress.metadata.artifact_transfer",
+    ):
+        bundle = source_transfer.prepare_source()
     source_bytes_by_path = {
         file.path: Path(file.path).read_bytes()
         for file in bundle.manifest.files
@@ -386,18 +453,26 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path):
     server, port = _start_server(servicer)
 
     try:
-        header = target_transfer.transfer_from_worker(
-            f"127.0.0.1:{port}",
-            mx_source_id="source-123",
-            artifact_id=bundle.artifact_id,
-            nixl_manager=target_nixl,
-            timeout=1.0,
-        )
+        with caplog.at_level(
+            logging.INFO,
+            logger="modelexpress.metadata.artifact_transfer",
+        ):
+            header = target_transfer.transfer_from_worker(
+                f"127.0.0.1:{port}",
+                mx_source_id="source-123",
+                artifact_id=bundle.artifact_id,
+                nixl_manager=target_nixl,
+                timeout=1.0,
+            )
         assert header.files[0].path == (
             tmp_path / "target-bundle" / "artifact.tar"
         ).resolve().as_posix()
         assert not (target_transfer.target_root / "bucket-000").exists()
-        target_transfer.install(header)
+        with caplog.at_level(
+            logging.INFO,
+            logger="modelexpress.metadata.artifact_transfer",
+        ):
+            target_transfer.install(header)
     finally:
         server.stop(grace=None)
 
@@ -419,6 +494,9 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path):
     assert chunk_manager.released_chunks == [
         chunk.chunk_index for chunk in bundle.manifest.chunks
     ]
+    assert "[TIMING] Artifact prepare complete: name=torch_compile_cache" in caplog.text
+    assert "[TIMING] Artifact transfer complete" in caplog.text
+    assert "[TIMING] Artifact install complete" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -520,8 +598,9 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
         gpu_arch="sm90",
         compile_config_digest="cache-key",
     )
-    mx_client = _FakeMxClient()
+    mx_client = _FakeMxClient(mx_source_id="server-artifact-source-id")
     source_nixl = _FakeSourceNixlManager(listen_port=7010)
+    worker_server = _FakeWorkerGrpcServer()
 
     published = publish_artifact_source(
         mx_client,
@@ -530,7 +609,7 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
         identity,
         source_nixl,
         worker_id="source-worker-0",
-        worker_grpc_port=0,
+        worker_grpc_server=worker_server,
         host="127.0.0.1",
     )
     try:
@@ -540,6 +619,13 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
 
     assert source_nixl.refresh_metadata_count == 1
     assert discovered == published.endpoint
+    assert published.endpoint.mx_source_id == "server-artifact-source-id"
+    assert worker_server.registered == [
+        ("server-artifact-source-id", bundle.artifact_id)
+    ]
+    assert worker_server.unregistered == [
+        ("server-artifact-source-id", bundle.artifact_id)
+    ]
     assert mx_client.published_worker.worker_grpc_endpoint == (
         published.endpoint.worker_grpc_endpoint
     )
@@ -548,9 +634,44 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
     assert mx_client.published_worker.artifact_source.file_count == 1
 
 
+def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "kernel.bin").write_bytes(b"compiled-cache")
+    transfer = torch_compile_cache_artifact_transfer(
+        source,
+        tmp_path / "target",
+        tmp_path / "bundle",
+        chunk_size=8,
+    )
+    bundle = transfer.prepare_source()
+    identity = p2p_pb2.SourceIdentity(
+        mx_version="0.5.0",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        model_name="test/model",
+    )
+    mx_client = _FakeMxClient()
+    published = publish_artifact_source(
+        mx_client,
+        transfer,
+        bundle,
+        identity,
+        _FakeSourceNixlManager(listen_port=7010),
+        worker_id="source-worker-3",
+        worker_rank=3,
+        worker_grpc_server=_FakeWorkerGrpcServer(),
+        host="127.0.0.1",
+    )
+    try:
+        assert discover_artifact_source(mx_client, identity) == published.endpoint
+        with pytest.raises(LookupError):
+            discover_artifact_source(mx_client, identity, worker_rank=0)
+    finally:
+        published.stop()
+
+
 def test_publish_artifact_source_stops_server_when_refresh_fails(
     tmp_path,
-    monkeypatch,
 ):
     source = tmp_path / "source"
     source.mkdir()
@@ -569,18 +690,7 @@ def test_publish_artifact_source_stops_server_when_refresh_fails(
     )
     mx_client = _FakeMxClient()
     source_nixl = _FailingRefreshNixlManager(listen_port=7010)
-    fake_servers = []
-
-    class _TrackedFakeWorkerGrpcServer(_FakeWorkerGrpcServer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            fake_servers.append(self)
-
-    monkeypatch.setattr(
-        artifact_transfer_module,
-        "WorkerGrpcServer",
-        _TrackedFakeWorkerGrpcServer,
-    )
+    worker_server = _FakeWorkerGrpcServer()
 
     with pytest.raises(RuntimeError, match="refresh failed"):
         publish_artifact_source(
@@ -590,13 +700,14 @@ def test_publish_artifact_source_stops_server_when_refresh_fails(
             identity,
             source_nixl,
             worker_id="source-worker-0",
-            worker_grpc_port=0,
+            worker_grpc_server=worker_server,
             host="127.0.0.1",
         )
 
     assert mx_client.published_worker is not None
-    assert len(fake_servers) == 1
-    assert fake_servers[0].stopped
+    mx_source_id = compute_mx_source_id(identity)
+    assert worker_server.registered == [(mx_source_id, bundle.artifact_id)]
+    assert worker_server.unregistered == [(mx_source_id, bundle.artifact_id)]
 
 
 def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_path):
@@ -850,7 +961,8 @@ class _FakeTargetNixlManager:
 
 
 class _FakeMxClient:
-    def __init__(self):
+    def __init__(self, mx_source_id: str | None = None):
+        self.mx_source_id = mx_source_id
         self.published_identity = None
         self.published_worker = None
         self.published_worker_id = ""
@@ -862,7 +974,7 @@ class _FakeMxClient:
         self.published_worker = p2p_pb2.WorkerMetadata()
         self.published_worker.CopyFrom(worker)
         self.published_worker_id = worker_id
-        return compute_mx_source_id(identity)
+        return self.mx_source_id or compute_mx_source_id(identity)
 
     def list_sources(self, identity=None, status_filter=None):
         assert identity == self.published_identity
@@ -870,7 +982,8 @@ class _FakeMxClient:
         return p2p_pb2.ListSourcesResponse(
             instances=[
                 p2p_pb2.SourceInstanceRef(
-                    mx_source_id=compute_mx_source_id(self.published_identity),
+                    mx_source_id=self.mx_source_id
+                    or compute_mx_source_id(self.published_identity),
                     worker_id=self.published_worker_id,
                     model_name=self.published_identity.model_name,
                     worker_rank=self.published_worker.worker_rank,
@@ -879,7 +992,9 @@ class _FakeMxClient:
         )
 
     def get_metadata(self, mx_source_id, worker_id):
-        assert mx_source_id == compute_mx_source_id(self.published_identity)
+        assert mx_source_id == (
+            self.mx_source_id or compute_mx_source_id(self.published_identity)
+        )
         assert worker_id == self.published_worker_id
         worker = p2p_pb2.WorkerMetadata()
         worker.CopyFrom(self.published_worker)
@@ -924,10 +1039,31 @@ class _FakeWorkerGrpcServer:
     def __init__(self, *args, artifact_chunk_manager=None, **kwargs):
         del args, kwargs
         self.artifact_chunk_manager = artifact_chunk_manager
+        self.mx_source_id = None
+        self.port = 7100
+        self.registered = []
+        self.unregistered = []
         self.stopped = False
 
     def start(self):
         return 7100
+
+    def set_mx_source_id(self, mx_source_id: str):
+        self.mx_source_id = mx_source_id
+
+    def register_artifact_source(
+        self,
+        mx_source_id,
+        artifact_id,
+        manifest,
+        artifact_chunk_manager,
+    ):
+        del manifest
+        self.artifact_chunk_manager = artifact_chunk_manager
+        self.registered.append((mx_source_id, artifact_id))
+
+    def unregister_artifact_source(self, mx_source_id, artifact_id):
+        self.unregistered.append((mx_source_id, artifact_id))
 
     def stop(self, grace: float = 5.0):
         del grace

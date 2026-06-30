@@ -506,7 +506,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
     ctx.mx_client.publish_metadata = publish_metadata
     ctx.mx_client.update_status = update_status
 
-    class FakeHeartbeat:
+    class FakePublisher:
         def __init__(self, **kwargs):
             published["heartbeat"] = kwargs
 
@@ -514,8 +514,8 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
             published["heartbeat_started"] = True
 
     with patch(
-        "modelexpress.engines.sglang.loader.HeartbeatThread",
-        FakeHeartbeat,
+        "modelexpress.engines.sglang.loader.PublisherThread",
+        FakePublisher,
     ):
         published_ok = loader._publish_transfer_engine_source(
             ctx=ctx,
