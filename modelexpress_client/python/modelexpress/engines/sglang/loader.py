@@ -217,6 +217,9 @@ class MxModelLoader:
         candidates = [
             inst for inst in response.instances if inst.worker_rank == ctx.worker_rank
         ]
+        # The nixl transport (and vLLM) order sources in the shared
+        # RdmaStrategy; this is SGLang's separate transfer_engine path, which
+        # discovers sources itself, so it applies the same selector here.
         selector = get_configured_selector()
         candidates = selector.order(candidates, ctx)
         logger.info(
