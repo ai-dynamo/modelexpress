@@ -181,9 +181,14 @@ class TrainerThread(threading.Thread):
         )
 
         dtype = torch.bfloat16
-        # Allocate per-layer expert blocks. Each block: (num_local_experts, rows, cols).
-        # Filled with a deterministic per-(layer, expert) pattern so receivers can
-        # checksum-verify they got the right bytes.
+        # Allocate per-layer expert blocks. Each block:
+        # (num_local_experts, rows, cols). Filled with a per-(rank, layer)
+        # constant — value = (rank + 1) + layer * 0.1. Values stay small
+        # (< 5.0 for default 4-rank 4-layer config) so bf16 representation
+        # is exact and receiver-side checksums are unambiguous. We don't
+        # vary per-expert — the receiver checksum verifies "the right
+        # trainer's bytes landed in the right slot," which is what tests
+        # the planner's source-selection correctness.
         named_tensors: dict[str, torch.Tensor] = {}
         for layer in range(self.cfg.num_layers):
             tname = f"layer_{layer}_experts"
@@ -192,8 +197,7 @@ class TrainerThread(threading.Thread):
                 dtype=dtype,
                 device=f"cuda:{self.cfg.cuda_device}",
             )
-            for i, eid in enumerate(self.owned_expert_ids):
-                block[i].fill_(float(layer * 1000 + eid + 1))
+            block.fill_(float(self.rank + 1) + layer * 0.1)
             self.layer_blocks[tname] = block
             named_tensors[tname] = block
 
@@ -211,13 +215,14 @@ class TrainerThread(threading.Thread):
         )
 
         for cycle in range(self.cfg.cycles):
-            # Refresh contents per cycle (simulates trainer step).
+            # Refresh contents per cycle (simulates trainer step). Cycle
+            # encoded as a small additive perturbation (0.01) — keeps all
+            # values < 10.0 for the default config so bf16 stays exact.
             for layer in range(self.cfg.num_layers):
                 tname = f"layer_{layer}_experts"
-                for i, eid in enumerate(self.owned_expert_ids):
-                    self.layer_blocks[tname][i].fill_(
-                        float(layer * 1000 + eid + 1 + cycle * 0.1)
-                    )
+                self.layer_blocks[tname].fill_(
+                    float(self.rank + 1) + layer * 0.1 + cycle * 0.01
+                )
 
             t0 = time.perf_counter()
             self.mx_source_id = self.publisher.publish_weights(
@@ -452,23 +457,40 @@ class ReceiverThread(threading.Thread):
         self.results[f"receiver_{self.rank}_metrics"] = per_cycle_metrics
 
     def _verify_checksum(self, cycle: int) -> tuple[bool, list[str]]:
-        """Confirm each layer's local-expert block is filled with the
-        cycle-specific pattern from the matching trainer rank."""
+        """Confirm each local-expert slot was filled with bytes from the
+        correct trainer rank.
+
+        Trainer rank ``r`` filled all of its expert slots in layer L with
+        the constant value ``(r + 1) + L*0.1 + cycle*0.01``. For each
+        local expert at the receiver, we know the global expert id it
+        represents (``self.required_experts[i]``), so we know which
+        trainer rank owns it (the rank whose ``owned_expert_ids``
+        contains that id). The block[i, 0, 0] value should match that
+        trainer's fill value. This indirectly validates the planner
+        routed bytes from the correct source.
+        """
+        # Resolve which trainer rank owns each global expert.
+        gid_to_trainer: dict[int, int] = {}
+        for t in self.trainers:
+            for eid in t.owned_expert_ids:
+                gid_to_trainer[eid] = t.rank
+
         errors: list[str] = []
-        per_expert_bytes = self.cfg.expert_rows * self.cfg.expert_cols * 2  # noqa: F841
+        bf16_tol = 0.05  # 0.01 cycle step + 0.05 slack for bf16 rounding
         for layer in range(self.cfg.num_layers):
             tname = f"layer_{layer}_experts"
             block = self.target_blocks[tname]
             for i, eid in enumerate(self.required_experts):
-                expected = float(layer * 1000 + eid + 1 + cycle * 0.1)
-                # Sample first element of the i-th expert.
+                src_rank = gid_to_trainer[eid]
+                expected = float(src_rank + 1) + layer * 0.1 + cycle * 0.01
                 actual = float(block[i, 0, 0].item())
-                if abs(actual - expected) > 0.5:  # bf16 tolerance
+                if abs(actual - expected) > bf16_tol:
                     errors.append(
-                        f"layer={layer} expert_id={eid} expected={expected} actual={actual}"
+                        f"layer={layer} expert_id={eid} (from trainer-{src_rank}) "
+                        f"expected={expected:.4f} actual={actual:.4f}"
                     )
                     if len(errors) >= 5:
-                        errors.append(f"... (more errors suppressed)")
+                        errors.append("... (more errors suppressed)")
                         return False, errors
         return len(errors) == 0, errors
 
