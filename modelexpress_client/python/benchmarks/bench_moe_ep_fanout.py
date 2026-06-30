@@ -15,9 +15,10 @@ pulling only its EP-rank-local experts via the new
 
 For each cycle, the harness:
 
-1. The N publishers register their per-rank expert blocks. Trainer EP
-   layout: linear partition over ``num_experts``, ``num_publishers``
-   ranks.
+1. The N publishers register one expert-block per "layer" (where one
+   layer is one expert tensor of shape (num_experts, rows, cols)
+   shard-published as a block along the expert axis). Trainer EP
+   layout: linear partition over ``num_experts``.
 2. Each receiver builds a ``SliceRequest`` per layer, with
    ``required_experts`` set to the receiver's EP-rank-local set via
    :func:`modelexpress.compute_local_expert_ids`.
@@ -44,9 +45,6 @@ The harness runs two cells back-to-back:
   publishers because its local-expert set spans multiple trainer
   ranks.
 
-This validates the substrate property under both topology shapes
-and confirms the planner handles cross-EP-shape transfers.
-
 What this validates beyond Tier-1:
 
 - ``SliceRequest.required_experts`` actually drives expert filtering
@@ -65,15 +63,6 @@ verl Tier-2 harness):
 - Real MoE model state dicts — the harness uses synthetic per-expert
   tensors sized to fit on one GPU.
 - Mixed dtype / quantization — bf16 only.
-
-Usage:
-    python bench_moe_ep_fanout.py \\
-        --mx-server-url=modelexpress-server.kavin.svc.cluster.local:8001 \\
-        --num-experts=128 --num-layers=4 --expert-rows=512 --expert-cols=512 \\
-        --cycles=5 --cuda-device=0 \\
-        --matched-publishers=4 --matched-receivers=4 \\
-        --mixed-publishers=4 --mixed-receivers=2 \\
-        --output-json=results.json
 """
 
 from __future__ import annotations
@@ -82,7 +71,6 @@ import argparse
 import dataclasses
 import json
 import logging
-import os
 import sys
 import threading
 import time
@@ -97,7 +85,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bench_moe_ep_fanout")
 
-# Import after logging is configured so child loggers inherit.
+# Import modelexpress after logging is configured so child loggers inherit.
 from modelexpress import (  # noqa: E402
     MxRefitReceiver,
     MxTrainingPublisher,
@@ -105,6 +93,7 @@ from modelexpress import (  # noqa: E402
     SliceRequest,
     compute_local_expert_ids,
     plan_coverage,
+    summarize_plan,
 )
 
 
@@ -119,47 +108,23 @@ class BenchConfig:
     model_name: str = "synthetic/moe-ep-fanout-bench"
 
     # Defaults match Qwen3-30B-A3B shape but scaled down for one GPU.
+    # 128 experts × num_layers × expert_rows × expert_cols × 2 bytes (bf16).
+    # At 128 × 4 × 512 × 512 × 2 = 256 MiB total expert bytes; per-rank ownership
+    # is num_local_experts × num_layers × 512KB.
     num_experts: int = 128
     num_layers: int = 4
-    expert_rows: int = 512  # synthetic expert tensor rows (Qwen3-MoE-30B-A3B has ~4096+)
-    expert_cols: int = 512  # synthetic expert tensor cols
+    expert_rows: int = 512
+    expert_cols: int = 512
     dtype: str = "torch.bfloat16"
 
-    matched_publishers: int = 4  # trainer EP world size (matched cell)
-    matched_receivers: int = 4   # inference EP world size (matched cell)
-    mixed_publishers: int = 4    # trainer EP world size (mixed cell)
-    mixed_receivers: int = 2     # inference EP world size (mixed cell)
+    matched_publishers: int = 4
+    matched_receivers: int = 4
+    mixed_publishers: int = 4
+    mixed_receivers: int = 2
 
     cycles: int = 5
     timeout_s: float = 60.0
     cuda_device: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Synthetic data
-# ---------------------------------------------------------------------------
-
-
-def _expert_bytes(cfg: BenchConfig) -> int:
-    """Bytes per single expert tensor."""
-    return cfg.expert_rows * cfg.expert_cols * 2  # bf16 = 2 bytes
-
-
-def _make_expert_block(cfg: BenchConfig, expert_ids: list[int], device: torch.device) -> torch.Tensor:
-    """Build a contiguous block of expert tensors owned by one publisher.
-
-    Shape: (len(expert_ids), expert_rows, expert_cols). Filled with
-    a deterministic pattern keyed off the expert id for checksum.
-    """
-    block = torch.empty(
-        (len(expert_ids), cfg.expert_rows, cfg.expert_cols),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    for i, eid in enumerate(expert_ids):
-        # Deterministic pattern per expert id — receiver can verify.
-        block[i] = float(eid) / 1000.0
-    return block
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +133,7 @@ def _make_expert_block(cfg: BenchConfig, expert_ids: list[int], device: torch.de
 
 
 class TrainerThread(threading.Thread):
-    """One publisher rank. Publishes its block of expert tensors per layer."""
+    """One publisher rank. Holds a block of expert tensors per layer."""
 
     def __init__(
         self,
@@ -182,89 +147,96 @@ class TrainerThread(threading.Thread):
         self.rank = rank
         self.ep_world_size = ep_world_size
         self.cfg = cfg
-        self.barrier = cycle_barrier
+        self.cycle_barrier = cycle_barrier
         self.results = results
+
         self.owned_expert_ids = compute_local_expert_ids(
             rank, ep_world_size, cfg.num_experts, placement="linear"
         )
+        self.expert_lo = self.owned_expert_ids[0]
+        self.expert_hi = self.owned_expert_ids[-1] + 1
+
+        self.publisher: MxTrainingPublisher | None = None
+        self.mx_source_id: str | None = None
+        self.layer_blocks: dict[str, torch.Tensor] = {}
+        self.ready_event = threading.Event()
 
     def run(self) -> None:
         try:
             self._run_inner()
         except Exception as e:
-            logger.exception(f"trainer-{self.rank} crashed: {e}")
+            logger.exception("trainer-%d crashed: %s", self.rank, e)
             self.results[f"trainer_{self.rank}_error"] = str(e)
+            try:
+                self.cycle_barrier.abort()
+            except Exception:
+                pass
 
     def _run_inner(self) -> None:
-        device = torch.device(f"cuda:{self.cfg.cuda_device}")
-        worker_id = f"trainer-{self.rank}-{uuid.uuid4().hex[:6]}"
-
-        # Build one expert block per layer.
-        # Each layer's expert block is a separate registered tensor.
-        layer_blocks: dict[str, torch.Tensor] = {}
-        layer_tensor_names: list[str] = []
-        for layer in range(self.cfg.num_layers):
-            tensor_name = f"model.layers.{layer}.experts.w13_weight"
-            block = _make_expert_block(self.cfg, list(self.owned_expert_ids), device)
-            layer_blocks[tensor_name] = block
-            layer_tensor_names.append(tensor_name)
-
-        pub = MxTrainingPublisher(
-            mx_server_url=self.cfg.mx_server_url,
-            worker_id=worker_id,
-            framework_name="moe-ep-bench-trainer",
+        torch.cuda.set_device(self.cfg.cuda_device)
+        logger.info(
+            "trainer-%d (ep_ws=%d): owns experts [%d, %d) (%d experts) × %d layers",
+            self.rank, self.ep_world_size, self.expert_lo, self.expert_hi,
+            len(self.owned_expert_ids), self.cfg.num_layers,
         )
-        pub.initialize(model_name=self.cfg.model_name)
-        pub.register_tensors(layer_blocks)
 
-        # The substrate's v1 publisher publishes the tensors with name-only
-        # metadata. For EP filtering we need to publish per-expert ownership
-        # via a separate metadata channel — but for this bench the receiver
-        # builds the SliceOwnership entries directly from known config
-        # (since this is a controlled harness, not catalog-driven discovery).
-        # See bench_verl_rank_to_rank.py for the same simplification.
+        dtype = torch.bfloat16
+        # Allocate per-layer expert blocks. Each block: (num_local_experts, rows, cols).
+        # Filled with a deterministic per-(layer, expert) pattern so receivers can
+        # checksum-verify they got the right bytes.
+        named_tensors: dict[str, torch.Tensor] = {}
+        for layer in range(self.cfg.num_layers):
+            tname = f"layer_{layer}_experts"
+            block = torch.empty(
+                (len(self.owned_expert_ids), self.cfg.expert_rows, self.cfg.expert_cols),
+                dtype=dtype,
+                device=f"cuda:{self.cfg.cuda_device}",
+            )
+            for i, eid in enumerate(self.owned_expert_ids):
+                block[i].fill_(float(layer * 1000 + eid + 1))
+            self.layer_blocks[tname] = block
+            named_tensors[tname] = block
 
-        # Build the SliceOwnership list this rank advertises (passed to the
-        # main thread via results dict for the receivers to consume).
-        owner_per_layer: list[SliceOwnership] = []
-        for layer_idx, tname in enumerate(layer_tensor_names):
-            block = layer_blocks[tname]
-            # NIXL address — pull from the underlying torch storage.
-            nixl_addr = block.data_ptr()
-            byte_size = block.numel() * block.element_size()
-            owner_per_layer.append(SliceOwnership(
-                model_name=self.cfg.model_name,
-                tensor_name=tname,
-                global_shape=(self.cfg.num_experts, self.cfg.expert_rows, self.cfg.expert_cols),
-                dtype=self.cfg.dtype,
-                placement_kind="SHARD",
-                shard_axis=0,
-                local_shard_range=(min(self.owned_expert_ids), max(self.owned_expert_ids) + 1),
-                worker_rank=self.rank,
-                nixl_addr=nixl_addr,
-                byte_size=byte_size,
-                device_id=self.cfg.cuda_device,
-                is_expert=True,
-                expert_axis=0,
-                owned_expert_ids=self.owned_expert_ids,
-            ))
-        self.results[f"trainer_{self.rank}_ownerships"] = owner_per_layer
-        self.results[f"trainer_{self.rank}_publisher"] = pub
-        self.results[f"trainer_{self.rank}_blocks"] = layer_blocks
+        # Stand up publisher.
+        agent_name = f"moe-ep-bench-trainer-{self.rank}-{uuid.uuid4().hex[:6]}"
+        self.publisher = MxTrainingPublisher(
+            agent_name=agent_name,
+            device_id=self.cfg.cuda_device,
+            mx_server_url=self.cfg.mx_server_url,
+        )
+        self.publisher.initialize(
+            model_name=self.cfg.model_name,
+            expert_parallel_size=self.ep_world_size,
+            training_framework="moe-ep-bench",
+        )
 
         for cycle in range(self.cfg.cycles):
-            # Refresh block contents per cycle (simulates trainer step).
-            for layer_idx, tname in enumerate(layer_tensor_names):
-                block = layer_blocks[tname]
+            # Refresh contents per cycle (simulates trainer step).
+            for layer in range(self.cfg.num_layers):
+                tname = f"layer_{layer}_experts"
                 for i, eid in enumerate(self.owned_expert_ids):
-                    block[i] = float(eid) / 1000.0 + cycle * 0.01
+                    self.layer_blocks[tname][i].fill_(
+                        float(layer * 1000 + eid + 1 + cycle * 0.1)
+                    )
 
-            pub.publish(version=cycle + 1)
-            logger.info(
-                f"trainer-{self.rank}: cycle {cycle} published "
-                f"{len(self.owned_expert_ids)} experts × {self.cfg.num_layers} layers"
+            t0 = time.perf_counter()
+            self.mx_source_id = self.publisher.publish_weights(
+                named_tensors=named_tensors,
+                step=cycle,
+                worker_rank=self.rank,
             )
-            self.barrier.wait()
+            self.publisher.mark_ready(worker_rank=self.rank)
+            publish_dt = time.perf_counter() - t0
+
+            total_bytes = sum(t.numel() * t.element_size() for t in named_tensors.values())
+            logger.info(
+                "trainer-%d cycle=%d source_id=%s publish=%.3fs (bytes=%d)",
+                self.rank, cycle, self.mx_source_id, publish_dt, total_bytes,
+            )
+
+            self.ready_event.set()
+            self.cycle_barrier.wait()
+            self.ready_event.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -280,172 +252,225 @@ class ReceiverThread(threading.Thread):
         rank: int,
         ep_world_size: int,
         cfg: BenchConfig,
+        trainers: list[TrainerThread],
         cycle_barrier: threading.Barrier,
         results: dict,
-        shared_ownerships: dict,  # populated by trainers before this starts
-        num_publishers: int,
     ):
         super().__init__(daemon=True, name=f"receiver-{rank}")
         self.rank = rank
         self.ep_world_size = ep_world_size
         self.cfg = cfg
-        self.barrier = cycle_barrier
+        self.trainers = trainers
+        self.cycle_barrier = cycle_barrier
         self.results = results
-        self.shared = shared_ownerships
-        self.num_publishers = num_publishers
+
         self.required_experts = compute_local_expert_ids(
             rank, ep_world_size, cfg.num_experts, placement="linear"
         )
+        self.expert_lo = self.required_experts[0]
+        self.expert_hi = self.required_experts[-1] + 1
+
+        self.receiver: MxRefitReceiver | None = None
+        self.target_blocks: dict[str, torch.Tensor] = {}
 
     def run(self) -> None:
         try:
             self._run_inner()
         except Exception as e:
-            logger.exception(f"receiver-{self.rank} crashed: {e}")
+            logger.exception("receiver-%d crashed: %s", self.rank, e)
             self.results[f"receiver_{self.rank}_error"] = str(e)
+            try:
+                self.cycle_barrier.abort()
+            except Exception:
+                pass
 
     def _run_inner(self) -> None:
-        device = torch.device(f"cuda:{self.cfg.cuda_device}")
-        worker_id = f"receiver-{self.rank}-{uuid.uuid4().hex[:6]}"
+        torch.cuda.set_device(self.cfg.cuda_device)
+        logger.info(
+            "receiver-%d (ep_ws=%d): wants experts [%d, %d) (%d experts) × %d layers",
+            self.rank, self.ep_world_size, self.expert_lo, self.expert_hi,
+            len(self.required_experts), self.cfg.num_layers,
+        )
 
-        # Allocate target buffers — one per layer, sized for local experts only.
-        target_blocks: dict[str, torch.Tensor] = {}
+        dtype = torch.bfloat16
+        # Allocate target buffers sized for local experts only.
         for layer in range(self.cfg.num_layers):
-            tname = f"model.layers.{layer}.experts.w13_weight"
-            target_blocks[tname] = torch.zeros(
+            tname = f"layer_{layer}_experts"
+            self.target_blocks[tname] = torch.zeros(
                 (len(self.required_experts), self.cfg.expert_rows, self.cfg.expert_cols),
-                dtype=torch.bfloat16,
-                device=device,
+                dtype=dtype,
+                device=f"cuda:{self.cfg.cuda_device}",
             )
 
-        recv = MxRefitReceiver(
+        agent_name = f"moe-ep-bench-receiver-{self.rank}-{uuid.uuid4().hex[:6]}"
+        self.receiver = MxRefitReceiver(
+            agent_name=agent_name,
+            device_id=self.cfg.cuda_device,
             mx_server_url=self.cfg.mx_server_url,
-            worker_id=worker_id,
-            framework_name="moe-ep-bench-receiver",
         )
-        recv.initialize(model_tensors=target_blocks)
+        self.receiver.initialize(model_tensors=self.target_blocks)
 
+        # The byte stride per "row along expert axis" — i.e. one expert's worth.
+        per_expert_bytes = self.cfg.expert_rows * self.cfg.expert_cols * 2  # bf16
+
+        per_cycle_metrics: list[dict] = []
         for cycle in range(self.cfg.cycles):
-            self.barrier.wait()  # wait for all publishers to publish
+            for t in self.trainers:
+                t.ready_event.wait(timeout=30.0)
 
-            # Build SliceRequest list for this receiver: one per layer.
-            # We need the request range to cover the expert sub-range we want.
-            # For linear placement (contiguous required experts), this is
-            # one contiguous range per layer.
-            requests: list[SliceRequest] = []
-            lo, hi = min(self.required_experts), max(self.required_experts) + 1
+            # Build SliceOwnership entries from the published trainer state.
+            # One ownership per (trainer, layer) — the publisher rank owns a
+            # contiguous block of experts on axis 0 of each layer's tensor.
+            ownerships: list[SliceOwnership] = []
+            for t in self.trainers:
+                for layer in range(self.cfg.num_layers):
+                    tname = f"layer_{layer}_experts"
+                    block = t.layer_blocks[tname]
+                    ownerships.append(SliceOwnership(
+                        model_name=self.cfg.model_name,
+                        tensor_name=tname,
+                        global_shape=(self.cfg.num_experts, self.cfg.expert_rows, self.cfg.expert_cols),
+                        dtype=self.cfg.dtype,
+                        placement_kind="SHARD",
+                        shard_axis=0,
+                        local_shard_range=(t.expert_lo, t.expert_hi),
+                        worker_rank=t.rank,
+                        nixl_addr=int(block.data_ptr()),
+                        byte_size=block.numel() * block.element_size(),
+                        device_id=self.cfg.cuda_device,
+                        is_expert=True,
+                        expert_axis=0,
+                        owned_expert_ids=t.owned_expert_ids,
+                    ))
+
+            # Build one SliceRequest per layer. The receiver wants
+            # experts in [expert_lo, expert_hi) — contiguous range, since
+            # we use linear placement.
             req_required = frozenset(self.required_experts)
-            for layer_idx, tname in enumerate(target_blocks.keys()):
-                target_block = target_blocks[tname]
+            requests: list[SliceRequest] = []
+            for layer in range(self.cfg.num_layers):
+                tname = f"layer_{layer}_experts"
+                target_block = self.target_blocks[tname]
                 requests.append(SliceRequest(
                     tensor_name=tname,
-                    global_range=(lo, hi),
+                    global_range=(self.expert_lo, self.expert_hi),
                     shard_axis=0,
                     dtype=self.cfg.dtype,
                     receiver_rank=self.rank,
-                    target_addr=target_block.data_ptr(),
+                    target_addr=int(target_block.data_ptr()),
+                    target_offset=0,
                     required_experts=req_required,
                 ))
 
-            # Collect ownerships from all publishers.
-            all_ownerships: list[SliceOwnership] = []
-            for pub_rank in range(self.num_publishers):
-                key = f"trainer_{pub_rank}_ownerships"
-                if key in self.shared:
-                    all_ownerships.extend(self.shared[key])
+            t0 = time.perf_counter()
+            plan = plan_coverage(sources=ownerships, requests=requests)
+            plan.raise_if_incomplete()
+            plan_dt = time.perf_counter() - t0
+            summary = summarize_plan(plan)
 
-            t0 = time.monotonic()
-            plan = plan_coverage(all_ownerships, requests)
-            plan_time = time.monotonic() - t0
+            # Resolve per-source NIXL agent handles (cached after first cycle).
+            t0 = time.perf_counter()
+            agents: dict[int, str] = {}
+            for t in self.trainers:
+                if t.rank in agents:
+                    continue
+                agents[t.rank] = self.receiver.prefetch_source(
+                    mx_source_id=t.mx_source_id,
+                    worker_id=t.publisher._worker_id,  # noqa: SLF001
+                )
+            prefetch_dt = time.perf_counter() - t0
 
-            # Validate the plan is complete + matches expectations.
-            assert plan.complete, f"receiver-{self.rank}: plan incomplete: {plan.missing}"
-            source_ranks_used = sorted({seg.source.worker_rank for seg in plan.segments})
-
-            # Execute the plan (issue receive_segment per SegmentPlan).
-            # Note: this bench uses receive_segment as the data plane primitive
-            # added in PR #349. The plan's expert filtering is what we're
-            # validating — fewer SegmentPlans = fewer bytes pulled.
-            t0 = time.monotonic()
-            bytes_pulled = 0
+            # Drive each SegmentPlan through receive_segment.
+            t0 = time.perf_counter()
+            total_bytes = 0
             for seg in plan.segments:
-                source = seg.source
-                # Resolve remote agent for this source rank.
-                source_worker_id = self.shared.get(
-                    f"trainer_{source.worker_rank}_worker_id"
+                src_addr = (
+                    seg.source.nixl_addr
+                    + seg.source_range[0] * per_expert_bytes
                 )
-                if source_worker_id is None:
-                    # Fall back to looking it up via the publisher object.
-                    pub_obj = self.shared.get(f"trainer_{source.worker_rank}_publisher")
-                    if pub_obj is not None:
-                        source_worker_id = pub_obj._worker_id  # noqa: SLF001
-                if source_worker_id is None:
-                    raise RuntimeError(
-                        f"receiver-{self.rank}: could not resolve worker_id for "
-                        f"source rank {source.worker_rank}"
-                    )
-                # Prefetch the remote agent handle (cached after first call).
-                remote_agent = recv.prefetch_source(
-                    mx_source_id=pub_obj._source_id if pub_obj else "",  # noqa: SLF001
-                    worker_id=source_worker_id,
+                tgt_addr = (
+                    seg.request.target_addr
+                    + seg.request.target_offset
+                    + seg.target_range[0] * per_expert_bytes
                 )
-                # Pull the segment.
-                source_addr = source.nixl_addr + seg.source_range[0] * (
-                    source.byte_size // (source.local_shard_range[1] - source.local_shard_range[0])
-                )
-                target_addr_full = seg.request.target_addr + seg.target_range[0] * (
-                    self.cfg.expert_rows * self.cfg.expert_cols * 2
-                )
-                recv.receive_segment(
-                    remote_agent_name=remote_agent,
-                    source_addr=source_addr,
+                self.receiver.receive_segment(
+                    remote_agent_name=agents[seg.source.worker_rank],
+                    source_addr=src_addr,
                     byte_count=seg.byte_count,
-                    target_addr=target_addr_full,
-                    source_device_id=source.device_id,
+                    target_addr=tgt_addr,
+                    source_device_id=seg.source.device_id,
                     timeout_seconds=self.cfg.timeout_s,
                 )
-                bytes_pulled += seg.byte_count
-            xfer_time = time.monotonic() - t0
+                total_bytes += seg.byte_count
+            xfer_dt = time.perf_counter() - t0
 
-            # Compute baseline: full-expert pull would be num_experts × layers × expert_bytes.
-            baseline_bytes = (
-                self.cfg.num_experts * self.cfg.num_layers * _expert_bytes(self.cfg)
-            )
-            local_expert_bytes = (
-                len(self.required_experts) * self.cfg.num_layers * _expert_bytes(self.cfg)
-            )
-            savings_ratio = baseline_bytes / max(bytes_pulled, 1)
-            # Expected: bytes_pulled ≈ local_expert_bytes (within rounding).
-            expected_ratio = (
-                len(self.required_experts) / self.cfg.num_experts
-            )
-            actual_ratio = bytes_pulled / baseline_bytes
+            # Checksum verify: every expert i in our buffer at layer L
+            # should be filled with float(L * 1000 + (lo + i) + 1 + cycle * 0.1).
+            verified, errors = self._verify_checksum(cycle)
 
-            cycle_result = {
+            # Baseline: full-expert pull would be num_experts × layers × per_expert_bytes.
+            baseline_bytes = self.cfg.num_experts * self.cfg.num_layers * per_expert_bytes
+            actual_ratio = total_bytes / baseline_bytes
+            expected_ratio = len(self.required_experts) / self.cfg.num_experts
+            within_tolerance = abs(actual_ratio - expected_ratio) <= 0.10  # ±10%
+            savings_vs_baseline = baseline_bytes / max(total_bytes, 1)
+            expected_savings = 1.0 / expected_ratio
+
+            gbps = (total_bytes * 8) / (xfer_dt * 1e9) if xfer_dt > 0 else float("inf")
+            metric = {
                 "cycle": cycle,
                 "receiver_rank": self.rank,
                 "ep_world_size": self.ep_world_size,
-                "required_experts": list(self.required_experts),
-                "segment_count": len(plan.segments),
-                "source_ranks_used": source_ranks_used,
-                "bytes_pulled": bytes_pulled,
+                "required_experts_count": len(self.required_experts),
+                "total_experts": self.cfg.num_experts,
+                "segment_count": summary["segment_count"],
+                "source_ranks_used": summary["source_ranks_used"],
+                "bytes_transferred": total_bytes,
                 "baseline_bytes": baseline_bytes,
-                "local_expert_bytes": local_expert_bytes,
-                "savings_vs_full_expert": savings_ratio,
                 "actual_ratio_of_baseline": actual_ratio,
                 "expected_ratio_of_baseline": expected_ratio,
-                "plan_time_seconds": plan_time,
-                "xfer_time_seconds": xfer_time,
-                "gbps": (bytes_pulled * 8) / max(xfer_time, 1e-9) / 1e9,
+                "savings_vs_baseline": savings_vs_baseline,
+                "expected_savings": expected_savings,
+                "within_tolerance": within_tolerance,
+                "verified": verified,
+                "checksum_errors": errors,
+                "plan_seconds": plan_dt,
+                "prefetch_seconds": prefetch_dt,
+                "xfer_seconds": xfer_dt,
+                "gbps": gbps,
             }
-            self.results.setdefault(f"receiver_{self.rank}_cycles", []).append(cycle_result)
+            per_cycle_metrics.append(metric)
             logger.info(
-                f"receiver-{self.rank} cycle={cycle} "
-                f"sources={source_ranks_used} bytes={bytes_pulled} "
-                f"savings={savings_ratio:.2f}x "
-                f"(expected ~{1.0 / expected_ratio:.2f}x), "
-                f"xfer={xfer_time:.3f}s ({cycle_result['gbps']:.2f} Gbps)"
+                "receiver-%d cycle=%d sources=%s bytes=%d savings=%.2fx (expected ~%.2fx) "
+                "tol_pass=%s verified=%s xfer=%.3fs (%.2f Gbps)",
+                self.rank, cycle, summary["source_ranks_used"], total_bytes,
+                savings_vs_baseline, expected_savings, within_tolerance,
+                verified, xfer_dt, gbps,
             )
+            self.cycle_barrier.wait()
+
+        self.results[f"receiver_{self.rank}_metrics"] = per_cycle_metrics
+
+    def _verify_checksum(self, cycle: int) -> tuple[bool, list[str]]:
+        """Confirm each layer's local-expert block is filled with the
+        cycle-specific pattern from the matching trainer rank."""
+        errors: list[str] = []
+        per_expert_bytes = self.cfg.expert_rows * self.cfg.expert_cols * 2  # noqa: F841
+        for layer in range(self.cfg.num_layers):
+            tname = f"layer_{layer}_experts"
+            block = self.target_blocks[tname]
+            for i, eid in enumerate(self.required_experts):
+                expected = float(layer * 1000 + eid + 1 + cycle * 0.1)
+                # Sample first element of the i-th expert.
+                actual = float(block[i, 0, 0].item())
+                if abs(actual - expected) > 0.5:  # bf16 tolerance
+                    errors.append(
+                        f"layer={layer} expert_id={eid} expected={expected} actual={actual}"
+                    )
+                    if len(errors) >= 5:
+                        errors.append(f"... (more errors suppressed)")
+                        return False, errors
+        return len(errors) == 0, errors
 
 
 # ---------------------------------------------------------------------------
@@ -460,14 +485,16 @@ def _run_cell(
     num_receivers: int,
 ) -> dict:
     logger.info(
-        f"=== {cell_name}: trainer EP={num_publishers}, inference EP={num_receivers}, "
-        f"experts={cfg.num_experts}, layers={cfg.num_layers}, "
-        f"expert_shape=({cfg.expert_rows},{cfg.expert_cols}) bf16 ==="
+        "=== %s: trainer EP=%d, inference EP=%d, experts=%d, layers=%d, "
+        "expert_shape=(%d,%d) bf16 ===",
+        cell_name, num_publishers, num_receivers,
+        cfg.num_experts, cfg.num_layers, cfg.expert_rows, cfg.expert_cols,
     )
 
     results: dict = {"cell": cell_name}
-    # +1 barrier wait per cycle: publishers wait once after publish, receivers
-    # wait once before pull. So barrier party count = pubs + recvs.
+    # Barrier: all publishers + all receivers wait at the cycle boundary.
+    # Receivers also wait at the END of each cycle so publishers can mutate
+    # the shard for the next cycle. So parties = pubs + recvs.
     barrier = threading.Barrier(num_publishers + num_receivers)
 
     trainers = [
@@ -477,11 +504,11 @@ def _run_cell(
     for t in trainers:
         t.start()
 
-    # Give trainers a moment to populate ownerships dict.
+    # Give trainers a moment to populate publisher / mx_source_id / layer_blocks.
     time.sleep(0.5)
 
     receivers = [
-        ReceiverThread(r, num_receivers, cfg, barrier, results, results, num_publishers)
+        ReceiverThread(r, num_receivers, cfg, trainers, barrier, results)
         for r in range(num_receivers)
     ]
     for r in receivers:
@@ -490,38 +517,49 @@ def _run_cell(
     for t in trainers + receivers:
         t.join(timeout=cfg.timeout_s * cfg.cycles + 60)
         if t.is_alive():
-            logger.error(f"{t.name} did not exit in time")
+            logger.error("%s did not exit in time", t.name)
+
+    # Surface crashes.
+    crashed: list[str] = []
+    for key, val in results.items():
+        if key.endswith("_error"):
+            crashed.append(f"{key}: {val}")
+    if crashed:
+        logger.error("%s crashed threads:\n  %s", cell_name, "\n  ".join(crashed))
 
     # Aggregate.
     per_cycle: list[dict] = []
+    pass_conditions: list[dict] = []
     for cycle in range(cfg.cycles):
         cycle_summary = {"cycle": cycle, "receivers": []}
         for r in range(num_receivers):
-            cycles = results.get(f"receiver_{r}_cycles", [])
-            if cycle < len(cycles):
-                cycle_summary["receivers"].append(cycles[cycle])
+            metrics = results.get(f"receiver_{r}_metrics", [])
+            if cycle < len(metrics):
+                m = metrics[cycle]
+                cycle_summary["receivers"].append(m)
+                pass_conditions.append({
+                    "receiver_rank": r,
+                    "cycle": cycle,
+                    "actual_ratio": m["actual_ratio_of_baseline"],
+                    "expected_ratio": m["expected_ratio_of_baseline"],
+                    "abs_diff": abs(m["actual_ratio_of_baseline"] - m["expected_ratio_of_baseline"]),
+                    "tolerance": 0.10,
+                    "passes": m["within_tolerance"] and m["verified"],
+                    "verified": m["verified"],
+                    "checksum_errors": m["checksum_errors"],
+                })
         per_cycle.append(cycle_summary)
 
-    # Pass-condition check.
-    pass_conditions: list[dict] = []
-    for r in range(num_receivers):
-        cycles = results.get(f"receiver_{r}_cycles", [])
-        for c in cycles:
-            actual = c["actual_ratio_of_baseline"]
-            expected = c["expected_ratio_of_baseline"]
-            tol = 0.10  # ±10% per §10.4 E-series-EP
-            within_tol = abs(actual - expected) <= tol
-            pass_conditions.append({
-                "receiver_rank": r,
-                "cycle": c["cycle"],
-                "actual_ratio": actual,
-                "expected_ratio": expected,
-                "abs_diff": abs(actual - expected),
-                "tolerance": tol,
-                "passes": within_tol,
-            })
+    # all_pass requires:
+    # (1) every (receiver, cycle) within ±10% AND verified
+    # (2) we actually got results for every (receiver, cycle) — no crashes
+    expected_data_points = num_receivers * cfg.cycles
+    all_pass = (
+        len(pass_conditions) == expected_data_points
+        and all(pc["passes"] for pc in pass_conditions)
+        and not crashed
+    )
 
-    all_pass = all(pc["passes"] for pc in pass_conditions)
     return {
         "cell": cell_name,
         "config": {
@@ -529,10 +567,15 @@ def _run_cell(
             "num_receivers": num_receivers,
             "num_experts": cfg.num_experts,
             "num_layers": cfg.num_layers,
-            "expert_bytes_per_tensor": _expert_bytes(cfg),
+            "expert_rows": cfg.expert_rows,
+            "expert_cols": cfg.expert_cols,
+            "per_expert_bytes": cfg.expert_rows * cfg.expert_cols * 2,
         },
         "per_cycle": per_cycle,
         "pass_conditions": pass_conditions,
+        "expected_data_points": expected_data_points,
+        "observed_data_points": len(pass_conditions),
+        "crashed_threads": crashed,
         "all_pass": all_pass,
     }
 
@@ -591,14 +634,22 @@ def main() -> None:
     }
 
     logger.info("=== SUMMARY ===")
-    logger.info(f"Matched EP: all_pass={matched['all_pass']}")
-    logger.info(f"Mixed EP:   all_pass={mixed['all_pass']}")
-    logger.info(f"Overall:    all_pass={summary['all_pass']}")
+    logger.info(
+        "Matched EP: all_pass=%s observed=%d/%d crashed=%d",
+        matched["all_pass"], matched["observed_data_points"],
+        matched["expected_data_points"], len(matched["crashed_threads"]),
+    )
+    logger.info(
+        "Mixed EP:   all_pass=%s observed=%d/%d crashed=%d",
+        mixed["all_pass"], mixed["observed_data_points"],
+        mixed["expected_data_points"], len(mixed["crashed_threads"]),
+    )
+    logger.info("Overall:    all_pass=%s", summary["all_pass"])
 
     if args.output_json:
         with open(args.output_json, "w") as f:
             json.dump(summary, f, indent=2)
-        logger.info(f"Results written to {args.output_json}")
+        logger.info("Results written to %s", args.output_json)
 
     if not summary["all_pass"]:
         sys.exit(1)
