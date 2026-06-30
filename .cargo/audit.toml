@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # cargo-audit configuration.
 #
 # RUSTSEC-2026-0118 / RUSTSEC-2026-0119 affect hickory-proto, which enters the
