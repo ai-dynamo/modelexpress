@@ -459,7 +459,11 @@ def _cute_dsl_cache_root() -> Path:
     configured = os.environ.get("CUTE_DSL_CACHE_DIR")
     if configured:
         return Path(configured)
-    return Path(tempfile.gettempdir()) / getuser() / "cutlass_python_cache"
+    try:
+        user = getuser()
+    except (KeyError, OSError):
+        user = str(os.getuid())
+    return Path(tempfile.gettempdir()) / user / "cutlass_python_cache"
 
 
 def _flashinfer_cache_root() -> Path:

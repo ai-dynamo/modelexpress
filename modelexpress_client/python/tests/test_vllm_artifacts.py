@@ -370,6 +370,17 @@ def test_cute_dsl_cache_root_uses_cute_dsl_cache_dir(monkeypatch, tmp_path):
     assert artifacts._cute_dsl_cache_root() == tmp_path / "cute-dsl-cache"
 
 
+@pytest.mark.parametrize("error", [KeyError(), OSError()])
+def test_cute_dsl_cache_root_falls_back_to_uid(monkeypatch, error):
+    monkeypatch.delenv("CUTE_DSL_CACHE_DIR", raising=False)
+    monkeypatch.setattr(artifacts, "getuser", MagicMock(side_effect=error))
+    monkeypatch.setattr(artifacts.os, "getuid", lambda: 12345)
+
+    assert artifacts._cute_dsl_cache_root() == (
+        Path(artifacts.tempfile.gettempdir()) / "12345" / "cutlass_python_cache"
+    )
+
+
 def test_flashinfer_cache_root_uses_workspace_base(monkeypatch, tmp_path):
     monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "flashinfer"))
 
