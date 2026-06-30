@@ -24,11 +24,14 @@ from modelexpress.metadata.artifact_manifest import (
 from modelexpress.metadata.artifact_transfer import (
     ArtifactBundle,
     P2PArtifactTransfer,
+    cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
     discover_artifact_source,
+    flashinfer_cache_artifact_transfer,
     publish_artifact_source,
     transfer_artifact_from_worker,
     triton_cache_artifact_transfer,
+    tilelang_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
 from modelexpress.metadata.source_id import compute_mx_source_id
@@ -516,6 +519,21 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
             deep_gemm_cache_artifact_transfer,
             "deep_gemm_cache",
             p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+        ),
+        (
+            tilelang_cache_artifact_transfer,
+            "tilelang_cache",
+            p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        ),
+        (
+            cute_dsl_cache_artifact_transfer,
+            "cute_dsl_cache",
+            p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+        ),
+        (
+            flashinfer_cache_artifact_transfer,
+            "flashinfer_cache",
+            p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
         ),
     ],
 )

@@ -94,6 +94,26 @@ def test_deep_gemm_cache_is_separate_artifact_source_type():
     assert compute_mx_source_id(torch_compile) != compute_mx_source_id(deep_gemm)
 
 
+def test_tilelang_cache_is_separate_artifact_source_type():
+    deep_gemm = _base_identity()
+    deep_gemm.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE
+
+    tilelang = _base_identity()
+    tilelang.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE
+
+    assert compute_mx_source_id(deep_gemm) != compute_mx_source_id(tilelang)
+
+
+def test_cute_dsl_and_flashinfer_have_separate_artifact_source_types():
+    cute_dsl = _base_identity()
+    cute_dsl.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE
+
+    flashinfer = _base_identity()
+    flashinfer.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE
+
+    assert compute_mx_source_id(cute_dsl) != compute_mx_source_id(flashinfer)
+
+
 def test_artifact_compatibility_fields_are_case_insensitive():
     upper = _base_identity()
     upper.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE

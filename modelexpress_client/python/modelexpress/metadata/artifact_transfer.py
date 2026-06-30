@@ -366,6 +366,57 @@ def deep_gemm_cache_artifact_transfer(
     )
 
 
+def tilelang_cache_artifact_transfer(
+    source_root: str | Path,
+    target_root: str | Path,
+    bundle_root: str | Path,
+    *,
+    chunk_size: int | None = None,
+) -> P2PArtifactTransfer:
+    return _cache_artifact_transfer(
+        "tilelang_cache",
+        p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        source_root,
+        target_root,
+        bundle_root,
+        chunk_size=chunk_size,
+    )
+
+
+def cute_dsl_cache_artifact_transfer(
+    source_root: str | Path,
+    target_root: str | Path,
+    bundle_root: str | Path,
+    *,
+    chunk_size: int | None = None,
+) -> P2PArtifactTransfer:
+    return _cache_artifact_transfer(
+        "cute_dsl_cache",
+        p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+        source_root,
+        target_root,
+        bundle_root,
+        chunk_size=chunk_size,
+    )
+
+
+def flashinfer_cache_artifact_transfer(
+    source_root: str | Path,
+    target_root: str | Path,
+    bundle_root: str | Path,
+    *,
+    chunk_size: int | None = None,
+) -> P2PArtifactTransfer:
+    return _cache_artifact_transfer(
+        "flashinfer_cache",
+        p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+        source_root,
+        target_root,
+        bundle_root,
+        chunk_size=chunk_size,
+    )
+
+
 def publish_artifact_source(
     mx_client,
     transfer: P2PArtifactTransfer,

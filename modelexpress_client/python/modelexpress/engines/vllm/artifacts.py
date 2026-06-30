@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from fcntl import flock, LOCK_EX, LOCK_UN
+from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -30,8 +31,11 @@ from ...load_strategy.context import LoadContext
 from ...metadata.artifact_transfer import (
     P2PArtifactTransfer,
     PublishedArtifactSource,
+    cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
+    flashinfer_cache_artifact_transfer,
     publish_artifact_source,
+    tilelang_cache_artifact_transfer,
     triton_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
@@ -395,6 +399,24 @@ def _vllm_artifact_transfers(
             p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
             _deep_gemm_cache_root(),
         ),
+        (
+            "tilelang_cache",
+            tilelang_cache_artifact_transfer,
+            p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            _tilelang_cache_root(),
+        ),
+        (
+            "cute_dsl_cache",
+            cute_dsl_cache_artifact_transfer,
+            p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+            _cute_dsl_cache_root(),
+        ),
+        (
+            "flashinfer_cache",
+            flashinfer_cache_artifact_transfer,
+            p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+            _flashinfer_cache_root(),
+        ),
     ]
 
     return [
@@ -426,6 +448,27 @@ def _deep_gemm_cache_root() -> Path:
     return _vllm_cache_root() / "deep_gemm"
 
 
+def _tilelang_cache_root() -> Path:
+    configured = os.environ.get("TILELANG_CACHE_DIR")
+    if configured:
+        return Path(configured)
+    return Path.home() / ".tilelang" / "cache"
+
+
+def _cute_dsl_cache_root() -> Path:
+    configured = os.environ.get("CUTE_DSL_CACHE_DIR")
+    if configured:
+        return Path(configured)
+    return Path(tempfile.gettempdir()) / getuser() / "cutlass_python_cache"
+
+
+def _flashinfer_cache_root() -> Path:
+    workspace_base = os.environ.get("FLASHINFER_WORKSPACE_BASE")
+    if workspace_base:
+        return Path(workspace_base) / ".cache" / "flashinfer"
+    return Path.home() / ".cache" / "flashinfer"
+
+
 def _vllm_cache_root() -> Path:
     configured = os.environ.get("VLLM_CACHE_ROOT")
     if configured:
@@ -455,6 +498,12 @@ def _artifact_identity(
         return _triton_cache_identity(ctx)
     if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE:
         return _deep_gemm_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE:
+        return _tilelang_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE:
+        return _cute_dsl_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE:
+        return _flashinfer_cache_identity(ctx)
     raise ValueError(f"unknown vLLM artifact source type: {mx_source_type}")
 
 
@@ -505,6 +554,44 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         gpu_arch=_gpu_arch(ctx.device_id),
     )
     _set_extra_if_present(identity, "deep_gemm_jit_key", _deep_gemm_jit_key())
+    return identity
+
+
+def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    # MX requires model_name; TileLang cache entries carry their own kernel keys.
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "tilelang_version", _tilelang_version())
+    return identity
+
+
+def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "cutlass_dsl_version", _cutlass_dsl_version())
+    return identity
+
+
+def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "flashinfer_version", _flashinfer_version())
     return identity
 
 
@@ -665,6 +752,27 @@ def _deep_gemm_jit_key() -> str:
         from deep_gemm.jit.compiler import get_deep_gemm_version
 
         return get_deep_gemm_version()
+    except Exception:
+        return ""
+
+
+def _tilelang_version() -> str:
+    try:
+        return pkg_version("tilelang")
+    except Exception:
+        return ""
+
+
+def _cutlass_dsl_version() -> str:
+    try:
+        return pkg_version("nvidia-cutlass-dsl")
+    except Exception:
+        return ""
+
+
+def _flashinfer_version() -> str:
+    try:
+        return pkg_version("flashinfer-python")
     except Exception:
         return ""
 

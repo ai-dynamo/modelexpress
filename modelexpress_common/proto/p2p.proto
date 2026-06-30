@@ -45,6 +45,9 @@ enum MxSourceType {
   MX_SOURCE_TYPE_TORCH_COMPILE_CACHE = 3; // torch.compile cache files
   MX_SOURCE_TYPE_TRITON_CACHE = 4;        // Triton cache files
   MX_SOURCE_TYPE_DEEP_GEMM_CACHE = 5;     // DeepGEMM kernel cache files
+  MX_SOURCE_TYPE_TILELANG_CACHE = 6;      // TileLang JIT kernel cache files
+  MX_SOURCE_TYPE_CUTE_DSL_CACHE = 7;      // CuTe DSL compiled kernel cache files
+  MX_SOURCE_TYPE_FLASHINFER_CACHE = 8;    // FlashInfer JIT workspace cache files
 }
 
 // All fields that affect source compatibility for reusable model material.
