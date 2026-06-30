@@ -113,6 +113,33 @@ def _source_matches_request(
                 f"{own.compile_metadata.get(key)!r}, request wants {want!r}"
             )
 
+    # Expert-parallel filtering — only applies when the request explicitly
+    # sets required_experts. With required_experts=None (default), expert
+    # metadata is ignored entirely and the planner behaves as it did before
+    # this filter was added. This preserves back-compat for callers that
+    # don't use MoE EP.
+    if req.required_experts is not None:
+        # The source must declare it carries expert data (is_expert=True
+        # with a non-empty owned_expert_ids). A non-MoE source that
+        # claims to satisfy an expert-typed request is a configuration
+        # error worth surfacing.
+        if not own.is_expert or not own.owned_expert_ids:
+            return False, (
+                f"source {own.tensor_name!r} (rank {own.worker_rank}) is not "
+                f"marked is_expert with owned_expert_ids; receiver requires "
+                f"experts {sorted(req.required_experts)!r}"
+            )
+        # Intersection must be non-empty. If a source owns experts
+        # disjoint from what the receiver wants, the planner refuses —
+        # no bytes pulled for non-local experts.
+        owned_set = set(own.owned_expert_ids)
+        if not (owned_set & req.required_experts):
+            return False, (
+                f"source {own.tensor_name!r} (rank {own.worker_rank}) owns "
+                f"experts {sorted(own.owned_expert_ids)!r}, receiver requires "
+                f"experts {sorted(req.required_experts)!r}; no intersection"
+            )
+
     # Quantization scope — the planner refuses zero-copy on global-required
     # tensors because the receiver can't safely use just one source's slice.
     # Caller can catch QuantizationMetadataError and fall back to a full-copy

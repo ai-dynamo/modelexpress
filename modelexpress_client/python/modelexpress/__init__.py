@@ -106,6 +106,11 @@ from .rank_local_publisher import (  # noqa: F401
     PlacementDescriptor,
     RankLocalPublisher,
 )
+from .rl_expert_layout import (  # noqa: F401
+    ExpertPlacement,
+    compute_local_expert_ids,
+    validate_placement_partition,
+)
 
 # The v2 RL helpers (training_publisher, refit_receiver, nemo_rl_v2) all
 # import torch. Keeping them as eager top-level re-exports makes
@@ -155,6 +160,7 @@ __all__ = [
     "COMPILE_TARGET_TRTLLM",
     "COMPILE_TARGET_VLLM_FUSED",
     "CoveragePlan",
+    "ExpertPlacement",
     "GdsTransferManager",
     "HeartbeatThread",
     "MxClient",
@@ -179,8 +185,10 @@ __all__ = [
     "V2SourceCandidate",
     "collect_byte_savings_vs_allgather",
     "compile_target_matches",
+    "compute_local_expert_ids",
     "configure_vllm_logging",
     "plan_coverage",
     "register_modelexpress_loaders",
     "summarize_plan",
+    "validate_placement_partition",
 ]

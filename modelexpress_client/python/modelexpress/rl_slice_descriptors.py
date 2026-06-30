@@ -230,6 +230,15 @@ class SliceRequest:
         required_compile_metadata: optional subset that every matched
             source's ``compile_metadata`` must agree with. E.g.
             ``{"block_size": 128}`` to require 128-block alignment.
+        required_experts: optional set of expert ids this receiver
+            wants. When set, the planner only matches against sources
+            whose ``owned_expert_ids`` intersects this set — i.e. it
+            refuses to pull non-local experts. When ``None`` (default),
+            expert metadata is ignored and the planner behaves as it
+            did before EP support landed (back-compat). Use
+            :func:`modelexpress.compute_local_expert_ids` to derive
+            this set from ``(ep_rank, ep_world_size, num_experts,
+            placement)``.
     """
 
     tensor_name: str
@@ -241,6 +250,7 @@ class SliceRequest:
     target_offset: int = 0
     compile_target_filter: frozenset[str] | None = None
     required_compile_metadata: dict[str, object] = field(default_factory=dict)
+    required_experts: frozenset[int] | None = None
 
     def __post_init__(self) -> None:
         lo, hi = self.global_range
