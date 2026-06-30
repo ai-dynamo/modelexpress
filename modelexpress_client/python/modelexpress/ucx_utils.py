@@ -355,11 +355,42 @@ def probe_nic_pin_for_device(
     return f"{chosen_name}:1"
 
 
+def _stripe_all_compute_nics(min_rate_gbps: float | None = None) -> str | None:
+    """Return a UCX_NET_DEVICES string listing ALL compute-fabric NICs.
+
+    This is the "stripe across all NICs" mode — every visible IB-class
+    NIC at the max compute rate is included, so UCX can spread traffic
+    across all of them. Pairs with ``UCX_MAX_RMA_RAILS`` to actually
+    use the multi-NIC paths (see ``apply_nic_pin_for_device``).
+
+    Surfaced by tracking issue ai-dynamo/modelexpress#449: NCCL's
+    advantage over MX/NIXL in the 16-receiver Llama 3.1 8B benchmark
+    (~0.05s vs ~6s pre-caching, ~0.32s post-caching single-NIC) is
+    almost entirely NIC under-utilization — NCCL stripes the broadcast
+    across all 4 (GB200) or 8 (GB300) RDMA NICs allocated to the pod;
+    MX's existing ``auto`` mode pins each receiver to ONE NIC via PCIe
+    topology affinity.
+
+    On topologies with 1 NIC visible, this degenerates to the same
+    behavior as ``auto`` (just that one NIC). On 4+ NIC pods, this
+    returns the comma-separated list of all of them.
+    """
+    compute_nics = _list_compute_ib_nics(min_rate_gbps=min_rate_gbps)
+    if not compute_nics:
+        return None
+    return ",".join(f"{name}:1" for name, _numa, _rate, _path in compute_nics)
+
+
 def _resolve_nic_pin(device_id: int) -> str | None:
     """Resolve MX_RDMA_NIC_PIN env var into a UCX_NET_DEVICES value.
 
     Modes:
       - unset / "off" / "0" / "false" / "no": returns None (no pinning).
+      - "stripe" / "all": list ALL compute-rate IB NICs in
+        UCX_NET_DEVICES so UCX can stripe across them. Pair with
+        ``UCX_MAX_RMA_RAILS=<N>`` for actual multi-NIC parallelism.
+        See ai-dynamo/modelexpress#449 for the motivation (closing
+        the MX↔NCCL bandwidth gap by ending single-NIC pinning).
       - explicit comma-separated list: indexed by device_id, like the
         original hardcoded shape. Useful for unusual topologies where
         the auto-probe heuristic doesn't fit (e.g. fabrics outside the
@@ -375,6 +406,33 @@ def _resolve_nic_pin(device_id: int) -> str | None:
     if raw == "" or raw.lower() in ("off", "0", "false", "no"):
         return None
 
+    raw_min = os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS")
+    if raw_min is None or raw_min.strip() == "":
+        min_rate: float | None = None
+    else:
+        try:
+            min_rate = float(raw_min)
+        except ValueError:
+            logger.warning(
+                f"MX_RDMA_NIC_PIN_MIN_RATE_GBPS={raw_min!r} not a float; "
+                f"falling back to max-rate auto-detect"
+            )
+            min_rate = None
+
+    if raw.lower() in ("stripe", "all"):
+        striped = _stripe_all_compute_nics(min_rate_gbps=min_rate)
+        if striped is None:
+            logger.warning(
+                "MX_RDMA_NIC_PIN=stripe: no compute IB-class NICs found; "
+                "skipping pin"
+            )
+            return None
+        logger.info(
+            f"MX_RDMA_NIC_PIN=stripe: device {device_id} -> "
+            f"UCX_NET_DEVICES={striped} (all compute-rate NICs)"
+        )
+        return striped
+
     if "," in raw:
         nic_list = [n.strip() for n in raw.split(",") if n.strip()]
         if 0 <= device_id < len(nic_list):
@@ -389,18 +447,6 @@ def _resolve_nic_pin(device_id: int) -> str | None:
         )
         return None
 
-    raw_min = os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS")
-    if raw_min is None or raw_min.strip() == "":
-        min_rate: float | None = None
-    else:
-        try:
-            min_rate = float(raw_min)
-        except ValueError:
-            logger.warning(
-                f"MX_RDMA_NIC_PIN_MIN_RATE_GBPS={raw_min!r} not a float; "
-                f"falling back to max-rate auto-detect"
-            )
-            min_rate = None
     return probe_nic_pin_for_device(device_id, min_rate_gbps=min_rate)
 
 
@@ -413,14 +459,37 @@ def apply_nic_pin_for_device(device_id: int) -> None:
     is the default. Designed to be called once per worker before NIXL
     agent construction.
 
+    When ``MX_RDMA_NIC_PIN=stripe`` (multi-NIC), also bumps
+    ``UCX_MAX_RMA_RAILS`` to the NIC count so UCX actually uses all of
+    them. UCX defaults ``MAX_RMA_RAILS=2`` and NIXL also hard-sets it
+    to 2 in its UCX backend (see ai-dynamo/modelexpress#449); without
+    the env override the stripe list would be ignored.
+
     See module docstring for the full semantics, including the explicit
     NIC-list override and the rate-filter env var.
     """
     pinned = _resolve_nic_pin(device_id)
-    if pinned:
-        prev = os.environ.get("UCX_NET_DEVICES")
-        os.environ["UCX_NET_DEVICES"] = pinned
-        logger.info(
-            f"NIXL NIC pin: device {device_id} -> "
-            f"UCX_NET_DEVICES={pinned} (was: {prev})"
-        )
+    if not pinned:
+        return
+
+    prev = os.environ.get("UCX_NET_DEVICES")
+    os.environ["UCX_NET_DEVICES"] = pinned
+    logger.info(
+        f"NIXL NIC pin: device {device_id} -> "
+        f"UCX_NET_DEVICES={pinned} (was: {prev})"
+    )
+
+    # When striping across multiple NICs, also bump MAX_RMA_RAILS so
+    # UCX actually uses them. Only do this when the caller is opting
+    # into multi-NIC explicitly (mode == "stripe") — leave single-NIC
+    # / explicit-list / auto modes alone, since they're intentionally
+    # single-NIC and bumping rails wouldn't help.
+    mode = os.environ.get("MX_RDMA_NIC_PIN", "").strip().lower()
+    if mode in ("stripe", "all"):
+        nic_count = pinned.count(",") + 1 if pinned else 0
+        if nic_count >= 2 and "UCX_MAX_RMA_RAILS" not in os.environ:
+            os.environ["UCX_MAX_RMA_RAILS"] = str(nic_count)
+            logger.info(
+                f"NIXL stripe mode: set UCX_MAX_RMA_RAILS={nic_count} "
+                f"to match {nic_count} striped NICs"
+            )
