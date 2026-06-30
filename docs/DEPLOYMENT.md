@@ -173,6 +173,75 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+## ServiceAccount Authentication
+
+Optional, off by default. When enabled, the server authenticates every gRPC caller
+(except health checks) against a Kubernetes ServiceAccount token and authorizes them
+against an exact-match allowlist. No sidecar or service mesh is required: the server
+calls the Kubernetes `TokenReview` API in-process.
+
+- **AuthN**: the caller presents a projected ServiceAccount token; the server verifies it
+  via `TokenReview` and extracts `system:serviceaccount:<namespace>:<serviceaccount>`.
+- **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
+  entry.
+
+### Modes
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No auth. Tokens are ignored. |
+| `enforce` | Verify every call and reject unauthenticated or non-allowlisted callers. |
+
+### Server configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_SECURITY_MODE` | `off` | `off` \| `enforce` |
+| `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated `<namespace>:<serviceaccount>` allowlist. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
+
+`enforce` fails config validation if either the audience list or the allowlist is empty,
+so a typo can't silently deny-all or accept-any-audience.
+
+The server's ServiceAccount needs permission to create `TokenReview`s (a cluster-scoped
+subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role. The
+Helm chart creates this automatically when `security.enabled=true`:
+
+```yaml
+security:
+  enabled: true
+  mode: enforce
+  tokenAudiences: ["modelexpress"]
+  allowedServiceAccounts:
+    - "vllm:worker"
+    - "vllm:router"
+```
+
+### Client configuration
+
+Clients (Rust and Python) attach the token automatically when a projected token file is
+present, and send nothing when it is absent (so the same client works against an `off`
+server, including off-cluster). Mount a projected token into each worker pod with an
+audience that matches the server's, then point the client at it:
+
+```yaml
+volumes:
+  - name: mx-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: modelexpress
+            audience: modelexpress
+            expirationSeconds: 3600
+# mounted at /var/run/secrets/tokens/modelexpress
+```
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
+| `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
+
 ## Docker
 
 ### Production Image
