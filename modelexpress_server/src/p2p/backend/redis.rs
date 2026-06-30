@@ -682,7 +682,7 @@ mod tests {
 
     fn test_identity() -> modelexpress_common::grpc::p2p::SourceIdentity {
         modelexpress_common::grpc::p2p::SourceIdentity {
-            mx_version: "0.4.0".to_string(),
+            mx_version: "0.4.1".to_string(),
             mx_source_type: 0,
             model_name: "deepseek-ai/DeepSeek-V3".to_string(),
             backend_framework: 1,
@@ -702,7 +702,7 @@ mod tests {
         let attr = SourceAttributesJson::from(&id);
 
         assert_eq!(attr.model_name, "deepseek-ai/DeepSeek-V3");
-        assert_eq!(attr.mx_version, "0.4.0");
+        assert_eq!(attr.mx_version, "0.4.1");
         assert_eq!(attr.tensor_parallel_size, 8);
         assert_eq!(attr.pipeline_parallel_size, 2);
         assert_eq!(attr.expert_parallel_size, 4);

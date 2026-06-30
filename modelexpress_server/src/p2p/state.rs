@@ -199,7 +199,7 @@ mod tests {
 
     fn test_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.4.0".to_string(),
+            mx_version: "0.4.1".to_string(),
             mx_source_type: MxSourceType::Weights as i32,
             model_name: "my-model".to_string(),
             backend_framework: 1,
