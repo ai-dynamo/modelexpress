@@ -12,14 +12,14 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
-from modelexpress.client_factory import create_metadata_client
+from modelexpress.metadata.client_factory import create_metadata_client
 from modelexpress.dht_client import (
     MxDhtClient,
     _decode_worker_pointer,
     _encode_worker_pointer,
     _key_for,
 )
-from modelexpress.metadata import _is_p2p_metadata_enabled
+from modelexpress.metadata.publish import _is_p2p_metadata_enabled
 from modelexpress.metadata.source_id import compute_mx_source_id
 
 
