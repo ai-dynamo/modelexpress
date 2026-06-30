@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TP=2 source pool using the dht metadata backend.
+#
+# No central server, no Redis, no CRDs, and no Service in the data path.
+# Workers discover each other over a libp2p Kademlia mesh: each one sets
+# MX_METADATA_BACKEND=dht, listens on MX_DHT_LISTEN, and bootstraps into
+# the mesh through MX_DHT_BOOTSTRAP_DNS.
+#
+# Bootstrap is worker-to-worker. The headless Service below selects every
+# DHT participant pod (sources and targets share the mx.dht=member label),
+# so its DNS name resolves to the pod IPs already in the mesh. A joining
+# pod dials those peers and pulls down the routing table. publishNotReady-
+# Addresses is true so pods find each other during the (long) weight-load
+# window, before vLLM reports ready - the libp2p swarm binds at process
+# start, well before weights finish loading.
+#
+# One publisher per (mx_source_id, rank): a single TP=2 source pod runs
+# both ranks under one mx_source_id, so it is the sole publisher for each.
+# The dht backend does not model a load-balanced pool of replicas for a
+# single rank; for that shape use the k8s-service or central-coordinator
+# backends. See ../../docs/DHT_BACKEND.md.
+#
+# Prerequisites:
+#   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+#   - RDMA-capable NICs available on the nodes (rdma/shared_ib)
+#   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
+
+# ---------------------------------------------------------------------------
+# Headless Service: worker-to-worker bootstrap anchor.
+#
+# clusterIP: None makes DNS resolve to the individual pod IPs (not a single
+# VIP), which is what MX_DHT_BOOTSTRAP_DNS needs - it dials every resolved
+# address at MX_DHT_BOOTSTRAP_PORT. No traffic flows through this Service;
+# it exists purely so a joining node can find existing peers by name.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-dht-peers
+  labels:
+    app: mx-dht
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    mx.dht: "member"
+  ports:
+    - name: kademlia
+      port: 4001
+      targetPort: 4001
+---
+# ---------------------------------------------------------------------------
+# TP=2 source (multi-GPU-per-pod).
+#
+# One pod, two GPUs, vLLM --tensor-parallel-size=2. The pod's two ranks
+# publish /mx/{mx_source_id}/rank/0 and /mx/{mx_source_id}/rank/1 into the
+# mesh. Cross-node TP (Ray / torchrun spanning pods) keeps the same dht env
+# and populates each rank from its runtime; this example stays single-pod
+# for clarity. NVLink is intra-node only, so multi-GPU-per-pod is the usual
+# production TP shape.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-dht-source
+  labels:
+    app: mx-dht
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-dht
+      role: source
+  template:
+    metadata:
+      labels:
+        app: mx-dht
+        role: source
+        # Joins the bootstrap Service's endpoint set.
+        mx.dht: "member"
+    spec:
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Pin the model revision so mx_source_id is content-addressed.
+            # Replace with the exact HuggingFace commit SHA you intend to serve.
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+
+            # Backend selection: decentralized Kademlia DHT.
+            - name: MX_METADATA_BACKEND
+              value: "dht"
+            # Listen address for this node's DHT participation.
+            - name: MX_DHT_LISTEN
+              value: "0.0.0.0:4001"
+            # Bootstrap into the mesh via the headless Service above. Its DNS
+            # resolves to every participant pod IP; each is dialed at
+            # MX_DHT_BOOTSTRAP_PORT.
+            - name: MX_DHT_BOOTSTRAP_DNS
+              value: "mx-dht-peers.default.svc.cluster.local"
+            - name: MX_DHT_BOOTSTRAP_PORT
+              value: "4001"
+
+            # NIXL listen port and WorkerGrpcServer port for the P2P data path.
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - modelexpress
+            - --tensor-parallel-size
+            - "2"
+          ports:
+            - name: kademlia
+              containerPort: 4001
+            - name: worker-grpc
+              containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+              rdma/shared_ib: "1"
+            requests:
+              nvidia.com/gpu: "2"
+              rdma/shared_ib: "1"
+          readinessProbe:
+            # Ready once the WorkerGrpcServer is serving tensor manifests.
+            exec:
+              command:
+                - /bin/grpc_health_probe
+                - -addr=:6555
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3

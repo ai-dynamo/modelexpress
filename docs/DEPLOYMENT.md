@@ -387,13 +387,14 @@ Pick based on workload, not operational preference. The choice has structural co
 | Workload shape                                                         | Backend          | Why                                                                                                                                            |
 |------------------------------------------------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`    | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service-routing requires.             |
+| Stable-weight inference with no Kubernetes Service to route through (bare metal, Slurm, mixed K8s). | `dht`            | Zero central infrastructure and no dependency on kube-proxy or a Service object. Peers self-organize over a Kademlia mesh; the operator only wires up a bootstrap source. |
 | RL rollouts. Training loop updates weights every step, all inference pods refit in-place, repeat. | `redis` or `kubernetes` | Central store tracks each worker's state individually by `worker_id`. Targets can fetch "worker W as it exists right now" instead of random-sampling a pool. Live refits stay consistent at the per-worker level. |
 | Live fine-tune broadcasts. New checkpoint produced outside training, pushed to all replicas, hot-swapped in place. | `redis` or `kubernetes` | Same reason as RL. The k8s-service backend can't swap a live pod's source_id without restarting the pod.                                      |
 | Mixed-version fleet. Multiple revisions serving concurrently, callers dispatch by revision. | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, so multiple identities coexist cleanly. k8s-service requires one Service pool per identity.          |
 | Heterogeneous hardware. Some sources on H100, some on B200, callers match on topology. | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.   |
 | Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).   | Either           | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work. |
 
-The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification.
+The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach for `k8s-service` specifically when the deployment meets three criteria: (1) weights stay fixed for each pod's lifetime, (2) every pod behind a given Service serves the exact same checkpoint, and (3) dropping the `modelexpress-server` / Redis / CRD components is a material simplification. Reach for `dht` when those same stable-weight criteria hold but there is no Kubernetes Service to route through, or you want source discovery to survive with no coordinating object at all: bare metal, Slurm allocations, or mixed topologies. The operator only provides a bootstrap source; see [`DHT_BACKEND.md`](DHT_BACKEND.md) and [`../examples/dht_sources/`](../examples/dht_sources/).
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
@@ -403,7 +404,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server), `k8s-service` (decentralized via K8s Service routing), or `dht`/`kademlia` (decentralized via Kademlia DHT). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
@@ -413,7 +414,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service`. |
+| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service` and `dht`. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor and artifact manifest serving |
@@ -422,6 +423,14 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
+| `MX_DHT_LISTEN` | client `0.0.0.0:0` | `dht` backend: `host:port` the node listens on. On the server, presence of this var is the opt-in switch for participation-only DHT membership (unset means the server skips the DHT entirely). |
+| `MX_DHT_BOOTSTRAP_PEERS` | (none) | `dht` backend: comma-separated libp2p multiaddrs to dial for initial peers (e.g. `/ip4/10.0.0.1/tcp/4001/p2p/Qm...`). Highest-priority bootstrap source. |
+| `MX_DHT_BOOTSTRAP_DNS` | (none) | `dht` backend: headless Service DNS name resolving to every peer IP; each is dialed at `MX_DHT_BOOTSTRAP_PORT`. The common in-Kubernetes bootstrap source. |
+| `MX_DHT_BOOTSTRAP_SLURM` | `SLURM_JOB_NODELIST` | `dht` backend: Slurm-style hostlist (e.g. `node[01-04]`) to expand and dial at `MX_DHT_BOOTSTRAP_PORT`; auto-detected from `SLURM_JOB_NODELIST` when unset. |
+| `MX_DHT_BOOTSTRAP_PORT` | `4001` | `dht` backend: port at which DNS- and Slurm-resolved peers are dialed. |
+| `MX_DHT_RECORD_TTL` | `86400` | `dht` backend: record republish interval / TTL in seconds. Published pointers refresh on this cadence so they survive node churn. |
+| `MX_DHT_GET_RETRIES` | `5` | `dht` backend: number of GET retries before a lookup is declared failed. Tune up for large cold-start fan-in. |
+| `MX_DHT_GET_BACKOFF_SECONDS` | `0.5` | `dht` backend: delay between GET retries, in seconds. |
 | `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
