@@ -1,0 +1,315 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: 'Run ModelExpress Fleet Scale CI Test'
+description: |
+  CI lifecycle for the fleet scale test (row 20). Wraps:
+
+    1. Apply ModelExpress CRDs + namespace RBAC + secrets.
+    2. Deploy mx-server (CRD backend).
+    3. Apply the fleet workers Deployment at replicas=1.
+    4. Wait for the first worker to load weights from HF and reach Ready
+       (status.worker.status == Ready). This worker becomes the P2P source;
+       gating on Ready rather than CR existence ensures wave-1 workers find
+       a live source instead of falling back to HF disk load.
+    5. Scale in waves: for each value in wave_sizes, patch the Deployment
+       to that replica count and wait for that many workers to reach Ready.
+       Waves serialise scaling so intermediate-size failures are visible
+       (wave 1 of 3 failed vs wave 3 of 3 failed).
+    6. Run pytest against ci/k8s/client/test_fleet_scale.py.
+    7. Delete the namespace on exit (pass or fail).
+
+  Differences from run-mx-dynamo-test:
+    - No Dynamo operator or DGD — raw Deployment scaled via kubectl scale.
+    - No anti-affinity — workers pack onto a100a MIG slices on shared nodes.
+    - NIXL uses TCP transport (NIXL_UCX_TLS=tcp in manifest) because MIG
+      slices GPU but not RDMA: each node has one IB NIC, so requesting
+      rdma/ib: 1 per pod would cap schedulable replicas to the node count.
+
+inputs:
+  kubeconfig_base64:
+    description: 'Base64-encoded kubeconfig for the vCluster'
+    required: true
+  namespace:
+    description: 'Namespace inside the vCluster for this test run'
+    required: true
+  server_image:
+    description: 'Fully-qualified MX server image (ci/k8s/server/Dockerfile.server)'
+    required: true
+  worker_image:
+    description: 'Fully-qualified worker image (ci/k8s/client/vllm/Dockerfile)'
+    required: true
+  model:
+    description: 'HuggingFace model id'
+    required: false
+    default: 'Qwen/Qwen2.5-0.5B'
+  hf_token:
+    description: 'HuggingFace token — written as hf-token-secret in the test namespace'
+    required: true
+  worker_registry:
+    description: 'Registry hostname for worker images (used to create worker-registry imagePullSecret)'
+    required: true
+  ngc_api_key:
+    description: 'NGC API key — used to create the worker-registry imagePullSecret'
+    required: true
+  fleet_size:
+    description: 'Total number of worker replicas at the end of all waves'
+    required: false
+    default: '15'
+  wave_sizes:
+    description: |
+      Space-separated list of intermediate replica counts. Each value must
+      be greater than the previous and the last value must equal fleet_size.
+      Example: "5 10 15" scales 1→5, then 5→10, then 10→15.
+    required: false
+    default: '5 10 15'
+  source_load_timeout_seconds:
+    description: 'Seconds to wait for the first worker to publish its ModelMetadata CR'
+    required: false
+    default: '900'
+  wave_timeout_seconds:
+    description: 'Seconds to wait per wave for the expected number of ModelMetadata CRs'
+    required: false
+    default: '900'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup vCluster kubeconfig
+      shell: bash
+      env:
+        KUBECONFIG_B64: ${{ inputs.kubeconfig_base64 }}
+      run: |
+        echo "${KUBECONFIG_B64}" | base64 -d > ${{ github.workspace }}/.kubeconfig-vcluster
+        chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
+        echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-vcluster" >> $GITHUB_ENV
+
+    - name: Setup test namespace
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
+        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl apply -f ci/k8s/server/crd-modelmetadata.yaml
+        NAMESPACE=${NAMESPACE} envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
+          kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Create worker registry pull secret
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.worker_registry }}
+        NGC_API_KEY: ${{ inputs.ngc_api_key }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create worker-registry pull secret"
+        kubectl create secret docker-registry worker-registry \
+          --docker-server="${REGISTRY}" \
+          --docker-username='$oauthtoken' \
+          --docker-password="${NGC_API_KEY}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Create HF token secret
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf_token }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Create hf-token-secret"
+        kubectl create secret generic hf-token-secret \
+          --from-literal=HF_TOKEN="${HF_TOKEN}" \
+          -n ${NAMESPACE} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "::endgroup::"
+
+    - name: Deploy mx-server
+      shell: bash
+      env:
+        MX_SERVER_IMAGE: ${{ inputs.server_image }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Deploy mx-server (CRD backend)"
+        envsubst < ci/k8s/server/mx-server.yaml | kubectl apply -n ${NAMESPACE} -f -
+        kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
+        echo "::endgroup::"
+
+    - name: Deploy fleet workers (replicas=1)
+      shell: bash
+      env:
+        WORKER_IMAGE: ${{ inputs.worker_image }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Deploy fleet workers Deployment at replicas=1"
+        envsubst < ci/k8s/client/vllm/manifest-azure-fleet.yaml | \
+          kubectl apply -n ${NAMESPACE} -f -
+        echo "::endgroup::"
+
+    - name: Wait for source worker to become Ready
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TIMEOUT: ${{ inputs.source_load_timeout_seconds }}
+      run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || {
+          echo "ERROR: source_load_timeout_seconds must be a positive integer, got '${TIMEOUT}'"
+          exit 1
+        }
+        # Gate on status.worker.status == Ready, not just CR existence. A
+        # worker publishes its ModelMetadata CR before the model is fully
+        # loaded; if the wave scaling starts before the source is Ready, the
+        # wave-1 workers query mx-server, find no Ready source, and fall back
+        # to HF disk load. Counting only Ready CRs makes the gate match the
+        # actual healthy state test_fleet_scale.py asserts.
+        ready_count() {
+          kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | grep -c '^Ready$' || true
+        }
+        echo "::group::Wait for source worker to reach Ready"
+        deadline=$((SECONDS + TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          READY=$(ready_count)
+          if [ "${READY}" -ge 1 ]; then
+            echo "Source worker is Ready (${READY} Ready CR)."
+            break
+          fi
+          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
+            | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+          if [ -n "${FAILED}" ]; then
+            echo "ERROR: worker pod failed before becoming Ready: ${FAILED}"
+            exit 1
+          fi
+          echo "Source not Ready yet (${READY} Ready), retrying in 15s..."
+          sleep 15
+        done
+        if [ "$(ready_count)" -lt 1 ]; then
+          echo "ERROR: source worker did not become Ready within ${TIMEOUT}s"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+    - name: Scale fleet in waves
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        FLEET_SIZE: ${{ inputs.fleet_size }}
+        WAVE_SIZES: ${{ inputs.wave_sizes }}
+        WAVE_TIMEOUT: ${{ inputs.wave_timeout_seconds }}
+      run: |
+        [[ "${WAVE_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || {
+          echo "ERROR: wave_timeout_seconds must be a positive integer, got '${WAVE_TIMEOUT}'"
+          exit 1
+        }
+        # Each wave waits until WAVE workers are Ready (not just CR-published),
+        # so a wave only "completes" when its workers are actually healthy.
+        # This is what makes wave isolation real: a failure shows up in the
+        # wave that caused it, not several waves later.
+        ready_count() {
+          kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | grep -c '^Ready$' || true
+        }
+        for WAVE in ${WAVE_SIZES}; do
+          echo "::group::Scale to replicas=${WAVE}"
+          kubectl scale deployment/mx-fleet-workers -n "${NAMESPACE}" --replicas="${WAVE}"
+          deadline=$((SECONDS + WAVE_TIMEOUT))
+          while [ $SECONDS -lt $deadline ]; do
+            READY=$(ready_count)
+            if [ "${READY}" -ge "${WAVE}" ]; then
+              echo "Wave complete: ${READY}/${WAVE} workers Ready."
+              break
+            fi
+            FAILED=$(kubectl get pods -n "${NAMESPACE}" -l app=mx-fleet-worker --no-headers 2>/dev/null \
+              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+            if [ -n "${FAILED}" ]; then
+              echo "ERROR: a worker pod failed during wave ${WAVE}: ${FAILED}"
+              exit 1
+            fi
+            echo "Have ${READY}/${WAVE} Ready, retrying in 15s..."
+            sleep 15
+          done
+          READY=$(ready_count)
+          if [ "${READY}" -lt "${WAVE}" ]; then
+            echo "ERROR: only ${READY}/${WAVE} workers Ready after ${WAVE_TIMEOUT}s"
+            exit 1
+          fi
+          echo "::endgroup::"
+        done
+        # Confirm the last wave reached fleet_size Ready workers.
+        READY=$(ready_count)
+        if [ "${READY}" -lt "${FLEET_SIZE}" ]; then
+          echo "ERROR: only ${READY}/${FLEET_SIZE} workers Ready after all waves"
+          exit 1
+        fi
+        echo "All ${FLEET_SIZE} workers are Ready."
+
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Install test dependencies
+      shell: bash
+      run: pip install pytest
+
+    - name: Run tests
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        FLEET_SIZE: ${{ inputs.fleet_size }}
+      run: |
+        pytest ci/k8s/client/test_fleet_scale.py -v \
+          --namespace "${NAMESPACE}" \
+          --model "${MX_CI_MODEL}" \
+          --expected-cr-count "${FLEET_SIZE}"
+
+    - name: Dump pod logs
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        set +eo pipefail
+        echo "::group::Pod summary"
+        kubectl get pods -n "${NAMESPACE}" -o wide 2>&1 || true
+        echo "::endgroup::"
+
+        echo "::group::Namespace events (last 50, newest first)"
+        kubectl get events -n "${NAMESPACE}" --sort-by='.lastTimestamp' 2>&1 | tail -50 || true
+        echo "::endgroup::"
+
+        for POD in $(kubectl get pods -n "${NAMESPACE}" --no-headers 2>/dev/null | awk '{print $1}'); do
+          echo "::group::describe ${POD}"
+          kubectl describe pod -n "${NAMESPACE}" "${POD}" 2>&1 | tail -60 || true
+          echo "::endgroup::"
+          echo "::group::logs ${POD} (tail 200)"
+          kubectl logs -n "${NAMESPACE}" "${POD}" --tail=200 2>&1 || true
+          echo "::endgroup::"
+        done
+
+    - name: Cleanup test namespace
+      if: always()
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+      run: |
+        echo "::group::Delete namespace ${NAMESPACE}"
+        if ! kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=180s; then
+          echo "::warning::Namespace ${NAMESPACE} did not finalize within 180s; force-clearing finalizers."
+          kubectl get ns "${NAMESPACE}" -o json 2>/dev/null \
+            | jq '.spec.finalizers = []' \
+            | kubectl replace --raw "/api/v1/namespaces/${NAMESPACE}/finalize" -f - || true
+          sleep 5
+          if kubectl get ns "${NAMESPACE}" --no-headers 2>/dev/null | grep -q .; then
+            echo "::error::Namespace ${NAMESPACE} still present after force-finalize."
+            kubectl get ns "${NAMESPACE}" -o yaml 2>&1 | tail -40
+            exit 1
+          fi
+          echo "Namespace ${NAMESPACE} is gone (safeguard cleared finalizers successfully)."
+        fi
+        echo "::endgroup::"

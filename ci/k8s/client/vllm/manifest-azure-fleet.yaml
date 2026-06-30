@@ -1,0 +1,132 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fleet scale manifest for row 20 (~15 workers, CRD + P2P metadata).
+# Driven by run-mx-fleet-test, which applies this at replicas=1 then
+# scales the Deployment in waves (e.g. 1 → 5 → 10 → 15).
+#
+# Design choices:
+#
+#   No Dynamo — raw Deployment + Service; no operator dependency.
+#   The first replica to start finds no READY source and loads from HF;
+#   subsequent replicas discover it via mx-server and pull via NIXL.
+#
+#   No anti-affinity — the goal is to saturate a100a MIG slices, not
+#   spread replicas across hosts. Multiple workers co-locate on the same
+#   node, each consuming one MIG slice. This is what makes the scale test
+#   feasible on a pool with far fewer physical nodes than workers.
+#
+#   NIXL over TCP — MIG slices GPU but not RDMA. Each a100a node has one
+#   IB NIC, so requesting rdma/ib: 1 per pod caps schedulable replicas to
+#   the number of physical nodes, defeating the purpose of MIG. By using
+#   TCP (NIXL_UCX_TLS=tcp) we avoid requesting the rdma/ib device and let
+#   the scheduler pack many MIG-slice pods per node. The "RDMA transfer
+#   complete" log marker still fires — it is a code-level name, not a
+#   physical RDMA indicator.
+#
+#   No rdma/ib resource — TCP needs no IB device.
+#   MX_RDMA_NIC_PIN and UCX_RNDV_SCHEME/THRESH dropped; they are IB-only.
+#
+# Environment variables substituted by envsubst before apply:
+#   WORKER_IMAGE  — image built from ci/k8s/client/vllm/Dockerfile
+#   MX_CI_MODEL   — HuggingFace model id
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-fleet-workers
+  labels:
+    app: mx-fleet-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-fleet-worker
+  template:
+    metadata:
+      labels:
+        app: mx-fleet-worker
+    spec:
+      imagePullSecrets:
+        - name: worker-registry
+      nodeSelector:
+        agentpool: a100a
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: worker
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --max-model-len
+            - "1024"
+            - --kv-cache-memory-bytes
+            - "1073741824"
+            - --trust-remote-code
+            - --port
+            - "8000"
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            # Force NIXL's UCX context to TCP + CUDA memory staging. Plain
+            # "tcp" alone causes UCX to treat GPU tensors as host memory
+            # (warning: "memory is detected as host, check that UCX is
+            # configured with CUDA support"), silently falling back to HF
+            # disk load. The "cuda_copy" component enables UCX to stage
+            # GPU memory through the CPU for TCP transport. nixl_transfer.py
+            # reads NIXL_UCX_TLS and applies it only for the NIXL agent init.
+            - name: NIXL_UCX_TLS
+              value: "tcp,cuda_copy"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-fleet-workers
+spec:
+  selector:
+    app: mx-fleet-worker
+  ports:
+    - port: 8000
+      targetPort: 8000
