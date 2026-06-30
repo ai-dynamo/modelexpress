@@ -46,6 +46,9 @@ impl ModelMetadataSpec {
             Ok(MxSourceType::TorchCompileCache) => "torch_compile_cache",
             Ok(MxSourceType::TritonCache) => "triton_cache",
             Ok(MxSourceType::DeepGemmCache) => "deep_gemm_cache",
+            Ok(MxSourceType::TilelangCache) => "tilelang_cache",
+            Ok(MxSourceType::CuteDslCache) => "cute_dsl_cache",
+            Ok(MxSourceType::FlashinferCache) => "flashinfer_cache",
             Err(_) => "unknown",
         }
         .to_string()
@@ -274,6 +277,18 @@ mod tests {
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(5),
             "deep_gemm_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(6),
+            "tilelang_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(7),
+            "cute_dsl_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(8),
+            "flashinfer_cache"
         );
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(99),

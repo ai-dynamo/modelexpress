@@ -141,7 +141,7 @@ runs:
         echo "::group::Create worker-registry pull secret"
         # docker-server is hardcoded to nvcr.io so this single secret
         # authenticates ALL nvcr.io images — both the team's worker images
-        # (nvcr.io/nvidian/...) and the public base images (nvcr.io/nvidia/...).
+        # (nvcr.io/0980761089281446/...) and the public base images (nvcr.io/nvidia/...).
         # Replaces the previous two-secret setup (worker-registry + ngc-registry).
         kubectl create secret docker-registry worker-registry \
           --docker-server="nvcr.io" \
