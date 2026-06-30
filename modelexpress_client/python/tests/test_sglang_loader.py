@@ -593,7 +593,7 @@ def test_te_find_source_iterates_in_selector_order_and_none_when_no_match(monkey
 
     monkeypatch.setattr(
         "modelexpress.engines.sglang.loader.get_configured_selector",
-        lambda _ctx: _ReverseSelector(),
+        lambda: _ReverseSelector(),
     )
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = _te_ctx([_te_ref(f"s{i}aaaaaaaaaaaaaa", f"w{i}", rank=0) for i in range(3)])
@@ -618,7 +618,7 @@ def test_te_find_source_skips_not_found(monkeypatch):
 
     monkeypatch.setattr(
         "modelexpress.engines.sglang.loader.get_configured_selector",
-        lambda _ctx: _IdentitySelector(),
+        lambda: _IdentitySelector(),
     )
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = _te_ctx(

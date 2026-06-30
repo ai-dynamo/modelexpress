@@ -21,11 +21,10 @@ from .context import LoadResult
 from ..metadata.payload import worker_tensor_count, worker_tensor_descriptors
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
-    SourceSelectionContext,
     configured_policy_label,
     get_configured_selector,
 )
-from ..source_selection_metrics import metrics as selection_metrics
+from ..metrics import metrics as selection_metrics
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
 from .. import p2p_pb2
@@ -191,15 +190,9 @@ class RdmaStrategy(LoadStrategy):
                 if inst.worker_rank == ctx.worker_rank
             ]
 
-            selection_ctx = SourceSelectionContext(
-                worker_rank=ctx.worker_rank,
-                global_rank=ctx.global_rank,
-                worker_id=ctx.worker_id,
-                model_name=ctx.identity.model_name,
-            )
-            selector = get_configured_selector(selection_ctx)
+            selector = get_configured_selector()
             select_start = time.perf_counter()
-            ordered = selector.order(candidates, selection_ctx)
+            ordered = selector.order(candidates, ctx)
             select_seconds = time.perf_counter() - select_start
 
             selection_metrics.observe_candidates(

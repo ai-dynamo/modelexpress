@@ -11,6 +11,7 @@ metadata-miss fallback, and the no-retry-after-transfer-start rule).
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,7 +23,6 @@ from modelexpress.source_selection import (
     ENV_SELECTOR,
     RandomSelector,
     RendezvousHashSelector,
-    SourceSelectionContext,
     configured_policy_label,
     get_configured_selector,
     get_selector,
@@ -30,13 +30,14 @@ from modelexpress.source_selection import (
 )
 
 
-def _ctx(worker_id="target-0", worker_rank=0, model_name="m", seed=None):
-    return SourceSelectionContext(
+def _ctx(worker_id="target-0", worker_rank=0, model_name="m"):
+    # Selectors read only these fields off the live LoadContext, so a tiny
+    # duck-typed stand-in is enough; no need to build a full LoadContext.
+    return SimpleNamespace(
         worker_rank=worker_rank,
         global_rank=worker_rank,
         worker_id=worker_id,
-        model_name=model_name,
-        selector_seed=seed,
+        identity=SimpleNamespace(model_name=model_name),
     )
 
 
@@ -60,34 +61,34 @@ def _sources(n, worker_rank=0):
 
 def test_default_is_random(monkeypatch):
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
-    assert get_configured_selector(_ctx()).name == "random"
+    assert get_configured_selector().name == "random"
 
 
 def test_env_selects_rendezvous_hash(monkeypatch):
     monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
-    assert get_configured_selector(_ctx()).name == "rendezvous_hash"
+    assert get_configured_selector().name == "rendezvous_hash"
 
 
 def test_unknown_name_falls_back_to_random(caplog):
     with caplog.at_level(logging.WARNING, logger="modelexpress.source_selection"):
-        sel = get_selector("does-not-exist", _ctx())
+        sel = get_selector("does-not-exist")
     assert sel.name == "random"
     assert any("Unknown P2P source selector" in r.message for r in caplog.records)
 
 
 def test_invalid_env_falls_back_to_random(monkeypatch):
     monkeypatch.setenv(ENV_SELECTOR, "garbage")
-    assert get_configured_selector(_ctx()).name == "random"
+    assert get_configured_selector().name == "random"
 
 
 def test_factory_failure_falls_back_to_random(caplog):
-    def _boom(_ctx):
+    def _boom():
         raise RuntimeError("broken factory")
 
     register_selector("broken", _boom)
     try:
         with caplog.at_level(logging.WARNING, logger="modelexpress.source_selection"):
-            sel = get_selector("broken", _ctx())
+            sel = get_selector("broken")
         assert sel.name == "random"
         assert any("Failed to construct" in r.message for r in caplog.records)
     finally:
@@ -98,9 +99,9 @@ def test_factory_failure_falls_back_to_random(caplog):
 
 def test_register_custom_selector():
     sentinel = RandomSelector()
-    register_selector("custom-x", lambda _ctx: sentinel)
+    register_selector("custom-x", lambda: sentinel)
     try:
-        assert get_selector("custom-x", _ctx()) is sentinel
+        assert get_selector("custom-x") is sentinel
     finally:
         from modelexpress.source_selection import SELECTORS
 
@@ -119,13 +120,6 @@ def test_random_preserves_candidate_set():
     assert {c.worker_id for c in out} == {c.worker_id for c in cands}
 
 
-def test_random_seeded_is_reproducible():
-    cands = _sources(8)
-    a = RandomSelector().order(cands, _ctx(seed=1234))
-    b = RandomSelector().order(cands, _ctx(seed=1234))
-    assert [c.worker_id for c in a] == [c.worker_id for c in b]
-
-
 def test_random_uses_local_rng_not_global(monkeypatch):
     import random as _random
 
@@ -133,7 +127,7 @@ def test_random_uses_local_rng_not_global(monkeypatch):
     orig_shuffle = _random.shuffle
     monkeypatch.setattr(_random, "shuffle", lambda *a, **k: calls.append(a))
     try:
-        RandomSelector().order(_sources(4), _ctx(seed=7))
+        RandomSelector().order(_sources(4), _ctx())
     finally:
         monkeypatch.setattr(_random, "shuffle", orig_shuffle)
     # The policy must not touch process-global random.shuffle.
@@ -323,7 +317,7 @@ def test_configured_policy_label_unknown_falls_back(monkeypatch):
 def test_configured_policy_label_failing_factory_falls_back(monkeypatch):
     # A registered-but-raising factory resolves to "random" at runtime, so the
     # label must too (else load() metrics would be split from selection metrics).
-    def _boom(_ctx):
+    def _boom():
         raise RuntimeError("broken factory")
 
     register_selector("broken-label", _boom)

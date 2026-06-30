@@ -1,23 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Opt-in Prometheus metrics for P2P source selection (benchmarking only).
+"""Opt-in Prometheus metrics for the ModelExpress client.
 
-Disabled by default. Enable with ``MX_P2P_METRICS_ENABLED=1`` to compare
-source-selection schemes quantitatively on a dashboard. The same selection
-signals are always emitted as structured logs (see rdma_strategy), so disabling
-metrics loses comparability, not correctness.
+A single, generic collector. Disabled by default; enable with
+``MX_METRICS_ENABLED=1``. It is built to grow: the P2P source-selection
+counters/histograms below are the first group, and other client signals (model
+load latency, P2P transfer latency, etc.) can be added to the same collector as
+additional families without changing the exposition or enable/disable plumbing.
 
 Exposition:
-  - Pull: a target worker keeps running after it loads (it becomes a source),
-    so it can serve a ``/metrics`` endpoint on ``MX_P2P_METRICS_PORT``.
+  - Pull: a worker that keeps running (e.g. a target that became a source) can
+    serve a ``/metrics`` endpoint on ``MX_METRICS_PORT``.
   - Push: short-lived load-only processes can push to a Pushgateway via
-    ``MX_P2P_METRICS_PUSHGATEWAY``.
+    ``MX_METRICS_PUSHGATEWAY``.
 
-Every metric carries a ``policy`` label (plus an optional ``scheme`` run label
-from ``MX_P2P_METRICS_SCHEME``) so multiple schemes compare on one dashboard.
-All public functions are no-ops when metrics are disabled or prometheus_client
-is unavailable; nothing here may raise into the load path.
+Every metric carries a ``scheme`` run label from ``MX_METRICS_SCHEME`` (plus
+group-specific labels) so multiple runs compare on one dashboard. All public
+functions are no-ops when metrics are disabled or prometheus_client is
+unavailable; nothing here may raise into the load path.
 """
 
 from __future__ import annotations
@@ -26,23 +27,25 @@ import atexit
 import logging
 import os
 
-logger = logging.getLogger("modelexpress.source_selection.metrics")
+logger = logging.getLogger("modelexpress.metrics")
 
-ENV_ENABLED = "MX_P2P_METRICS_ENABLED"
-ENV_PORT = "MX_P2P_METRICS_PORT"
-ENV_PUSHGATEWAY = "MX_P2P_METRICS_PUSHGATEWAY"
-ENV_SCHEME = "MX_P2P_METRICS_SCHEME"
+ENV_ENABLED = "MX_METRICS_ENABLED"
+ENV_PORT = "MX_METRICS_PORT"
+ENV_PUSHGATEWAY = "MX_METRICS_PUSHGATEWAY"
+ENV_SCHEME = "MX_METRICS_SCHEME"
 
 
 def _enabled() -> bool:
     return os.environ.get(ENV_ENABLED, "0") in ("1", "true", "True")
 
 
-class _Metrics:
+class MetricsCollector:
     """Lazy holder for prometheus_client collectors.
 
     Construction is attempted once, on first use, only when enabled. Any import
-    or registration failure disables the layer permanently with a warning.
+    or registration failure disables the layer permanently with a warning. The
+    metric families are grouped by feature so new groups slot in alongside the
+    P2P source-selection group without touching the rest.
     """
 
     def __init__(self) -> None:
@@ -63,6 +66,7 @@ class _Metrics:
         try:
             from prometheus_client import Counter, Histogram
 
+            # --- P2P source-selection group ---
             self.selections = Counter(
                 "mx_p2p_source_selections_total",
                 "How often each source worker is chosen (utilization balance).",
@@ -97,9 +101,9 @@ class _Metrics:
                 buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
             )
             self._ready = True
-            logger.info("P2P source-selection metrics enabled (scheme=%r)", self.scheme)
+            logger.info("ModelExpress metrics enabled (scheme=%r)", self.scheme)
         except Exception as e:
-            logger.warning("Failed to initialize P2P metrics, disabling: %s", e)
+            logger.warning("Failed to initialize metrics, disabling: %s", e)
             self._ready = False
         if self._ready and not self._atexit_registered:
             self._atexit_registered = True
@@ -122,11 +126,11 @@ class _Metrics:
             from prometheus_client import start_http_server
 
             start_http_server(int(port))
-            logger.info("P2P metrics /metrics endpoint listening on :%s", port)
+            logger.info("Metrics /metrics endpoint listening on :%s", port)
         except Exception as e:
-            logger.warning("Failed to start P2P metrics server on port %s: %s", port, e)
+            logger.warning("Failed to start metrics server on port %s: %s", port, e)
 
-    # -- recording API (all no-op when disabled) --
+    # -- P2P source-selection recording API (all no-op when disabled) --
 
     def record_selection(self, policy: str, source_worker_id: str) -> None:
         if self._ensure():
@@ -171,11 +175,11 @@ class _Metrics:
                 pass
 
 
-metrics = _Metrics()
+metrics = MetricsCollector()
 
 
-def push_metrics_if_enabled(job: str = "mx_p2p") -> None:
-    """Push current metrics to MX_P2P_METRICS_PUSHGATEWAY, if configured.
+def push_metrics_if_enabled(job: str = "modelexpress") -> None:
+    """Push current metrics to MX_METRICS_PUSHGATEWAY, if configured.
 
     For short-lived load-only processes that exit before a scrape. No-op when
     disabled or no pushgateway is set.
@@ -194,6 +198,6 @@ def push_metrics_if_enabled(job: str = "mx_p2p") -> None:
         # Key by host so concurrent workers don't overwrite each other's metrics.
         grouping_key = {"instance": socket.gethostname()}
         push_to_gateway(gateway, job=job, grouping_key=grouping_key, registry=REGISTRY)
-        logger.info("Pushed P2P metrics to %s (job=%s, %s)", gateway, job, grouping_key)
+        logger.info("Pushed metrics to %s (job=%s, %s)", gateway, job, grouping_key)
     except Exception as e:
-        logger.warning("Failed to push P2P metrics to %s: %s", gateway, e)
+        logger.warning("Failed to push metrics to %s: %s", gateway, e)

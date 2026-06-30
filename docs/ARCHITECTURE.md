@@ -127,7 +127,7 @@ ModelExpress/
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
-│       ├── source_selection_metrics.py # Opt-in Prometheus metrics for selection benchmarking
+│       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader
 │       ├── adapter.py                  # EngineAdapter contract and strategy errors
@@ -615,7 +615,13 @@ After `RdmaStrategy` filters listed READY sources to the target's `worker_rank`,
 - `random` — behavior-preserving default; shuffles with a local RNG so it does not perturb process-global state.
 - `rendezvous_hash` — stateless deterministic spreading via HRW hashing of the target identity plus each candidate identity. Different targets get different first choices without a shared counter or server coordination, it is stable across process restarts (blake2b, not Python's salted `hash()`), and adding/removing one source perturbs only a fraction of rankings.
 
-The selector controls ordering only; the retry budget and the rule that a transfer failure does not fall back to another source are unchanged. Load- and topology-aware policies are deferred (they need signals such as per-source load or node/rack topology); the same scoring interface accepts them as drop-ins. Selection decisions are emitted as structured logs, and an opt-in Prometheus layer (`source_selection_metrics.py`, `MX_P2P_METRICS_ENABLED=1`) re-emits them as `mx_p2p_*` metrics for benchmarking different schemes.
+The selector controls ordering only; the retry budget and the rule that a transfer failure does not fall back to another source are unchanged. Selectors read the few fields they need (`worker_rank`, `worker_id`, `identity.model_name`) directly off the live `LoadContext`, so there is no parallel context type. Load- and topology-aware policies are deferred (they need signals such as per-source load or node/rack topology); the same scoring interface accepts them as drop-ins. Selection decisions are emitted as structured logs, and an opt-in Prometheus collector (`metrics.py`, `MX_METRICS_ENABLED=1`) re-emits them as `mx_p2p_*` metrics for benchmarking different schemes.
+
+#### Selection efficacy (measured)
+
+The two Phase 1 policies were compared two ways. An offline simulation drives the real selector code over synthetic `(target, source)` identity sets; because the score depends only on identity and policy (not on hardware or RDMA), it reproduces the on-cluster `mx_p2p_source_selections_total` distribution without standing up transfers. Across M sources / N targets configs (4×20, 4×40, 8×32), **first-choice balance is equivalent** for both policies (both are uniform hashes — max-source share within a few percent of each other and of the `ceil(N/M)/N` ideal). The difference is elsewhere: `rendezvous_hash` has **0% re-pick churn** on a repeated, unchanged source set (vs `random`'s ~`(M-1)/M`), and removing one source changes only ~`1/M` of the unaffected targets' picks.
+
+On-cluster (8×B200 nodes, InfiniBand RDMA; vLLM `--load-format modelexpress`, TP=1, central-coordinator backend), both policies were run against pre-warmed source pools that grow as targets become sources. Across Qwen2.5-0.5B (0.99 GB) and Qwen2.5-7B (~15 GB), 42 real cross-node NIXL RDMA transfers completed and **bandwidth was policy-independent** (~180 Gbps for the 0.5B transfers, ~211 Gbps for the larger 7B transfers as setup amortizes). So `rendezvous_hash`'s win is determinism and low disruption at no balance or bandwidth cost; the deferred `load_aware` policy is what closes the live-fan-out gap where deterministic hashing can pile onto an always-present source.
 
 ### Transfer Safety
 

@@ -46,7 +46,7 @@ dev = [
 otel = [
     "opentelemetry-api>=1.20.0",
 ]
-# Opt-in P2P source-selection benchmarking metrics (MX_P2P_METRICS_ENABLED=1).
+# Opt-in Prometheus metrics collector (MX_METRICS_ENABLED=1).
 # Lazily imported; not required for normal operation.
 metrics = [
     "prometheus-client>=0.20.0",

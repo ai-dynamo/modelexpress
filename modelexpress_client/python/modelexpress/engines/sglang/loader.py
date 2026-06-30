@@ -19,7 +19,7 @@ from ...metadata.heartbeat import HeartbeatThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
 from ...nixl_transfer import NixlTransferManager
-from ...source_selection import SourceSelectionContext, get_configured_selector
+from ...source_selection import get_configured_selector
 from .adapter import build_sglang_load_context
 
 logger = logging.getLogger("modelexpress.engines.sglang.loader")
@@ -217,14 +217,8 @@ class MxModelLoader:
         candidates = [
             inst for inst in response.instances if inst.worker_rank == ctx.worker_rank
         ]
-        selection_ctx = SourceSelectionContext(
-            worker_rank=ctx.worker_rank,
-            global_rank=ctx.global_rank,
-            worker_id=ctx.worker_id,
-            model_name=ctx.identity.model_name,
-        )
-        selector = get_configured_selector(selection_ctx)
-        candidates = selector.order(candidates, selection_ctx)
+        selector = get_configured_selector()
+        candidates = selector.order(candidates, ctx)
         logger.info(
             "[Worker %s] TransferEngine source selection: source_selector=%s "
             "source_candidates_total=%d source_candidates_rank_matched=%d",

@@ -7,8 +7,14 @@ Ranks the compatible READY source workers returned by the metadata backend
 before transfer attempts. The flow is:
 
     metadata backend -> ListSources(identity, READY) -> filter by worker_rank
-      -> SourceSelector.order(candidates, context) -> slice to MAX_SOURCE_RETRIES
+      -> SourceSelector.order(candidates, ctx) -> slice to MAX_SOURCE_RETRIES
       -> NIXL/RDMA transfer
+
+Selectors order candidates using the live ``LoadContext`` (the same object the
+load strategies already pass around): only a few fields are read
+(``worker_rank``, ``worker_id``, ``identity.model_name``), so there is no
+parallel context type to keep in sync. The annotation is a forward reference to
+avoid importing the load_strategy package at module load.
 
 Phase 1 is stateless: a policy ranks candidates using only the current
 candidate list, the target context, and the configured policy. It keeps no
@@ -23,10 +29,12 @@ import hashlib
 import logging
 import os
 import random
-from dataclasses import dataclass
-from typing import Callable, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 from . import p2p_pb2
+
+if TYPE_CHECKING:
+    from .load_strategy.context import LoadContext
 
 logger = logging.getLogger("modelexpress.source_selection")
 
@@ -34,23 +42,6 @@ logger = logging.getLogger("modelexpress.source_selection")
 # warning and fall back to DEFAULT_SELECTOR.
 ENV_SELECTOR = "MX_P2P_SOURCE_SELECTOR"
 DEFAULT_SELECTOR = "random"
-
-
-@dataclass(frozen=True)
-class SourceSelectionContext:
-    """Client-side target context passed to a selector.
-
-    Holds only values already available on the client when source discovery
-    runs; it introduces no new metadata or schema dependency.
-    """
-
-    worker_rank: int
-    global_rank: int
-    worker_id: str
-    model_name: str
-    # Optional seed for the random policy. None matches today's behavior
-    # (process-global entropy); a fixed int makes ordering reproducible.
-    selector_seed: int | None = None
 
 
 @runtime_checkable
@@ -62,7 +53,7 @@ class SourceSelector(Protocol):
     def order(
         self,
         candidates: list[p2p_pb2.SourceInstanceRef],
-        context: SourceSelectionContext,
+        ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         ...
 
@@ -80,18 +71,18 @@ class ScoredSelector:
     def score(
         self,
         candidate: p2p_pb2.SourceInstanceRef,
-        context: SourceSelectionContext,
+        ctx: LoadContext,
     ) -> float:
         raise NotImplementedError
 
     def order(
         self,
         candidates: list[p2p_pb2.SourceInstanceRef],
-        context: SourceSelectionContext,
+        ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         return sorted(
             candidates,
-            key=lambda c: self.score(c, context),
+            key=lambda c: self.score(c, ctx),
             reverse=True,
         )
 
@@ -100,8 +91,7 @@ class RandomSelector:
     """Behavior-preserving default: shuffle candidates with a local RNG.
 
     Uses a local ``random.Random`` rather than process-global state so it does
-    not perturb other callers and stays reproducible when seeded. With
-    ``selector_seed=None`` it matches the previous ``random.shuffle`` behavior.
+    not perturb other callers. Matches the previous ``random.shuffle`` behavior.
     """
 
     name = "random"
@@ -109,11 +99,10 @@ class RandomSelector:
     def order(
         self,
         candidates: list[p2p_pb2.SourceInstanceRef],
-        context: SourceSelectionContext,
+        ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         out = list(candidates)
-        rng = random.Random(context.selector_seed)
-        rng.shuffle(out)
+        random.Random().shuffle(out)
         return out
 
 
@@ -139,14 +128,14 @@ class RendezvousHashSelector(ScoredSelector):
     def score(
         self,
         candidate: p2p_pb2.SourceInstanceRef,
-        context: SourceSelectionContext,
+        ctx: LoadContext,
     ) -> float:
         key = "|".join(
             str(x)
             for x in (
-                context.model_name,
-                context.worker_id,
-                context.worker_rank,
+                ctx.identity.model_name,
+                ctx.worker_id,
+                ctx.worker_rank,
                 candidate.mx_source_id,
                 candidate.worker_id,
                 candidate.worker_rank,
@@ -161,9 +150,9 @@ class RendezvousHashSelector(ScoredSelector):
 # ---------------------------------------------------------------------------
 
 # A policy registers a factory by name so adding one does not touch the RDMA
-# strategy. The factory receives the selection context (future policies may use
-# it for construction; the Phase 1 policies are context-free).
-SelectorFactory = Callable[[SourceSelectionContext], SourceSelector]
+# strategy. Factories are context-free: the per-target signal flows in through
+# the LoadContext passed to order(), not through construction.
+SelectorFactory = Callable[[], SourceSelector]
 
 SELECTORS: dict[str, SelectorFactory] = {}
 
@@ -173,11 +162,11 @@ def register_selector(name: str, factory: SelectorFactory) -> None:
     SELECTORS[name] = factory
 
 
-register_selector("random", lambda _ctx: RandomSelector())
-register_selector("rendezvous_hash", lambda _ctx: RendezvousHashSelector())
+register_selector("random", lambda: RandomSelector())
+register_selector("rendezvous_hash", lambda: RendezvousHashSelector())
 
 
-def get_selector(name: str, context: SourceSelectionContext) -> SourceSelector:
+def get_selector(name: str) -> SourceSelector:
     """Resolve a policy name to a selector instance.
 
     Unknown names, or factories that raise, log a warning and fall back to
@@ -191,9 +180,9 @@ def get_selector(name: str, context: SourceSelectionContext) -> SourceSelector:
             DEFAULT_SELECTOR,
             sorted(SELECTORS),
         )
-        return SELECTORS[DEFAULT_SELECTOR](context)
+        return SELECTORS[DEFAULT_SELECTOR]()
     try:
-        return factory(context)
+        return factory()
     except Exception as e:  # defensive: a broken factory must not block loading
         logger.warning(
             "Failed to construct P2P source selector %r (%s), falling back to %r",
@@ -201,12 +190,12 @@ def get_selector(name: str, context: SourceSelectionContext) -> SourceSelector:
             e,
             DEFAULT_SELECTOR,
         )
-        return SELECTORS[DEFAULT_SELECTOR](context)
+        return SELECTORS[DEFAULT_SELECTOR]()
 
 
-def get_configured_selector(context: SourceSelectionContext) -> SourceSelector:
+def get_configured_selector() -> SourceSelector:
     """Resolve the selector named by ``MX_P2P_SOURCE_SELECTOR`` (default random)."""
-    return get_selector(os.environ.get(ENV_SELECTOR, DEFAULT_SELECTOR), context)
+    return get_selector(os.environ.get(ENV_SELECTOR, DEFAULT_SELECTOR))
 
 
 def configured_policy_label() -> str:
@@ -216,11 +205,4 @@ def configured_policy_label() -> str:
     fallback to ``random`` when the configured policy is unknown *or* its factory
     raises -- so emitted labels never claim a policy that did not actually run.
     """
-    name = os.environ.get(ENV_SELECTOR, DEFAULT_SELECTOR)
-    factory = SELECTORS.get(name)
-    if factory is None:
-        return DEFAULT_SELECTOR
-    try:
-        return factory(SourceSelectionContext(0, 0, "", "")).name
-    except Exception:
-        return DEFAULT_SELECTOR
+    return get_configured_selector().name
