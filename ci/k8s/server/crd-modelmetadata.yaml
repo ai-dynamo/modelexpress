@@ -43,7 +43,7 @@ spec:
                   description: Full model name (e.g., meta-llama/Llama-3.1-405B-Instruct)
                 sourceType:
                   type: string
-                  description: Source type from SourceIdentity (e.g., weights, torch_compile_cache)
+                  description: Source type from SourceIdentity (for example, weights or a JIT cache type)
             status:
               type: object
               properties:

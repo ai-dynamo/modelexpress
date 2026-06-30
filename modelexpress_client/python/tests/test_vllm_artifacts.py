@@ -211,11 +211,86 @@ def test_deep_gemm_artifact_identity_omits_jit_key_when_unavailable(monkeypatch)
     assert "deep_gemm_jit_key" not in identity.extra_parameters
 
 
+def test_tilelang_artifact_identity_uses_tilelang_cache_criteria(monkeypatch):
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm100")
+    monkeypatch.setattr(artifacts, "_tilelang_version", lambda: "0.1.11")
+    monkeypatch.setattr(artifacts.torch.version, "cuda", "13.0")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            model_name="deepseek-ai/DeepSeek-V4-Pro",
+            tensor_parallel_size=8,
+            revision="abc123",
+        ),
+    )
+
+    identity = artifacts._artifact_identity(
+        ctx,
+        p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+    )
+
+    assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE
+    assert identity.model_name == "deepseek-ai/DeepSeek-V4-Pro"
+    assert identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_VLLM
+    assert identity.cuda_version == "13.0"
+    assert identity.gpu_arch == "sm100"
+    assert identity.extra_parameters["tilelang_version"] == "0.1.11"
+    assert identity.tensor_parallel_size == 0
+    assert identity.revision == ""
+
+
+def test_cute_dsl_artifact_identity_uses_compiler_criteria(monkeypatch):
+    monkeypatch.setattr(artifacts, "_cutlass_dsl_version", lambda: "4.5.2")
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm100")
+    monkeypatch.setattr(artifacts.torch.version, "cuda", "13.0")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(model_name="test/model"),
+    )
+
+    identity = artifacts._artifact_identity(
+        ctx,
+        p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+    )
+
+    assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE
+    assert identity.model_name == "test/model"
+    assert identity.cuda_version == "13.0"
+    assert identity.gpu_arch == "sm100"
+    assert identity.extra_parameters["cutlass_dsl_version"] == "4.5.2"
+    assert identity.torch_version == ""
+
+
+def test_flashinfer_artifact_identity_uses_runtime_criteria(monkeypatch):
+    monkeypatch.setattr(artifacts, "_flashinfer_version", lambda: "0.6.12")
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm100")
+    monkeypatch.setattr(artifacts.torch.version, "cuda", "13.0")
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(model_name="test/model"),
+    )
+
+    identity = artifacts._artifact_identity(
+        ctx,
+        p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+    )
+
+    assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE
+    assert identity.model_name == "test/model"
+    assert identity.torch_version == artifacts.torch.__version__
+    assert identity.cuda_version == "13.0"
+    assert identity.gpu_arch == "sm100"
+    assert identity.extra_parameters["flashinfer_version"] == "0.6.12"
+
+
 def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm-cache"))
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
     monkeypatch.delenv("DG_JIT_CACHE_DIR", raising=False)
     monkeypatch.delenv("DEEP_GEMM_CACHE_DIR", raising=False)
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tilelang-cache"))
+    monkeypatch.setenv("CUTE_DSL_CACHE_DIR", str(tmp_path / "cute-dsl-cache"))
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "flashinfer"))
     monkeypatch.setenv("MX_ARTIFACT_BUNDLE_ROOT", str(tmp_path / "bundles"))
     monkeypatch.setattr(artifacts, "_vllm_version", lambda: "0.17.1")
     monkeypatch.setattr(artifacts, "_triton_key", lambda: "triton-key")
@@ -254,6 +329,24 @@ def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tm
             Path(tmp_path / "vllm-cache" / "deep_gemm"),
             Path(tmp_path / "bundles" / "rank-1" / "deep_gemm_cache"),
         ),
+        (
+            "tilelang_cache",
+            p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            Path(tmp_path / "tilelang-cache"),
+            Path(tmp_path / "bundles" / "rank-1" / "tilelang_cache"),
+        ),
+        (
+            "cute_dsl_cache",
+            p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+            Path(tmp_path / "cute-dsl-cache"),
+            Path(tmp_path / "bundles" / "rank-1" / "cute_dsl_cache"),
+        ),
+        (
+            "flashinfer_cache",
+            p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+            Path(tmp_path / "flashinfer" / ".cache" / "flashinfer"),
+            Path(tmp_path / "bundles" / "rank-1" / "flashinfer_cache"),
+        ),
     ]
 
 
@@ -263,6 +356,37 @@ def test_deep_gemm_cache_root_honors_dg_jit_cache_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("DG_JIT_CACHE_DIR", str(tmp_path / "deep-gemm-cache"))
 
     assert artifacts._deep_gemm_cache_root() == tmp_path / "deep-gemm-cache"
+
+
+def test_tilelang_cache_root_uses_tilelang_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tilelang-cache"))
+
+    assert artifacts._tilelang_cache_root() == tmp_path / "tilelang-cache"
+
+
+def test_cute_dsl_cache_root_uses_cute_dsl_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("CUTE_DSL_CACHE_DIR", str(tmp_path / "cute-dsl-cache"))
+
+    assert artifacts._cute_dsl_cache_root() == tmp_path / "cute-dsl-cache"
+
+
+@pytest.mark.parametrize("error", [KeyError(), OSError()])
+def test_cute_dsl_cache_root_falls_back_to_uid(monkeypatch, error):
+    monkeypatch.delenv("CUTE_DSL_CACHE_DIR", raising=False)
+    monkeypatch.setattr(artifacts, "getuser", MagicMock(side_effect=error))
+    monkeypatch.setattr(artifacts.os, "getuid", lambda: 12345)
+
+    assert artifacts._cute_dsl_cache_root() == (
+        Path(artifacts.tempfile.gettempdir()) / "12345" / "cutlass_python_cache"
+    )
+
+
+def test_flashinfer_cache_root_uses_workspace_base(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "flashinfer"))
+
+    assert artifacts._flashinfer_cache_root() == (
+        tmp_path / "flashinfer" / ".cache" / "flashinfer"
+    )
 
 
 def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
