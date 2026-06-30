@@ -10,7 +10,7 @@
 
 use modelexpress_client::{Client, ClientConfig};
 use modelexpress_common::download;
-use modelexpress_common::models::ModelProvider;
+use modelexpress_common::models::{ModelProvider, WeightFormat};
 use std::env;
 use std::time::{Duration, Instant};
 use tracing::{error, info};
@@ -101,7 +101,12 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         info!("Client 1: Requesting model {model_name1}");
         let start = Instant::now();
         client1
-            .request_model(model_name1, ModelProvider::default(), false)
+            .request_model(
+                model_name1,
+                ModelProvider::default(),
+                false,
+                WeightFormat::default(),
+            )
             .await
             .expect("Client 1 failed to download model");
         info!("Client 1: Model downloaded in {:?}", start.elapsed());
@@ -117,7 +122,12 @@ async fn run_concurrent_model_test(model_name: &str) -> Result<(), Box<dyn std::
         info!("Client 2: Requesting model {model_name2}");
         let start = Instant::now();
         client2
-            .request_model(model_name2, ModelProvider::default(), false)
+            .request_model(
+                model_name2,
+                ModelProvider::default(),
+                false,
+                WeightFormat::default(),
+            )
             .await
             .expect("Client 2 failed to download model");
         info!("Client 2: Model downloaded in {:?}", start.elapsed());
@@ -142,7 +152,12 @@ async fn run_single_model_test(model_name: &str) -> Result<(), Box<dyn std::erro
     let start = Instant::now();
 
     match client
-        .request_model(model_name.to_string(), ModelProvider::default(), false)
+        .request_model(
+            model_name.to_string(),
+            ModelProvider::default(),
+            false,
+            WeightFormat::default(),
+        )
         .await
     {
         Ok(()) => {
@@ -167,7 +182,12 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
 
     // This should work via server since it's running
     match client
-        .request_model(model_name, ModelProvider::HuggingFace, false)
+        .request_model(
+            model_name,
+            ModelProvider::HuggingFace,
+            false,
+            WeightFormat::default(),
+        )
         .await
     {
         Ok(()) => {
@@ -190,6 +210,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         ModelProvider::HuggingFace,
         Some(ClientConfig::default().cache.local_path.clone()),
         false,
+        WeightFormat::default(),
     )
     .await
     {
@@ -209,6 +230,7 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
         ModelProvider::HuggingFace,
         ClientConfig::default(),
         false,
+        WeightFormat::default(),
     )
     .await
     {

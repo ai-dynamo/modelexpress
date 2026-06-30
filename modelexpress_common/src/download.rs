@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::models::ModelProvider;
+use crate::models::{ModelProvider, WeightFormat};
 use crate::providers::{GcsProvider, HuggingFaceProvider, ModelProviderTrait, NgcProvider};
 use anyhow::Result;
 use std::path::PathBuf;
@@ -28,12 +28,14 @@ pub async fn download_model(
     provider: ModelProvider,
     cache_dir: Option<PathBuf>,
     ignore_weights: bool,
+    weight_format: WeightFormat,
 ) -> Result<PathBuf> {
     let provider_impl = get_provider(provider);
     info!(
-        "Downloading model '{}' using provider: {}",
+        "Downloading model '{}' using provider: {} (weight_format: {})",
         model_name,
-        provider_impl.provider_name()
+        provider_impl.provider_name(),
+        weight_format,
     );
 
     if ignore_weights {
@@ -41,7 +43,7 @@ pub async fn download_model(
     }
 
     provider_impl
-        .download_model(model_name, cache_dir, ignore_weights)
+        .download_model(model_name, cache_dir, ignore_weights, weight_format)
         .await
 }
 
@@ -65,6 +67,7 @@ mod tests {
             _model_name: &str,
             _cache_dir: Option<PathBuf>,
             _ignore_weights: bool,
+            _weight_format: WeightFormat,
         ) -> Result<PathBuf> {
             if self.should_succeed {
                 Ok(self.return_path.clone())
@@ -137,7 +140,12 @@ mod tests {
         };
 
         let result = mock_provider
-            .download_model("test-model", Some(temp_dir.path().to_path_buf()), false)
+            .download_model(
+                "test-model",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                WeightFormat::default(),
+            )
             .await;
         assert!(result.is_ok());
         assert_eq!(result.expect("Expected successful result"), temp_dir.path());
@@ -152,7 +160,12 @@ mod tests {
         };
 
         let result = mock_provider
-            .download_model("test-model", Some(temp_dir.path().to_path_buf()), false)
+            .download_model(
+                "test-model",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                WeightFormat::default(),
+            )
             .await;
         assert!(result.is_err());
         assert!(
@@ -175,6 +188,7 @@ mod tests {
                 _model_name: &str,
                 _cache_dir: Option<PathBuf>,
                 _ignore_weights: bool,
+                _weight_format: WeightFormat,
             ) -> Result<PathBuf> {
                 Ok(PathBuf::from("/tmp"))
             }
@@ -205,9 +219,12 @@ mod tests {
 
         // Test default is_ignored behavior - explicit files
         assert!(DefaultProvider::is_ignored("README.md"));
+        assert!(DefaultProvider::is_ignored("LICENSE"));
+        assert!(DefaultProvider::is_ignored("LICENSE.md"));
+        assert!(DefaultProvider::is_ignored("LICENSE.txt"));
+        assert!(DefaultProvider::is_ignored("NOTICE"));
 
         // Test default is_ignored behavior - regular files
-        assert!(!DefaultProvider::is_ignored("LICENSE"));
         assert!(!DefaultProvider::is_ignored("model.bin"));
         assert!(!DefaultProvider::is_ignored("config.json"));
 
