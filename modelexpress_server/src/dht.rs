@@ -33,10 +33,10 @@ use std::time::Duration;
 use libp2p::{
     PeerId, StreamProtocol, SwarmBuilder,
     futures::StreamExt,
-    identify, identity, kad, mdns,
+    identify, identity, kad,
     multiaddr::{Multiaddr, Protocol},
     noise,
-    swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
+    swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
 use tokio::net::lookup_host;
@@ -53,7 +53,6 @@ const LISTEN_READY_TIMEOUT: Duration = Duration::from_secs(5);
 struct MxBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     identify: identify::Behaviour,
-    mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,14 +131,6 @@ impl DhtNode {
         let local_peer_id = PeerId::from(local_key.public());
         info!("DhtNode: local peer_id={local_peer_id}");
 
-        // Mirror kademlite: auto-disable mDNS when explicit bootstrap is
-        // configured. Otherwise mDNS announces on 224.0.0.251:5353 in
-        // every cluster and leaks discovery across the boundaries the
-        // bootstrap layer is enforcing (e.g. K8s namespaces).
-        let has_bootstrap = !config.bootstrap_peers.is_empty()
-            || config.bootstrap_dns.is_some()
-            || config.bootstrap_slurm.is_some();
-
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
@@ -158,20 +149,7 @@ impl DhtNode {
                     key.public(),
                 ));
 
-                let mdns: Toggle<mdns::tokio::Behaviour> = if has_bootstrap {
-                    Toggle::from(None)
-                } else {
-                    Toggle::from(Some(mdns::tokio::Behaviour::new(
-                        mdns::Config::default(),
-                        local_peer_id,
-                    )?))
-                };
-
-                Ok(MxBehaviour {
-                    kademlia,
-                    identify,
-                    mdns,
-                })
+                Ok(MxBehaviour { kademlia, identify })
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
@@ -317,12 +295,6 @@ fn handle_swarm_event(swarm: &mut libp2p::Swarm<MxBehaviour>, event: SwarmEvent<
                 if addr_is_routable(&addr) {
                     swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                 }
-            }
-        }
-        SwarmEvent::Behaviour(MxBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-            for (peer_id, addr) in peers {
-                debug!("DhtNode: mDNS discovered peer={peer_id} addr={addr}");
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
             }
         }
         SwarmEvent::Behaviour(MxBehaviourEvent::Kademlia(
