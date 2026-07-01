@@ -104,14 +104,20 @@ impl BackendConfig {
             return Ok(url);
         }
         let host = modelexpress_common::envs::redis_host().ok_or_else(|| {
-            "MX_METADATA_BACKEND=redis requires REDIS_URL or MX_REDIS_HOST (alias \
-             REDIS_HOST) to be set."
-                .to_string()
+            format!(
+                "MX_METADATA_BACKEND=redis requires {} or {} (alias {}) to be set.",
+                modelexpress_common::envs::REDIS_URL,
+                modelexpress_common::envs::MX_REDIS_HOST,
+                modelexpress_common::envs::REDIS_HOST,
+            )
         })?;
         let port = modelexpress_common::envs::redis_port().ok_or_else(|| {
-            "MX_METADATA_BACKEND=redis requires REDIS_URL or MX_REDIS_PORT (alias \
-             REDIS_PORT) to be set."
-                .to_string()
+            format!(
+                "MX_METADATA_BACKEND=redis requires {} or {} (alias {}) to be set.",
+                modelexpress_common::envs::REDIS_URL,
+                modelexpress_common::envs::MX_REDIS_PORT,
+                modelexpress_common::envs::REDIS_PORT,
+            )
         })?;
         Ok(format!("redis://{host}:{port}"))
     }
@@ -122,9 +128,11 @@ impl BackendConfig {
     /// can't silently land ModelCacheEntry CRs in the `default` namespace.
     fn k8s_namespace_from_env() -> Result<String, String> {
         modelexpress_common::envs::metadata_namespace().ok_or_else(|| {
-            "MX_METADATA_BACKEND=kubernetes requires MX_METADATA_NAMESPACE or \
-             POD_NAMESPACE to be set."
-                .to_string()
+            format!(
+                "MX_METADATA_BACKEND=kubernetes requires {} or {} to be set.",
+                modelexpress_common::envs::MX_METADATA_NAMESPACE,
+                modelexpress_common::envs::POD_NAMESPACE,
+            )
         })
     }
 }

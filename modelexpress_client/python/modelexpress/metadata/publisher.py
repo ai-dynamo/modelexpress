@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("modelexpress.metadata.publisher")
 
-PUBLISH_TIMEOUT_SECS_DEFAULT = 30 * 60
-
 
 class PublisherThread:
     """Background thread that publishes a source and keeps it READY.

@@ -16,7 +16,7 @@ ModelExpress uses a layered configuration system. Sources are applied in order o
 3. **Configuration file** (YAML)
 4. **Default values** (lowest priority)
 
-> Every environment variable the code reads — its name, default, and fallback chain — is defined in one place per language: `modelexpress_common/src/envs.rs` (Rust server/client) and `modelexpress_client/python/modelexpress/envs.py` (Python client). Treat those modules as the canonical inventory; the tables below mirror them.
+> Most environment variables the code reads — including their defaults and fallback chains — are defined in one place per language: `modelexpress_common/src/envs.rs` (Rust server/client) and `modelexpress_client/python/modelexpress/envs.py` (Python client). Treat those modules as the canonical inventory; the tables below mirror them, and the documented exceptions are called out where needed.
 
 ### Generating a Configuration File
 
