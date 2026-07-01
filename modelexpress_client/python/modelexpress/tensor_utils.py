@@ -44,7 +44,7 @@ def safe_checksum(tensor: torch.Tensor) -> str:
 
 
 @contextmanager
-def capture_tensor_attrs(accelerator_backend: AcceleratorBackend | None = None):
+def capture_tensor_attrs(accelerator_backend: AcceleratorBackend):
     """Intercept bare accelerator tensor assignments during post-load processing.
 
     vLLM's post-processing (quant methods, attention backends) may create
@@ -56,13 +56,12 @@ def capture_tensor_attrs(accelerator_backend: AcceleratorBackend | None = None):
     tensors to non-persistent buffers, making them discoverable by
     named_buffers() and thus included in the manifest.
     """
-    backend = _resolve_accelerator_backend(accelerator_backend)
     original_setattr = nn.Module.__setattr__
 
     def capturing_setattr(self, name, value):
         if (isinstance(value, torch.Tensor)
                 and not isinstance(value, nn.Parameter)
-                and backend.is_accel_tensor(value)
+                and accelerator_backend.is_accel_tensor(value)
                 and name not in self._parameters
                 and name not in self._buffers
                 and name not in self._modules):
@@ -89,7 +88,7 @@ def capture_tensor_attrs(accelerator_backend: AcceleratorBackend | None = None):
 def _find_hidden_accel_tensors(
     obj: object,
     visited: set[int],
-    accelerator_backend: AcceleratorBackend | None = None,
+    accelerator_backend: AcceleratorBackend,
     depth: int = 0,
 ) -> list[tuple[str, torch.Tensor]]:
     """Recursively find accelerator tensors in a non-Module Python object graph.
@@ -99,7 +98,6 @@ def _find_hidden_accel_tensors(
     upstream adoption would silently cause hidden tensors to be missed —
     which is exactly the bug class this function exists to fix.
     """
-    backend = _resolve_accelerator_backend(accelerator_backend)
     if depth > 20 or id(obj) in visited:
         return []
     visited.add(id(obj))
@@ -108,14 +106,14 @@ def _find_hidden_accel_tensors(
 
     if isinstance(obj, torch.Tensor):
         tensor = cast(torch.Tensor, obj)
-        if backend.is_accel_tensor(tensor) and tensor.numel() > 0:
+        if accelerator_backend.is_accel_tensor(tensor) and tensor.numel() > 0:
             results.append(("t", tensor))
     elif isinstance(obj, (list, tuple)):
         for i, item in enumerate(obj):
             for path, tensor in _find_hidden_accel_tensors(
                 item,
                 visited,
-                backend,
+                accelerator_backend,
                 depth + 1,
             ):
                 results.append((f"{i}_{path}", tensor))
@@ -124,7 +122,7 @@ def _find_hidden_accel_tensors(
             for path, tensor in _find_hidden_accel_tensors(
                 v,
                 visited,
-                backend,
+                accelerator_backend,
                 depth + 1,
             ):
                 results.append((f"{k}_{path}", tensor))
@@ -135,7 +133,7 @@ def _find_hidden_accel_tensors(
             for path, tensor in _find_hidden_accel_tensors(
                 attr_val,
                 visited,
-                backend,
+                accelerator_backend,
                 depth + 1,
             ):
                 results.append((f"{attr_name}_{path}", tensor))

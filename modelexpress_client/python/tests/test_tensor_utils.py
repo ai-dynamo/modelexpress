@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 
+from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
     adopt_hidden_tensors,
@@ -74,8 +75,10 @@ class ModuleWithNested(nn.Module):
 class TestFindHiddenAccelTensors:
     def test_default_cuda_backend_ignores_cpu_tensor(self):
         config = QuantConfig(device="cpu")
-        # Default CUDA backend: CPU tensors must be ignored.
-        results = _find_hidden_accel_tensors(config, visited=set())
+        # CUDA backend: CPU tensors must be ignored.
+        results = _find_hidden_accel_tensors(
+            config, visited=set(), accelerator_backend=CudaAcceleratorBackend()
+        )
         assert len(results) == 0
 
     def test_finds_backend_tensor_on_plain_object(self, mock_accelerator_backend_cls):
@@ -92,9 +95,11 @@ class TestFindHiddenAccelTensors:
 
     def test_skips_non_tensor_attrs(self):
         config = QuantConfig(device="cpu")
-        # Default CUDA backend: CPU tensors must be ignored.
-        results = _find_hidden_accel_tensors(config, visited=set())
-        # CPU tensors are not CUDA by default; ints and strings are not tensors.
+        # CUDA backend: CPU tensors must be ignored.
+        results = _find_hidden_accel_tensors(
+            config, visited=set(), accelerator_backend=CudaAcceleratorBackend()
+        )
+        # CPU tensors are not CUDA; ints and strings are not tensors.
         # Nothing should be found.
         assert len(results) == 0
 
@@ -104,8 +109,10 @@ class TestFindHiddenAccelTensors:
 
         obj = Circular()
         obj.self_ref = obj
-        # Default CUDA backend: this no-op CPU object graph must stay ignored.
-        results = _find_hidden_accel_tensors(obj, visited=set())
+        # CUDA backend: this no-op CPU object graph must stay ignored.
+        results = _find_hidden_accel_tensors(
+            obj, visited=set(), accelerator_backend=CudaAcceleratorBackend()
+        )
         assert len(results) == 0
 
     def test_respects_depth_limit(self, mock_accelerator_backend_cls):
@@ -218,7 +225,7 @@ class TestCaptureTensorAttrs:
     def test_does_not_promote_parameter(self):
         module = nn.Module()
         param = nn.Parameter(torch.randn(4))
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(CudaAcceleratorBackend()):
             module.my_param = param
 
         assert "my_param" in dict(module.named_parameters())
@@ -226,14 +233,14 @@ class TestCaptureTensorAttrs:
 
     def test_does_not_promote_cpu_tensor(self):
         module = nn.Module()
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(CudaAcceleratorBackend()):
             module.cpu_tensor = torch.randn(4)
 
         assert "cpu_tensor" not in dict(module.named_buffers())
 
     def test_restores_setattr_after_exit(self):
         original = nn.Module.__setattr__
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(CudaAcceleratorBackend()):
             assert nn.Module.__setattr__ is not original
         assert nn.Module.__setattr__ is original
 
