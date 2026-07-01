@@ -27,11 +27,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import random
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
-from . import p2p_pb2
+from . import envs, p2p_pb2
 
 if TYPE_CHECKING:
     from .load_strategy.context import LoadContext
@@ -195,7 +194,7 @@ def get_selector(name: str) -> SourceSelector:
 
 def get_configured_selector() -> SourceSelector:
     """Resolve the selector named by ``MX_P2P_SOURCE_SELECTOR`` (default random)."""
-    return get_selector(os.environ.get(ENV_SELECTOR, DEFAULT_SELECTOR))
+    return get_selector(envs.MX_P2P_SOURCE_SELECTOR or DEFAULT_SELECTOR)
 
 
 def configured_policy_label() -> str:

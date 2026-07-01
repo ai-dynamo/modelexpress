@@ -25,18 +25,17 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
+
+from . import envs
 
 logger = logging.getLogger("modelexpress.metrics")
 
+# Env-var name kept for callers/tests; values are read via ``envs``.
 ENV_ENABLED = "MX_METRICS_ENABLED"
-ENV_PORT = "MX_METRICS_PORT"
-ENV_PUSHGATEWAY = "MX_METRICS_PUSHGATEWAY"
-ENV_SCHEME = "MX_METRICS_SCHEME"
 
 
 def _enabled() -> bool:
-    return os.environ.get(ENV_ENABLED, "0") in ("1", "true", "True")
+    return envs.MX_METRICS_ENABLED
 
 
 class MetricsCollector:
@@ -53,7 +52,7 @@ class MetricsCollector:
         self._init_attempted = False
         self._server_started = False
         self._atexit_registered = False
-        self.scheme = os.environ.get(ENV_SCHEME, "")
+        self.scheme = envs.MX_METRICS_SCHEME
 
     def _ensure(self) -> bool:
         if self._ready:
@@ -119,7 +118,7 @@ class MetricsCollector:
         if self._server_started:
             return
         self._server_started = True
-        port = os.environ.get(ENV_PORT)
+        port = envs.MX_METRICS_PORT
         if not port:
             return
         try:
@@ -186,7 +185,7 @@ def push_metrics_if_enabled(job: str = "modelexpress") -> None:
     """
     if not _enabled():
         return
-    gateway = os.environ.get(ENV_PUSHGATEWAY)
+    gateway = envs.MX_METRICS_PUSHGATEWAY
     if not gateway:
         return
     try:
