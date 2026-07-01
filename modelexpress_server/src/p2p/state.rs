@@ -309,6 +309,7 @@ mod tests {
                 total_size: 1024,
                 file_count: 2,
                 chunk_count: 4,
+                node_rank: 0,
             })),
             ..Default::default()
         };

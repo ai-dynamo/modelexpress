@@ -254,6 +254,8 @@ struct ArtifactSourceMetadataJson {
     pub total_size: u64,
     pub file_count: u32,
     pub chunk_count: u32,
+    #[serde(default)]
+    pub node_rank: u32,
 }
 
 impl WorkerRecordJson {
@@ -311,6 +313,7 @@ impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadataJson {
             total_size: record.total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
+            node_rank: record.node_rank,
         }
     }
 }
@@ -322,6 +325,7 @@ impl From<ArtifactSourceMetadataJson> for ArtifactSourceMetadataRecord {
             total_size: json.total_size,
             file_count: json.file_count,
             chunk_count: json.chunk_count,
+            node_rank: json.node_rank,
         }
     }
 }
@@ -723,6 +727,7 @@ mod tests {
                 total_size: 1_099_511_627_776,
                 file_count: 7,
                 chunk_count: 128,
+                node_rank: 2,
             }),
         };
 
