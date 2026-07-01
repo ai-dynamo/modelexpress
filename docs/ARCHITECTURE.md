@@ -771,6 +771,8 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_DHT_BOOTSTRAP_PEERS` | (none) | `dht` comma-separated libp2p multiaddrs to dial for initial peers |
 | `MX_DHT_BOOTSTRAP_DNS` | (none) | `dht` headless Service DNS resolving to peer IPs; each dialed at `MX_DHT_BOOTSTRAP_PORT` |
 | `MX_DHT_BOOTSTRAP_SLURM` | `SLURM_JOB_NODELIST` | `dht` Slurm hostlist to expand and dial; auto-detected from the Slurm environment when unset |
+| `MX_DHT_BOOTSTRAP_LEASES` | (none) | `dht` anchor Lease name-prefix; presence enables self-organizing lease bootstrap - workers elect an anchor quorum via `coordination.k8s.io` Leases (no dedicated pods; needs Lease RBAC + `POD_IP`) |
+| `MX_DHT_LEASE_NAMESPACE` | (none) | `dht` override for the auto-detected in-cluster namespace of the anchor Leases |
 | `MX_DHT_BOOTSTRAP_PORT` | `4001` | `dht` port at which DNS- and Slurm-resolved peers are dialed |
 | `MX_DHT_RECORD_TTL` | `86400` | `dht` record republish interval / TTL in seconds |
 | `MX_DHT_GET_RETRIES` | `5` | `dht` GET retries before a lookup fails; tune up for large cold-start fan-in |

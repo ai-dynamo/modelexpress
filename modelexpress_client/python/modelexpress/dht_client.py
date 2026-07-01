@@ -13,6 +13,11 @@ full tensor manifest stays on the worker, served via
 
 Bootstrap mechanisms (in priority order):
 
+- ``MX_DHT_BOOTSTRAP_LEASES``: K8s Lease-based self-organizing anchor
+  quorum (the value is the anchor Lease name-prefix). Workers elect a
+  small set of bootstrap anchors among themselves via
+  ``coordination.k8s.io`` Leases - no dedicated seed pods. Requires
+  RBAC to get/update Leases and ``POD_IP`` from the downward API.
 - ``MX_DHT_BOOTSTRAP_PEERS``: comma-separated libp2p multiaddrs
   (e.g. ``/ip4/10.0.0.1/tcp/4001/p2p/Qm...``).
 - ``MX_DHT_BOOTSTRAP_DNS``: K8s headless Service hostname; resolves
@@ -61,6 +66,7 @@ from .metadata.source_id import compute_mx_source_id
 
 if TYPE_CHECKING:
     from kademlite import DhtNode
+    from kademlite.k8s_lease import LeaseCoordinator
 
 logger = logging.getLogger("modelexpress.dht_client")
 
@@ -73,6 +79,16 @@ _LOOP_START_TIMEOUT = 10.0
 _NODE_START_TIMEOUT = 30.0
 _NODE_STOP_TIMEOUT = 10.0
 _GET_TENSOR_MANIFEST_TIMEOUT = 30.0
+
+# K8s Lease-based self-organizing anchor bootstrap (MX_DHT_BOOTSTRAP_LEASES).
+# A fixed set of Lease slots elects a small anchor quorum from the workers
+# themselves - no dedicated seed pods. Slot count is locked at 8 (a node maps
+# to a slot by the low 3 bits of its peer_id); the anchor quorum converges
+# among itself before workers join, which breaks the large-N cold-start stall.
+_DHT_LEASE_SLOTS = 8
+_DHT_LEASE_TTL_SECONDS = 15
+_DHT_LEASE_RENEW_INTERVAL = 5.0
+_DHT_LEASE_GATE_TIMEOUT = 60.0
 
 
 def _key_for(mx_source_id: str, worker_rank: int) -> bytes:
@@ -123,6 +139,8 @@ class MxDhtClient(MxClientBase):
         bootstrap_peers: list[str] | None = None,
         bootstrap_dns: str | None = None,
         bootstrap_slurm: str | None = None,
+        bootstrap_leases: str | None = None,
+        lease_namespace: str | None = None,
         bootstrap_port: int | None = None,
         record_ttl_seconds: float | None = None,
         max_retries: int | None = None,
@@ -161,6 +179,22 @@ class MxDhtClient(MxClientBase):
             or None
         )
 
+        # K8s Lease-based self-organizing bootstrap: the value of
+        # MX_DHT_BOOTSTRAP_LEASES is the anchor Lease name-prefix, and its
+        # presence enables anchor election over coordination.k8s.io Leases -
+        # no dedicated seed pods. Namespace is auto-detected from the
+        # in-cluster service account unless MX_DHT_LEASE_NAMESPACE overrides.
+        self._bootstrap_leases = (
+            bootstrap_leases
+            or os.environ.get("MX_DHT_BOOTSTRAP_LEASES", "").strip()
+            or None
+        )
+        self._lease_namespace = (
+            lease_namespace
+            or os.environ.get("MX_DHT_LEASE_NAMESPACE", "").strip()
+            or None
+        )
+
         env_port = os.environ.get("MX_DHT_BOOTSTRAP_PORT", "")
         self._bootstrap_port = (
             bootstrap_port if bootstrap_port is not None
@@ -190,6 +224,7 @@ class MxDhtClient(MxClientBase):
         )
 
         self._node: DhtNode | None = None
+        self._lease_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._started = threading.Event()
@@ -270,7 +305,8 @@ class MxDhtClient(MxClientBase):
         # flag ourselves or mDNS leaks discovery across the boundaries
         # the bootstrap layer is enforcing (e.g. K8s namespaces).
         has_explicit_bootstrap = bool(
-            self._bootstrap_peers
+            self._bootstrap_leases
+            or self._bootstrap_peers
             or self._bootstrap_dns
             or self._bootstrap_slurm
         )
@@ -284,9 +320,11 @@ class MxDhtClient(MxClientBase):
             listen[0], listen[1], self._node.peer_id_short,
         )
 
-        # Bootstrap priority: explicit peers > DNS > Slurm > mDNS auto.
+        # Bootstrap priority: Leases > explicit peers > DNS > Slurm > mDNS.
         try:
-            if self._bootstrap_peers:
+            if self._bootstrap_leases:
+                await self._bootstrap_via_leases()
+            elif self._bootstrap_peers:
                 logger.info(
                     "MxDhtClient: bootstrapping from %d peer multiaddrs",
                     len(self._bootstrap_peers),
@@ -321,7 +359,143 @@ class MxDhtClient(MxClientBase):
                 "republish", exc,
             )
 
+    def _advertise_host(self, listen_host: str) -> str | None:
+        """Return the dialable host other pods use to reach this node.
+
+        Anchors listen on 0.0.0.0, so the multiaddr published into a Lease
+        must carry a routable address. Prefer POD_IP (injected via the k8s
+        downward API), then a non-wildcard listen host.
+        """
+        pod_ip = os.environ.get("POD_IP", "").strip()
+        if pod_ip:
+            return pod_ip
+        if listen_host and listen_host not in ("0.0.0.0", "::", ""):
+            return listen_host
+        return None
+
+    async def _bootstrap_via_leases(self) -> None:
+        """Self-organizing anchor bootstrap over K8s Leases.
+
+        A fixed set of Lease slots elects a small anchor quorum from the
+        workers themselves - no dedicated seed pods. This node maps to one
+        slot by its peer_id and contests that slot's Lease: winners become
+        anchors (converge with the other anchors, then publish converged);
+        losers gate on quorum convergence, then bootstrap to the anchor set.
+        The anchor quorum converging before workers join is what breaks the
+        large-N simultaneous cold-start stall.
+        """
+        from kademlite.k8s_lease import LeaseCoordinator
+        from kademlite.multiaddr import (
+            encode_multiaddr_ip_tcp_p2p,
+            multiaddr_to_string,
+        )
+
+        node = self._node
+        listen = node.listen_addr or self._parse_listen(self._listen_addr)
+        advertise_host = self._advertise_host(listen[0])
+        if advertise_host is None:
+            logger.error(
+                "MxDhtClient: MX_DHT_BOOTSTRAP_LEASES set but no advertisable "
+                "address (set POD_IP via the downward API); skipping lease "
+                "bootstrap - node stays up and may join via later republish",
+            )
+            return
+
+        try:
+            coordinator = LeaseCoordinator(
+                name_prefix=self._bootstrap_leases,
+                num_slots=_DHT_LEASE_SLOTS,
+                ttl_seconds=_DHT_LEASE_TTL_SECONDS,
+                namespace=self._lease_namespace,
+            )
+        except ValueError as exc:
+            logger.error(
+                "MxDhtClient: lease coordinator init failed (%s); skipping "
+                "lease bootstrap", exc,
+            )
+            return
+
+        my_multiaddr = multiaddr_to_string(
+            encode_multiaddr_ip_tcp_p2p(advertise_host, listen[1], node.peer_id)
+        )
+        holder = node.peer_id.hex()
+        slot = coordinator.slot_for(node.peer_id)
+
+        won = await coordinator.claim(slot, holder, my_multiaddr)
+        if won:
+            logger.info(
+                "MxDhtClient: won anchor slot %d (%s); converging quorum",
+                slot, my_multiaddr,
+            )
+            # Dial whichever peer anchors are already up, then flag this
+            # anchor converged so gated workers can begin joining.
+            await self._bootstrap_to_anchors(coordinator, my_multiaddr)
+            await coordinator.renew(slot, holder, my_multiaddr, converged=True)
+            self._lease_task = asyncio.create_task(
+                self._renew_lease_loop(coordinator, slot, holder, my_multiaddr)
+            )
+        else:
+            logger.info(
+                "MxDhtClient: not anchor for slot %d; awaiting quorum "
+                "convergence (<=%ss)", slot, _DHT_LEASE_GATE_TIMEOUT,
+            )
+            converged = await coordinator.wait_all_converged(
+                _DHT_LEASE_GATE_TIMEOUT
+            )
+            if not converged:
+                logger.warning(
+                    "MxDhtClient: anchor quorum not fully converged within "
+                    "%ss; joining against whatever anchors are available",
+                    _DHT_LEASE_GATE_TIMEOUT,
+                )
+            await self._bootstrap_to_anchors(coordinator, my_multiaddr)
+
+    async def _bootstrap_to_anchors(
+        self, coordinator: "LeaseCoordinator", my_multiaddr: str,
+    ) -> None:
+        """Bootstrap this node against the current anchor multiaddr set."""
+        anchors = await coordinator.anchor_multiaddrs()
+        peers = [a for a in anchors if a and a != my_multiaddr]
+        if not peers:
+            logger.warning(
+                "MxDhtClient: no anchor multiaddrs available to bootstrap "
+                "against yet",
+            )
+            return
+        logger.info("MxDhtClient: bootstrapping to %d anchor(s)", len(peers))
+        await self._node.bootstrap(peers)
+
+    async def _renew_lease_loop(
+        self,
+        coordinator: "LeaseCoordinator",
+        slot: int,
+        holder: str,
+        my_multiaddr: str,
+    ) -> None:
+        """Keep this anchor's Lease held and flagged converged until stopped."""
+        try:
+            while True:
+                await asyncio.sleep(_DHT_LEASE_RENEW_INTERVAL)
+                ok = await coordinator.renew(
+                    slot, holder, my_multiaddr, converged=True,
+                )
+                if not ok:
+                    logger.warning(
+                        "MxDhtClient: lost anchor lease slot %d; stopping "
+                        "renew loop", slot,
+                    )
+                    return
+        except asyncio.CancelledError:
+            return
+
     async def _stop_node(self) -> None:
+        if self._lease_task is not None:
+            self._lease_task.cancel()
+            try:
+                await self._lease_task
+            except asyncio.CancelledError:
+                pass
+            self._lease_task = None
         if self._node is not None:
             await self._node.stop()
 

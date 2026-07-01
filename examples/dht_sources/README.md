@@ -4,42 +4,60 @@ Concrete TP=2 manifests for deploying the `dht` metadata backend - workers disco
 
 For design rationale, backend-selection guidance, and trade-offs, see [`docs/DHT_BACKEND.md`](../../docs/DHT_BACKEND.md). For the generic deployment how-to (env vars, kubectl operations), see [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md#p2p-gpu-weight-transfers).
 
+The DHT backend is **serverless**: there is no central `modelexpress-server` in the path. A joining node still needs at least one existing peer to find the rest of the mesh, so this example presents two ways to provide that pre-converged anchor set. Both avoid the cold-start stall where a large batch of workers boots simultaneously with no established peer to bootstrap against.
+
 ## Limitations
 
-This backend is for **stable-weight inference only**. Weights loaded at pod startup don't change for the lifetime of the pod, and each rank has exactly one publisher. If your workload is RL rollouts, live fine-tune broadcasts, mixed-revision serving under load, or anything needing per-worker addressability, use the central-coordinator backends (`redis` or `kubernetes`) instead. Full details in [`DHT_BACKEND.md`](../../docs/DHT_BACKEND.md#limitations).
+This backend is for **stable-weight inference only**. Weights loaded at pod startup don't change for the lifetime of the pod, and each rank has exactly one publisher (one-publisher-per-(source, rank)). If your workload is RL rollouts, live fine-tune broadcasts, mixed-revision serving under load, or anything needing per-worker addressability, use the central-coordinator backends (`redis` or `kubernetes`) instead. Full details in [`DHT_BACKEND.md`](../../docs/DHT_BACKEND.md#limitations).
+
+## Two bootstrap options
+
+Both options give the mesh a pre-converged anchor set. The difference is a single tradeoff axis: **RBAC vs pods.**
+
+| Option | Extra pods | RBAC | Downward API | Best when |
+|--------|-----------|------|--------------|-----------|
+| A - K8s Leases | None | Workers need get/list/watch/create/update/patch on `coordination.k8s.io` Leases | `POD_IP` from the downward API | You would rather grant a narrow RBAC role than run standing pods. |
+| B - Seed quorum | A few GPU-free seed pods | None | None | You would rather run a few cheap pods than grant Lease RBAC. |
+
+- **Option A (self-organizing Leases):** the anchor quorum self-elects over `coordination.k8s.io` Leases named with the `MX_DHT_BOOTSTRAP_LEASES` prefix. There are no dedicated anchor pods - the workers themselves take the anchor Leases, and whichever hold them publish their `POD_IP` for joiners to dial. The cost is that the workers need get/update RBAC on Leases plus `POD_IP` from the downward API.
+- **Option B (dedicated seed quorum):** a handful of long-lived, GPU-free seed pods join the mesh as participation-only bootstrap peers (they publish no records of their own). The cost is running those seed pods; the benefit is that no RBAC is required on the workers.
+
+Common to both: bootstrap is the only difference. The DHT env on every worker is identical (`MX_METADATA_BACKEND=dht`, `MX_DHT_LISTEN=0.0.0.0:4001`, and the P2P data-path ports). One publisher per (source, rank). Replication factor `K` defaults to a floor of 20, the recommended Kademlia bucket size; leave it unless you have a measured reason to change it (see [`DHT_BACKEND.md`](../../docs/DHT_BACKEND.md#replication-factor-k)).
 
 ## Files
 
-- [`sources-tp2.yaml`](sources-tp2.yaml) - A headless Service that anchors worker-to-worker bootstrap, plus a TP=2 source Deployment (one pod, two GPUs, `--tensor-parallel-size=2`). The pod's two ranks publish `/mx/{mx_source_id}/rank/0` and `/mx/{mx_source_id}/rank/1` into the mesh.
-- [`target.yaml`](target.yaml) - A TP=2 target Deployment that joins the same mesh, resolves the publisher for each rank with a DHT GET, and pulls weights over NIXL.
+Option A (top level):
 
-## How bootstrap works (no central infrastructure)
+- [`sources-tp2.yaml`](sources-tp2.yaml) - TP=2 source Deployment (one pod, two GPUs, `--tensor-parallel-size=2`) with the Lease bootstrap env and `serviceAccountName: mx-dht`.
+- [`target.yaml`](target.yaml) - TP=2 target Deployment with the identical Lease bootstrap.
+- [`lease-rbac.yaml`](lease-rbac.yaml) - `ServiceAccount` `mx-dht`, a `Role` granting Lease verbs, and the `RoleBinding`.
 
-A joining node needs at least one existing peer to find the rest of the mesh. This example bootstraps **worker-to-worker**: the headless Service `mx-dht-peers` (`clusterIP: None`) selects every DHT participant pod by the shared `mx.dht=member` label, so its DNS name resolves to the participant pod IPs. Each worker points `MX_DHT_BOOTSTRAP_DNS` at that name and dials the resolved peers at `MX_DHT_BOOTSTRAP_PORT`. `publishNotReadyAddresses: true` makes pods discoverable to each other during the (long) weight-load window, before vLLM reports ready - the libp2p swarm binds at process start, well ahead of weights finishing.
+Option B (`seeds/`):
 
-No `modelexpress-server`, Redis, or CRDs are involved. The headless Service carries no data-plane traffic; it exists purely as a name a joining node can resolve to find peers.
-
-> **Optional stable anchor.** If you already run a `modelexpress-server` (with its own `redis`/`kubernetes` backend) for other reasons, set `MX_DHT_LISTEN` on it and it will join the same mesh as a long-lived, participation-only bootstrap peer (it publishes no records of its own). There is no standalone seed binary - a dedicated anchor is a full server carrying its own backend, so it is only worth running when you already have one. For a pure `dht` deployment, the worker-to-worker bootstrap above needs nothing extra.
+- [`seeds/seed-quorum.yaml`](seeds/seed-quorum.yaml) - headless Service `mx-dht-seed` plus a 3-replica seed Deployment (GPU-free, pure networking).
+- [`seeds/sources-tp2.yaml`](seeds/sources-tp2.yaml) - TP=2 source Deployment bootstrapping against the seed quorum.
+- [`seeds/target.yaml`](seeds/target.yaml) - TP=2 target Deployment with the same seed bootstrap.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    subgraph mesh["Kademlia mesh (mx.dht=member)"]
-        S["Source Pod (2 GPUs)<br/>TP=2, ranks 0 and 1<br/>MX_METADATA_BACKEND=dht"]
-        T["Target Pod (2 GPUs)<br/>TP=2, ranks 0 and 1<br/>MX_METADATA_BACKEND=dht"]
+    subgraph mesh["Kademlia mesh (MX_METADATA_BACKEND=dht)"]
+        S["Source Pod (2 GPUs)<br/>TP=2, ranks 0 and 1"]
+        T["Target Pod (2 GPUs)<br/>TP=2, ranks 0 and 1"]
     end
-    SVC["headless Service: mx-dht-peers<br/>clusterIP: None<br/>resolves to participant pod IPs"]
-    S -. bootstrap .-> SVC
-    T -. bootstrap .-> SVC
-    SVC -. resolves .-> S
-    SVC -. resolves .-> T
+    A["Option A: anchor Leases<br/>(coordination.k8s.io)<br/>workers self-elect"]
+    B["Option B: seed quorum<br/>(GPU-free pods)"]
+    S -. bootstrap .-> A
+    T -. bootstrap .-> A
+    S -. bootstrap .-> B
+    T -. bootstrap .-> B
     S <-->|Kademlia mesh| T
     T -->|"DHT GET /mx/{id}/rank/{r}"| S
     T -->|NIXL/RDMA pull| S
 ```
 
-The source publishes a rank-keyed pointer per rank; the target resolves the matching rank with one keyspace GET, calls `GetTensorManifest` against the resolved endpoint, validates `mx_source_id` and rank on the response, then pulls weights over NIXL. There is no central process and no Service in the path.
+Pick one bootstrap path (A or B), not both. The source publishes a rank-keyed pointer per rank; the target resolves the matching rank with one keyspace GET, calls `GetTensorManifest` against the resolved endpoint, validates `mx_source_id` and rank on the response, then pulls weights over NIXL. There is no central process and no Service in the data path.
 
 ## Prerequisites
 
@@ -49,13 +67,38 @@ The source publishes a rank-keyed pointer per rank; the target resolves the matc
 
 ## Deploying
 
+### Option A - self-organizing Leases
+
+`lease-rbac.yaml` uses `${NAMESPACE}` in the RoleBinding subject; substitute it with `envsubst` before applying.
+
 ```bash
-# Headless Service + TP=2 source. Wait for the source to finish loading.
+# 1. Lease RBAC (ServiceAccount + Role + RoleBinding).
+NAMESPACE=<your-ns> envsubst < lease-rbac.yaml | kubectl apply -n <your-ns> -f -
+
+# 2. TP=2 source. Wait for it to finish loading.
 kubectl apply -f sources-tp2.yaml
 kubectl wait --for=condition=Ready pod -l app=mx-dht,role=source --timeout=15m
 
-# Targets join the mesh and pull from the source.
+# 3. Targets join the mesh and pull from the source.
 kubectl apply -f target.yaml
+kubectl wait --for=condition=Ready pod -l app=mx-dht,role=target --timeout=15m
+```
+
+### Option B - dedicated seed quorum
+
+The seed manifests use `${NAMESPACE}` in `MX_DHT_BOOTSTRAP_DNS`; substitute it with `envsubst` before applying.
+
+```bash
+# 1. Seed quorum. Let the seeds converge among themselves before workers join.
+NAMESPACE=<your-ns> envsubst < seeds/seed-quorum.yaml | kubectl apply -n <your-ns> -f -
+kubectl wait --for=condition=Available deployment/mx-dht-seed --timeout=5m
+
+# 2. TP=2 source. Wait for it to finish loading.
+NAMESPACE=<your-ns> envsubst < seeds/sources-tp2.yaml | kubectl apply -n <your-ns> -f -
+kubectl wait --for=condition=Ready pod -l app=mx-dht,role=source --timeout=15m
+
+# 3. Targets join the mesh and pull from the source.
+NAMESPACE=<your-ns> envsubst < seeds/target.yaml | kubectl apply -n <your-ns> -f -
 kubectl wait --for=condition=Ready pod -l app=mx-dht,role=target --timeout=15m
 ```
 
@@ -67,7 +110,8 @@ Outside Kubernetes the bootstrap source changes but the worker configuration doe
 |------------------------------|-----------------------|----------------------------------------------------------------------------------------------------------|
 | `MX_METADATA_BACKEND`        | `""` (central server) | Set to `dht` (alias `kademlia`) to enable this backend.                                                   |
 | `MX_DHT_LISTEN`              | client `0.0.0.0:0`    | `host:port` the node listens on for DHT participation.                                                    |
-| `MX_DHT_BOOTSTRAP_DNS`       | (none)                | Headless Service DNS resolving to peer IPs; each is dialed at `MX_DHT_BOOTSTRAP_PORT`.                    |
+| `MX_DHT_BOOTSTRAP_LEASES`    | (none)                | Option A: anchor Lease name-prefix. The quorum self-elects over Leases with this prefix.                  |
+| `MX_DHT_BOOTSTRAP_DNS`       | (none)                | Option B: headless Service DNS resolving to seed IPs; each is dialed at `MX_DHT_BOOTSTRAP_PORT`.          |
 | `MX_DHT_BOOTSTRAP_PEERS`     | (none)                | Comma-separated libp2p multiaddrs to dial for initial peers (bare-metal bootstrap).                      |
 | `MX_DHT_BOOTSTRAP_SLURM`     | `SLURM_JOB_NODELIST`  | Slurm hostlist to expand and dial; auto-detected from the Slurm environment when unset.                 |
 | `MX_DHT_BOOTSTRAP_PORT`      | `4001`                | Port at which DNS- and Slurm-resolved peers are dialed.                                                  |
@@ -76,5 +120,3 @@ Outside Kubernetes the bootstrap source changes but the worker configuration doe
 | `MX_DHT_GET_BACKOFF_SECONDS` | `0.5`                 | Delay between GET retries, in seconds.                                                                   |
 | `MX_MODEL_REVISION`          | (from vLLM config)    | Override for `SourceIdentity.revision`. Pin so `mx_source_id` is content-addressed.                      |
 | `MX_WORKER_GRPC_PORT`        | `6555`                | Base port for the WorkerGrpcServer (bound port is this + `device_id`).                                   |
-
-Replication factor `K` defaults to 20, the recommended Kademlia bucket size. Leave it at the default unless you have a measured reason to change it; see [`DHT_BACKEND.md`](../../docs/DHT_BACKEND.md#replication-factor-k).

@@ -427,6 +427,8 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_DHT_BOOTSTRAP_PEERS` | (none) | `dht` backend: comma-separated libp2p multiaddrs to dial for initial peers (e.g. `/ip4/10.0.0.1/tcp/4001/p2p/Qm...`). Highest-priority bootstrap source. |
 | `MX_DHT_BOOTSTRAP_DNS` | (none) | `dht` backend: headless Service DNS name resolving to every peer IP; each is dialed at `MX_DHT_BOOTSTRAP_PORT`. The common in-Kubernetes bootstrap source. |
 | `MX_DHT_BOOTSTRAP_SLURM` | `SLURM_JOB_NODELIST` | `dht` backend: Slurm-style hostlist (e.g. `node[01-04]`) to expand and dial at `MX_DHT_BOOTSTRAP_PORT`; auto-detected from `SLURM_JOB_NODELIST` when unset. |
+| `MX_DHT_BOOTSTRAP_LEASES` | (none) | `dht` backend: anchor Lease name-prefix; its presence enables self-organizing lease bootstrap - workers elect an anchor quorum among themselves via `coordination.k8s.io` Leases, no dedicated seed pods. Requires RBAC to get/update Leases and `POD_IP` from the downward API. |
+| `MX_DHT_LEASE_NAMESPACE` | (none) | `dht` backend: override for the auto-detected in-cluster namespace holding the anchor Leases. |
 | `MX_DHT_BOOTSTRAP_PORT` | `4001` | `dht` backend: port at which DNS- and Slurm-resolved peers are dialed. |
 | `MX_DHT_RECORD_TTL` | `86400` | `dht` backend: record republish interval / TTL in seconds. Published pointers refresh on this cadence so they survive node churn. |
 | `MX_DHT_GET_RETRIES` | `5` | `dht` backend: number of GET retries before a lookup is declared failed. Tune up for large cold-start fan-in. |

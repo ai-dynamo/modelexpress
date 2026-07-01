@@ -1,17 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Target pool that pulls weights via the dht backend, bootstrapped with the
-# self-organizing K8s Leases anchor (OPTION A).
+# Target pool that pulls weights via the dht backend, bootstrapped against
+# the dedicated seed quorum (OPTION B).
 #
-# Each target pod joins the same Kademlia mesh as the sources (same
-# MX_DHT_BOOTSTRAP_LEASES anchor quorum), resolves the publisher for each of
-# its ranks with a single DHT GET on /mx/{mx_source_id}/rank/{rank}, then
-# opens NIXL to the serving source pod for the actual weight pull.
-# mx_source_id is computed client-side from the SourceIdentity (model, dtype,
-# quantization, TP, revision) and validated on the GetTensorManifest response,
-# so a target only accepts weights from a source whose identity matches its
-# own.
+# Each target pod joins the same Kademlia mesh as the sources (same seed
+# quorum bootstrap), resolves the publisher for each of its ranks with a
+# single DHT GET on /mx/{mx_source_id}/rank/{rank}, then opens NIXL to the
+# serving source pod for the actual weight pull. mx_source_id is computed
+# client-side from the SourceIdentity (model, dtype, quantization, TP,
+# revision) and validated on the GetTensorManifest response, so a target
+# only accepts weights from a source whose identity matches its own.
 #
 # Target pods become sources themselves once their weights are loaded (the
 # dht backend forces the WorkerGrpcServer on), but note the one-publisher-
@@ -38,9 +37,6 @@ spec:
         app: mx-dht
         role: target
     spec:
-      # Grants the workers get/update/patch on coordination.k8s.io Leases so
-      # the anchor quorum can self-elect. See lease-rbac.yaml.
-      serviceAccountName: mx-dht
       containers:
         - name: vllm
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
@@ -63,14 +59,11 @@ spec:
               value: "dht"
             - name: MX_DHT_LISTEN
               value: "0.0.0.0:4001"
-            # Same self-electing anchor quorum as the sources.
-            - name: MX_DHT_BOOTSTRAP_LEASES
-              value: "mx-dht-anchor"
-            # POD_IP is the dialable address an anchor publishes into its Lease.
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
+            # Same seed quorum bootstrap as the sources.
+            - name: MX_DHT_BOOTSTRAP_DNS
+              value: "mx-dht-seed.${NAMESPACE}.svc.cluster.local"
+            - name: MX_DHT_BOOTSTRAP_PORT
+              value: "4001"
 
             # Cold-start convergence: a freshly published record and a freshly
             # joined node both take a short while to propagate, so a GET can

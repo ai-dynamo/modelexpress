@@ -71,13 +71,22 @@ Kademlia replicates each record across the `K` nodes closest to its key. `K` def
 
 ### Bootstrapping into the mesh
 
-A joining node needs at least one existing peer to find the rest of the mesh. The backend supports three explicit bootstrap sources, checked in priority order:
+This backend is serverless: there is no central `modelexpress-server` to act as a fixed rendezvous point. That raises one structural requirement at cold start. Kademlia assumes peers join incrementally against an already-converged mesh, walking a populated routing table to reach the nodes nearest a key. When N pods all cold-start against each other at once, every routing table is sparse and no node yet knows the overlay's shape, so lookups stall and convergence can take a long time or fail to settle. A large, simultaneous worker cold-start therefore needs a **pre-converged anchor set**: a small group of peers that mesh with each other first and give every arriving worker a known, reachable, already-organized entry point.
+
+There are two ways to provide that anchor set. The tradeoff axis is **RBAC vs pods**: elect anchors from the workers themselves and pay for it in cluster permissions, or run a few dedicated anchor pods and pay for it in extra pods to manage.
+
+**Option 1: self-organizing K8s Leases (recommended, fully serverless).** Set `MX_DHT_BOOTSTRAP_LEASES` to an anchor Lease name-prefix. A fixed set of 8 `coordination.k8s.io/v1` Lease slots elects a small anchor quorum from the workers themselves: each node maps to exactly one slot by the low bits of its `peer_id` and contests only that slot's Lease. The winners become anchors, converge among themselves first, then publish `converged` into their Lease. Every other worker gates on all slots reporting converged (with a bounded timeout, after which it degrades and proceeds anyway) before bootstrapping to the elected anchor set. No dedicated pods run; the anchors are ordinary workers that happened to win a slot. This path requires RBAC to `get`/`update` Leases (a ServiceAccount plus a Role) and the pod's own dialable address via `POD_IP` (Kubernetes downward API). Anchors advertise themselves at `/ip4/$POD_IP/tcp/<port>/p2p/<peer_id>`. See [`../examples/dht_sources/`](../examples/dht_sources/) for the top-level manifests and `lease-rbac.yaml`.
+
+**Option 2: dedicated seed quorum.** Run a few `python -m modelexpress.dht_seed` pods behind a headless Service. These are participation-only kademlite nodes: they carry no records and need no GPU, and they cross-bootstrap to each other so the quorum converges before any worker arrives. Point worker `MX_DHT_BOOTSTRAP_DNS` at that Service. This path needs no RBAC, at the cost of running and managing a few extra pods. See [`../examples/dht_sources/seeds/`](../examples/dht_sources/seeds/).
+
+Both paths sit on top of the same explicit bootstrap sources, which are also what a bare-metal or Slurm deployment wires up directly. The client checks these in priority order:
 
 1. `MX_DHT_BOOTSTRAP_PEERS` - explicit libp2p multiaddrs (for example `/ip4/10.0.0.1/tcp/4001/p2p/Qm...`).
-2. `MX_DHT_BOOTSTRAP_DNS` - a headless Kubernetes Service DNS name that resolves to every backing peer IP; each is dialed at `MX_DHT_BOOTSTRAP_PORT`.
-3. `MX_DHT_BOOTSTRAP_SLURM` - a Slurm-style hostlist (for example `node[01-04]`), auto-detected from `SLURM_JOB_NODELIST` when unset; each resolved host is dialed at `MX_DHT_BOOTSTRAP_PORT`.
+2. `MX_DHT_BOOTSTRAP_LEASES` - an anchor Lease name-prefix; the elected anchor set is resolved from the Lease slots (Option 1 above).
+3. `MX_DHT_BOOTSTRAP_DNS` - a headless Kubernetes Service DNS name that resolves to every backing peer IP; each is dialed at `MX_DHT_BOOTSTRAP_PORT`. This is what points workers at a dedicated seed quorum (Option 2 above).
+4. `MX_DHT_BOOTSTRAP_SLURM` - a Slurm-style hostlist (for example `node[01-04]`), auto-detected from `SLURM_JOB_NODELIST` when unset; each resolved host is dialed at `MX_DHT_BOOTSTRAP_PORT`.
 
-When none of these is configured, the client falls back to mDNS, discovering peers on the local network with no configuration at all - convenient for single-host or bare-metal development. In Kubernetes, set an explicit bootstrap source (typically `MX_DHT_BOOTSTRAP_DNS` pointing at a headless Service): cluster networking generally does not carry multicast, so the mDNS fallback will not find peers there, and configuring an explicit source disables it.
+When none of these is configured, the client falls back to mDNS, discovering peers on the local network with no configuration at all - convenient for single-host or bare-metal development. In Kubernetes, set an explicit bootstrap source: cluster networking generally does not carry multicast, so the mDNS fallback will not find peers there, and configuring an explicit source disables it.
 
 ## Configuration
 
@@ -88,12 +97,16 @@ All settings are read from the environment. The same variables configure both th
 | `MX_METADATA_BACKEND`        | central server | Set to `dht` (or `kademlia`) to select this backend.                                                                                                                    |
 | `MX_DHT_LISTEN`              | client: `0.0.0.0:0` | `host:port` the local node listens on. On the server this is the opt-in switch: unset means the server does not participate in the DHT at all.                     |
 | `MX_DHT_BOOTSTRAP_PEERS`     | (none)         | Comma-separated libp2p multiaddrs to dial for initial peers.                                                                                                            |
+| `MX_DHT_BOOTSTRAP_LEASES`    | (none)         | Anchor Lease name-prefix. Presence enables self-organizing lease bootstrap: workers elect an anchor quorum from themselves via `coordination.k8s.io/v1` Lease slots.    |
+| `MX_DHT_LEASE_NAMESPACE`     | (none)         | Overrides the auto-detected in-cluster namespace used for the anchor Lease slots. Leave unset to use the pod's own namespace.                                            |
 | `MX_DHT_BOOTSTRAP_DNS`       | (none)         | Headless Service DNS name that resolves to peer IPs; all resolved addresses are dialed at `MX_DHT_BOOTSTRAP_PORT`.                                                       |
 | `MX_DHT_BOOTSTRAP_SLURM`     | `SLURM_JOB_NODELIST` | Slurm hostlist to expand and dial; auto-detected from the Slurm environment when unset.                                                                          |
 | `MX_DHT_BOOTSTRAP_PORT`      | `4001`         | Port at which DNS- and Slurm-resolved peers are dialed.                                                                                                                 |
 | `MX_DHT_RECORD_TTL`          | `86400` (24h)  | Record republish interval / TTL, in seconds. Published pointers are refreshed on this cadence so they survive churn.                                                    |
 | `MX_DHT_GET_RETRIES`         | `5`            | Number of GET retries before a lookup is declared failed. Tune up for large cold-start fan-in.                                                                          |
 | `MX_DHT_GET_BACKOFF_SECONDS` | `0.5`          | Delay between GET retries, in seconds.                                                                                                                                  |
+
+The anchor quorum affects only bootstrap, not replication: `K=20` remains the replication floor regardless of how many anchors are elected or seeded, so records stay replicated across the 20 nodes nearest each key once the mesh has converged.
 
 The Kademlia implementation ships in-tree with the Python client as the `kademlite` package; `cryptography` is a runtime dependency of the client. The server joins the same mesh through a libp2p stack that is wire-compatible with the Python client (same Kademlia protocol id, same TCP + Noise + Yamux transport, same Identify protocol), so server and client nodes mesh together regardless of which side they run on.
 
@@ -105,30 +118,39 @@ Running a small set of these participation-only nodes gives the mesh a stable an
 
 ## Deployment
 
+Both bootstrap paths converge a small anchor set first, then let the full worker mesh form against it. The two options differ only in where the anchors come from:
+
 ```mermaid
-flowchart LR
-    subgraph seeds["Optional anchor: an existing server you already run"]
-        S1["modelexpress-server\n(redis/k8s backend)\n+ MX_DHT_LISTEN"]
-        S2["modelexpress-server\n(redis/k8s backend)\n+ MX_DHT_LISTEN"]
+flowchart TB
+    subgraph opt1["Option 1: self-organizing Leases (no dedicated pods)"]
+        direction TB
+        L["Lease slots\n(coordination.k8s.io/v1)\nMX_DHT_BOOTSTRAP_LEASES"]
+        A1["worker (won a slot)\nanchor"]
+        A2["worker (won a slot)\nanchor"]
+        WA["other workers\nMX_METADATA_BACKEND=dht"]
+        A1 -- "elect + converged" --> L
+        A2 -- "elect + converged" --> L
+        WA -. "gate on all-converged" .-> L
+        WA -. bootstrap .-> A1
+        A1 <--> A2
     end
-    subgraph workers["Inference workers"]
-        W1["source / target worker\nMX_METADATA_BACKEND=dht"]
-        W2["source / target worker\nMX_METADATA_BACKEND=dht"]
-        W3["source / target worker\nMX_METADATA_BACKEND=dht"]
+    subgraph opt2["Option 2: dedicated seed quorum"]
+        direction TB
+        HS["headless Service DNS\nMX_DHT_BOOTSTRAP_DNS"]
+        SD1["dht_seed pod\n(no records, no GPU)"]
+        SD2["dht_seed pod\n(no records, no GPU)"]
+        WB["workers\nMX_METADATA_BACKEND=dht"]
+        WB -. bootstrap .-> HS
+        HS --> SD1
+        HS --> SD2
+        SD1 <--> SD2
+        WB <-->|Kademlia mesh| WB
     end
-    headless["headless Service DNS\n(resolves to seed IPs)"]
-    W1 -.bootstrap.-> headless
-    W2 -.bootstrap.-> headless
-    W3 -.bootstrap.-> headless
-    headless --> S1
-    headless --> S2
-    W1 <-->|Kademlia mesh| W2
-    W2 <-->|Kademlia mesh| W3
-    W1 <-->|Kademlia mesh| W3
-    S1 <--> S2
 ```
 
-Run inference workers with `MX_METADATA_BACKEND=dht` and a bootstrap source. The common shape points `MX_DHT_BOOTSTRAP_DNS` at a headless Service that resolves to a stable set of bootstrap peers:
+Run inference workers with `MX_METADATA_BACKEND=dht` and one of the two anchor bootstrap paths.
+
+**Option 1: self-organizing Leases.** The recommended, fully serverless shape. Workers elect an anchor quorum from themselves through a fixed set of Lease slots, so no dedicated pods run. Set `MX_DHT_BOOTSTRAP_LEASES` to the anchor Lease name-prefix, grant the pod RBAC to `get`/`update` those Leases, and expose `POD_IP` via the downward API so anchors can advertise a dialable address:
 
 ```yaml
 apiVersion: apps/v1
@@ -145,6 +167,7 @@ spec:
       labels:
         app: mx-dht-worker
     spec:
+      serviceAccountName: mx-dht-worker
       containers:
         - name: worker
           image: <your-inference-image>
@@ -153,18 +176,34 @@ spec:
               value: "dht"
             - name: MX_DHT_LISTEN
               value: "0.0.0.0:4001"
-            - name: MX_DHT_BOOTSTRAP_DNS
-              value: "mx-dht-peers.default.svc.cluster.local"
-            - name: MX_DHT_BOOTSTRAP_PORT
-              value: "4001"
+            - name: MX_DHT_BOOTSTRAP_LEASES
+              value: "mx-dht-anchor"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - name: kademlia
               containerPort: 4001
 ```
 
-Bootstrapping is worker-to-worker by default. Point `MX_DHT_BOOTSTRAP_DNS` at a headless Service whose selector matches the worker pods themselves, with `publishNotReadyAddresses: true` so a joining worker finds peers that are already up even while their weights are still loading. No separate component is required; the mesh is the workers. See [`../examples/dht_sources/`](../examples/dht_sources/) for this shape.
+The ServiceAccount plus Role that grant Lease access are in [`../examples/dht_sources/`](../examples/dht_sources/) alongside the top-level manifests (`lease-rbac.yaml`). If the in-cluster namespace is not auto-detected correctly, set `MX_DHT_LEASE_NAMESPACE` to override it.
 
-If you already run a `modelexpress-server` (with its own `redis`/`kubernetes` backend) for other reasons, you can additionally set `MX_DHT_LISTEN` on it to give the mesh a stable, long-lived participation-only anchor that outlives individual workers. There is no standalone seed binary - a dedicated anchor is always a full server carrying its own backend - so a pure `dht` deployment uses worker-to-worker bootstrap and adds nothing extra.
+**Option 2: dedicated seed quorum.** Run a few `python -m modelexpress.dht_seed` pods behind a headless Service and point workers at it. The seeds are participation-only kademlite nodes with no records and no GPU; they cross-bootstrap so the quorum converges before workers arrive. This path needs no RBAC. Point worker `MX_DHT_BOOTSTRAP_DNS` at the seed Service, with `publishNotReadyAddresses: true` on that Service so a joining worker finds seeds even while they are still coming up:
+
+```yaml
+env:
+  - name: MX_METADATA_BACKEND
+    value: "dht"
+  - name: MX_DHT_LISTEN
+    value: "0.0.0.0:4001"
+  - name: MX_DHT_BOOTSTRAP_DNS
+    value: "mx-dht-seeds.default.svc.cluster.local"
+  - name: MX_DHT_BOOTSTRAP_PORT
+    value: "4001"
+```
+
+The seed Deployment and its headless Service are in [`../examples/dht_sources/seeds/`](../examples/dht_sources/seeds/).
 
 Outside Kubernetes the bootstrap source changes but the worker configuration does not: under Slurm, `MX_DHT_BOOTSTRAP_SLURM` (or the auto-detected `SLURM_JOB_NODELIST`) supplies the peer hostlist; on bare metal, list peer multiaddrs in `MX_DHT_BOOTSTRAP_PEERS`.
 

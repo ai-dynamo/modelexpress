@@ -1,30 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# TP=2 source pool using the dht metadata backend, bootstrapped with the
-# self-organizing K8s Leases anchor (OPTION A).
+# TP=2 source pool using the dht metadata backend, bootstrapped against the
+# dedicated seed quorum (OPTION B).
 #
 # No central server, no Redis, no CRDs, and no Service in the data path.
 # Workers discover each other over a libp2p Kademlia mesh: each one sets
-# MX_METADATA_BACKEND=dht, listens on MX_DHT_LISTEN, and bootstraps into
-# the mesh through a self-electing anchor quorum.
-#
-# The anchor quorum self-elects over coordination.k8s.io Leases named with
-# the MX_DHT_BOOTSTRAP_LEASES prefix - there are no dedicated anchor pods.
-# The workers themselves take the anchor Leases; whichever ones hold them
-# publish their dialable address for joiners to bootstrap against. POD_IP,
-# taken from the downward API, is the address an anchor publishes into its
-# Lease so peers can reach it. This gives a pre-converged anchor set so a
-# large simultaneous worker cold-start does not stall waiting for a seed.
+# MX_METADATA_BACKEND=dht, listens on MX_DHT_LISTEN, and bootstraps into the
+# mesh by dialing the seed quorum's headless Service (see seed-quorum.yaml).
+# No Lease RBAC and no ServiceAccount are needed on the workers - the seeds
+# are the pre-converged anchor set.
 #
 # One publisher per (mx_source_id, rank): a single TP=2 source pod runs
 # both ranks under one mx_source_id, so it is the sole publisher for each.
 # The dht backend does not model a load-balanced pool of replicas for a
 # single rank; for that shape use the k8s-service or central-coordinator
-# backends. See ../../docs/DHT_BACKEND.md.
+# backends. See ../../../docs/DHT_BACKEND.md.
 #
 # Prerequisites:
-#   - Lease RBAC applied: kubectl apply -f lease-rbac.yaml
+#   - Seed quorum applied and converged: kubectl apply -f seed-quorum.yaml
 #   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #   - RDMA-capable NICs available on the nodes (rdma/shared_ib)
 #   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
@@ -57,9 +51,6 @@ spec:
         app: mx-dht
         role: source
     spec:
-      # Grants the workers get/update/patch on coordination.k8s.io Leases so
-      # the anchor quorum can self-elect. See lease-rbac.yaml.
-      serviceAccountName: mx-dht
       containers:
         - name: vllm
           image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
@@ -84,15 +75,13 @@ spec:
             # Listen address for this node's DHT participation.
             - name: MX_DHT_LISTEN
               value: "0.0.0.0:4001"
-            # Self-organizing anchor bootstrap: the anchor quorum self-elects
-            # over Leases with this name-prefix. No dedicated anchor pods.
-            - name: MX_DHT_BOOTSTRAP_LEASES
-              value: "mx-dht-anchor"
-            # POD_IP is the dialable address an anchor publishes into its Lease.
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
+            # Bootstrap into the mesh via the seed quorum's headless Service.
+            # Its DNS resolves to every seed pod IP; each is dialed at
+            # MX_DHT_BOOTSTRAP_PORT.
+            - name: MX_DHT_BOOTSTRAP_DNS
+              value: "mx-dht-seed.${NAMESPACE}.svc.cluster.local"
+            - name: MX_DHT_BOOTSTRAP_PORT
+              value: "4001"
 
             # NIXL listen port and WorkerGrpcServer port for the P2P data path.
             - name: MX_METADATA_PORT
