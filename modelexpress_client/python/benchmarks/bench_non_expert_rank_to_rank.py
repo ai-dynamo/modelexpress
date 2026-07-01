@@ -66,9 +66,10 @@ from modelexpress import NonExpertShardSpec  # noqa: E402
 from modelexpress.nemo_rl_v2 import (  # noqa: E402
     MxV2RefitReceiver,
     MxV2TrainingPublisher,
-    TargetTPLayout,
     TrainerWorldLayout,
 )
+from modelexpress.rl_reshard_planner import plan_coverage  # noqa: E402
+from modelexpress.rl_slice_descriptors import SliceOwnership, SliceRequest  # noqa: E402
 
 
 @dataclasses.dataclass
@@ -194,107 +195,125 @@ class ReceiverThread(threading.Thread):
 
     def _run_inner(self) -> None:
         torch.cuda.set_device(self.cfg.cuda_device)
+        # Full-tensor destination the reassembled shards land into.
+        full_buf = torch.zeros(
+            (self.cfg.rows_total, self.cfg.cols),
+            dtype=torch.bfloat16,
+            device=f"cuda:{self.cfg.cuda_device}",
+        )
         receiver = MxV2RefitReceiver(
             agent_name=f"ne-bench-receiver-{uuid.uuid4().hex[:6]}",
             device_id=self.cfg.cuda_device,
             mx_server_url=self.cfg.mx_server_url,
             worker_rank=0,
         )
-        receiver.initialize(model_tensors=None)  # scratch mode
+        receiver.initialize(model_tensors={self.cfg.tensor_name: full_buf})
+        base = receiver._receiver  # underlying MxRefitReceiver (one-sided receive_segment)
 
-        target = TargetTPLayout(world_size=1, rank=0, shard_axis=0)
         rps = self.cfg.rows_total // self.cfg.num_publishers
-        shard_shape = (rps, self.cfg.cols)
+        row_bytes = self.cfg.cols * 2  # bf16
         per_cycle: list[dict] = []
 
         for cycle in range(self.cfg.cycles):
             for t in self.trainers:
                 t.ready_event.wait(timeout=30.0)
 
-            # Discovery races the trainers' per-cycle re-publish: the
-            # catalog may not yet show version>=cycle for all ranks when we
-            # first look. Poll with backoff until every rank's shard is
-            # covered (same async gap the prime-rl worker absorbs).
-            t0 = time.perf_counter()
-            deadline = time.monotonic() + self.cfg.timeout_s
-            backoff = 0.25
-            plan = None
-            while True:
-                plan = receiver.discover_v2_sources_for_slice(
+            # Build SliceOwnership per trainer shard (harness owns both sides,
+            # same pattern as the verl rank-to-rank bench). shard_spec metadata
+            # was also published to the catalog; here we exercise the planner +
+            # one-sided receive_segment data plane, which — unlike the scratch
+            # rendezvous path — works when target threads are blocked at the
+            # cross-cycle barrier.
+            ownerships = [
+                SliceOwnership(
                     model_name=self.cfg.model_name,
-                    target_layout=target,
-                    min_version=cycle,
-                    same_rank_only=False,
+                    tensor_name=self.cfg.tensor_name,
+                    global_shape=(self.cfg.rows_total, self.cfg.cols),
+                    dtype=self.cfg.dtype,
+                    placement_kind="SHARD",
+                    shard_axis=0,
+                    local_shard_range=(t.row_lo, t.row_hi),
+                    worker_rank=t.rank,
+                    nixl_addr=int(t.local_shard.data_ptr()),
+                    byte_size=t.local_shard.numel() * t.local_shard.element_size(),
+                    device_id=self.cfg.cuda_device,
                 )
-                covered_ranks = {
-                    src.candidate.ref.worker_rank
-                    for contributions in plan.per_tensor_sources.values()
-                    for src in contributions
-                }
-                if plan.fully_covered and len(covered_ranks) == self.cfg.num_publishers:
-                    break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        f"cycle {cycle}: plan not covered after {self.cfg.timeout_s}s; "
-                        f"covered_ranks={sorted(covered_ranks)} missing={plan.missing}"
-                    )
-                time.sleep(backoff)
-                backoff = min(backoff * 1.5, 4.0)
-            discover_dt = time.perf_counter() - t0
+                for t in self.trainers
+            ]
+            request = SliceRequest(
+                tensor_name=self.cfg.tensor_name,
+                global_range=(0, self.cfg.rows_total),
+                shard_axis=0,
+                dtype=self.cfg.dtype,
+                receiver_rank=0,
+                target_addr=int(full_buf.data_ptr()),
+                target_offset=0,
+            )
 
             t0 = time.perf_counter()
-            got: dict[str, torch.Tensor] = {}
-            for name, tensor in receiver.receive_via_plan(
-                plan, timeout_seconds=self.cfg.timeout_s, tensor_shapes={self.cfg.tensor_name: shard_shape}
-            ):
-                got[name] = tensor
+            plan = plan_coverage(sources=ownerships, requests=[request])
+            plan.raise_if_incomplete()
+            plan_dt = time.perf_counter() - t0
+
+            agents: dict[int, str] = {}
+            for t in self.trainers:
+                agents[t.rank] = base.prefetch_source(
+                    mx_source_id=t.mx_source_id, worker_id=t.publisher.worker_id
+                )
+
+            t0 = time.perf_counter()
+            for seg in plan.segments:
+                src_addr = seg.source.nixl_addr + seg.source_range[0] * row_bytes
+                tgt_addr = (
+                    seg.request.target_addr
+                    + seg.request.target_offset
+                    + seg.target_range[0] * row_bytes
+                )
+                base.receive_segment(
+                    remote_agent_name=agents[seg.source.worker_rank],
+                    source_addr=src_addr,
+                    byte_count=seg.byte_count,
+                    target_addr=tgt_addr,
+                    source_device_id=seg.source.device_id,
+                    timeout_seconds=self.cfg.timeout_s,
+                )
             xfer_dt = time.perf_counter() - t0
 
-            full = got.get(self.cfg.tensor_name)
-            if full is None:
-                raise RuntimeError(f"cycle {cycle}: tensor {self.cfg.tensor_name} not in receive output")
-
-            # Shape check: reassembled tensor must be the full global shape.
-            expected_shape = (self.cfg.rows_total, self.cfg.cols)
-            shape_ok = tuple(full.shape) == expected_shape
-
-            # Byte-identity: rows [r*rps,(r+1)*rps) must hold rank r's cycle value.
+            # Byte-identity: rows [r*rps,(r+1)*rps) must hold rank r's value.
             verified = True
             first_bad = None
             for r in range(self.cfg.num_publishers):
                 expected_val = float(r + 1) + cycle * 0.01
-                seg = full[r * rps : (r + 1) * rps]
-                if not torch.allclose(seg.float(), torch.full_like(seg.float(), expected_val), atol=0.02):
+                view = full_buf[r * rps : (r + 1) * rps]
+                if not torch.allclose(
+                    view.float(), torch.full_like(view.float(), expected_val), atol=0.02
+                ):
                     verified = False
-                    first_bad = (r, expected_val, float(seg.flatten()[0].item()))
+                    first_bad = (r, expected_val, float(view.flatten()[0].item()))
                     break
 
-            # Count distinct source ranks the plan drew from.
-            source_ranks = set()
-            for contributions in plan.per_tensor_sources.values():
-                for src in contributions:
-                    source_ranks.add(src.candidate.ref.worker_rank)
-
-            bytes_pulled = self.cfg.rows_total * self.cfg.cols * 2
+            source_ranks = sorted({seg.source.worker_rank for seg in plan.segments})
+            bytes_pulled = sum(seg.byte_count for seg in plan.segments)
             metric = {
                 "cycle": cycle,
-                "shape_ok": shape_ok,
+                "shape_ok": tuple(full_buf.shape) == (self.cfg.rows_total, self.cfg.cols),
                 "verified": verified,
                 "first_bad": first_bad,
                 "num_source_ranks": len(source_ranks),
-                "source_ranks": sorted(source_ranks),
+                "source_ranks": source_ranks,
                 "expected_source_ranks": self.cfg.num_publishers,
+                "segment_count": len(plan.segments),
                 "bytes_pulled": bytes_pulled,
-                "discover_seconds": discover_dt,
+                "plan_seconds": plan_dt,
                 "xfer_seconds": xfer_dt,
                 "gbps": (bytes_pulled * 8) / max(xfer_dt, 1e-9) / 1e9,
             }
             per_cycle.append(metric)
             logger.info(
-                "receiver cycle=%d shape_ok=%s verified=%s sources=%s/%d "
-                "bytes=%d xfer=%.3fs (%.2f Gbps)",
-                cycle, shape_ok, verified, sorted(source_ranks),
-                self.cfg.num_publishers, bytes_pulled, xfer_dt, metric["gbps"],
+                "receiver cycle=%d verified=%s sources=%s/%d segs=%d bytes=%d "
+                "xfer=%.3fs (%.2f Gbps)",
+                cycle, verified, source_ranks, self.cfg.num_publishers,
+                len(plan.segments), bytes_pulled, xfer_dt, metric["gbps"],
             )
             if not verified:
                 logger.error("cycle=%d BYTE MISMATCH first_bad=%s", cycle, first_bad)
