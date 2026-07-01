@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import torch
 
+from . import envs
 from .client import MxClient
 from .metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from . import p2p_pb2
@@ -79,8 +80,8 @@ def publish_model_params(torch_model: Any) -> None:
     except Exception:
         mpi_rank = device_id
 
-    model_name = os.environ.get("MODEL_NAME", "unknown")
-    mx_server = os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001")
+    model_name = envs.MODEL_NAME or "unknown"
+    mx_server = envs.MODEL_EXPRESS_URL or "modelexpress-server:8001"
 
     param_tensors = {}
     seen_data_ptrs = set()
@@ -186,8 +187,8 @@ def publish_from_worker(worker: Any) -> None:
     except Exception:
         mpi_rank = getattr(worker, "rank", device_id)
 
-    model_name = os.environ.get("MODEL_NAME", "unknown")
-    mx_server = os.environ.get("MODEL_EXPRESS_URL", "modelexpress-server:8001")
+    model_name = envs.MODEL_NAME or "unknown"
+    mx_server = envs.MODEL_EXPRESS_URL or "modelexpress-server:8001"
 
     param_tensors = {}
     seen_data_ptrs = set()
@@ -286,8 +287,8 @@ class MxLiveWeightLoader:
         from .types import TensorDescriptor
 
         # Use provided URL, then env var, then default
-        mx_server = self._mx_server or os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS", "localhost:8001")
-        model_name = os.environ.get("MODEL_NAME", os.path.basename(checkpoint_dir))
+        mx_server = self._mx_server or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS or "localhost:8001"
+        model_name = envs.MODEL_NAME or os.path.basename(checkpoint_dir)
 
         if model is None:
             raise RuntimeError(
@@ -307,7 +308,7 @@ class MxLiveWeightLoader:
             mpi_rank = device_id
 
         # MPI workers' stdout is swallowed by TRT-LLM — write to per-rank file
-        log_dir = os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs")
+        log_dir = envs.MX_TRANSFER_LOG_DIR
         os.makedirs(log_dir, exist_ok=True)
         rank_log = os.path.join(log_dir, f"rank{mpi_rank}.log")
         fh = logging.FileHandler(rank_log, mode="w")
@@ -320,7 +321,7 @@ class MxLiveWeightLoader:
         )
 
         # 1. Query source metadata
-        query_timeout = int(os.environ.get("MX_SOURCE_QUERY_TIMEOUT", "3600"))
+        query_timeout = envs.MX_SOURCE_QUERY_TIMEOUT
         source_meta = self._query_source(mx_server, model_name, timeout=query_timeout)
 
         # Find my rank's source worker — use MPI rank, not local GPU index
@@ -421,7 +422,7 @@ class MxLiveWeightLoader:
         ]
 
         # 7. RDMA transfer: source params → target params
-        xfer_timeout = int(os.environ.get("MX_TRANSFER_TIMEOUT", "900"))
+        xfer_timeout = envs.MX_TRANSFER_TIMEOUT
         t0 = time.perf_counter()
         bytes_transferred, n_tensors, _ = nixl_mgr.receive_from_source(
             source_metadata=source_worker.nixl_metadata,

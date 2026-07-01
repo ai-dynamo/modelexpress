@@ -19,7 +19,8 @@ Quick Start (vLLM):
 """
 
 import logging
-import os
+
+from . import envs
 
 _logger = logging.getLogger(__name__)
 _loaders_registered = False
@@ -39,7 +40,7 @@ def configure_vllm_logging():
     vllm_logger = logging.getLogger("vllm")
     for handler in vllm_logger.handlers:
         mx_root.addHandler(handler)
-    mx_level = os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper()
+    mx_level = envs.MODEL_EXPRESS_LOG_LEVEL
     if mx_level and hasattr(logging, mx_level):
         mx_root.setLevel(getattr(logging, mx_level))
     elif vllm_logger.level != logging.NOTSET:

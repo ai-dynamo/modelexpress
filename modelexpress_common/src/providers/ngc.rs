@@ -2,34 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Utils,
     cache::{ModelInfo, ProviderCache, directory_size},
+    envs,
     models::ModelProvider,
     providers::ModelProviderTrait,
 };
 use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-const NGC_API_ENDPOINT_ENV_VAR: &str = "NGC_API_ENDPOINT";
-const NGC_AUTH_ENDPOINT_ENV_VAR: &str = "NGC_AUTH_ENDPOINT";
-const DEFAULT_NGC_API_BASE: &str = "https://api.ngc.nvidia.com";
-const DEFAULT_NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
-
-fn ngc_api_base() -> String {
-    std::env::var(NGC_API_ENDPOINT_ENV_VAR).unwrap_or_else(|_| DEFAULT_NGC_API_BASE.to_string())
-}
-
-fn ngc_authn_base() -> String {
-    std::env::var(NGC_AUTH_ENDPOINT_ENV_VAR).unwrap_or_else(|_| DEFAULT_NGC_AUTHN_BASE.to_string())
-}
-const NGC_API_KEY_ENV_VAR: &str = "NGC_API_KEY";
-const NGC_CLI_API_KEY_ENV_VAR: &str = "NGC_CLI_API_KEY";
 const NGC_CLI_CONFIG_PATH: &str = ".ngc/config";
-const MODEL_EXPRESS_CACHE_ENV_VAR: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 const DEFAULT_NGC_CACHE_SUBDIR: &str = ".cache";
 const PAGE_SIZE: u32 = 500;
 
@@ -114,11 +98,10 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     if let Some(dir) = cache_dir {
         return dir;
     }
-    if let Ok(path) = env::var(MODEL_EXPRESS_CACHE_ENV_VAR) {
-        return PathBuf::from(path);
+    if let Some(path) = envs::cache_directory() {
+        return path;
     }
-    let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(DEFAULT_NGC_CACHE_SUBDIR)
+    envs::home_dir_or_cwd().join(DEFAULT_NGC_CACHE_SUBDIR)
 }
 
 /// Build the local directory path for an NGC artifact.
@@ -144,21 +127,12 @@ fn model_dir(cache_root: &Path, id: &NgcArtifactId) -> PathBuf {
 /// 2. `NGC_CLI_API_KEY` env var
 /// 3. `~/.ngc/config` (or `$NGC_CLI_HOME/.ngc/config`) — INI or JSON
 fn get_ngc_api_key() -> Result<String> {
-    for var in [NGC_API_KEY_ENV_VAR, NGC_CLI_API_KEY_ENV_VAR] {
-        if let Ok(v) = env::var(var) {
-            let trimmed = v.trim().to_string();
-            if !trimmed.is_empty() {
-                return Ok(trimmed);
-            }
-        }
+    if let Some(key) = envs::ngc_api_key() {
+        return Ok(key);
     }
 
-    let config_path = env::var("NGC_CLI_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home)
-        })
+    let config_path = envs::ngc_cli_home()
+        .unwrap_or_else(envs::home_dir_or_cwd)
         .join(NGC_CLI_CONFIG_PATH);
 
     if config_path.exists() {
@@ -170,8 +144,10 @@ fn get_ngc_api_key() -> Result<String> {
     }
 
     anyhow::bail!(
-        "NGC API key not set. Set {NGC_API_KEY_ENV_VAR} or {NGC_CLI_API_KEY_ENV_VAR}, \
-         or run 'ngc config set' to configure the NGC CLI."
+        "NGC API key not set. Set {} or {}, \
+         or run 'ngc config set' to configure the NGC CLI.",
+        envs::NGC_API_KEY,
+        envs::NGC_CLI_API_KEY
     )
 }
 
@@ -290,7 +266,7 @@ async fn fetch_token(
         Some(team) => format!("group/ngc:{}/{}", id.org, team),
         None => format!("group/ngc:{}", id.org),
     };
-    let url = format!("{}/token", ngc_authn_base());
+    let url = format!("{}/token", envs::ngc_authn_base());
     let response = client
         .get(&url)
         .query(&[("service", "ngc"), ("scope", scope.as_str())])
@@ -347,7 +323,7 @@ async fn fetch_artifact_files(
     auth: &HeaderValue,
     id: &NgcArtifactId,
 ) -> Result<(Vec<String>, Vec<String>, bool)> {
-    let api_base = ngc_api_base();
+    let api_base = envs::ngc_api_base();
     let artifact_base = match &id.team {
         Some(team) => format!(
             "{api_base}/v2/org/{}/team/{}/{}/{}",
@@ -1467,13 +1443,13 @@ mod tests {
                 .await;
 
             let api_endpoint_guard =
-                EnvVarGuard::set(env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
+                EnvVarGuard::set(env_lock, envs::NGC_API_ENDPOINT, &server.uri());
             let auth_endpoint_guard =
-                EnvVarGuard::set(env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
-            let api_key_guard = EnvVarGuard::set(env_lock, NGC_API_KEY_ENV_VAR, "mock-legacy-key");
+                EnvVarGuard::set(env_lock, envs::NGC_AUTH_ENDPOINT, &server.uri());
+            let api_key_guard = EnvVarGuard::set(env_lock, envs::NGC_API_KEY, "mock-legacy-key");
             let cache_guard = EnvVarGuard::set(
                 env_lock,
-                MODEL_EXPRESS_CACHE_ENV_VAR,
+                envs::MODEL_EXPRESS_CACHE_DIRECTORY,
                 temp_dir.path().to_str().expect("path"),
             );
 
@@ -1546,9 +1522,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _api = EnvVarGuard::set(&env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
-        let _auth = EnvVarGuard::set(&env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
-        let _key = EnvVarGuard::set(&env_lock, NGC_API_KEY_ENV_VAR, "mock-key");
+        let _api = EnvVarGuard::set(&env_lock, envs::NGC_API_ENDPOINT, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, envs::NGC_AUTH_ENDPOINT, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, envs::NGC_API_KEY, "mock-key");
 
         let result = NgcProvider
             .download_model(
@@ -1609,9 +1585,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _api = EnvVarGuard::set(&env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
-        let _auth = EnvVarGuard::set(&env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
-        let _key = EnvVarGuard::set(&env_lock, NGC_API_KEY_ENV_VAR, "mock-key");
+        let _api = EnvVarGuard::set(&env_lock, envs::NGC_API_ENDPOINT, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, envs::NGC_AUTH_ENDPOINT, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, envs::NGC_API_KEY, "mock-key");
 
         let result = NgcProvider
             .download_model(
@@ -1652,9 +1628,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _api = EnvVarGuard::set(&env_lock, NGC_API_ENDPOINT_ENV_VAR, &server.uri());
-        let _auth = EnvVarGuard::set(&env_lock, NGC_AUTH_ENDPOINT_ENV_VAR, &server.uri());
-        let _key = EnvVarGuard::set(&env_lock, NGC_API_KEY_ENV_VAR, "nvapi-test-key-xyz");
+        let _api = EnvVarGuard::set(&env_lock, envs::NGC_API_ENDPOINT, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, envs::NGC_AUTH_ENDPOINT, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, envs::NGC_API_KEY, "nvapi-test-key-xyz");
 
         let result = NgcProvider
             .download_model(
