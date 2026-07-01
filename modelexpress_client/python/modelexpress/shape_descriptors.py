@@ -149,6 +149,30 @@ def _dtype_to_str(dtype: torch.dtype) -> str:
     return s[len("torch.") :] if s.startswith("torch.") else s
 
 
+@dataclasses.dataclass(frozen=True)
+class NonExpertShardSpec:
+    """Explicit shard metadata for a plain (non-DTensor) tensor.
+
+    ``describe_tensor`` infers placement from a DTensor's ``placements``,
+    but a caller that holds an already-materialized *plain* shard (e.g. a
+    post-conversion output buffer that is no longer a DTensor) has no
+    placement info to infer from. Passing a ``NonExpertShardSpec`` lets
+    such a caller publish its buffer as a ``SHARD`` of a larger logical
+    tensor so receivers can pull + reassemble across ranks instead of
+    the publisher pre-gathering the full tensor.
+
+    Fields:
+        global_shape: the un-sharded full tensor's shape.
+        shard_axis: axis along which the tensor is sharded across ranks.
+        local_shard_range: ``(start, end)`` along ``shard_axis`` that the
+            publisher's rank owns. End-exclusive.
+    """
+
+    global_shape: tuple[int, ...]
+    shard_axis: int
+    local_shard_range: tuple[int, int]
+
+
 def describe_tensor(
     *,
     name: str,
@@ -160,6 +184,7 @@ def describe_tensor(
     owned_expert_ids: tuple[int, ...] | set[int] | list[int] = (),
     compile_target: str = COMPILE_TARGET_HF_RAW,
     compile_metadata: dict[str, Any] | None = None,
+    shard_spec: NonExpertShardSpec | None = None,
 ) -> TensorDescriptorV2:
     """Build a ``TensorDescriptorV2`` from a tensor + rank context.
 
@@ -170,12 +195,53 @@ def describe_tensor(
     is the same). Uneven shards are not supported in v0 — the caller should
     pre-pad or fall back to bucket pack.
 
+    When ``shard_spec`` is provided the tensor is treated as an explicit
+    ``SHARD`` of ``shard_spec.global_shape`` regardless of whether it is a
+    DTensor — this is the path for publishing a plain, already-materialized
+    shard (e.g. a post-conversion output buffer) so receivers can pull and
+    reassemble it. The caller owns the shard math; we validate the local
+    extent matches the tensor's actual size along ``shard_axis``.
+
     The returned descriptor refers to the **global** shape: i.e. the
     un-sharded full tensor. ``local_shard_range[0:1]`` describes the slice
     along ``shard_axis`` that this rank owns.
     """
     dtype_str = _dtype_to_str(tensor.dtype)
     metadata = dict(compile_metadata) if compile_metadata else {}
+
+    # Explicit shard spec short-circuit: publish a plain buffer as a SHARD
+    # of a larger logical tensor. Used by frameworks whose post-conversion
+    # buffers are plain tensors (not DTensors) but represent a per-rank
+    # FSDP/TP shard the receiver must reassemble.
+    if shard_spec is not None:
+        lo, hi = shard_spec.local_shard_range
+        axis = shard_spec.shard_axis
+        local_extent = int(tensor.shape[axis])
+        if hi - lo != local_extent:
+            raise ValueError(
+                f"describe_tensor({name!r}): shard_spec local_shard_range "
+                f"({lo}, {hi}) width {hi - lo} != tensor extent {local_extent} "
+                f"on axis {axis}"
+            )
+        if hi > shard_spec.global_shape[axis] or lo < 0:
+            raise ValueError(
+                f"describe_tensor({name!r}): shard_spec range ({lo}, {hi}) "
+                f"outside global_shape[{axis}]={shard_spec.global_shape[axis]}"
+            )
+        return TensorDescriptorV2(
+            name=name,
+            global_shape=tuple(int(s) for s in shard_spec.global_shape),
+            dtype=dtype_str,
+            placement_kind=PLACEMENT_SHARD,
+            shard_axis=axis,
+            local_shard_range=(lo, hi),
+            is_expert=is_expert,
+            expert_axis=expert_axis,
+            owned_expert_ids=tuple(sorted(owned_expert_ids)),
+            compile_target=compile_target,
+            compile_metadata=metadata,
+        )
+
     placements = getattr(tensor, "placements", None)
     if not _DTensor_AVAILABLE or not placements:
         return TensorDescriptorV2(
