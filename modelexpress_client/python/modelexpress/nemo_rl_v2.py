@@ -58,6 +58,7 @@ from .refit_receiver import MxRefitReceiver, SourceRef
 from .shape_descriptors import (
     COMPILE_TARGET_HF_RAW,
     PLACEMENT_SHARD,
+    NonExpertShardSpec,
     TensorDescriptorV2,
     compile_target_matches,
     decode_expert_set,
@@ -228,6 +229,7 @@ class MxV2TrainingPublisher:
         owned_expert_ids: tuple[int, ...] | set[int] | list[int] = (),
         compile_target: str = COMPILE_TARGET_HF_RAW,
         compile_metadata: dict[str, object] | None = None,
+        shard_spec: "NonExpertShardSpec | None" = None,
     ) -> None:
         """Register a tensor for publication.
 
@@ -274,6 +276,7 @@ class MxV2TrainingPublisher:
             owned_expert_ids=tuple(sorted(owned_expert_ids)),
             compile_target=compile_target,
             compile_metadata=compile_metadata,
+            shard_spec=shard_spec,
         )
 
         # `describe_tensor` infers the descriptor from a DTensor's

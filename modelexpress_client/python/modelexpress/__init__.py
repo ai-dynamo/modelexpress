@@ -81,6 +81,7 @@ from .shape_descriptors import (  # noqa: F401
     COMPILE_TARGET_HF_RAW,
     COMPILE_TARGET_TRTLLM,
     COMPILE_TARGET_VLLM_FUSED,
+    NonExpertShardSpec,
     TensorDescriptorV2,
     compile_target_matches,
 )
@@ -173,6 +174,7 @@ __all__ = [
     "SliceRequest",
     "SliceSource",
     "TargetTPLayout",
+    "NonExpertShardSpec",
     "TensorDescriptorV2",
     "TrainerWorldLayout",
     "TransferStats",
