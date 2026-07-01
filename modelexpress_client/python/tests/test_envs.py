@@ -83,7 +83,7 @@ def test_normalization(monkeypatch):
     assert envs.MODEL_EXPRESS_LOG_LEVEL == "DEBUG"
 
 
-def test_raw_optional_passthrough(monkeypatch):
+def test_raw_optional_passthrough(monkeypatch, tmp_path):
     monkeypatch.delenv("MX_MODEL_URI", raising=False)
     assert envs.MX_MODEL_URI is None
     monkeypatch.setenv("MX_MODEL_URI", "s3://bucket/model")
@@ -91,8 +91,9 @@ def test_raw_optional_passthrough(monkeypatch):
     # Raw string; artifact_manifest owns the parse/validation.
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER_CHUNK_SIZE", "12345")
     assert envs.MX_ARTIFACT_TRANSFER_CHUNK_SIZE == "12345"
-    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", "/tmp/flashinfer-autotune")
-    assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR == "/tmp/flashinfer-autotune"
+    autotune_root = tmp_path / "flashinfer-autotune"
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(autotune_root))
+    assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR == str(autotune_root)
 
 
 def test_is_set(monkeypatch):

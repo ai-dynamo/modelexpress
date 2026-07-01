@@ -645,11 +645,19 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
 ):
     cache_root = tmp_path / "torch_compile_cache"
     autotune_root = tmp_path / "autotune-cache"
-    ready = artifacts._vllm_artifact_ready_fn((cache_root, autotune_root))
+    roots = (
+        ArtifactCacheRoot("primary", cache_root, cache_root),
+        ArtifactCacheRoot("autotune", autotune_root, autotune_root, optional=True),
+    )
+    ready = artifacts._vllm_artifact_ready_fn(roots)
     health_check = MagicMock(side_effect=[False, True])
     now = 100.0
     monkeypatch.setattr(artifacts, "_vllm_health_ready", health_check)
     monkeypatch.setattr(artifacts.time, "monotonic", lambda: now)
+
+    autotune_root.mkdir()
+    autotune_file = autotune_root / "configs.json"
+    autotune_file.write_text("{}")
 
     assert ready() is False
 
@@ -666,8 +674,7 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
     now += 1
     assert ready() is True
 
-    autotune_root.mkdir()
-    (autotune_root / "configs.json").write_text("{}")
+    autotune_file.write_text('{"updated": true}')
     assert ready() is False
 
     now += artifacts._CACHE_SETTLE_SECS

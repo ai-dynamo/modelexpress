@@ -150,7 +150,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         if previous is not None:
             previous.stop()
 
-        source_roots = tuple(root.source_root for root in transfer.roots)
+        source_roots = transfer.roots
         publisher_ref: list[PublisherThread | None] = [None]
         publisher = PublisherThread(
             mx_client=ctx.mx_client,
@@ -178,7 +178,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
             "[Worker %s] Scheduled vLLM artifact publisher: name=%s roots=%s",
             ctx.global_rank,
             transfer.name,
-            [str(path) for path in source_roots],
+            [str(root.source_root) for root in source_roots],
         )
 
 
@@ -243,11 +243,13 @@ def _publish_vllm_cache_artifact(
     worker_grpc_server = _get_worker_server(ctx.device_id)
     if worker_grpc_server is None:
         raise RuntimeError("P2P worker gRPC server is required for artifact publish")
-    source_roots = tuple(root.source_root for root in transfer.roots)
-    if not any(_has_files(path) for path in source_roots):
+    required_roots = tuple(
+        root.source_root for root in transfer.roots if not root.optional
+    )
+    if not all(_has_files(path) for path in required_roots):
         raise LookupError(
-            f"vLLM artifact sources {transfer.name} are empty or missing: "
-            f"{source_roots}"
+            f"Required vLLM artifact sources {transfer.name} are empty or missing: "
+            f"{required_roots}"
         )
 
     start = time.perf_counter()
@@ -635,7 +637,7 @@ def _has_files(path: Path) -> bool:
     return any(child.is_file() for child in path.rglob("*"))
 
 
-def _vllm_artifact_ready_fn(source_roots: tuple[Path, ...]):
+def _vllm_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
     server_ready = False
     stable_since: float | None = None
     last_signature: tuple[int, int, int] | None = None
@@ -666,12 +668,20 @@ def _vllm_artifact_ready_fn(source_roots: tuple[Path, ...]):
     return ready
 
 
-def _cache_signature(paths: tuple[Path, ...]) -> tuple[int, int, int] | None:
+def _cache_signature(
+    roots: tuple[ArtifactCacheRoot, ...],
+) -> tuple[int, int, int] | None:
+    if not all(
+        _has_files(root.source_root) for root in roots if not root.optional
+    ):
+        return None
+
     count = 0
     total_size = 0
     max_mtime_ns = 0
     try:
-        for path in paths:
+        for root in roots:
+            path = root.source_root
             if not path.is_dir():
                 continue
             for child in path.rglob("*"):

@@ -5,8 +5,8 @@ that have EFA-capable nodes, using the libfabric NIXL backend for GPU-to-GPU
 RDMA over the EFA fabric. Scale the Deployment to N>=2 to demonstrate P2P
 weight transfer between replicas.
 
-The manifest uses `deepseek-ai/DeepSeek-V4-Pro` and requires an EFA-enabled
-Dynamo runtime built with vLLM 0.23.0.
+The manifest uses `deepseek-ai/DeepSeek-V3` and requires an EFA-enabled Dynamo
+runtime with vLLM and ModelExpress installed.
 
 The default NIXL backend (`UCX`) is tuned for InfiniBand and RoCE clusters. On
 AWS EFA, UCX can silently fall back to TCP depending on the libibverbs / EFA
@@ -41,7 +41,7 @@ From the repository root:
 ```bash
 docker build \
   -f examples/p2p_transfer_k8s/client/vllm/aws_efa/Dockerfile \
-  --build-arg DYNAMO_VLLM_EFA_RUNTIME_IMAGE=<efa-runtime-with-vllm-0.23.0> \
+  --build-arg DYNAMO_VLLM_EFA_RUNTIME_IMAGE=<efa-runtime-image> \
   -t <YOUR_REGISTRY>/modelexpress-aws-efa:latest \
   .
 
@@ -49,7 +49,7 @@ docker push <YOUR_REGISTRY>/modelexpress-aws-efa:latest
 ```
 
 Edit the `image:` field in `vllm-aws-efa.yaml` to point at your pushed tag.
-The manifest defaults to `deepseek-ai/DeepSeek-V4-Pro` with
+The manifest defaults to `deepseek-ai/DeepSeek-V3` with
 `--tensor-parallel-size 8` and eight GPUs. If you switch models, update the
 tensor-parallel size and GPU request/limit to match that model.
 
@@ -128,5 +128,4 @@ container sees every EFA NIC on its host node.
 
 The base passed through `DYNAMO_VLLM_EFA_RUNTIME_IMAGE` determines the target
 architecture. Use an amd64 EFA image for AWS EFAv2 H100 instances (`p5.*`) or
-an arm64 EFA image for AWS EFAv3 GB200 instances (`p6e-*`). The wrapper
-Dockerfile rejects images that do not contain vLLM 0.23.0.
+an arm64 EFA image for AWS EFAv3 GB200 instances (`p6e-*`).

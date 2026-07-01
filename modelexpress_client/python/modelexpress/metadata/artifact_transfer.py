@@ -315,7 +315,10 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         root_archives = self._root_archives()
         self._validate_archive_names(root_archives)
         expected_names = {tar_name for tar_name, _ in root_archives}
-        files_by_name = {Path(file.path).name: file for file in header.files}
+        file_names = [Path(file.path).name for file in header.files]
+        if len(set(file_names)) != len(file_names):
+            raise ValueError("artifact bundle files must be unique by archive name")
+        files_by_name = dict(zip(file_names, header.files, strict=True))
         if set(files_by_name) != expected_names:
             raise ValueError(
                 "artifact bundle files do not match configured cache roots: "

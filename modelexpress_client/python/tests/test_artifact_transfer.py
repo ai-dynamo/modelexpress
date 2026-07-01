@@ -522,6 +522,23 @@ def test_extract_tarred_artifact_rejects_unsafe_member(tmp_path):
         transfer.install(header)
 
 
+def test_extract_tarred_artifact_rejects_duplicate_archive_names(tmp_path):
+    transfer = torch_compile_cache_artifact_transfer(
+        tmp_path,
+        tmp_path / "extract",
+        tmp_path / "bundle",
+    )
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(
+        files=[
+            p2p_pb2.ArtifactManifestFile(path="left/artifact.tar"),
+            p2p_pb2.ArtifactManifestFile(path="right/artifact.tar"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unique by archive name"):
+        transfer.install(header)
+
+
 def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, caplog):
     source = tmp_path / "source"
     source.mkdir()

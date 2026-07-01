@@ -17,7 +17,7 @@
 #       --build-arg ENABLE_MODELEXPRESS_P2P=true \
 #       --build-arg MODELEXPRESS_REF=main \
 #       -t <your-tag> .
-ARG DYNAMO_VLLM_RUNTIME_IMAGE
+ARG DYNAMO_VLLM_RUNTIME_IMAGE=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1
 FROM ${DYNAMO_VLLM_RUNTIME_IMAGE}
 
 # Copy and install ModelExpress Python client
