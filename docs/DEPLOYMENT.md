@@ -380,7 +380,7 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM uses `--load-format modelexpress`, which auto-detects whether to load from disk or receive via RDMA; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which auto-detects whether to load from disk or receive via RDMA; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Choosing a Metadata Backend
 
@@ -415,11 +415,11 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange (source workers only). Opt-in on central-coordinator backends. Auto-enabled (and this env var ignored) on backends that declare themselves decentralized, currently `k8s-service`. |
+| `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_READY_URL` | `http://127.0.0.1:8000/health` | Readiness endpoint polled before source workers prepare and publish cache artifact bundles. Kubernetes StatefulSet vLLM worker pods using the default localhost URL infer pod-0's stable DNS endpoint. |
@@ -432,7 +432,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
-| `VLLM_PLUGINS` | - | Set to `modelexpress` to register the `modelexpress` and `mx` loaders |
+| `VLLM_PLUGINS` | - | For vLLM versions older than 0.23.0, set to `modelexpress` to register the `modelexpress` and `mx` loaders. vLLM 0.23.0 and newer recognize the load format natively. |
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
@@ -512,16 +512,16 @@ operations that cross into later handles fail. See the reproducer and
 fix notes in this gist:
 <https://gist.github.com/nicolasnoble/e0e57eb5a1b902057ae3d1df59c039cf>.
 
-### P2P Metadata Exchange (Opt-In)
+### P2P Metadata Exchange
 
-`MX_P2P_METADATA=1` makes source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets also call `PrepareArtifactChunk` and `ReleaseArtifactChunk` on this worker service while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets also call `PrepareArtifactChunk` and `ReleaseArtifactChunk` on this worker service while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
 
-- **Central-coordinator backends (`redis`, `kubernetes`):** opt-in via `MX_P2P_METADATA=1`. By default the source publishes full tensor metadata (NIXL blobs + tensor descriptors) to the central server, and targets fetch the full blob from the server. With the env var set, the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration needed on the target side.
+- **Central-coordinator backends (`redis`, `kubernetes`):** the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Set `MX_P2P_METADATA=0` to publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server instead. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration is needed on the target side.
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
-For vLLM cache artifact transfer, set both `MX_ARTIFACT_TRANSFER=1` and `MX_P2P_METADATA=1` on source and target workers. The loader installs compatible artifacts before model initialization, then schedules publisher threads after successful load. Each publisher waits for readiness before publishing local torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer JIT (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact covers its JIT workspace, not vLLM's separate FlashInfer autotune cache. In multi-pod StatefulSet deployments, non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`).
+For vLLM cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The default P2P metadata path is also required; if it was disabled, set `MX_P2P_METADATA=1`. The loader installs compatible artifacts before model initialization, then schedules publisher threads after successful load. Each publisher waits for readiness before publishing local torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path. In multi-node deployments, artifact metadata records vLLM's `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. StatefulSet non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
 
 Cache artifacts may contain executable code. Transfer checksums detect corruption
 but do not authenticate the publishing replica or attest the artifact. Enable
@@ -539,7 +539,7 @@ All storage backends (S3, GCS, Azure) are included as core dependencies — no e
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_MODEL_URI` | (none) | Model location. Must be set to enable ModelStreamer. Accepts: remote URI (`s3://bucket/model`, `gs://...`, `az://...`), absolute local path (`/models/deepseek-ai/DeepSeek-V3`), or HuggingFace model ID (`deepseek-ai/DeepSeek-V3` — resolved via `HF_HUB_CACHE`). |
+| `MX_MODEL_URI` | (none) | Model location. Must be set to enable ModelStreamer. Accepts: remote URI (`s3://bucket/model`, `gs://...`, `az://...`), absolute local path (`/models/deepseek-ai/DeepSeek-V4-Pro`), or HuggingFace model ID (`deepseek-ai/DeepSeek-V4-Pro` — resolved via `HF_HUB_CACHE`). |
 | `MX_MS_DISTRIBUTED` | `0` | Enable distributed streaming (streams directly to each worker's GPU). Requires tensor parallelism > 1 and a CUDA-capable platform. Set to `1` to activate. |
 | `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
 | `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). See [runai-model-streamer docs](https://github.com/run-ai/model-streamer). |
@@ -750,7 +750,7 @@ kubectl -n $NAMESPACE get modelcacheentries   # model registry (lifecycle state,
 # Test inference
 kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "deepseek-ai/DeepSeek-V3", "prompt": "Hello", "max_tokens": 10}'
+  -d '{"model": "deepseek-ai/DeepSeek-V4-Pro", "prompt": "Hello", "max_tokens": 10}'
 ```
 
 ## Performance Reference

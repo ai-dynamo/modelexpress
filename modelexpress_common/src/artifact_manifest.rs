@@ -170,6 +170,7 @@ impl SealedArtifactManifest {
             file_count: u32::try_from(self.manifest.files.len())
                 .context("artifact manifest file count exceeds u32")?,
             chunk_count: self.manifest.chunk_count()?,
+            node_rank: 0,
         })
     }
 

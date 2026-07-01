@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Single-node vLLM deployment on AWS EFA with the libfabric NIXL backend
-# and P2P metadata exchange. Same shape as vllm-single-node-p2p.yaml,
+# Single-node vLLM deployment on AWS EFA with the libfabric NIXL backend.
+# Same shape as ../vllm-single-node.yaml,
 # with the EFA-specific delta:
 #   - vpc.amazonaws.com/efa resource for the AWS EFA device plugin
 #   - MX_NIXL_BACKEND=LIBFABRIC selects the libfabric NIXL plugin; the
@@ -65,14 +65,15 @@ spec:
             - name: VLLM_RPC_TIMEOUT
               value: "7200000"
             - name: MODEL_NAME
-              value: "deepseek-ai/DeepSeek-V3"
-            - name: VLLM_PLUGINS
-              value: "modelexpress"
+              value: "deepseek-ai/DeepSeek-V4-Pro"
+            # vLLM 0.23.0 recognizes --load-format modelexpress natively. For
+            # older vLLM versions, add:
+            # - name: VLLM_PLUGINS
+            #   value: "modelexpress"
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
-            # P2P metadata exchange: source workers serve NIXL metadata and
-            # tensor manifests directly to targets instead of via the server.
-            - name: MX_P2P_METADATA
+            # Transfer compatible vLLM JIT caches after the source is healthy.
+            - name: MX_ARTIFACT_TRANSFER
               value: "1"
             # Fixed ports for NIXL listen thread and worker gRPC server.
             - name: MX_METADATA_PORT
@@ -118,6 +119,8 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "8"
+            - --kv-cache-dtype
+            - fp8
           ports:
             - name: http
               containerPort: 8000

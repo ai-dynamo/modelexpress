@@ -158,6 +158,9 @@ message ArtifactSourceMetadata {
 
   // Number of transfer chunks in the sealed artifact manifest.
   uint32 chunk_count = 4;
+
+  // Distributed node rank that owns this node-scoped artifact.
+  uint32 node_rank = 5;
 }
 
 // Tensor source payload for the source_payload migration. Writers populate this
@@ -265,7 +268,7 @@ message WorkerMetadata {
   // Timestamp of last status update (unix millis)
   int64 updated_at = 5;
 
-  // P2P metadata exchange fields (opt-in via MX_P2P_METADATA=1).
+  // P2P metadata exchange fields (disable via MX_P2P_METADATA=0).
   // When populated, targets fetch NIXL metadata and tensor manifests
   // directly from the source worker instead of from the central server.
 

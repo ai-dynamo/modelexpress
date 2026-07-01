@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Single-node vLLM deployment with ModelExpress P2P weight transfer.
-# Deploys Llama-3.1-405B-Instruct on 1 node (8 GPUs, TP=8).
+# Single-node vLLM deployment with ModelExpress P2P weight and cache transfer.
+# Deploys DeepSeek-V4-Pro on 1 node (8 GPUs, TP=8).
 #
 # Prerequisites:
 #   - ModelExpress server deployed (see ../../server/)
@@ -14,6 +14,7 @@
 #   - If no source is available -> load weights from disk
 # Either way, the node registers with NIXL and publishes metadata so
 # future nodes can discover it as a source.
+# P2P metadata is enabled by default; set MX_P2P_METADATA=0 to disable it.
 apiVersion: v1
 kind: Service
 metadata:
@@ -63,13 +64,13 @@ spec:
             - name: HF_HUB_CACHE
               value: "/models"
             - name: MODEL_NAME
-              value: "meta-llama/Llama-3.1-405B-Instruct"
-            # Register ModelExpress loaders via vLLM plugin system
-            - name: VLLM_PLUGINS
-              value: "modelexpress"
+              value: "deepseek-ai/DeepSeek-V4-Pro"
             # Server address for metadata publishing
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
+            # Transfer compatible vLLM JIT caches after the source is healthy.
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
@@ -106,6 +107,8 @@ spec:
             - modelexpress
             - --tensor-parallel-size
             - "8"
+            - --kv-cache-dtype
+            - fp8
           resources:
             limits:
               nvidia.com/gpu: "8"

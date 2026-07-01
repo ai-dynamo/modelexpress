@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     TILELANG_CACHE_DIR: Optional[str]
     CUTE_DSL_CACHE_DIR: Optional[str]
     FLASHINFER_WORKSPACE_BASE: Optional[str]
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: Optional[str]
     VLLM_CACHE_ROOT: Optional[str]
     # Other third-party / system
     VLLM_ATTENTION_BACKEND: str
@@ -144,7 +145,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
-    "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", ""),
+    "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
@@ -188,6 +189,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TILELANG_CACHE_DIR": lambda: os.environ.get("TILELANG_CACHE_DIR"),
     "CUTE_DSL_CACHE_DIR": lambda: os.environ.get("CUTE_DSL_CACHE_DIR"),
     "FLASHINFER_WORKSPACE_BASE": lambda: os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+    "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.environ.get(
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
+    ),
     "VLLM_CACHE_ROOT": lambda: os.environ.get("VLLM_CACHE_ROOT"),
     # ── Other third-party / system ─────────────────────────────────────────
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),

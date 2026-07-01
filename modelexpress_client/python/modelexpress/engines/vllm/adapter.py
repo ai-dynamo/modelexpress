@@ -307,6 +307,7 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
+        node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

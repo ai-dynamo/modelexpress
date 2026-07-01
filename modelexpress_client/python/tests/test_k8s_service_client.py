@@ -100,10 +100,11 @@ def test_is_p2p_metadata_enabled_forced_by_k8s_service_client(monkeypatch):
     assert _is_p2p_metadata_enabled(MxK8sServiceClient()) is True
 
 
-def test_is_p2p_metadata_enabled_mx_client_honors_env_var(monkeypatch):
-    # MxClient has no REQUIRES_P2P_METADATA, so env var is the source of truth.
+def test_is_p2p_metadata_enabled_mx_client_defaults_on_and_honors_env_var(
+    monkeypatch,
+):
     monkeypatch.delenv("MX_P2P_METADATA", raising=False)
-    assert _is_p2p_metadata_enabled(MxClient()) is False
+    assert _is_p2p_metadata_enabled(MxClient()) is True
 
     monkeypatch.setenv("MX_P2P_METADATA", "0")
     assert _is_p2p_metadata_enabled(MxClient()) is False

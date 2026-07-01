@@ -17,6 +17,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
         "VLLM_ATTENTION_BACKEND",
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "MODEL_EXPRESS_URL",
         "MX_SERVER_ADDRESS",
         "MX_GDS_TIMEOUT",
@@ -31,6 +32,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is False
     assert envs.VLLM_ATTENTION_BACKEND == "auto"
+    assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR is None
     assert envs.MODEL_EXPRESS_URL is None
     assert envs.MX_SERVER_ADDRESS is None
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
@@ -89,6 +91,8 @@ def test_raw_optional_passthrough(monkeypatch):
     # Raw string; artifact_manifest owns the parse/validation.
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER_CHUNK_SIZE", "12345")
     assert envs.MX_ARTIFACT_TRANSFER_CHUNK_SIZE == "12345"
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", "/tmp/flashinfer-autotune")
+    assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR == "/tmp/flashinfer-autotune"
 
 
 def test_is_set(monkeypatch):
