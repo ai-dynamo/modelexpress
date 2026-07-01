@@ -57,7 +57,7 @@ Client CLI arguments are defined in a shared struct to avoid duplication:
 
 1. **Add to `ClientArgs`** in `modelexpress_common/src/client_config.rs`
    - Single source of truth for shared arguments
-   - Use `#[arg(long, env = "MODEL_EXPRESS_...")]` for environment variable support
+   - Register the variable name in `modelexpress_common/src/envs.rs` and reference the constant: `#[arg(long, env = crate::envs::MODEL_EXPRESS_...)]` (never a bare string literal, so the CLI and the `envs` getters cannot drift). All env-var names live in `modelexpress_common/src/envs.rs` (Rust) and `modelexpress/envs.py` (Python).
    - Do NOT use `-v` short flag (reserved for CLI's verbose)
 
 2. **Update `ClientConfig::load()`** in the same file

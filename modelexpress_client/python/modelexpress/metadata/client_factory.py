@@ -23,8 +23,8 @@ Supported values:
 from __future__ import annotations
 
 import logging
-import os
 
+from .. import envs
 from ..client import MxClient, MxClientBase
 from ..dht_client import MxDhtClient
 from .k8s_service_client import MxK8sServiceClient
@@ -48,7 +48,7 @@ def create_metadata_client(
     specific endpoint (:class:`MxK8sServiceClient`, :class:`MxDhtClient`);
     others ignore it.
     """
-    backend = os.environ.get("MX_METADATA_BACKEND", "").lower().strip()
+    backend = envs.MX_METADATA_BACKEND
     if backend in _CENTRAL_BACKEND_ALIASES:
         logger.debug("create_metadata_client: central MxClient (backend=%r)", backend)
         return MxClient(server_url=server_url)

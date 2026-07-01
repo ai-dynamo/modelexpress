@@ -90,10 +90,27 @@ inputs:
       Catches silent TP collapse and rank-pairing regressions.
     required: false
     default: '1'
+  dp_size:
+    description: |
+      Data-parallel size of the target deployment. Forwarded to pytest as
+      --dp-size. DP replicas are interchangeable copies at the same
+      worker_rank, so the per-rank agent assertion accepts a distinct-agent
+      count in [tp_size, tp_size * dp_size] instead of exactly tp_size.
+      Defaults to 1 (pure TP / single copy).
+    required: false
+    default: '1'
   measure_vram:
     description: 'When true, sample source/target VRAM and enable the pytest VRAM parity assertions.'
     required: false
     default: 'false'
+  expected_artifact_sources:
+    description: 'Number of ready non-weight artifact ModelMetadata CRs expected before target starts.'
+    required: false
+    default: '0'
+  expected_artifact_source_types:
+    description: 'Comma-separated non-weight artifact sourceType values expected by pytest.'
+    required: false
+    default: ''
 runs:
   using: "composite"
   steps:
@@ -133,7 +150,7 @@ runs:
         echo "::group::Create worker-registry pull secret"
         # docker-server is hardcoded to nvcr.io so this single secret
         # authenticates ALL nvcr.io images — both the team's worker images
-        # (nvcr.io/nvidian/...) and the public base images (nvcr.io/nvidia/...).
+        # (nvcr.io/0980761089281446/...) and the public base images (nvcr.io/nvidia/...).
         # Replaces the previous two-secret setup (worker-registry + ngc-registry).
         kubectl create secret docker-registry worker-registry \
           --docker-server="nvcr.io" \
@@ -208,12 +225,53 @@ runs:
         TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
         TP_SIZE: ${{ inputs.tp_size }}
         MEASURE_VRAM: ${{ inputs.measure_vram }}
+        EXPECTED_ARTIFACT_SOURCES: ${{ inputs.expected_artifact_sources }}
       run: |
         [[ "${TP_SIZE}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: tp_size must be a positive integer, got '${TP_SIZE}'"; exit 1; }
         [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: pod_ready_timeout_seconds must be a positive integer, got '${TIMEOUT}'"; exit 1; }
         [[ "${MEASURE_VRAM}" == "true" || "${MEASURE_VRAM}" == "false" ]] || { echo "ERROR: measure_vram must be 'true' or 'false', got '${MEASURE_VRAM}'"; exit 1; }
+        [[ "${EXPECTED_ARTIFACT_SOURCES}" =~ ^[0-9]+$ ]] || { echo "ERROR: expected_artifact_sources must be a non-negative integer, got '${EXPECTED_ARTIFACT_SOURCES}'"; exit 1; }
         source .github/actions/run-mx-p2p-test/vram-sampling.sh
-        echo "::group::Wait for source to publish ${TP_SIZE} ModelMetadata CR(s)"
+        count_ready_artifact_sources() {
+          kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{" "}{.status.worker.status}{" "}{.status.worker.artifactSource.artifactId}{"\n"}{end}' 2>/dev/null \
+            | awk '$1 != "weights" && $2 == "Ready" && $3 != "" { count++ } END { print count + 0 }'
+        }
+        count_weight_sources() {
+          kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null \
+            | awk '$1 == "weights" { count++ } END { print count + 0 }'
+        }
+        wait_for_artifact_sources() {
+          local expected="$1"
+          local deadline=$((SECONDS + TIMEOUT))
+
+          echo "Source is healthy; wait for ${expected} artifact ModelMetadata CR(s)."
+          while [ $SECONDS -lt $deadline ]; do
+            local count
+            count=$(count_ready_artifact_sources)
+            if [ "${count}" -ge "${expected}" ]; then
+              echo "Source published ${count}/${expected} artifact ModelMetadata CR(s)."
+              return 0
+            fi
+            local failed
+            failed=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
+              | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
+            if [ -n "${failed}" ]; then
+              echo "ERROR: source pod failed before publishing artifact metadata: ${failed}"
+              return 1
+            fi
+            echo "Have ${count}/${expected} artifact ModelMetadata CRs, retrying in 5s..."
+            sleep 5
+          done
+
+          local final
+          final=$(count_ready_artifact_sources)
+          if [ "${final}" -lt "${expected}" ]; then
+            echo "ERROR: source published only ${final}/${expected} artifact ModelMetadata CRs within ${TIMEOUT}s"
+            kubectl get modelmetadata -n ${NAMESPACE} -o wide 2>&1 || true
+            return 1
+          fi
+        }
+        echo "::group::Wait for source to publish ${TP_SIZE} weight ModelMetadata CR(s)"
         # Wait for one CR per source rank. Under TP=N each rank publishes
         # its own ModelMetadata CR (worker_rank=0..N-1), and the target's
         # rdma_strategy filters source candidates by matching worker_rank.
@@ -234,9 +292,9 @@ runs:
             sample_peak_vram "Source" "job-name=mx-source" "mx-source" \
               SOURCE_POD SOURCE_PEAK_VRAM_MIB SOURCE_VRAM_SAMPLES SOURCE_FINAL_VRAM_MIB
           fi
-          CR_COUNT=$(kubectl get modelmetadata -n ${NAMESPACE} --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          CR_COUNT=$(count_weight_sources)
           if [ "${CR_COUNT}" -ge "${TP_SIZE}" ]; then
-            echo "Source published ${CR_COUNT}/${TP_SIZE} ModelMetadata CRs."
+            echo "Source published ${CR_COUNT}/${TP_SIZE} weight ModelMetadata CRs."
             break
           fi
           FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
@@ -245,7 +303,7 @@ runs:
             echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
             exit 1
           fi
-          echo "Have ${CR_COUNT}/${TP_SIZE} ModelMetadata CRs, retrying in 5s..."
+          echo "Have ${CR_COUNT}/${TP_SIZE} weight ModelMetadata CRs, retrying in 5s..."
           sleep 5
         done
         # The loop exits without error when the deadline fires. Without this
@@ -253,9 +311,9 @@ runs:
         # a namespace that has fewer CRs than required and the test would
         # fail downstream with a confusing "no source worker for rank N"
         # error instead of the actual root cause.
-        FINAL=$(kubectl get modelmetadata -n ${NAMESPACE} --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        FINAL=$(count_weight_sources)
         if [ "${FINAL}" -lt "${TP_SIZE}" ]; then
-          echo "ERROR: source published only ${FINAL}/${TP_SIZE} ModelMetadata CRs within ${TIMEOUT}s"
+          echo "ERROR: source published only ${FINAL}/${TP_SIZE} weight ModelMetadata CRs within ${TIMEOUT}s"
           exit 1
         fi
         if [ "${MEASURE_VRAM}" = "true" ]; then
@@ -271,6 +329,9 @@ runs:
           echo "Source published metadata; wait until source /health returns 200."
           wait_for_health "Source" "job-name=mx-source" "mx-source" \
             "${SOURCE_PORT}" SOURCE_POD "${TIMEOUT}" " after metadata publish"
+        fi
+        if [ "${EXPECTED_ARTIFACT_SOURCES}" -gt 0 ]; then
+          wait_for_artifact_sources "${EXPECTED_ARTIFACT_SOURCES}"
         fi
         echo "::endgroup::"
 
@@ -371,7 +432,10 @@ runs:
         WORKER_PORT: ${{ inputs.worker_port }}
         TEST_SCRIPT: ${{ inputs.test_script }}
         TP_SIZE: ${{ inputs.tp_size }}
+        DP_SIZE: ${{ inputs.dp_size }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
+        EXPECTED_ARTIFACT_SOURCES: ${{ inputs.expected_artifact_sources }}
+        EXPECTED_ARTIFACT_SOURCE_TYPES: ${{ inputs.expected_artifact_source_types }}
       run: |
         # Parse PYTEST_ARGS via shlex so values with internal spaces
         # (e.g. --p2p-marker 'TRT-LLM marker with spaces') are honored,
@@ -382,12 +446,22 @@ runs:
             python3 -c 'import shlex,sys; [sys.stdout.buffer.write(a.encode()+b"\0") for a in shlex.split(sys.argv[1])]' "${PYTEST_ARGS}"
           )
         fi
+        if [ "${EXPECTED_ARTIFACT_SOURCES}" != "0" ] || [ -n "${EXPECTED_ARTIFACT_SOURCE_TYPES}" ]; then
+          EXTRA+=(--require-artifact-transfer)
+        fi
+        if [ "${EXPECTED_ARTIFACT_SOURCES}" != "0" ]; then
+          EXTRA+=(--expected-artifact-sources "${EXPECTED_ARTIFACT_SOURCES}")
+        fi
+        if [ -n "${EXPECTED_ARTIFACT_SOURCE_TYPES}" ]; then
+          EXTRA+=(--expected-artifact-source-types "${EXPECTED_ARTIFACT_SOURCE_TYPES}")
+        fi
         pytest "${TEST_SCRIPT}" -v \
           --namespace "${NAMESPACE}" \
           --model "${MX_CI_MODEL}" \
           --source-port "${SOURCE_PORT}" \
           --worker-port "${WORKER_PORT}" \
           --tp-size "${TP_SIZE}" \
+          --dp-size "${DP_SIZE}" \
           "${EXTRA[@]}"
 
     - name: Dump pod logs

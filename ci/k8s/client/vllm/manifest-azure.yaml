@@ -115,6 +115,12 @@ spec:
               value: "0"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
+            - name: MX_P2P_METADATA
+              value: "1"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:${WORKER_PORT}/health"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH
