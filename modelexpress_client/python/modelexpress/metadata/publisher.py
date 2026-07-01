@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
+
+from .. import envs
 
 if TYPE_CHECKING:
     from ..client import MxClient
@@ -86,12 +87,7 @@ class PublisherThread:
         self._publish_timeout = (
             publish_timeout_secs
             if publish_timeout_secs is not None
-            else int(
-                os.environ.get(
-                    "MX_PUBLISH_TIMEOUT_SECS",
-                    str(PUBLISH_TIMEOUT_SECS_DEFAULT),
-                )
-            )
+            else envs.MX_PUBLISH_TIMEOUT_SECS
         )
         self._publish_started_at: float | None = None
         self._publish_given_up = False
@@ -100,7 +96,7 @@ class PublisherThread:
         self._interval = (
             interval_secs
             if interval_secs is not None
-            else int(os.environ.get("MX_HEARTBEAT_INTERVAL_SECS", "30"))
+            else envs.MX_HEARTBEAT_INTERVAL_SECS
         )
         self._stop_event = threading.Event()
         self._status_lock = threading.Lock()

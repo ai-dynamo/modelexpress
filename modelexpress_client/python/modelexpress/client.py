@@ -13,11 +13,11 @@ registered by the owning process for GPUDirect RDMA.
 """
 
 import logging
-import os
 from abc import ABC, abstractmethod
 
 import grpc
 
+from . import envs
 from . import p2p_pb2
 from . import p2p_pb2_grpc
 
@@ -101,10 +101,11 @@ def _get_server_url(explicit_url: str | None = None) -> str:
     """
     if explicit_url:
         return _parse_server_address(explicit_url)
-    url = os.environ.get(
-        "MODEL_EXPRESS_URL",
-        os.environ.get("MX_SERVER_ADDRESS", "localhost:8001"),
-    )
+    url = envs.MODEL_EXPRESS_URL
+    if url is None:
+        url = envs.MX_SERVER_ADDRESS
+        if url is None:
+            url = "localhost:8001"
     return _parse_server_address(url)
 
 

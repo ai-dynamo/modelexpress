@@ -22,6 +22,7 @@ from typing import Iterator
 
 import torch
 
+from ... import envs
 from ... import p2p_pb2
 from ...load_strategy.base import (
     _init_nixl_manager,
@@ -45,17 +46,9 @@ from ...nixl_transfer import is_nixl_available
 
 logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
 
-_ENABLE_ENV = "MX_ARTIFACT_TRANSFER"
-_BUNDLE_ROOT_ENV = "MX_ARTIFACT_BUNDLE_ROOT"
-_COMPILE_CONFIG_DIGEST_ENV = "MX_ARTIFACT_COMPILE_CONFIG_DIGEST"
-_DEEP_GEMM_CACHE_DIR_ENV = "DEEP_GEMM_CACHE_DIR"
-_DG_JIT_CACHE_DIR_ENV = "DG_JIT_CACHE_DIR"
-_READY_URL_ENV = "MX_ARTIFACT_READY_URL"
-_READY_TIMEOUT_ENV = "MX_ARTIFACT_READY_TIMEOUT_SECS"
 _DEFAULT_READY_URL = "http://127.0.0.1:8000/health"
 _READY_POLL_SECS = 5
 _CACHE_SETTLE_SECS = 5
-_TRUTHY = {"1", "true", "yes", "on"}
 
 _published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
 _scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
@@ -166,7 +159,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
                 _publish_vllm_cache_artifact(ctx, transfer, identity).endpoint.mx_source_id
             ),
             ready_fn=_vllm_artifact_ready_fn(transfer.source_root),
-            publish_timeout_secs=_ready_timeout_secs(),
+            publish_timeout_secs=envs.MX_ARTIFACT_READY_TIMEOUT_SECS,
             interval_secs=_READY_POLL_SECS,
             heartbeat_after_publish=False,
             cleanup_fn=lambda marker_path=marker_path, publisher_ref=publisher_ref: (
@@ -286,7 +279,7 @@ def _publish_vllm_cache_artifact(
 
 
 def _artifact_transfer_enabled() -> bool:
-    return os.environ.get(_ENABLE_ENV, "").strip().lower() in _TRUTHY
+    return envs.MX_ARTIFACT_TRANSFER
 
 
 def _artifact_source_worker_id(
@@ -360,7 +353,7 @@ def _p2p_metadata_enabled_for_artifacts(ctx: LoadContext) -> bool:
 def _ensure_nixl_manager(ctx: LoadContext) -> None:
     if ctx.nixl_manager is not None:
         return
-    base_port = _env_int("MX_METADATA_PORT", 5555)
+    base_port = envs.MX_METADATA_PORT
     try:
         ctx.nixl_manager = _init_nixl_manager(
             ctx.global_rank,
@@ -433,30 +426,28 @@ def _torch_compile_cache_root() -> Path:
 
 
 def _triton_cache_root() -> Path:
-    configured = os.environ.get("TRITON_CACHE_DIR")
+    configured = envs.TRITON_CACHE_DIR
     if configured:
         return Path(configured)
     return Path.home() / ".triton" / "cache"
 
 
 def _deep_gemm_cache_root() -> Path:
-    configured = os.environ.get(_DG_JIT_CACHE_DIR_ENV) or os.environ.get(
-        _DEEP_GEMM_CACHE_DIR_ENV
-    )
+    configured = envs.DG_JIT_CACHE_DIR or envs.DEEP_GEMM_CACHE_DIR
     if configured:
         return Path(configured)
     return _vllm_cache_root() / "deep_gemm"
 
 
 def _tilelang_cache_root() -> Path:
-    configured = os.environ.get("TILELANG_CACHE_DIR")
+    configured = envs.TILELANG_CACHE_DIR
     if configured:
         return Path(configured)
     return Path.home() / ".tilelang" / "cache"
 
 
 def _cute_dsl_cache_root() -> Path:
-    configured = os.environ.get("CUTE_DSL_CACHE_DIR")
+    configured = envs.CUTE_DSL_CACHE_DIR
     if configured:
         return Path(configured)
     try:
@@ -467,21 +458,21 @@ def _cute_dsl_cache_root() -> Path:
 
 
 def _flashinfer_cache_root() -> Path:
-    workspace_base = os.environ.get("FLASHINFER_WORKSPACE_BASE")
+    workspace_base = envs.FLASHINFER_WORKSPACE_BASE
     if workspace_base:
         return Path(workspace_base) / ".cache" / "flashinfer"
     return Path.home() / ".cache" / "flashinfer"
 
 
 def _vllm_cache_root() -> Path:
-    configured = os.environ.get("VLLM_CACHE_ROOT")
+    configured = envs.VLLM_CACHE_ROOT
     if configured:
         return Path(configured)
     return Path.home() / ".cache" / "vllm"
 
 
 def _bundle_root(ctx: LoadContext) -> Path:
-    configured = os.environ.get(_BUNDLE_ROOT_ENV)
+    configured = envs.MX_ARTIFACT_BUNDLE_ROOT
     if configured:
         return Path(configured) / f"rank-{ctx.worker_rank}"
     return (
@@ -528,7 +519,7 @@ def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         cuda_version=torch.version.cuda or "",
         triton_version=_triton_version(),
         gpu_arch=_gpu_arch(ctx.device_id),
-        compile_config_digest=os.environ.get(_COMPILE_CONFIG_DIGEST_ENV, ""),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "triton_key", _triton_key())
     return identity
@@ -673,13 +664,13 @@ def _vllm_health_ready() -> bool:
 
 
 def _vllm_health_url() -> str:
-    configured = os.environ.get(_READY_URL_ENV, "").strip()
+    configured = envs.MX_ARTIFACT_READY_URL.strip()
     fallback = _statefulset_head_health_url() or _DEFAULT_READY_URL
     if not configured or configured == _DEFAULT_READY_URL:
         return fallback
     if _is_http_url(configured):
         return configured
-    logger.warning("Invalid %s=%r; using %s", _READY_URL_ENV, configured, fallback)
+    logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, fallback)
     return fallback
 
 
@@ -689,29 +680,14 @@ def _is_http_url(url: str) -> bool:
 
 
 def _statefulset_head_health_url() -> str | None:
-    pod_name, _, ordinal = os.environ.get("HOSTNAME", "").rpartition("-")
+    pod_name, _, ordinal = envs.HOSTNAME.rpartition("-")
     if not pod_name or not ordinal.isdigit() or ordinal == "0":
         return None
-    namespace = os.environ.get("POD_NAMESPACE", "").strip()
+    namespace = envs.POD_NAMESPACE.strip()
     host = f"{pod_name}-0.{pod_name}"
     if namespace:
         host = f"{host}.{namespace}.svc"
     return f"http://{host}:8000/health"
-
-
-def _ready_timeout_secs() -> int:
-    return _env_int(_READY_TIMEOUT_ENV, 1800)
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
-        return default
 
 
 def _vllm_version() -> str:

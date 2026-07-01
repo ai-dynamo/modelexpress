@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import os
 from typing import Iterator
 
 import torch
 
+from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
@@ -26,7 +26,7 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
 def _resolve_model_uri(ctx: LoadContext) -> str:
     """Resolve the model URI used by ModelStreamer across engine configs."""
-    if model_uri := os.environ.get("MX_MODEL_URI"):
+    if model_uri := envs.MX_MODEL_URI:
         return model_uri
     for attr in ("model_weights", "model", "model_path"):
         value = getattr(ctx.model_config, attr, None)
@@ -58,7 +58,7 @@ class ModelStreamerStrategy(LoadStrategy):
             )
             return False
 
-        model_uri = os.environ.get("MX_MODEL_URI", "")
+        model_uri = envs.MX_MODEL_URI or ""
         if not model_uri:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"

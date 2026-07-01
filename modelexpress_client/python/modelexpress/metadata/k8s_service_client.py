@@ -41,11 +41,11 @@ object is the source list, maintained by K8s based on pod readiness.
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 import grpc
 
+from .. import envs
 from .. import p2p_pb2
 from .payload import tensor_source_metadata
 from .. import p2p_pb2_grpc
@@ -78,16 +78,14 @@ class MxK8sServiceClient(MxClientBase):
         backoff_seconds: float | None = None,
     ):
         self._worker_rank = worker_rank
-        self._service_pattern = service_pattern or os.environ.get(
-            "MX_K8S_SERVICE_PATTERN", _DEFAULT_SERVICE_PATTERN,
-        )
-        env_retries = os.environ.get("MX_K8S_SOURCE_RETRIES", "")
+        self._service_pattern = service_pattern or envs.MX_K8S_SERVICE_PATTERN
+        env_retries = envs.MX_K8S_SOURCE_RETRIES
         self._max_retries = (
             max_retries if max_retries is not None
             else int(env_retries) if env_retries
             else _DEFAULT_MAX_RETRIES
         )
-        env_backoff = os.environ.get("MX_K8S_SOURCE_BACKOFF_SECONDS", "")
+        env_backoff = envs.MX_K8S_SOURCE_BACKOFF_SECONDS
         self._backoff_seconds = (
             backoff_seconds if backoff_seconds is not None
             else float(env_backoff) if env_backoff
@@ -313,7 +311,5 @@ class MxK8sServiceClient(MxClientBase):
         resolved = self._service_pattern.format(rank=self._worker_rank)
         if ":" in resolved:
             return resolved
-        base_port = int(
-            os.environ.get("MX_WORKER_GRPC_PORT", str(_DEFAULT_WORKER_GRPC_PORT)),
-        )
+        base_port = envs.MX_WORKER_GRPC_PORT
         return f"{resolved}:{base_port + self._worker_rank}"

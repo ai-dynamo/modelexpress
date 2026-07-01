@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from . import envs
 from . import ucx_utils
 from .accelerators import (
     AcceleratorBackend,
@@ -59,7 +60,7 @@ def _resolve_nixl_backend() -> str:
 
     Defaults to UCX. Set MX_NIXL_BACKEND=LIBFABRIC on AWS EFA.
     """
-    raw = os.environ.get("MX_NIXL_BACKEND", DEFAULT_NIXL_BACKEND).strip().upper()
+    raw = envs.MX_NIXL_BACKEND
     if raw not in SUPPORTED_NIXL_BACKENDS:
         raise ValueError(
             f"MX_NIXL_BACKEND={raw!r} is not supported. "
@@ -74,7 +75,7 @@ def _pool_reg_enabled() -> bool:
     MX_POOL_REG=1 enables it; default is per-tensor registration. Read at
     call time so tests can toggle the env var without re-importing.
     """
-    return os.environ.get("MX_POOL_REG", "0") == "1"
+    return envs.MX_POOL_REG
 
 
 class NixlTransferManager:
@@ -150,8 +151,8 @@ class NixlTransferManager:
         # Let UCX auto-detect transports (RoCE, TCP, etc).
         # OMPI_MCA_pml=ob1 keeps MPI on TCP independently.
         # Only override UCX_TLS if explicitly set to "tcp" (legacy compat).
-        saved_ucx_tls = os.environ.get("UCX_TLS")
-        nixl_ucx_tls = os.environ.get("NIXL_UCX_TLS")
+        saved_ucx_tls = envs.UCX_TLS
+        nixl_ucx_tls = envs.NIXL_UCX_TLS
         if nixl_ucx_tls:
             os.environ["UCX_TLS"] = nixl_ucx_tls
             logger.info(f"NIXL UCX_TLS override: {nixl_ucx_tls} (was: {saved_ucx_tls})")
@@ -187,7 +188,7 @@ class NixlTransferManager:
         finally:
             if saved_ucx_tls is not None:
                 os.environ["UCX_TLS"] = saved_ucx_tls
-            elif "UCX_TLS" in os.environ:
+            elif envs.is_set("UCX_TLS"):
                 os.environ.pop("UCX_TLS")
 
     def _build_tensor_descriptors(

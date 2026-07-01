@@ -8,11 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 
 import google_crc32c
 
+from .. import envs
 from .. import p2p_pb2
 
 ARTIFACT_MANIFEST_VERSION = 1
@@ -80,7 +80,7 @@ def build_artifact_manifest(
 def artifact_transfer_chunk_size(
     default: int = DEFAULT_ARTIFACT_TRANSFER_CHUNK_SIZE,
 ) -> int:
-    raw = os.environ.get(MX_ARTIFACT_TRANSFER_CHUNK_SIZE_ENV)
+    raw = envs.MX_ARTIFACT_TRANSFER_CHUNK_SIZE
     if raw is None:
         return default
     try:

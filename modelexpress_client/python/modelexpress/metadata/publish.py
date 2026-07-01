@@ -6,13 +6,13 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING
 
 import grpc
 import torch
 
+from .. import envs
 from .publisher import PublisherThread
 from .payload import tensor_source_metadata
 from ..client import MxClient
@@ -86,7 +86,7 @@ def _resolve_model_revision(model_config) -> str:
        identity fields only, and decentralized deployments lose the
        bit-identical guarantee).
     """
-    override = os.environ.get("MX_MODEL_REVISION", "")
+    override = envs.MX_MODEL_REVISION
     if override:
         return override
     revision = getattr(model_config, "revision", None)
@@ -139,7 +139,7 @@ def publish_metadata_and_ready(
 
         host = _get_worker_host()
 
-        grpc_base = int(os.environ.get("MX_WORKER_GRPC_PORT", "6555"))
+        grpc_base = envs.MX_WORKER_GRPC_PORT
         worker_grpc_port = grpc_base + device_id
 
         grpc_server = WorkerGrpcServer(
@@ -268,7 +268,7 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
     # (and any other non-literal truthy value) doesn't accidentally
     # force the P2P path in tests or misconfigured clients.
     if getattr(mx_client, "REQUIRES_P2P_METADATA", False) is True:
-        env_value = os.environ.get("MX_P2P_METADATA", "")
+        env_value = envs.MX_P2P_METADATA
         if env_value not in ("", "1"):
             logger.warning(
                 "MX_P2P_METADATA=%r is ignored for backend %s which "
@@ -276,7 +276,7 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
                 env_value, type(mx_client).__name__,
             )
         return True
-    return os.environ.get("MX_P2P_METADATA", "0") == "1"
+    return envs.MX_P2P_METADATA == "1"
 
 
 def _get_worker_host() -> str:
@@ -286,7 +286,7 @@ def _get_worker_host() -> str:
     Falls back to FQDN. Rejects localhost variants.
     """
     import socket
-    explicit = os.environ.get("MX_WORKER_HOST", "")
+    explicit = envs.MX_WORKER_HOST
     if explicit:
         return explicit
     try:
