@@ -653,8 +653,13 @@ jobs:
           source_port: ${{ matrix.source_port }}
           worker_port: ${{ matrix.worker_port }}
           # tp_size omitted — defaults to 1. DP cores are full, interchangeable
-          # copies at worker_rank 0; the source publishes one CR and the target
-          # pulls a single rank-0 weight set per DP core.
+          # copies at worker_rank 0, so each DP core publishes its own rank-0
+          # source agent and the target's DP cores each select one at random.
+          # dp_size=2 widens the per-rank agent assertion to [tp_size,
+          # tp_size*dp_size] = [1, 2]: the two target cores may converge on one
+          # source (1 distinct agent) or split across both (2), both valid. The
+          # source_ranks == range(tp_size) check still pins rank pairing to 0.
+          dp_size: "2"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()

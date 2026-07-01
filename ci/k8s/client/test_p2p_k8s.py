@@ -6,8 +6,10 @@
 Runs after the workflow has applied the source and target Jobs and both pods
 have reached Running state.  Asserts:
   1. Target pod logs contain the framework-specific P2P transfer marker (--p2p-marker).
-  2. Target connected to `--tp-size` distinct source NIXL agents covering ranks
-     0..tp_size-1 (catches TP collapse and source-rank-pairing regressions).
+  2. Target connected to source NIXL agents covering ranks 0..tp_size-1, with a
+     distinct-agent count in [tp_size, tp_size * dp_size] (catches TP collapse
+     and source-rank-pairing regressions; the range accommodates interchangeable
+     DP replicas that share a rank — see --dp-size).
   3. Both source and target servers respond to /v1/completions — confirms weights
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
@@ -20,6 +22,7 @@ Invoked by the workflow as:
       --source-port $SOURCE_PORT \
       --worker-port $WORKER_PORT \
       --tp-size $TP_SIZE \
+      [--dp-size $DP_SIZE] \
       [--p2p-marker "framework-specific transfer complete string"]
 
 --p2p-marker defaults:
@@ -28,6 +31,11 @@ Invoked by the workflow as:
 
 --tp-size default is 1 — every existing TP=1 P2P test still asserts exactly
 one source agent, which is the correct expectation and adds a free safety net.
+
+--dp-size default is 1 — with a single copy per rank the accepted range
+collapses to exactly tp_size, so TP-only jobs are unaffected. Set it to the
+target's data-parallel size (e.g. 2 for the DP=2 job) so the range widens to
+[tp_size, tp_size * dp_size] for the interchangeable replicas DP publishes.
 """
 
 import json
@@ -189,8 +197,10 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     )
 
 
-def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) -> None:
-    """Target must connect to one distinct source NIXL agent per target rank.
+def test_per_rank_source_agents(
+    namespace: str, tp_size: int, dp_size: int, transport: str
+) -> None:
+    """Target's source NIXL agents must cover every rank without mis-pairing.
 
     NIXL-only: the assertion scans for remote-agent log lines that the shared
     NixlTransferManager emits. The Mooncake TransferEngine path
@@ -200,17 +210,29 @@ def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) ->
     Each source rank publishes exactly one NIXL agent. The shared
     NixlTransferManager.receive_from_source (in modelexpress.nixl_transfer)
     logs either `add_remote_agent: ... (agent=b'<name>')` for central metadata
-    or `Using pre-loaded remote agent <name>` for P2P metadata. Failure modes:
+    or `Using pre-loaded remote agent <name>` for P2P metadata.
 
-      - TP collapse: fewer than `tp_size` remote-agent lines.
-      - Source-rank collapse (e.g. all target ranks pulling from source rank 0
-        because the rank filter regressed in _find_source_instances): same agent
-        name repeats across target ranks → distinct-count < tp_size.
-      - Wrong source-rank set: source ranks observed don't cover 0..tp_size-1.
+    Two orthogonal checks:
 
-    Inference alone can't catch source-rank collapse because TP shards have the
-    same shape per rank, so the load succeeds with wrong values and produces
-    plausible-but-garbage text — which the current non-empty assertion passes.
+      1. source_ranks == range(tp_size). This is the deterministic invariant:
+         the observed source ranks must cover exactly 0..tp_size-1, no matter
+         which replica each target core selected. It catches TP collapse (a
+         target rank never ran → missing rank) and source-rank collapse (the
+         rank filter in _find_source_instances regressed so a target rank
+         pulled from the wrong rank). Inference alone can't catch the latter:
+         shards share a shape per rank, so a wrong-rank load succeeds with
+         garbage values and still produces plausible text.
+
+      2. tp_size <= distinct_agents <= tp_size * dp_size. Distinct-agent count
+         is NOT deterministic under DP: DP replicas are interchangeable full
+         copies at the SAME worker_rank, so a rank can expose up to dp_size
+         agents and each target core of that rank picks one at random (default
+         `random` selector). The dp_size cores at a rank therefore land on
+         1..dp_size distinct replicas → the total is anywhere in
+         [tp_size, tp_size * dp_size]. Asserting == tp_size is only correct
+         when dp_size == 1 (pure TP, one candidate per rank); it is a coin-flip
+         flake under DP > 1. The lower bound still catches full collapse; the
+         upper bound catches agents outside the expected rank set.
     """
     if transport != "nixl":
         pytest.skip(
@@ -231,10 +253,13 @@ def test_per_rank_source_agents(namespace: str, tp_size: int, transport: str) ->
     source_ranks = sorted({int(r) for _, r in distinct_pairs})
     print(f"[mx-target] distinct source agents: {distinct_agents}  source_ranks={source_ranks}")
 
-    assert len(distinct_agents) == tp_size, (
-        f"Expected {tp_size} distinct source agent(s), got {len(distinct_agents)}: "
-        f"{distinct_agents}. Fewer means TP collapse (target rank didn't run) or "
-        f"source-rank collapse (multiple target ranks pulled from the same source)."
+    lo, hi = tp_size, tp_size * dp_size
+    assert lo <= len(distinct_agents) <= hi, (
+        f"Expected between {lo} and {hi} distinct source agent(s) "
+        f"(tp_size={tp_size}, dp_size={dp_size}), got {len(distinct_agents)}: "
+        f"{distinct_agents}. Below {lo} means TP collapse (a target rank didn't "
+        f"run) or source-rank collapse (a rank's target cores all pulled from a "
+        f"single source); above {hi} means agents outside the expected rank set."
     )
     assert source_ranks == list(range(tp_size)), (
         f"Expected source ranks {list(range(tp_size))}, got {source_ranks}."
