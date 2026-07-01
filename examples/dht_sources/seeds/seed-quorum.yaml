@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Dedicated seed quorum for the dht metadata backend (OPTION B).
+#
+# A small set of long-lived, GPU-free pods that join the Kademlia mesh as
+# participation-only bootstrap peers. They publish no records of their own;
+# they exist so a joining worker always has a stable, pre-converged anchor
+# to dial. This trades running a few extra pods for not needing any Lease
+# RBAC on the workers.
+#
+# The seeds converge among themselves first, before any worker arrives:
+# each seed points MX_DHT_BOOTSTRAP_DNS at the headless Service below, whose
+# DNS resolves to the other seed pod IPs, so the quorum forms a stable mesh
+# ahead of a large simultaneous worker cold-start.
+
+# ---------------------------------------------------------------------------
+# Headless Service: resolves to the seed pod IPs for cross-seed and worker
+# bootstrap.
+#
+# clusterIP: None makes DNS resolve to the individual pod IPs (not a single
+# VIP), which is what MX_DHT_BOOTSTRAP_DNS needs - it dials every resolved
+# address at MX_DHT_BOOTSTRAP_PORT. publishNotReadyAddresses: true lets the
+# seeds find each other while the quorum is still forming.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-dht-seed
+  labels:
+    app: mx-dht-seed
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: mx-dht-seed
+  ports:
+    - name: kademlia
+      port: 4001
+      targetPort: 4001
+---
+# ---------------------------------------------------------------------------
+# Seed quorum Deployment.
+#
+# Three replicas of the seed process: same client image, but launched as the
+# dedicated seed entrypoint instead of vLLM. No GPU and no rdma resources -
+# seeds are pure networking. They only participate in the mesh so joining
+# workers have a stable peer to bootstrap against.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-dht-seed
+  labels:
+    app: mx-dht-seed
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mx-dht-seed
+  template:
+    metadata:
+      labels:
+        app: mx-dht-seed
+    spec:
+      containers:
+        - name: seed
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "modelexpress.dht_seed"]
+          env:
+            # Listen address for this seed's DHT participation.
+            - name: MX_DHT_LISTEN
+              value: "0.0.0.0:4001"
+            # Cross-seed convergence: each seed dials the other seeds via the
+            # headless Service so the quorum forms before workers arrive.
+            - name: MX_DHT_BOOTSTRAP_DNS
+              value: "mx-dht-seed.${NAMESPACE}.svc.cluster.local"
+            - name: MX_DHT_BOOTSTRAP_PORT
+              value: "4001"
+          ports:
+            - name: kademlia
+              containerPort: 4001
