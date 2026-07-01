@@ -7,26 +7,42 @@
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
 use crate::p2p::backend::SourceInstanceInfo;
+use crate::p2p::load_tracker::SourceLoadTracker;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
+use modelexpress_common::envs;
 use modelexpress_common::grpc::p2p::{
     GetMetadataRequest, GetMetadataResponse, ListSourcesRequest, ListSourcesResponse,
     PublishMetadataRequest, PublishMetadataResponse, SourceInstanceRef, SourceStatus,
     UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 
 /// P2P Service implementation
 pub struct P2pServiceImpl {
     state: Arc<P2pStateManager>,
+    /// Transient, in-memory per-source load estimate surfaced in ListSources as
+    /// `active_transfers` for the client `load_aware` selector.
+    load_tracker: SourceLoadTracker,
 }
 
 impl P2pServiceImpl {
-    /// Create a new P2P service
+    /// Create a new P2P service, sizing the source-load window from
+    /// `MX_P2P_SOURCE_LOAD_TTL_SECS` (default 60s).
     pub fn new(state: Arc<P2pStateManager>) -> Self {
-        Self { state }
+        Self::with_load_ttl(state, Duration::from_secs(envs::p2p_source_load_ttl_secs()))
+    }
+
+    /// Create a new P2P service with an explicit source-load TTL (used by tests
+    /// for deterministic load-tracking behavior).
+    pub fn with_load_ttl(state: Arc<P2pStateManager>, load_ttl: Duration) -> Self {
+        Self {
+            state,
+            load_tracker: SourceLoadTracker::new(load_ttl),
+        }
     }
 }
 
@@ -170,6 +186,10 @@ impl P2pService for P2pServiceImpl {
         let refs: Vec<SourceInstanceRef> = workers
             .into_iter()
             .map(|info| SourceInstanceRef {
+                // Read the load estimate before moving the id fields into the ref.
+                active_transfers: self
+                    .load_tracker
+                    .active_count(&info.source_id, &info.worker_id),
                 mx_source_id: info.source_id,
                 worker_id: info.worker_id,
                 model_name: info.model_name,
@@ -206,6 +226,13 @@ impl P2pService for P2pServiceImpl {
                 // Each worker_id maps to exactly one worker record; take the first.
                 let worker = record.workers.into_iter().next().map(WorkerMetadata::from);
                 let found = worker.is_some();
+                if found {
+                    // A target that reached GetMetadata has selected this source
+                    // and is about to pull from it; count it toward the source's
+                    // load estimate for the load_aware selector.
+                    self.load_tracker
+                        .record_selection(&req.mx_source_id, &req.worker_id);
+                }
                 info!(
                     "GetMetadata '{}' (source_id={}, worker_id={}): {} tensors",
                     record.model_name,
@@ -312,6 +339,10 @@ mod tests {
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))
+    }
+
+    fn make_service_with_load_ttl(mock: MockMetadataBackend, ttl: Duration) -> P2pServiceImpl {
+        P2pServiceImpl::with_load_ttl(Arc::new(P2pStateManager::with_backend(Arc::new(mock))), ttl)
     }
 
     fn empty_tensor_source() -> Option<SourcePayload> {
@@ -818,6 +849,89 @@ mod tests {
             .expect("rpc")
             .into_inner();
         assert!(resp.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_reports_active_transfers_after_selection() {
+        let mut mock = MockMetadataBackend::new();
+        // Every GetMetadata resolves to a ready worker for the requested source.
+        mock.expect_get_metadata()
+            .times(2)
+            .returning(|source_id, worker_id| {
+                Ok(Some(ModelMetadataRecord {
+                    source_id: source_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    model_name: "my-model".to_string(),
+                    workers: vec![WorkerRecord {
+                        worker_rank: 0,
+                        backend_metadata: BackendMetadataRecord::None,
+                        tensors: vec![],
+                        status: SourceStatus::Ready as i32,
+                        updated_at: 1234567890000,
+                        metadata_endpoint: String::new(),
+                        agent_name: String::new(),
+                        worker_grpc_endpoint: String::new(),
+                        artifact_source: None,
+                    }],
+                    published_at: 1234567890,
+                }))
+            });
+        // Two ready workers of the same rank; only w1 gets selected below.
+        mock.expect_list_workers().times(1).returning(|_, _| {
+            Ok(vec![
+                SourceInstanceInfo {
+                    source_id: "srcaaaabbbbccccd".to_string(),
+                    worker_id: "w1".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
+                },
+                SourceInstanceInfo {
+                    source_id: "srcaaaabbbbccccd".to_string(),
+                    worker_id: "w2".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: 1234567890000,
+                },
+            ])
+        });
+
+        // Long TTL so both selections stay in-window for the test.
+        let svc = make_service_with_load_ttl(mock, Duration::from_secs(300));
+
+        // Select w1 twice via GetMetadata (the load signal).
+        for _ in 0..2 {
+            svc.get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "srcaaaabbbbccccd".to_string(),
+                worker_id: "w1".to_string(),
+            }))
+            .await
+            .expect("rpc");
+        }
+
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                status_filter: Some(SourceStatus::Ready as i32),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+
+        let w1 = resp
+            .instances
+            .iter()
+            .find(|r| r.worker_id == "w1")
+            .expect("w1 present");
+        let w2 = resp
+            .instances
+            .iter()
+            .find(|r| r.worker_id == "w2")
+            .expect("w2 present");
+        assert_eq!(w1.active_transfers, 2, "selected source reflects its load");
+        assert_eq!(w2.active_transfers, 0, "unselected source stays idle");
     }
 
     // ── get_metadata (additional) ───────────────────────────────────────────

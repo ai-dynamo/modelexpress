@@ -26,6 +26,7 @@ _RECORDERS = [
     ("observe_candidates", ("random", "listed", 2)),
     ("observe_selection_seconds", ("random", 0.001)),
     ("observe_transfer_seconds", ("random", "success", 1.0)),
+    ("set_active_transfers", ("w1", 3)),
 ]
 
 
@@ -55,6 +56,7 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.candidates = boom
     m.selection_seconds = boom
     m.transfer_seconds = boom
+    m.active_transfers = boom
     # None of these may propagate the RuntimeError.
     for name, args in _RECORDERS:
         getattr(m, name)(*args)

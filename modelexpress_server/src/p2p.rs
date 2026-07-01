@@ -5,10 +5,12 @@
 //!
 //! The backend abstraction (`backend`) persists worker metadata to Redis or Kubernetes CRDs;
 //! `state` wraps it with a lazy-connect manager; `service` exposes the gRPC surface; `reaper`
-//! garbage-collects stale workers; `source_identity` derives deterministic source IDs.
+//! garbage-collects stale workers; `source_identity` derives deterministic source IDs;
+//! `load_tracker` estimates per-source transfer load for load-aware client selection.
 
 pub mod backend;
 pub mod k8s_types;
+pub mod load_tracker;
 pub mod reaper;
 pub mod service;
 pub mod source_identity;

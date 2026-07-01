@@ -21,6 +21,7 @@ from modelexpress.adapter import StrategyFailed
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
     ENV_SELECTOR,
+    LoadAwareSelector,
     RandomSelector,
     RendezvousHashSelector,
     configured_policy_label,
@@ -41,12 +42,13 @@ def _ctx(worker_id="target-0", worker_rank=0, model_name="m"):
     )
 
 
-def _ref(mx_source_id, worker_id, worker_rank=0, model_name="m"):
+def _ref(mx_source_id, worker_id, worker_rank=0, model_name="m", active_transfers=0):
     return p2p_pb2.SourceInstanceRef(
         mx_source_id=mx_source_id,
         worker_id=worker_id,
         model_name=model_name,
         worker_rank=worker_rank,
+        active_transfers=active_transfers,
     )
 
 
@@ -191,6 +193,116 @@ def test_rendezvous_hash_removing_source_preserves_relative_order():
     remaining = [c for c in cands if c.worker_id != dropped]
     after = [c.worker_id for c in sel.order(remaining, _ctx())]
     assert after == [w for w in full if w != dropped]
+
+
+# ---------------------------------------------------------------------------
+# Load-aware policy
+# ---------------------------------------------------------------------------
+
+
+def test_load_aware_registered_and_selectable(monkeypatch):
+    assert get_selector("load_aware").name == "load_aware"
+    monkeypatch.setenv(ENV_SELECTOR, "load_aware")
+    assert get_configured_selector().name == "load_aware"
+    assert configured_policy_label() == "load_aware"
+
+
+def test_load_aware_collapses_to_rendezvous_when_no_load():
+    # Default active_transfers=0 for every candidate -> no penalty -> identical
+    # ordering to rendezvous_hash.
+    cands = _sources(6)
+    la = [c.worker_id for c in LoadAwareSelector().order(cands, _ctx())]
+    rh = [c.worker_id for c in RendezvousHashSelector().order(cands, _ctx())]
+    assert la == rh
+
+
+def test_load_aware_equal_load_collapses_to_rendezvous():
+    # Equal load across all candidates normalizes to an equal penalty, so the
+    # rendezvous ordering is preserved.
+    loaded = [
+        _ref(c.mx_source_id, c.worker_id, active_transfers=7) for c in _sources(5)
+    ]
+    la = [c.worker_id for c in LoadAwareSelector(w_load=1.0).order(loaded, _ctx())]
+    rh = [c.worker_id for c in RendezvousHashSelector().order(loaded, _ctx())]
+    assert la == rh
+
+
+def test_load_aware_demotes_busy_source():
+    cands = _sources(5)
+    top = RendezvousHashSelector().order(cands, _ctx())[0].worker_id
+    # Load only the source rendezvous would have picked first.
+    loaded = [
+        _ref(
+            c.mx_source_id,
+            c.worker_id,
+            active_transfers=(100 if c.worker_id == top else 0),
+        )
+        for c in cands
+    ]
+    out = LoadAwareSelector(w_load=1.0).order(loaded, _ctx())
+    assert out[0].worker_id != top
+    # The busy source is pushed to the back of the preference list.
+    assert out[-1].worker_id == top
+
+
+def test_load_aware_deterministic_and_order_independent():
+    cands = [_ref(f"src{i:013x}aaa", f"w{i}", active_transfers=i) for i in range(6)]
+    forward = [c.worker_id for c in LoadAwareSelector().order(cands, _ctx())]
+    reverse = [
+        c.worker_id for c in LoadAwareSelector().order(list(reversed(cands)), _ctx())
+    ]
+    assert forward == reverse
+
+
+def test_load_aware_weight_monotonicity():
+    # A larger w_load makes the penalty dominate the rendezvous base, so a
+    # heavily loaded source that rendezvous ranked first is demoted at high
+    # weight but may survive at very low weight.
+    cands = _sources(4)
+    top = RendezvousHashSelector().order(cands, _ctx())[0].worker_id
+    loaded = [
+        _ref(
+            c.mx_source_id,
+            c.worker_id,
+            active_transfers=(10 if c.worker_id == top else 9),
+        )
+        for c in cands
+    ]
+    # Tiny weight: penalty differences are minute, rendezvous winner survives.
+    weak = LoadAwareSelector(w_load=1e-9).order(loaded, _ctx())[0].worker_id
+    # Strong weight: the busiest source is demoted.
+    strong = LoadAwareSelector(w_load=10.0).order(loaded, _ctx())[0].worker_id
+    assert weak == top
+    assert strong != top
+
+
+def test_load_aware_missing_field_treated_as_zero():
+    # Duck-typed candidates without active_transfers (older servers) -> load 0.
+    cands = [
+        SimpleNamespace(
+            mx_source_id=f"src{i:013x}aaa",
+            worker_id=f"w{i}",
+            worker_rank=0,
+            model_name="m",
+        )
+        for i in range(4)
+    ]
+    out = LoadAwareSelector().order(cands, _ctx())
+    assert {c.worker_id for c in out} == {c.worker_id for c in cands}
+
+
+def test_load_aware_empty_candidates():
+    assert LoadAwareSelector().order([], _ctx()) == []
+
+
+def test_load_aware_weight_from_env(monkeypatch):
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "2.5")
+    assert LoadAwareSelector().w_load == 2.5
+
+
+def test_load_aware_default_weight(monkeypatch):
+    monkeypatch.delenv("MX_P2P_LOAD_WEIGHT", raising=False)
+    assert LoadAwareSelector().w_load == 1.0
 
 
 # ---------------------------------------------------------------------------

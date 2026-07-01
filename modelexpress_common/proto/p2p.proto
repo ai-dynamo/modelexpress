@@ -509,6 +509,13 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Server-estimated concurrent transfers this source is currently serving,
+  // computed as a TTL-decayed count of recent GetMetadata selections for this
+  // (mx_source_id, worker_id). Zero when the load tracker is idle or the field
+  // is unset (older servers). Consumed by the client `load_aware` selector to
+  // steer new targets away from busy sources; ordering-only, advisory.
+  uint32 active_transfers = 5;
 }
 
 message ListSourcesRequest {

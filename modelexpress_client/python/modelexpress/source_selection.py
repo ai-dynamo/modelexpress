@@ -53,8 +53,7 @@ class SourceSelector(Protocol):
         self,
         candidates: list[p2p_pb2.SourceInstanceRef],
         ctx: LoadContext,
-    ) -> list[p2p_pb2.SourceInstanceRef]:
-        ...
+    ) -> list[p2p_pb2.SourceInstanceRef]: ...
 
 
 class ScoredSelector:
@@ -105,6 +104,45 @@ class RandomSelector:
         return out
 
 
+# blake2b(digest_size=8) yields an 8-byte digest, so the score space is 2**64.
+# _unit_hash maps that score into [0, 1) for policies (load_aware) that blend the
+# rendezvous term with a normalized load penalty on the same scale.
+_HASH_SPACE = 2**64
+
+
+def _rendezvous_score(
+    candidate: p2p_pb2.SourceInstanceRef,
+    ctx: LoadContext,
+) -> int:
+    """Stable, process-independent HRW score for (target, candidate).
+
+    Uses blake2b (not Python's salted ``hash()``) so orderings are identical
+    across processes and restarts. Shared by ``rendezvous_hash`` and the
+    rendezvous base term of ``load_aware``.
+    """
+    key = "|".join(
+        str(x)
+        for x in (
+            ctx.identity.model_name,
+            ctx.worker_id,
+            ctx.worker_rank,
+            candidate.mx_source_id,
+            candidate.worker_id,
+            candidate.worker_rank,
+        )
+    )
+    digest = hashlib.blake2b(key.encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _unit_hash(
+    candidate: p2p_pb2.SourceInstanceRef,
+    ctx: LoadContext,
+) -> float:
+    """Rendezvous score mapped into ``[0, 1)``."""
+    return _rendezvous_score(candidate, ctx) / _HASH_SPACE
+
+
 class RendezvousHashSelector(ScoredSelector):
     """Stateless deterministic spreading via rendezvous (HRW) hashing.
 
@@ -129,19 +167,59 @@ class RendezvousHashSelector(ScoredSelector):
         candidate: p2p_pb2.SourceInstanceRef,
         ctx: LoadContext,
     ) -> float:
-        key = "|".join(
-            str(x)
-            for x in (
-                ctx.identity.model_name,
-                ctx.worker_id,
-                ctx.worker_rank,
-                candidate.mx_source_id,
-                candidate.worker_id,
-                candidate.worker_rank,
+        return _rendezvous_score(candidate, ctx)
+
+
+class LoadAwareSelector:
+    """Load-aware spreading: rendezvous base biased away from busy sources.
+
+    Score is ``unit_hash(target, candidate) - w_load * normalized_load``, so the
+    stable rendezvous ordering (Section 1's deterministic spread) is preserved
+    while a per-source load penalty steers new targets away from sources that
+    are already serving many transfers -- the single-source convergence a purely
+    deterministic hash cannot avoid when a source is persistently available.
+
+    Load comes from ``candidate.active_transfers`` (a server-estimated,
+    TTL-decayed count surfaced in ListSources). It is normalized by the maximum
+    across the current candidate set, so the penalty is relative and needs no
+    tuned capacity constant: when loads are equal (or all zero -- older servers,
+    disabled tracking) every penalty is identical and ordering collapses exactly
+    to ``rendezvous_hash``. This policy overrides ``order()`` rather than
+    implementing ``ScoredSelector.score()`` because that normalization requires
+    the whole candidate set, not one candidate at a time.
+    """
+
+    name = "load_aware"
+
+    def __init__(self, w_load: float | None = None) -> None:
+        # Weight trading rendezvous spread (base in [0, 1)) against the load
+        # penalty (also in [0, 1] after normalization). Default from env.
+        self.w_load = envs.MX_P2P_LOAD_WEIGHT if w_load is None else w_load
+
+    @staticmethod
+    def _load(candidate: p2p_pb2.SourceInstanceRef) -> float:
+        # active_transfers is optional on the wire; older servers or disabled
+        # load tracking omit it -> treat as 0 (no penalty).
+        return float(max(0, getattr(candidate, "active_transfers", 0) or 0))
+
+    def order(
+        self,
+        candidates: list[p2p_pb2.SourceInstanceRef],
+        ctx: LoadContext,
+    ) -> list[p2p_pb2.SourceInstanceRef]:
+        if not candidates:
+            return []
+        max_load = max(self._load(c) for c in candidates)
+        if max_load <= 0.0:
+            # No observable load: identical to rendezvous_hash.
+            return sorted(
+                candidates, key=lambda c: _rendezvous_score(c, ctx), reverse=True
             )
+        return sorted(
+            candidates,
+            key=lambda c: _unit_hash(c, ctx) - self.w_load * (self._load(c) / max_load),
+            reverse=True,
         )
-        digest = hashlib.blake2b(key.encode(), digest_size=8).digest()
-        return int.from_bytes(digest, "big")
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +241,7 @@ def register_selector(name: str, factory: SelectorFactory) -> None:
 
 register_selector("random", lambda: RandomSelector())
 register_selector("rendezvous_hash", lambda: RendezvousHashSelector())
+register_selector("load_aware", lambda: LoadAwareSelector())
 
 
 def get_selector(name: str) -> SourceSelector:

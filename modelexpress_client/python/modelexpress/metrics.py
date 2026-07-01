@@ -63,7 +63,7 @@ class MetricsCollector:
         if not _enabled():
             return False
         try:
-            from prometheus_client import Counter, Histogram
+            from prometheus_client import Counter, Gauge, Histogram
 
             # --- P2P source-selection group ---
             self.selections = Counter(
@@ -74,7 +74,11 @@ class MetricsCollector:
             self.attempts = Counter(
                 "mx_p2p_source_attempts_total",
                 "Source attempts by result.",
-                ["policy", "scheme", "result"],  # success|metadata_miss|transfer_fallback
+                [
+                    "policy",
+                    "scheme",
+                    "result",
+                ],  # success|metadata_miss|transfer_fallback
             )
             self.metadata_failures = Counter(
                 "mx_p2p_metadata_lookup_failures_total",
@@ -98,6 +102,12 @@ class MetricsCollector:
                 "End-to-end transfer time in seconds.",
                 ["policy", "scheme", "outcome"],  # success|fallback
                 buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            )
+            self.active_transfers = Gauge(
+                "mx_p2p_active_transfers",
+                "Server-estimated concurrent transfers per source, as observed by "
+                "clients during selection (the signal the load_aware policy ranks on).",
+                ["scheme", "source_worker_id"],
             )
             self._ready = True
             logger.info("ModelExpress metrics enabled (scheme=%r)", self.scheme)
@@ -166,10 +176,21 @@ class MetricsCollector:
             except Exception:
                 pass
 
-    def observe_transfer_seconds(self, policy: str, outcome: str, seconds: float) -> None:
+    def observe_transfer_seconds(
+        self, policy: str, outcome: str, seconds: float
+    ) -> None:
         if self._ensure():
             try:
-                self.transfer_seconds.labels(policy, self.scheme, outcome).observe(seconds)
+                self.transfer_seconds.labels(policy, self.scheme, outcome).observe(
+                    seconds
+                )
+            except Exception:
+                pass
+
+    def set_active_transfers(self, source_worker_id: str, value: float) -> None:
+        if self._ensure():
+            try:
+                self.active_transfers.labels(self.scheme, source_worker_id).set(value)
             except Exception:
                 pass
 
