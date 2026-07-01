@@ -85,6 +85,13 @@ if TYPE_CHECKING:
     MX_ARTIFACT_READY_URL: str
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
+    # P2P source selection
+    MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Opt-in metrics collector
+    MX_METRICS_ENABLED: bool
+    MX_METRICS_PORT: Optional[str]
+    MX_METRICS_PUSHGATEWAY: Optional[str]
+    MX_METRICS_SCHEME: str
     # Third-party JIT/compile cache locations read for artifact transfer
     TRITON_CACHE_DIR: Optional[str]
     DG_JIT_CACHE_DIR: Optional[str]
@@ -181,6 +188,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Raw string: artifact_manifest.artifact_transfer_chunk_size() owns the
     # int parse plus its non-positive/max-bound validation and default param.
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
+    # ── P2P source selection ───────────────────────────────────────────────
+    # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
+    "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    # ── Opt-in metrics collector ───────────────────────────────────────────
+    "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
+    in _TRUTHY,
+    "MX_METRICS_PORT": lambda: os.environ.get("MX_METRICS_PORT"),
+    "MX_METRICS_PUSHGATEWAY": lambda: os.environ.get("MX_METRICS_PUSHGATEWAY"),
+    "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
     # ── Third-party JIT/compile cache locations (raw; caller builds path) ──
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
     "DG_JIT_CACHE_DIR": lambda: os.environ.get("DG_JIT_CACHE_DIR"),

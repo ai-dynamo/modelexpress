@@ -526,3 +526,110 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         session_id="te-session",
         weight_info={"weight": (1000, 4, 2)},
     )
+
+
+# ---------------------------------------------------------------------------
+# _find_transfer_engine_source: source-selector wiring
+# ---------------------------------------------------------------------------
+
+
+def _te_ref(sid, wid, rank=0):
+    return p2p_pb2.SourceInstanceRef(
+        mx_source_id=sid, worker_id=wid, model_name="m", worker_rank=rank
+    )
+
+
+def _te_ctx(instances):
+    ctx = SimpleNamespace()
+    ctx.global_rank = 0
+    ctx.worker_rank = 0
+    ctx.worker_id = "tgt-0"
+    ctx.identity = SimpleNamespace(model_name="m")
+    ctx.mx_client = MagicMock()
+    ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=instances
+    )
+    return ctx
+
+
+def _te_meta(found=True, transfer_engine=False):
+    if not found:
+        return SimpleNamespace(found=False, worker=None)
+    worker = (
+        p2p_pb2.WorkerMetadata(worker_rank=0, transfer_engine_session_id="te")
+        if transfer_engine
+        else p2p_pb2.WorkerMetadata(worker_rank=0)
+    )
+    return SimpleNamespace(found=True, worker=worker)
+
+
+def test_te_find_source_filters_rank_and_returns_transfer_engine(monkeypatch):
+    monkeypatch.delenv("MX_P2P_SOURCE_SELECTOR", raising=False)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [
+            _te_ref("s0aaaaaaaaaaaaaa", "w0", rank=0),
+            _te_ref("s1aaaaaaaaaaaaaa", "w1", rank=1),  # wrong rank -> filtered out
+            _te_ref("s2aaaaaaaaaaaaaa", "w2", rank=0),
+        ]
+    )
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=(worker_id == "w2")
+    )
+
+    worker = loader._find_transfer_engine_source(ctx)
+    assert worker is not None
+    assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    queried = {c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list}
+    assert "w1" not in queried  # rank-mismatched source never queried
+
+
+def test_te_find_source_iterates_in_selector_order_and_none_when_no_match(monkeypatch):
+    class _ReverseSelector:
+        name = "reverse"
+
+        def order(self, candidates, context):
+            return list(reversed(candidates))
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda: _ReverseSelector(),
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([_te_ref(f"s{i}aaaaaaaaaaaaaa", f"w{i}", rank=0) for i in range(3)])
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=False
+    )
+
+    # No transfer_engine source -> None, and iteration follows the selector order.
+    assert loader._find_transfer_engine_source(ctx) is None
+    order = [c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list]
+    assert order == ["w2", "w1", "w0"]
+
+
+def test_te_find_source_skips_not_found(monkeypatch):
+    # Force identity order so w0 (not-found) is queried first and the
+    # `if not metadata.found: continue` branch is actually exercised.
+    class _IdentitySelector:
+        name = "identity"
+
+        def order(self, candidates, context):
+            return list(candidates)
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda: _IdentitySelector(),
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
+    )
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        found=(worker_id == "w1"), transfer_engine=(worker_id == "w1")
+    )
+    worker = loader._find_transfer_engine_source(ctx)
+    assert worker is not None
+    assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    assert [
+        c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list
+    ] == ["w0", "w1"]
