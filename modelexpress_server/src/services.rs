@@ -38,9 +38,7 @@ fn get_server_cache_dir() -> Option<std::path::PathBuf> {
         Some(config.local_path)
     } else {
         // Fall back to environment variable
-        std::env::var("HF_HUB_CACHE")
-            .ok()
-            .map(std::path::PathBuf::from)
+        modelexpress_common::envs::hf_hub_cache()
     }
 }
 

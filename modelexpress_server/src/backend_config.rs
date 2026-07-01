@@ -44,7 +44,7 @@ impl BackendConfig {
     /// the selected backend is missing (no silent fallback to `localhost:6379` /
     /// `default` namespace, since those mask misconfig in production).
     pub fn from_env() -> Result<Self, String> {
-        let backend_type = std::env::var("MX_METADATA_BACKEND").unwrap_or_default();
+        let backend_type = modelexpress_common::envs::metadata_backend();
         match backend_type.to_lowercase().as_str() {
             "redis" => Ok(Self::Redis {
                 url: Self::redis_url_from_env()?,
@@ -100,23 +100,19 @@ impl BackendConfig {
     /// compatibility with charts that predate the `MX_` prefix). Errors when neither the
     /// URL nor both host-and-port pieces are provided.
     pub fn redis_url_from_env() -> Result<String, String> {
-        if let Ok(url) = std::env::var("REDIS_URL") {
+        if let Some(url) = modelexpress_common::envs::redis_url() {
             return Ok(url);
         }
-        let host = std::env::var("MX_REDIS_HOST")
-            .or_else(|_| std::env::var("REDIS_HOST"))
-            .map_err(|_| {
-                "MX_METADATA_BACKEND=redis requires REDIS_URL or MX_REDIS_HOST (alias \
-                 REDIS_HOST) to be set."
-                    .to_string()
-            })?;
-        let port = std::env::var("MX_REDIS_PORT")
-            .or_else(|_| std::env::var("REDIS_PORT"))
-            .map_err(|_| {
-                "MX_METADATA_BACKEND=redis requires REDIS_URL or MX_REDIS_PORT (alias \
-                 REDIS_PORT) to be set."
-                    .to_string()
-            })?;
+        let host = modelexpress_common::envs::redis_host().ok_or_else(|| {
+            "MX_METADATA_BACKEND=redis requires REDIS_URL or MX_REDIS_HOST (alias \
+             REDIS_HOST) to be set."
+                .to_string()
+        })?;
+        let port = modelexpress_common::envs::redis_port().ok_or_else(|| {
+            "MX_METADATA_BACKEND=redis requires REDIS_URL or MX_REDIS_PORT (alias \
+             REDIS_PORT) to be set."
+                .to_string()
+        })?;
         Ok(format!("redis://{host}:{port}"))
     }
 
@@ -125,13 +121,11 @@ impl BackendConfig {
     /// out-of-cluster operators. Errors when neither is set so a typo in the chart
     /// can't silently land ModelCacheEntry CRs in the `default` namespace.
     fn k8s_namespace_from_env() -> Result<String, String> {
-        std::env::var("MX_METADATA_NAMESPACE")
-            .or_else(|_| std::env::var("POD_NAMESPACE"))
-            .map_err(|_| {
-                "MX_METADATA_BACKEND=kubernetes requires MX_METADATA_NAMESPACE or \
-                 POD_NAMESPACE to be set."
-                    .to_string()
-            })
+        modelexpress_common::envs::metadata_namespace().ok_or_else(|| {
+            "MX_METADATA_BACKEND=kubernetes requires MX_METADATA_NAMESPACE or \
+             POD_NAMESPACE to be set."
+                .to_string()
+        })
     }
 }
 
