@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 
+from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import (
     LoadContext,
@@ -73,7 +73,7 @@ class RdmaStrategy(LoadStrategy):
         # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't
         # masquerade as the flag in tests.
-        server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+        server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
         requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
         if not server_addr and not requires_p2p:
             logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")

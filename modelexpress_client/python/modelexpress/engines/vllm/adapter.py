@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import uuid
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
@@ -246,7 +246,7 @@ class VllmAdapter(EngineAdapter):
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
         return (
             tp_size > 1
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 

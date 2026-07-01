@@ -135,7 +135,7 @@ ModelExpress/
 │       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
 │       │   ├── __init__.py
 │       │   ├── publish.py              # Source identity + metadata publication
-│       │   ├── heartbeat.py            # Client-side heartbeat for source liveness
+│       │   ├── publisher.py            # Source publication and heartbeat signaling
 │       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor/artifact manifests)
 │       │   ├── source_id.py            # Python mx_source_id computation
 │       │   ├── client_factory.py       # Selects central vs k8s-service metadata client
@@ -631,7 +631,7 @@ NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inf
 
 During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match (a likely symptom of a rolling update where pods run different image versions). The receive path converts it, like any receive failure, into a `SourceTransferError`, which the chain treats as a mutated RDMA failure: RDMA is abandoned and loading falls through to the next strategy (GDS, then disk) rather than retrying another source. Source-candidate retry happens only for pre-transfer metadata misses, before any target tensor is prepared.
 
-After loading by any strategy, the worker starts a `HeartbeatThread` that periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the heartbeat sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged but do not crash the worker.
+After loading by any strategy, the worker starts a `PublisherThread` that owns initial publication retry and then periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the publisher sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged and retried in the publisher thread instead of crashing the worker.
 
 Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
 
@@ -744,13 +744,20 @@ graph TD
 ### Flow
 
 1. **Source loads**: Loads weights from storage (S3/GCS/Azure/local via ModelStreamer, GDS, or disk), runs `process_weights_after_loading()`
-2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
-3. **Heartbeat starts**: `HeartbeatThread` sends `UpdateStatus(READY)` every 30s, refreshing `updated_at`
+2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then a `PublisherThread` calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
+3. **Publisher heartbeats**: `PublisherThread` sends `UpdateStatus(READY)` every 30s after publication succeeds, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
 5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Auto-detects P2P mode if `worker_grpc_endpoint` is populated - fetches tensors or artifact manifest metadata from the source worker's `WorkerService` and NIXL metadata via the listen thread instead of from the central server.
 6. **Target transfers**: Executes RDMA reads from source; for cache artifacts, it prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. On `SourceTransferError` tries next candidate (max 3)
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; GC deletes after 1 hour
+
+Cache artifact checksums protect transfer integrity but do not authenticate the
+source or attest the contents. TorchInductor, Triton, DeepGEMM, TileLang, CuTe
+DSL, and FlashInfer caches may
+contain executable code, so artifact transfer must be limited to trusted
+replicas and a trusted MX server, with MX and worker gRPC endpoints isolated
+from untrusted networks. ModelExpress does not currently sign cache artifacts.
 
 See [`metadata.md`](metadata.md) for the full storage schema and debugging guide.
 
@@ -767,13 +774,17 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_VMM_ARENA` | `0` | Install a `CUDAPluggableAllocator` that routes weight-loading allocations into a CUDA VMM arena, then registers the used arena range once through dmabuf at end-of-load. Reserves 16.0 TiB of VA by default and commits physical memory only for mapped allocations. See [VMM Arena](#vmm-arena-cudapluggableallocator-hook) |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers. Opt-in on central-coordinator backends; auto-enabled (env var ignored) on decentralized backends |
+| `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
+| `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving; effective port is `MX_WORKER_GRPC_PORT + device_id` |
+| `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
+| `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
+| `MX_ARTIFACT_READY_URL` | `http://127.0.0.1:8000/health` | Readiness endpoint polled by the artifact publisher before preparing and publishing cache bundles. Kubernetes StatefulSet vLLM worker pods using the default localhost URL infer pod-0's stable DNS endpoint |
+| `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
-| `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
-| `MX_WORKER_GRPC_PORT` | `0` | Worker gRPC port for P2P tensor and artifact manifest serving |
-| `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |

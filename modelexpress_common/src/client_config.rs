@@ -41,23 +41,23 @@ pub struct ClientArgs {
     pub config: Option<PathBuf>,
 
     /// Server endpoint
-    #[arg(short, long, env = "MODEL_EXPRESS_ENDPOINT")]
+    #[arg(short, long, env = crate::envs::MODEL_EXPRESS_ENDPOINT)]
     pub endpoint: Option<String>,
 
     /// Request timeout in seconds
-    #[arg(short, long, env = "MODEL_EXPRESS_TIMEOUT")]
+    #[arg(short, long, env = crate::envs::MODEL_EXPRESS_TIMEOUT)]
     pub timeout: Option<u64>,
 
     /// Cache path override
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_path: Option<PathBuf>,
 
     /// Log level (no short flag to avoid conflict with CLI's -v/--verbose)
-    #[arg(long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_LOG_LEVEL, value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
-    #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_LOG_FORMAT, value_enum)]
     pub log_format: Option<LogFormat>,
 
     /// Quiet mode (suppress all output except errors)
@@ -65,19 +65,19 @@ pub struct ClientArgs {
     pub quiet: bool,
 
     /// Maximum number of retries
-    #[arg(long, env = "MODEL_EXPRESS_MAX_RETRIES")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_MAX_RETRIES)]
     pub max_retries: Option<u32>,
 
     /// Retry delay in seconds
-    #[arg(long, env = "MODEL_EXPRESS_RETRY_DELAY")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_RETRY_DELAY)]
     pub retry_delay: Option<u64>,
 
     /// Disable shared storage mode (will transfer files from server to client)
-    #[arg(long, env = "MODEL_EXPRESS_NO_SHARED_STORAGE")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_NO_SHARED_STORAGE)]
     pub no_shared_storage: bool,
 
     /// Chunk size in bytes for file transfer when shared storage is disabled
-    #[arg(long, env = "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE")]
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_TRANSFER_CHUNK_SIZE)]
     pub transfer_chunk_size: Option<usize>,
 }
 
@@ -120,8 +120,11 @@ impl ClientConfig {
     /// 3. Add a test in the `tests` module to verify the override works
     pub fn load(args: ClientArgs) -> Result<Self, ConfigError> {
         // Start with layered config loading (file + env + defaults)
-        let mut config =
-            load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?;
+        let mut config = load_layered_config(
+            args.config.clone(),
+            crate::envs::MODEL_EXPRESS_PREFIX,
+            Self::default(),
+        )?;
 
         // ==================== APPLY CLI ARGUMENT OVERRIDES ====================
         // When adding a new field to ClientArgs, add the override logic here.

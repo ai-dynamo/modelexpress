@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
@@ -188,7 +188,7 @@ class SglangAdapter(EngineAdapter):
         return (
             tp_size > 1
             and self.is_cuda_alike()
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 
@@ -289,7 +289,7 @@ def _get_quantization(model_config: ModelConfig) -> str:
 
 
 def _get_revision(model_config: ModelConfig) -> str:
-    override = os.environ.get("MX_MODEL_REVISION", "")
+    override = envs.MX_MODEL_REVISION
     if override:
         return override
     return str(getattr(model_config, "revision", "") or "")

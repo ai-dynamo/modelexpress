@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::error::Error as StdError;
 
 pub mod artifact_manifest;
@@ -10,6 +9,7 @@ pub mod cache;
 pub mod client_config;
 pub mod config;
 pub mod download;
+pub mod envs;
 pub mod models;
 pub mod providers;
 #[cfg(any(test, feature = "test-support"))]
@@ -121,11 +121,10 @@ pub type Result<T> = std::result::Result<T, Box<Error>>;
 pub struct Utils;
 
 impl Utils {
-    /// Get home directory from environment variables
+    /// Get home directory from environment variables ([`envs::HOME`], then
+    /// [`envs::USERPROFILE`]).
     pub fn get_home_dir() -> std::result::Result<String, Box<Error>> {
-        env::var("HOME")
-            .or_else(|_| env::var("USERPROFILE"))
-            .map_err(|e| Error::Generic(format!("Failed to get home directory: {e}")).into())
+        envs::home_dir()
     }
 }
 

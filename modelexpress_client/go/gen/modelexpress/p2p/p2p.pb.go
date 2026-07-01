@@ -87,6 +87,9 @@ const (
 	MxSourceType_MX_SOURCE_TYPE_TORCH_COMPILE_CACHE MxSourceType = 3 // torch.compile cache files
 	MxSourceType_MX_SOURCE_TYPE_TRITON_CACHE        MxSourceType = 4 // Triton cache files
 	MxSourceType_MX_SOURCE_TYPE_DEEP_GEMM_CACHE     MxSourceType = 5 // DeepGEMM kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_TILELANG_CACHE      MxSourceType = 6 // TileLang JIT kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_CUTE_DSL_CACHE      MxSourceType = 7 // CuTe DSL compiled kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_FLASHINFER_CACHE    MxSourceType = 8 // FlashInfer JIT workspace cache files
 )
 
 // Enum value maps for MxSourceType.
@@ -98,6 +101,9 @@ var (
 		3: "MX_SOURCE_TYPE_TORCH_COMPILE_CACHE",
 		4: "MX_SOURCE_TYPE_TRITON_CACHE",
 		5: "MX_SOURCE_TYPE_DEEP_GEMM_CACHE",
+		6: "MX_SOURCE_TYPE_TILELANG_CACHE",
+		7: "MX_SOURCE_TYPE_CUTE_DSL_CACHE",
+		8: "MX_SOURCE_TYPE_FLASHINFER_CACHE",
 	}
 	MxSourceType_value = map[string]int32{
 		"MX_SOURCE_TYPE_WEIGHTS":             0,
@@ -106,6 +112,9 @@ var (
 		"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE": 3,
 		"MX_SOURCE_TYPE_TRITON_CACHE":        4,
 		"MX_SOURCE_TYPE_DEEP_GEMM_CACHE":     5,
+		"MX_SOURCE_TYPE_TILELANG_CACHE":      6,
+		"MX_SOURCE_TYPE_CUTE_DSL_CACHE":      7,
+		"MX_SOURCE_TYPE_FLASHINFER_CACHE":    8,
 	}
 )
 
@@ -2649,14 +2658,17 @@ const file_p2p_proto_rawDesc = "" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
 	"\x18BACKEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n" +
-	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xcf\x01\n" +
+	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xba\x02\n" +
 	"\fMxSourceType\x12\x1a\n" +
 	"\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n" +
 	"\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n" +
 	"\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02\x12&\n" +
 	"\"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE\x10\x03\x12\x1f\n" +
 	"\x1bMX_SOURCE_TYPE_TRITON_CACHE\x10\x04\x12\"\n" +
-	"\x1eMX_SOURCE_TYPE_DEEP_GEMM_CACHE\x10\x05*{\n" +
+	"\x1eMX_SOURCE_TYPE_DEEP_GEMM_CACHE\x10\x05\x12!\n" +
+	"\x1dMX_SOURCE_TYPE_TILELANG_CACHE\x10\x06\x12!\n" +
+	"\x1dMX_SOURCE_TYPE_CUTE_DSL_CACHE\x10\a\x12#\n" +
+	"\x1fMX_SOURCE_TYPE_FLASHINFER_CACHE\x10\b*{\n" +
 	"\fSourceStatus\x12\x19\n" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +

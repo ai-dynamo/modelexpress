@@ -15,7 +15,7 @@ import torch.nn as nn
 from ... import p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...load_strategy.context import LoadResult
-from ...metadata.heartbeat import HeartbeatThread
+from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
 from ...nixl_transfer import NixlTransferManager
@@ -379,7 +379,7 @@ class MxModelLoader:
             )
             return False
         try:
-            heartbeat = HeartbeatThread(
+            heartbeat = PublisherThread(
                 mx_client=ctx.mx_client,
                 mx_source_id=mx_source_id,
                 worker_id=ctx.worker_id,

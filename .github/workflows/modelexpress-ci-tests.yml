@@ -28,12 +28,12 @@
 #                         parallel once each framework has been validated
 #                         independently.
 #
-#   test-tp             — TP > 1 variant of test-p2p. Matrix covers
-#                         single-node TP=2 (one Job, two GPUs per pod,
-#                         pinned to a non-MIG GPU pool via nodeSelector)
-#                         and multi-node TP=2 (StatefulSet + Ray, one
-#                         GPU per pod, 2 pods per role). See TEST_PLAN
-#                         row 5.1 for the full topology rationale.
+#   test-tp             — TP > 1 variant of test-p2p. Multi-node TP=2 only
+#                         (StatefulSet + Ray, one GPU per pod on a100a, 2 pods
+#                         per role). Single-node TP=2 is covered by
+#                         test-p2p-mla-model (same manifest, plus VRAM parity)
+#                         and was dropped here to avoid doubling a100b demand.
+#                         See TEST_PLAN row 5.1.
 #
 #   test-dp             — DP > 1 variant of test-p2p. vLLM native data
 #                         parallelism (--data-parallel-size 2): N full model
@@ -55,6 +55,9 @@
 #   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
 #                        Uses a TP=2 DeepSeek MLA + MoE model and also runs
 #                        the standard source/target VRAM parity assertions.
+#                        Doubles as the single-node TP=2 coverage (same
+#                        manifest-azure-tp2.yaml + test_p2p_k8s.py as the
+#                        dropped test-tp single-node entry).
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
@@ -134,8 +137,8 @@ env:
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
-  MX_CI_S3_REGION: us-east-1
-  MX_IMAGE_REPO: nvcr.io/nvidian/dynamo-dev
+  MX_CI_S3_REGION: us-west-2
+  MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -347,6 +350,8 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8001"
             worker_port: "8002"
+            expected_artifact_sources: "1"
+            expected_artifact_source_types: "torch_compile_cache"
           - framework: trt-llm
             namespace: mx-ci-trt-llm-${{ github.run_id }}
             manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
@@ -413,6 +418,8 @@ jobs:
           source_port: ${{ matrix.source_port }}
           worker_port: ${{ matrix.worker_port }}
           pytest_args: ${{ matrix.pytest_args }}
+          expected_artifact_sources: ${{ matrix.expected_artifact_sources || '0' }}
+          expected_artifact_source_types: ${{ matrix.expected_artifact_source_types || '' }}
 
       - name: Dump vCluster diagnostics on failure
         # Captures vCluster control-plane state at the moment of failure
@@ -498,15 +505,17 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # P2P weight transfer with tensor parallelism > 1.
-  # Single-node TP: each pod has N GPUs and runs the engine with
-  # --tensor-parallel-size N. Source and target on different hosts (existing
-  # podAntiAffinity) so RDMA still goes over IB cross-host, not loopback.
-  # Multi-node TP coverage is a follow-up — would slot in here as additional
-  # matrix entries once the cluster + manifests support it.
   #
-  # Pinned to the right agentpool (2 nodes, full physical GPUs,
-  # `mig.config=all-disabled`) via the nodeSelector in
-  # manifest-azure-tp2.yaml.
+  # Multi-node TP only: StatefulSet + Ray, 1 GPU per pod on the a100a pool,
+  # so this job does NOT contend for the scarce full-GPU a100b pool. See the
+  # manifest header for the cross-host pod-pairing rationale.
+  #
+  # Single-node TP=2 is intentionally NOT a separate entry here: the
+  # `test-p2p-mla-model` job already exercises the single-node TP=2 path
+  # (same manifest-azure-tp2.yaml + test_p2p_k8s.py on the a100b full-GPU
+  # pool) and adds VRAM-parity assertions on top. Running both was redundant
+  # and doubled the a100b demand, so the Qwen single-node TP=2 entry was
+  # dropped in favor of the MLA one. See TEST_PLAN row 5.1.
   # ---------------------------------------------------------------------------
   test-tp:
     name: P2P TP test (${{ matrix.framework }} TP=${{ matrix.tp_size }} ${{ matrix.topology }})
@@ -518,14 +527,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - framework: vllm
-            tp_size: 2
-            topology: single-node
-            namespace: mx-ci-vllm-tp2-${{ github.run_id }}
-            manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
-            source_port: "8001"
-            worker_port: "8002"
-
           # Multi-node TP=2 (vLLM). StatefulSet + Ray topology; see the
           # manifest header for the cross-host pod-pairing rationale.
           - framework: vllm
@@ -652,8 +653,13 @@ jobs:
           source_port: ${{ matrix.source_port }}
           worker_port: ${{ matrix.worker_port }}
           # tp_size omitted — defaults to 1. DP cores are full, interchangeable
-          # copies at worker_rank 0; the source publishes one CR and the target
-          # pulls a single rank-0 weight set per DP core.
+          # copies at worker_rank 0, so each DP core publishes its own rank-0
+          # source agent and the target's DP cores each select one at random.
+          # dp_size=2 widens the per-rank agent assertion to [tp_size,
+          # tp_size*dp_size] = [1, 2]: the two target cores may converge on one
+          # source (1 distinct agent) or split across both (2), both valid. The
+          # source_ranks == range(tp_size) check still pins rank pairing to 0.
+          dp_size: "2"
 
       - name: Dump vCluster diagnostics on failure
         if: failure()
@@ -961,8 +967,8 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Model Streamer S3 test — single worker pod, no vCluster, no P2P.
-  # Streams weights directly from S3 via runai-model-streamer.
+  # Model Streamer S3 tests — single worker pod, no vCluster, no P2P.
+  # Covers direct streaming and fallback to the default loader.
   # IRSA provides S3 access; first run uploads safetensors to the bucket.
   #
   # Matrix over inference engine frameworks. The composite action
@@ -971,7 +977,7 @@ jobs:
   # variant) before un-commenting the matrix entry below.
   # ---------------------------------------------------------------------------
   model-streamer:
-    name: Model Streamer test (${{ matrix.framework }}, S3)
+    name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client]
     permissions:
@@ -981,6 +987,11 @@ jobs:
       matrix:
         include:
           - framework: vllm
+            mode: direct
+            test_model_streamer_fallback: 'false'
+          - framework: vllm
+            mode: fallback
+            test_model_streamer_fallback: 'true'
           # sglang — blocked on the SGLang streamer path crashing inside
           # ModelStreamerStrategy.load on `ctx.model_config.model` (a
           # vLLM-specific attribute). See the workflow header comment.
@@ -1009,6 +1020,7 @@ jobs:
           s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
           s3_region: ${{ env.MX_CI_S3_REGION }}
           hf_token: ${{ secrets.HF_TOKEN }}
+          test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
 
   # ---------------------------------------------------------------------------
   # Umbrella status check for branch protection.

@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import os
 from typing import Iterator
 
 import torch
 
+from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
@@ -26,21 +26,21 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
 def _resolve_model_uri(ctx: LoadContext) -> str:
     """Resolve the model URI used by ModelStreamer across engine configs."""
+    if model_uri := envs.MX_MODEL_URI:
+        return model_uri
     for attr in ("model_weights", "model", "model_path"):
         value = getattr(ctx.model_config, attr, None)
         if value:
             return value
-    return os.environ.get("MX_MODEL_URI", "")
+    return ""
 
 
 class ModelStreamerStrategy(LoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
-    Activated by setting MX_MODEL_URI (gate only). The actual URI used to
-    stream weights is taken from `model_config.model_weights` if set
-    (object-storage URIs: s3://, gs://, az://) and falls back to
-    `model_config.model` otherwise (local paths, HF-resolved snapshots).
-    Engine adapters provide the concrete ModelStreamer iterator.
+    Activated by setting MX_MODEL_URI, which is also the preferred streaming
+    URI. Engine model configuration is used only when the environment value is
+    unavailable. Engine adapters provide the concrete ModelStreamer iterator.
     """
 
     name = "model_streamer"
@@ -58,7 +58,7 @@ class ModelStreamerStrategy(LoadStrategy):
             )
             return False
 
-        model_uri = os.environ.get("MX_MODEL_URI", "")
+        model_uri = envs.MX_MODEL_URI or ""
         if not model_uri:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
