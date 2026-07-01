@@ -16,11 +16,7 @@ import torch
 
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
-from ...accelerators import (
-    AcceleratorBackend,
-    CudaAcceleratorBackend,
-    accelerator_backend_for,
-)
+from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 
@@ -79,7 +75,40 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        return collect_sglang_tensors(result.model, self.accelerator_backend)
+        return self._collect_tensors(result.model)
+
+    def _collect_tensors(self, model) -> dict[str, torch.Tensor]:
+        """Collect SGLang model parameters for NIXL registration.
+
+        SGLang's current NIXL path registers contiguous parameters directly and
+        registers a byte view of the underlying storage for non-contiguous
+        parameters. Keep that naming behavior so source and target descriptors
+        match the upstream integration.
+        """
+        backend = self.accelerator_backend
+        tensors: dict[str, torch.Tensor] = {}
+        seen_ptrs: set[int] = set()
+
+        for name, param in model.named_parameters():
+            t = param.data
+            if not backend.is_accel_tensor(t):
+                continue
+            if t.is_contiguous():
+                tensor_name = name
+                registered = t
+            else:
+                tensor_name = f"{name}.__storage"
+                registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+                    t.untyped_storage()
+                )
+
+            ptr = registered.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            tensors[tensor_name] = registered
+
+        return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         return self._process_weights_after_loading(result)
@@ -213,43 +242,6 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
         post_load_weights = getattr(child, "post_load_weights", None)
         if callable(post_load_weights):
             post_load_weights()
-
-
-def collect_sglang_tensors(
-    model,
-    accelerator_backend: AcceleratorBackend | None = None,
-) -> dict[str, torch.Tensor]:
-    """Collect SGLang model parameters for NIXL registration.
-
-    SGLang's current NIXL path registers contiguous parameters directly and
-    registers a byte view of the underlying storage for non-contiguous
-    parameters. Keep that naming behavior so source and target descriptors
-    match the upstream integration.
-    """
-    backend = accelerator_backend or CudaAcceleratorBackend()
-    tensors: dict[str, torch.Tensor] = {}
-    seen_ptrs: set[int] = set()
-
-    for name, param in model.named_parameters():
-        t = param.data
-        if not backend.is_accel_tensor(t):
-            continue
-        if t.is_contiguous():
-            tensor_name = name
-            registered = t
-        else:
-            tensor_name = f"{name}.__storage"
-            registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                t.untyped_storage()
-            )
-
-        ptr = registered.data_ptr()
-        if ptr in seen_ptrs:
-            continue
-        seen_ptrs.add(ptr)
-        tensors[tensor_name] = registered
-
-    return tensors
 
 
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:

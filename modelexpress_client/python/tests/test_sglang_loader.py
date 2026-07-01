@@ -16,7 +16,6 @@ from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
     build_sglang_load_context,
-    collect_sglang_tensors,
 )
 from modelexpress.engines.sglang.loader import MxModelLoader
 
@@ -135,10 +134,12 @@ def test_collect_sglang_tensors_preserves_non_contiguous_storage_names(
     mock_accelerator_backend_cls,
 ):
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     model.weight_t = nn.Parameter(torch.randn(4, 3).T)
 
-    tensors = collect_sglang_tensors(model, backend)
+    tensors = adapter._collect_tensors(model)
 
     assert "weight_t.__storage" in tensors
     assert tensors["weight_t.__storage"].dtype == torch.uint8
@@ -148,12 +149,14 @@ def test_collect_sglang_tensors_deduplicates_tied_parameters(
     mock_accelerator_backend_cls,
 ):
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     shared = nn.Parameter(torch.randn(4, 3))
     model.first = shared
     model.second = shared
 
-    tensors = collect_sglang_tensors(model, backend)
+    tensors = adapter._collect_tensors(model)
 
     assert list(tensors) == ["first"]
 
