@@ -211,17 +211,36 @@ class ReceiverThread(threading.Thread):
             for t in self.trainers:
                 t.ready_event.wait(timeout=30.0)
 
+            # Discovery races the trainers' per-cycle re-publish: the
+            # catalog may not yet show version>=cycle for all ranks when we
+            # first look. Poll with backoff until every rank's shard is
+            # covered (same async gap the prime-rl worker absorbs).
             t0 = time.perf_counter()
-            plan = receiver.discover_v2_sources_for_slice(
-                model_name=self.cfg.model_name,
-                target_layout=target,
-                min_version=cycle,
-                same_rank_only=False,
-            )
+            deadline = time.monotonic() + self.cfg.timeout_s
+            backoff = 0.25
+            plan = None
+            while True:
+                plan = receiver.discover_v2_sources_for_slice(
+                    model_name=self.cfg.model_name,
+                    target_layout=target,
+                    min_version=cycle,
+                    same_rank_only=False,
+                )
+                covered_ranks = {
+                    src.candidate.ref.worker_rank
+                    for contributions in plan.per_tensor_sources.values()
+                    for src in contributions
+                }
+                if plan.fully_covered and len(covered_ranks) == self.cfg.num_publishers:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"cycle {cycle}: plan not covered after {self.cfg.timeout_s}s; "
+                        f"covered_ranks={sorted(covered_ranks)} missing={plan.missing}"
+                    )
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 4.0)
             discover_dt = time.perf_counter() - t0
-
-            if not plan.fully_covered:
-                raise RuntimeError(f"cycle {cycle}: plan not covered; missing={plan.missing}")
 
             t0 = time.perf_counter()
             got: dict[str, torch.Tensor] = {}
