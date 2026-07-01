@@ -268,16 +268,30 @@ class MxDhtClient(MxClientBase):
                 target=_run_loop, name="mx-dht-loop", daemon=False,
             )
             self._loop_thread.start()
-            if not loop_ready.wait(timeout=_LOOP_START_TIMEOUT):
-                raise RuntimeError(
-                    f"MxDhtClient: event loop failed to start within "
-                    f"{_LOOP_START_TIMEOUT}s"
-                )
+            try:
+                if not loop_ready.wait(timeout=_LOOP_START_TIMEOUT):
+                    raise RuntimeError(
+                        f"MxDhtClient: event loop failed to start within "
+                        f"{_LOOP_START_TIMEOUT}s"
+                    )
 
-            future = asyncio.run_coroutine_threadsafe(
-                self._start_node(), self._loop,
-            )
-            future.result(timeout=_NODE_START_TIMEOUT)
+                future = asyncio.run_coroutine_threadsafe(
+                    self._start_node(), self._loop,
+                )
+                future.result(timeout=_NODE_START_TIMEOUT)
+            except BaseException:
+                # A failed start must not leak the non-daemon loop thread:
+                # _started stays unset, so close() would early-return and the
+                # still-running thread would hang the process on exit. Tear the
+                # loop and thread down here before propagating.
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._loop_thread is not None:
+                    self._loop_thread.join(timeout=_NODE_STOP_TIMEOUT)
+                self._node = None
+                self._loop = None
+                self._loop_thread = None
+                raise
             self._started.set()
             # Best-effort cleanup on normal interpreter exit. SIGTERM
             # / SIGKILL bypass atexit; callers that need cleanup on

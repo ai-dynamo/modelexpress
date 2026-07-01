@@ -48,6 +48,9 @@ const KADEMLIA_PROTOCOL: &str = "/ipfs/kad/1.0.0";
 const IDENTIFY_AGENT: &str = "modelexpress/0.3.0";
 const DEFAULT_BOOTSTRAP_PORT: u16 = 4001;
 const LISTEN_READY_TIMEOUT: Duration = Duration::from_secs(5);
+// DHT participation is best-effort; bound bootstrap name resolution so a hung
+// resolver cannot stall server startup (start() is awaited inline by the server).
+const BOOTSTRAP_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(NetworkBehaviour)]
 struct MxBehaviour {
@@ -211,8 +214,24 @@ impl DhtNode {
 
         // DNS / Slurm bootstrap: resolve names to IPs and dial. Peer
         // ids are learned via the Noise handshake, after which the
-        // Identify behaviour propagates them into kad.
-        let dial_targets = collect_bootstrap_dial_targets(&config).await;
+        // Identify behaviour propagates them into kad. Bounded by a timeout so
+        // a hanging resolver cannot stall best-effort DHT startup.
+        let dial_targets = match tokio::time::timeout(
+            BOOTSTRAP_RESOLVE_TIMEOUT,
+            collect_bootstrap_dial_targets(&config),
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(_) => {
+                warn!(
+                    "DhtNode: bootstrap resolution timed out after {:?}; \
+                     continuing without initial dial targets",
+                    BOOTSTRAP_RESOLVE_TIMEOUT
+                );
+                Vec::new()
+            }
+        };
         for addr in dial_targets {
             if let Err(err) = swarm.dial(addr.clone()) {
                 warn!("DhtNode: bootstrap dial {addr} failed: {err}");
