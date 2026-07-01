@@ -146,6 +146,10 @@ pub struct ArtifactSourceStatus {
     /// Number of transfer chunks in the sealed artifact manifest.
     #[serde(rename = "chunkCount")]
     pub chunk_count: u32,
+
+    /// Distributed node rank that owns this node-scoped artifact.
+    #[serde(rename = "nodeRank", default)]
+    pub node_rank: u32,
 }
 
 impl WorkerStatus {

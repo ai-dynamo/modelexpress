@@ -81,6 +81,16 @@ class ArtifactBundle:
 
 
 @dataclass(frozen=True)
+class ArtifactCacheRoot:
+    """Named source and target directories packaged into one cache artifact."""
+
+    name: str
+    source_root: Path
+    target_root: Path
+    optional: bool = False
+
+
+@dataclass(frozen=True)
 class ArtifactSourceEndpoint:
     """MX-discovered worker endpoint for one published artifact source."""
 
@@ -120,8 +130,7 @@ class P2PArtifactTransfer(Protocol):
 
     name: str
     mx_source_type: int
-    source_root: Path
-    target_root: Path
+    roots: tuple[ArtifactCacheRoot, ...]
     bundle_root: Path
 
     def prepare_source(self) -> ArtifactBundle:
@@ -146,14 +155,15 @@ class P2PArtifactTransfer(Protocol):
         nixl_manager: NixlTransferManager,
         *,
         worker_rank: int | None = None,
+        node_rank: int | None = None,
         artifact_id: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
         """Discover an artifact source, then transfer from its worker.
 
-        By default artifact discovery does not rank-match. Pass worker_rank only
-        for artifact types whose contents are worker/rank-specific.
+        By default artifact discovery does not rank-match. Pass node_rank for
+        node-scoped artifacts or worker_rank for worker-specific artifacts.
         """
 
     def install(
@@ -169,36 +179,60 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
 
     name: str
     mx_source_type: int
-    source_root: Path
-    target_root: Path
+    roots: tuple[ArtifactCacheRoot, ...]
     bundle_root: Path
     chunk_size: int | None = None
     tar_name: str = "artifact.tar"
 
     def prepare_source(self) -> ArtifactBundle:
-        """Tar the source directory into bundle_root and build its manifest."""
+        """Tar the source directories into bundle_root and build their manifest."""
         start = time.perf_counter()
-        source_path = self.source_root.resolve(strict=True)
-        if not source_path.is_dir():
-            raise ValueError(f"artifact source root is not a directory: {source_path}")
-
+        root_archives = self._root_archives()
+        self._validate_archive_names(root_archives)
         bundle_path = self.bundle_root.resolve()
-        if bundle_path == source_path or bundle_path.is_relative_to(source_path):
-            raise ValueError("artifact bundle_root must not be inside source_root")
-        if Path(self.tar_name).name != self.tar_name:
-            raise ValueError("artifact tar_name must be a file name, not a path")
+        resolved_sources: dict[str, Path | None] = {}
+        for tar_name, root in root_archives:
+            source_candidate = root.source_root.resolve()
+            if bundle_path == source_candidate or bundle_path.is_relative_to(
+                source_candidate
+            ):
+                raise ValueError("artifact bundle_root must not be inside source_root")
+            try:
+                resolved_source = root.source_root.resolve(strict=True)
+            except FileNotFoundError:
+                if not root.optional:
+                    raise
+                resolved_source = None
+            if resolved_source is not None and not resolved_source.is_dir():
+                raise ValueError(
+                    f"artifact source root is not a directory: {resolved_source}"
+                )
+            resolved_sources[tar_name] = resolved_source
 
-        _reject_symlinked_source_entries(source_path)
+        source_path = resolved_sources[self.tar_name]
+        if source_path is None:
+            raise ValueError("primary artifact source root is required")
+
         bundle_path.mkdir(parents=True, exist_ok=True)
-        tar_path = bundle_path / self.tar_name
+        tar_paths = {bundle_path / tar_name for tar_name, _ in root_archives}
         for child in bundle_path.iterdir():
-            if child != tar_path:
+            if child not in tar_paths:
                 raise ValueError(
                     f"artifact bundle_root must be dedicated; found {child}"
                 )
-        tar_path.unlink(missing_ok=True)
+        for tar_path in tar_paths:
+            tar_path.unlink(missing_ok=True)
 
-        _run_tar(["-cf", str(tar_path), "-C", str(source_path), "."])
+        for tar_name, _ in root_archives:
+            tar_path = bundle_path / tar_name
+            resolved_source = resolved_sources[tar_name]
+            if resolved_source is None:
+                with tarfile.open(tar_path, "w"):
+                    pass
+                continue
+            _reject_symlinked_source_entries(resolved_source)
+            _run_tar(["-cf", str(tar_path), "-C", str(resolved_source), "."])
+
         manifest = build_artifact_manifest(
             bundle_path,
             chunk_size=self.chunk_size,
@@ -220,7 +254,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         return ArtifactBundle(
             source_root=source_path,
             bundle_root=bundle_path,
-            tar_path=tar_path,
+            tar_path=bundle_path / self.tar_name,
             manifest=manifest,
             artifact_id=artifact_id,
         )
@@ -235,7 +269,6 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
-        target_tar_path = self._target_tar_path()
         return transfer_artifact_from_worker(
             endpoint,
             mx_source_id,
@@ -243,7 +276,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
             nixl_manager,
             timeout=timeout,
             max_inflight_chunks=max_inflight_chunks,
-            target_file_paths=[target_tar_path],
+            target_file_paths=self._target_tar_paths(),
         )
 
     def discover_and_transfer(
@@ -253,6 +286,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         nixl_manager: NixlTransferManager,
         *,
         worker_rank: int | None = None,
+        node_rank: int | None = None,
         artifact_id: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
@@ -261,6 +295,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
             mx_client,
             identity,
             worker_rank=worker_rank,
+            node_rank=node_rank,
             artifact_id=artifact_id,
         )
         return self.transfer_from_worker(
@@ -277,42 +312,74 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
     ) -> None:
         start = time.perf_counter()
-        if len(header.files) != 1:
+        root_archives = self._root_archives()
+        self._validate_archive_names(root_archives)
+        expected_names = {tar_name for tar_name, _ in root_archives}
+        file_names = [Path(file.path).name for file in header.files]
+        if len(set(file_names)) != len(file_names):
+            raise ValueError("artifact bundle files must be unique by archive name")
+        files_by_name = dict(zip(file_names, header.files, strict=True))
+        if set(files_by_name) != expected_names:
             raise ValueError(
-                f"artifact bundle must contain exactly one file, got {len(header.files)}"
+                "artifact bundle files do not match configured cache roots: "
+                f"{sorted(files_by_name)} != {sorted(expected_names)}"
             )
-        tar_file = Path(header.files[0].path).resolve(strict=True)
-        output_path = self.target_root.resolve()
-        output_path.mkdir(parents=True, exist_ok=True)
-        _validate_tar_members(tar_file)
-        _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+        installed_targets = []
+        for tar_name, root in root_archives:
+            tar_file = Path(files_by_name[tar_name].path).resolve(strict=True)
+            output_path = root.target_root.resolve()
+            output_path.mkdir(parents=True, exist_ok=True)
+            _validate_tar_members(tar_file)
+            _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+            installed_targets.append(str(output_path))
         elapsed = time.perf_counter() - start
         logger.info(
-            "[TIMING] Artifact install complete: artifact_id=%s target=%s "
+            "[TIMING] Artifact install complete: artifact_id=%s targets=%s "
             "size=%.2f MiB elapsed=%.3fs",
             header.artifact_id,
-            output_path,
+            installed_targets,
             _mib(header.total_size),
             elapsed,
         )
 
-    def _target_tar_path(self) -> Path:
-        if Path(self.tar_name).name != self.tar_name:
-            raise ValueError("artifact tar_name must be a file name, not a path")
-        target_path = self.target_root.resolve()
+    def _target_tar_paths(self) -> list[Path]:
+        root_archives = self._root_archives()
+        self._validate_archive_names(root_archives)
         bundle_path = self.bundle_root.resolve()
-        if bundle_path == target_path or bundle_path.is_relative_to(target_path):
-            raise ValueError("artifact bundle_root must not be inside target_root")
+        for _, root in root_archives:
+            target_path = root.target_root.resolve()
+            if bundle_path == target_path or bundle_path.is_relative_to(target_path):
+                raise ValueError("artifact bundle_root must not be inside target_root")
         bundle_path.mkdir(parents=True, exist_ok=True)
-        tar_path = bundle_path / self.tar_name
+        tar_paths = [bundle_path / tar_name for tar_name, _ in root_archives]
         for child in bundle_path.iterdir():
-            if child != tar_path:
+            if child not in tar_paths:
                 raise ValueError(
                     f"artifact bundle_root must be dedicated; found {child}"
                 )
-        if tar_path.is_symlink():
-            raise ValueError(f"artifact target bundle path must not be a symlink: {tar_path}")
-        return tar_path
+        for tar_path in tar_paths:
+            if tar_path.is_symlink():
+                raise ValueError(
+                    f"artifact target bundle path must not be a symlink: {tar_path}"
+                )
+        return sorted(tar_paths)
+
+    def _root_archives(self) -> tuple[tuple[str, ArtifactCacheRoot], ...]:
+        if not self.roots:
+            raise ValueError("artifact transfer requires at least one cache root")
+        return ((self.tar_name, self.roots[0]),) + tuple(
+            (f"{root.name}.tar", root) for root in self.roots[1:]
+        )
+
+    @staticmethod
+    def _validate_archive_names(
+        root_archives: tuple[tuple[str, ArtifactCacheRoot], ...],
+    ) -> None:
+        names = [tar_name for tar_name, _ in root_archives]
+        if any(Path(name).name != name for name in names):
+            raise ValueError("artifact tar names must be file names, not paths")
+        if len(set(names)) != len(names):
+            raise ValueError("artifact tar names must be unique")
 
 
 def torch_compile_cache_artifact_transfer(
@@ -406,6 +473,7 @@ def flashinfer_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
+    additional_roots: tuple[ArtifactCacheRoot, ...] = (),
 ) -> P2PArtifactTransfer:
     return _cache_artifact_transfer(
         "flashinfer_cache",
@@ -414,6 +482,7 @@ def flashinfer_cache_artifact_transfer(
         target_root,
         bundle_root,
         chunk_size=chunk_size,
+        additional_roots=additional_roots,
     )
 
 
@@ -427,6 +496,7 @@ def publish_artifact_source(
     *,
     worker_grpc_server: WorkerGrpcServer,
     worker_rank: int = 0,
+    node_rank: int = 0,
     max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     host: str | None = None,
 ) -> PublishedArtifactSource:
@@ -459,7 +529,7 @@ def publish_artifact_source(
         metadata_endpoint=metadata_endpoint,
         agent_name=nixl_manager.agent_name,
         worker_grpc_endpoint=worker_grpc_endpoint,
-        artifact_source=artifact_source_metadata(bundle.manifest),
+        artifact_source=artifact_source_metadata(bundle.manifest, node_rank=node_rank),
     )
     try:
         mx_source_id = _publish_metadata_to_server(
@@ -523,12 +593,13 @@ def discover_artifact_source(
     identity: p2p_pb2.SourceIdentity,
     *,
     worker_rank: int | None = None,
+    node_rank: int | None = None,
     artifact_id: str = "",
 ) -> ArtifactSourceEndpoint:
     """Find a ready artifact source through the MX server.
 
-    Artifact sources are not rank-matched by default. Pass worker_rank only for
-    artifact types whose contents are worker/rank-specific.
+    Artifact sources are not rank-matched by default. Pass node_rank for
+    node-scoped artifacts or worker_rank for worker-specific artifacts.
     """
     sources = mx_client.list_sources(
         identity=identity,
@@ -542,6 +613,8 @@ def discover_artifact_source(
             continue
         worker = metadata.worker
         if worker.WhichOneof("source_payload") != "artifact_source":
+            continue
+        if node_rank is not None and worker.artifact_source.node_rank != node_rank:
             continue
         if not worker.worker_grpc_endpoint:
             continue
@@ -566,12 +639,19 @@ def _cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None,
+    additional_roots: tuple[ArtifactCacheRoot, ...] = (),
 ) -> P2PArtifactTransfer:
     return TarredP2PArtifactTransfer(
         name=name,
         mx_source_type=mx_source_type,
-        source_root=Path(source_root),
-        target_root=Path(target_root),
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=Path(source_root),
+                target_root=Path(target_root),
+            ),
+            *additional_roots,
+        ),
         bundle_root=Path(bundle_root),
         chunk_size=chunk_size,
     )

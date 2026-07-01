@@ -61,6 +61,7 @@ class LoadContext:
     identity: p2p_pb2.SourceIdentity
     mx_client: MxClientBase
     worker_id: str
+    node_rank: int = 0
     adapter: EngineAdapter | None = None
     accelerator_backend: AcceleratorBackend = field(default_factory=CudaAcceleratorBackend)
     nixl_manager: NixlTransferManager | None = None

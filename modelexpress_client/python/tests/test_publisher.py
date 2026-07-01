@@ -132,21 +132,27 @@ class TestPublisherPublishAndReady:
         mx_client.update_status.assert_not_called()
 
     def test_can_stop_after_publish_without_heartbeat(self, mx_client, nixl_manager):
+        ready = MagicMock(return_value=True)
+        publish = MagicMock(return_value="abc123")
         publisher = PublisherThread(
             mx_client=mx_client,
             worker_id="w1",
             worker_rank=0,
             nixl_manager=nixl_manager,
-            publish_fn=lambda: "abc123",
+            publish_fn=publish,
+            ready_fn=ready,
             heartbeat_after_publish=False,
             interval_secs=1,
         )
 
         publisher._tick()
+        publisher._tick()
 
         assert publisher.mx_source_id == "abc123"
         mx_client.update_status.assert_not_called()
         assert publisher._stop_event.is_set()
+        ready.assert_called_once_with()
+        publish.assert_called_once_with()
 
 
 class TestHeartbeatStop:

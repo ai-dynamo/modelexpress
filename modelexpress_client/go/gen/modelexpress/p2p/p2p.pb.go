@@ -495,7 +495,9 @@ type ArtifactSourceMetadata struct {
 	// Number of files in the sealed artifact manifest.
 	FileCount uint32 `protobuf:"varint,3,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
 	// Number of transfer chunks in the sealed artifact manifest.
-	ChunkCount    uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	ChunkCount uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	// Distributed node rank that owns this node-scoped artifact.
+	NodeRank      uint32 `protobuf:"varint,5,opt,name=node_rank,json=nodeRank,proto3" json:"node_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -554,6 +556,13 @@ func (x *ArtifactSourceMetadata) GetFileCount() uint32 {
 func (x *ArtifactSourceMetadata) GetChunkCount() uint32 {
 	if x != nil {
 		return x.ChunkCount
+	}
+	return 0
+}
+
+func (x *ArtifactSourceMetadata) GetNodeRank() uint32 {
+	if x != nil {
+		return x.NodeRank
 	}
 	return 0
 }
@@ -2471,7 +2480,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\x04addr\x18\x02 \x01(\x04R\x04addr\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x04R\x04size\x12\x1b\n" +
 	"\tdevice_id\x18\x04 \x01(\rR\bdeviceId\x12\x14\n" +
-	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\x98\x01\n" +
+	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\xb5\x01\n" +
 	"\x16ArtifactSourceMetadata\x12\x1f\n" +
 	"\vartifact_id\x18\x01 \x01(\tR\n" +
 	"artifactId\x12\x1d\n" +
@@ -2480,7 +2489,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"file_count\x18\x03 \x01(\rR\tfileCount\x12\x1f\n" +
 	"\vchunk_count\x18\x04 \x01(\rR\n" +
-	"chunkCount\"U\n" +
+	"chunkCount\x12\x1b\n" +
+	"\tnode_rank\x18\x05 \x01(\rR\bnodeRank\"U\n" +
 	"\x14TensorSourceMetadata\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\"\xa4\x02\n" +
 	"\x10ArtifactManifest\x12)\n" +
