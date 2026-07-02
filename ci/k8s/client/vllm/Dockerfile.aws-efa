@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# AWS EFA vLLM runtime for CI. The base image includes the AWS EFA installer,
+# libfabric provider, and aws-ofi-nccl. Runtime manifests must set
+# MX_NIXL_BACKEND=LIBFABRIC so ModelExpress uses NIXL's libfabric backend.
+#
+# Why the Dynamo EFA runtime instead of upstream vllm/vllm-openai:
+# upstream vLLM images ship NIXL with the LIBFABRIC plugin, but the NIXL
+# wheel deliberately excludes libfabric itself (libfabric*/libefa*), so the
+# plugin cannot dlopen its dependency. Without the AWS EFA userspace stack
+# (libfabric.so.1 with the EFA provider under /opt/amazon/efa) the LIBFABRIC
+# backend fails to initialize and ModelExpress silently falls back to disk
+# load: exactly the false-positive this CI lane exists to catch. The Dynamo
+# -efa tag ships NIXL + libfabric + EFA userspace prebuilt and path-wired.
+#
+# Known tradeoff: this tag carries vLLM 0.19.0 while the Azure/GCP CI workers
+# pin vLLM 0.17.1, so the EFA lane tests a newer vLLM than the other clouds.
+# Acceptable while the lane targets transport correctness; if exact cross-
+# cloud vLLM parity ever becomes a requirement, the alternative is upstream
+# vLLM plus a pinned AWS EFA installer layer (no NIXL rebuild needed).
+# The -efa tag is AMD64-only; there is no -efa-arm64 variant.
+FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.1.0-efa-amd64
+
+# Copy and install ModelExpress Python client.
+COPY --chown=dynamo:dynamo modelexpress_client/python /opt/modelexpress/client
+WORKDIR /opt/modelexpress/client
+RUN uv pip install .
+
+WORKDIR /workspace

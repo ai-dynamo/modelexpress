@@ -16,8 +16,12 @@ description: |
 
 inputs:
   kubeconfig_base64:
-    description: 'Base64-encoded kubeconfig for the vCluster'
-    required: true
+    description: |
+      Base64-encoded kubeconfig. If omitted, the caller must set KUBECONFIG
+      before invoking this action, for example from a Teleport-mounted
+      kubeconfig on the runner.
+    required: false
+    default: ''
   namespace:
     description: 'Namespace to create inside the vCluster for this test run'
     required: false
@@ -25,6 +29,18 @@ inputs:
   server_image:
     description: 'Fully-qualified MX server image (built from ci/k8s/server/Dockerfile.server)'
     required: true
+  server_heartbeat_timeout_secs:
+    description: |
+      Server reaper heartbeat threshold for READY/INITIALIZING source
+      metadata. Default 900 preserves the widened CI window for slow
+      cold-starting engine tests; the FP8 disk-fallback job overrides
+      higher to keep deleted-source metadata alive across the target run.
+    required: false
+    default: '900'
+  server_reaper_scan_interval_secs:
+    description: 'Server reaper scan interval for stale source metadata (server default).'
+    required: false
+    default: '30'
   manifest:
     description: 'Repo-root-relative path to the K8s manifest. Envsubst is run on it before apply.'
     required: true
@@ -102,10 +118,21 @@ inputs:
     description: 'Comma-separated non-weight artifact sourceType values expected by pytest.'
     required: false
     default: ''
+  delete_source_before_target:
+    description: |
+      Force-delete the source Job after it publishes metadata and before
+      applying the target. This leaves stale READY metadata long enough for
+      the target to attempt RDMA, fail after target preparation, reinitialize,
+      and fall back to the native disk loader. Used by the FP8 disk-fallback
+      regression test. Defaults to false for normal P2P tests.
+    required: false
+    default: 'false'
+
 runs:
   using: "composite"
   steps:
-    - name: Setup vCluster kubeconfig
+    - name: Setup kubeconfig from base64
+      if: inputs.kubeconfig_base64 != ''
       shell: bash
       env:
         KUBECONFIG_B64: ${{ inputs.kubeconfig_base64 }}
@@ -113,6 +140,15 @@ runs:
         echo "${KUBECONFIG_B64}" | base64 -d > ${{ github.workspace }}/.kubeconfig-vcluster
         chmod 600 ${{ github.workspace }}/.kubeconfig-vcluster
         echo "KUBECONFIG=${{ github.workspace }}/.kubeconfig-vcluster" >> $GITHUB_ENV
+
+    - name: Validate kubeconfig
+      shell: bash
+      run: |
+        if [ -z "${KUBECONFIG:-}" ]; then
+          echo "ERROR: kubeconfig_base64 was not provided and KUBECONFIG is not set"
+          exit 1
+        fi
+        kubectl config current-context >/dev/null
 
     - name: Setup test namespace
       shell: bash
@@ -169,9 +205,13 @@ runs:
       shell: bash
       env:
         MX_SERVER_IMAGE: ${{ inputs.server_image }}
+        MX_HEARTBEAT_TIMEOUT_SECS: ${{ inputs.server_heartbeat_timeout_secs }}
+        MX_REAPER_SCAN_INTERVAL_SECS: ${{ inputs.server_reaper_scan_interval_secs }}
         NAMESPACE: ${{ inputs.namespace }}
       run: |
-        echo "::group::Deploy MX server in ${NAMESPACE}"
+        [[ "${MX_HEARTBEAT_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: server_heartbeat_timeout_secs must be a positive integer, got '${MX_HEARTBEAT_TIMEOUT_SECS}'"; exit 1; }
+        [[ "${MX_REAPER_SCAN_INTERVAL_SECS}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: server_reaper_scan_interval_secs must be a positive integer, got '${MX_REAPER_SCAN_INTERVAL_SECS}'"; exit 1; }
+        echo "::group::Deploy MX server in ${NAMESPACE} (heartbeat=${MX_HEARTBEAT_TIMEOUT_SECS}s, scan=${MX_REAPER_SCAN_INTERVAL_SECS}s)"
         envsubst < ci/k8s/server/mx-server.yaml | kubectl apply -n ${NAMESPACE} -f -
         kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
         echo "::endgroup::"
@@ -288,10 +328,10 @@ runs:
             echo "Source published ${CR_COUNT}/${TP_SIZE} weight ModelMetadata CRs."
             break
           fi
-          FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
+          FAILED=$(kubectl get pods -n "${NAMESPACE}" -l "job-name=mx-source" --no-headers 2>/dev/null \
             | awk '$3 ~ /Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull/' || true)
           if [ -n "${FAILED}" ]; then
-            echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
+            echo "ERROR: source pod failed before publishing READY metadata: ${FAILED}"
             exit 1
           fi
           echo "Have ${CR_COUNT}/${TP_SIZE} weight ModelMetadata CRs, retrying in 5s..."
@@ -324,6 +364,68 @@ runs:
         if [ "${EXPECTED_ARTIFACT_SOURCES}" -gt 0 ]; then
           wait_for_artifact_sources "${EXPECTED_ARTIFACT_SOURCES}"
         fi
+        echo "::endgroup::"
+
+    - name: Delete source before target
+      if: inputs.source_extra_env != '' && inputs.delete_source_before_target == 'true'
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        TP_SIZE: ${{ inputs.tp_size }}
+        TIMEOUT: ${{ inputs.pod_ready_timeout_seconds }}
+      run: |
+        echo "::group::Force-delete source Job before target apply"
+        # Gate the kill on Ready weight metadata, not mere CR existence.
+        # The CR is created before tensor metadata/status is written; Ready
+        # is set later by the client heartbeat, and targets filter strictly
+        # for Ready sources. Killing a not-yet-Ready source would produce a
+        # clean no-source fallback instead of the dead-peer receive-failure
+        # path this test exists to exercise.
+        count_ready_weight_sources() {
+          kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{" "}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | awk '$1 == "weights" && $2 == "Ready" { count++ } END { print count + 0 }'
+        }
+        deadline=$((SECONDS + TIMEOUT))
+        while true; do
+          READY=$(count_ready_weight_sources)
+          if [ "${READY}" -ge "${TP_SIZE}" ]; then
+            echo "All ${TP_SIZE} weight source(s) Ready; safe to delete."
+            break
+          fi
+          if [ $SECONDS -ge $deadline ]; then
+            echo "ERROR: only ${READY}/${TP_SIZE} weight sources Ready within ${TIMEOUT}s; refusing to delete a not-yet-Ready source"
+            exit 1
+          fi
+          echo "Have ${READY}/${TP_SIZE} Ready weight sources, retrying in 5s..."
+          sleep 5
+        done
+        # Keep the source's published ModelMetadata around, but remove the
+        # serving pod before the target starts. The target should discover the
+        # stale READY source, fail the RDMA receive after target preparation,
+        # reinitialize the vLLM model, and then fall back to disk.
+        kubectl delete job mx-source -n "${NAMESPACE}" \
+          --grace-period=0 \
+          --force \
+          --cascade=foreground \
+          --timeout=60s
+
+        deadline=$((SECONDS + 60))
+        while true; do
+          if ! SOURCE_PODS=$(kubectl get pods -n "${NAMESPACE}" -l "job-name=mx-source" -o name); then
+            echo "ERROR: failed to verify source pod deletion"
+            exit 1
+          fi
+          if [ -z "${SOURCE_PODS}" ]; then
+            echo "Source pod deletion confirmed."
+            break
+          fi
+          if [ $SECONDS -ge $deadline ]; then
+            echo "ERROR: source pod still exists after 60s: ${SOURCE_PODS//$'\n'/, }"
+            exit 1
+          fi
+          echo "Waiting for source pod deletion: ${SOURCE_PODS//$'\n'/, }"
+          sleep 2
+        done
         echo "::endgroup::"
 
     - name: Apply target manifest

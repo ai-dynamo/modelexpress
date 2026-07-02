@@ -10,10 +10,10 @@
 #                         (prod-modelexpress-builder-amd-v1).
 #
 #   build-client        — matrix over inference engine frameworks (vllm,
-#                         trt-llm, sglang, dynamo-vllm); builds and pushes
-#                         one worker image per framework. Runs on the
-#                         self-hosted builder runner. All build jobs run in
-#                         parallel.
+#                         vllm-aws-efa, trt-llm, sglang, dynamo-vllm);
+#                         builds and pushes one worker image per framework.
+#                         Runs on the self-hosted builder runner. All build
+#                         jobs run in parallel.
 #
 #   ensure-vcluster     — bootstraps the persistent mx-ci-cluster vCluster on
 #                         first run (no-ops on re-runs). Runs in parallel with
@@ -76,6 +76,13 @@
 #                         (vllm / sglang). No target pod — the assertion runs
 #                         against mx-server directly via gRPC.
 #
+#   test-fp8-disk-fallback-aws
+#                         FP8 disk-fallback regression on the AWS H100/EFA
+#                         cluster (guards the vLLM CompilationConfig cleanup
+#                         in PR #244). Uses
+#                         the Teleport kubeconfig mounted on the selected
+#                         runner instead of a kubeconfig secret.
+#
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
 #                          via runai-model-streamer + IRSA. Validates the
@@ -134,6 +141,9 @@ concurrency:
 
 env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
+  MX_CI_FP8_MODEL: ${{ vars.MX_CI_FP8_MODEL || 'gaunernst/DeepSeek-V2-Lite-Chat-FP8' }}
+  MX_CI_AWS_EFA_COUNT: ${{ vars.MX_CI_AWS_EFA_COUNT || '4' }}
+  MX_CI_AWS_KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
@@ -207,6 +217,8 @@ jobs:
         include:
           - framework: vllm
             dockerfile: ci/k8s/client/vllm/Dockerfile
+          - framework: vllm-aws-efa
+            dockerfile: ci/k8s/client/vllm/Dockerfile.aws-efa
           - framework: trt-llm
             dockerfile: ci/k8s/client/trt-llm/Dockerfile
           - framework: sglang
@@ -962,6 +974,67 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # FP8 disk-fallback regression after failed RDMA target preparation.
+  #
+  # Runs on the AWS EFA cluster directly, not through the AKS vCluster path.
+  # Sequence:
+  #   1. Start a source pod and wait for ModelMetadata.
+  #   2. Force-delete the source before target apply, leaving stale READY
+  #      metadata in mx-server.
+  #   3. Start the target. It should attempt RDMA, fail after target
+  #      preparation, reinitialize vLLM, clear CompilationConfig state, fall
+  #      back to native disk load, and serve inference.
+  # ---------------------------------------------------------------------------
+  test-fp8-disk-fallback-aws:
+    name: FP8 disk fallback (AWS EFA)
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set kubectl context
+        shell: bash
+        env:
+          KUBE_CONTEXT: ${{ env.MX_CI_AWS_KUBE_CONTEXT }}
+        run: |
+          set -euo pipefail
+          KUBECONFIG_PATH="${RUNNER_TEMP}/kubeconfig.yaml"
+          cp /teleport/kubeconfig.yaml "${KUBECONFIG_PATH}"
+          chmod 600 "${KUBECONFIG_PATH}"
+          kubectl --kubeconfig="${KUBECONFIG_PATH}" config use-context "${KUBE_CONTEXT}"
+          echo "KUBECONFIG=${KUBECONFIG_PATH}" >> "$GITHUB_ENV"
+
+      - name: Run FP8 disk fallback test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          namespace: mx-ci-fp8-disk-fallback-${{ github.run_id }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          server_heartbeat_timeout_secs: "1800"
+          server_reaper_scan_interval_secs: "300"
+          manifest: ci/k8s/client/vllm/manifest-aws-efa.yaml
+          test_script: ci/k8s/client/test_fp8_disk_fallback_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm-aws-efa:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_FP8_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: |
+            JOB_NAME=mx-source
+            AWS_EFA_COUNT=${{ env.MX_CI_AWS_EFA_COUNT }}
+          extra_env: |
+            JOB_NAME=mx-target
+            AWS_EFA_COUNT=${{ env.MX_CI_AWS_EFA_COUNT }}
+          source_port: "8021"
+          worker_port: "8022"
+          delete_source_before_target: "true"
+
+  # ---------------------------------------------------------------------------
   # Model Streamer S3 tests — single worker pod, no vCluster, no P2P.
   # Covers direct streaming and fallback to the default loader.
   # IRSA provides S3 access; first run uploads safetensors to the bucket.
@@ -1054,6 +1127,7 @@ jobs:
       - test-with-dynamo
       - test-fleet-scale
       - test-stale-metadata
+      - test-fp8-disk-fallback-aws
       - model-streamer
     if: always()
     steps:
