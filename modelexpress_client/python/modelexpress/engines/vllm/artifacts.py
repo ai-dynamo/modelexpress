@@ -30,6 +30,7 @@ from ...load_strategy.base import (
 )
 from ...load_strategy.context import LoadContext
 from ...metadata.artifact_transfer import (
+    ArtifactCacheRoot,
     P2PArtifactTransfer,
     PublishedArtifactSource,
     cute_dsl_cache_artifact_transfer,
@@ -149,6 +150,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         if previous is not None:
             previous.stop()
 
+        source_roots = transfer.roots
         publisher_ref: list[PublisherThread | None] = [None]
         publisher = PublisherThread(
             mx_client=ctx.mx_client,
@@ -158,7 +160,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
             publish_fn=lambda transfer=transfer, identity=identity: (
                 _publish_vllm_cache_artifact(ctx, transfer, identity).endpoint.mx_source_id
             ),
-            ready_fn=_vllm_artifact_ready_fn(transfer.source_root),
+            ready_fn=_vllm_artifact_ready_fn(source_roots),
             publish_timeout_secs=envs.MX_ARTIFACT_READY_TIMEOUT_SECS,
             interval_secs=_READY_POLL_SECS,
             heartbeat_after_publish=False,
@@ -173,10 +175,10 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         _scheduled_publishers[key] = publisher
         publisher.start()
         logger.info(
-            "[Worker %s] Scheduled vLLM artifact publisher: name=%s root=%s",
+            "[Worker %s] Scheduled vLLM artifact publisher: name=%s roots=%s",
             ctx.global_rank,
             transfer.name,
-            transfer.source_root,
+            [str(root.source_root) for root in source_roots],
         )
 
 
@@ -224,6 +226,7 @@ def _install_vllm_cache_artifact_once(
             identity,
             ctx.nixl_manager,
             worker_rank=None,
+            node_rank=ctx.node_rank,
         )
         transfer.install(header)
         _write_marker(marker_path, header.artifact_id)
@@ -240,10 +243,13 @@ def _publish_vllm_cache_artifact(
     worker_grpc_server = _get_worker_server(ctx.device_id)
     if worker_grpc_server is None:
         raise RuntimeError("P2P worker gRPC server is required for artifact publish")
-    if not _has_files(transfer.source_root):
+    required_roots = tuple(
+        root.source_root for root in transfer.roots if not root.optional
+    )
+    if not all(_has_files(path) for path in required_roots):
         raise LookupError(
-            f"vLLM artifact source {transfer.name} is empty or missing: "
-            f"{transfer.source_root}"
+            f"Required vLLM artifact sources {transfer.name} are empty or missing: "
+            f"{required_roots}"
         )
 
     start = time.perf_counter()
@@ -261,6 +267,7 @@ def _publish_vllm_cache_artifact(
         worker_id=_artifact_source_worker_id(ctx),
         worker_grpc_server=worker_grpc_server,
         worker_rank=ctx.worker_rank,
+        node_rank=ctx.node_rank,
     )
     _published_sources[key] = published
     elapsed = time.perf_counter() - start
@@ -304,10 +311,11 @@ def _artifact_marker_key(
     identity: p2p_pb2.SourceIdentity,
     action: str,
 ) -> str:
-    path = transfer.source_root if action == "publish" else transfer.target_root
     digest = sha256()
     digest.update(identity.SerializeToString())
-    digest.update(str(path.resolve()).encode())
+    for root in transfer.roots:
+        path = root.source_root if action == "publish" else root.target_root
+        digest.update(str(path.resolve()).encode())
     digest.update(transfer.name.encode())
     return digest.hexdigest()[:16]
 
@@ -373,51 +381,68 @@ def _vllm_artifact_transfers(
     ctx: LoadContext,
 ) -> list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]]:
     bundle_root = _bundle_root(ctx)
-    transfer_specs = [
-        (
-            "torch_compile_cache",
-            torch_compile_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-            _torch_compile_cache_root(),
-        ),
-        (
-            "triton_cache",
-            triton_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
-            _triton_cache_root(),
-        ),
-        (
-            "deep_gemm_cache",
-            deep_gemm_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
-            _deep_gemm_cache_root(),
-        ),
-        (
-            "tilelang_cache",
-            tilelang_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
-            _tilelang_cache_root(),
-        ),
-        (
-            "cute_dsl_cache",
-            cute_dsl_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
-            _cute_dsl_cache_root(),
-        ),
-        (
-            "flashinfer_cache",
-            flashinfer_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
-            _flashinfer_cache_root(),
-        ),
-    ]
-
+    flashinfer_cache_root = _flashinfer_cache_root()
+    flashinfer_autotune_cache_root = _flashinfer_autotune_cache_root()
     return [
         (
-            factory(cache_root, cache_root, bundle_root / name),
-            _artifact_identity(ctx, mx_source_type),
-        )
-        for name, factory, mx_source_type, cache_root in transfer_specs
+            torch_compile_cache_artifact_transfer(
+                _torch_compile_cache_root(),
+                _torch_compile_cache_root(),
+                bundle_root / "torch_compile_cache",
+            ),
+            _artifact_identity(
+                ctx,
+                p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+            ),
+        ),
+        (
+            triton_cache_artifact_transfer(
+                _triton_cache_root(),
+                _triton_cache_root(),
+                bundle_root / "triton_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE),
+        ),
+        (
+            deep_gemm_cache_artifact_transfer(
+                _deep_gemm_cache_root(),
+                _deep_gemm_cache_root(),
+                bundle_root / "deep_gemm_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE),
+        ),
+        (
+            tilelang_cache_artifact_transfer(
+                _tilelang_cache_root(),
+                _tilelang_cache_root(),
+                bundle_root / "tilelang_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE),
+        ),
+        (
+            cute_dsl_cache_artifact_transfer(
+                _cute_dsl_cache_root(),
+                _cute_dsl_cache_root(),
+                bundle_root / "cute_dsl_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE),
+        ),
+        (
+            flashinfer_cache_artifact_transfer(
+                flashinfer_cache_root,
+                flashinfer_cache_root,
+                bundle_root / "flashinfer_cache",
+                additional_roots=(
+                    ArtifactCacheRoot(
+                        name="autotune",
+                        source_root=flashinfer_autotune_cache_root,
+                        target_root=flashinfer_autotune_cache_root,
+                        optional=True,
+                    ),
+                ),
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE),
+        ),
     ]
 
 
@@ -462,6 +487,13 @@ def _flashinfer_cache_root() -> Path:
     if workspace_base:
         return Path(workspace_base) / ".cache" / "flashinfer"
     return Path.home() / ".cache" / "flashinfer"
+
+
+def _flashinfer_autotune_cache_root() -> Path:
+    configured = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
+    if configured:
+        return Path(configured)
+    return _vllm_cache_root() / "flashinfer_autotune_cache"
 
 
 def _vllm_cache_root() -> Path:
@@ -605,18 +637,21 @@ def _has_files(path: Path) -> bool:
     return any(child.is_file() for child in path.rglob("*"))
 
 
-def _vllm_artifact_ready_fn(source_root: Path):
+def _vllm_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
+    server_ready = False
     stable_since: float | None = None
     last_signature: tuple[int, int, int] | None = None
 
     def ready() -> bool:
-        nonlocal stable_since, last_signature
-        if not _vllm_health_ready():
-            stable_since = None
-            last_signature = None
-            return False
+        nonlocal server_ready, stable_since, last_signature
+        if not server_ready:
+            if not _vllm_health_ready():
+                stable_since = None
+                last_signature = None
+                return False
+            server_ready = True
 
-        signature = _cache_signature(source_root)
+        signature = _cache_signature(source_roots)
         if signature is None:
             stable_since = None
             last_signature = None
@@ -633,20 +668,29 @@ def _vllm_artifact_ready_fn(source_root: Path):
     return ready
 
 
-def _cache_signature(path: Path) -> tuple[int, int, int] | None:
-    if not path.is_dir():
+def _cache_signature(
+    roots: tuple[ArtifactCacheRoot, ...],
+) -> tuple[int, int, int] | None:
+    if not all(
+        _has_files(root.source_root) for root in roots if not root.optional
+    ):
         return None
+
     count = 0
     total_size = 0
     max_mtime_ns = 0
     try:
-        for child in path.rglob("*"):
-            if not child.is_file():
+        for root in roots:
+            path = root.source_root
+            if not path.is_dir():
                 continue
-            stat = child.stat()
-            count += 1
-            total_size += stat.st_size
-            max_mtime_ns = max(max_mtime_ns, stat.st_mtime_ns)
+            for child in path.rglob("*"):
+                if not child.is_file():
+                    continue
+                stat = child.stat()
+                count += 1
+                total_size += stat.st_size
+                max_mtime_ns = max(max_mtime_ns, stat.st_mtime_ns)
     except OSError:
         return None
     if count == 0:

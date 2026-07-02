@@ -219,8 +219,8 @@ ModelExpress/
 │   │   └── client/
 │   │       ├── vllm/
 │   │       │   ├── Dockerfile          # vLLM + ModelExpress client image
-│   │       │   ├── vllm-single-node.yaml  # TP-only (DeepSeek-V3)
-│   │       │   └── vllm-multi-node.yaml   # TP+PP (Kimi-K2.5, 2 nodes)
+│   │       │   ├── vllm-single-node.yaml  # TP-only (DeepSeek-V4-Pro)
+│   │       │   └── vllm-multi-node.yaml   # TP+PP (DeepSeek-V4-Pro, 2 nodes)
 │   │       └── sglang/
 │   │           ├── Dockerfile          # SGLang + ModelExpress client image
 │   │           └── sglang-single-node-p2p.yaml
@@ -641,7 +641,7 @@ On-cluster (B200 nodes, InfiniBand RDMA; vLLM `--load-format modelexpress`, TP=1
 
 `RdmaStrategy.is_available()` calls `transfer_safety.check_transfer_allowed()` before attempting P2P transfer. The function logs the model's detected features (attention type, quantization, MoE) and currently allows all combinations — no feature is blocked. The function is kept as a hook for future safety gates.
 
-NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned CUDA tensors and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4 and on DeepSeek-V3 (MLA + FP8).
+NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned accelerator tensors (via `is_accel_tensor()`) and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4 and on DeepSeek-V3 (MLA + FP8).
 
 During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match (a likely symptom of a rolling update where pods run different image versions). The receive path converts it, like any receive failure, into a `SourceTransferError`, which the chain treats as a mutated RDMA failure: RDMA is abandoned and loading falls through to the next strategy (GDS, then disk) rather than retrying another source. Source-candidate retry happens only for pre-transfer metadata misses, before any target tensor is prepared.
 
@@ -651,17 +651,20 @@ Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and p
 
 ### Tensor Discovery
 
-The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree and find all CUDA tensors after post-processing. This discovers three categories:
+The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. CUDA is the only concrete backend today, so current behavior still collects CUDA tensors. This discovers three categories:
 
 | Category | Source | Example |
 |----------|--------|---------|
-| Parameters | `module._parameters` | `layers.0.attention.weight` |
-| Buffers | `module._buffers` | Batch norm running mean |
-| Tensor attributes | `dir(module)` scan | FP8 `weight_scale`, `_k_scale` |
+| Parameters | `named_parameters()` | `layers.0.attention.weight` |
+| Buffers | `named_buffers()` | Batch norm running mean |
+| Promoted tensor attributes | non-persistent buffers added by `capture_tensor_attrs()` / `adopt_hidden_tensors()` | FP8 `weight_scale`, `_k_scale` |
 
-This is more thorough than `named_parameters()` which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Non-contiguous tensors (e.g. MLA's `W_UV` and `W_UK_T` sharing a dequantized intermediate) are registered as flat byte views of their underlying storage via `storage_view()`. Multiple views into the same storage are deduplicated by `data_ptr()` so tied weights are only transferred once.
+This is more thorough than `named_parameters()` alone, which only finds parameters and would miss tensors created during `process_weights_after_loading()`. Those bare-attribute tensors are surfaced by promoting them to non-persistent buffers (see below) before discovery, so `named_buffers()` then includes them. Non-contiguous tensors (e.g. MLA's `W_UV` and `W_UK_T` sharing a dequantized intermediate) are registered as flat byte views of their underlying storage via `storage_view()`. Multiple views into the same storage are deduplicated by `data_ptr()` so tied weights are only transferred once.
 
-Before tensor collection, `adopt_hidden_tensors()` scans each module's non-Module attributes recursively for CUDA tensors not already in `named_parameters()`/`named_buffers()`. These "orphaned" tensors (e.g. `FusedMoEQuantConfig.a1_gscale`, FlashInfer workspace buffers) are registered as non-persistent buffers so they appear in the manifest. Without this, the target's quant method objects retain values computed from dummy weights, causing incorrect inference despite all registered tensor bytes matching.
+Two mechanisms promote tensors that `named_parameters()`/`named_buffers()` would otherwise miss, both gated on `is_accel_tensor()`:
+
+- `capture_tensor_attrs()` wraps `process_weights_after_loading()` and intercepts bare accelerator tensors assigned directly as module attributes, registering each as a non-persistent buffer.
+- `adopt_hidden_tensors()` recursively scans each module's non-Module attributes for accelerator tensors stashed on plain Python objects (e.g. `FusedMoEQuantConfig.a1_gscale`, FlashInfer workspace buffers) and registers them as non-persistent buffers so they appear in the manifest. Without this, the target's quant method objects retain values computed from dummy weights, causing incorrect inference despite all registered tensor bytes matching.
 
 ### VMM Arena (CUDAPluggableAllocator hook)
 
@@ -730,14 +733,14 @@ agent.release_xfer_handle(handle)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
-The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers any CUDA tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout, receives the real data via RDMA, and all state (including hidden quant config tensors) is correct.
+The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers any accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout, receives the real data via RDMA, and all state (including hidden quant config tensors) is correct.
 
 ```mermaid
 graph TD
     subgraph Source
         S1[Load real weights from disk]
         S2[process_weights_after_loading]
-        S3[adopt_hidden_tensors - find orphaned CUDA tensors]
+        S3[adopt_hidden_tensors - find orphaned accelerator tensors]
         S4[Register ALL tensors with NIXL]
         S5[Publish metadata]
         S1 --> S2 --> S3 --> S4 --> S5
@@ -787,11 +790,11 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
 | `MX_VMM_ARENA` | `0` | Install a `CUDAPluggableAllocator` that routes weight-loading allocations into a CUDA VMM arena, then registers the used arena range once through dmabuf at end-of-load. Reserves 16.0 TiB of VA by default and commits physical memory only for mapped allocations. See [VMM Arena](#vmm-arena-cudapluggableallocator-hook) |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
-| `MX_P2P_METADATA` | `0` | Enable P2P metadata exchange on source workers. Opt-in on central-coordinator backends; auto-enabled (env var ignored) on decentralized backends |
+| `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange on source workers. Set to `0` to publish full metadata through a central-coordinator backend; ignored on decentralized backends that require P2P metadata |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving; effective port is `MX_WORKER_GRPC_PORT + device_id` |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_READY_URL` | `http://127.0.0.1:8000/health` | Readiness endpoint polled by the artifact publisher before preparing and publishing cache bundles. Kubernetes StatefulSet vLLM worker pods using the default localhost URL infer pod-0's stable DNS endpoint |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |

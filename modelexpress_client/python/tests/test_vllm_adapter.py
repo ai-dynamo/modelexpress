@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn as nn
 
 from modelexpress.engines.vllm.adapter import (
     VllmAdapter,
@@ -106,6 +107,24 @@ def test_vllm_is_cuda_alike_uses_current_platform(
     assert adapter.is_cuda_alike() is True
 
 
+def test_vllm_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
+
+
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
@@ -128,6 +147,16 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     assert ctx.target_device == torch.device("cuda:3")
     assert ctx.target_device.index == 3
     assert ctx.device_id == ctx.target_device.index
+
+
+def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
+    _stub_metadata_client(monkeypatch)
+    vllm_config = _context_config(load_device="cuda:0")
+    vllm_config.parallel_config.node_rank = 1
+
+    ctx = build_vllm_load_context(vllm_config, _model_config())
+
+    assert ctx.node_rank == 1
 
 
 def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):

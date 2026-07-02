@@ -104,6 +104,10 @@ spec:
                           type: integer
                           minimum: 0
                           description: Number of transfer chunks in the sealed artifact manifest
+                        nodeRank:
+                          type: integer
+                          minimum: 0
+                          description: Distributed node rank that owns this node-scoped artifact
                     status:
                       type: string
                       description: Worker lifecycle status

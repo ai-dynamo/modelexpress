@@ -23,7 +23,7 @@ class WorkerMetadata:
     tensors: list[TensorDescriptor]
     nixl_metadata: bytes = b""
     transfer_engine_session_id: str = ""
-    # P2P metadata exchange fields (opt-in via MX_P2P_METADATA=1)
+    # P2P metadata exchange fields (disable via MX_P2P_METADATA=0)
     metadata_endpoint: str = ""
     agent_name: str = ""
     worker_grpc_endpoint: str = ""
