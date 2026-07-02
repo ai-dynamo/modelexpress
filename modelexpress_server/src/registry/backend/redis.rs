@@ -39,10 +39,11 @@ mod fields {
 }
 
 /// Every provider, for enumerating candidate keys in name-addressed lookups.
-const ALL_PROVIDERS: [ModelProvider; 3] = [
+const ALL_PROVIDERS: [ModelProvider; 4] = [
     ModelProvider::HuggingFace,
     ModelProvider::Ngc,
     ModelProvider::Gcs,
+    ModelProvider::S3,
 ];
 
 /// Provider-scoped key: `mx:model:{Provider}:{model_name}`.
@@ -72,6 +73,7 @@ fn provider_str(p: ModelProvider) -> &'static str {
         ModelProvider::HuggingFace => "HuggingFace",
         ModelProvider::Ngc => "Ngc",
         ModelProvider::Gcs => "Gcs",
+        ModelProvider::S3 => "S3",
     }
 }
 
@@ -80,6 +82,7 @@ fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         "HuggingFace" => Ok(ModelProvider::HuggingFace),
         "Ngc" => Ok(ModelProvider::Ngc),
         "Gcs" => Ok(ModelProvider::Gcs),
+        "S3" => Ok(ModelProvider::S3),
         other => Err(format!("unknown provider in Redis record: {other:?}").into()),
     }
 }
@@ -588,10 +591,10 @@ mod tests {
     #[test]
     fn candidate_keys_cover_all_providers_and_legacy() {
         let keys = candidate_keys("org/model");
-        assert_eq!(keys.len(), 4);
-        assert!(keys.contains(&"mx:model:HuggingFace:org/model".to_string()));
-        assert!(keys.contains(&"mx:model:Ngc:org/model".to_string()));
-        assert!(keys.contains(&"mx:model:Gcs:org/model".to_string()));
+        assert_eq!(keys.len(), ALL_PROVIDERS.len() + 1);
+        for provider in ALL_PROVIDERS {
+            assert!(keys.contains(&model_key(provider, "org/model")));
+        }
         assert!(keys.contains(&"mx:model:org/model".to_string())); // legacy
     }
 

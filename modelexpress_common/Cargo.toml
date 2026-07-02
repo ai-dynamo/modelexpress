@@ -35,6 +35,7 @@ futures = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true }
 google-cloud-storage = { workspace = true }
+object_store = { workspace = true }
 rustls = { workspace = true }
 crc32c = { workspace = true }
 fd-lock = { workspace = true }

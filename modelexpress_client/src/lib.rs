@@ -278,6 +278,7 @@ impl Client {
         model_name: &str,
         provider: ModelProvider,
     ) -> anyhow::Result<PathBuf> {
+        let provider = ModelProvider::resolve_provider_for_model_name(model_name, provider);
         let cache_dir = self
             .cache_config
             .as_ref()
@@ -631,6 +632,7 @@ impl Client {
         ignore_weights: bool,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
         info!(
             "Requesting model: {} from provider: {:?}",
             model_name, provider
@@ -701,6 +703,7 @@ impl Client {
         ignore_weights: bool,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
         self.request_model_on_server(&model_name, provider, ignore_weights)
             .await?;
@@ -735,6 +738,7 @@ impl Client {
         ignore_weights: bool,
     ) -> CommonResult<()> {
         let model_name = model_name.into();
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
         match Client::new(config.clone()).await {
             Ok(mut client) => {
@@ -791,6 +795,7 @@ mod tests {
     struct UnavailableModelService;
     struct RecordingModelService {
         seen_model_name: Arc<Mutex<Option<String>>>,
+        seen_provider: Arc<Mutex<Option<i32>>>,
     }
     struct ZeroByteGcsMarkerStreamModelService;
 
@@ -934,11 +939,15 @@ mod tests {
                 .seen_model_name
                 .lock()
                 .expect("Failed to lock seen_model_name") = Some(request.model_name);
+            *self
+                .seen_provider
+                .lock()
+                .expect("Failed to lock seen_provider") = Some(request.provider);
             let update = ModelStatusUpdate {
                 model_name: "gs://envbucket/dev/bake/qwen/rev123".to_string(),
                 status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
                 message: None,
-                provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+                provider: request.provider,
             };
             Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
                 update,
@@ -1575,8 +1584,10 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_request_model_with_smart_fallback_accepts_full_gcs_url() {
         let seen_model_name = Arc::new(Mutex::new(None));
+        let seen_provider = Arc::new(Mutex::new(None));
         let (addr, server_handle) = spawn_model_service(RecordingModelService {
             seen_model_name: Arc::clone(&seen_model_name),
+            seen_provider: Arc::clone(&seen_provider),
         })
         .await;
 
@@ -1601,6 +1612,49 @@ mod tests {
                 .expect("Failed to lock seen_model_name")
                 .clone(),
             "gs://envbucket/dev/bake/qwen/rev123".to_string().into()
+        );
+        assert_eq!(
+            *seen_provider.lock().expect("Failed to lock seen_provider"),
+            Some(modelexpress_common::grpc::model::ModelProvider::Gcs as i32)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_model_with_smart_fallback_infers_s3_provider() {
+        let seen_model_name = Arc::new(Mutex::new(None));
+        let seen_provider = Arc::new(Mutex::new(None));
+        let (addr, server_handle) = spawn_model_service(RecordingModelService {
+            seen_model_name: Arc::clone(&seen_model_name),
+            seen_provider: Arc::clone(&seen_provider),
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.shared_storage = true;
+
+        Client::request_model_with_smart_fallback(
+            "s3://envbucket/dev/bake/qwen/rev123",
+            ModelProvider::HuggingFace,
+            config,
+            true,
+        )
+        .await
+        .expect("Expected smart fallback request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        assert_eq!(
+            seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name")
+                .clone(),
+            "s3://envbucket/dev/bake/qwen/rev123".to_string().into()
+        );
+        assert_eq!(
+            *seen_provider.lock().expect("Failed to lock seen_provider"),
+            Some(modelexpress_common::grpc::model::ModelProvider::S3 as i32)
         );
     }
 }

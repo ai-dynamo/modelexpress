@@ -55,17 +55,6 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
     }
 }
 
-fn infer_provider_from_model_name(model_name: &str) -> ModelProvider {
-    let model_name = model_name.trim_start();
-    if strip_ascii_prefix_ignore_case(model_name, "gs://").is_some() {
-        ModelProvider::Gcs
-    } else if strip_ascii_prefix_ignore_case(model_name, "ngc://").is_some() {
-        ModelProvider::Ngc
-    } else {
-        ModelProvider::HuggingFace
-    }
-}
-
 fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     let candidate = value.get(..prefix.len())?;
     if candidate.eq_ignore_ascii_case(prefix) {
@@ -79,6 +68,8 @@ fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
     let model_name = model_name.trim_start();
     if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "gs://") {
         Cow::Owned(format!("gs://{rest}"))
+    } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "s3://") {
+        Cow::Owned(format!("s3://{rest}"))
     } else if let Some(rest) = strip_ascii_prefix_ignore_case(model_name, "ngc://") {
         Cow::Owned(format!("ngc://{rest}"))
     } else {
@@ -88,7 +79,10 @@ fn normalize_model_name_scheme(model_name: &str) -> Cow<'_, str> {
 
 fn resolve_validation_model_path(cache_root: &Path, model_name: &str) -> (ModelProvider, PathBuf) {
     let normalized_name = normalize_model_name_scheme(model_name);
-    let provider = infer_provider_from_model_name(normalized_name.as_ref());
+    let provider = ModelProvider::resolve_provider_for_model_name(
+        normalized_name.as_ref(),
+        ModelProvider::HuggingFace,
+    );
     let model_path = resolve_model_path(cache_root, provider, normalized_name.as_ref(), None)
         .unwrap_or_else(|_| cache_root.join(normalized_name.as_ref()));
     (provider, model_path)
@@ -821,19 +815,38 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_provider_inference_keeps_ambiguous_names_hugging_face() {
-        assert_eq!(
-            infer_provider_from_model_name("nvidia/model/version"),
-            ModelProvider::HuggingFace
-        );
-        assert_eq!(
-            infer_provider_from_model_name("ngc://nvidia/model/version"),
-            ModelProvider::Ngc
-        );
-        assert_eq!(
-            infer_provider_from_model_name("NgC://nvidia/model/version"),
-            ModelProvider::Ngc
-        );
+    fn test_validate_resolves_s3_model_name_to_s3_cache_path() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_name = "S3://bucket/foo/bar";
+        let expected_path = temp_dir
+            .path()
+            .join("s3")
+            .join("bucket")
+            .join("foo")
+            .join("bar");
+        fs::create_dir_all(&expected_path).expect("Failed to create S3 cache path");
+
+        let (provider, model_path) = resolve_validation_model_path(temp_dir.path(), model_name);
+
+        assert_eq!(provider, ModelProvider::S3);
+        assert_eq!(model_path, expected_path);
+        assert!(model_path.exists());
+        assert!(!temp_dir.path().join("S3://bucket/foo/bar").exists());
+    }
+
+    #[test]
+    fn test_validate_provider_resolution_keeps_ambiguous_names_hugging_face() {
+        let (provider, _) =
+            resolve_validation_model_path(Path::new("/tmp/mx-cache"), "nvidia/model/version");
+        assert_eq!(provider, ModelProvider::HuggingFace);
+
+        let (provider, _) =
+            resolve_validation_model_path(Path::new("/tmp/mx-cache"), "ngc://nvidia/model/version");
+        assert_eq!(provider, ModelProvider::Ngc);
+
+        let (provider, _) =
+            resolve_validation_model_path(Path::new("/tmp/mx-cache"), "NgC://nvidia/model/version");
+        assert_eq!(provider, ModelProvider::Ngc);
     }
 
     #[test]
