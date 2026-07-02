@@ -934,6 +934,171 @@ mod tests {
         assert_eq!(w2.active_transfers, 0, "unselected source stays idle");
     }
 
+    fn ready_record(source_id: &str, worker_id: &str) -> ModelMetadataRecord {
+        ModelMetadataRecord {
+            source_id: source_id.to_string(),
+            worker_id: worker_id.to_string(),
+            model_name: "my-model".to_string(),
+            workers: vec![WorkerRecord {
+                worker_rank: 0,
+                backend_metadata: BackendMetadataRecord::None,
+                tensors: vec![],
+                status: SourceStatus::Ready as i32,
+                updated_at: 1234567890000,
+                metadata_endpoint: String::new(),
+                agent_name: String::new(),
+                worker_grpc_endpoint: String::new(),
+                artifact_source: None,
+            }],
+            published_at: 1234567890,
+        }
+    }
+
+    fn single_instance_listing(worker_id: &'static str) -> Vec<SourceInstanceInfo> {
+        vec![SourceInstanceInfo {
+            source_id: "srcaaaabbbbccccd".to_string(),
+            worker_id: worker_id.to_string(),
+            model_name: "my-model".to_string(),
+            worker_rank: 0,
+            status: SourceStatus::Ready as i32,
+            updated_at: 1234567890000,
+        }]
+    }
+
+    async fn list_first_active_transfers(svc: &P2pServiceImpl) -> u32 {
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                status_filter: Some(SourceStatus::Ready as i32),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        resp.instances[0].active_transfers
+    }
+
+    // ── load signal: end-to-end robustness ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_load_signal_decays_after_ttl_end_to_end() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_get_metadata()
+            .once()
+            .returning(|s, w| Ok(Some(ready_record(s, w))));
+        mock.expect_list_workers()
+            .times(2)
+            .returning(|_, _| Ok(single_instance_listing("w1")));
+
+        let svc = make_service_with_load_ttl(mock, Duration::from_millis(50));
+        svc.get_metadata(Request::new(GetMetadataRequest {
+            mx_source_id: "srcaaaabbbbccccd".to_string(),
+            worker_id: "w1".to_string(),
+        }))
+        .await
+        .expect("rpc");
+
+        assert_eq!(list_first_active_transfers(&svc).await, 1);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            list_first_active_transfers(&svc).await,
+            0,
+            "selection must age out of the TTL window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_signal_resets_on_service_restart() {
+        // Restart contract: a fresh service instance (new in-memory tracker)
+        // reports zero load, which makes the client load_aware policy collapse
+        // to rendezvous_hash until the window repopulates.
+        let mut mock1 = MockMetadataBackend::new();
+        mock1
+            .expect_get_metadata()
+            .times(3)
+            .returning(|s, w| Ok(Some(ready_record(s, w))));
+        mock1
+            .expect_list_workers()
+            .once()
+            .returning(|_, _| Ok(single_instance_listing("w1")));
+        let svc1 = make_service_with_load_ttl(mock1, Duration::from_secs(300));
+        for _ in 0..3 {
+            svc1.get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "srcaaaabbbbccccd".to_string(),
+                worker_id: "w1".to_string(),
+            }))
+            .await
+            .expect("rpc");
+        }
+        assert_eq!(list_first_active_transfers(&svc1).await, 3);
+
+        let mut mock2 = MockMetadataBackend::new();
+        mock2
+            .expect_list_workers()
+            .once()
+            .returning(|_, _| Ok(single_instance_listing("w1")));
+        let svc2 = make_service_with_load_ttl(mock2, Duration::from_secs(300));
+        assert_eq!(
+            list_first_active_transfers(&svc2).await,
+            0,
+            "restarted server must report zero load, not stale counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_selections_all_counted() {
+        // 64 targets selecting the same source concurrently: every selection
+        // lands in the window, no deadlock or lost update.
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_get_metadata()
+            .times(64)
+            .returning(|s, w| Ok(Some(ready_record(s, w))));
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Ok(single_instance_listing("w1")));
+
+        let svc = Arc::new(make_service_with_load_ttl(mock, Duration::from_secs(300)));
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let svc = Arc::clone(&svc);
+            handles.push(tokio::spawn(async move {
+                svc.get_metadata(Request::new(GetMetadataRequest {
+                    mx_source_id: "srcaaaabbbbccccd".to_string(),
+                    worker_id: "w1".to_string(),
+                }))
+                .await
+                .expect("rpc")
+            }));
+        }
+        for h in handles {
+            h.await.expect("task");
+        }
+        assert_eq!(list_first_active_transfers(&svc).await, 64);
+    }
+
+    #[tokio::test]
+    async fn test_failed_metadata_lookup_not_counted_as_load() {
+        // A metadata miss means no transfer follows; it must not inflate the
+        // source's load estimate.
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_get_metadata().once().returning(|_, _| Ok(None));
+        mock.expect_list_workers()
+            .once()
+            .returning(|_, _| Ok(single_instance_listing("w1")));
+
+        let svc = make_service_with_load_ttl(mock, Duration::from_secs(300));
+        let resp = svc
+            .get_metadata(Request::new(GetMetadataRequest {
+                mx_source_id: "srcaaaabbbbccccd".to_string(),
+                worker_id: "w1".to_string(),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.found);
+        assert_eq!(list_first_active_transfers(&svc).await, 0);
+    }
+
     // ── get_metadata (additional) ───────────────────────────────────────────
 
     #[tokio::test]
