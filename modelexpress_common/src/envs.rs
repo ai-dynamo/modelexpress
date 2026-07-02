@@ -116,6 +116,12 @@ pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 /// Age (seconds) after which a STALE worker is garbage-collected.
 pub const MX_GC_TIMEOUT_SECS: &str = "MX_GC_TIMEOUT_SECS";
 
+// ── P2P source selection (server) ─────────────────────────────────────────────
+/// Sliding-window TTL (seconds) over which a source's recent `GetMetadata`
+/// selections are counted into the `active_transfers` load estimate returned by
+/// `ListSources`. Consumed by the client `load_aware` selector.
+pub const MX_P2P_SOURCE_LOAD_TTL_SECS: &str = "MX_P2P_SOURCE_LOAD_TTL_SECS";
+
 // ── System ──────────────────────────────────────────────────────────────────
 /// Primary source for the user's home directory.
 pub const HOME: &str = "HOME";
@@ -128,6 +134,12 @@ pub const KUBECONFIG: &str = "KUBECONFIG";
 const DEFAULT_REAPER_SCAN_INTERVAL_SECS: u64 = 30;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
+
+// ── Default P2P source-load window ────────────────────────────────────────────
+/// Roughly a small-model P2P transfer duration: long enough that a selected
+/// source still counts while its target is pulling, short enough to decay once
+/// the burst passes.
+const DEFAULT_P2P_SOURCE_LOAD_TTL_SECS: u64 = 60;
 
 // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -256,6 +268,15 @@ pub fn gc_timeout_secs() -> u64 {
     env_u64(MX_GC_TIMEOUT_SECS, DEFAULT_GC_TIMEOUT_SECS)
 }
 
+/// P2P source-load TTL window in seconds
+/// ([`MX_P2P_SOURCE_LOAD_TTL_SECS`], default 60).
+pub fn p2p_source_load_ttl_secs() -> u64 {
+    env_u64(
+        MX_P2P_SOURCE_LOAD_TTL_SECS,
+        DEFAULT_P2P_SOURCE_LOAD_TTL_SECS,
+    )
+}
+
 /// Read an environment variable as `u64`, falling back to `default`.
 fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
@@ -321,6 +342,7 @@ mod tests {
         assert_eq!(MX_REAPER_SCAN_INTERVAL_SECS, "MX_REAPER_SCAN_INTERVAL_SECS");
         assert_eq!(MX_HEARTBEAT_TIMEOUT_SECS, "MX_HEARTBEAT_TIMEOUT_SECS");
         assert_eq!(MX_GC_TIMEOUT_SECS, "MX_GC_TIMEOUT_SECS");
+        assert_eq!(MX_P2P_SOURCE_LOAD_TTL_SECS, "MX_P2P_SOURCE_LOAD_TTL_SECS");
         assert_eq!(HOME, "HOME");
         assert_eq!(USERPROFILE, "USERPROFILE");
         assert_eq!(KUBECONFIG, "KUBECONFIG");

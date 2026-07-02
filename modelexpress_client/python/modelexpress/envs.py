@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    MX_P2P_LOAD_WEIGHT: float
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -140,10 +141,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Site-varying defaults: return raw (None when unset), callers add defaults.
     "MODEL_EXPRESS_URL": lambda: os.environ.get("MODEL_EXPRESS_URL"),
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
-    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
+    "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get(
+        "MODEL_EXPRESS_LOG_LEVEL", ""
+    ).upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
     # ── Metadata / worker ──────────────────────────────────────────────────
-    "MX_METADATA_BACKEND": lambda: os.environ.get("MX_METADATA_BACKEND", "").lower().strip(),
+    "MX_METADATA_BACKEND": lambda: (
+        os.environ.get("MX_METADATA_BACKEND", "").lower().strip()
+    ),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
@@ -153,9 +158,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", ""),
     # ── Kubernetes service backend ─────────────────────────────────────────
-    "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
+    "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get(
+        "MX_K8S_SERVICE_PATTERN", "mx-sources"
+    ),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
-    "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: os.environ.get("MX_K8S_SOURCE_BACKOFF_SECONDS", ""),
+    "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: os.environ.get(
+        "MX_K8S_SOURCE_BACKOFF_SECONDS", ""
+    ),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
     "MX_POOL_REG": lambda: os.environ.get("MX_POOL_REG", "0") == "1",
@@ -163,37 +172,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
     "UCX_NET_DEVICES": lambda: os.environ.get("UCX_NET_DEVICES"),
     "MX_RDMA_NIC_PIN": lambda: os.environ.get("MX_RDMA_NIC_PIN", "").strip(),
-    "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS"),
+    "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get(
+        "MX_RDMA_NIC_PIN_MIN_RATE_GBPS"
+    ),
     # ── GPUDirect Storage ──────────────────────────────────────────────────
     "MX_GDS_MAX_CHUNK_KB": lambda: os.environ.get("MX_GDS_MAX_CHUNK_KB"),
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
-    "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true"),
+    "MX_MS_DISTRIBUTED": lambda: (
+        os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+    ),
     # ── TRT-LLM live transfer ──────────────────────────────────────────────
     "MX_SOURCE_QUERY_TIMEOUT": lambda: _env_int("MX_SOURCE_QUERY_TIMEOUT", 3600),
     "MX_TRANSFER_TIMEOUT": lambda: _env_int("MX_TRANSFER_TIMEOUT", 900),
-    "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
+    "MX_TRANSFER_LOG_DIR": lambda: os.environ.get(
+        "MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"
+    ),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
     # ── vLLM artifact (JIT cache) transfer ─────────────────────────────────
-    "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
-    in _TRUTHY,
+    "MX_ARTIFACT_TRANSFER": lambda: (
+        os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower() in _TRUTHY
+    ),
     "MX_ARTIFACT_BUNDLE_ROOT": lambda: os.environ.get("MX_ARTIFACT_BUNDLE_ROOT"),
     "MX_ARTIFACT_COMPILE_CONFIG_DIGEST": lambda: os.environ.get(
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST", ""
     ),
     "MX_ARTIFACT_READY_URL": lambda: os.environ.get("MX_ARTIFACT_READY_URL", ""),
-    "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int("MX_ARTIFACT_READY_TIMEOUT_SECS", 1800),
+    "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int(
+        "MX_ARTIFACT_READY_TIMEOUT_SECS", 1800
+    ),
     # Raw string: artifact_manifest.artifact_transfer_chunk_size() owns the
     # int parse plus its non-positive/max-bound validation and default param.
-    "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
+    "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
+        "MX_ARTIFACT_TRANSFER_CHUNK_SIZE"
+    ),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    # Weight of the load penalty in the load_aware selector (0 disables it,
+    # collapsing load_aware to rendezvous_hash). Default 1.0.
+    "MX_P2P_LOAD_WEIGHT": lambda: _env_float("MX_P2P_LOAD_WEIGHT", 1.0),
     # ── Opt-in metrics collector ───────────────────────────────────────────
-    "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
-    in _TRUTHY,
+    "MX_METRICS_ENABLED": lambda: (
+        os.environ.get("MX_METRICS_ENABLED", "0").strip().lower() in _TRUTHY
+    ),
     "MX_METRICS_PORT": lambda: os.environ.get("MX_METRICS_PORT"),
     "MX_METRICS_PUSHGATEWAY": lambda: os.environ.get("MX_METRICS_PUSHGATEWAY"),
     "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),

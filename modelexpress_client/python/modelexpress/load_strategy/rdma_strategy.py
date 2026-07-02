@@ -76,14 +76,14 @@ class RdmaStrategy(LoadStrategy):
         server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
         requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
         if not server_addr and not requires_p2p:
-            logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
+            logger.info(
+                f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA"
+            )
             return False
 
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
-            logger.info(
-                f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}"
-            )
+            logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
             return False
 
         return True
@@ -100,7 +100,9 @@ class RdmaStrategy(LoadStrategy):
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
         if not candidates:
-            logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
+            logger.info(
+                f"[Worker {ctx.global_rank}] No RDMA source available, skipping"
+            )
             raise StrategyFailed("No RDMA source available", mutated=False)
 
         policy = configured_policy_label()
@@ -115,7 +117,9 @@ class RdmaStrategy(LoadStrategy):
 
             try:
                 source_worker = self._fetch_worker_metadata(
-                    ctx, mx_source_id, worker_id,
+                    ctx,
+                    mx_source_id,
+                    worker_id,
                 )
             except Exception as e:
                 logger.warning(
@@ -143,7 +147,11 @@ class RdmaStrategy(LoadStrategy):
             transfer_start = time.perf_counter()
             try:
                 out = self._load_as_target(
-                    result, ctx, source_worker, mx_source_id, worker_id,
+                    result,
+                    ctx,
+                    source_worker,
+                    mx_source_id,
+                    worker_id,
                 )
             except BaseException:
                 selection_metrics.observe_transfer_seconds(
@@ -167,7 +175,8 @@ class RdmaStrategy(LoadStrategy):
         raise StrategyFailed("No RDMA source succeeded", mutated=False)
 
     def _find_source_instances(
-        self, ctx: LoadContext,
+        self,
+        ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         """Return READY source instances ranked by the configured selector.
 
@@ -182,11 +191,14 @@ class RdmaStrategy(LoadStrategy):
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             if not list_resp.instances:
-                logger.debug(f"[Worker {ctx.global_rank}] No ready source instances found")
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] No ready source instances found"
+                )
                 return []
 
             candidates = [
-                inst for inst in list_resp.instances
+                inst
+                for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
             ]
 
@@ -202,6 +214,14 @@ class RdmaStrategy(LoadStrategy):
                 selector.name, "rank_matched", len(ordered)
             )
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
+
+            # Surface the server-estimated per-source load the client saw, so a
+            # dashboard can compare convergence across policies. Field is 0 when
+            # the server does not populate it (older servers / disabled tracking).
+            for inst in ordered:
+                selection_metrics.set_active_transfers(
+                    inst.worker_id, getattr(inst, "active_transfers", 0)
+                )
 
             logger.info(
                 f"[Worker {ctx.global_rank}] Source selection: "
@@ -303,8 +323,11 @@ class RdmaStrategy(LoadStrategy):
             manifest_time = time.perf_counter() - manifest_start
             source_tensors = [
                 TensorDescriptor(
-                    name=t.name, addr=t.addr, size=t.size,
-                    device_id=t.device_id, dtype=t.dtype,
+                    name=t.name,
+                    addr=t.addr,
+                    size=t.size,
+                    device_id=t.device_id,
+                    dtype=t.dtype,
                 )
                 for t in tensor_protos
             ]
@@ -331,8 +354,11 @@ class RdmaStrategy(LoadStrategy):
         else:
             source_tensors = [
                 TensorDescriptor(
-                    name=t.name, addr=t.addr, size=t.size,
-                    device_id=t.device_id, dtype=t.dtype,
+                    name=t.name,
+                    addr=t.addr,
+                    size=t.size,
+                    device_id=t.device_id,
+                    dtype=t.dtype,
                 )
                 for t in worker_tensor_descriptors(source_worker)
             ]
@@ -354,7 +380,9 @@ class RdmaStrategy(LoadStrategy):
             raise SourceTransferError(f"RDMA receive failed: {e}") from e
         transfer_time = time.perf_counter() - transfer_start
 
-        bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
+        bandwidth_gbps = (
+            (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
+        )
         logger.info(
             f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
             f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
@@ -364,4 +392,6 @@ class RdmaStrategy(LoadStrategy):
         ctx.accelerator_backend.synchronize()
 
         total_time = time.perf_counter() - receive_start
-        logger.info(f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s")
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s"
+        )
