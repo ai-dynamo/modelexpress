@@ -10,11 +10,18 @@
 //! "transfers currently being served" -- the signal the client `load_aware`
 //! selector uses to steer new targets away from busy sources.
 //!
-//! It is transient in-memory state, not persisted to the metadata backend.
-//! Scope is a single central-coordinator server; sharing the estimate across
-//! replicated servers (e.g. via Redis) is a follow-up. The tensor RDMA path has
-//! no source-side completion signal, so a TTL window (rather than an explicit
-//! release) is what bounds a selection's contribution to the count.
+//! It is transient in-memory state, not persisted to the metadata backend --
+//! intentionally. On a server restart the counts reset to zero, which makes the
+//! client `load_aware` policy collapse to `rendezvous_hash` (its tested
+//! zero-load path) until the window repopulates from live selections, within
+//! one TTL. Persisting would not help: the signal decays within the TTL (60s
+//! default), which is comparable to a crash-restart itself, and it would turn
+//! an in-memory increment on every `GetMetadata` into a per-selection backend
+//! write. Scope is a single central-coordinator server; sharing the estimate
+//! across replicated servers (e.g. via Redis) is a follow-up about visibility,
+//! not durability. The tensor RDMA path has no source-side completion signal,
+//! so a TTL window (rather than an explicit release) is what bounds a
+//! selection's contribution to the count.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
