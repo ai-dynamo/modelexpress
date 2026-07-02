@@ -48,10 +48,16 @@ spec:
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
           env:
+            {{- $hasNsInExtra := false }}
+            {{- range .Values.extraEnv }}
+              {{- if eq .name "MX_METADATA_NAMESPACE" }}
+                {{- $hasNsInExtra = true }}
+              {{- end }}
+            {{- end }}
+            {{- if and (not (hasKey .Values.env "MX_METADATA_NAMESPACE")) (not $hasNsInExtra) }}
             - name: MX_METADATA_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+              value: {{ .Release.Namespace | quote }}
+            {{- end }}
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
