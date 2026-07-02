@@ -7,11 +7,20 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from typing import cast
 
 import torch
 import torch.nn as nn
 
+from .accelerators import AcceleratorBackend, CudaAcceleratorBackend
+
 logger = logging.getLogger("modelexpress.tensor_utils")
+
+
+def _resolve_accelerator_backend(
+    accelerator_backend: AcceleratorBackend | None,
+) -> AcceleratorBackend:
+    return accelerator_backend or CudaAcceleratorBackend()
 
 
 def safe_checksum(tensor: torch.Tensor) -> str:
@@ -35,8 +44,8 @@ def safe_checksum(tensor: torch.Tensor) -> str:
 
 
 @contextmanager
-def capture_tensor_attrs():
-    """Intercept bare CUDA tensor assignments during process_weights_after_loading.
+def capture_tensor_attrs(accelerator_backend: AcceleratorBackend):
+    """Intercept bare accelerator tensor assignments during post-load processing.
 
     vLLM's post-processing (quant methods, attention backends) may create
     tensor attributes via plain setattr (e.g. self.W_UV = tensor) instead
@@ -52,7 +61,7 @@ def capture_tensor_attrs():
     def capturing_setattr(self, name, value):
         if (isinstance(value, torch.Tensor)
                 and not isinstance(value, nn.Parameter)
-                and value.is_cuda
+                and accelerator_backend.is_accel_tensor(value)
                 and name not in self._parameters
                 and name not in self._buffers
                 and name not in self._modules):
@@ -63,7 +72,7 @@ def capture_tensor_attrs():
                     pass
             self.register_buffer(name, value, persistent=False)
             logger.debug(
-                "Captured bare CUDA tensor: %s.%s (shape=%s, dtype=%s)",
+                "Captured bare accelerator tensor: %s.%s (shape=%s, dtype=%s)",
                 type(self).__name__, name, list(value.shape), value.dtype,
             )
         else:
@@ -76,10 +85,13 @@ def capture_tensor_attrs():
         nn.Module.__setattr__ = original_setattr
 
 
-def _find_hidden_cuda_tensors(
-    obj: object, visited: set[int], depth: int = 0,
+def _find_hidden_accel_tensors(
+    obj: object,
+    visited: set[int],
+    accelerator_backend: AcceleratorBackend,
+    depth: int = 0,
 ) -> list[tuple[str, torch.Tensor]]:
-    """Recursively find CUDA tensors in a non-Module Python object graph.
+    """Recursively find accelerator tensors in a non-Module Python object graph.
 
     Known limitation: objects using ``__slots__`` are skipped because they
     lack ``__dict__``. No current vLLM quant class uses slots, but any
@@ -92,41 +104,62 @@ def _find_hidden_cuda_tensors(
 
     results: list[tuple[str, torch.Tensor]] = []
 
-    if isinstance(obj, torch.Tensor) and obj.is_cuda and obj.numel() > 0:
-        results.append(("t", obj))
+    if isinstance(obj, torch.Tensor):
+        tensor = cast(torch.Tensor, obj)
+        if accelerator_backend.is_accel_tensor(tensor) and tensor.numel() > 0:
+            results.append(("t", tensor))
     elif isinstance(obj, (list, tuple)):
         for i, item in enumerate(obj):
-            for path, tensor in _find_hidden_cuda_tensors(item, visited, depth + 1):
+            for path, tensor in _find_hidden_accel_tensors(
+                item,
+                visited,
+                accelerator_backend,
+                depth + 1,
+            ):
                 results.append((f"{i}_{path}", tensor))
     elif isinstance(obj, dict):
         for k, v in obj.items():
-            for path, tensor in _find_hidden_cuda_tensors(v, visited, depth + 1):
+            for path, tensor in _find_hidden_accel_tensors(
+                v,
+                visited,
+                accelerator_backend,
+                depth + 1,
+            ):
                 results.append((f"{k}_{path}", tensor))
     elif hasattr(obj, "__dict__") and not isinstance(obj, (type, nn.Module)):
         for attr_name, attr_val in vars(obj).items():
             if attr_name.startswith("__"):
                 continue
-            for path, tensor in _find_hidden_cuda_tensors(attr_val, visited, depth + 1):
+            for path, tensor in _find_hidden_accel_tensors(
+                attr_val,
+                visited,
+                accelerator_backend,
+                depth + 1,
+            ):
                 results.append((f"{attr_name}_{path}", tensor))
 
     return results
 
 
-def adopt_hidden_tensors(model: nn.Module) -> int:
-    """Register hidden CUDA tensors as module buffers for RDMA transfer.
+def adopt_hidden_tensors(
+    model: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
+) -> int:
+    """Register hidden accelerator tensors as module buffers for RDMA transfer.
 
-    process_weights_after_loading may create CUDA tensors stored on plain
+    process_weights_after_loading may create accelerator tensors stored on plain
     Python objects attached to modules (e.g. quant configs, kernel objects,
     dataclasses) rather than as nn.Module parameters or buffers. These are
     invisible to named_parameters()/named_buffers() and thus missing from
     the RDMA manifest, causing incorrect inference on the target.
 
     This function scans each module's non-Module attributes recursively for
-    any CUDA tensors not already registered, and adopts them as non-persistent
-    buffers so they appear in the manifest and get transferred.
+    any accelerator tensors not already registered, and adopts them as
+    non-persistent buffers so they appear in the manifest and get transferred.
     """
     import time
     start = time.perf_counter()
+    backend = _resolve_accelerator_backend(accelerator_backend)
 
     existing_ptrs: set[int] = set()
     for _, p in model.named_parameters():
@@ -143,7 +176,11 @@ def adopt_hidden_tensors(model: nn.Module) -> int:
             if isinstance(attr_val, (torch.Tensor, nn.Parameter, nn.Module)):
                 continue
 
-            tensors = _find_hidden_cuda_tensors(attr_val, visited=set())
+            tensors = _find_hidden_accel_tensors(
+                attr_val,
+                visited=set(),
+                accelerator_backend=backend,
+            )
             for tensor_path, tensor in tensors:
                 if tensor.data_ptr() in existing_ptrs:
                     continue
@@ -172,18 +209,19 @@ def adopt_hidden_tensors(model: nn.Module) -> int:
     elapsed = time.perf_counter() - start
     if adopted:
         logger.info(
-            f"Adopted {adopted} hidden CUDA tensors as module buffers "
+            f"Adopted {adopted} hidden accelerator tensors as module buffers "
             f"in {elapsed:.3f}s"
         )
     else:
-        logger.debug(f"No hidden CUDA tensors found ({elapsed:.3f}s)")
+        logger.debug(f"No hidden accelerator tensors found ({elapsed:.3f}s)")
     return adopted
 
 
 def iter_module_tensors(
     module: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
 ) -> list[tuple[str, torch.Tensor, str]]:
-    """Iterate over all CUDA tensors in a module tree.
+    """Iterate over all accelerator tensors in a module tree.
 
     Uses named_parameters() and named_buffers() to discover tensors.
     When used with capture_tensor_attrs() wrapping process_weights_after_loading,
@@ -191,16 +229,18 @@ def iter_module_tensors(
     non-persistent buffers and thus included in named_buffers().
 
     Returns:
-        List of (qualified_name, tensor, tensor_type) tuples for each CUDA tensor.
+        List of (qualified_name, tensor, tensor_type) tuples for each
+        accelerator tensor.
     """
+    backend = _resolve_accelerator_backend(accelerator_backend)
     results: list[tuple[str, torch.Tensor, str]] = []
 
     for name, param in module.named_parameters():
-        if param.is_cuda:
+        if backend.is_accel_tensor(param):
             results.append((name, param, "parameter"))
 
     for name, buf in module.named_buffers():
-        if buf.is_cuda:
+        if backend.is_accel_tensor(buf):
             results.append((name, buf, "buffer"))
 
     return results
@@ -224,8 +264,11 @@ def storage_view(tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
-def collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Collect all CUDA tensors from a module tree into a flat dict.
+def collect_module_tensors(
+    model: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
+) -> dict[str, torch.Tensor]:
+    """Collect all accelerator tensors from a module tree into a flat dict.
 
     Uses iter_module_tensors (named_parameters + named_buffers) to find
     tensors, then returns them as a name -> tensor mapping suitable for
@@ -242,11 +285,12 @@ def collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
     a dequantized intermediate) are deduplicated by data_ptr so the
     storage is transferred only once.
     """
+    backend = _resolve_accelerator_backend(accelerator_backend)
     tensors: dict[str, torch.Tensor] = {}
     seen_ptrs: set[int] = set()
     storage_view_count = 0
     skipped_duplicate = 0
-    for name, tensor, _tensor_type in iter_module_tensors(model):
+    for name, tensor, _tensor_type in iter_module_tensors(model, backend):
         t = tensor.data if hasattr(tensor, "data") else tensor
 
         if t.is_contiguous():
