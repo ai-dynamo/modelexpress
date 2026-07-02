@@ -16,21 +16,30 @@ from benchmarks.source_selection_sim import run_policies, simulate
 
 def test_load_aware_beats_rendezvous_under_high_fanout():
     # Small arrival gap vs service time -> heavy overlap -> contention on any
-    # source that a load-blind policy over-picks.
+    # source that a load-blind policy over-picks. rendezvous_hash and
+    # load_aware are deterministic, so single runs give exact assertions.
     results = run_policies(
         m_sources=4, n_targets=40, arrival_dt=0.5, service_time=10.0, trials=1
     )
     la = results["load_aware"]
     rh = results["rendezvous_hash"]
-    rnd = results["random"]
 
     # Balance: load_aware never concentrates more than the deterministic baseline.
     assert la.max_source_share <= rh.max_source_share
     assert la.cov <= rh.cov
     # Makespan: steering off busy sources shortens the fan-out (no regression).
     assert la.makespan <= rh.makespan
-    # And it does no worse than random on balance either.
-    assert la.max_source_share <= rnd.max_source_share
+
+    # random shuffles with an unseeded local RNG, so any single trial is
+    # nondeterministic; compare against its mean balance over several trials,
+    # which concentrates well above load_aware's near-ideal spread.
+    rnd_shares = [
+        simulate(
+            "random", m_sources=4, n_targets=40, arrival_dt=0.5, service_time=10.0
+        ).max_source_share
+        for _ in range(10)
+    ]
+    assert la.max_source_share <= sum(rnd_shares) / len(rnd_shares)
 
 
 def test_load_aware_matches_rendezvous_without_concurrency():

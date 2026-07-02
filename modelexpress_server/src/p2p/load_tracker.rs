@@ -27,12 +27,19 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Map + sweep bookkeeping guarded together by one mutex.
+struct Inner {
+    // Recent selection timestamps per source worker, oldest-first. Pruned lazily
+    // on every access, so a key's deque only ever holds within-window entries.
+    map: HashMap<(String, String), VecDeque<Instant>>,
+    // Last time the whole map was swept for fully-decayed keys.
+    last_sweep: Instant,
+}
+
 /// TTL-decayed per-source selection counter keyed by `(mx_source_id, worker_id)`.
 pub struct SourceLoadTracker {
     ttl: Duration,
-    // Recent selection timestamps per source worker, oldest-first. Pruned lazily
-    // on every access, so a key's deque only ever holds within-window entries.
-    inner: Mutex<HashMap<(String, String), VecDeque<Instant>>>,
+    inner: Mutex<Inner>,
 }
 
 impl SourceLoadTracker {
@@ -40,7 +47,10 @@ impl SourceLoadTracker {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                last_sweep: Instant::now(),
+            }),
         }
     }
 
@@ -56,16 +66,28 @@ impl SourceLoadTracker {
 
     fn record_at(&self, mx_source_id: &str, worker_id: &str, now: Instant) {
         let key = (mx_source_id.to_string(), worker_id.to_string());
-        let mut map = self.lock();
-        let dq = map.entry(key).or_default();
+        let mut inner = self.lock();
+        // Keys for churned workers are never queried again through
+        // active_count (they drop out of ListSources), so a periodic sweep --
+        // at most once per TTL, amortized O(1) per record -- is what bounds
+        // the map to sources active within the last ~2x TTL.
+        if now.duration_since(inner.last_sweep) >= self.ttl {
+            let ttl = self.ttl;
+            inner.map.retain(|_, dq| {
+                prune(dq, now, ttl);
+                !dq.is_empty()
+            });
+            inner.last_sweep = now;
+        }
+        let dq = inner.map.entry(key).or_default();
         prune(dq, now, self.ttl);
         dq.push_back(now);
     }
 
     fn active_count_at(&self, mx_source_id: &str, worker_id: &str, now: Instant) -> u32 {
         let key = (mx_source_id.to_string(), worker_id.to_string());
-        let mut map = self.lock();
-        let count = match map.get_mut(&key) {
+        let mut inner = self.lock();
+        let count = match inner.map.get_mut(&key) {
             Some(dq) => {
                 prune(dq, now, self.ttl);
                 dq.len() as u32
@@ -75,12 +97,18 @@ impl SourceLoadTracker {
         // Drop keys that have fully decayed so the map stays bounded by the set
         // of recently active sources rather than every source ever selected.
         if count == 0 {
-            map.remove(&key);
+            inner.map.remove(&key);
         }
         count
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), VecDeque<Instant>>> {
+    /// Number of tracked `(mx_source_id, worker_id)` keys (test observability).
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.lock().map.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // Best-effort telemetry: recover from a poisoned lock rather than panic
         // (unwrap is forbidden) so a caller panicking mid-update never wedges
         // source selection.
@@ -135,6 +163,26 @@ mod tests {
         assert_eq!(
             t.active_count_at("src", "w0", t0 + Duration::from_secs(91)),
             0
+        );
+    }
+
+    #[test]
+    fn sweep_evicts_churned_worker_keys() {
+        // A churned worker's key is never queried again (it drops out of
+        // ListSources), so only the periodic sweep on the record path can
+        // reclaim it. Regression test for unbounded map growth under churn.
+        let ttl = Duration::from_secs(60);
+        let t = SourceLoadTracker::new(ttl);
+        let t0 = Instant::now();
+        t.record_at("src", "dead-worker", t0);
+        assert_eq!(t.tracked_keys(), 1);
+        // A later selection for a different worker triggers the sweep once the
+        // TTL has elapsed; the dead worker's fully-decayed key is dropped.
+        t.record_at("src", "live-worker", t0 + Duration::from_secs(61));
+        assert_eq!(t.tracked_keys(), 1);
+        assert_eq!(
+            t.active_count_at("src", "live-worker", t0 + Duration::from_secs(61)),
+            1
         );
     }
 
