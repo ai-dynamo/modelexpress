@@ -16,7 +16,6 @@ from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
     build_sglang_load_context,
-    collect_sglang_tensors,
 )
 from modelexpress.engines.sglang.loader import MxModelLoader
 
@@ -131,25 +130,53 @@ def test_sglang_is_cuda_alike_uses_sglang_platform_helper(monkeypatch):
     assert adapter.is_cuda_alike() is True
 
 
-def test_collect_sglang_tensors_preserves_non_contiguous_storage_names():
+def test_collect_sglang_tensors_preserves_non_contiguous_storage_names(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     model.weight_t = nn.Parameter(torch.randn(4, 3).T)
 
-    tensors = collect_sglang_tensors(model)
+    tensors = adapter._collect_tensors(model)
 
     assert "weight_t.__storage" in tensors
     assert tensors["weight_t.__storage"].dtype == torch.uint8
 
 
-def test_collect_sglang_tensors_deduplicates_tied_parameters():
+def test_collect_sglang_tensors_deduplicates_tied_parameters(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     shared = nn.Parameter(torch.randn(4, 3))
     model.first = shared
     model.second = shared
 
-    tensors = collect_sglang_tensors(model)
+    tensors = adapter._collect_tensors(model)
 
     assert list(tensors) == ["first"]
+
+
+def test_sglang_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
 
 
 def test_sglang_adapter_post_load_delegates_to_child_module():
