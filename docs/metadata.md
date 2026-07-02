@@ -60,7 +60,7 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 | Payload | Purpose |
 |---------|---------|
 | `tensor_source` | Tensor descriptors for weight transfer. Readers fall back to the deprecated top-level `tensors` field for old publishers. |
-| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, and `chunk_count`. |
+| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, `chunk_count`, and the owning `node_rank`. |
 
 Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker, then use `PrepareArtifactChunk` and `ReleaseArtifactChunk` around each NIXL transfer. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Manifest file paths are canonical absolute publisher paths and are included in the sealed manifest; transfer helpers may rewrite them to target-local staging paths before installing the artifact.
 
@@ -163,7 +163,7 @@ Factory helpers provide the cache source types currently expected by loaders:
 | `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM JIT cache directory (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) |
 | `tilelang_cache_artifact_transfer()` | `TILELANG_CACHE` | TileLang JIT cache directory (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`) |
 | `cute_dsl_cache_artifact_transfer()` | `CUTE_DSL_CACHE` | CuTe DSL compiled-kernel cache directory (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`) |
-| `flashinfer_cache_artifact_transfer()` | `FLASHINFER_CACHE` | FlashInfer JIT workspace (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) |
+| `flashinfer_cache_artifact_transfer()` | `FLASHINFER_CACHE` | Engine-selected FlashInfer JIT and autotune cache directories packaged as one artifact |
 
 ### UpdateStatus
 
@@ -383,6 +383,7 @@ status:
       totalSize: 67108864
       fileCount: 1
       chunkCount: 8
+      nodeRank: 0
     tensorCount: 0
     status: Ready
     updatedAt: "2025-11-14T22:13:20Z"

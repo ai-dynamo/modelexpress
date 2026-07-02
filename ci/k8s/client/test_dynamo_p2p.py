@@ -15,10 +15,8 @@ Asserts:
      ranks 0 and 1 (matches our existing P2P test plumbing — the worker_rank
      filter is what gates rank pairing in rdma_strategy.py).
   2. The second worker actually pulled weights via NIXL RDMA (not via the
-     HF disk-fallback path). Detected by scanning all worker pod logs for
-     exactly one `add_remote_agent: ... (agent=b'<source-agent-name>')` line
-     across the fleet — only the receiving replica logs this; the source
-     replica never does.
+     HF disk-fallback path). Detected by scanning all worker pod logs for a
+     remote source agent loaded through either central or P2P metadata.
   3. The Dynamo Frontend serves /v1/completions end-to-end with a non-empty
      response. Proves the frontend → worker routing path works, separate
      from the P2P transfer itself.
@@ -70,7 +68,7 @@ def _worker_pod_names(namespace: str, dgd_name: str) -> list[str]:
 
 def _worker_logs_combined(namespace: str, dgd_name: str) -> str:
     """Concat logs from all worker pods. The replica that pulled is whichever one
-    emits an `add_remote_agent` line; we don't care which ordinal it is."""
+    emits a remote-agent line; we don't care which ordinal it is."""
     chunks = []
     for pod in _worker_pod_names(namespace, dgd_name):
         # --all-containers because the worker pod may have sidecars; the dynamo
@@ -113,8 +111,7 @@ def test_modelmetadata_crs_published(namespace: str, expected_cr_count: int) -> 
 
 
 def test_second_replica_used_rdma(namespace: str, dgd_name: str) -> None:
-    """At least one worker pod must have called `add_remote_agent` — the
-    signal that P2P weight transfer engaged at all.
+    """At least one worker pod must have loaded a remote NIXL agent.
 
     Why `>= 1` and not `== 1`: in aggregated mode only the scaled-up replica
     pulls (1 source + 1 puller = 1 distinct source agent), but disaggregated
@@ -128,16 +125,18 @@ def test_second_replica_used_rdma(namespace: str, dgd_name: str) -> None:
     `== 0` case.
     """
     logs = _worker_logs_combined(namespace, dgd_name)
-    # Same regex shape as test_p2p_k8s.py's per-rank source agent check. Both
-    # naming schemes (`mx-{role}-worker{N}-{uuid}` and
-    # `trtllm-live-source-rank{N}-{pid}`) are accepted in case future dynamo
-    # paths route through the trtllm transfer code.
-    pattern = r"agent=b?'((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'"
-    matches = re.findall(pattern, logs)
+    # Central metadata calls add_remote_agent; P2P metadata preloads the same
+    # agent while fetching metadata directly from the source worker.
+    matches = []
+    for pattern in (
+        r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
+        r"Using pre-loaded remote agent ((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)",
+    ):
+        matches.extend(re.findall(pattern, logs))
     distinct_agents = {name for name, _ in set(matches)}
     print(f"[workers] distinct source agents observed across all worker logs: {distinct_agents}")
     assert len(distinct_agents) >= 1, (
-        f"No add_remote_agent calls found across worker logs — every worker that "
+        f"No remote source agents found across worker logs — every worker that "
         f"needed weights fell back to HF disk load. P2P didn't engage at all."
     )
 

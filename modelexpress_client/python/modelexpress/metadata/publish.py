@@ -260,9 +260,8 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
     function returns True for them unconditionally.
 
     For backends that DON'T force it (``MxClient`` backed by the
-    central server), the ``MX_P2P_METADATA`` env var controls
-    whether the source publishes lightweight pointers (and serves
-    the full metadata itself) or full metadata to the server.
+    central server), P2P metadata is enabled by default. Set
+    ``MX_P2P_METADATA=0`` to publish full metadata to the server.
     """
     # Strict identity check against True so MagicMock's auto-attribute
     # (and any other non-literal truthy value) doesn't accidentally

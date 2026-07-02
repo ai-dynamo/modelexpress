@@ -13,10 +13,12 @@ For ModelStreamer-only examples that load from Azure Blob Storage, S3, or a loca
 
 ## vLLM Deployments
 
+The vLLM image is pinned to 0.23.0. These manifests use vLLM's native `modelexpress` load format and do not require `VLLM_PLUGINS`.
+
 | Topology | Manifest | Model | Configuration |
 |----------|----------|-------|---------------|
-| **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | Llama-3.1-405B-Instruct | TP=8, 1 node (8 GPUs) |
-| **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | Kimi-K2.5-NVFP4 | TP=4, PP=2, 2 nodes (8 GPUs) |
+| **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | DeepSeek-V4-Pro | TP=8, P2P weights + JIT caches |
+| **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | DeepSeek-V4-Pro | TP=4, PP=2, P2P weights + JIT caches |
 
 ## SGLang Deployments
 

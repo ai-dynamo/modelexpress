@@ -149,6 +149,16 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     assert ctx.device_id == ctx.target_device.index
 
 
+def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
+    _stub_metadata_client(monkeypatch)
+    vllm_config = _context_config(load_device="cuda:0")
+    vllm_config.parallel_config.node_rank = 1
+
+    ctx = build_vllm_load_context(vllm_config, _model_config())
+
+    assert ctx.node_rank == 1
+
+
 def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):
     events = []
 

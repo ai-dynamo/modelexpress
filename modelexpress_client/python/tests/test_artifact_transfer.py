@@ -10,6 +10,7 @@ import logging
 import tarfile
 from concurrent import futures
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import grpc
 import pytest
@@ -23,6 +24,7 @@ from modelexpress.metadata.artifact_manifest import (
 )
 from modelexpress.metadata.artifact_transfer import (
     ArtifactBundle,
+    ArtifactCacheRoot,
     P2PArtifactTransfer,
     cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
@@ -320,9 +322,115 @@ def test_tarred_p2p_artifact_transfer_prepares_single_file_bundle(tmp_path):
     ]
     assert bundle.manifest.files[0].size == bundle.tar_path.stat().st_size
     assert len(bundle.manifest.chunks) > 1
-    assert (transfer.target_root / "a.txt").read_text() == "alpha"
-    assert (transfer.target_root / "nested" / "b.bin").read_bytes() == b"beta"
+    assert (transfer.roots[0].target_root / "a.txt").read_text() == "alpha"
+    assert (transfer.roots[0].target_root / "nested" / "b.bin").read_bytes() == b"beta"
     assert isinstance(bundle, ArtifactBundle)
+
+
+def test_flashinfer_cache_transfer_includes_engine_autotune_files(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="modelexpress.metadata.artifact_transfer")
+    jit_source = tmp_path / "jit-source"
+    autotune_source = tmp_path / "autotune-source"
+    jit_source.mkdir()
+    autotune_source.mkdir()
+    (jit_source / "kernel.so").write_bytes(b"compiled")
+    (autotune_source / "configs.json").write_text("{}")
+    jit_target = tmp_path / "jit-target"
+    autotune_target = tmp_path / "autotune-target"
+
+    source_transfer = flashinfer_cache_artifact_transfer(
+        jit_source,
+        tmp_path / "unused-jit-target",
+        tmp_path / "source-bundle",
+        additional_roots=(
+            ArtifactCacheRoot(
+                name="autotune",
+                source_root=autotune_source,
+                target_root=tmp_path / "unused-autotune-target",
+                optional=True,
+            ),
+        ),
+    )
+    target_transfer = flashinfer_cache_artifact_transfer(
+        jit_source,
+        jit_target,
+        tmp_path / "target-bundle",
+        additional_roots=(
+            ArtifactCacheRoot(
+                name="autotune",
+                source_root=autotune_source,
+                target_root=autotune_target,
+                optional=True,
+            ),
+        ),
+    )
+    bundle = source_transfer.prepare_source()
+    source_bytes_by_path = {
+        file.path: Path(file.path).read_bytes() for file in bundle.manifest.files
+    }
+    chunk_manager = _FakeArtifactChunkManager(source_bytes_by_path)
+    target_nixl = _FakeTargetNixlManager(chunk_manager)
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        artifact_manifests={bundle.artifact_id: bundle.manifest},
+        artifact_chunk_manager=chunk_manager,
+        metadata_endpoint="127.0.0.1:5555",
+        agent_name="source-agent",
+        worker_rank=0,
+    )
+    server, port = _start_server(servicer)
+
+    try:
+        header = target_transfer.transfer_from_worker(
+            f"127.0.0.1:{port}",
+            mx_source_id="source-123",
+            artifact_id=bundle.artifact_id,
+            nixl_manager=target_nixl,
+            timeout=1.0,
+        )
+        target_transfer.install(header)
+    finally:
+        server.stop(grace=None)
+
+    assert [Path(file.path).name for file in bundle.manifest.files] == [
+        "artifact.tar",
+        "autotune.tar",
+    ]
+    assert [Path(file.path).name for file in header.files] == [
+        "artifact.tar",
+        "autotune.tar",
+    ]
+    assert (jit_target / "kernel.so").read_bytes() == b"compiled"
+    assert (autotune_target / "configs.json").read_text() == "{}"
+    assert f"targets=['{jit_target}', '{autotune_target}']" in caplog.text
+
+
+def test_flashinfer_cache_transfer_allows_missing_optional_root(tmp_path):
+    jit_source = tmp_path / "jit-source"
+    jit_source.mkdir()
+    (jit_source / "kernel.so").write_bytes(b"compiled")
+
+    transfer = flashinfer_cache_artifact_transfer(
+        jit_source,
+        tmp_path / "jit-target",
+        tmp_path / "bundle",
+        additional_roots=(
+            ArtifactCacheRoot(
+                name="autotune",
+                source_root=tmp_path / "missing-autotune-source",
+                target_root=tmp_path / "autotune-target",
+                optional=True,
+            ),
+        ),
+    )
+    bundle = transfer.prepare_source()
+    transfer.install(
+        p2p_pb2.GetArtifactManifestHeaderResponse(files=bundle.manifest.files)
+    )
+
+    assert (transfer.roots[0].target_root / "kernel.so").read_bytes() == b"compiled"
+    assert (tmp_path / "autotune-target").is_dir()
 
 
 def test_tarred_p2p_artifact_transfer_rejects_unsafe_staging(tmp_path):
@@ -395,7 +503,7 @@ def test_tarred_p2p_artifact_transfer_rejects_symlink(tmp_path):
 
 
 def test_extract_tarred_artifact_rejects_unsafe_member(tmp_path):
-    tar_path = tmp_path / "unsafe.tar"
+    tar_path = tmp_path / "artifact.tar"
     data = b"escape"
     info = tarfile.TarInfo("../escape.txt")
     info.size = len(data)
@@ -411,6 +519,23 @@ def test_extract_tarred_artifact_rejects_unsafe_member(tmp_path):
     )
 
     with pytest.raises(ValueError, match="unsafe tar member"):
+        transfer.install(header)
+
+
+def test_extract_tarred_artifact_rejects_duplicate_archive_names(tmp_path):
+    transfer = torch_compile_cache_artifact_transfer(
+        tmp_path,
+        tmp_path / "extract",
+        tmp_path / "bundle",
+    )
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(
+        files=[
+            p2p_pb2.ArtifactManifestFile(path="left/artifact.tar"),
+            p2p_pb2.ArtifactManifestFile(path="right/artifact.tar"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unique by archive name"):
         transfer.install(header)
 
 
@@ -470,7 +595,7 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
         assert header.files[0].path == (
             tmp_path / "target-bundle" / "artifact.tar"
         ).resolve().as_posix()
-        assert not (target_transfer.target_root / "bucket-000").exists()
+        assert not (target_transfer.roots[0].target_root / "bucket-000").exists()
         with caplog.at_level(
             logging.INFO,
             logger="modelexpress.metadata.artifact_transfer",
@@ -481,8 +606,8 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
 
     assert header.artifact_id == bundle.artifact_id
     installed_files = {
-        file.relative_to(target_transfer.target_root).as_posix(): file.read_bytes()
-        for file in target_transfer.target_root.rglob("*")
+        file.relative_to(target_transfer.roots[0].target_root).as_posix(): file.read_bytes()
+        for file in target_transfer.roots[0].target_root.rglob("*")
         if file.is_file()
     }
     assert installed_files == {
@@ -582,13 +707,13 @@ def test_cache_artifact_transfers_share_p2p_interface(
             nixl_manager=target_nixl,
             timeout=1.0,
         )
-        assert not (transfer.target_root / "kernel.so").exists()
+        assert not (transfer.roots[0].target_root / "kernel.so").exists()
         transfer.install(header)
     finally:
         server.stop(grace=None)
 
     assert header.mx_source_type == mx_source_type
-    assert (transfer.target_root / "kernel.so").read_bytes() == (
+    assert (transfer.roots[0].target_root / "kernel.so").read_bytes() == (
         f"{name}-bytes".encode()
     )
 
@@ -686,6 +811,54 @@ def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
             discover_artifact_source(mx_client, identity, worker_rank=0)
     finally:
         published.stop()
+
+
+def test_discover_artifact_source_matches_node_rank():
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        model_name="test/model",
+    )
+    mx_source_id = compute_mx_source_id(identity)
+    instances = [
+        p2p_pb2.SourceInstanceRef(
+            mx_source_id=mx_source_id,
+            worker_id=f"source-pod-{node_rank}",
+            worker_rank=worker_rank,
+        )
+        for node_rank, worker_rank in [(0, 3), (1, 7)]
+    ]
+    metadata = {
+        f"source-pod-{node_rank}": p2p_pb2.GetMetadataResponse(
+            found=True,
+            mx_source_id=mx_source_id,
+            worker_id=f"source-pod-{node_rank}",
+            worker=p2p_pb2.WorkerMetadata(
+                worker_rank=worker_rank,
+                worker_grpc_endpoint=f"source-pod-{node_rank}:6555",
+                artifact_source=p2p_pb2.ArtifactSourceMetadata(
+                    artifact_id=f"artifact-{node_rank}",
+                    node_rank=node_rank,
+                ),
+            ),
+        )
+        for node_rank, worker_rank in [(0, 3), (1, 7)]
+    }
+    mx_client = MagicMock()
+    mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=instances
+    )
+    mx_client.get_metadata.side_effect = (
+        lambda source_id, worker_id: metadata[worker_id]
+    )
+
+    source_0 = discover_artifact_source(mx_client, identity, node_rank=0)
+    source_1 = discover_artifact_source(mx_client, identity, node_rank=1)
+
+    assert source_0.worker_id == "source-pod-0"
+    assert source_0.artifact_id == "artifact-0"
+    assert source_1.worker_id == "source-pod-1"
+    assert source_1.worker_rank == 7
+    assert source_1.artifact_id == "artifact-1"
 
 
 def test_publish_artifact_source_stops_server_when_refresh_fails(
@@ -798,7 +971,7 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
             timeout=1.0,
             max_inflight_chunks=2,
         )
-        assert not transfer.target_root.exists()
+        assert not transfer.roots[0].target_root.exists()
         transfer.install(header)
     finally:
         server.stop(grace=None)
@@ -807,8 +980,8 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
     assert discovered.artifact_id == bundle.artifact_id
     assert header.artifact_id == bundle.artifact_id
     installed_files = {
-        file.relative_to(transfer.target_root).as_posix(): file.read_bytes()
-        for file in transfer.target_root.rglob("*")
+        file.relative_to(transfer.roots[0].target_root).as_posix(): file.read_bytes()
+        for file in transfer.roots[0].target_root.rglob("*")
         if file.is_file()
     }
     assert installed_files == {

@@ -97,13 +97,20 @@ spec:
         - name: HF_HOME
           value: "/models"
         - name: MODEL_NAME
-          value: "nvidia/Kimi-K2.5-NVFP4"
-        - name: VLLM_PLUGINS
-          value: "modelexpress"
+          value: "deepseek-ai/DeepSeek-V4-Pro"
+        # vLLM 0.23.0 recognizes --load-format modelexpress natively. For
+        # older vLLM versions, add:
+        # - name: VLLM_PLUGINS
+        #   value: "modelexpress"
         # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
         # standardizing on MX_SERVER_ADDRESS going forward (see README).
         - name: MODEL_EXPRESS_URL
           value: "mx-vllm-disagg-sn-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        # Dynamo serves worker health on 9090; publish caches after JIT warmup.
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL
@@ -138,13 +145,15 @@ spec:
             - dynamo.vllm
           args:
             - --model
-            - nvidia/Kimi-K2.5-NVFP4
+            - deepseek-ai/DeepSeek-V4-Pro
             - --load-format
             - modelexpress
             - --tensor-parallel-size
             - "4"
             - --max-model-len
             - "32768"
+            - --kv-cache-dtype
+            - fp8
             - --trust-remote-code
             - --disaggregation-mode
             - decode
@@ -171,13 +180,20 @@ spec:
         - name: HF_HOME
           value: "/models"
         - name: MODEL_NAME
-          value: "nvidia/Kimi-K2.5-NVFP4"
-        - name: VLLM_PLUGINS
-          value: "modelexpress"
+          value: "deepseek-ai/DeepSeek-V4-Pro"
+        # vLLM 0.23.0 recognizes --load-format modelexpress natively. For
+        # older vLLM versions, add:
+        # - name: VLLM_PLUGINS
+        #   value: "modelexpress"
         # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
         # standardizing on MX_SERVER_ADDRESS going forward (see README).
         - name: MODEL_EXPRESS_URL
           value: "mx-vllm-disagg-sn-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        # Dynamo serves worker health on 9090; publish caches after JIT warmup.
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         - name: NIXL_LOG_LEVEL
           value: "INFO"
         - name: UCX_LOG_LEVEL
@@ -209,13 +225,15 @@ spec:
             - dynamo.vllm
           args:
             - --model
-            - nvidia/Kimi-K2.5-NVFP4
+            - deepseek-ai/DeepSeek-V4-Pro
             - --load-format
             - modelexpress
             - --tensor-parallel-size
             - "4"
             - --max-model-len
             - "32768"
+            - --kv-cache-dtype
+            - fp8
             - --trust-remote-code
             - --disaggregation-mode
             - prefill

@@ -114,12 +114,14 @@ def artifact_manifest_id(manifest: p2p_pb2.ArtifactManifest) -> str:
 
 def artifact_source_metadata(
     manifest: p2p_pb2.ArtifactManifest,
+    node_rank: int = 0,
 ) -> p2p_pb2.ArtifactSourceMetadata:
     return p2p_pb2.ArtifactSourceMetadata(
         artifact_id=artifact_manifest_id(manifest),
         total_size=sum(file.size for file in manifest.files),
         file_count=len(manifest.files),
         chunk_count=len(manifest.chunks),
+        node_rank=node_rank,
     )
 
 
