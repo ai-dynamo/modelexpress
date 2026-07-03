@@ -362,6 +362,7 @@ status:
     nixlMetadata: <base64>
     tensorCount: 1327
     tensorConfigMap: mx-source-a1b2c3d4e5f67890-f3a2b1c4-tensors-worker-0
+    accelerator: cuda
     status: Ready
     updatedAt: "2025-11-14T22:13:20Z"
   conditions:
@@ -388,6 +389,7 @@ status:
   worker:
     workerRank: 0
     backendType: none
+    accelerator: cuda
     artifactSource:
       artifactId: a0f08392f2abc45f78bd59f0fe2c601750c2b270dc5cc37c2166d86a65398466
       totalSize: 67108864
