@@ -987,7 +987,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-fp8-disk-fallback-aws:
     name: FP8 disk fallback (AWS EFA)
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-deploy-tester-v1
     needs: [build-client, build-server]
     permissions:
       contents: read
