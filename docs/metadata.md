@@ -548,4 +548,4 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
 | Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
 | Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
-| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. Target retries next candidate (max 3) |
+| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. RDMA is aborted and loading falls through to GDS, then disk; the target does not retry another source once transfer has started |
