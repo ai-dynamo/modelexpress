@@ -1,0 +1,137 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package weight_sync;
+
+// WeightSyncService: server-side plan building for trainer-inference weight sync.
+//
+// Protocol (PULL mode):
+//   1. Trainer calls PublishTrainerTable with the full shard layout.
+//   2. One inference worker calls BuildPlan with its resolved element-run
+//      regions (baked + resolved client-side, torch-dependent).
+//   3. Server routes regions against the TrainerTable (pure Rust arithmetic),
+//      builds RdmaDescriptors, caches by plan_id.
+//   4. All workers with the same plan_key call GetPlan to retrieve the cached
+//      descriptors without repeating routing work.
+//   5. Trainer calls InvalidatePlan when weights are resharded.
+//
+// Protocol (PUSH mode):
+//   1. Inference workers call PublishInferenceTable with their parameter
+//      GPU addresses and NIXL metadata.
+//   2. Trainer calls BuildPushPlan / GetPlan symmetrically.
+service WeightSyncService {
+  // Trainer publishes its full shard layout (called once per broadcast step).
+  rpc PublishTrainerTable(PublishTrainerTableRequest) returns (PublishTrainerTableResponse);
+
+  // Retrieve the current TrainerTable for a model (called by workers at init).
+  rpc GetTrainerTable(GetTrainerTableRequest) returns (GetTrainerTableResponse);
+
+  // Inference worker publishes its live parameter GPU addresses (PUSH mode).
+  rpc PublishInferenceTable(PublishInferenceTableRequest) returns (PublishInferenceTableResponse);
+
+  // Submit resolved element-run regions; server routes and caches the plan.
+  rpc BuildPlan(BuildPlanRequest) returns (BuildPlanResponse);
+
+  // Retrieve a previously built plan by plan_id.
+  rpc GetPlan(GetPlanRequest) returns (GetPlanResponse);
+
+  // Invalidate a cached plan (call when trainer reshards or worker restarts).
+  rpc InvalidatePlan(InvalidatePlanRequest) returns (InvalidatePlanResponse);
+}
+
+// ---------------------------------------------------------------------------
+// TrainerTable publish / fetch
+// ---------------------------------------------------------------------------
+
+message PublishTrainerTableRequest {
+  // Identifies the model + run; used as the Redis key prefix.
+  string model_key = 1;
+  // JSON-encoded TrainerTable (produced by protocol.serialization.encode_trainer_table).
+  bytes table_payload = 2;
+}
+
+message PublishTrainerTableResponse {
+  bool ok = 1;
+}
+
+message GetTrainerTableRequest {
+  string model_key = 1;
+}
+
+message GetTrainerTableResponse {
+  bool found = 1;
+  bytes table_payload = 2;
+}
+
+// ---------------------------------------------------------------------------
+// InferenceTable publish (PUSH mode)
+// ---------------------------------------------------------------------------
+
+message PublishInferenceTableRequest {
+  string model_key = 1;
+  int32 worker_rank = 2;
+  // JSON-encoded InferenceTable.
+  bytes table_payload = 3;
+}
+
+message PublishInferenceTableResponse {
+  bool ok = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Plan building and retrieval
+// ---------------------------------------------------------------------------
+
+// A single resolved element-run region, matching protocol.types.ResolvedRegion.
+message ResolvedRegionProto {
+  string tensor_name = 1;
+  // Flat [offset, count, offset, count, ...] pairs.
+  repeated int64 src_elem_runs = 2;
+  uint64 dst_addr = 3;
+  repeated int64 dst_elem_runs = 4;
+  uint32 element_size = 5;
+  uint32 dst_device_id = 6;
+}
+
+message BuildPlanRequest {
+  // Stable key for this (model, worker_rank) combination.
+  // Workers with identical plan_key share the cached plan.
+  string plan_key = 1;
+  // Model key to look up the TrainerTable on the server.
+  string model_key = 2;
+  // Resolved regions from the client's bake+resolve pass.
+  repeated ResolvedRegionProto regions = 3;
+}
+
+message BuildPlanResponse {
+  // Opaque identifier for the built plan; pass to GetPlan.
+  string plan_id = 1;
+}
+
+message GetPlanRequest {
+  string plan_id = 1;
+}
+
+// One NIXL RDMA READ or WRITE descriptor.
+message RdmaDescriptorProto {
+  uint32 agent_index = 1;
+  uint64 src_addr = 2;
+  uint64 dst_addr = 3;
+  uint64 nbytes = 4;
+}
+
+message GetPlanResponse {
+  // True once the plan has been built and is ready.
+  bool ready = 1;
+  repeated RdmaDescriptorProto descriptors = 2;
+}
+
+message InvalidatePlanRequest {
+  string plan_key = 1;
+}
+
+message InvalidatePlanResponse {
+  bool ok = 1;
+}
