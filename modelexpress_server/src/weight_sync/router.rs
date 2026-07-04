@@ -8,7 +8,7 @@
 //! `modelexpress/weight_transfer/planner/router.py`.
 //! Both implementations must produce identical output for the same inputs.
 
-use modelexpress_common::grpc::weight_sync::{RdmaDescriptorProto, ResolvedRegionProto};
+use modelexpress_common::grpc::weight_sync::{M2nDescriptorProto, RdmaDescriptorProto, ResolvedRegionProto};
 use serde::Deserialize;
 
 /// Trainer shard descriptor, mirroring `protocol.types.TrainerShard`.
@@ -84,6 +84,36 @@ pub fn route_regions(
     }
 
     descriptors
+}
+
+/// Route resolved regions for all workers in one pass, returning per-worker
+/// M2N descriptor slices tagged with both src and dst agent indices.
+///
+/// Each worker's regions are routed independently against the shared
+/// TrainerTable.  The resulting descriptors are annotated with
+/// `dst_agent_index = worker_rank` so the trainer side can identify
+/// which worker each descriptor targets.
+pub fn route_all_workers(
+    workers: &[(i32, &[ResolvedRegionProto])],
+    table: &TrainerTableJson,
+) -> Vec<(i32, Vec<M2nDescriptorProto>)> {
+    workers
+        .iter()
+        .map(|(rank, regions)| {
+            let rdma_descs = route_regions(regions, table);
+            let m2n_descs = rdma_descs
+                .into_iter()
+                .map(|d| M2nDescriptorProto {
+                    src_agent_index: d.agent_index,
+                    dst_agent_index: *rank as u32,
+                    src_addr: d.src_addr,
+                    dst_addr: d.dst_addr,
+                    nbytes: d.nbytes,
+                })
+                .collect();
+            (*rank, m2n_descs)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

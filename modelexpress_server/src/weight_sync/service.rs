@@ -19,15 +19,19 @@ use uuid::Uuid;
 use modelexpress_common::grpc::weight_sync::{
     weight_sync_service_server::WeightSyncService as WeightSyncServiceTrait,
     BuildPlanRequest, BuildPlanResponse,
+    GetM2nPlanRequest, GetM2nPlanResponse,
     GetPlanRequest, GetPlanResponse,
     GetTrainerTableRequest, GetTrainerTableResponse,
+    InvalidateM2nPlanRequest, InvalidateM2nPlanResponse,
     InvalidatePlanRequest, InvalidatePlanResponse,
+    M2nDescriptorProto,
     PublishInferenceTableRequest, PublishInferenceTableResponse,
     PublishTrainerTableRequest, PublishTrainerTableResponse,
     RdmaDescriptorProto,
+    RegisterM2nWorkerRequest, RegisterM2nWorkerResponse,
 };
 
-use super::router::{route_regions, TrainerTableJson};
+use super::router::{route_all_workers, route_regions, TrainerTableJson};
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -37,6 +41,20 @@ use super::router::{route_regions, TrainerTableJson};
 #[derive(Clone)]
 struct CachedPlan {
     descriptors: Vec<RdmaDescriptorProto>,
+}
+
+/// One worker's registration data for an M2N collective plan.
+struct M2nWorkerRegistration {
+    regions: Vec<modelexpress_common::grpc::weight_sync::ResolvedRegionProto>,
+    nixl_metadata: Vec<u8>,
+}
+
+/// Pending M2N plan accumulating worker registrations until the barrier fires.
+struct M2nPlanEntry {
+    total_workers: i32,
+    registrations: HashMap<i32, M2nWorkerRegistration>,
+    /// Set once all workers have registered and the plan is built.
+    plan_id: Option<String>,
 }
 
 /// Shared server state (plan cache + raw table blobs).
@@ -49,6 +67,10 @@ struct WeightSyncState {
     trainer_tables: HashMap<String, Vec<u8>>,
     /// (model_key, worker_rank) -> raw JSON-encoded InferenceTable bytes
     inference_tables: HashMap<(String, i32), Vec<u8>>,
+    /// model_key -> M2N plan accumulator
+    m2n_pending: HashMap<String, M2nPlanEntry>,
+    /// (plan_id, worker_rank) -> this worker's M2N descriptors
+    m2n_worker_plans: HashMap<(String, i32), Vec<M2nDescriptorProto>>,
 }
 
 impl WeightSyncState {
@@ -58,6 +80,8 @@ impl WeightSyncState {
             plan_key_to_id: HashMap::new(),
             trainer_tables: HashMap::new(),
             inference_tables: HashMap::new(),
+            m2n_pending: HashMap::new(),
+            m2n_worker_plans: HashMap::new(),
         }
     }
 }
@@ -196,5 +220,142 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
             state.plans.remove(&plan_id);
         }
         Ok(Response::new(InvalidatePlanResponse { ok: true }))
+    }
+
+    async fn register_m2n_worker(
+        &self,
+        request: Request<RegisterM2nWorkerRequest>,
+    ) -> Result<Response<RegisterM2nWorkerResponse>, Status> {
+        let req = request.into_inner();
+
+        let mut state = self.state.write().await;
+
+        // Reuse an existing plan_id if this worker already registered.
+        if let Some(entry) = state.m2n_pending.get(&req.model_key) {
+            if let Some(plan_id) = &entry.plan_id {
+                return Ok(Response::new(RegisterM2nWorkerResponse {
+                    m2n_plan_id: plan_id.clone(),
+                }));
+            }
+        }
+
+        // Accumulate this worker's registration.
+        let entry = state
+            .m2n_pending
+            .entry(req.model_key.clone())
+            .or_insert_with(|| M2nPlanEntry {
+                total_workers: req.total_workers,
+                registrations: HashMap::new(),
+                plan_id: None,
+            });
+
+        entry.registrations.insert(
+            req.worker_rank,
+            M2nWorkerRegistration {
+                regions: req.regions,
+                nixl_metadata: req.nixl_metadata,
+            },
+        );
+
+        // Check if the barrier is satisfied.
+        if entry.registrations.len() < entry.total_workers as usize {
+            // Return the same empty plan_id; client will poll GetM2nPlan.
+            return Ok(Response::new(RegisterM2nWorkerResponse {
+                m2n_plan_id: String::new(),
+            }));
+        }
+
+        // All workers registered: fetch the TrainerTable and route.
+        let table_bytes = state
+            .trainer_tables
+            .get(&req.model_key)
+            .cloned()
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "TrainerTable not found for model_key {:?}",
+                    req.model_key
+                ))
+            })?;
+
+        let table: TrainerTableJson = serde_json::from_slice(&table_bytes)
+            .map_err(|e| Status::internal(format!("Failed to decode TrainerTable: {e}")))?;
+
+        // Build the worker list for route_all_workers.
+        let worker_data: Vec<(i32, Vec<modelexpress_common::grpc::weight_sync::ResolvedRegionProto>)> = entry
+            .registrations
+            .iter()
+            .map(|(rank, reg)| (*rank, reg.regions.clone()))
+            .collect();
+
+        let worker_refs: Vec<(i32, &[modelexpress_common::grpc::weight_sync::ResolvedRegionProto])> =
+            worker_data.iter().map(|(r, v)| (*r, v.as_slice())).collect();
+
+        let per_worker = route_all_workers(&worker_refs, &table);
+
+        let plan_id = Uuid::new_v4().to_string();
+
+        for (rank, descs) in per_worker {
+            state
+                .m2n_worker_plans
+                .insert((plan_id.clone(), rank), descs);
+        }
+
+        // Record the plan_id so subsequent RegisterM2nWorker calls return it.
+        if let Some(entry) = state.m2n_pending.get_mut(&req.model_key) {
+            entry.plan_id = Some(plan_id.clone());
+        }
+
+        Ok(Response::new(RegisterM2nWorkerResponse {
+            m2n_plan_id: plan_id,
+        }))
+    }
+
+    async fn get_m2n_plan(
+        &self,
+        request: Request<GetM2nPlanRequest>,
+    ) -> Result<Response<GetM2nPlanResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.m2n_plan_id.is_empty() {
+            // Barrier not yet satisfied; caller should poll again.
+            return Ok(Response::new(GetM2nPlanResponse {
+                ready: false,
+                descriptors: vec![],
+            }));
+        }
+
+        let state = self.state.read().await;
+        match state
+            .m2n_worker_plans
+            .get(&(req.m2n_plan_id.clone(), req.worker_rank))
+        {
+            Some(descs) => Ok(Response::new(GetM2nPlanResponse {
+                ready: true,
+                descriptors: descs.clone(),
+            })),
+            None => Ok(Response::new(GetM2nPlanResponse {
+                ready: false,
+                descriptors: vec![],
+            })),
+        }
+    }
+
+    async fn invalidate_m2n_plan(
+        &self,
+        request: Request<InvalidateM2nPlanRequest>,
+    ) -> Result<Response<InvalidateM2nPlanResponse>, Status> {
+        let req = request.into_inner();
+        let mut state = self.state.write().await;
+
+        if let Some(entry) = state.m2n_pending.remove(&req.model_key) {
+            if let Some(plan_id) = entry.plan_id {
+                // Remove all per-worker slices for this plan.
+                state
+                    .m2n_worker_plans
+                    .retain(|(pid, _), _| pid != &plan_id);
+            }
+        }
+
+        Ok(Response::new(InvalidateM2nPlanResponse { ok: true }))
     }
 }

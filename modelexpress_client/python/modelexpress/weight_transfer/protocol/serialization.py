@@ -12,6 +12,7 @@ from dataclasses import asdict
 from .types import (
     InferenceShard,
     InferenceTable,
+    M2nDescriptor,
     RdmaDescriptor,
     ResolvedRegion,
     TrainerShard,
@@ -117,3 +118,16 @@ def encode_rdma_descriptors(descs: list[RdmaDescriptor]) -> bytes:
 
 def decode_rdma_descriptors(data: bytes) -> list[RdmaDescriptor]:
     return [RdmaDescriptor(**d) for d in json.loads(data)]
+
+
+# ---------------------------------------------------------------------------
+# M2nDescriptor list
+# ---------------------------------------------------------------------------
+
+
+def encode_m2n_descriptors(descs: list[M2nDescriptor]) -> bytes:
+    return json.dumps([asdict(d) for d in descs], separators=(",", ":")).encode()
+
+
+def decode_m2n_descriptors(data: bytes) -> list[M2nDescriptor]:
+    return [M2nDescriptor(**d) for d in json.loads(data)]
