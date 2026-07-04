@@ -128,6 +128,7 @@ ModelExpress/
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
+│       ├── gds_constants.py             # Shared GDS alignment constants
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader
 │       ├── adapter.py                  # EngineAdapter contract and strategy errors
@@ -148,6 +149,12 @@ ModelExpress/
 │       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3/GCS/Azure/local)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (engine-native fallback)
+│       ├── restore_strategy/           # GMS snapshot restore chain
+│       │   ├── __init__.py             # Fixed RDMA, GDS, POSIX policy
+│       │   ├── context.py              # GMS source extents and target GPU VAs
+│       │   ├── rdma_strategy.py        # Live-source NIXL RDMA restore
+│       │   ├── gds_strategy.py         # Snapshot-file GDS restore
+│       │   └── posix_strategy.py       # Reserved POSIX staging strategy
 │       ├── engines/
 │       │   ├── vllm/                   # vLLM integration
 │       │   │   ├── __init__.py         # vLLM loader registration
@@ -533,6 +540,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
+| `restore_strategy/` | GMS snapshot restore policy and neutral context for loading file extents or live-source regions into existing GPU virtual addresses |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
@@ -607,6 +615,12 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | p3 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for CUDA-only fast paths such as pool registration, VMM arena registration, and GDS. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
+
+### GMS Snapshot Restore
+
+The separate `restore_strategy` package restores GMS snapshot extents into GPU virtual addresses that GMS already owns. `GmsRestoreContext` carries allocation IDs, source file ranges, destination addresses, device ownership, and backend configuration without depending on a framework tensor type.
+
+The fixed policy is P2P, then GDS, then POSIX. P2P discovers READY `GMS_WEIGHT_SNAPSHOT` sources, filters by worker rank and runtime accelerator, validates the selected `worker_id` when fetching a direct worker manifest, and registers the destination regions with NIXL. GDS submits grouped file ranges through `MxGdsLoader.restore_gms_snapshot()` with bounded in-flight batches. The POSIX strategy is currently a reserved placeholder and is not an implemented fallback.
 
 ### Source Selection
 

@@ -49,6 +49,7 @@ impl ModelMetadataSpec {
             Ok(MxSourceType::TilelangCache) => "tilelang_cache",
             Ok(MxSourceType::CuteDslCache) => "cute_dsl_cache",
             Ok(MxSourceType::FlashinferCache) => "flashinfer_cache",
+            Ok(MxSourceType::GmsWeightSnapshot) => "gms_weight_snapshot",
             Err(_) => "unknown",
         }
         .to_string()
@@ -297,6 +298,10 @@ mod tests {
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(8),
             "flashinfer_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(MxSourceType::GmsWeightSnapshot as i32),
+            "gms_weight_snapshot"
         );
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(99),

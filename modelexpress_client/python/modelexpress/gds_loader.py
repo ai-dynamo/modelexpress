@@ -21,13 +21,20 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Mapping, Sequence
 
 import torch
 
 from .accelerators import AcceleratorBackend
-from .gds_transfer import GdsTransferManager, is_gds_available
+from .gds_constants import _GDS_ALIGNMENT
+from .gds_transfer import (
+    GdsReadRequest,
+    GdsReadTransfer,
+    GdsTransferManager,
+    is_gds_available,
+)
 
 logger = logging.getLogger("modelexpress.gds_loader")
 
@@ -47,6 +54,22 @@ SAFETENSORS_DTYPE_MAP: dict[str, torch.dtype] = {
     "U8": torch.uint8,
     "BOOL": torch.bool,
 }
+
+
+@dataclass(frozen=True)
+class MxFileReadSource:
+    allocation_id: str
+    file_path: str
+    file_offset: int
+    byte_count: int
+
+
+@dataclass(frozen=True)
+class MxDeviceReadTarget:
+    allocation_id: str
+    va: int
+    device: int
+    byte_count: int
 
 
 class MxGdsLoader:
@@ -155,9 +178,251 @@ class MxGdsLoader:
                 pbar.close()
             pool.shutdown(wait=True)
 
+    def restore_gms_snapshot(
+        self,
+        *,
+        grouped_sources: Mapping[
+            str, Sequence[tuple[MxFileReadSource, MxDeviceReadTarget]]
+        ],
+        device: int,
+        max_workers: int = 16,
+        chunk_size_bytes: int | None = None,
+        max_inflight_batches: int | None = None,
+    ) -> dict[str, object]:
+        """Restore GMS snapshot file ranges into existing GPU VAs via GDS."""
+        if max_inflight_batches is None:
+            max_inflight_batches = max_workers
+        max_inflight_batches = max(1, int(max_inflight_batches))
+
+        if not grouped_sources:
+            return {
+                "total_bytes": 0,
+                "elapsed_s": 0.0,
+                "selected_strategy": "gds",
+                "source_count": 0,
+                "file_count": 0,
+                "max_inflight_batches": max_inflight_batches,
+            }
+        if not is_gds_available():
+            raise RuntimeError("GDS is not available")
+
+        device_id = int(device)
+        if device_id < 0:
+            raise RuntimeError(
+                f"GMS transfer device must be non-negative: {device_id}"
+            )
+        source_count = 0
+        total_bytes = 0
+        for pairs in grouped_sources.values():
+            for source, target in pairs:
+                source_count += 1
+                total_bytes += int(source.byte_count)
+                target_device = int(target.device)
+                if target_device != device_id:
+                    raise RuntimeError(
+                        "MxGdsLoader.restore_gms_snapshot expects one CUDA device per "
+                        f"call: expected={device} got={target.device}"
+                    )
+
+        torch.cuda.set_device(device_id)
+        self._device_id = device_id
+        self._ensure_gds_manager()
+
+        start = time.perf_counter()
+        pending: list[tuple[GdsReadTransfer, int]] = []
+        fd: int | None = None
+        transfer: GdsReadTransfer | None = None
+        try:
+            for file_path, pairs in sorted(grouped_sources.items()):
+                fd = self._open_gds_file(file_path)
+                file_size = os.fstat(fd).st_size
+                requests = self._build_read_requests(
+                    file_path=file_path,
+                    fd=fd,
+                    file_size=file_size,
+                    pairs=pairs,
+                    chunk_size_bytes=chunk_size_bytes,
+                )
+                transfer = self._gds_manager.prepare_read(
+                    requests,
+                    label=f"gms:{Path(file_path).name}",
+                )
+                self._gds_manager.start(transfer)
+                pending.append((transfer, fd))
+                transfer = None
+                fd = None
+
+                if len(pending) >= max_inflight_batches:
+                    self._wait_and_release(*pending.pop(0))
+
+            while pending:
+                self._wait_and_release(*pending.pop(0))
+        except Exception as exc:
+            if fd is not None:
+                try:
+                    if transfer is None:
+                        os.close(fd)
+                    else:
+                        self._release_transfer(transfer, fd)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Failed to clean up current GDS restore file fd=%d: %s",
+                        fd,
+                        cleanup_exc,
+                    )
+            for pending_transfer, pending_fd in pending:
+                try:
+                    self._release_transfer(pending_transfer, pending_fd)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Failed to clean up pending GDS restore transfer fd=%d: %s",
+                        pending_fd,
+                        cleanup_exc,
+                    )
+            raise RuntimeError(f"GMS snapshot GDS restore failed: {exc}") from exc
+
+        elapsed = time.perf_counter() - start
+        throughput = total_bytes / elapsed / (1024**3) if elapsed > 0 else 0.0
+        logger.info(
+            "GMS snapshot GDS restore complete: %.2f GiB in %.3fs "
+            "(%.2f GiB/s, files=%d, sources=%d, max_inflight=%d)",
+            total_bytes / (1024**3),
+            elapsed,
+            throughput,
+            len(grouped_sources),
+            source_count,
+            max_inflight_batches,
+        )
+        return {
+            "total_bytes": total_bytes,
+            "elapsed_s": elapsed,
+            "selected_strategy": "gds",
+            "source_count": source_count,
+            "file_count": len(grouped_sources),
+            "max_inflight_batches": max_inflight_batches,
+        }
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _build_read_requests(
+        self,
+        *,
+        file_path: str,
+        fd: int,
+        file_size: int,
+        pairs: Sequence[tuple[MxFileReadSource, MxDeviceReadTarget]],
+        chunk_size_bytes: int | None,
+    ) -> list[GdsReadRequest]:
+        """Build GDS read requests for one shard file's source/target pairs.
+
+        Validates the GDS-specific invariants (positive byte_count, aligned
+        non-negative file_offset, aligned positive VA, reads within EOF) and
+        splits ranges larger than chunk_size_bytes into aligned chunks.
+        """
+        if chunk_size_bytes is not None:
+            if chunk_size_bytes <= 0:
+                raise ValueError("chunk_size_bytes must be positive when set")
+            if chunk_size_bytes % _GDS_ALIGNMENT != 0:
+                raise ValueError(
+                    f"chunk_size_bytes must be a multiple of {_GDS_ALIGNMENT} when set"
+                )
+
+        requests: list[GdsReadRequest] = []
+        for source, target in pairs:
+            source_size = int(source.byte_count)
+            if source_size <= 0:
+                raise RuntimeError(
+                    "GMS transfer byte_count must be positive for "
+                    f"{source.allocation_id}: {source.byte_count}"
+                )
+
+            file_offset = int(source.file_offset)
+            if file_offset < 0:
+                raise RuntimeError(
+                    "GMS transfer file_offset must be non-negative for "
+                    f"{source.allocation_id}: {source.file_offset}"
+                )
+            if file_offset % _GDS_ALIGNMENT != 0:
+                raise RuntimeError(
+                    f"GMS transfer file_offset must be {_GDS_ALIGNMENT}-byte aligned for "
+                    f"{source.allocation_id}: {source.file_offset}"
+                )
+
+            target_va = int(target.va)
+            if target_va <= 0:
+                raise RuntimeError(
+                    "GMS transfer target VA must be positive for "
+                    f"{source.allocation_id}: {target.va}"
+                )
+            if target_va % _GDS_ALIGNMENT != 0:
+                raise RuntimeError(
+                    f"GMS transfer target VA must be {_GDS_ALIGNMENT}-byte aligned for "
+                    f"{source.allocation_id}: {target.va}"
+                )
+
+            end = file_offset + source_size
+            if end > file_size:
+                raise RuntimeError(
+                    "GDS read beyond EOF for allocation "
+                    f"{source.allocation_id}: path={file_path} end={end} "
+                    f"file_size={file_size}"
+                )
+
+            chunk_limit = source_size
+            if chunk_size_bytes is not None:
+                chunk_limit = int(chunk_size_bytes)
+
+            done = 0
+            while done < source_size:
+                chunk = min(chunk_limit, source_size - done)
+                requests.append(
+                    GdsReadRequest(
+                        fd=fd,
+                        file_offset=file_offset + done,
+                        dst_addr=target_va + done,
+                        byte_count=chunk,
+                        device=int(target.device),
+                        label=(
+                            f"allocation_id={source.allocation_id} "
+                            f"file_path={file_path}"
+                        ),
+                    )
+                )
+                done += chunk
+
+        return requests
+
+    def _wait_and_release(self, transfer: GdsReadTransfer, fd: int) -> None:
+        """Wait for a started transfer, then release it and close its file."""
+        if self._gds_manager is None:
+            raise RuntimeError("GDS manager is not initialized")
+        try:
+            self._gds_manager.wait(transfer)
+        except Exception:
+            try:
+                self._release_transfer(transfer, fd)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "Failed to release GDS transfer after wait failure fd=%d: %s",
+                    fd,
+                    cleanup_exc,
+                )
+            raise
+        self._release_transfer(transfer, fd)
+
+    def _release_transfer(
+        self,
+        transfer: GdsReadTransfer,
+        fd: int,
+    ) -> None:
+        if self._gds_manager is None:
+            raise RuntimeError("GDS manager is not initialized")
+        try:
+            self._gds_manager.release(transfer)
+        finally:
+            os.close(fd)
 
     @staticmethod
     def _resolve_model_path(
@@ -172,6 +437,18 @@ class MxGdsLoader:
         local_dir = snapshot_download(model_path, revision=revision)
         logger.info("Resolved HF model '%s' -> %s", model_path, local_dir)
         return local_dir
+
+    @staticmethod
+    def _open_gds_file(file_path: str) -> int:
+        direct_flag = getattr(os, "O_DIRECT", 0)
+        if direct_flag == 0:
+            raise RuntimeError("O_DIRECT is not available on this platform")
+        try:
+            return os.open(file_path, os.O_RDONLY | direct_flag)
+        except OSError as exc:
+            raise RuntimeError(
+                f"failed to open {file_path!r} for GDS read: {exc}"
+            ) from exc
 
     def _ensure_gds_manager(self) -> None:
         """Lazily create and initialize the GDS transfer manager."""

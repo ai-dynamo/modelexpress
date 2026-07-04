@@ -21,6 +21,8 @@ def test_defaults_when_unset(monkeypatch):
         "MODEL_EXPRESS_URL",
         "MX_SERVER_ADDRESS",
         "MX_GDS_TIMEOUT",
+        "MX_GDS_CHUNK_SIZE_BYTES",
+        "MX_GDS_MAX_INFLIGHT_BATCHES",
         "MX_HEARTBEAT_INTERVAL_SECS",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -36,6 +38,8 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MODEL_EXPRESS_URL is None
     assert envs.MX_SERVER_ADDRESS is None
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
+    assert envs.MX_GDS_CHUNK_SIZE_BYTES is None
+    assert envs.MX_GDS_MAX_INFLIGHT_BATCHES is None
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
 
 
@@ -91,6 +95,10 @@ def test_raw_optional_passthrough(monkeypatch, tmp_path):
     # Raw string; artifact_manifest owns the parse/validation.
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER_CHUNK_SIZE", "12345")
     assert envs.MX_ARTIFACT_TRANSFER_CHUNK_SIZE == "12345"
+    monkeypatch.setenv("MX_GDS_CHUNK_SIZE_BYTES", "4096")
+    monkeypatch.setenv("MX_GDS_MAX_INFLIGHT_BATCHES", "3")
+    assert envs.MX_GDS_CHUNK_SIZE_BYTES == "4096"
+    assert envs.MX_GDS_MAX_INFLIGHT_BATCHES == "3"
     autotune_root = tmp_path / "flashinfer-autotune"
     monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(autotune_root))
     assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR == str(autotune_root)

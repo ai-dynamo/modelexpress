@@ -415,6 +415,11 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METRICS_SCHEME` | `""` | Optional run/scheme label added to every metric, so multiple runs compare on one dashboard. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
+| `MX_GDS_MAX_CHUNK_KB` | `131072` | Maximum NIXL GDS transfer chunk size in KiB. |
+| `MX_GDS_THREADS` | `8` | Number of NIXL `GDS_MT` transfer threads. |
+| `MX_GDS_TIMEOUT` | `120` | GDS transfer timeout in seconds. |
+| `MX_GDS_CHUNK_SIZE_BYTES` | (unset) | Optional positive, GDS-aligned chunk size for splitting GMS snapshot source extents. Unset keeps each source extent as one request. |
+| `MX_GDS_MAX_INFLIGHT_BATCHES` | `max_workers` | Maximum number of concurrently submitted GMS snapshot file batches. Must be at least 1. |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
@@ -440,6 +445,12 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `VLLM_PLUGINS` | - | For vLLM versions older than 0.23.0, set to `modelexpress` to register the `modelexpress` and `mx` loaders. vLLM 0.23.0 and newer recognize the load format natively. |
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### GMS Snapshot Restore
+
+The Python `modelexpress.restore_strategy` package accepts a `GmsRestoreContext` containing snapshot file extents and existing destination GPU virtual addresses. Its fixed policy tries a compatible live P2P source first and then local GDS. The POSIX slot is reserved but is not implemented yet.
+
+P2P restore uses `MODEL_EXPRESS_URL`, then `MX_SERVER_ADDRESS`, then the context's `mx_p2p_metadata_endpoint`. Discovery requires a rank-matched READY `GMS_WEIGHT_SNAPSHOT` source. Runtime accelerator metadata is checked before and after metadata retrieval, and direct worker manifest requests include the selected `worker_id` to reject stale endpoints during rollouts.
 
 ### NIXL Backend Selection
 

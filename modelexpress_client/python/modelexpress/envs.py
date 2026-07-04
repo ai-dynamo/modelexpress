@@ -70,6 +70,8 @@ if TYPE_CHECKING:
     MX_GDS_MAX_CHUNK_KB: Optional[str]
     MX_GDS_THREADS: int
     MX_GDS_TIMEOUT: float
+    MX_GDS_CHUNK_SIZE_BYTES: Optional[str]
+    MX_GDS_MAX_INFLIGHT_BATCHES: Optional[str]
     # Model streamer
     MX_MS_DISTRIBUTED: bool
     # TRT-LLM live transfer
@@ -169,6 +171,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_MAX_CHUNK_KB": lambda: os.environ.get("MX_GDS_MAX_CHUNK_KB"),
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
+    # Raw strings: GmsRestoreContext owns positive/alignment validation and
+    # the max_workers-dependent fallback for these values.
+    "MX_GDS_CHUNK_SIZE_BYTES": lambda: os.environ.get("MX_GDS_CHUNK_SIZE_BYTES"),
+    "MX_GDS_MAX_INFLIGHT_BATCHES": lambda: os.environ.get(
+        "MX_GDS_MAX_INFLIGHT_BATCHES"
+    ),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true"),
     # ── TRT-LLM live transfer ──────────────────────────────────────────────

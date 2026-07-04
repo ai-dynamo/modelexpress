@@ -226,6 +226,25 @@ class TestRawDescriptorMemType:
             backends=["UCX"],
         )
 
+    def test_device_region_registration_uses_vram_segment(self):
+        mgr = self._make_manager()
+        region = TensorDescriptor(
+            name="allocation-0",
+            addr=0x100000,
+            size=8192,
+            device_id=0,
+            dtype="uint8",
+        )
+
+        assert mgr.register_device_regions({region.name: region}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(region.addr, region.size, region.device_id, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+        assert mgr.tensor_descriptors == [region]
+
     def test_receive_transfer_descriptors_use_vram_segment(self, monkeypatch):
         monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
         monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
@@ -269,7 +288,86 @@ class TestRawDescriptorMemType:
                 backends=["UCX"],
             ),
         ]
+        mgr._agent.release_xfer_handle.assert_called_once_with("handle")
 
+    def test_receive_uses_registered_device_region(self, monkeypatch, caplog):
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+        mgr = self._make_manager()
+        local = TensorDescriptor(
+            name="allocation-0",
+            addr=0x2000,
+            size=4096,
+            device_id=0,
+            dtype="uint8",
+        )
+        mgr._device_regions = {local.name: local}
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+            result = mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor(
+                        name=local.name,
+                        addr=0x1000,
+                        size=local.size,
+                        device_id=0,
+                        dtype=local.dtype,
+                    )
+                ],
+                remote_agent_name="source",
+            )
+
+        assert result[:2] == (4096, 1)
+        assert not any(
+            "Tensor name mismatch" in record.getMessage()
+            for record in caplog.records
+        )
+        assert mgr._agent.prep_xfer_dlist.call_args_list == [
+            call(
+                agent_name="source",
+                xfer_list=[(0x1000, 4096, 0)],
+                mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+                backends=["UCX"],
+            ),
+            call(
+                agent_name="",
+                xfer_list=[(0x2000, 4096, 0)],
+                mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+                backends=["UCX"],
+            ),
+        ]
+
+    def test_receive_releases_handle_when_polling_fails(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
+
+        local = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._tensors = {"w": local}
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.side_effect = RuntimeError("poll failed")
+
+        with pytest.raises(RuntimeError, match="poll failed"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor(
+                        name="w",
+                        addr=0x1000,
+                        size=local.numel() * local.element_size(),
+                        device_id=0,
+                        dtype=str(local.dtype),
+                    )
+                ],
+                remote_agent_name="source",
+            )
+
+        mgr._agent.release_xfer_handle.assert_called_once_with("handle")
 
 class TestReceiveFromSourceManifestValidation:
     """receive_from_source must reject size/dtype mismatches before building

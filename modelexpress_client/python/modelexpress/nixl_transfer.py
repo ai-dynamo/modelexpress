@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
@@ -85,6 +85,7 @@ class NixlTransferManager:
     Each vLLM worker creates its own instance of this class to handle:
     - Creating and managing a NIXL agent for the worker's GPU
     - Registering tensors with NIXL for RDMA access
+    - Registering named raw accelerator regions for GMS restore
     - Executing transfers to receive weights from remote sources
     - Registering host DRAM buffers for artifact chunk transfer
 
@@ -112,6 +113,7 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        self._device_regions: dict[str, TensorDescriptor] = {}
 
     @property
     def agent_name(self) -> str:
@@ -211,6 +213,7 @@ class NixlTransferManager:
         ``param.data``; only the dict container is owned by the manager.
         """
         self._tensors = dict(tensors)
+        self._device_regions = {}
         tensor_descriptors = []
         for name, tensor in tensors.items():
             if not tensor.is_contiguous():
@@ -320,6 +323,55 @@ class NixlTransferManager:
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
         )
 
+        return self._metadata
+
+    def register_device_regions(
+        self,
+        regions: Mapping[str, TensorDescriptor],
+    ) -> bytes:
+        """Register named raw accelerator regions for RDMA receive.
+
+        GMS owns destination virtual addresses rather than framework tensor
+        objects. Keeping those regions as named descriptors lets the normal
+        receive path match them by allocation ID while using the same NIXL
+        registration and transfer machinery as tensor-backed loads.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        if not regions:
+            raise ValueError("regions must not be empty")
+
+        descriptors: dict[str, TensorDescriptor] = {}
+        registration = []
+        for name, descriptor in regions.items():
+            if name != descriptor.name:
+                raise ValueError(
+                    "device region key must match descriptor name: "
+                    f"key={name!r} descriptor={descriptor.name!r}"
+                )
+            if descriptor.addr <= 0:
+                raise ValueError(f"device region {name!r} must have a positive address")
+            if descriptor.size <= 0:
+                raise ValueError(f"device region {name!r} must have a positive size")
+            if descriptor.device_id != self._device_id:
+                raise ValueError(
+                    f"device region {name!r} is on device {descriptor.device_id}; "
+                    f"manager device is {self._device_id}"
+                )
+            descriptors[name] = descriptor
+            registration.append(
+                (descriptor.addr, descriptor.size, descriptor.device_id, "")
+            )
+
+        self._agent.register_memory(
+            registration,
+            mem_type=self._accelerator_backend.nixl_mem_type,
+            backends=self._backends,
+        )
+        self._metadata = self._agent.get_agent_metadata()
+        self._device_regions = descriptors
+        self._tensor_descriptors = list(descriptors.values())
+        self._tensors = {}
         return self._metadata
 
     def register_arena(self, arena: VmmArena, tensors: dict[str, torch.Tensor]) -> bytes:
@@ -495,11 +547,10 @@ class NixlTransferManager:
         """
         Receive weights from a remote source via NIXL RDMA.
 
-        Matches source tensors to local tensors by name and issues per-tensor
-        RDMA READs. Both sides may have registered either pools (MX_POOL_REG=1)
-        or individual tensors; the addresses inside source_tensors and the
-        local tensor data_ptrs are what NIXL prep_xfer_dlist resolves against
-        the registered memory metadata.
+        Matches source descriptors to local tensors or named device regions
+        and issues per-region RDMA READs. Both sides may have registered either
+        pools (MX_POOL_REG=1) or individual ranges; descriptor addresses are
+        resolved against the registered memory metadata.
 
         Args:
             source_metadata: NIXL metadata from the source agent (unused if
@@ -531,14 +582,35 @@ class NixlTransferManager:
         else:
             logger.info(f"Using pre-loaded remote agent {remote_agent_name}")
 
-        # Match source tensors to local tensors by name and build raw
-        # (addr, size, device_id) descriptor lists for both sides.
+        # Match source tensors to local tensors or raw device regions by name
+        # and build (addr, size, device_id) descriptor lists for both sides.
         match_start = time.perf_counter()
         remote_descs: list[tuple[int, int, int]] = []
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
 
         for src_tensor in source_tensors:
+            local_region = self._device_regions.get(src_tensor.name)
+            if local_region is not None:
+                if local_region.size != src_tensor.size:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' size mismatch: "
+                        f"source={src_tensor.size} bytes, local={local_region.size} bytes"
+                    )
+                if local_region.dtype != src_tensor.dtype:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' dtype mismatch: "
+                        f"source={src_tensor.dtype!r}, local={local_region.dtype!r}"
+                    )
+                remote_descs.append(
+                    (src_tensor.addr, src_tensor.size, src_tensor.device_id)
+                )
+                local_descs.append(
+                    (local_region.addr, local_region.size, local_region.device_id)
+                )
+                total_bytes += src_tensor.size
+                continue
+
             local_tensor = self._tensors.get(src_tensor.name)
             if local_tensor is None:
                 continue
@@ -572,8 +644,9 @@ class NixlTransferManager:
         # Name-set diff between the source manifest and the locally registered
         # tensors.
         src_names = {s.name for s in source_tensors}
-        local_only = sorted(set(self._tensors) - src_names)
-        source_only = sorted(src_names - set(self._tensors))
+        local_names = set(self._tensors) | set(self._device_regions)
+        local_only = sorted(local_names - src_names)
+        source_only = sorted(src_names - local_names)
         if local_only or source_only:
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
@@ -619,23 +692,25 @@ class NixlTransferManager:
             remote_indices=indices,
             backends=self._backends,
         )
-        self._agent.transfer(handle)
+        try:
+            self._agent.transfer(handle)
 
-        # Wait for completion
-        start_wait = time.perf_counter()
-        while True:
-            if timeout_seconds is not None and time.perf_counter() - start_wait >= timeout_seconds:
-                self._agent.release_xfer_handle(handle)
-                raise TimeoutError("Transfer timed out")
+            start_wait = time.perf_counter()
+            while True:
+                if (
+                    timeout_seconds is not None
+                    and time.perf_counter() - start_wait >= timeout_seconds
+                ):
+                    raise TimeoutError("Transfer timed out")
 
-            status = self._agent.check_xfer_state(handle)
-            if status in ("DONE", "SUCCESS"):
-                self._agent.release_xfer_handle(handle)
-                break
-            if status in ("ERR", "ERROR", "FAIL"):
-                self._agent.release_xfer_handle(handle)
-                raise RuntimeError(f"Transfer failed with status {status}")
-            time.sleep(0.001)
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    break
+                if status in ("ERR", "ERROR", "FAIL"):
+                    raise RuntimeError(f"Transfer failed with status {status}")
+                time.sleep(0.001)
+        finally:
+            self._agent.release_xfer_handle(handle)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
         # GPUDirect RDMA writes bypass torch streams, so we must sync.
@@ -766,14 +841,13 @@ class NixlTransferManager:
     def shutdown(self) -> None:
         """Clean up NIXL resources.
 
-        Rebinds ``_tensor_descriptors`` and ``_tensors`` to fresh empty
-        containers instead of mutating in place. Belt-and-suspenders:
-        even if a future caller bypasses ``register_tensors`` and
-        aliases ``_tensors`` directly, shutdown will not mutate the
-        shared container out from under them.
+        Rebinds owned descriptor containers instead of mutating them in place,
+        so shutdown cannot mutate a caller-owned mapping through an accidental
+        alias.
         """
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []
         self._tensors = {}
+        self._device_regions = {}
         logger.info("NixlTransferManager shutdown complete")
