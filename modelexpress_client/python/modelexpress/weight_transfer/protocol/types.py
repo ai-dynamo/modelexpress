@@ -34,15 +34,42 @@ class SyncMode(str, Enum):
 
 @dataclass
 class TrainerShard:
-    """One trainer rank's ownership of a row range within a parameter tensor.
+    """One trainer rank's ownership of a 2-D tile within a parameter tensor.
+
+    Supports both row-only sharding (FSDP / DP) and 2-D tile sharding
+    (TP × FSDP hybrid, MoE expert parallelism).
 
     Attributes:
         agent_index: Index into TrainerTable.agents (NIXL metadata blob).
         row_start: First dim-0 row this rank owns (inclusive).
         row_end: First dim-0 row this rank does NOT own (exclusive).
-        device_addr: GPU virtual address of row_start in trainer memory.
-        row_bytes: Bytes per row = prod(shape[1:]) * elem_size.
+        device_addr: GPU virtual address of element [row_start, col_start]
+            in trainer memory.  For row-only shards this equals the address
+            of the first owned row.
+        row_bytes: Bytes per **shard row** = (col_end - col_start) * elem_size.
+            For row-only shards this equals prod(shape[1:]) * elem_size.
         device_id: CUDA device index on the trainer node.
+        col_start: First dim-1 column this rank owns (inclusive).
+            Defaults to 0 (full-width shard — backwards compatible).
+        col_end: First dim-1 column this rank does NOT own (exclusive).
+            -1 means "full width" and is resolved by TrainerTensor at
+            query time.  Defaults to -1 (backwards compatible).
+
+    Sharding modes
+    --------------
+    Row-only (FSDP / DP):
+        col_start=0, col_end=-1 (or full width).  Each shard spans all
+        columns for a contiguous range of rows.
+
+    Column-only (row-parallel TP):
+        row_start=0, row_end=full_rows.  Each shard spans all rows for a
+        contiguous range of columns.  Arises in Megatron-LM row-parallel
+        layers (o_proj, down_proj).
+
+    2-D tile (FSDP × TP hybrid):
+        Each rank owns a rectangular tile [row_start:row_end, col_start:col_end].
+        device_addr points to element [row_start, col_start] in shard-local
+        storage, and row_bytes is the width of the tile in bytes.
     """
 
     agent_index: int
@@ -51,6 +78,8 @@ class TrainerShard:
     device_addr: int
     row_bytes: int
     device_id: int
+    col_start: int = 0
+    col_end: int = -1   # -1 = full width; resolved against TrainerTensor.shape
 
     @property
     def num_rows(self) -> int:
@@ -65,7 +94,8 @@ class TrainerShard:
 class TrainerTensor:
     """All shard descriptors for one parameter tensor across trainer ranks.
 
-    Shards are non-overlapping and together cover [0, shape[0]).
+    For row-only sharding shards together cover [0, shape[0]).
+    For 2-D sharding shards tile the full [0, shape[0]) × [0, shape[1]) space.
     """
 
     name: str
@@ -77,9 +107,27 @@ class TrainerTensor:
     def num_rows(self) -> int:
         return self.shape[0] if self.shape else 0
 
+    def _resolved_col_end(self, shard: TrainerShard) -> int:
+        """Return the effective col_end, resolving -1 to the full column count."""
+        if shard.col_end == -1:
+            return self.shape[1] if len(self.shape) > 1 else 1
+        return shard.col_end
+
     def shard_for_row(self, row: int) -> TrainerShard | None:
+        """Return the shard that owns *row* (for row-only sharding)."""
         for s in self.shards:
             if s.row_start <= row < s.row_end:
+                return s
+        return None
+
+    def shard_for_elem(self, row: int, col: int) -> TrainerShard | None:
+        """Return the shard that owns element (row, col) in the full tensor.
+
+        Handles both row-only shards (col_start=0, col_end=-1) and 2-D tiles.
+        """
+        for s in self.shards:
+            col_end = self._resolved_col_end(s)
+            if s.row_start <= row < s.row_end and s.col_start <= col < col_end:
                 return s
         return None
 
@@ -192,3 +240,34 @@ class RdmaDescriptor:
     src_addr: int
     dst_addr: int
     nbytes: int
+
+
+@dataclass
+class M2nDescriptor:
+    """One descriptor in a globally-coordinated M2N transfer.
+
+    Extends RdmaDescriptor with a destination agent index so the trainer side
+    can identify which inference worker each descriptor targets.
+
+    Attributes:
+        src_agent_index: Index into TrainerTable.agents (trainer rank).
+        dst_agent_index: Index identifying the target inference worker.
+        src_addr: Source GPU virtual address on the trainer.
+        dst_addr: Destination GPU virtual address on the inference worker.
+        nbytes: Transfer size in bytes.
+    """
+
+    src_agent_index: int
+    dst_agent_index: int
+    src_addr: int
+    dst_addr: int
+    nbytes: int
+
+    def to_rdma_descriptor(self) -> RdmaDescriptor:
+        """Convert to RdmaDescriptor for use with NixlExecutor (PULL path)."""
+        return RdmaDescriptor(
+            agent_index=self.src_agent_index,
+            src_addr=self.src_addr,
+            dst_addr=self.dst_addr,
+            nbytes=self.nbytes,
+        )

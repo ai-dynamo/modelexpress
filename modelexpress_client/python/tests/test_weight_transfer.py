@@ -289,3 +289,255 @@ class TestMoEAdapter:
         result = dict(adapter.adapt_lazy_weights(lazy_weights.items(), table))
         assert "model.layers.0.mlp.gate.weight" in result
         assert "model.layers.0.mlp.router.gate.weight" not in result
+
+
+# ---------------------------------------------------------------------------
+# planner/router.py — 2-D tile sharding (TP trainer support)
+# ---------------------------------------------------------------------------
+
+
+class TestRouteRegions2D:
+    """Tests for column-parallel and 2-D tile (TP × FSDP) sharding."""
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _region(
+        self,
+        name: str,
+        src_elem_runs: list[int],
+        dst_addr: int = 0xDEAD_0000,
+        dst_elem_runs: list[int] | None = None,
+        element_size: int = 2,
+    ) -> ResolvedRegion:
+        n_elems = sum(src_elem_runs[i + 1] for i in range(0, len(src_elem_runs), 2))
+        if dst_elem_runs is None:
+            dst_elem_runs = [0, n_elems]
+        return ResolvedRegion(
+            tensor_name=name,
+            src_elem_runs=src_elem_runs,
+            dst_addr=dst_addr,
+            dst_elem_runs=dst_elem_runs,
+            element_size=element_size,
+        )
+
+    # ── column-parallel TP (row-parallel weight split along dim-1) ───────────
+
+    def test_column_parallel_tp2_full_tensor(self):
+        """Row-parallel TP=2: o_proj weight [8, 8] split into two [8, 4] column shards.
+
+        The full tensor lives as:
+          Shard 0 (cols 0-3): row_bytes=8 (4 cols × 2 bytes)
+          Shard 1 (cols 4-7): row_bytes=8
+
+        We request all 64 elements (the full tensor).
+        Expected: 32 elements from shard 0, 32 from shard 1 with interleaving
+        at every row boundary.
+        """
+        # 8 rows × 8 cols, TP=2 along columns
+        # Shard 0 owns cols [0:4], shard 1 owns cols [4:8]
+        shards = [
+            TrainerShard(
+                agent_index=0, row_start=0, row_end=8,
+                col_start=0, col_end=4,
+                device_addr=0x1000, row_bytes=8, device_id=0,
+            ),
+            TrainerShard(
+                agent_index=1, row_start=0, row_end=8,
+                col_start=4, col_end=8,
+                device_addr=0x2000, row_bytes=8, device_id=1,
+            ),
+        ]
+        table = TrainerTable(
+            agents=[b"a0", b"a1"],
+            tensors=[TrainerTensor(name="weight", dtype="torch.bfloat16",
+                                   shape=[8, 8], shards=shards)],
+            step=0,
+        )
+        # Request all 64 elements
+        region = self._region("weight", [0, 64])
+        descs = route_regions([region], table)
+        total_bytes = sum(d.nbytes for d in descs)
+        assert total_bytes == 64 * 2
+        # Both shards must be referenced
+        agents = {d.agent_index for d in descs}
+        assert agents == {0, 1}
+        # Contributions must be equal (32 elements each)
+        bytes_per_agent = {a: 0 for a in agents}
+        for d in descs:
+            bytes_per_agent[d.agent_index] += d.nbytes
+        assert bytes_per_agent[0] == 32 * 2
+        assert bytes_per_agent[1] == 32 * 2
+
+    def test_column_parallel_tp2_partial_row(self):
+        """Request only the first row (cols 0-7) of a column-split tensor.
+
+        First row spans both column shards: cols 0-3 in shard 0, cols 4-7 in shard 1.
+        """
+        shards = [
+            TrainerShard(
+                agent_index=0, row_start=0, row_end=4,
+                col_start=0, col_end=4,
+                device_addr=0x1000, row_bytes=8, device_id=0,
+            ),
+            TrainerShard(
+                agent_index=1, row_start=0, row_end=4,
+                col_start=4, col_end=8,
+                device_addr=0x2000, row_bytes=8, device_id=1,
+            ),
+        ]
+        table = TrainerTable(
+            agents=[b"a0", b"a1"],
+            tensors=[TrainerTensor(name="w", dtype="torch.bfloat16",
+                                   shape=[4, 8], shards=shards)],
+            step=0,
+        )
+        # First row: elements 0-7
+        region = self._region("w", [0, 8])
+        descs = route_regions([region], table)
+        assert sum(d.nbytes for d in descs) == 8 * 2
+        assert {d.agent_index for d in descs} == {0, 1}
+        # Each shard contributes exactly 4 elements (one half-row)
+        for d in descs:
+            assert d.nbytes == 4 * 2
+
+    def test_column_parallel_single_shard_hit(self):
+        """When the requested elements land entirely in one column shard."""
+        shards = [
+            TrainerShard(
+                agent_index=0, row_start=0, row_end=4,
+                col_start=0, col_end=4,
+                device_addr=0x0000, row_bytes=8, device_id=0,
+            ),
+            TrainerShard(
+                agent_index=1, row_start=0, row_end=4,
+                col_start=4, col_end=8,
+                device_addr=0x1000, row_bytes=8, device_id=1,
+            ),
+        ]
+        table = TrainerTable(
+            agents=[b"a0", b"a1"],
+            tensors=[TrainerTensor(name="w", dtype="torch.bfloat16",
+                                   shape=[4, 8], shards=shards)],
+            step=0,
+        )
+        # Elements 4-7: second half of row 0 → shard 1 only
+        region = self._region("w", [4, 4])
+        descs = route_regions([region], table)
+        assert len(descs) == 1
+        assert descs[0].agent_index == 1
+        assert descs[0].nbytes == 4 * 2
+        # Local offset in shard 1: col 4 is local col 0 → shard offset 0
+        assert descs[0].src_addr == 0x1000
+
+    # ── 2-D tile sharding (TP × FSDP) ────────────────────────────────────────
+
+    def test_2d_tile_tp2_fsdp2(self):
+        """TP=2 × FSDP=2 tiling of a [8, 8] weight into four [4, 4] tiles.
+
+        Tile layout (trainer_rank → tile):
+          rank 0: rows [0:4], cols [0:4]
+          rank 1: rows [0:4], cols [4:8]
+          rank 2: rows [4:8], cols [0:4]
+          rank 3: rows [4:8], cols [4:8]
+
+        All tiles have device_addr=0 (we only check byte counts and coverage).
+        """
+        shards = [
+            TrainerShard(agent_index=0, row_start=0, row_end=4, col_start=0, col_end=4,
+                         device_addr=0x0000, row_bytes=8, device_id=0),
+            TrainerShard(agent_index=1, row_start=0, row_end=4, col_start=4, col_end=8,
+                         device_addr=0x1000, row_bytes=8, device_id=1),
+            TrainerShard(agent_index=2, row_start=4, row_end=8, col_start=0, col_end=4,
+                         device_addr=0x2000, row_bytes=8, device_id=0),
+            TrainerShard(agent_index=3, row_start=4, row_end=8, col_start=4, col_end=8,
+                         device_addr=0x3000, row_bytes=8, device_id=1),
+        ]
+        table = TrainerTable(
+            agents=[b"a0", b"a1", b"a2", b"a3"],
+            tensors=[TrainerTensor(name="w", dtype="torch.bfloat16",
+                                   shape=[8, 8], shards=shards)],
+            step=0,
+        )
+        # Request all 64 elements
+        region = self._region("w", [0, 64])
+        descs = route_regions([region], table)
+        total_bytes = sum(d.nbytes for d in descs)
+        assert total_bytes == 64 * 2
+        # All four shards must be referenced
+        assert {d.agent_index for d in descs} == {0, 1, 2, 3}
+        # Each tile contributes exactly 16 elements
+        per_agent = {i: 0 for i in range(4)}
+        for d in descs:
+            per_agent[d.agent_index] += d.nbytes // 2
+        for agent, count in per_agent.items():
+            assert count == 16, f"Agent {agent} contributed {count} elements, expected 16"
+
+    def test_2d_tile_local_offset_correctness(self):
+        """Verify that src_addr is correct for a known element in a 2-D tile.
+
+        Tensor [4, 4], split into 2 column shards of [4, 2].
+        Request element (row=1, col=2) = flat offset 6.
+        In shard 1 (cols 2-3): local row=1, local col=0 → local offset=2.
+        src_addr should be shard1.device_addr + 2 * elem_size.
+        """
+        elem_size = 2
+        shard1_addr = 0x5000
+        shards = [
+            TrainerShard(agent_index=0, row_start=0, row_end=4, col_start=0, col_end=2,
+                         device_addr=0x4000, row_bytes=4, device_id=0),
+            TrainerShard(agent_index=1, row_start=0, row_end=4, col_start=2, col_end=4,
+                         device_addr=shard1_addr, row_bytes=4, device_id=1),
+        ]
+        table = TrainerTable(
+            agents=[b"a0", b"a1"],
+            tensors=[TrainerTensor(name="w", dtype="torch.bfloat16",
+                                   shape=[4, 4], shards=shards)],
+            step=0,
+        )
+        # Flat offset 6 = row 1, col 2 → lands in shard 1, local offset 2
+        region = self._region("w", [6, 1], element_size=elem_size)
+        descs = route_regions([region], table)
+        assert len(descs) == 1
+        assert descs[0].agent_index == 1
+        assert descs[0].nbytes == 1 * elem_size
+        assert descs[0].src_addr == shard1_addr + 2 * elem_size
+
+    # ── backward compatibility ────────────────────────────────────────────────
+
+    def test_row_only_shards_unchanged(self):
+        """Existing row-only shards (no col_start/col_end) continue to work."""
+        shards = [
+            TrainerShard(agent_index=0, row_start=0, row_end=4,
+                         device_addr=0x0000, row_bytes=8, device_id=0),
+            TrainerShard(agent_index=1, row_start=4, row_end=8,
+                         device_addr=0x1000, row_bytes=8, device_id=1),
+        ]
+        table = TrainerTable(
+            agents=[b"a0", b"a1"],
+            tensors=[TrainerTensor(name="w", dtype="torch.bfloat16",
+                                   shape=[8, 4], shards=shards)],
+            step=0,
+        )
+        # Cross-shard region: rows 2-5 (spans both shards)
+        region = self._region("w", [8, 16])  # offset=8=row2, count=16=4rows
+        descs = route_regions([region], table)
+        assert sum(d.nbytes for d in descs) == 16 * 2
+        assert {d.agent_index for d in descs} == {0, 1}
+
+    def test_shard_for_elem_on_trainer_tensor(self):
+        """TrainerTensor.shard_for_elem correctly dispatches for 2-D tiles."""
+        shards = [
+            TrainerShard(agent_index=0, row_start=0, row_end=2, col_start=0, col_end=4,
+                         device_addr=0, row_bytes=8, device_id=0),
+            TrainerShard(agent_index=1, row_start=0, row_end=2, col_start=4, col_end=8,
+                         device_addr=0, row_bytes=8, device_id=1),
+        ]
+        from modelexpress.weight_transfer.protocol.types import TrainerTensor as TT
+        tt = TT(name="w", dtype="torch.bfloat16", shape=[2, 8], shards=shards)
+        assert tt.shard_for_elem(0, 0).agent_index == 0
+        assert tt.shard_for_elem(0, 3).agent_index == 0
+        assert tt.shard_for_elem(0, 4).agent_index == 1
+        assert tt.shard_for_elem(0, 7).agent_index == 1
+        assert tt.shard_for_elem(1, 0).agent_index == 0
+        assert tt.shard_for_elem(1, 4).agent_index == 1
+        assert tt.shard_for_elem(1, 8) is None   # out of range

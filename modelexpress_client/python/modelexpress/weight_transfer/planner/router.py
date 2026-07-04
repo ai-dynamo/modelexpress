@@ -15,9 +15,29 @@ both the source (trainer shard) side and the destination (vLLM parameter)
 side.  The router:
 
   1. Iterates source element runs and maps each element offset to the
-     trainer shard that owns it (dim-0 row sharding).
+     trainer shard that owns it.
   2. Computes the GPU byte address inside that shard.
   3. Zips source and destination byte addresses into RdmaDescriptor pairs.
+
+Sharding modes
+--------------
+Row-only (FSDP / DP):
+    TrainerShard.col_start == 0 and col_end == full width (or -1).
+    Element runs are split only at row-shard boundaries.  This is the
+    original behaviour and is fully backwards compatible.
+
+2-D tile (TP × FSDP hybrid, row-parallel TP, column-parallel TP):
+    Each shard owns [row_start:row_end, col_start:col_end] of the full
+    tensor.  Element runs are split at *both* row and column boundaries.
+    device_addr is the address of element [row_start, col_start] in the
+    shard's contiguous storage; row_bytes is the byte width of one shard
+    row (col_end - col_start) * elem_size.
+
+    For column-parallel TP (o_proj, down_proj in Megatron-LM): the full
+    row dimension is owned by multiple shards, each covering a different
+    column range.  A single flattened element run that spans multiple
+    column shards is split at each column boundary and mapped to the
+    appropriate shard with its local row-major offset.
 """
 
 from __future__ import annotations
@@ -27,49 +47,75 @@ import math
 from ..protocol.types import RdmaDescriptor, ResolvedRegion, TrainerShard, TrainerTable
 
 
-def _shard_for_elem(
-    elem_offset: int,
-    elems_per_row: int,
-    shards: list[TrainerShard],
-) -> tuple[TrainerShard, int]:
-    """Return the shard that owns *elem_offset* and the offset within that shard.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    Args:
-        elem_offset: Element offset from the start of the trainer tensor storage.
-        elems_per_row: Number of elements per dim-0 row.
-        shards: Sorted (by row_start) list of TrainerShard for this tensor.
 
-    Returns:
-        (shard, shard_relative_elem_offset)
-    """
-    row = elem_offset // elems_per_row if elems_per_row > 0 else 0
-    col = elem_offset % elems_per_row if elems_per_row > 0 else 0
-    for shard in shards:
-        if shard.row_start <= row < shard.row_end:
-            return shard, (row - shard.row_start) * elems_per_row + col
-    raise ValueError(
-        f"Element at offset {elem_offset} (row {row}) is not covered by any shard"
+def _resolved_col_end(shard: TrainerShard, full_width: int) -> int:
+    """Return the effective col_end for a shard, resolving -1 to full_width."""
+    return full_width if shard.col_end == -1 else shard.col_end
+
+
+def _shard_width(shard: TrainerShard, full_width: int) -> int:
+    return _resolved_col_end(shard, full_width) - shard.col_start
+
+
+def _is_row_only(shards: list[TrainerShard], full_width: int) -> bool:
+    """True when all shards span the full column range (row-only sharding)."""
+    return all(
+        s.col_start == 0 and _resolved_col_end(s, full_width) == full_width
+        for s in shards
     )
 
 
-def _split_run_across_shards(
+def _shard_for_elem_2d(
+    row: int,
+    col: int,
+    shards: list[TrainerShard],
+    full_width: int,
+) -> tuple[TrainerShard, int]:
+    """Return the shard owning (row, col) and the element offset within it.
+
+    For 2-D tile shards, the shard's local storage is row-major over the
+    tile [row_start:row_end, col_start:col_end], so the local offset is:
+        (row - row_start) * shard_width + (col - col_start)
+    """
+    for shard in shards:
+        col_end = _resolved_col_end(shard, full_width)
+        if shard.row_start <= row < shard.row_end and shard.col_start <= col < col_end:
+            w = col_end - shard.col_start
+            local_off = (row - shard.row_start) * w + (col - shard.col_start)
+            return shard, local_off
+    raise ValueError(
+        f"Element at (row={row}, col={col}) is not covered by any shard"
+    )
+
+
+def _split_run_row_only(
     run_offset: int,
     run_count: int,
     elems_per_row: int,
     shards: list[TrainerShard],
 ) -> list[tuple[TrainerShard, int, int]]:
-    """Split an element run at shard boundaries.
-
-    Returns a list of (shard, shard_relative_offset, count) triples.
-    """
+    """Fast path for row-only sharding.  Splits runs at row-shard boundaries."""
     result: list[tuple[TrainerShard, int, int]] = []
     pos = run_offset
     remaining = run_count
 
     while remaining > 0:
-        shard, shard_rel = _shard_for_elem(pos, elems_per_row, shards)
         row = pos // elems_per_row if elems_per_row > 0 else 0
         col = pos % elems_per_row if elems_per_row > 0 else 0
+        shard: TrainerShard | None = None
+        for s in shards:
+            if s.row_start <= row < s.row_end:
+                shard = s
+                break
+        if shard is None:
+            raise ValueError(
+                f"Element at offset {pos} (row {row}) is not covered by any shard"
+            )
+        shard_rel = (row - shard.row_start) * elems_per_row + col
         elems_until_shard_end = (shard.row_end - row) * elems_per_row - col
         count = min(remaining, elems_until_shard_end)
         result.append((shard, shard_rel, count))
@@ -77,6 +123,75 @@ def _split_run_across_shards(
         remaining -= count
 
     return result
+
+
+def _split_run_2d(
+    run_offset: int,
+    run_count: int,
+    full_width: int,
+    shards: list[TrainerShard],
+) -> list[tuple[TrainerShard, int, int]]:
+    """Split an element run at row AND column shard boundaries (2-D tiling).
+
+    For a flat element offset `pos` in the original full tensor (stored
+    row-major with full_width columns):
+        row = pos // full_width
+        col = pos %  full_width
+
+    The run may cross multiple shard boundaries in either dimension.  We
+    advance pos one column-segment at a time, stopping at the earlier of:
+      - the end of the current column shard (col boundary)
+      - the end of the current row shard (row boundary)
+      - the end of the run
+    """
+    result: list[tuple[TrainerShard, int, int]] = []
+    pos = run_offset
+    remaining = run_count
+
+    while remaining > 0:
+        row = pos // full_width if full_width > 0 else 0
+        col = pos % full_width if full_width > 0 else 0
+
+        shard, local_off = _shard_for_elem_2d(row, col, shards, full_width)
+        col_end = _resolved_col_end(shard, full_width)
+        shard_w = col_end - shard.col_start
+
+        # Elements remaining in this row before hitting a column boundary
+        elems_to_col_boundary = col_end - col
+        # Elements remaining in this row before hitting a row boundary
+        # (only relevant if shard spans multiple rows)
+        elems_to_row_boundary = (shard.row_end - row - 1) * shard_w + (col_end - col)
+        # Elements remaining in the original tensor row (full_width - col)
+        elems_to_row_end = full_width - col
+
+        # We must stop at the earlier of: col_end or end-of-original-row
+        # because crossing the original row end means we jump to row+1 col=0,
+        # which may land in a different column shard.
+        elems_this_segment = min(remaining, elems_to_col_boundary, elems_to_row_end)
+
+        result.append((shard, local_off, elems_this_segment))
+        pos += elems_this_segment
+        remaining -= elems_this_segment
+
+    return result
+
+
+def _split_run_across_shards(
+    run_offset: int,
+    run_count: int,
+    full_width: int,
+    shards: list[TrainerShard],
+    row_only: bool,
+) -> list[tuple[TrainerShard, int, int]]:
+    """Dispatch to the appropriate splitting strategy."""
+    if row_only:
+        return _split_run_row_only(run_offset, run_count, full_width, shards)
+    return _split_run_2d(run_offset, run_count, full_width, shards)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def _unpack_runs(flat: list[int]) -> list[tuple[int, int]]:
@@ -158,16 +273,19 @@ def route_regions(
         if trainer_tensor is None:
             continue
 
-        elems_per_row = math.prod(trainer_tensor.shape[1:]) if len(trainer_tensor.shape) > 1 else 1
-        shards = sorted(trainer_tensor.shards, key=lambda s: s.row_start)
+        full_width = math.prod(trainer_tensor.shape[1:]) if len(trainer_tensor.shape) > 1 else 1
+        # Sort shards: primary by row_start, secondary by col_start for 2-D tiles
+        shards = sorted(trainer_tensor.shards, key=lambda s: (s.row_start, s.col_start))
+        row_only = _is_row_only(shards, full_width)
 
         src_runs = _unpack_runs(region.src_elem_runs)
         dst_runs = _unpack_runs(region.dst_elem_runs)
 
-        # Split all src runs across shard boundaries
         src_triples: list[tuple[TrainerShard, int, int]] = []
         for run_off, run_count in src_runs:
-            src_triples.extend(_split_run_across_shards(run_off, run_count, elems_per_row, shards))
+            src_triples.extend(
+                _split_run_across_shards(run_off, run_count, full_width, shards, row_only)
+            )
 
         descs = _zip_src_dst(
             src_triples,
