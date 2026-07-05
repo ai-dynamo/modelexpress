@@ -65,6 +65,12 @@ Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 [project.entry-points."vllm.general_plugins"]
 modelexpress = "modelexpress:register_modelexpress_loaders"
 
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires one or more CUDA GPUs",
+    "slow: long-running test (real model load + transfer)",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["modelexpress*"]
