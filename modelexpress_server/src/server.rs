@@ -11,6 +11,7 @@ use std::sync::Arc;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
+    weight_sync::weight_sync_service_server::WeightSyncServiceServer,
 };
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -21,6 +22,7 @@ use crate::config::ServerConfig;
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
+use crate::weight_sync::WeightSyncServiceImpl;
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
@@ -127,6 +129,7 @@ pub async fn run_server(
     }
 
     let p2p_service = P2pServiceImpl::new(p2p_state.clone());
+    let weight_sync_service = WeightSyncServiceImpl::new();
 
     // Start reaper for stale source detection
     let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -160,6 +163,11 @@ pub async fn run_server(
         .add_service(ModelServiceServer::new(model_service))
         .add_service(
             P2pServiceServer::new(p2p_service)
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE),
+        )
+        .add_service(
+            WeightSyncServiceServer::new(weight_sync_service)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
                 .max_encoding_message_size(MAX_MESSAGE_SIZE),
         )
