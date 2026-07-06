@@ -50,6 +50,29 @@ DEFAULT_NIXL_BACKEND = "UCX"
 NIXL_DRAM_MEM_TYPE = "DRAM"
 
 
+from dataclasses import dataclass
+
+
+@dataclass
+class SlicedTransferRequest:
+    """One per-tensor sub-slice pull request for :meth:`receive_sliced_from_source`.
+
+    Each request says "read ``slice_bytes`` bytes starting at offset
+    ``source_offset_bytes`` from the remote tensor named ``name``, and
+    write them into the local memory backing ``dest_view`` (which must be
+    a contiguous tensor of exactly ``slice_bytes`` bytes — typically a
+    ``narrow`` of a pre-registered destination buffer)."
+
+    The combined transfer is built from a list of these — N requests
+    produces one NIXL transfer with N (remote, local) descriptor pairs.
+    """
+
+    name: str
+    source_offset_bytes: int
+    slice_bytes: int
+    dest_view: torch.Tensor
+
+
 def is_nixl_available() -> bool:
     """Check if NIXL is available."""
     return NIXL_AVAILABLE
@@ -76,6 +99,55 @@ def _pool_reg_enabled() -> bool:
     call time so tests can toggle the env var without re-importing.
     """
     return envs.MX_POOL_REG
+
+
+# NIXL memtype strings for the two locations we support. Kept as module
+# constants so tests and adapters can reference them without hardcoding
+# strings.
+#
+# NIXL's Python API accepts both the native names ("VRAM", "DRAM") and
+# lowercase aliases ("cuda", "cpu"). We use the aliases because the
+# existing GPU path already hard-codes "cuda" and the CPU alias matches
+# ``tensor.device.type == "cpu"`` — keeps the mapping obvious in
+# ``_resolve_local_mem_type``. NIXL's ``prep_xfer_dlist`` requires the
+# exact key (case-sensitive), so lowercase "dram" (which we used
+# initially) fails with KeyError. Verified from
+# ``nixl_cu12._api.nixl_agent.__init__`` on the deployed image
+# (2026-07-02): both "cpu" and "DRAM" map to ``DRAM_SEG``.
+_MEM_TYPE_CUDA = "cuda"
+_MEM_TYPE_DRAM = "cpu"
+
+
+def _resolve_local_mem_type(tensors: dict[str, torch.Tensor]) -> str:
+    """Pick the NIXL memtype for a group of locally-registered tensors.
+
+    All tensors in one NixlTransferManager must share a memtype because
+    ``prep_xfer_dlist`` takes a single ``mem_type`` per side. We enforce
+    uniformity here to fail fast at register time rather than mid-transfer.
+
+    Returns:
+        ``"cuda"`` if every tensor is on a CUDA device.
+        ``"dram"`` if every tensor is on CPU (pinned or otherwise —
+        the caller controls whether it's pinned; NIXL just needs the
+        DRAM memtype for host-side registration).
+
+    Raises:
+        ValueError: on empty input or mixed-device sets.
+    """
+    if not tensors:
+        raise ValueError(
+            "_resolve_local_mem_type: empty tensor set; nothing to register"
+        )
+    devices = {t.device.type for t in tensors.values()}
+    if devices == {"cuda"}:
+        return _MEM_TYPE_CUDA
+    if devices == {"cpu"}:
+        return _MEM_TYPE_DRAM
+    raise ValueError(
+        f"_resolve_local_mem_type: mixed or unsupported device set "
+        f"{sorted(devices)!r}. Register CUDA tensors and CPU tensors "
+        "with separate NixlTransferManager instances."
+    )
 
 
 class NixlTransferManager:
@@ -112,6 +184,17 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        # Memory type of the LOCAL tensors registered via register_tensors.
+        # Set by register_tensors from the first tensor's device; used by
+        # the transfer paths' prep_xfer_dlist local-side call. Defaults
+        # to "cuda" for back-compat with pre-DRAM behavior.
+        #
+        # DRAM support (pinned-CPU staging, Istvan Phase 0.5) lets the
+        # receiver cache buffers on pinned host memory instead of GPU
+        # HBM, freeing ~model-shard-sized HBM at the cost of an async
+        # H2D copy per refit cycle (which the pipeline already needs
+        # to hand tensors to load_weights).
+        self._local_mem_type: str = "cuda"
 
     @property
     def agent_name(self) -> str:
@@ -262,11 +345,24 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
+        # Detect and validate memtype uniformity across the tensor set.
+        # NIXL's prep_xfer_dlist local side needs a single memtype per
+        # transfer, so we don't support mixed device+host registrations
+        # in one manager. Callers wanting both should use two managers
+        # (rare — the current pinned-CPU staging path allocates all
+        # buffers on host).
+        self._local_mem_type = _resolve_local_mem_type(tensors)
+
         tensor_descriptors = self._build_tensor_descriptors(tensors)
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
+        # Pool registration only applies to CUDA tensors — the discovery
+        # path calls cuMemGetAddressRange, which is a device-memory API.
+        # For DRAM registrations we always fall through to per-tensor.
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled():
+        # Pool reg only for on-device (cuda) local buffers on a backend that
+        # supports it. The DRAM/host (Phase 0.5) path uses per-tensor reg.
+        if _pool_reg_enabled() and self._local_mem_type == "cuda":
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(tensor_descriptors)
             else:
@@ -278,7 +374,14 @@ class NixlTransferManager:
                 )
         else:
             allocations = None
-            logger.info("Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration")
+            if _pool_reg_enabled() and self._local_mem_type != "cuda":
+                logger.info(
+                    "Pool registration skipped: local memtype is %r; "
+                    "using per-tensor registration",
+                    self._local_mem_type,
+                )
+            else:
+                logger.info("Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration")
         alloc_discovery_time = time.perf_counter() - alloc_discovery_start
 
         # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
@@ -296,7 +399,15 @@ class NixlTransferManager:
             reg_count = len(allocations)
         else:
             tensor_list = list(tensors.values())
-            self._agent.register_memory(tensor_list, backends=self._backends)
+            # For DRAM (pinned-CPU) tensors we must pass mem_type
+            # explicitly — NIXL's torch-tensor auto-detect keys off
+            # tensor.is_cuda but the explicit path leaves nothing to
+            # infer.
+            self._agent.register_memory(
+                tensor_list,
+                mem_type=self._local_mem_type,
+                backends=self._backends,
+            )
             reg_count = len(tensor_list)
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
@@ -321,6 +432,35 @@ class NixlTransferManager:
         )
 
         return self._metadata
+
+    def rebind_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Point the active local tensor set at ``tensors`` without re-registering.
+
+        Buffer-caching call paths register a set of destination buffers
+        once (e.g. ``_mx_megatron_buffers`` in the Dynamo / NeMo-RL
+        extensions) and reuse them across refit cycles. Meanwhile other
+        code paths — notably ``receive_weights_scratch`` — call
+        :meth:`register_tensors` mid-flight and replace ``self._tensors``
+        with a different (temporary) set. Without a rebind step,
+        subsequent transfers to the cached buffers would use the stale
+        tensor set for name→address resolution and, worse for DRAM,
+        would use the stale ``self._local_mem_type``.
+
+        This method rebuilds the local descriptor list and re-derives
+        ``self._local_mem_type`` from the given tensors. It does NOT call
+        ``register_memory`` — the underlying buffers must already be
+        NIXL-registered (via a prior ``register_tensors``); NIXL keeps
+        those registrations live independently of ``self._tensors``.
+
+        Raises:
+            RuntimeError: if the agent is not initialized.
+            ValueError: from :func:`_resolve_local_mem_type` on empty
+                input or mixed-device sets.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        self._local_mem_type = _resolve_local_mem_type(tensors)
+        self._build_tensor_descriptors(tensors)
 
     def register_arena(self, arena: VmmArena, tensors: dict[str, torch.Tensor]) -> bytes:
         """Register a VmmArena's full bump range as a single NIXL region.
@@ -579,6 +719,10 @@ class NixlTransferManager:
         )
 
         # Prepare transfer descriptors on both sides.
+        # Remote side is always "cuda" — the source is a trainer/other
+        # receiver publishing GPU tensors. Local side depends on where
+        # this receiver allocated its dest buffers (see
+        # self._local_mem_type, set by register_tensors).
         prep_start = time.perf_counter()
         src_prepped = self._agent.prep_xfer_dlist(
             agent_name=remote_agent_name,
@@ -589,7 +733,9 @@ class NixlTransferManager:
         dst_prepped = self._agent.prep_xfer_dlist(
             agent_name="",
             xfer_list=local_descs,
-            mem_type=self._accelerator_backend.nixl_mem_type,
+            # Local side uses our dynamic memtype (cuda for GPU buffers, cpu
+            # for the Phase-0.5 host path); falls back to the backend default.
+            mem_type=self._local_mem_type or self._accelerator_backend.nixl_mem_type,
             backends=self._backends,
         )
         prep_time = time.perf_counter() - prep_start
@@ -625,8 +771,12 @@ class NixlTransferManager:
             time.sleep(0.001)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
-        # GPUDirect RDMA writes bypass torch streams, so we must sync.
-        self._accelerator_backend.synchronize(self._device_id)
+        # GPUDirect RDMA writes bypass torch streams, so we must sync — but
+        # only for on-device buffers. For the DRAM (pinned-CPU / Phase 0.5)
+        # path RDMA hits host memory directly, so no device sync is required
+        # (and skipping lets CPU-only unit tests exercise this path).
+        if self._local_mem_type == "cuda":
+            self._accelerator_backend.synchronize(self._device_id)
 
         duration = time.perf_counter() - start_time
         bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
@@ -639,6 +789,161 @@ class NixlTransferManager:
 
         return total_bytes, matched_tensors, duration
 
+    def receive_sliced_from_source(
+        self,
+        source_metadata: bytes,
+        source_tensors: list[TensorDescriptor],
+        slice_requests: list["SlicedTransferRequest"],
+        timeout_seconds: float | None = None,
+        remote_agent_name: str | None = None,
+    ) -> tuple[int, int, float]:
+        """Pull sub-slices of remote tensors directly into local dest views.
+
+        Unlike :meth:`receive_from_source` (which transfers full tensors into
+        pre-registered named buffers), this primitive transfers per-tensor
+        sub-ranges directly into caller-provided dest views — one combined
+        NIXL transfer with N (source slice, dest view) descriptor pairs.
+
+        This is the v1 "sliced pull" needed for bandwidth-optimal mixed-TP
+        in the target-wider direction: each receiver pulls only the bytes
+        it actually needs from each source rank, instead of pulling the
+        full source manifest and slicing on the host (the v0 fallback in
+        :func:`MxRefitReceiver.receive_weights_scratch`).
+
+        Args:
+            source_metadata: NIXL agent metadata from the remote source.
+            source_tensors: source manifest (one ``TensorDescriptor`` per
+                published tensor, ``addr`` + ``size`` referring to the
+                source's GPU memory). The request's ``name`` field is
+                looked up against this list.
+            slice_requests: each request specifies a single (source tensor,
+                source byte offset, byte count, local dest view) tuple.
+                The local dest view must be **contiguous** in memory — if
+                the caller wants a non-contiguous slice (e.g. a row-parallel
+                axis-1 ``narrow``), it must use the v0 scratch+copy path
+                instead, since RDMA writes need a flat byte range.
+            timeout_seconds: as for :meth:`receive_from_source`.
+            remote_agent_name: as for :meth:`receive_from_source`. When
+                None, ``add_remote_agent(source_metadata)`` is called once
+                up front.
+
+        Returns:
+            ``(total_bytes_transferred, num_slices, elapsed_seconds)``.
+
+        Raises:
+            RuntimeError: if any dest view is non-contiguous, if a request
+                names a tensor not in the source manifest, or if the
+                source offset/size goes past the source tensor's end.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        if not slice_requests:
+            return 0, 0, 0.0
+
+        start_time = time.perf_counter()
+        torch.cuda.set_device(self._device_id)
+
+        if remote_agent_name is None:
+            remote_agent_name = self._agent.add_remote_agent(source_metadata)
+
+        # Index source tensors by name for fast lookup.
+        by_name: dict[str, TensorDescriptor] = {t.name: t for t in source_tensors}
+
+        remote_descs: list[tuple[int, int, int]] = []
+        local_descs: list[tuple[int, int, int]] = []
+        total_bytes = 0
+
+        for req in slice_requests:
+            src = by_name.get(req.name)
+            if src is None:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: tensor {req.name!r} not in "
+                    f"source manifest (have {len(by_name)} tensors)"
+                )
+            if req.source_offset_bytes < 0:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: negative source_offset_bytes "
+                    f"on {req.name!r}"
+                )
+            if req.source_offset_bytes + req.slice_bytes > src.size:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: slice on {req.name!r} runs "
+                    f"past end of source (offset={req.source_offset_bytes} + "
+                    f"size={req.slice_bytes} > src.size={src.size})"
+                )
+            dest = req.dest_view
+            if not dest.is_contiguous():
+                raise RuntimeError(
+                    f"receive_sliced_from_source: dest view for {req.name!r} "
+                    f"is non-contiguous (shape={tuple(dest.shape)}, "
+                    f"stride={dest.stride()}). Use receive_weights_scratch + "
+                    f"host-side copy for non-contiguous slices (e.g. "
+                    f"row-parallel axis-1 narrows)."
+                )
+            dest_bytes = dest.numel() * dest.element_size()
+            if dest_bytes != req.slice_bytes:
+                raise RuntimeError(
+                    f"receive_sliced_from_source: dest view size {dest_bytes} "
+                    f"!= slice_bytes {req.slice_bytes} on {req.name!r}"
+                )
+
+            remote_descs.append(
+                (src.addr + req.source_offset_bytes, req.slice_bytes, src.device_id)
+            )
+            local_descs.append(
+                (dest.data_ptr(), req.slice_bytes, self._device_id)
+            )
+            total_bytes += req.slice_bytes
+
+        # One combined transfer. Same memtype logic as receive_from_source:
+        # remote is always "cuda" (trainer GPU), local uses whatever the
+        # receiver registered under.
+        src_prepped = self._agent.prep_xfer_dlist(
+            agent_name=remote_agent_name,
+            xfer_list=remote_descs,
+            mem_type="cuda",
+            backends=self._backends,
+        )
+        dst_prepped = self._agent.prep_xfer_dlist(
+            agent_name="",
+            xfer_list=local_descs,
+            mem_type=self._local_mem_type,
+            backends=self._backends,
+        )
+        indices = list(range(len(remote_descs)))
+        handle = self._agent.make_prepped_xfer(
+            operation="READ",
+            local_xfer_side=dst_prepped,
+            local_indices=indices,
+            remote_xfer_side=src_prepped,
+            remote_indices=indices,
+            backends=self._backends,
+        )
+        self._agent.transfer(handle)
+
+        start_wait = time.perf_counter()
+        while True:
+            if timeout_seconds is not None and time.perf_counter() - start_wait >= timeout_seconds:
+                self._agent.release_xfer_handle(handle)
+                raise TimeoutError("Sliced transfer timed out")
+            status = self._agent.check_xfer_state(handle)
+            if status in ("DONE", "SUCCESS"):
+                self._agent.release_xfer_handle(handle)
+                break
+            if status in ("ERR", "ERROR", "FAIL"):
+                self._agent.release_xfer_handle(handle)
+                raise RuntimeError(f"Sliced transfer failed with status {status}")
+            time.sleep(0.001)
+
+        if self._local_mem_type == "cuda":
+            torch.cuda.synchronize(self._device_id)
+        duration = time.perf_counter() - start_time
+        bw_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
+        logger.info(
+            f"Sliced transfer complete: {len(slice_requests)} slices, "
+            f"{total_bytes / 1e9:.2f} GB in {duration:.2f}s ({bw_gbps:.1f} Gbps)"
+        )
+        return total_bytes, len(slice_requests), duration
     def register_dram_buffer(self, buffer: torch.Tensor) -> Any:
         """Register one CPU buffer as NIXL DRAM and refresh agent metadata."""
         if self._agent is None:

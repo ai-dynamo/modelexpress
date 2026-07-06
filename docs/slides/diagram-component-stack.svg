@@ -1,0 +1,148 @@
+<svg viewBox="0 0 960 490" xmlns="http://www.w3.org/2000/svg" fill="none">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&amp;family=Space+Mono:wght@400;700&amp;display=swap');
+      text { font-family: 'DM Sans', sans-serif; }
+      .mono { font-family: 'Space Mono', monospace; }
+    </style>
+  </defs>
+
+  <rect width="960" height="490" rx="16" fill="#0f1420"/>
+  <text x="480" y="28" text-anchor="middle" fill="#76b900" font-size="12" font-weight="700" class="mono" letter-spacing="3">COMPONENT ARCHITECTURE  NEW &amp; EXISTING</text>
+
+  <!-- ===== TRAINING COLUMN ===== -->
+  <rect x="10" y="42" width="290" height="438" rx="14" fill="#76b90008" stroke="#76b900" stroke-width="2"/>
+  <text x="155" y="36" text-anchor="middle" fill="#76b900" font-size="10" font-weight="700" class="mono" letter-spacing="2.5">TRAINING WORKERS</text>
+
+  <rect x="28" y="58" width="254" height="42" rx="8" fill="#1e293b"/>
+  <text x="155" y="74" text-anchor="middle" fill="#8892a4" font-size="9" class="mono" letter-spacing="1">RL FRAMEWORK</text>
+  <text x="155" y="90" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">NeMo RL / verl / PRIME-RL</text>
+
+  <rect x="28" y="108" width="254" height="42" rx="8" fill="#1e293b"/>
+  <text x="155" y="124" text-anchor="middle" fill="#8892a4" font-size="9" class="mono" letter-spacing="1">TRAINING BACKEND</text>
+  <text x="155" y="140" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">FSDP2 / Megatron-LM</text>
+
+  <line x1="155" y1="150" x2="155" y2="164" stroke="#4a5568" stroke-width="1.5"/>
+  <polygon points="150,160 155,168 160,160" fill="#4a5568"/>
+
+  <rect x="28" y="170" width="254" height="50" rx="8" fill="#1e293b" stroke="#76b900" stroke-width="1" stroke-dasharray="5,3"/>
+  <text x="155" y="190" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">WeightExtractor</text>
+  <text x="155" y="208" text-anchor="middle" fill="#8892a4" font-size="10">Gather params per bucket (FSDP2 / Megatron)</text>
+  <text x="282" y="168" text-anchor="end" fill="#76b900" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <line x1="155" y1="220" x2="155" y2="234" stroke="#4a5568" stroke-width="1.5"/>
+  <polygon points="150,230 155,238 160,230" fill="#4a5568"/>
+
+  <rect x="28" y="240" width="254" height="60" rx="8" fill="#76b90015" stroke="#76b900" stroke-width="1.5"/>
+  <text x="155" y="260" text-anchor="middle" fill="#76b900" font-size="14" font-weight="700">MxTrainingPublisher</text>
+  <text x="155" y="278" text-anchor="middle" fill="#8892a4" font-size="10">Register tensors with NIXL</text>
+  <text x="155" y="292" text-anchor="middle" fill="#8892a4" font-size="10">Publish metadata + step version (gRPC)</text>
+  <text x="282" y="238" text-anchor="end" fill="#76b900" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <line x1="155" y1="300" x2="155" y2="314" stroke="#4a5568" stroke-width="1.5"/>
+  <polygon points="150,310 155,318 160,310" fill="#4a5568"/>
+
+  <rect x="28" y="320" width="254" height="42" rx="8" fill="#1e293b" stroke="#ff6f00" stroke-width="1" stroke-dasharray="5,3"/>
+  <text x="155" y="336" text-anchor="middle" fill="#ff6f00" font-size="12" font-weight="700">ResharderPlugin</text>
+  <text x="155" y="354" text-anchor="middle" fill="#8892a4" font-size="10">Gather-then-shard / Direct-match / Auto</text>
+  <text x="282" y="318" text-anchor="end" fill="#ff6f00" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <line x1="155" y1="362" x2="155" y2="376" stroke="#4a5568" stroke-width="1.5"/>
+  <polygon points="150,372 155,380 160,372" fill="#4a5568"/>
+
+  <rect x="28" y="382" width="254" height="42" rx="8" fill="#1e293b"/>
+  <text x="155" y="398" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">NIXL Agent (per GPU)</text>
+  <text x="155" y="416" text-anchor="middle" fill="#8892a4" font-size="10">UCX backend � RDMA WRITE capability</text>
+  <text x="282" y="380" text-anchor="end" fill="#8892a4" font-size="8" class="mono">EXISTING</text>
+
+  <!-- ===== MX SERVER COLUMN ===== -->
+  <rect x="340" y="96" width="280" height="310" rx="14" fill="#00bcd408" stroke="#00bcd4" stroke-width="2"/>
+  <text x="480" y="88" text-anchor="middle" fill="#00bcd4" font-size="10" font-weight="700" class="mono" letter-spacing="2.5">MODELEXPRESS SERVER (RUST)</text>
+
+  <rect x="358" y="116" width="244" height="36" rx="7" fill="#1e293b"/>
+  <text x="480" y="140" text-anchor="middle" fill="#e8eaf0" font-size="12" font-weight="600">gRPC P2P Service</text>
+  <text x="602" y="114" text-anchor="end" fill="#8892a4" font-size="8" class="mono">EXISTING</text>
+
+  <rect x="358" y="162" width="244" height="36" rx="7" fill="#1e293b"/>
+  <text x="480" y="186" text-anchor="middle" fill="#e8eaf0" font-size="12" font-weight="600">Redis / K8s CRD Metadata</text>
+  <text x="602" y="160" text-anchor="end" fill="#8892a4" font-size="8" class="mono">EXISTING</text>
+
+  <rect x="358" y="208" width="244" height="36" rx="7" fill="#00bcd412" stroke="#00bcd4" stroke-width="1" stroke-dasharray="5,3"/>
+  <text x="480" y="232" text-anchor="middle" fill="#00bcd4" font-size="12" font-weight="700">Refit Version Tracking</text>
+  <text x="602" y="206" text-anchor="end" fill="#00bcd4" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <rect x="358" y="254" width="244" height="36" rx="7" fill="#00bcd412" stroke="#00bcd4" stroke-width="1" stroke-dasharray="5,3"/>
+  <text x="480" y="278" text-anchor="middle" fill="#00bcd4" font-size="12" font-weight="700">Bucket Coordination</text>
+  <text x="602" y="252" text-anchor="end" fill="#00bcd4" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <rect x="358" y="300" width="244" height="36" rx="7" fill="#1e293b"/>
+  <text x="480" y="324" text-anchor="middle" fill="#e8eaf0" font-size="12" font-weight="600">Heartbeat / Stale Reaper</text>
+  <text x="602" y="298" text-anchor="end" fill="#8892a4" font-size="8" class="mono">EXISTING</text>
+
+  <rect x="358" y="346" width="244" height="36" rx="7" fill="#1e293b" stroke="#ff6f00" stroke-width="1"/>
+  <text x="480" y="370" text-anchor="middle" fill="#ff6f00" font-size="12" font-weight="700">p2p.proto (extended)</text>
+  <text x="602" y="344" text-anchor="end" fill="#ff6f00" font-size="8" class="mono" font-weight="700">MODIFIED</text>
+
+  <!-- ===== INFERENCE COLUMN ===== -->
+  <rect x="660" y="42" width="290" height="438" rx="14" fill="#9c27b008" stroke="#9c27b0" stroke-width="2"/>
+  <text x="805" y="36" text-anchor="middle" fill="#9c27b0" font-size="10" font-weight="700" class="mono" letter-spacing="2.5">INFERENCE WORKERS</text>
+
+  <rect x="678" y="58" width="254" height="42" rx="8" fill="#1e293b"/>
+  <text x="805" y="74" text-anchor="middle" fill="#8892a4" font-size="9" class="mono" letter-spacing="1">INFERENCE ENGINE</text>
+  <text x="805" y="90" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">vLLM / SGLang</text>
+
+  <rect x="678" y="108" width="254" height="60" rx="8" fill="#9c27b015" stroke="#9c27b0" stroke-width="1.5"/>
+  <text x="805" y="128" text-anchor="middle" fill="#9c27b0" font-size="14" font-weight="700">MxRefitReceiver</text>
+  <text x="805" y="146" text-anchor="middle" fill="#8892a4" font-size="10">Poll for new weight versions</text>
+  <text x="805" y="160" text-anchor="middle" fill="#8892a4" font-size="10">Coordinate with MX Server</text>
+  <text x="932" y="106" text-anchor="end" fill="#9c27b0" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <rect x="678" y="176" width="254" height="42" rx="8" fill="#1e293b"/>
+  <text x="805" y="192" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">NIXL Agent (per GPU)</text>
+  <text x="805" y="210" text-anchor="middle" fill="#8892a4" font-size="10">UCX � Pre-registered receive buffers</text>
+  <text x="932" y="174" text-anchor="end" fill="#8892a4" font-size="8" class="mono">EXISTING</text>
+
+  <rect x="678" y="226" width="254" height="42" rx="8" fill="#1e293b"/>
+  <text x="805" y="242" text-anchor="middle" fill="#e8eaf0" font-size="13" font-weight="600">Apply Weights In-Place</text>
+  <text x="805" y="260" text-anchor="middle" fill="#8892a4" font-size="10">FP8 quantization on receiver side</text>
+
+  <rect x="678" y="276" width="254" height="42" rx="8" fill="#1e293b" stroke="#ff6f00" stroke-width="1" stroke-dasharray="5,3"/>
+  <text x="805" y="292" text-anchor="middle" fill="#ff6f00" font-size="12" font-weight="700">SyncPolicyController</text>
+  <text x="805" y="310" text-anchor="middle" fill="#8892a4" font-size="10">Sync � One-step-off � Fully async</text>
+  <text x="932" y="274" text-anchor="end" fill="#ff6f00" font-size="8" class="mono" font-weight="700">NEW</text>
+
+  <rect x="678" y="326" width="254" height="36" rx="8" fill="#1e293b"/>
+  <text x="805" y="350" text-anchor="middle" fill="#e8eaf0" font-size="12" font-weight="600">Resume Rollout Generation</text>
+
+  <!-- ===== ARROWS ===== -->
+  <!-- gRPC: Training -> Server -->
+  <line x1="282" y1="270" x2="340" y2="230" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <polygon points="336,227 344,230 338,235" fill="#00bcd4"/>
+  <text x="304" y="244" text-anchor="middle" fill="#00bcd4" font-size="8" class="mono">gRPC</text>
+
+  <!-- gRPC: Server -> Inference -->
+  <line x1="620" y1="230" x2="678" y2="138" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <polygon points="674,135 682,138 676,143" fill="#00bcd4"/>
+  <text x="656" y="178" text-anchor="middle" fill="#00bcd4" font-size="8" class="mono">gRPC</text>
+
+  <!-- RDMA WRITE: Training NIXL -> Inference NIXL -->
+  <rect x="320" y="428" width="320" height="30" rx="6" fill="#76b90012" stroke="#76b900" stroke-width="2"/>
+  <line x1="282" y1="403" x2="320" y2="443" stroke="#76b900" stroke-width="3"/>
+  <line x1="640" y1="443" x2="678" y2="197" stroke="#76b900" stroke-width="3"/>
+  <polygon points="674,193 682,197 676,203" fill="#76b900"/>
+  <text x="480" y="448" text-anchor="middle" fill="#76b900" font-size="12" font-weight="700" class="mono">RDMA WRITE (per bucket)</text>
+
+  <!-- Legend -->
+  <rect x="678" y="380" width="254" height="90" rx="8" fill="#0a0e17" stroke="#1e293b" stroke-width="1"/>
+  <text x="805" y="398" text-anchor="middle" fill="#4a5568" font-size="9" class="mono" letter-spacing="1.5">LEGEND</text>
+  <rect x="692" y="410" width="10" height="10" rx="2" fill="#76b900"/>
+  <text x="710" y="419" fill="#76b900" font-size="10" font-weight="600">New component</text>
+  <rect x="810" y="410" width="10" height="10" rx="2" fill="#ff6f00"/>
+  <text x="828" y="419" fill="#ff6f00" font-size="10" font-weight="600">Modified</text>
+  <rect x="692" y="428" width="10" height="10" rx="2" fill="#1e293b" stroke="#8892a4" stroke-width="1"/>
+  <text x="710" y="437" fill="#8892a4" font-size="10">Existing (NIXL, gRPC, Redis)</text>
+  <line x1="692" y1="452" x2="722" y2="452" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="730" y="456" fill="#00bcd4" font-size="10">Metadata (gRPC)</text>
+  <line x1="810" y1="452" x2="840" y2="452" stroke="#76b900" stroke-width="3"/>
+  <text x="848" y="456" fill="#76b900" font-size="10" font-weight="600">Data plane</text>
+</svg>

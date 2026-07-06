@@ -74,12 +74,56 @@ from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.publisher import PublisherThread  # noqa: F401
+from .nemo_rl_v2 import (  # noqa: F401
+    MxV2RefitReceiver,
+    MxV2TrainingPublisher,
+    TrainerWorldLayout,
+)
+from .training_publisher import MxTrainingPublisher  # noqa: F401
+from .refit_receiver import MxRefitReceiver  # noqa: F401
+
+# Rank-to-rank RL substrate (from the #349 lineage). These modules are
+# pure-Python dataclasses + planners (torch is lazy-imported inside method
+# bodies), safe to re-export eagerly.
+from .shape_descriptors import NonExpertShardSpec  # noqa: F401
+from .rl_slice_descriptors import (  # noqa: F401
+    CoveragePlan,
+    SegmentPlan,
+    SliceOwnership,
+    SliceRequest,
+)
+from .rl_reshard_planner import plan_coverage  # noqa: F401
+from .rl_expert_layout import (  # noqa: F401
+    ExpertPlacement,
+    compute_local_expert_ids,
+    validate_placement_partition,
+)
+from .rank_local_publisher import (  # noqa: F401
+    PlacementDescriptor,
+    RankLocalPublisher,
+)
 
 __all__ = [
+    "CoveragePlan",
+    "ExpertPlacement",
     "GdsTransferManager",
     "MxClient",
     "MxGdsLoader",
+    "MxRefitReceiver",
+    "MxTrainingPublisher",
+    "MxV2RefitReceiver",
+    "MxV2TrainingPublisher",
+    "NonExpertShardSpec",
+    "PlacementDescriptor",
     "PublisherThread",
+    "RankLocalPublisher",
+    "SegmentPlan",
+    "SliceOwnership",
+    "SliceRequest",
+    "TrainerWorldLayout",
+    "compute_local_expert_ids",
     "configure_vllm_logging",
+    "plan_coverage",
     "register_modelexpress_loaders",
+    "validate_placement_partition",
 ]
