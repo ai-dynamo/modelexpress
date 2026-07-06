@@ -12,6 +12,7 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.engines.vllm import artifacts
+from modelexpress.metadata.artifact_transfer import ArtifactCacheRoot
 
 
 def test_install_vllm_cache_artifacts_is_default_off(monkeypatch):
@@ -291,6 +292,10 @@ def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tm
     monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tilelang-cache"))
     monkeypatch.setenv("CUTE_DSL_CACHE_DIR", str(tmp_path / "cute-dsl-cache"))
     monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "flashinfer"))
+    monkeypatch.setenv(
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
+        str(tmp_path / "flashinfer-autotune-cache"),
+    )
     monkeypatch.setenv("MX_ARTIFACT_BUNDLE_ROOT", str(tmp_path / "bundles"))
     monkeypatch.setattr(artifacts, "_vllm_version", lambda: "0.17.1")
     monkeypatch.setattr(artifacts, "_triton_key", lambda: "triton-key")
@@ -308,7 +313,12 @@ def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tm
     transfers = artifacts._vllm_artifact_transfers(ctx)
 
     assert [
-        (transfer.name, identity.mx_source_type, transfer.source_root, transfer.bundle_root)
+        (
+            transfer.name,
+            identity.mx_source_type,
+            transfer.roots[0].source_root,
+            transfer.bundle_root,
+        )
         for transfer, identity in transfers
     ] == [
         (
@@ -348,6 +358,11 @@ def test_vllm_artifact_transfers_use_distinct_cache_source_types(monkeypatch, tm
             Path(tmp_path / "bundles" / "rank-1" / "flashinfer_cache"),
         ),
     ]
+    flashinfer_transfer = transfers[-1][0]
+    assert tuple(root.source_root for root in flashinfer_transfer.roots) == (
+        Path(tmp_path / "flashinfer" / ".cache" / "flashinfer"),
+        Path(tmp_path / "flashinfer-autotune-cache"),
+    )
 
 
 def test_deep_gemm_cache_root_honors_dg_jit_cache_dir(monkeypatch, tmp_path):
@@ -389,6 +404,23 @@ def test_flashinfer_cache_root_uses_workspace_base(monkeypatch, tmp_path):
     )
 
 
+def test_flashinfer_autotune_cache_root_uses_override(monkeypatch, tmp_path):
+    configured = tmp_path / "configured-autotune-cache"
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(configured))
+
+    assert artifacts._flashinfer_autotune_cache_root() == configured
+
+
+def test_flashinfer_autotune_cache_root_uses_vllm_cache_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", raising=False)
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path / "vllm-cache"))
+
+    assert artifacts._flashinfer_autotune_cache_root() == (
+        tmp_path / "vllm-cache" / "flashinfer_autotune_cache"
+    )
+    assert artifacts.envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR is None
+
+
 def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
     source_root = tmp_path / "cache"
     source_root.mkdir()
@@ -396,7 +428,13 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
     transfer = SimpleNamespace(
         name="torch_compile_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-        source_root=source_root,
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=source_root,
+                target_root=source_root,
+            ),
+        ),
         prepare_source=MagicMock(
             return_value=SimpleNamespace(
                 artifact_id="artifact-id",
@@ -414,6 +452,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
         global_rank=0,
         device_id=0,
         worker_rank=1,
+        node_rank=2,
         worker_id="worker-a",
         mx_client=object(),
         nixl_manager=object(),
@@ -432,6 +471,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
 
     publish.assert_called_once()
     assert publish.call_args.kwargs["worker_id"] == "worker-a"
+    assert publish.call_args.kwargs["node_rank"] == 2
     assert publish.call_args.kwargs["worker_grpc_server"] is worker_server
     artifacts._published_sources.pop(
         (ctx.device_id, transfer.mx_source_type),
@@ -445,8 +485,13 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
     transfer = SimpleNamespace(
         name="deep_gemm_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
-        source_root=target_root,
-        target_root=target_root,
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=target_root,
+                target_root=target_root,
+            ),
+        ),
         discover_and_transfer=MagicMock(
             return_value=p2p_pb2.GetArtifactManifestHeaderResponse(
                 artifact_id="artifact-id",
@@ -459,7 +504,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
         model_name="test/model",
     )
-    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object())
+    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object(), node_rank=2)
 
     first = artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
     second = artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
@@ -471,6 +516,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         identity,
         ctx.nixl_manager,
         worker_rank=None,
+        node_rank=2,
     )
     transfer.install.assert_called_once_with(first)
 
@@ -483,8 +529,13 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
     transfer = SimpleNamespace(
         name="triton_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
-        source_root=tmp_path / "cache",
-        target_root=tmp_path / "cache",
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=tmp_path / "cache",
+                target_root=tmp_path / "cache",
+            ),
+        ),
         discover_and_transfer=MagicMock(side_effect=RuntimeError("transfer failed")),
         install=MagicMock(),
     )
@@ -492,7 +543,7 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
         model_name="test/model",
     )
-    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object())
+    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object(), node_rank=2)
 
     with pytest.raises(RuntimeError, match="transfer failed"):
         artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
@@ -505,16 +556,28 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
 def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
     monkeypatch,
     tmp_path,
+    caplog,
 ):
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
     monkeypatch.setenv("MX_P2P_METADATA", "1")
     monkeypatch.setattr(artifacts.tempfile, "gettempdir", lambda: str(tmp_path))
     source_root = tmp_path / "torch-cache"
+    autotune_root = tmp_path / "autotune-cache"
     transfer = SimpleNamespace(
         name="torch_compile_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-        source_root=source_root,
-        target_root=source_root,
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=source_root,
+                target_root=source_root,
+            ),
+            ArtifactCacheRoot(
+                name="autotune",
+                source_root=autotune_root,
+                target_root=autotune_root,
+            ),
+        ),
     )
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
@@ -550,7 +613,11 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         "modelexpress.engines.vllm.artifacts.PublisherThread",
         return_value=publisher,
     ) as publisher_cls:
-        artifacts.schedule_vllm_cache_artifact_publish(ctx)
+        with caplog.at_level(
+            logging.INFO,
+            logger="modelexpress.engines.vllm.artifacts",
+        ):
+            artifacts.schedule_vllm_cache_artifact_publish(ctx)
         artifacts.schedule_vllm_cache_artifact_publish(other_ctx)
         publisher_cls.assert_called_once()
         kwargs = publisher_cls.call_args.kwargs
@@ -567,6 +634,8 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         kwargs["cleanup_fn"]()
         artifacts.schedule_vllm_cache_artifact_publish(other_ctx)
         assert publisher_cls.call_count == 2
+
+    assert f"roots=['{source_root}', '{autotune_root}']" in caplog.text
     artifacts._scheduled_publishers.clear()
 
 
@@ -575,15 +644,23 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
     tmp_path,
 ):
     cache_root = tmp_path / "torch_compile_cache"
-    ready = artifacts._vllm_artifact_ready_fn(cache_root)
-    health_ready = False
+    autotune_root = tmp_path / "autotune-cache"
+    roots = (
+        ArtifactCacheRoot("primary", cache_root, cache_root),
+        ArtifactCacheRoot("autotune", autotune_root, autotune_root, optional=True),
+    )
+    ready = artifacts._vllm_artifact_ready_fn(roots)
+    health_check = MagicMock(side_effect=[False, True])
     now = 100.0
-    monkeypatch.setattr(artifacts, "_vllm_health_ready", lambda: health_ready)
+    monkeypatch.setattr(artifacts, "_vllm_health_ready", health_check)
     monkeypatch.setattr(artifacts.time, "monotonic", lambda: now)
+
+    autotune_root.mkdir()
+    autotune_file = autotune_root / "configs.json"
+    autotune_file.write_text("{}")
 
     assert ready() is False
 
-    health_ready = True
     assert ready() is False
 
     cache_root.mkdir()
@@ -597,8 +674,15 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
     now += 1
     assert ready() is True
 
+    autotune_file.write_text('{"updated": true}')
+    assert ready() is False
+
+    now += artifacts._CACHE_SETTLE_SECS
+    assert ready() is True
+
     cache_file.write_bytes(b"compiled-again")
     assert ready() is False
+    assert health_check.call_count == 2
 
 
 def test_vllm_health_url_defaults_to_localhost(monkeypatch):

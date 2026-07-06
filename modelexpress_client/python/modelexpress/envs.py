@@ -85,6 +85,13 @@ if TYPE_CHECKING:
     MX_ARTIFACT_READY_URL: str
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
+    # P2P source selection
+    MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Opt-in metrics collector
+    MX_METRICS_ENABLED: bool
+    MX_METRICS_PORT: Optional[str]
+    MX_METRICS_PUSHGATEWAY: Optional[str]
+    MX_METRICS_SCHEME: str
     # Third-party JIT/compile cache locations read for artifact transfer
     TRITON_CACHE_DIR: Optional[str]
     DG_JIT_CACHE_DIR: Optional[str]
@@ -92,6 +99,7 @@ if TYPE_CHECKING:
     TILELANG_CACHE_DIR: Optional[str]
     CUTE_DSL_CACHE_DIR: Optional[str]
     FLASHINFER_WORKSPACE_BASE: Optional[str]
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: Optional[str]
     VLLM_CACHE_ROOT: Optional[str]
     # Other third-party / system
     VLLM_ATTENTION_BACKEND: str
@@ -144,7 +152,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
-    "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", ""),
+    "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
@@ -181,6 +189,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Raw string: artifact_manifest.artifact_transfer_chunk_size() owns the
     # int parse plus its non-positive/max-bound validation and default param.
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
+    # ── P2P source selection ───────────────────────────────────────────────
+    # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
+    "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    # ── Opt-in metrics collector ───────────────────────────────────────────
+    "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
+    in _TRUTHY,
+    "MX_METRICS_PORT": lambda: os.environ.get("MX_METRICS_PORT"),
+    "MX_METRICS_PUSHGATEWAY": lambda: os.environ.get("MX_METRICS_PUSHGATEWAY"),
+    "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
     # ── Third-party JIT/compile cache locations (raw; caller builds path) ──
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
     "DG_JIT_CACHE_DIR": lambda: os.environ.get("DG_JIT_CACHE_DIR"),
@@ -188,6 +205,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TILELANG_CACHE_DIR": lambda: os.environ.get("TILELANG_CACHE_DIR"),
     "CUTE_DSL_CACHE_DIR": lambda: os.environ.get("CUTE_DSL_CACHE_DIR"),
     "FLASHINFER_WORKSPACE_BASE": lambda: os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+    "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.environ.get(
+        "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
+    ),
     "VLLM_CACHE_ROOT": lambda: os.environ.get("VLLM_CACHE_ROOT"),
     # ── Other third-party / system ─────────────────────────────────────────
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
