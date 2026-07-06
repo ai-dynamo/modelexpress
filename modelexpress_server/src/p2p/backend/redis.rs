@@ -540,11 +540,11 @@ impl MetadataBackend for RedisBackend {
                     }
                 }
 
-                let (status, updated_at) = fields
+                let (status, updated_at, accelerator) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| (j.status, j.updated_at))
-                    .unwrap_or((0, 0));
+                    .map(|j| (j.status, j.updated_at, j.accelerator))
+                    .unwrap_or((0, 0, String::new()));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -553,6 +553,7 @@ impl MetadataBackend for RedisBackend {
                     worker_rank,
                     status,
                     updated_at,
+                    accelerator,
                 });
             }
         }

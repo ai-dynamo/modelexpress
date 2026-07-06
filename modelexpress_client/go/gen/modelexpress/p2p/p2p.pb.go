@@ -2055,7 +2055,12 @@ type SourceInstanceRef struct {
 	ModelName string `protobuf:"bytes,3,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// Global rank of this worker within the instance.
 	// Clients filter on this field to find a peer with a matching rank.
-	WorkerRank    uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	WorkerRank uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// Lets clients drop incompatible sources before GetMetadata and before
+	// the retry-cap slice. Empty means unknown (treated as compatible for
+	// rolling upgrades and sources that predate this field).
+	Accelerator   string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2116,6 +2121,13 @@ func (x *SourceInstanceRef) GetWorkerRank() uint32 {
 		return x.WorkerRank
 	}
 	return 0
+}
+
+func (x *SourceInstanceRef) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
 }
 
 type ListSourcesRequest struct {
@@ -2652,7 +2664,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\x92\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xb4\x01\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2660,7 +2672,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
-	"workerRank\"\xb0\x01\n" +
+	"workerRank\x12 \n" +
+	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\"\xb0\x01\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +

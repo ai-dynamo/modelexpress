@@ -521,6 +521,12 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Lets clients drop incompatible sources before GetMetadata and before
+  // the retry-cap slice. Empty means unknown (treated as compatible for
+  // rolling upgrades and sources that predate this field).
+  string accelerator = 5;
 }
 
 message ListSourcesRequest {

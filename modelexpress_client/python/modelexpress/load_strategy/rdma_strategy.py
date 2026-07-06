@@ -188,9 +188,20 @@ class RdmaStrategy(LoadStrategy):
                 logger.debug(f"[Worker {ctx.global_rank}] No ready source instances found")
                 return []
 
-            candidates = [
+            rank_matched = [
                 inst for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
+            ]
+
+            # Drop accelerator-incompatible sources before ordering and the
+            # retry-cap slice, so the selector only ranks eligible peers and a
+            # compatible source can never be pushed past MAX_SOURCE_RETRIES by
+            # incompatible ones. The post-GetMetadata check in load() stays as
+            # defense-in-depth (empty refs, stale records, metadata drift).
+            target_accelerator = ctx.accelerator_backend.name
+            candidates = [
+                inst for inst in rank_matched
+                if self._accelerators_compatible(target_accelerator, inst.accelerator)
             ]
 
             selector = get_configured_selector()
@@ -202,7 +213,10 @@ class RdmaStrategy(LoadStrategy):
                 selector.name, "listed", len(list_resp.instances)
             )
             selection_metrics.observe_candidates(
-                selector.name, "rank_matched", len(ordered)
+                selector.name, "rank_matched", len(rank_matched)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "accelerator_matched", len(candidates)
             )
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
@@ -210,7 +224,8 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] Source selection: "
                 f"source_selector={selector.name} "
                 f"source_candidates_total={len(list_resp.instances)} "
-                f"source_candidates_rank_matched={len(ordered)}"
+                f"source_candidates_rank_matched={len(rank_matched)} "
+                f"source_candidates_accelerator_matched={len(candidates)}"
             )
             if ordered:
                 logger.debug(
@@ -226,21 +241,34 @@ class RdmaStrategy(LoadStrategy):
             return []
 
     @staticmethod
+    def _accelerators_compatible(target: str, source: str) -> bool:
+        """Return whether ``target`` and ``source`` accelerator families match.
+
+        Empty values mean unknown and are accepted for backward compatibility
+        with workers published before accelerator metadata existed. This is the
+        single compatibility rule shared by the pre-slice candidate filter and
+        the post-GetMetadata defense-in-depth check.
+        """
+        if not target or not source:
+            return True
+        return target == source
+
     def _accelerator_compatible(
+        self,
         ctx: LoadContext,
         source_worker: p2p_pb2.WorkerMetadata,
         worker_id: str,
     ) -> bool:
         """Return whether source and target accelerator metadata are compatible.
 
-        Empty values mean unknown and are accepted for backward compatibility
-        with workers published before accelerator metadata existed.
+        Defense-in-depth re-check on the authoritative ``WorkerMetadata`` after
+        GetMetadata: the pre-slice filter in ``_find_source_instances`` uses the
+        lightweight ``SourceInstanceRef.accelerator``, which may be empty on old
+        servers or drift between list and fetch.
         """
         target_accelerator = ctx.accelerator_backend.name
         source_accelerator = source_worker.accelerator
-        if not target_accelerator or not source_accelerator:
-            return True
-        if target_accelerator == source_accelerator:
+        if self._accelerators_compatible(target_accelerator, source_accelerator):
             return True
 
         logger.info(

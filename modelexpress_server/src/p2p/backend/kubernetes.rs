@@ -539,6 +539,13 @@ impl MetadataBackend for KubernetesBackend {
                 })
                 .unwrap_or((0, 0));
 
+            let accelerator = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.accelerator.clone())
+                .unwrap_or_default();
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
@@ -546,6 +553,7 @@ impl MetadataBackend for KubernetesBackend {
                 worker_rank,
                 status,
                 updated_at,
+                accelerator,
             });
         }
 

@@ -51,6 +51,9 @@ pub struct SourceInstanceInfo {
     pub status: i32,
     /// Timestamp of last status update (unix millis).
     pub updated_at: i64,
+    /// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+    /// Empty when unknown (records that predate the field).
+    pub accelerator: String,
 }
 
 /// Backend-specific metadata for a worker

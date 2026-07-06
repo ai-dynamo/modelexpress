@@ -174,6 +174,7 @@ impl P2pService for P2pServiceImpl {
                 worker_id: info.worker_id,
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
+                accelerator: info.accelerator,
             })
             .collect();
 
@@ -645,6 +646,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    accelerator: "cuda".to_string(),
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -653,6 +655,7 @@ mod tests {
                     worker_rank: 1,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    accelerator: "cuda".to_string(),
                 },
             ])
         });
@@ -692,6 +695,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    accelerator: "cuda".to_string(),
                 }])
             });
 

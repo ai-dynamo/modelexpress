@@ -120,7 +120,10 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     .ranks
                     .get(&entry.index_rank)
                     .or_else(|| entry.ranks.values().next());
-                let (status, updated_at) = reported.map_or((0, 0), |r| (r.status, r.updated_at));
+                let (status, updated_at, accelerator) = reported.map_or_else(
+                    || (0, 0, String::new()),
+                    |r| (r.status, r.updated_at, r.accelerator.clone()),
+                );
                 result.push(SourceInstanceInfo {
                     source_id: sid.clone(),
                     worker_id: worker_id.clone(),
@@ -128,6 +131,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     worker_rank: entry.index_rank,
                     status,
                     updated_at,
+                    accelerator,
                 });
             }
         }

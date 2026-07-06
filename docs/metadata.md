@@ -57,9 +57,9 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 
 ### Runtime Accelerator Compatibility
 
-`WorkerMetadata.accelerator` records the source worker's runtime accelerator family, such as `cuda`, from the active `AcceleratorBackend.name`. This field is used only for source compatibility filtering. It is not folded into `SourceIdentity`, does not affect `mx_source_id`, and does not change the Rust/Python pinned source-ID cross-check hashes.
+The source worker's runtime accelerator family, such as `cuda`, comes from the active `AcceleratorBackend.name`. It is published on `WorkerMetadata.accelerator` and also surfaced on the lightweight `SourceInstanceRef.accelerator` returned by `ListSources`. This field is used only for source compatibility filtering. It is not folded into `SourceIdentity`, does not affect `mx_source_id`, and does not change the Rust/Python pinned source-ID cross-check hashes.
 
-Targets treat an empty `accelerator` value as unknown and do not reject it, which keeps transfers backward compatible with metadata published before this field existed. If both source and target publish non-empty accelerator values and they differ, the target skips that source after fetching metadata and before target preparation or RDMA receive.
+Targets treat an empty `accelerator` value as unknown and do not reject it, which keeps transfers backward compatible with metadata published before this field existed. If both source and target publish non-empty accelerator values and they differ, the target skips that source. Because `SourceInstanceRef` carries the value, incompatible sources are dropped while handling `ListSources` -- before the selector orders candidates and before the `MAX_SOURCE_RETRIES` slice -- so incompatible sources cannot exhaust the retry budget ahead of a compatible one. The post-`GetMetadata` check on `WorkerMetadata.accelerator` remains as defense-in-depth, before target preparation or RDMA receive.
 
 ### Tensor and Artifact Source Payloads
 
@@ -111,7 +111,7 @@ PublishMetadataRequest {
 
 ### ListSources
 
-Lightweight listing -- returns `SourceInstanceRef` entries (no tensor data). Clients filter by `worker_rank` to find matching peers, then call `GetMetadata` for the chosen one.
+Lightweight listing -- returns `SourceInstanceRef` entries (no tensor data). Clients filter by `worker_rank` and `accelerator` to find matching peers, then call `GetMetadata` for the chosen one.
 
 ```protobuf
 ListSourcesRequest {
@@ -128,6 +128,7 @@ SourceInstanceRef {
   worker_id: string       // Unique worker identifier
   model_name: string      // Human-readable
   worker_rank: uint32     // Global rank for peer matching
+  accelerator: string     // Runtime accelerator family for pre-fetch compatibility filtering
 }
 ```
 
@@ -135,7 +136,7 @@ SourceInstanceRef {
 
 Fetches full metadata for one specific worker. Called on demand after filtering `ListSources` results. In central metadata mode this can include tensor descriptors directly. In P2P metadata mode the central response carries endpoint pointers and source summaries; targets fetch tensor descriptors or artifact manifests from `WorkerService`.
 
-Accelerator compatibility filtering happens after this metadata fetch because `ListSources` returns lightweight `SourceInstanceRef` values without the `accelerator` field. A target skips a source before target preparation if both source and target publish non-empty, different accelerator values.
+Accelerator compatibility filtering happens in two places. `SourceInstanceRef` now carries the source's `accelerator`, so the target drops incompatible sources during `ListSources` handling, before ordering and before the `MAX_SOURCE_RETRIES` slice; this prevents incompatible sources from consuming every retry slot and stranding a compatible one. The target then re-checks the authoritative `WorkerMetadata.accelerator` after `GetMetadata` as defense-in-depth against empty refs on older servers, stale records, or metadata drift between list and fetch. In both places, a target skips a source only when both source and target publish non-empty, different accelerator values.
 
 ```protobuf
 GetMetadataRequest {
@@ -456,7 +457,7 @@ sequenceDiagram
 
     W->>MX: ListSources(identity, status=READY)
     MX-->>W: [SourceInstanceRef, ...]
-    W->>W: Filter by worker_rank, shuffle for load balancing
+    W->>W: Filter by worker_rank and accelerator, then order via SourceSelector
     W->>W: Load dummy weights, initialize NIXL agent
     loop For each candidate (max MAX_SOURCE_RETRIES) until metadata found
         W->>MX: GetMetadata(mx_source_id, worker_id)
