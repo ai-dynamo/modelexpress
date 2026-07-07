@@ -93,14 +93,36 @@ class MxUpdateInfo(WeightTransferUpdateInfo):
 class WeightSubset:
     """Scopes an ``update_weights`` call to part of the model.
 
-    Exactly one selector is expected. ``param_names`` is implemented; layer /
-    layer-group selection is a documented follow-up (raises for now so callers
-    don't silently get a full update).
+    Selectors (a tensor is kept if it matches ANY provided selector; all-None =
+    full update):
+      * ``param_names`` — exact HF/Megatron tensor names.
+      * ``layers`` — transformer layer indices; matches ``.layers.<n>.``.
+      * ``layer_groups`` — name fragments for coarse groups, e.g.
+        ``["self_attn", "mlp"]`` or ``["experts"]``.
     """
 
     param_names: list[str] | None = None
     layers: list[int] | None = None
     layer_groups: list[str] | None = None
+
+    def is_empty(self) -> bool:
+        return not (self.param_names or self.layers or self.layer_groups)
+
+    def matches(self, *names: str) -> bool:
+        """True if any of ``names`` satisfies any provided selector."""
+        ns = [n for n in names if n]
+        if self.param_names:
+            want = set(self.param_names)
+            if any(n in want for n in ns):
+                return True
+        if self.layers:
+            tags = tuple(f".layers.{i}." for i in self.layers)
+            if any(t in n for n in ns for t in tags):
+                return True
+        if self.layer_groups:
+            if any(g in n for n in ns for g in self.layer_groups):
+                return True
+        return False
 
 
 @dataclass
@@ -231,22 +253,15 @@ class MxVllmWeightUpdater:
 
     @staticmethod
     def _apply_subset(specs: dict, subset: WeightSubset | None) -> None:
-        """Prune receive specs to a subset (in place). param_names only today."""
-        if subset is None:
+        """Prune receive specs to a subset (in place), by param name, layer index,
+        or layer-group fragment. A spec is kept if its Megatron name or any of its
+        HF names matches any provided selector."""
+        if subset is None or subset.is_empty():
             return
-        if subset.layers is not None or subset.layer_groups is not None:
-            raise NotImplementedError(
-                "[mx-wt] layer / layer_group subset selection is not wired yet; "
-                "use param_names, or omit subset for a full update"
-            )
-        if subset.param_names is None:
-            return
-        wanted = set(subset.param_names)
-        keep = {}
-        for mname, spec in specs.items():
-            hf = set(getattr(spec, "hf_names", []) or [])
-            if mname in wanted or (hf & wanted):
-                keep[mname] = spec
+        keep = {
+            m: s for m, s in specs.items()
+            if subset.matches(m, *(getattr(s, "hf_names", []) or []))
+        }
         removed = len(specs) - len(keep)
         specs.clear()
         specs.update(keep)
@@ -348,16 +363,12 @@ class MxVllmWeightUpdater:
         self, cands: list[Any], upd: MxUpdateInfo, subset: WeightSubset | None = None
     ) -> list[tuple[str, torch.Tensor]]:
         """HF/DTensor path: pull by name into scratch, yield (name, tensor)."""
-        wanted = set(subset.param_names) if (subset and subset.param_names) else None
-        if subset and (subset.layers is not None or subset.layer_groups is not None):
-            raise NotImplementedError(
-                "[mx-wt] layer / layer_group subset selection is not wired yet"
-            )
+        active = subset is not None and not subset.is_empty()
         out: list[tuple[str, torch.Tensor]] = []
         for name, t in self._receiver._receiver.receive_weights_scratch(
             cands[0].ref, timeout_seconds=upd.timeout_seconds
         ):
-            if wanted is None or name in wanted:
+            if not active or subset.matches(name):
                 out.append((name, t))
         return out
 
