@@ -41,6 +41,13 @@ Generality / regime:
     params present on *this* worker, and fallback only fires for incoming
     tensors — so a PP stage maps its own subset with no spurious fallback for
     other-stage params (validated PP=2).
+  * **Partial / subset / delta updates:** the destination map is built
+    *incrementally* — each tensor is classified the first time it is seen, in
+    whatever update it arrives in. So an ``update_weights(subset=...)`` (by
+    layer, layer-group, or param list), a layerwise reload, or a delta update
+    gets the warm fast path instead of permanently falling back for tensors
+    absent from the first cycle. Fused-group offsets are computed per batch, so
+    a subset should carry a fused group's members together.
   * **Out of regime today (fall back to stock load, correct but slow):** kernel-
     swizzled / quantized MoE (needs ``--moe-backend triton``; guarded), and any
     custom loader fusion not expressed in ``stacked_params_mapping``.
@@ -107,7 +114,7 @@ class MdlLoader:
             self._model.load_weights(weights=weights)
             self._check_moe_swizzle()
             self._param_cache = dict(self._model.named_parameters())
-            self._build_dest_map(weights)
+            self._extend_dest_map(weights)
             self._layout_sig = self._layout_signature()
             logger.info(
                 "[mx-mdl] cold-cycle stock load %.2fs; cached %d params",
@@ -125,43 +132,80 @@ class MdlLoader:
         self._layout_sig = None
 
     # ---- warm path ----
+    def _try_write(self, hf_name: str, tensor: torch.Tensor) -> str | None:
+        """In-place write `tensor` into its mapped slot if known; return the
+        class it was written as (``direct``/``fused``/``expert``) or ``None``."""
+        d = self._fused.get(hf_name)
+        if d is not None:
+            param, axis, off, sz = d
+            param.data.narrow(axis, off, sz).copy_(tensor, non_blocking=True)
+            return "fused"
+        e = self._expert.get(hf_name)
+        if e is not None:
+            param, eid, axis, off, sz = e
+            param.data[eid].narrow(axis, off, sz).copy_(tensor, non_blocking=True)
+            return "expert"
+        p = self._direct.get(hf_name)
+        if p is not None and tuple(p.shape) == tuple(tensor.shape):
+            p.data.copy_(tensor, non_blocking=True)
+            return "direct"
+        return None
+
     def _warm_load(self, weights: list[tuple[str, torch.Tensor]]) -> None:
-        direct = fused = expert = 0
+        counts = {"direct": 0, "fused": 0, "expert": 0}
+        mapped_late = 0
         fallback: list[tuple[str, torch.Tensor]] = []
         t0 = _time.perf_counter()
         with torch.no_grad():
+            unmapped: list[tuple[str, torch.Tensor]] = []
             for hf_name, tensor in weights:
-                d = self._fused.get(hf_name)
-                if d is not None:
-                    param, axis, off, sz = d
-                    param.data.narrow(axis, off, sz).copy_(tensor, non_blocking=True)
-                    fused += 1
-                    continue
-                e = self._expert.get(hf_name)
-                if e is not None:
-                    param, eid, axis, off, sz = e
-                    param.data[eid].narrow(axis, off, sz).copy_(tensor, non_blocking=True)
-                    expert += 1
-                    continue
-                p = self._direct.get(hf_name)
-                if p is not None and tuple(p.shape) == tuple(tensor.shape):
-                    p.data.copy_(tensor, non_blocking=True)
-                    direct += 1
-                    continue
-                fallback.append((hf_name, tensor))
+                cls = self._try_write(hf_name, tensor)
+                if cls is not None:
+                    counts[cls] += 1
+                else:
+                    unmapped.append((hf_name, tensor))
+            # Partial / subset / delta support: a tensor not present in the cold
+            # cycle (e.g. an update_weights(subset=...) scoped to new params, or a
+            # layerwise/delta update) is classified + mapped on first sight here,
+            # so it goes warm from the next cycle instead of falling back to the
+            # stock loader every time. Only truly unclassifiable tensors fall back.
+            if unmapped:
+                self._extend_dest_map(unmapped)
+                still: list[tuple[str, torch.Tensor]] = []
+                for hf_name, tensor in unmapped:
+                    cls = self._try_write(hf_name, tensor)
+                    if cls is not None:
+                        counts[cls] += 1
+                        mapped_late += 1
+                    else:
+                        still.append((hf_name, tensor))
+                fallback = still
         if fallback:
             self._model.load_weights(weights=fallback)
         self._cycles += 1
         logger.info(
-            "[mx-mdl] warm-cycle %d: %d direct + %d fused + %d expert in %.3fs, "
-            "%d fallback", self._cycles, direct, fused, expert,
-            _time.perf_counter() - t0, len(fallback),
+            "[mx-mdl] warm-cycle %d: %d direct + %d fused + %d expert in %.3fs "
+            "(%d mapped on-the-fly, %d fallback)", self._cycles, counts["direct"],
+            counts["fused"], counts["expert"], _time.perf_counter() - t0,
+            mapped_late, len(fallback),
         )
 
-    # ---- map building ----
-    def _build_dest_map(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+    # ---- map building (additive / incremental) ----
+    def _extend_dest_map(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Classify + record destination-map entries for any tensors in
+        ``weights`` not already mapped. Additive and idempotent, so it serves
+        both the full cold cycle and later partial/subset updates (each tensor
+        is mapped the first time it's seen). Fused-group offsets are computed
+        from the members present in this batch, so a subset update should
+        include a fused group's members together (attention/MLP block
+        granularity); a lone fused member with no mapped siblings falls back."""
         params = self._param_cache
-        name_to_shape = {n: tuple(t.shape) for n, t in weights}
+        name_to_shape = {
+            n: tuple(t.shape) for n, t in weights
+            if n not in self._direct and n not in self._fused and n not in self._expert
+        }
+        if not name_to_shape:
+            return
         expert_lookup: dict[str, tuple] = {}
         model = self._model
         if hasattr(model, "get_expert_mapping"):
