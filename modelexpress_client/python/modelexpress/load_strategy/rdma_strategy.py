@@ -156,6 +156,7 @@ class RdmaStrategy(LoadStrategy):
             raise StrategyFailed("No RDMA source available", mutated=False)
 
         policy = configured_policy_label()
+        local_hosts = _local_worker_host_aliases()
         for attempt_index, instance in enumerate(candidates[:MAX_SOURCE_RETRIES]):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
@@ -182,7 +183,7 @@ class RdmaStrategy(LoadStrategy):
                 selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
-            if self._is_self_source(source_worker):
+            if self._is_self_source(source_worker, local_hosts):
                 logger.info(
                     f"[Worker {ctx.global_rank}] Skipping self RDMA source "
                     f"worker_id={worker_id} mx_source_id={mx_source_id} "
@@ -317,8 +318,11 @@ class RdmaStrategy(LoadStrategy):
         )
         return worker
 
-    def _is_self_source(self, source_worker: p2p_pb2.WorkerMetadata) -> bool:
-        local_hosts = _local_worker_host_aliases()
+    def _is_self_source(
+        self,
+        source_worker: p2p_pb2.WorkerMetadata,
+        local_hosts: set[str],
+    ) -> bool:
         if not local_hosts:
             return False
 
