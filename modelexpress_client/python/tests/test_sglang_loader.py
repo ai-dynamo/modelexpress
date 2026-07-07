@@ -193,7 +193,7 @@ def test_sglang_adapter_post_load_delegates_to_child_module():
     model = nn.Module()
     model.child = ChildModel()
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.child.post_load_called
 
@@ -217,7 +217,7 @@ def test_sglang_adapter_post_load_prefers_top_level_hook():
     model = TopLevelModel()
     model.child.post_load_weights = child_post_load_weights
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.post_load_called
     assert not model.child.post_load_called

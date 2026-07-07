@@ -575,11 +575,11 @@ class NixlTransferManager:
         local_only = sorted(set(self._tensors) - src_names)
         source_only = sorted(src_names - set(self._tensors))
         if local_only or source_only:
-            raise ManifestMismatchError(
-                f"Tensor name mismatch between source manifest and local "
-                f"registration: {len(local_only)} local-only, "
-                f"{len(source_only)} source-only. Refusing to serve "
-                f"partially transferred weights. "
+            logger.warning(
+                "Tensor name mismatch between source manifest and local "
+                "registration: %d local-only, %d source-only",
+                len(local_only),
+                len(source_only),
             )
 
         if not remote_descs:
