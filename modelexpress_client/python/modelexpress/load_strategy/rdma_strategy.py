@@ -91,11 +91,12 @@ class RdmaStrategy(LoadStrategy):
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         """Load from a READY source or raise StrategyFailed for fallback.
 
-        Source discovery and metadata misses do not mutate the target model and
-        therefore raise clean StrategyFailed errors. Once _load_as_target()
-        prepares target storage, failures are treated as mutated because the
-        engine may have initialized or transformed model tensors, and those
-        failures are raised immediately instead of trying another source.
+        Source discovery and metadata misses do not mutate the target model.
+        Transfer failures after target preparation may partially write weights,
+        so retrying another source first reinitializes the target through the
+        engine adapter. If the last candidate fails after mutation, the failure
+        remains mutated so the outer strategy chain reinitializes before the
+        next loading strategy.
         """
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
@@ -103,8 +104,10 @@ class RdmaStrategy(LoadStrategy):
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
             raise StrategyFailed("No RDMA source available", mutated=False)
 
+        attempts = candidates[:MAX_SOURCE_RETRIES]
         policy = configured_policy_label()
-        for attempt_index, instance in enumerate(candidates[:MAX_SOURCE_RETRIES]):
+        needs_outer_reinit = False
+        for attempt_index, instance in enumerate(attempts):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
             logger.info(
@@ -135,22 +138,46 @@ class RdmaStrategy(LoadStrategy):
                 f"({worker_tensor_count(source_worker)} tensors)"
             )
 
-            # Do not try another source after target preparation starts. The
-            # adapter may have initialized or transformed model tensors, and a
-            # failed receive may have partially written weights. The chain will
-            # re-initialize the model before trying the next loading strategy.
             selection_metrics.record_selection(policy, worker_id)
             transfer_start = time.perf_counter()
             try:
                 out = self._load_as_target(
                     result, ctx, source_worker, mx_source_id, worker_id,
                 )
-            except BaseException:
+            except StrategyFailed as e:
+                has_next_candidate = attempt_index + 1 < len(attempts)
                 selection_metrics.observe_transfer_seconds(
-                    policy, "fallback", time.perf_counter() - transfer_start
+                    policy,
+                    "retry" if has_next_candidate else "fallback",
+                    time.perf_counter() - transfer_start,
                 )
-                selection_metrics.record_attempt(policy, "transfer_fallback")
-                raise
+                if not e.mutated:
+                    selection_metrics.record_attempt(
+                        policy,
+                        "transfer_retry" if has_next_candidate else "transfer_fallback",
+                    )
+                    if not has_next_candidate:
+                        if needs_outer_reinit:
+                            raise StrategyFailed(str(e), mutated=True) from e
+                        raise
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] RDMA source worker {worker_id} "
+                        f"failed before target mutation: {e}. Trying next candidate."
+                    )
+                    continue
+                if not has_next_candidate:
+                    selection_metrics.record_attempt(policy, "transfer_fallback")
+                    raise
+
+                selection_metrics.record_attempt(policy, "transfer_retry")
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] RDMA source worker {worker_id} "
+                    f"failed after target mutation: {e}. Reinitializing target "
+                    "before trying next candidate."
+                )
+                result = self._reinit_for_next_source(result, ctx, worker_id, e)
+                needs_outer_reinit = True
+                continue
             selection_metrics.observe_transfer_seconds(
                 policy, "success", time.perf_counter() - transfer_start
             )
@@ -163,8 +190,8 @@ class RdmaStrategy(LoadStrategy):
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
         # Only pre-target metadata/discovery misses reach here. Failures after
-        # target preparation are raised from _load_as_target() as mutated=True.
-        raise StrategyFailed("No RDMA source succeeded", mutated=False)
+        # the last target mutation are raised from _load_as_target() as mutated.
+        raise StrategyFailed("No RDMA source succeeded", mutated=needs_outer_reinit)
 
     def _find_source_instances(
         self, ctx: LoadContext,
@@ -273,6 +300,29 @@ class RdmaStrategy(LoadStrategy):
             raise
         except Exception as e:
             raise StrategyFailed(str(e), mutated=True) from e
+
+    def _reinit_for_next_source(
+        self,
+        result: LoadResult,
+        ctx: LoadContext,
+        source_worker_id: str,
+        failure: StrategyFailed,
+    ) -> LoadResult:
+        self.rollback(ctx)
+        if ctx.adapter is None:
+            raise StrategyFailed(
+                f"RDMA source worker {source_worker_id} failed and no adapter "
+                "can reinitialize the target",
+                mutated=True,
+            ) from failure
+        try:
+            return ctx.adapter.reinit_for_retry(result)
+        except Exception as e:
+            raise StrategyFailed(
+                f"RDMA source worker {source_worker_id} failed and target "
+                f"reinitialization failed: {e}",
+                mutated=True,
+            ) from e
 
     def _receive_from_peer(
         self,

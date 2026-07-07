@@ -268,15 +268,48 @@ def test_load_metadata_miss_tries_next_candidate():
     assert cands[1].worker_id in args
 
 
-def test_load_transfer_failure_does_not_try_next_source():
+def test_load_transfer_failure_reinitializes_and_tries_next_source():
     strat = RdmaStrategy()
     cands = _sources(3)
     strat._find_source_instances = MagicMock(return_value=cands)
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
     strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    original_result = MagicMock(name="original-result")
+    retry_result = MagicMock(name="retry-result")
+    ctx = MagicMock(global_rank=0)
+    ctx.adapter.reinit_for_retry.return_value = retry_result
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+            lambda w: 1,
+        )
+        result = strat.load(original_result, ctx)
+
+    assert result == "loaded"
+    assert strat._fetch_worker_metadata.call_count == 2
+    assert strat._load_as_target.call_count == 2
+    ctx.adapter.reinit_for_retry.assert_called_once()
+    first_args = strat._load_as_target.call_args_list[0].args
+    second_args = strat._load_as_target.call_args_list[1].args
+    assert first_args[0] is original_result
+    assert second_args[0] is retry_result
+    assert cands[0].worker_id in first_args
+    assert cands[1].worker_id in second_args
+
+
+def test_load_reports_mutated_when_retry_reinit_does_not_find_source():
+    strat = RdmaStrategy()
+    cands = _sources(2)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    strat._fetch_worker_metadata = MagicMock(side_effect=[MagicMock(), None])
+    strat._load_as_target = MagicMock(
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
@@ -287,8 +320,7 @@ def test_load_transfer_failure_does_not_try_next_source():
             strat.load(MagicMock(), ctx)
 
     assert ei.value.mutated is True
-    # Exactly one source was attempted; no retry after transfer start.
-    assert strat._fetch_worker_metadata.call_count == 1
+    ctx.adapter.reinit_for_retry.assert_called_once()
     assert strat._load_as_target.call_count == 1
 
 
@@ -374,7 +406,7 @@ def test_load_records_success_metrics(monkeypatch):
 def test_load_records_transfer_fallback_metrics(monkeypatch):
     m = _patched_metrics(monkeypatch)
     strat = RdmaStrategy()
-    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
     strat._load_as_target = MagicMock(
         side_effect=StrategyFailed("receive failed", mutated=True)
@@ -384,6 +416,23 @@ def test_load_records_transfer_fallback_metrics(monkeypatch):
         strat.load(MagicMock(), MagicMock(global_rank=0))
     m.record_attempt.assert_any_call("random", "transfer_fallback")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "fallback")
+
+
+def test_load_records_transfer_retry_metrics(monkeypatch):
+    m = _patched_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
+
+    assert strat.load(MagicMock(), ctx) == "loaded"
+    m.record_attempt.assert_any_call("random", "transfer_retry")
+    m.record_attempt.assert_any_call("random", "success")
+    assert m.observe_transfer_seconds.call_args_list[0].args[:2] == ("random", "retry")
 
 
 def test_load_records_metadata_miss_metric(monkeypatch):
