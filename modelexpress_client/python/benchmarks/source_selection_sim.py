@@ -254,6 +254,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if (args.sources is None) != (args.targets is None):
+        parser.error("--sources and --targets must be provided together")
+
     print(
         "Load-aware source-selection simulation "
         "(processor-sharing fan-out; real selector code)"
