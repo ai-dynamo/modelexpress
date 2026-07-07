@@ -34,6 +34,18 @@ logger = logging.getLogger("modelexpress.strategy_rdma")
 MAX_SOURCE_RETRIES = 3
 
 
+def _max_source_retries() -> int:
+    configured = envs.MX_P2P_MAX_SOURCE_RETRIES
+    if configured > 0:
+        return configured
+    logger.warning(
+        "Invalid MX_P2P_MAX_SOURCE_RETRIES=%d; using default %d",
+        configured,
+        MAX_SOURCE_RETRIES,
+    )
+    return MAX_SOURCE_RETRIES
+
+
 class RdmaStrategy(LoadStrategy):
     """Load weights via RDMA P2P transfer from an existing source.
 
@@ -104,7 +116,8 @@ class RdmaStrategy(LoadStrategy):
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
             raise StrategyFailed("No RDMA source available", mutated=False)
 
-        attempts = candidates[:MAX_SOURCE_RETRIES]
+        max_source_retries = _max_source_retries()
+        attempts = candidates[:max_source_retries]
         policy = configured_policy_label()
         needs_outer_reinit = False
         for attempt_index, instance in enumerate(attempts):
@@ -184,10 +197,10 @@ class RdmaStrategy(LoadStrategy):
             selection_metrics.record_attempt(policy, "success")
             return out
 
-        tried = min(len(candidates), MAX_SOURCE_RETRIES)
+        tried = min(len(candidates), max_source_retries)
         logger.warning(
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
-            f"(max retries={MAX_SOURCE_RETRIES}), falling through"
+            f"(max retries={max_source_retries}), falling through"
         )
         # Only pre-target metadata/discovery misses reach here. Failures after
         # the last target mutation are raised from _load_as_target() as mutated.
@@ -200,8 +213,9 @@ class RdmaStrategy(LoadStrategy):
 
         Filters listed instances to the target's worker_rank, then delegates
         ordering to the policy named by MX_P2P_SOURCE_SELECTOR (default
-        ``random``). The retry slice (MAX_SOURCE_RETRIES) is applied by the
-        caller in load(), so the selector controls ordering only.
+        ``random``). The retry slice (MX_P2P_MAX_SOURCE_RETRIES, default
+        MAX_SOURCE_RETRIES) is applied by the caller in load(), so the selector
+        controls ordering only.
         """
         try:
             list_resp = ctx.mx_client.list_sources(

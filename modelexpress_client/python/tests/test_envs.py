@@ -22,6 +22,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_SERVER_ADDRESS",
         "MX_GDS_TIMEOUT",
         "MX_HEARTBEAT_INTERVAL_SECS",
+        "MX_P2P_MAX_SOURCE_RETRIES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -37,20 +38,25 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_SERVER_ADDRESS is None
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
+    assert envs.MX_P2P_MAX_SOURCE_RETRIES == 3
 
 
 def test_int_and_float_parsing(monkeypatch):
     monkeypatch.setenv("MX_METADATA_PORT", "1234")
     monkeypatch.setenv("MX_GDS_TIMEOUT", "1.5")
     monkeypatch.setenv("MX_SOURCE_QUERY_TIMEOUT", "42")
+    monkeypatch.setenv("MX_P2P_MAX_SOURCE_RETRIES", "2")
     assert envs.MX_METADATA_PORT == 1234
     assert envs.MX_GDS_TIMEOUT == pytest.approx(1.5)
     assert envs.MX_SOURCE_QUERY_TIMEOUT == 42
+    assert envs.MX_P2P_MAX_SOURCE_RETRIES == 2
 
 
 def test_invalid_int_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("MX_METADATA_PORT", "not-a-number")
     assert envs.MX_METADATA_PORT == 5555
+    monkeypatch.setenv("MX_P2P_MAX_SOURCE_RETRIES", "not-a-number")
+    assert envs.MX_P2P_MAX_SOURCE_RETRIES == 3
 
 
 def test_bool_parsing(monkeypatch):

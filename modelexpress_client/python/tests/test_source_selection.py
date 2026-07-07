@@ -228,7 +228,24 @@ def test_find_source_instances_empty_on_list_error():
     assert RdmaStrategy()._find_source_instances(ctx) == []
 
 
-def test_load_slices_to_max_source_retries():
+def test_load_slices_to_configured_max_source_retries(monkeypatch):
+    monkeypatch.setenv("MX_P2P_MAX_SOURCE_RETRIES", "2")
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(5))
+    strat._fetch_worker_metadata = MagicMock(return_value=None)
+    strat._load_as_target = MagicMock()
+    ctx = MagicMock(global_rank=0)
+
+    with pytest.raises(StrategyFailed) as ei:
+        strat.load(MagicMock(), ctx)
+
+    assert ei.value.mutated is False
+    assert strat._fetch_worker_metadata.call_count == 2
+    strat._load_as_target.assert_not_called()
+
+
+def test_load_uses_default_max_source_retries_for_non_positive_env(monkeypatch):
+    monkeypatch.setenv("MX_P2P_MAX_SOURCE_RETRIES", "0")
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(5))
     strat._fetch_worker_metadata = MagicMock(return_value=None)

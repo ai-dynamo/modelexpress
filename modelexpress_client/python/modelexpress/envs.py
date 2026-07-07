@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    MX_P2P_MAX_SOURCE_RETRIES: int
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -192,6 +193,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    "MX_P2P_MAX_SOURCE_RETRIES": lambda: _env_int("MX_P2P_MAX_SOURCE_RETRIES", 3),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
     in _TRUTHY,
