@@ -428,6 +428,57 @@ class TestAbstractMethodCompleteness:
         assert registered["mx"] is MxModelLoader
 
 
+class TestMtpDrafterSecondLoad:
+    """vLLM loads MTP in two passes on one worker: the target, then the drafter
+    via a second load_model whose speculative draft_model_config reuses the
+    target's device and model name. The test drives both passes on device 0."""
+
+    def _load(self, loader, vllm_config, model_config, ctx):
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader.install_vllm_cache_artifacts",
+        ), patch(
+            "modelexpress.engines.vllm.loader.initialize_model",
+            return_value=MagicMock(),
+        ), patch(
+            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            side_effect=lambda model, _ctx: model,
+        ), patch(
+            "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
+        ) as schedule:
+            loader.load_model(vllm_config, model_config)
+        return schedule
+
+    @pytest.mark.xfail(strict=True, reason="mx does not yet handle the MTP drafter's second load")
+    def test_drafter_does_not_clobber_target(self):
+        """The drafter's second load overwrites the target's device registry and
+        re-schedules P2P publish."""
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        loader = _make_loader()
+        target_ctx = _make_load_context(device_id=0)
+        target_ctx.tensors = {"target.weight": MagicMock()}
+        target_ctx.nixl_manager = MagicMock()
+        self._load(loader, MagicMock(), MagicMock(dtype=torch.float32), target_ctx)
+
+        draft_config = MagicMock(dtype=torch.float32)
+        draft_vllm_config = MagicMock()
+        draft_vllm_config.speculative_config.draft_model_config = draft_config
+        draft_ctx = _make_load_context(device_id=0)
+        draft_ctx.tensors = {"drafter.mtp": MagicMock()}
+        draft_ctx.nixl_manager = MagicMock()
+        try:
+            schedule = self._load(loader, draft_vllm_config, draft_config, draft_ctx)
+            assert loader_mod._tensor_registry[0] is target_ctx.tensors
+            assert loader_mod._nixl_managers[0] is target_ctx.nixl_manager
+            schedule.assert_not_called()
+        finally:
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+
+
 # ---------------------------------------------------------------------------
 # register_tensors (load_strategy.base)
 # ---------------------------------------------------------------------------
