@@ -227,6 +227,7 @@ def _install_vllm_cache_artifact_once(
             ctx.nixl_manager,
             worker_rank=None,
             node_rank=ctx.node_rank,
+            accelerator=ctx.accelerator_backend.name,
         )
         transfer.install(header)
         _write_marker(marker_path, header.artifact_id)

@@ -18,7 +18,11 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
-from ..metadata.payload import worker_tensor_count, worker_tensor_descriptors
+from ..metadata.payload import (
+    accelerators_compatible,
+    worker_tensor_count,
+    worker_tensor_descriptors,
+)
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
     configured_policy_label,
@@ -201,7 +205,7 @@ class RdmaStrategy(LoadStrategy):
             target_accelerator = ctx.accelerator_backend.name
             candidates = [
                 inst for inst in rank_matched
-                if self._accelerators_compatible(target_accelerator, inst.accelerator)
+                if accelerators_compatible(target_accelerator, inst.accelerator)
             ]
 
             selector = get_configured_selector()
@@ -240,19 +244,6 @@ class RdmaStrategy(LoadStrategy):
             )
             return []
 
-    @staticmethod
-    def _accelerators_compatible(target: str, source: str) -> bool:
-        """Return whether ``target`` and ``source`` accelerator families match.
-
-        Empty values mean unknown and are accepted for backward compatibility
-        with workers published before accelerator metadata existed. This is the
-        single compatibility rule shared by the pre-slice candidate filter and
-        the post-GetMetadata defense-in-depth check.
-        """
-        if not target or not source:
-            return True
-        return target == source
-
     def _accelerator_compatible(
         self,
         ctx: LoadContext,
@@ -268,7 +259,7 @@ class RdmaStrategy(LoadStrategy):
         """
         target_accelerator = ctx.accelerator_backend.name
         source_accelerator = source_worker.accelerator
-        if self._accelerators_compatible(target_accelerator, source_accelerator):
+        if accelerators_compatible(target_accelerator, source_accelerator):
             return True
 
         logger.info(

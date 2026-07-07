@@ -61,6 +61,8 @@ The source worker's runtime accelerator family, such as `cuda`, comes from the a
 
 Targets treat an empty `accelerator` value as unknown and do not reject it, which keeps transfers backward compatible with metadata published before this field existed. If both source and target publish non-empty accelerator values and they differ, the target skips that source. Because `SourceInstanceRef` carries the value, incompatible sources are dropped while handling `ListSources` -- before the selector orders candidates and before the `MAX_SOURCE_RETRIES` slice -- so incompatible sources cannot exhaust the retry budget ahead of a compatible one. The post-`GetMetadata` check on `WorkerMetadata.accelerator` remains as defense-in-depth, before target preparation or RDMA receive.
 
+The same rule guards artifact cache transfers. vLLM JIT and compile caches (Torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer) are accelerator-specific, so `discover_artifact_source` drops sources whose `SourceInstanceRef.accelerator` is incompatible before `GetMetadata`, then re-checks the authoritative `WorkerMetadata.accelerator` after the fetch. Both checks share the single `accelerators_compatible` helper (`metadata/payload.py`) with the RDMA tensor path, so empty-means-unknown behaves identically. The `k8s-service` backend does not yet expose artifact discovery, so this filtering applies to the central-coordinator backends only.
+
 ### Tensor and Artifact Source Payloads
 
 `WorkerMetadata.source_payload` selects the source-specific metadata shape:
