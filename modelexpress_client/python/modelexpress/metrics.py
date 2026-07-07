@@ -74,7 +74,8 @@ class MetricsCollector:
             self.attempts = Counter(
                 "mx_p2p_source_attempts_total",
                 "Source attempts by result.",
-                ["policy", "scheme", "result"],  # success|metadata_miss|transfer_fallback
+                # success|metadata_miss|self_source|transfer_fallback
+                ["policy", "scheme", "result"],
             )
             self.metadata_failures = Counter(
                 "mx_p2p_metadata_lookup_failures_total",

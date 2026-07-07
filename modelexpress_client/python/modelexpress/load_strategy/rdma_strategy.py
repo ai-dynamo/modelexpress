@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import time
 
 from .. import envs
@@ -32,6 +33,57 @@ from .. import p2p_pb2
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+
+
+def _normalize_host(host: str) -> str:
+    return host.strip().strip("[]").rstrip(".").lower()
+
+
+def _endpoint_host(endpoint: object) -> str | None:
+    if not isinstance(endpoint, str):
+        return None
+    endpoint = endpoint.strip()
+    if not endpoint:
+        return None
+    if endpoint.startswith("["):
+        end = endpoint.find("]")
+        if end > 1:
+            return _normalize_host(endpoint[1:end])
+    if ":" in endpoint:
+        return _normalize_host(endpoint.rsplit(":", 1)[0])
+    return _normalize_host(endpoint)
+
+
+def _host_aliases(host: str) -> set[str]:
+    normalized = _normalize_host(host)
+    aliases = {normalized} if normalized else set()
+    try:
+        for item in socket.getaddrinfo(normalized, None):
+            aliases.add(_normalize_host(item[4][0]))
+    except Exception:
+        pass
+    return aliases
+
+
+def _local_worker_host_aliases() -> set[str]:
+    hosts: set[str] = set()
+    explicit = envs.MX_WORKER_HOST
+    if explicit:
+        hosts.add(explicit)
+    else:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                hosts.add(sock.getsockname()[0])
+        except Exception:
+            pass
+        hosts.add(socket.getfqdn())
+        hosts.add(socket.gethostname())
+
+    aliases: set[str] = set()
+    for host in hosts:
+        aliases.update(_host_aliases(host))
+    return aliases
 
 
 class RdmaStrategy(LoadStrategy):
@@ -128,6 +180,16 @@ class RdmaStrategy(LoadStrategy):
 
             if source_worker is None:
                 selection_metrics.record_attempt(policy, "metadata_miss")
+                continue
+
+            if self._is_self_source(source_worker):
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Skipping self RDMA source "
+                    f"worker_id={worker_id} mx_source_id={mx_source_id} "
+                    f"worker_grpc_endpoint={source_worker.worker_grpc_endpoint!r} "
+                    f"metadata_endpoint={source_worker.metadata_endpoint!r}"
+                )
+                selection_metrics.record_attempt(policy, "self_source")
                 continue
 
             logger.info(
@@ -254,6 +316,22 @@ class RdmaStrategy(LoadStrategy):
             f"{fetch_time:.3f}s, {tensor_count} tensors"
         )
         return worker
+
+    def _is_self_source(self, source_worker: p2p_pb2.WorkerMetadata) -> bool:
+        local_hosts = _local_worker_host_aliases()
+        if not local_hosts:
+            return False
+
+        source_hosts: set[str] = set()
+        for endpoint in (
+            source_worker.worker_grpc_endpoint,
+            source_worker.metadata_endpoint,
+        ):
+            host = _endpoint_host(endpoint)
+            if host:
+                source_hosts.update(_host_aliases(host))
+
+        return bool(source_hosts & local_hosts)
 
     def _load_as_target(
         self,
