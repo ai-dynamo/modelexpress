@@ -569,6 +569,19 @@ class NixlTransferManager:
         matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
+        # Name-set diff between the source manifest and the locally registered
+        # tensors.
+        src_names = {s.name for s in source_tensors}
+        local_only = sorted(set(self._tensors) - src_names)
+        source_only = sorted(src_names - set(self._tensors))
+        if local_only or source_only:
+            raise ManifestMismatchError(
+                f"Tensor name mismatch between source manifest and local "
+                f"registration: {len(local_only)} local-only, "
+                f"{len(source_only)} source-only. Refusing to serve "
+                f"partially transferred weights. "
+            )
+
         if not remote_descs:
             logger.warning("No matching tensors found for transfer")
             return 0, 0, 0.0

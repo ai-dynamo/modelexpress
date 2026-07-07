@@ -111,10 +111,8 @@ class SglangAdapter(EngineAdapter):
         return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
+        result = self._post_load_weights(result)
         return self._process_weights_after_loading(result)
-
-    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
-        return self._post_load_weights(result)
 
     def apply_weight_iter(
         self,
