@@ -60,8 +60,8 @@ def _host_aliases(host: str) -> set[str]:
     try:
         for item in socket.getaddrinfo(normalized, None):
             aliases.add(_normalize_host(item[4][0]))
-    except Exception:
-        pass
+    except OSError as e:
+        logger.debug("Failed to resolve aliases for host %r: %s", normalized, e)
     return aliases
 
 
@@ -75,8 +75,8 @@ def _local_worker_host_aliases() -> set[str]:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.connect(("8.8.8.8", 80))
                 hosts.add(sock.getsockname()[0])
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug("Failed to determine outbound IP for self-source check: %s", e)
         hosts.add(socket.getfqdn())
         hosts.add(socket.gethostname())
 

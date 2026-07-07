@@ -301,6 +301,68 @@ def test_load_skips_self_source_candidate():
     assert cands[1].worker_id in args
 
 
+def test_load_skips_self_source_candidate_from_detected_local_host(monkeypatch):
+    strat = RdmaStrategy()
+    cands = _sources(2)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    self_worker = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        worker_grpc_endpoint="10.0.0.9:6555",
+        metadata_endpoint="10.0.0.9:5555",
+    )
+    remote_worker = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        worker_grpc_endpoint="10.0.0.10:6555",
+        metadata_endpoint="10.0.0.10:5555",
+    )
+    strat._fetch_worker_metadata = MagicMock(side_effect=[self_worker, remote_worker])
+    strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = MagicMock(global_rank=0)
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def connect(self, addr):
+            return None
+
+        def getsockname(self):
+            return ("10.0.0.9", 43210)
+
+    monkeypatch.delenv("MX_WORKER_HOST", raising=False)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.socket.socket",
+        lambda *args, **kwargs: FakeSocket(),
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.socket.getfqdn",
+        lambda: "local.example",
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.socket.gethostname",
+        lambda: "local",
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.socket.getaddrinfo",
+        lambda host, port: [(None, None, None, None, (host, 0))],
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+        lambda w: 1,
+    )
+
+    result = strat.load(MagicMock(), ctx)
+
+    assert result == "loaded"
+    assert strat._fetch_worker_metadata.call_count == 2
+    args = strat._load_as_target.call_args.args
+    assert cands[1].mx_source_id in args
+    assert cands[1].worker_id in args
+
+
 def test_load_transfer_failure_does_not_try_next_source():
     strat = RdmaStrategy()
     cands = _sources(3)
