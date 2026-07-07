@@ -220,6 +220,7 @@ mod tests {
             backend_metadata: None,
             status: status as i32,
             updated_at: 0,
+            accelerator: "cuda".to_string(),
             ..Default::default()
         }
     }
@@ -346,6 +347,10 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].worker_rank, 3, "reports the last-published rank");
         assert_eq!(listed[0].status, SourceStatus::Ready as i32);
+        assert_eq!(
+            listed[0].accelerator, "cuda",
+            "carries the runtime accelerator"
+        );
     }
 
     // update_status patches an existing rank and errors on a missing rank or worker
