@@ -6,6 +6,7 @@ and receive_from_source manifest validation."""
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -327,3 +328,21 @@ class TestReceiveFromSourceManifestValidation:
             remote_agent_name="dummy",
         )
         assert result == (0, 0, 0.0)
+
+    def test_unmatched_name_warns(self, monkeypatch, caplog):
+        # Unmatched names stay non-fatal but are surfaced: an unmatched local
+        # tensor keeps its init values.
+        mgr = self._make_manager(monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)})
+        wrong_name = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[wrong_name],
+                remote_agent_name="dummy",
+            )
+        assert any(
+            "1 local-only, 1 source-only" in rec.getMessage()
+            for rec in caplog.records
+        )
