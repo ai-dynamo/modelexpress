@@ -122,8 +122,20 @@ All other ModelExpress settings are environment variables, matching vLLM:
 `MX_NIXL_BACKEND`, `MX_RDMA_NIC_PIN`, `MX_METADATA_PORT`,
 `MX_WORKER_GRPC_PORT`, and `MODEL_EXPRESS_LOG_LEVEL`.
 
+Set `MX_ARTIFACT_TRANSFER=1` with the `nixl` transport to transfer compatible
+JIT cache artifacts before SGLang initializes the model. The source publishes
+cache artifacts after the SGLang `/health` endpoint is ready and the cache
+directories have stopped changing briefly. Supported cache roots are
+`TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
+`TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TILELANG_CACHE_DIR`,
+`CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
+`MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
+`kubernetes`) for artifact discovery.
+
 For Mooncake TransferEngine, use the same command shape and change only the
 transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.
+ModelExpress artifact transfer is currently implemented on the NIXL transport;
+TransferEngine mode remains weight-only.
 
 ```bash
 export MX_SERVER_ADDRESS=modelexpress-server:8001
