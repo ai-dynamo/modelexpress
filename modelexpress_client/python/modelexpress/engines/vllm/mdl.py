@@ -96,6 +96,13 @@ class MdlLoader:
         self._moe_module_cache: dict[str, Any] = {}
         self._layout_sig: tuple | None = None
         self._cycles = 0
+        # H1: some quantized models (block-fp8 MoE) replace their parameters in
+        # process_weights_after_loading, so vLLM's own load_weights is not
+        # re-entrant (it reads param.output_dim etc. that the processed params
+        # no longer carry). In that regime MDL runs "loaderless": it never calls
+        # model.load_weights, and instead writes bytes straight into the
+        # already-allocated/processed parameter slots on every cycle.
+        self._loaderless = False
 
     # ---- public callback ----
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
@@ -111,17 +118,77 @@ class MdlLoader:
             self._reset_map()
         if self._param_cache is None:
             t0 = _time.perf_counter()
-            self._model.load_weights(weights=weights)
+            if not self._loaderless:
+                try:
+                    self._model.load_weights(weights=weights)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[mx-mdl] model.load_weights failed on cold cycle (%s: %s); "
+                        "switching to loaderless MDL apply (quant/refit-unsupported "
+                        "loader). MDL will write parameter slots in-place instead.",
+                        type(exc).__name__, str(exc)[:120],
+                    )
+                    self._loaderless = True
             self._check_moe_swizzle()
             self._param_cache = dict(self._model.named_parameters())
-            self._extend_dest_map(weights)
+            apply_weights = self._remap_weights(weights) if self._loaderless else weights
+            self._extend_dest_map(apply_weights)
             self._layout_sig = self._layout_signature()
+            if self._loaderless:
+                # load_weights didn't apply anything — do it ourselves via the
+                # dest map (same in-place writes the warm path uses).
+                self._warm_load(apply_weights)
+                self._assert_loaderless_coverage()
             logger.info(
-                "[mx-mdl] cold-cycle stock load %.2fs; cached %d params",
+                "[mx-mdl] cold-cycle %s load %.2fs; cached %d params",
+                "loaderless" if self._loaderless else "stock",
                 _time.perf_counter() - t0, len(self._param_cache),
             )
             return
-        self._warm_load(weights)
+        self._warm_load(self._remap_weights(weights) if self._loaderless else weights)
+
+    def _remap_weights(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Loaderless mode: translate checkpoint tensor names to vLLM param
+        names with the model's own weight mapper — the substitution that
+        ``model.load_weights`` normally applies. No-op if the model exposes no
+        mapper (names already match)."""
+        mapper = getattr(self._model, "hf_to_vllm_mapper", None)
+        if mapper is None:
+            return weights
+        try:
+            return list(mapper.apply(weights))
+        except Exception:  # noqa: BLE001
+            fn = getattr(mapper, "_map_name", None) or getattr(mapper, "map_name", None)
+            if fn is None:
+                return weights
+            out = []
+            for n, t in weights:
+                try:
+                    mn = fn(n)
+                except Exception:  # noqa: BLE001
+                    mn = n
+                if mn is not None:
+                    out.append((mn, t))
+            return out
+
+    def _assert_loaderless_coverage(self) -> None:
+        """Fail loud rather than silently serve a half-written model. In
+        loaderless mode MDL is the only thing writing the parameters, so if it
+        couldn't classify most of them (e.g. a quantized model whose scale
+        tensors MDL doesn't yet map), refuse instead of leaving stale bytes."""
+        mapped = len(self._direct) + len(self._fused) + len(self._expert)
+        total = len(self._param_cache or {})
+        if total and mapped < 0.9 * total:
+            raise RuntimeError(
+                f"[mx-mdl] loaderless MDL mapped only {mapped}/{total} parameters "
+                f"— this model's refit path is not fully supported by MDL yet "
+                f"(commonly: fp8/quantized scale tensors, or an unmapped weight "
+                f"name scheme). Refusing to serve a partially-written model. "
+                f"Use a refit-capable (non-quantized, or triton-MoE) config, or "
+                f"extend MDL's quant handling."
+            )
 
     def _reset_map(self) -> None:
         self._param_cache = None
@@ -181,7 +248,17 @@ class MdlLoader:
                         still.append((hf_name, tensor))
                 fallback = still
         if fallback:
-            self._model.load_weights(weights=fallback)
+            if self._loaderless:
+                # No re-entrant stock loader available for this (quantized)
+                # model; a truly unmapped tensor can't be applied. For a fully
+                # classified model this list is empty; warn if not so it's
+                # visible rather than silently stale.
+                logger.warning(
+                    "[mx-mdl] loaderless: %d tensor(s) unmapped, left unwritten: %s",
+                    len(fallback), [n for n, _ in fallback[:5]],
+                )
+            else:
+                self._model.load_weights(weights=fallback)
         self._cycles += 1
         logger.info(
             "[mx-mdl] warm-cycle %d: %d direct + %d fused + %d expert in %.3fs "
