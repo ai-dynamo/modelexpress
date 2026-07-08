@@ -652,6 +652,96 @@ class NixlTransferManager:
 
         return total_bytes, matched_tensors, duration
 
+    def execute_read_batch(
+        self,
+        remote_agent_name: str,
+        ranges: list[tuple[int, int, int, int]],
+        mem_type: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> tuple[int, int, float]:
+        """Issue one batched one-sided RDMA READ over arbitrary byte ranges.
+
+        ``ranges`` is a list of ``(remote_addr, local_addr, nbytes,
+        remote_device_id)``. Remote addresses must fall within memory the peer
+        (``remote_agent_name``, pre-loaded via ``add_remote_agent``) registered;
+        local addresses within memory this agent registered. Unlike
+        ``receive_from_source`` (whole-tensor, name-matched), this reads the
+        exact sub-tensor runs a reshard pull needs - one dest param filled from
+        many non-contiguous source segments across a single READ.
+
+        Returns ``(total_bytes, num_reads, duration)``.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        ranges = [r for r in ranges if r[2] > 0]
+        if not ranges:
+            return 0, 0, 0.0
+
+        mem = mem_type or self._accelerator_backend.nixl_mem_type
+        remote_descs = [(remote_addr, nbytes, dev) for (remote_addr, _local, nbytes, dev) in ranges]
+        local_descs = [(local_addr, nbytes, self._device_id) for (_remote, local_addr, nbytes, _dev) in ranges]
+
+        # Diagnostic: what we ask NIXL to READ from the remote. NIXL_ERR_NOT_FOUND
+        # at prep means these (addr,size,dev) aren't in a registered region of
+        # remote_agent_name as this agent knows it.
+        try:
+            _known = self._agent.check_remote_metadata(remote_agent_name)
+        except Exception:
+            _known = "n/a"
+        logger.info(
+            "execute_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
+            remote_agent_name,
+            mem,
+            len(remote_descs),
+            _known,
+            [(hex(a), n, d) for (a, n, d) in remote_descs[:3]],
+            self._device_id,
+        )
+
+        start_time = time.perf_counter()
+        handle = None
+        try:
+            src_prepped = self._agent.prep_xfer_dlist(
+                agent_name=remote_agent_name,
+                xfer_list=remote_descs,
+                mem_type=mem,
+                backends=self._backends,
+            )
+            dst_prepped = self._agent.prep_xfer_dlist(
+                agent_name="",
+                xfer_list=local_descs,
+                mem_type=mem,
+                backends=self._backends,
+            )
+            indices = list(range(len(ranges)))
+            handle = self._agent.make_prepped_xfer(
+                operation="READ",
+                local_xfer_side=dst_prepped,
+                local_indices=indices,
+                remote_xfer_side=src_prepped,
+                remote_indices=indices,
+                backends=self._backends,
+            )
+            self._agent.transfer(handle)
+
+            wait_start = time.perf_counter()
+            while True:
+                if timeout_seconds is not None and time.perf_counter() - wait_start >= timeout_seconds:
+                    raise TimeoutError("NIXL reshard READ batch timed out")
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    break
+                if status in ("ERR", "ERROR", "FAIL"):
+                    raise RuntimeError(f"NIXL reshard READ batch failed with status {status}")
+                time.sleep(0.001)
+        finally:
+            if handle is not None:
+                self._agent.release_xfer_handle(handle)
+
+        self._accelerator_backend.synchronize(self._device_id)
+        total_bytes = sum(nbytes for (_r, _l, nbytes, _d) in ranges)
+        return total_bytes, len(ranges), time.perf_counter() - start_time
+
     def register_dram_buffer(self, buffer: torch.Tensor) -> Any:
         """Register one CPU buffer as NIXL DRAM and refresh agent metadata."""
         if self._agent is None:
