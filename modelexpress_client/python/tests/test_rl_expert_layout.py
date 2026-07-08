@@ -5,9 +5,8 @@
 
 Covers the three placement strategies (linear / round_robin / external),
 edge cases (empty model, single rank, uneven splits), partition
-validation, and the round-trip property that
-``compute_local_expert_ids`` outputs slot directly into the substrate's
-expert metadata fields.
+validation, and the round-trip property that ``compute_local_expert_ids``
+outputs compose into plain SHARD ranges on the substrate's expert axis.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import pytest
 
 from modelexpress.rl_expert_layout import (
     compute_local_expert_ids,
+    expert_ids_to_contiguous_ranges,
     validate_placement_partition,
 )
 from modelexpress.rl_slice_descriptors import SliceOwnership, SliceRequest
@@ -182,13 +182,12 @@ class TestValidatePartition:
 
 
 class TestSubstrateRoundTrip:
-    """Helper output plugs directly into SliceOwnership.owned_expert_ids
-    and SliceRequest.required_experts without massaging."""
+    """Helper output composes into plain SHARD ranges on the expert axis —
+    there is no expert-specific descriptor field."""
 
-    def test_owned_expert_ids_fits(self) -> None:
-        owned = compute_local_expert_ids(0, 8, 128, "linear")
-        # Should be directly usable as the tuple-typed owned_expert_ids
-        # without wrapping.
+    def test_owned_ids_become_a_shard_range(self) -> None:
+        owned = compute_local_expert_ids(2, 8, 128, "linear")  # -> (32..47)
+        (lo, hi), = expert_ids_to_contiguous_ranges(owned)
         own = SliceOwnership(
             model_name="test-model",
             tensor_name="model.layers.0.experts.w13_weight",
@@ -196,36 +195,27 @@ class TestSubstrateRoundTrip:
             dtype="torch.bfloat16",
             placement_kind="SHARD",
             shard_axis=0,
-            local_shard_range=(0, 16),
-            worker_rank=0,
-            byte_size=16 * 4096 * 2048 * 2,
-            is_expert=True,
-            expert_axis=0,
-            owned_expert_ids=owned,
+            local_shard_range=(lo, hi),
+            worker_rank=2,
+            byte_size=(hi - lo) * 4096 * 2048 * 2,
         )
-        assert own.owned_expert_ids == tuple(range(16))
+        assert own.local_shard_range == (32, 48)
 
-    def test_required_experts_fits(self) -> None:
+    def test_wanted_ids_become_request_ranges(self) -> None:
         owned = compute_local_expert_ids(2, 8, 128, "linear")
-        # Should be directly usable wrapped in frozenset() for the
-        # request side.
-        req = SliceRequest(
-            tensor_name="model.layers.0.experts.w13_weight",
-            global_range=(0, 128),
-            shard_axis=0,
-            dtype="torch.bfloat16",
-            receiver_rank=2,
-            required_experts=frozenset(owned),
-        )
-        assert req.required_experts == frozenset(range(32, 48))
+        reqs = [
+            SliceRequest(
+                tensor_name="model.layers.0.experts.w13_weight",
+                global_range=(lo, hi),
+                shard_axis=0,
+                dtype="torch.bfloat16",
+                receiver_rank=2,
+            )
+            for lo, hi in expert_ids_to_contiguous_ranges(owned)
+        ]
+        assert [r.global_range for r in reqs] == [(32, 48)]
 
-    def test_default_required_experts_is_none(self) -> None:
-        # Back-compat: callers that don't care about EP get the existing
-        # behavior unchanged.
-        req = SliceRequest(
-            tensor_name="model.embed_tokens.weight",
-            global_range=(0, 1000),
-            shard_axis=0,
-            dtype="torch.bfloat16",
-        )
-        assert req.required_experts is None
+    def test_noncontiguous_ids_become_multiple_ranges(self) -> None:
+        owned = compute_local_expert_ids(0, 4, 16, "round_robin")  # {0,4,8,12}
+        ranges = expert_ids_to_contiguous_ranges(owned)
+        assert len(ranges) == 4  # one SHARD entry per interleaved expert

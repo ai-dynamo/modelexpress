@@ -4,12 +4,13 @@
 """Expert-parallel layout helpers for MoE refit.
 
 When a framework adapter wants to publish or request per-expert MoE
-tensors through the substrate (:class:`SliceOwnership.owned_expert_ids`,
-:class:`SliceRequest.required_experts`), it needs to translate
+tensors through the substrate, it needs to translate
 ``(ep_rank, ep_world_size, num_experts, placement_strategy)`` into the
-expert-id set this rank owns. The math is small but boilerplate, and
-the three placement strategies vLLM, SGLang, and Megatron-Core ship
-today are stable enough to centralize once.
+expert-id set this rank owns, then express that set as ordinary shard
+ranges on the expert axis (via :func:`expert_ids_to_contiguous_ranges`)
+for :class:`SliceOwnership` / :class:`SliceRequest`. The math is small
+but boilerplate, and the three placement strategies vLLM, SGLang, and
+Megatron-Core ship today are stable enough to centralize once.
 
 This module is intentionally pure-Python and framework-agnostic — no
 torch, no NIXL, no engine knowledge. Framework adapters import it,
@@ -49,10 +50,10 @@ def compute_local_expert_ids(
 ) -> tuple[int, ...]:
     """Return the expert-ids that ``ep_rank`` owns under ``placement``.
 
-    The return is an immutable tuple, sorted ascending — suitable for
-    passing directly into :class:`SliceOwnership.owned_expert_ids`
-    (which is typed as ``tuple[int, ...]``) or wrapping in a
-    ``frozenset`` for :class:`SliceRequest.required_experts`.
+    The return is an immutable tuple, sorted ascending — feed it to
+    :func:`expert_ids_to_contiguous_ranges` to get the shard ranges to
+    publish on :class:`SliceOwnership` / request on :class:`SliceRequest`
+    (one entry per contiguous run).
 
     Args:
         ep_rank: this worker's EP rank, in ``[0, ep_world_size)``.

@@ -113,40 +113,11 @@ def _source_matches_request(
                 f"{own.compile_metadata.get(key)!r}, request wants {want!r}"
             )
 
-    # ---- DEPRECATED transitional expert shim ----
-    # Experts are NOT a core planner concept: an expert shard is a plain
-    # SHARD range on the expert axis, and ordinary range intersection (below,
-    # in plan_coverage) already produces the correct EP coverage — see the
-    # ranges-only contract in rl_slice_descriptors and the parity test in
-    # tests/test_rl_reshard_planner_ep_ranges.py. This block is kept ONLY so
-    # callers still passing required_experts/owned_expert_ids don't change
-    # behavior mid-migration. Once every caller emits expert ranges via
-    # expert_ids_to_contiguous_ranges (and the EP bench confirms parity), this
-    # block and the is_expert/owned_expert_ids/required_experts fields are
-    # removed and the planner is strictly range-only.
-    # It only runs when a request explicitly sets required_experts; with the
-    # default None the planner is already pure range intersection.
-    if req.required_experts is not None:
-        # The source must declare it carries expert data (is_expert=True
-        # with a non-empty owned_expert_ids). A non-MoE source that
-        # claims to satisfy an expert-typed request is a configuration
-        # error worth surfacing.
-        if not own.is_expert or not own.owned_expert_ids:
-            return False, (
-                f"source {own.tensor_name!r} (rank {own.worker_rank}) is not "
-                f"marked is_expert with owned_expert_ids; receiver requires "
-                f"experts {sorted(req.required_experts)!r}"
-            )
-        # Intersection must be non-empty. If a source owns experts
-        # disjoint from what the receiver wants, the planner refuses —
-        # no bytes pulled for non-local experts.
-        owned_set = set(own.owned_expert_ids)
-        if not (owned_set & req.required_experts):
-            return False, (
-                f"source {own.tensor_name!r} (rank {own.worker_rank}) owns "
-                f"experts {sorted(own.owned_expert_ids)!r}, receiver requires "
-                f"experts {sorted(req.required_experts)!r}; no intersection"
-            )
+    # MoE experts are not a planner concept: an expert shard is a plain SHARD
+    # range on the expert axis, and the ordinary range intersection in
+    # plan_coverage produces the correct EP coverage (proven equivalent to the
+    # old expert shim in tests/test_rl_reshard_planner_ep_ranges.py). No
+    # expert special-case here.
 
     # Quantization scope — the planner refuses zero-copy on global-required
     # tensors because the receiver can't safely use just one source's slice.

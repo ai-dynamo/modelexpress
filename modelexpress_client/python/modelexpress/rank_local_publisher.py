@@ -27,7 +27,6 @@ a sibling surface, not a replacement.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -177,15 +176,16 @@ class RankLocalPublisher:
         compile_target: str = "bf16_cast",
         compile_metadata: dict[str, object] | None = None,
         quantization_scope: QuantizationScope = "absent",
-        is_expert: bool = False,
-        expert_axis: int = 0,
-        owned_expert_ids: Iterable[int] = (),
     ) -> None:
         """Register a DTensor for rank-local publish.
 
         Internally calls ``tensor.to_local()`` (no allgather, no
         cross-rank comms) and builds the :class:`SliceOwnership` from
         the DTensor's placement metadata.
+
+        MoE experts need no special handling here: publish the expert
+        tensor as an ordinary shard whose ``placement`` shards the expert
+        axis (the DTensor placement already expresses this).
         """
         placement = _placement_from_dtensor(tensor)
         local_tensor = tensor.to_local()
@@ -196,9 +196,6 @@ class RankLocalPublisher:
             compile_target=compile_target,
             compile_metadata=compile_metadata or {},
             quantization_scope=quantization_scope,
-            is_expert=is_expert,
-            expert_axis=expert_axis,
-            owned_expert_ids=tuple(owned_expert_ids),
         )
 
     def add_explicit_shard(
@@ -210,9 +207,6 @@ class RankLocalPublisher:
         compile_target: str = "bf16_cast",
         compile_metadata: dict[str, object] | None = None,
         quantization_scope: QuantizationScope = "absent",
-        is_expert: bool = False,
-        expert_axis: int = 0,
-        owned_expert_ids: Iterable[int] = (),
     ) -> None:
         """Register a non-DTensor local shard for publish.
 
@@ -223,6 +217,10 @@ class RankLocalPublisher:
         aren't DTensors but native parallel shards) and for tests
         that want to drive the publisher without a real torch.distributed
         process group.
+
+        MoE experts are published as an ordinary shard: set ``placement``
+        to shard the expert axis over this rank's owned-expert range (one
+        call per contiguous run for non-contiguous ownership).
         """
         self._record(
             name=name,
@@ -231,9 +229,6 @@ class RankLocalPublisher:
             compile_target=compile_target,
             compile_metadata=compile_metadata or {},
             quantization_scope=quantization_scope,
-            is_expert=is_expert,
-            expert_axis=expert_axis,
-            owned_expert_ids=tuple(owned_expert_ids),
         )
 
     def _record(
@@ -245,9 +240,6 @@ class RankLocalPublisher:
         compile_target: str,
         compile_metadata: dict[str, object],
         quantization_scope: QuantizationScope,
-        is_expert: bool,
-        expert_axis: int,
-        owned_expert_ids: tuple[int, ...],
     ) -> None:
         # Derive byte_size + dtype from the local tensor.
         dtype = str(local_tensor.dtype) if hasattr(local_tensor, "dtype") else "unknown"
@@ -271,9 +263,6 @@ class RankLocalPublisher:
             device_id=getattr(local_tensor, "device", None).index
             if hasattr(local_tensor, "device") and local_tensor.device.type == "cuda"
             else 0,
-            is_expert=is_expert,
-            expert_axis=expert_axis,
-            owned_expert_ids=owned_expert_ids,
             compile_target=compile_target,
             compile_metadata=compile_metadata,
             quantization_scope=quantization_scope,

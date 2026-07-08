@@ -58,10 +58,13 @@ The one deliberate non-range field on the descriptor is ``compile_target`` /
 incompatible kernel layouts before pulling), not a sharding concept.
 
 MoE experts are NOT a core concept: an expert shard is just a ``SHARD`` range
-on the expert axis. The ``is_expert`` / ``owned_expert_ids`` /
-``required_experts`` fields are a **deprecated compatibility shim** kept only
-until every caller emits expert ranges via the adapter; new code should not
-use them (see the field docs and the planner shim note).
+on the expert axis (``shard_axis`` = the expert axis, ``local_shard_range`` =
+the owned-expert range). For non-contiguous ownership (round-robin / EPLB),
+emit one entry per run via
+:func:`modelexpress.rl_expert_layout.expert_ids_to_contiguous_ranges`; ordinary
+range intersection in the planner then produces the correct EP coverage. There
+is no expert special-case in the descriptor or the planner — this was proven
+equivalent to the old expert shim and the shim has been removed.
 """
 
 from __future__ import annotations
@@ -139,18 +142,13 @@ class SliceOwnership:
         byte_size: size in bytes of this shard. Derived from
             ``local_shape × dtype.element_size()`` at publish time.
         device_id: CUDA device index for the shard.
-        is_expert: **DEPRECATED shim.** Experts are not a core concept —
-            an expert shard is a plain ``SHARD`` range on the expert axis
-            (``shard_axis`` = the expert axis, ``local_shard_range`` = the
-            owned-expert range). Prefer publishing that range directly; for
-            non-contiguous ownership emit one entry per run from
+
+            Note: MoE experts have no dedicated field. An expert shard is a
+            plain ``SHARD`` range on the expert axis — set ``shard_axis`` to
+            the expert axis and ``local_shard_range`` to the owned-expert
+            range. For non-contiguous ownership, publish one entry per run
+            from
             :func:`modelexpress.rl_expert_layout.expert_ids_to_contiguous_ranges`.
-            Kept only for back-compat until all callers migrate.
-        expert_axis: **DEPRECATED shim** — use ``shard_axis`` (the expert
-            axis is just the shard axis for an expert tensor).
-        owned_expert_ids: **DEPRECATED shim** — encode ownership as the
-            ``local_shard_range`` (contiguous) or multiple range entries
-            (non-contiguous). Retained for the transitional expert filter.
         compile_target: kernel layout tag (e.g. ``"bf16_cast"``,
             ``"cutlass_fp8"``). The planner refuses to plan if request
             ``compile_target_filter`` doesn't include this — the same
@@ -175,10 +173,6 @@ class SliceOwnership:
     nixl_addr: int = 0
     byte_size: int = 0
     device_id: int = 0
-
-    is_expert: bool = False
-    expert_axis: int = 0
-    owned_expert_ids: tuple[int, ...] = field(default_factory=tuple)
 
     compile_target: str = "bf16_cast"
     compile_metadata: dict[str, object] = field(default_factory=dict)
@@ -269,15 +263,13 @@ class SliceRequest:
         required_compile_metadata: optional subset that every matched
             source's ``compile_metadata`` must agree with. E.g.
             ``{"block_size": 128}`` to require 128-block alignment.
-        required_experts: **DEPRECATED shim.** The ranges-only way to want
-            a subset of experts is to emit a ``SliceRequest`` with a
+
+            Note: to want a subset of experts, emit a ``SliceRequest`` with a
             ``global_range`` on the expert axis (one request per contiguous
             run for non-contiguous sets — see
             :func:`modelexpress.rl_expert_layout.expert_ids_to_contiguous_ranges`).
-            When set, the planner additionally runs the transitional expert
-            filter (only matches sources whose ``owned_expert_ids`` intersect
-            this set); when ``None`` (default) the planner is pure range
-            intersection. Retained for back-compat until callers migrate.
+            Ordinary range intersection then pulls only the wanted experts;
+            there is no expert-specific request field.
     """
 
     tensor_name: str
@@ -289,7 +281,6 @@ class SliceRequest:
     target_offset: int = 0
     compile_target_filter: frozenset[str] | None = None
     required_compile_metadata: dict[str, object] = field(default_factory=dict)
-    required_experts: frozenset[int] | None = None
 
     def __post_init__(self) -> None:
         lo, hi = self.global_range
