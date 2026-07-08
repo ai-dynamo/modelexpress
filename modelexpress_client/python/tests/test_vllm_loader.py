@@ -451,10 +451,9 @@ class TestMtpDrafterSecondLoad:
             loader.load_model(vllm_config, model_config)
         return schedule
 
-    @pytest.mark.xfail(strict=True, reason="mx does not yet handle the MTP drafter's second load")
     def test_drafter_does_not_clobber_target(self):
-        """The drafter's second load overwrites the target's device registry and
-        re-schedules P2P publish."""
+        """The drafter's second load leaves the target's device registry and
+        P2P publish untouched."""
         from modelexpress.engines.vllm import loader as loader_mod
 
         loader = _make_loader()
@@ -477,6 +476,30 @@ class TestMtpDrafterSecondLoad:
         finally:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_register_tensors_skips_when_p2p_disabled(self, mock_init, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+
+        ctx = _make_load_context()
+        ctx.p2p_enabled = False
+        ctx.adapter.discover_tensors = MagicMock(return_value={"w": MagicMock()})
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx)
+
+        mock_init.assert_not_called()
+        ctx.adapter.discover_tensors.assert_not_called()
+        assert ctx.nixl_manager is None
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_rdma_unavailable_when_p2p_disabled(self, _mock):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.p2p_enabled = False
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert RdmaStrategy().is_available(ctx) is False
 
 
 # ---------------------------------------------------------------------------

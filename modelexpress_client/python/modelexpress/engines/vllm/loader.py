@@ -52,6 +52,14 @@ _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
 
 
+def _is_speculative_draft(vllm_config: VllmConfig, model_config: ModelConfig) -> bool:
+    """True when this load is the speculative drafter, not the target."""
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return False
+    return getattr(spec, "draft_model_config", None) is model_config
+
+
 class MxModelLoader(BaseModelLoader):
     """
     Auto-detecting model loader for ModelExpress.
@@ -82,15 +90,17 @@ class MxModelLoader(BaseModelLoader):
         load_start = time.perf_counter()
 
         ctx = build_vllm_load_context(vllm_config, model_config)
+        ctx.p2p_enabled = not _is_speculative_draft(vllm_config, model_config)
         self._ctx = ctx
 
         logger.info(
             f"[Worker {ctx.global_rank}] MxModelLoader starting "
-            f"(model={ctx.identity.model_name})"
+            f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled})"
         )
 
         with maybe_enter_vmm_arena(ctx):
-            install_vllm_cache_artifacts(ctx)
+            if ctx.p2p_enabled:
+                install_vllm_cache_artifacts(ctx)
             with set_default_torch_dtype(model_config.dtype):
                 with ctx.target_device:
                     model = initialize_model(
@@ -101,14 +111,14 @@ class MxModelLoader(BaseModelLoader):
 
                 model = LoadStrategyChain.run(model, ctx)
 
-                # Update global registries
-                _tensor_registry[ctx.device_id] = ctx.tensors
-                if ctx.nixl_manager is not None:
-                    _nixl_managers[ctx.device_id] = ctx.nixl_manager
-                else:
-                    _nixl_managers.pop(ctx.device_id, None)
+                if ctx.p2p_enabled:
+                    _tensor_registry[ctx.device_id] = ctx.tensors
+                    if ctx.nixl_manager is not None:
+                        _nixl_managers[ctx.device_id] = ctx.nixl_manager
+                    else:
+                        _nixl_managers.pop(ctx.device_id, None)
 
-                schedule_vllm_cache_artifact_publish(ctx)
+                    schedule_vllm_cache_artifact_publish(ctx)
 
         log_arena_post_load(ctx)
 
