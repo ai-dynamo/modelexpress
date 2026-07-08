@@ -53,11 +53,16 @@ _nixl_managers: dict[int, NixlTransferManager] = {}
 
 
 def _is_speculative_draft(vllm_config: VllmConfig, model_config: ModelConfig) -> bool:
-    """True when this load is the speculative drafter, not the target."""
-    spec = getattr(vllm_config, "speculative_config", None)
-    if spec is None:
+    """True when this load is the speculative draft model, not the target.
+
+    vLLM builds the draft ModelConfig with runner="draft"; the target resolves
+    to "generate". This is more reliable than comparing against
+    speculative_config.draft_model_config, which ngram/custom_class alias to
+    the target's own config.
+    """
+    if getattr(vllm_config, "speculative_config", None) is None:
         return False
-    return getattr(spec, "draft_model_config", None) is model_config
+    return getattr(model_config, "runner_type", None) == "draft"
 
 
 class MxModelLoader(BaseModelLoader):

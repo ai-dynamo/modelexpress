@@ -430,8 +430,8 @@ class TestAbstractMethodCompleteness:
 
 class TestMtpDrafterSecondLoad:
     """vLLM loads MTP in two passes on one worker: the target, then the drafter
-    via a second load_model whose speculative draft_model_config reuses the
-    target's device and model name. The test drives both passes on device 0."""
+    via a second load_model whose draft ModelConfig has runner_type="draft" and
+    reuses the target's device and model name. The test drives both on device 0."""
 
     def _load(self, loader, vllm_config, model_config, ctx):
         with patch(
@@ -460,11 +460,11 @@ class TestMtpDrafterSecondLoad:
         target_ctx = _make_load_context(device_id=0)
         target_ctx.tensors = {"target.weight": MagicMock()}
         target_ctx.nixl_manager = MagicMock()
-        self._load(loader, MagicMock(), MagicMock(dtype=torch.float32), target_ctx)
+        target_config = MagicMock(dtype=torch.float32, runner_type="generate")
+        self._load(loader, MagicMock(), target_config, target_ctx)
 
-        draft_config = MagicMock(dtype=torch.float32)
+        draft_config = MagicMock(dtype=torch.float32, runner_type="draft")
         draft_vllm_config = MagicMock()
-        draft_vllm_config.speculative_config.draft_model_config = draft_config
         draft_ctx = _make_load_context(device_id=0)
         draft_ctx.tensors = {"drafter.mtp": MagicMock()}
         draft_ctx.nixl_manager = MagicMock()
@@ -476,6 +476,21 @@ class TestMtpDrafterSecondLoad:
         finally:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
+
+    def test_is_speculative_draft(self):
+        from modelexpress.engines.vllm.loader import _is_speculative_draft
+
+        # No speculative decoding: never a draft.
+        no_spec = MagicMock(speculative_config=None)
+        assert _is_speculative_draft(no_spec, MagicMock(runner_type="generate")) is False
+
+        # Draft model load under speculative decoding.
+        spec = MagicMock()
+        assert _is_speculative_draft(spec, MagicMock(runner_type="draft")) is True
+
+        # Target load with spec on (e.g. ngram aliases draft to the target):
+        # runner_type stays "generate", so the target keeps P2P.
+        assert _is_speculative_draft(spec, MagicMock(runner_type="generate")) is False
 
     @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
     @patch("modelexpress.load_strategy.base._init_nixl_manager")
