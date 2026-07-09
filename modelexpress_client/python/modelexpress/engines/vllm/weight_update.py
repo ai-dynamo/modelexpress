@@ -151,15 +151,29 @@ class MxVllmWeightUpdater:
         self._arena = None  # kept alive if arena registration is used
 
     # ---- lifecycle: initialize ----
-    def initialize_weight_update_setup(self, init_info: MxInitInfo) -> None:
-        """One-time setup: create the generic tier-1 receiver and pin NICs.
+    def initialize_weight_update_setup(
+        self, init_info: MxInitInfo, existing_receiver: Any | None = None
+    ) -> None:
+        """One-time setup: create (or adopt) the generic tier-1 receiver and pin NICs.
 
         vLLM geometry discovery (target layout, fused-param / expert mappings)
         is done lazily per update from the live model + source registry, so this
-        stays cheap and idempotent."""
-        from modelexpress import MxV2RefitReceiver, ucx_utils
+        stays cheap and idempotent.
+
+        ``existing_receiver``: when a host (e.g. NeMo-RL's vLLM worker extension)
+        already owns an :class:`MxV2RefitReceiver`, pass it in so we reuse the
+        one NIXL agent instead of creating a second one in the same process."""
+        from modelexpress import ucx_utils
 
         self._init_info = init_info
+        if existing_receiver is not None:
+            self._receiver = existing_receiver
+            logger.info("[mx-wt] setup: adopted existing receiver (model=%s)",
+                        init_info.model_name)
+            return
+
+        from modelexpress import MxV2RefitReceiver
+
         ucx_utils.apply_nic_pin_for_device(init_info.device_id)
         rank = init_info.worker_rank
         self._receiver = MxV2RefitReceiver(
