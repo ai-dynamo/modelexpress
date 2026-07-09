@@ -278,6 +278,17 @@ class MxVllmWeightUpdater:
 
         device = torch.device(f"cuda:{self._init_info.device_id}")
         sidecar_cfg, name_map = discover_megatron_context(cands)
+
+        # EP-gather path: an EP-sharded trainer (sources spanning >1 ep_rank)
+        # publishing to a non-EP / lower-EP rollout must gather experts across
+        # sources and remap each source's local expert names to global. The
+        # matched/TP-assembly path below (single ep_rank) is unchanged.
+        ep_ranks = {c.megatron_meta.ep_rank for c in cands if c.megatron_meta is not None}
+        if len(ep_ranks) > 1:
+            return self._receive_megatron_ep_gather(
+                cands, upd, subset, device, sidecar_cfg, name_map
+            )
+
         specs: dict[str, ReceiveSpec] = {}
         cand = cands[0]
         for td in (cand.registry.get("tensors", []) if cand.registry else []):
@@ -357,6 +368,109 @@ class MxVllmWeightUpdater:
             pull=_noop_pull, device=device, pre_assembled_buffers=dict(buffers),
         ))
         self._buffers = buffers
+        return weights
+
+    def _receive_megatron_ep_gather(
+        self, cands: list[Any], upd: MxUpdateInfo, subset: WeightSubset | None,
+        device: torch.device, sidecar_cfg: Any, name_map: dict,
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Gather an EP-sharded Megatron trainer -> non-EP / lower-EP rollout.
+
+        Each EP source names its grouped experts LOCALLY (``weight<L>`` ->
+        ``experts.<L>.``), identical across ranks; the publisher advertises the
+        GLOBAL id in ``extras['expert_id']`` (``local_expert_id`` keeps the local
+        one). We process each source with its expert HF names rewritten
+        ``experts.<L>. -> experts.<G>.`` so the gathered experts land in distinct,
+        correct slots (vLLM's loader expects global expert names). Replicated/dense
+        tensors are identical across sources and dedupe by name. The EP filter keeps
+        only the rollout rank's wanted global experts. Delivers full HF weights
+        (target TP1); vLLM slices to the rollout's TP at load.
+        """
+        import re
+        from modelexpress.nemo_rl_v2 import TargetTpLayout
+        from modelexpress.megatron_translator import (
+            ReceiveSpec, MegatronReceiverContext, run_refit_cycle,
+        )
+        from modelexpress.rl_expert_layout import compute_local_expert_ids
+
+        layout = TargetTpLayout(tp_size=1, tp_rank=0)
+        wanted: set[int] | None = None
+        if upd.moe_expert_filter and upd.num_experts:
+            placement = (upd.expert_placement
+                         if upd.expert_placement in ("linear", "round_robin") else "linear")
+            wanted = set(compute_local_expert_ids(
+                ep_rank=upd.ep_rank, ep_world_size=upd.ep_world_size,
+                num_experts=int(upd.num_experts), placement=placement))
+
+        _EXP = re.compile(r"(experts\.)(\d+)(\.)")
+
+        def _globalize(hf: str, local_id: int, global_id: int) -> str:
+            return _EXP.sub(
+                lambda m: (f"{m.group(1)}{global_id}{m.group(3)}"
+                           if int(m.group(2)) == local_id else m.group(0)),
+                hf,
+            )
+
+        inner = self._receiver._receiver
+        hf_results: dict[str, torch.Tensor] = {}
+        # Dedupe by ep_rank keeping the MOST RECENT source: the MX server can
+        # retain stale registrations from prior (torn-down) trainers with the same
+        # model name; connecting to a dead agent yields NIXL_ERR_REMOTE_DISCONNECT.
+        by_ep: dict[int, Any] = {}
+        for c in sorted(cands, key=lambda c: -(getattr(c, "updated_at", 0) or 0)):
+            ep = c.megatron_meta.ep_rank if c.megatron_meta else 0
+            by_ep.setdefault(ep, c)
+        ordered = [by_ep[e] for e in sorted(by_ep)]
+        logger.info("[mx-wt] EP-gather: %d candidates -> %d live EP sources (by ep_rank, newest)",
+                    len(cands), len(ordered))
+        for cand in ordered:
+            specs: dict[str, ReceiveSpec] = {}
+            nm_c = dict(name_map)
+            shapes: dict[str, tuple[int, ...]] = {}
+            for td in (cand.registry.get("tensors", []) if cand.registry else []):
+                if not td.megatron_role or td.name.startswith("__mx_"):
+                    continue
+                extras = dict(td.megatron_extras or {})
+                hfs = list(name_map.get(td.name, [td.name]))
+                if td.megatron_role.startswith("expert_"):
+                    gid = int(extras.get("expert_id", -1))
+                    lid = int(extras.get("local_expert_id", gid))
+                    if wanted is not None and gid not in wanted:
+                        continue
+                    hfs = [_globalize(h, lid, gid) for h in hfs]
+                    nm_c[td.name] = hfs
+                specs[td.name] = ReceiveSpec(
+                    megatron_name=td.name, hf_names=hfs, role=td.megatron_role,
+                    target_shape=tuple(int(s) for s in td.global_shape),
+                    target_dtype=td.dtype or "bfloat16", shard_axis=int(td.shard_axis),
+                    pp_rank=cand.megatron_meta.pp_rank if cand.megatron_meta else 0,
+                    role_descriptor=extras,
+                )
+                shapes[td.name] = tuple(int(s) for s in td.global_shape)
+            self._apply_subset(specs, subset)
+            if not specs:
+                continue
+            ctx = MegatronReceiverContext(
+                target_tp_layout=layout, transformer_config=sidecar_cfg,
+                hf_name_map=nm_c, receive_specs=specs,
+            )
+            pre: dict[str, torch.Tensor] = {}
+            for n, t in inner.receive_weights_scratch(
+                cand.ref, timeout_seconds=upd.timeout_seconds, tensor_shapes=shapes
+            ):
+                if n in specs:
+                    pre[n] = t
+            for hf_name, hf_t in run_refit_cycle(
+                self._receiver, candidates=[cand], context=ctx,
+                pull=lambda _s, _d: None, device=device, pre_assembled_buffers=pre,
+            ):
+                hf_results.setdefault(hf_name, hf_t)
+        weights = list(hf_results.items())
+        logger.info(
+            "[mx-wt] megatron EP-gather: %d HF tensors from %d EP sources%s",
+            len(weights), len(cands),
+            f", EP-filtered to {len(wanted)} experts" if wanted is not None else "",
+        )
         return weights
 
     def _receive_dtensor(
