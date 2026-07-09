@@ -108,6 +108,26 @@ class PullRole(WeightSyncRole):
         self.sync()
         self._adapter.post_pull_hook(model)
 
+    def reshard(
+        self,
+        model: Any,
+        table: TrainerTable,
+        executor: Any,
+        tp_src: int,
+        tp_dst: int,
+    ) -> tuple[int, float]:
+        """Receive weights via the nccl_m2n collective (destination side).
+
+        Collective semantics: this MUST be co-called by the trainer's
+        ``PushRole.reshard()`` in the same step (engine-scheduled).  This
+        generator rank supplies the destination tile; the source dataPtr is NULL.
+        Delegates layout + staging to ``NcclM2nExecutor``.
+        """
+        from ..transport.nccl_m2n_executor import build_reshard_params
+
+        params, window_bytes = build_reshard_params(model, table, tp_src, tp_dst)
+        return executor.execute(params, window_bytes)
+
     def refresh(self, model: Any, table: TrainerTable) -> None:
         """Invalidate the plan and re-initialize when the trainer reshards."""
         if table.step == self._current_step:
