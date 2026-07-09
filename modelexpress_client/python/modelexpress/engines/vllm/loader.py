@@ -34,7 +34,7 @@ from ... import configure_vllm_logging
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
-from .adapter import build_vllm_load_context
+from .adapter import _is_speculative_draft, build_vllm_load_context
 from .artifacts import install_vllm_cache_artifacts, schedule_vllm_cache_artifact_publish
 
 from vllm.config import ModelConfig, VllmConfig
@@ -50,19 +50,6 @@ logger = logging.getLogger(__name__)
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
-
-
-def _is_speculative_draft(vllm_config: VllmConfig, model_config: ModelConfig) -> bool:
-    """True when this load is the speculative draft model, not the target.
-
-    vLLM builds the draft ModelConfig with runner="draft"; the target resolves
-    to "generate". This is more reliable than comparing against
-    speculative_config.draft_model_config, which ngram/custom_class alias to
-    the target's own config.
-    """
-    if getattr(vllm_config, "speculative_config", None) is None:
-        return False
-    return getattr(model_config, "runner_type", None) == "draft"
 
 
 class MxModelLoader(BaseModelLoader):
