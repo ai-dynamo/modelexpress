@@ -95,6 +95,26 @@ class PushRole(WeightSyncRole):
         self._descriptors = []
         self._executor = None
 
+    def reshard(
+        self,
+        model: Any,
+        table: TrainerTable,
+        executor: Any,
+        tp_src: int,
+        tp_dst: int,
+    ) -> tuple[int, float]:
+        """Send weights via the nccl_m2n collective (source side).
+
+        Collective semantics: this MUST be co-called by every generator's
+        ``PullRole.reshard()`` in the same step (engine-scheduled).  This trainer
+        rank supplies the source tile; the destination dataPtr is NULL.  Delegates
+        layout + staging to ``NcclM2nExecutor``.
+        """
+        from ..transport.nccl_m2n_executor import build_reshard_params
+
+        params, window_bytes = build_reshard_params(model, table, tp_src, tp_dst)
+        return executor.execute(params, window_bytes)
+
     def _build_push_plan(
         self,
         local_params: dict[str, Any],
