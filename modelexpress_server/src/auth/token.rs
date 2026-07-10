@@ -51,9 +51,11 @@ impl TokenError {
 
 pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<SecretString> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let raw = value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))?;
+    let prefix = value.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    let raw = value.get(7..)?;
     if raw.is_empty() {
         return None;
     }
@@ -140,7 +142,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[test]
-    fn extracts_bearer_token_both_cases() {
+    fn extracts_bearer_token_case_insensitively() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer abc.def".parse().unwrap());
         assert_eq!(extract_bearer(&headers).unwrap().expose_secret(), "abc.def");
@@ -148,6 +150,14 @@ mod tests {
         let mut lower = HeaderMap::new();
         lower.insert(AUTHORIZATION, "bearer xyz".parse().unwrap());
         assert_eq!(extract_bearer(&lower).unwrap().expose_secret(), "xyz");
+
+        let mut upper = HeaderMap::new();
+        upper.insert(AUTHORIZATION, "BEARER token123".parse().unwrap());
+        assert_eq!(extract_bearer(&upper).unwrap().expose_secret(), "token123");
+
+        let mut mixed = HeaderMap::new();
+        mixed.insert(AUTHORIZATION, "BeArEr abc".parse().unwrap());
+        assert_eq!(extract_bearer(&mixed).unwrap().expose_secret(), "abc");
     }
 
     #[test]
@@ -161,6 +171,10 @@ mod tests {
         let mut empty = HeaderMap::new();
         empty.insert(AUTHORIZATION, "Bearer ".parse().unwrap());
         assert!(extract_bearer(&empty).is_none());
+
+        let mut short = HeaderMap::new();
+        short.insert(AUTHORIZATION, "Bear".parse().unwrap());
+        assert!(extract_bearer(&short).is_none());
     }
 
     #[test]
