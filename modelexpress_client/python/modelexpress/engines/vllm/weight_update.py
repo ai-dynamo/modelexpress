@@ -437,6 +437,13 @@ class MxVllmWeightUpdater:
         ordered = [by_ep[e] for e in sorted(by_ep)]
         logger.info("[mx-wt] EP-gather: %d candidates -> %d live EP sources (by ep_rank, newest)",
                     len(cands), len(ordered))
+        # Non-expert / replicated tensors (attention, embeddings, norms, router
+        # gate) are IDENTICAL across every EP source. Pull them from ONE source
+        # only (the first) instead of pulling N copies over the wire and deduping
+        # on keep. Expert tensors are distinct per source and always pulled.
+        # NOTE: assumes non-expert coverage is complete on a single source (true
+        # for PP=1; a PP-split trainer would need per-pp_rank non-expert handling).
+        seen_nonexpert: set[str] = set()
         for cand in ordered:
             specs: dict[str, ReceiveSpec] = {}
             nm_c = dict(name_map)
@@ -453,6 +460,11 @@ class MxVllmWeightUpdater:
                         continue
                     hfs = [_globalize(h, lid, gid) for h in hfs]
                     nm_c[td.name] = hfs
+                else:
+                    # replicated/dense: only pull from the first source that has it
+                    if td.name in seen_nonexpert:
+                        continue
+                    seen_nonexpert.add(td.name)
                 specs[td.name] = ReceiveSpec(
                     megatron_name=td.name, hf_names=hfs, role=td.megatron_role,
                     target_shape=tuple(int(s) for s in td.global_shape),
