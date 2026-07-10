@@ -76,7 +76,7 @@ spec:
             - name: MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
               value: {{ join "," . | quote }}
             {{- end }}
-            {{- if .Values.security.cacheTtlSecs }}
+            {{- if hasKey .Values.security "cacheTtlSecs" }}
             - name: MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
               value: {{ .Values.security.cacheTtlSecs | quote }}
             {{- end }}
