@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Full-stack ServiceAccount token authentication over a real in-process tonic server.
-//! Each scenario boots its own server on a separate ephemeral port with a fake
-//! TokenReview backend configured to return specific responses.
+//! Full-stack ServiceAccount token auth: the real client (interceptor reading a projected
+//! token file) against a real tonic server wrapped in [`AuthLayer`], with a fake
+//! TokenReview backend. Scenarios run sequentially in one test because the token path
+//! env var is process-global.
 
 #![allow(clippy::expect_used)]
 
@@ -15,13 +16,13 @@ use http::header::CONTENT_TYPE;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewStatus, UserInfo};
 use kube::client::{Body, Client as KubeClient};
 use modelexpress_client::Client;
+use modelexpress_common::Error;
 use modelexpress_common::client_config::ClientConfig;
 use modelexpress_common::config::ConnectionConfig;
 use modelexpress_common::grpc::health::health_service_server::HealthServiceServer;
 use modelexpress_server::auth::{AuthLayer, AuthState};
 use modelexpress_server::config::{AuthMode, SecurityConfig, ServiceAccountRef};
 use modelexpress_server::services::HealthServiceImpl;
-use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
@@ -94,7 +95,7 @@ async fn stop_and_join(shutdown: oneshot::Sender<()>, handle: JoinHandle<ServerR
         .await
         .expect("server task did not exit in time")
         .expect("server task panicked")
-        .expect("run_server returned an error");
+        .expect("server returned an error");
 }
 
 fn token_review_for(username: &str) -> TokenReview {
@@ -134,11 +135,18 @@ fn security_config() -> SecurityConfig {
     }
 }
 
+fn grpc_code(error: &Error) -> Option<tonic::Code> {
+    match error {
+        Error::Grpc(status) => Some(status.code()),
+        _ => None,
+    }
+}
+
 #[tokio::test]
-async fn allowlisted_authenticated_caller_succeeds_and_caches() {
-    let temp_dir = TempDir::new().expect("temp dir");
+async fn token_auth_end_to_end() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
     let token_path = temp_dir.path().join("token");
-    std::fs::write(&token_path, "good-token\n").expect("write token");
+    std::fs::write(&token_path, "worker-token\n").expect("write token");
     unsafe {
         std::env::set_var(
             modelexpress_common::envs::MX_AUTH_TOKEN_PATH,
@@ -146,85 +154,47 @@ async fn allowlisted_authenticated_caller_succeeds_and_caches() {
         );
     }
 
+    // Allowlisted caller: RPCs succeed and the verified token is served from cache.
     let port = free_port();
     let (kube_client, calls) =
         fake_kube_client_for_review(token_review_for("system:serviceaccount:vllm:worker"));
     let (shutdown, handle) = start_auth_server(port, kube_client, security_config());
-
     let mut client = connect_client(port).await;
     client.health_check().await.expect("first health_check");
     client.health_check().await.expect("second health_check");
-
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-
     stop_and_join(shutdown, handle).await;
-}
 
-#[tokio::test]
-async fn non_allowlisted_caller_is_denied() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let token_path = temp_dir.path().join("token");
-    std::fs::write(&token_path, "intruder-token\n").expect("write token");
-    unsafe {
-        std::env::set_var(
-            modelexpress_common::envs::MX_AUTH_TOKEN_PATH,
-            token_path.to_str().expect("token path"),
-        );
-    }
-
+    // Authenticated but non-allowlisted caller: PERMISSION_DENIED.
     let port = free_port();
     let (kube_client, _calls) =
         fake_kube_client_for_review(token_review_for("system:serviceaccount:other:intruder"));
     let (shutdown, handle) = start_auth_server(port, kube_client, security_config());
-
     let mut client = connect_client(port).await;
     let error = client
         .health_check()
         .await
         .expect_err("non-allowlisted SA should be denied");
-
-    let error_str = error.to_string();
-    assert!(
-        error_str.contains("gRPC error")
-            && (error_str.contains("permission")
-                || error_str.contains("PermissionDenied")
-                || error_str.contains("other:intruder")),
-        "expected PERMISSION_DENIED error, got: {error_str}"
+    assert_eq!(
+        grpc_code(&error),
+        Some(tonic::Code::PermissionDenied),
+        "expected PERMISSION_DENIED, got: {error}"
     );
-
     stop_and_join(shutdown, handle).await;
-}
 
-#[tokio::test]
-async fn unauthenticated_caller_is_rejected() {
-    let temp_dir = TempDir::new().expect("temp dir");
-    let token_path = temp_dir.path().join("token");
-    std::fs::write(&token_path, "bad-token\n").expect("write token");
-    unsafe {
-        std::env::set_var(
-            modelexpress_common::envs::MX_AUTH_TOKEN_PATH,
-            token_path.to_str().expect("token path"),
-        );
-    }
-
+    // Token the reviewer rejects: UNAUTHENTICATED.
     let port = free_port();
     let (kube_client, _calls) = fake_kube_client_for_review(unauthenticated_review());
     let (shutdown, handle) = start_auth_server(port, kube_client, security_config());
-
     let mut client = connect_client(port).await;
     let error = client
         .health_check()
         .await
         .expect_err("unauthenticated caller should be rejected");
-
-    let error_str = error.to_string();
-    assert!(
-        error_str.contains("gRPC error")
-            && (error_str.contains("unauthenticated")
-                || error_str.contains("Unauthenticated")
-                || error_str.contains("authentication")),
-        "expected UNAUTHENTICATED error, got: {error_str}"
+    assert_eq!(
+        grpc_code(&error),
+        Some(tonic::Code::Unauthenticated),
+        "expected UNAUTHENTICATED, got: {error}"
     );
-
     stop_and_join(shutdown, handle).await;
 }

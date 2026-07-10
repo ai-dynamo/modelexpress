@@ -19,6 +19,7 @@ use kube::client::Client;
 use moka::future::Cache;
 use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
+use tracing::warn;
 
 use crate::config::{SecurityConfig, ServiceAccountRef};
 use token::{extract_bearer, review_token};
@@ -130,10 +131,9 @@ impl AuthState {
                 if error.is_token_rejection() {
                     self.negative_cache.insert(key, ()).await;
                     return Err(Denial::Unauthenticated);
-                } else {
-                    tracing::warn!("TokenReview infrastructure error (not cached): {}", error);
-                    return Err(Denial::Unavailable);
                 }
+                warn!(error = %error, "TokenReview backend error");
+                return Err(Denial::Unavailable);
             }
         };
 
