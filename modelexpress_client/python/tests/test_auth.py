@@ -71,6 +71,14 @@ def test_token_provider_missing_file_returns_none_and_warns_once(tmp_path, caplo
     assert len(warnings) == 1
 
 
+def test_token_provider_invalid_ttl_env_falls_back_to_default(monkeypatch, caplog):
+    monkeypatch.setenv("MX_AUTH_TOKEN_TTL_SECONDS", "not-a-number")
+    with caplog.at_level(logging.WARNING, logger="modelexpress.auth"):
+        provider = TokenProvider(path="/unused")
+    assert provider._ttl == 60.0
+    assert any("MX_AUTH_TOKEN_TTL_SECONDS" in r.getMessage() for r in caplog.records)
+
+
 def test_interceptor_attaches_bearer_when_token_present(tmp_path):
     token_file = tmp_path / "token"
     token_file.write_text("secret-token")

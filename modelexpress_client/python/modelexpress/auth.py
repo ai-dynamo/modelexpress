@@ -25,7 +25,16 @@ class TokenProvider:
         self._path = path or envs.MX_AUTH_TOKEN_PATH or DEFAULT_TOKEN_PATH
         if ttl_seconds is None:
             raw_ttl = envs.MX_AUTH_TOKEN_TTL_SECONDS
-            ttl_seconds = float(raw_ttl) if raw_ttl else DEFAULT_TTL_SECONDS
+            try:
+                ttl_seconds = float(raw_ttl) if raw_ttl else DEFAULT_TTL_SECONDS
+            except ValueError:
+                logger.warning(
+                    "Invalid %s value %r; using default %ss.",
+                    "MX_AUTH_TOKEN_TTL_SECONDS",
+                    raw_ttl,
+                    DEFAULT_TTL_SECONDS,
+                )
+                ttl_seconds = DEFAULT_TTL_SECONDS
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
         self._cached: str | None = None
