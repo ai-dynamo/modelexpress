@@ -90,7 +90,7 @@ impl TokenProvider {
                      (server must have auth off)",
                 );
                 cache.token = None;
-                cache.read_at = Some(now);
+                cache.mtime = None;
                 None
             }
         }
@@ -269,5 +269,22 @@ mod tests {
             .expect_err("invalid metadata value");
 
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn missing_file_is_rechecked_immediately() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("late-mounted-token");
+        let provider = TokenProvider {
+            path: path.clone(),
+            ttl: DEFAULT_TTL,
+            cache: Mutex::new(CachedToken::default()),
+        };
+
+        assert!(provider.token().is_none());
+
+        fs::write(&path, "appeared-token\n").expect("write token");
+
+        assert_eq!(provider.token().as_deref(), Some("appeared-token"));
     }
 }
