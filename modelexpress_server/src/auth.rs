@@ -87,6 +87,8 @@ pub struct AuthState {
 }
 
 impl AuthState {
+    const TOKEN_CACHE_MAX_ENTRIES: u64 = 10_000;
+
     #[must_use]
     pub fn new(client: Client, config: &SecurityConfig) -> Self {
         let ttl = Duration::from_secs(config.cache_ttl_secs);
@@ -94,8 +96,14 @@ impl AuthState {
             client,
             audiences: config.token_audiences.clone(),
             allowlist: config.allowed_service_accounts.iter().cloned().collect(),
-            token_cache: Cache::builder().time_to_live(ttl).build(),
-            negative_cache: Cache::builder().time_to_live(ttl).build(),
+            token_cache: Cache::builder()
+                .time_to_live(ttl)
+                .max_capacity(Self::TOKEN_CACHE_MAX_ENTRIES)
+                .build(),
+            negative_cache: Cache::builder()
+                .time_to_live(ttl)
+                .max_capacity(Self::TOKEN_CACHE_MAX_ENTRIES)
+                .build(),
         }
     }
 
