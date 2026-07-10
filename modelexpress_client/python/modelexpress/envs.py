@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     MX_SERVER_ADDRESS: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
+    # Auth (client)
+    MX_AUTH_TOKEN_PATH: Optional[str]
+    MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
     # Metadata / worker
     MX_METADATA_BACKEND: str
     MX_METADATA_PORT: int
@@ -143,6 +146,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
+    # ── Auth (client) ──────────────────────────────────────────────────────
+    "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
+    "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),
     # ── Metadata / worker ──────────────────────────────────────────────────
     "MX_METADATA_BACKEND": lambda: os.environ.get("MX_METADATA_BACKEND", "").lower().strip(),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),

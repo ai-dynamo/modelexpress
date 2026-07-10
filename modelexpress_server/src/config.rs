@@ -131,7 +131,7 @@ pub struct SecurityArgs {
     /// ServiceAccount auth mode (off, enforce). Off by default.
     #[arg(
         long = "security-mode",
-        env = "MODEL_EXPRESS_SECURITY_MODE",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_MODE,
         value_enum
     )]
     pub mode: Option<AuthMode>,
@@ -139,21 +139,21 @@ pub struct SecurityArgs {
     /// Comma-separated SA token audiences the caller's token must carry.
     #[arg(
         long = "security-token-audiences",
-        env = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES"
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
     )]
     pub token_audiences: Option<CommaList<String>>,
 
     /// Comma-separated allowed callers as `<namespace>:<serviceaccount>`.
     #[arg(
         long = "security-allowed-service-accounts",
-        env = "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS"
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
     )]
     pub allowed_service_accounts: Option<CommaList<ServiceAccountRef>>,
 
     /// TTL for the verified-token and rejection caches, in seconds.
     #[arg(
         long = "security-cache-ttl-secs",
-        env = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS"
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
     )]
     pub cache_ttl_secs: Option<u64>,
 }

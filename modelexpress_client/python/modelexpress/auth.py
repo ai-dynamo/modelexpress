@@ -10,11 +10,11 @@ import time
 
 import grpc
 
+from modelexpress import envs
+
 logger = logging.getLogger("modelexpress.auth")
 
 DEFAULT_TOKEN_PATH = "/var/run/secrets/tokens/modelexpress"
-ENV_TOKEN_PATH = "MX_AUTH_TOKEN_PATH"
-ENV_TOKEN_TTL = "MX_AUTH_TOKEN_TTL_SECONDS"
 DEFAULT_TTL_SECONDS = 60.0
 
 
@@ -22,9 +22,10 @@ class TokenProvider:
     """Caches a projected ServiceAccount token, re-reading on TTL expiry or mtime change."""
 
     def __init__(self, path: str | None = None, ttl_seconds: float | None = None):
-        self._path = path or os.environ.get(ENV_TOKEN_PATH, DEFAULT_TOKEN_PATH)
+        self._path = path or envs.MX_AUTH_TOKEN_PATH or DEFAULT_TOKEN_PATH
         if ttl_seconds is None:
-            ttl_seconds = float(os.environ.get(ENV_TOKEN_TTL, DEFAULT_TTL_SECONDS))
+            raw_ttl = envs.MX_AUTH_TOKEN_TTL_SECONDS
+            ttl_seconds = float(raw_ttl) if raw_ttl else DEFAULT_TTL_SECONDS
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
         self._cached: str | None = None

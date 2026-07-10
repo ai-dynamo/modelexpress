@@ -14,8 +14,6 @@ use tonic::{Request, Status};
 use tracing::warn;
 
 const DEFAULT_TOKEN_PATH: &str = "/var/run/secrets/tokens/modelexpress";
-const ENV_TOKEN_PATH: &str = "MX_AUTH_TOKEN_PATH";
-const ENV_TOKEN_TTL: &str = "MX_AUTH_TOKEN_TTL_SECONDS";
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
@@ -35,10 +33,10 @@ pub struct TokenProvider {
 impl TokenProvider {
     #[must_use]
     pub fn from_env() -> Self {
-        let path = std::env::var(ENV_TOKEN_PATH)
+        let path = std::env::var(modelexpress_common::envs::MX_AUTH_TOKEN_PATH)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_TOKEN_PATH));
-        let ttl = std::env::var(ENV_TOKEN_TTL)
+        let ttl = std::env::var(modelexpress_common::envs::MX_AUTH_TOKEN_TTL_SECONDS)
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .map_or(DEFAULT_TTL, Duration::from_secs);
