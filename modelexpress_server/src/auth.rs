@@ -200,6 +200,7 @@ pub(crate) mod test_util {
         TokenReview {
             status: Some(TokenReviewStatus {
                 authenticated: Some(true),
+                audiences: Some(vec!["modelexpress".to_string()]),
                 user: Some(UserInfo {
                     username: Some(username.to_string()),
                     ..Default::default()

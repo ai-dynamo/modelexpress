@@ -33,11 +33,19 @@ pub(crate) enum TokenError {
     NoUser,
     #[error("caller is not a kubernetes service account")]
     NotServiceAccount,
+    #[error("token audience mismatch: requested {requested:?}, got {actual:?}")]
+    AudienceMismatch {
+        requested: Vec<String>,
+        actual: Option<Vec<String>>,
+    },
 }
 
 impl TokenError {
     pub(crate) fn is_token_rejection(&self) -> bool {
-        matches!(self, Self::NotAuthenticated(_) | Self::NotServiceAccount)
+        matches!(
+            self,
+            Self::NotAuthenticated(_) | Self::NotServiceAccount | Self::AudienceMismatch { .. }
+        )
     }
 }
 
@@ -103,6 +111,20 @@ pub(crate) async fn review_token(
     if !status.authenticated.unwrap_or(false) {
         return Err(TokenError::NotAuthenticated(status.error));
     }
+
+    if !audiences.is_empty() {
+        let status_audiences = status.audiences.as_deref().unwrap_or(&[]);
+        let has_overlap = audiences
+            .iter()
+            .any(|req| status_audiences.iter().any(|stat| req == stat));
+        if !has_overlap {
+            return Err(TokenError::AudienceMismatch {
+                requested: audiences.to_vec(),
+                actual: status.audiences.clone(),
+            });
+        }
+    }
+
     let user = status.user.ok_or(TokenError::NoUser)?;
     caller_from_userinfo(&user).ok_or(TokenError::NotServiceAccount)
 }
@@ -190,6 +212,13 @@ mod tests {
     fn only_definitive_rejections_are_cacheable() {
         assert!(TokenError::NotAuthenticated(None).is_token_rejection());
         assert!(TokenError::NotServiceAccount.is_token_rejection());
+        assert!(
+            TokenError::AudienceMismatch {
+                requested: vec!["modelexpress".to_string()],
+                actual: None,
+            }
+            .is_token_rejection()
+        );
         assert!(!TokenError::NoStatus.is_token_rejection());
         assert!(!TokenError::NoUser.is_token_rejection());
     }
@@ -252,5 +281,122 @@ mod tests {
             .expect_err("missing TokenReview user");
 
         assert!(matches!(error, TokenError::NoUser));
+    }
+
+    #[tokio::test]
+    async fn review_token_rejects_authenticated_with_no_audiences() {
+        use k8s_openapi::api::authentication::v1::TokenReviewStatus;
+
+        let review = TokenReview {
+            status: Some(TokenReviewStatus {
+                authenticated: Some(true),
+                audiences: None,
+                user: Some(UserInfo {
+                    username: Some("system:serviceaccount:vllm:worker".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (client, _calls) = fake_kube_client(vec![review]);
+        let audiences = vec!["modelexpress".to_string()];
+
+        let error = review_token(&client, "token", &audiences)
+            .await
+            .expect_err("TokenReview with None audiences");
+
+        assert!(matches!(
+            error,
+            TokenError::AudienceMismatch {
+                requested,
+                actual: None,
+            } if requested == audiences
+        ));
+    }
+
+    #[tokio::test]
+    async fn review_token_rejects_mismatched_audiences() {
+        use k8s_openapi::api::authentication::v1::TokenReviewStatus;
+
+        let review = TokenReview {
+            status: Some(TokenReviewStatus {
+                authenticated: Some(true),
+                audiences: Some(vec!["other".to_string()]),
+                user: Some(UserInfo {
+                    username: Some("system:serviceaccount:vllm:worker".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (client, _calls) = fake_kube_client(vec![review]);
+        let audiences = vec!["modelexpress".to_string()];
+
+        let error = review_token(&client, "token", &audiences)
+            .await
+            .expect_err("TokenReview with mismatched audiences");
+
+        assert!(matches!(
+            error,
+            TokenError::AudienceMismatch {
+                requested,
+                actual: Some(ref actual_vec),
+            } if requested == audiences && actual_vec == &["other".to_string()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn review_token_accepts_overlapping_audiences() {
+        use k8s_openapi::api::authentication::v1::TokenReviewStatus;
+
+        let review = TokenReview {
+            status: Some(TokenReviewStatus {
+                authenticated: Some(true),
+                audiences: Some(vec!["other".to_string(), "modelexpress".to_string()]),
+                user: Some(UserInfo {
+                    username: Some("system:serviceaccount:vllm:worker".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (client, _calls) = fake_kube_client(vec![review]);
+        let audiences = vec!["modelexpress".to_string()];
+
+        let caller = review_token(&client, "token", &audiences)
+            .await
+            .expect("overlapping audiences");
+
+        assert_eq!(caller.namespace, "vllm");
+        assert_eq!(caller.service_account, "worker");
+    }
+
+    #[tokio::test]
+    async fn review_token_accepts_empty_requested_audiences_with_none_status() {
+        use k8s_openapi::api::authentication::v1::TokenReviewStatus;
+
+        let review = TokenReview {
+            status: Some(TokenReviewStatus {
+                authenticated: Some(true),
+                audiences: None,
+                user: Some(UserInfo {
+                    username: Some("system:serviceaccount:vllm:worker".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (client, _calls) = fake_kube_client(vec![review]);
+
+        let caller = review_token(&client, "token", &[])
+            .await
+            .expect("empty requested audiences");
+
+        assert_eq!(caller.namespace, "vllm");
+        assert_eq!(caller.service_account, "worker");
     }
 }
