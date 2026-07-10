@@ -308,6 +308,7 @@ class MxRefitReceiver:
         source: SourceRef,
         timeout_seconds: float = 300.0,
         tensor_shapes: dict[str, tuple[int, ...]] | None = None,
+        include_names: set[str] | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Receive weights into scratch GPU buffers via NIXL RDMA.
 
@@ -356,6 +357,10 @@ class MxRefitReceiver:
             )
             for t in worker.tensors
             if not t.name.startswith("__mx_") and t.size > 0
+            # Wire-prune: when the caller knows which tensors it wants (EP expert
+            # filter, non-expert dedup across EP sources), pull ONLY those over
+            # RDMA instead of the source's full published set.
+            and (include_names is None or t.name in include_names)
         ]
 
         scratch_tensors: dict[str, torch.Tensor] = {}

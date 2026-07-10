@@ -481,8 +481,13 @@ class MxVllmWeightUpdater:
                 hf_name_map=nm_c, receive_specs=specs,
             )
             pre: dict[str, torch.Tensor] = {}
+            # include_names prunes the RDMA pull to exactly this source's kept
+            # tensors (experts owned by this rollout rank after the EP filter +
+            # non-expert only from the first source), instead of the source's
+            # full published set.
             for n, t in inner.receive_weights_scratch(
-                cand.ref, timeout_seconds=upd.timeout_seconds, tensor_shapes=shapes
+                cand.ref, timeout_seconds=upd.timeout_seconds,
+                tensor_shapes=shapes, include_names=set(specs.keys()),
             ):
                 if n in specs:
                     pre[n] = t
