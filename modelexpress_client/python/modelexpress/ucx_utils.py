@@ -405,6 +405,19 @@ def _resolve_nic_pin(device_id: int) -> str | None:
         # syntax. UCX picks the port from :1 (all IB NICs have their
         # single port at index 1).
         pinned = ",".join(f"{name}:1" for name, _numa, _rate, _path in nics)
+        # Keep a routable Ethernet device in the list so UCX still has a tcp
+        # transport for the NIXL control/AM lane (cross-pod metadata exchange +
+        # connection setup). IB-only pinning drops the tcp path, so the receiver
+        # can't reach the publisher's CM address ("no active messages transport
+        # ... rc_mlx5 - no route to <ip>") and stripe fails at loadRemoteMD.
+        # rc still carries the RMA data across the mlx5 rails; eth0 only serves
+        # control. Overridable via MX_RDMA_STRIPE_CM_DEV; set to "" to disable.
+        cm_dev = os.environ.get("MX_RDMA_STRIPE_CM_DEV", "eth0")
+        if cm_dev and cm_dev not in pinned.split(","):
+            pinned = f"{pinned},{cm_dev}"
+            logger.info(
+                f"MX_RDMA_NIC_PIN=stripe: keeping {cm_dev} for the tcp control/AM lane"
+            )
         # Bump UCX_MAX_RMA_RAILS so UCX actually multiplexes RMA
         # traffic across the pinned NICs. Default is 1 (single rail);
         # setting to len(nics) lets the striping happen. Callers can
