@@ -90,6 +90,17 @@ class MxRefitReceiver:
         self._client: MxClient | None = None
         self._initialized = False
         self._current_step = -1
+        # Persistent full-manifest scratch reused by receive_weights_scratch.
+        # Callers may vary include_names per source/refit, but the publisher's
+        # full manifest is stable, so allocate/register that layout once and
+        # transfer only the requested subset into it. This avoids per-source
+        # registration churn without maintaining duplicate subset buffers.
+        self._scratch_tensors: dict[str, torch.Tensor] = {}
+        self._scratch_sig: tuple[tuple[str, int, str], ...] | None = None
+        # Stable worker_id -> (remote NIXL agent name, metadata blob). Trainer
+        # parameters are registered once and updated in place, so unchanged
+        # metadata can safely reuse the loaded remote agent across refits.
+        self._scratch_remote_agents: dict[str, tuple[Any, bytes]] = {}
         # Stable per-instance worker_id consumed by publish flows that
         # require a non-empty worker_id (e.g.
         # MxV2RefitReceiver.publish_self_as_source).  Assigned eagerly
@@ -303,6 +314,70 @@ class MxRefitReceiver:
             if td.name in self._nixl._tensors:
                 yield td.name, self._nixl._tensors[td.name]
 
+    def _get_or_add_scratch_remote_agent(
+        self,
+        source: SourceRef,
+        worker: Any,
+    ) -> Any:
+        """Reuse a remote agent while its registered-memory metadata is stable."""
+        agent_key = source.worker_id or (worker.agent_name or source.mx_source_id)
+        metadata = bytes(worker.nixl_metadata)
+        cached = self._scratch_remote_agents.get(agent_key)
+        if cached is not None and cached[1] == metadata:
+            logger.info(
+                "[refit] reusing remote agent %r for worker %r",
+                cached[0],
+                agent_key,
+            )
+            return cached[0]
+
+        if cached is not None:
+            try:
+                self._nixl._agent.remove_remote_agent(cached[0])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("remove_remote_agent(%r) failed: %s", cached[0], exc)
+
+        remote_agent = self._nixl._agent.add_remote_agent(metadata)
+        self._scratch_remote_agents[agent_key] = (remote_agent, metadata)
+        logger.info(
+            "[refit] loaded remote agent %r for worker %r (%s)",
+            remote_agent,
+            agent_key,
+            "new worker" if cached is None else "metadata changed",
+        )
+        return remote_agent
+
+    def prune_scratch_remote_agents(self, active_worker_ids: set[str]) -> None:
+        """Remove cached remotes from an older trainer process generation.
+
+        Trainer restarts reuse rank-based NIXL agent names but receive new MX
+        worker IDs. NIXL rejects loading new metadata under an already-loaded
+        same-named agent, so the orchestrator calls this with the complete
+        current source set before importing any source from the new generation.
+        """
+        if self._nixl is None or self._nixl._agent is None:
+            return
+        stale = [
+            worker_id
+            for worker_id in self._scratch_remote_agents
+            if worker_id not in active_worker_ids
+        ]
+        for worker_id in stale:
+            remote_agent, _ = self._scratch_remote_agents.pop(worker_id)
+            try:
+                self._nixl._agent.remove_remote_agent(remote_agent)
+                logger.info(
+                    "[refit] removed stale remote agent %r for worker %r",
+                    remote_agent,
+                    worker_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "remove stale remote agent %r failed: %s",
+                    remote_agent,
+                    exc,
+                )
+
     def receive_weights_scratch(
         self,
         source: SourceRef,
@@ -347,7 +422,7 @@ class MxRefitReceiver:
         # past the MX server's field-dropping; they aren't real RDMA
         # targets. Leaving them in the source_tensors list propagates a
         # (0,0,0) descriptor into prep_xfer_dlist which UCX rejects.
-        source_tensors = [
+        all_source_tensors = [
             TensorDescriptor(
                 name=t.name,
                 addr=t.addr,
@@ -357,34 +432,58 @@ class MxRefitReceiver:
             )
             for t in worker.tensors
             if not t.name.startswith("__mx_") and t.size > 0
+        ]
+        source_tensors = [
+            tensor
+            for tensor in all_source_tensors
             # Wire-prune: when the caller knows which tensors it wants (EP expert
             # filter, non-expert dedup across EP sources), pull ONLY those over
             # RDMA instead of the source's full published set.
-            and (include_names is None or t.name in include_names)
+            if include_names is None or tensor.name in include_names
         ]
 
-        scratch_tensors: dict[str, torch.Tensor] = {}
-        scratch_shapes: dict[str, tuple[int, ...]] = {}
-        for td in source_tensors:
-            dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
-            elem_size = torch.tensor([], dtype=dt).element_size()
-            numel = td.size // elem_size
-            scratch_tensors[td.name] = torch.empty(
-                numel, dtype=dt, device=f"cuda:{self._device_id}"
-            )
-            scratch_shapes[td.name] = (numel,)
-
-        logger.info(
-            f"Allocated {len(scratch_tensors)} scratch buffers "
-            f"({sum(t.numel() * t.element_size() for t in scratch_tensors.values()) / 1e9:.2f} GB)"
+        sig = tuple(
+            sorted((td.name, int(td.size), td.dtype) for td in all_source_tensors)
         )
+        if self._scratch_sig is None:
+            scratch_tensors: dict[str, torch.Tensor] = {}
+            for td in all_source_tensors:
+                dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
+                elem_size = torch.tensor([], dtype=dt).element_size()
+                numel = td.size // elem_size
+                scratch_tensors[td.name] = torch.empty(
+                    numel, dtype=dt, device=f"cuda:{self._device_id}"
+                )
+            self._nixl.register_tensors(scratch_tensors)
+            self._scratch_tensors = scratch_tensors
+            self._scratch_sig = sig
+            logger.info(
+                "Allocated + registered %d persistent scratch buffers (%.2f GB)",
+                len(scratch_tensors),
+                sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in scratch_tensors.values()
+                )
+                / 1e9,
+            )
+        elif sig != self._scratch_sig:
+            raise RuntimeError(
+                "Source tensor layout changed after persistent scratch registration; "
+                "reinitialize the MX receiver before loading the new layout"
+            )
+        else:
+            self._nixl.rebind_tensors(self._scratch_tensors)
+            logger.info(
+                "Reusing %d persistent scratch buffers",
+                len(self._scratch_tensors),
+            )
 
-        self._nixl.register_tensors(scratch_tensors)
-
+        remote_agent = self._get_or_add_scratch_remote_agent(source, worker)
         transferred, skipped, elapsed = self._nixl.receive_from_source(
             source_metadata=worker.nixl_metadata,
             source_tensors=source_tensors,
             timeout_seconds=timeout_seconds,
+            remote_agent_name=remote_agent,
         )
 
         bandwidth_gbps = (transferred * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
@@ -396,7 +495,9 @@ class MxRefitReceiver:
 
         self._current_step = source.training_step
 
-        for name, tensor in scratch_tensors.items():
+        for td in source_tensors:
+            tensor = self._scratch_tensors[td.name]
+            name = td.name
             if tensor_shapes and name in tensor_shapes:
                 tensor = tensor.view(tensor_shapes[name])
             yield name, tensor

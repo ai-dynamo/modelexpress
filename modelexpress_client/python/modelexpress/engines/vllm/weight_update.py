@@ -437,6 +437,7 @@ class MxVllmWeightUpdater:
         ordered = [by_ep[e] for e in sorted(by_ep)]
         logger.info("[mx-wt] EP-gather: %d candidates -> %d live EP sources (by ep_rank, newest)",
                     len(cands), len(ordered))
+        inner.prune_scratch_remote_agents({c.ref.worker_id for c in ordered})
         # Non-expert / replicated tensors (attention, embeddings, norms, router
         # gate) are IDENTICAL across every EP source. Pull them from ONE source
         # only (the first) instead of pulling N copies over the wire and deduping
