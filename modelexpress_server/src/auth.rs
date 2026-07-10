@@ -29,6 +29,8 @@ pub enum Denial {
     Unauthenticated,
     #[error("{0}")]
     PermissionDenied(String),
+    #[error("authentication backend unavailable")]
+    Unavailable,
 }
 
 impl Denial {
@@ -38,6 +40,7 @@ impl Denial {
                 tonic::Status::unauthenticated("missing or invalid service account token")
             }
             Self::PermissionDenied(message) => tonic::Status::permission_denied(message),
+            Self::Unavailable => tonic::Status::unavailable("authentication backend unavailable"),
         }
     }
 }
@@ -118,8 +121,11 @@ impl AuthState {
             Err(error) => {
                 if error.is_token_rejection() {
                     self.negative_cache.insert(key, ()).await;
+                    return Err(Denial::Unauthenticated);
+                } else {
+                    tracing::warn!("TokenReview infrastructure error (not cached): {}", error);
+                    return Err(Denial::Unavailable);
                 }
-                return Err(Denial::Unauthenticated);
             }
         };
 
@@ -217,29 +223,53 @@ pub(crate) mod test_util {
         }
     }
 
+    pub(crate) enum FakeResponse {
+        Review(Box<TokenReview>),
+        Error(http::StatusCode),
+    }
+
     pub(crate) fn fake_kube_client(reviews: Vec<TokenReview>) -> (Client, Arc<AtomicUsize>) {
-        let reviews = Arc::new(Mutex::new(VecDeque::from(reviews)));
+        fake_kube_client_with_responses(
+            reviews
+                .into_iter()
+                .map(|r| FakeResponse::Review(Box::new(r)))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn fake_kube_client_with_responses(
+        responses: Vec<FakeResponse>,
+    ) -> (Client, Arc<AtomicUsize>) {
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
         let calls = Arc::new(AtomicUsize::new(0));
 
         let service = tower::service_fn({
-            let reviews = reviews.clone();
+            let responses = responses.clone();
             let calls = calls.clone();
             move |_request: http::Request<Body>| {
-                let reviews = reviews.clone();
+                let responses = responses.clone();
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    let review = reviews
+                    let response_item = responses
                         .lock()
-                        .expect("fake TokenReview queue lock")
+                        .expect("fake response queue lock")
                         .pop_front()
-                        .expect("fake TokenReview response");
-                    let body = serde_json::to_vec(&review).expect("serialize TokenReview");
-                    let response = http::Response::builder()
-                        .status(http::StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(body))
-                        .expect("fake TokenReview response body");
+                        .expect("fake response");
+                    let response = match response_item {
+                        FakeResponse::Review(review) => {
+                            let body = serde_json::to_vec(&*review).expect("serialize TokenReview");
+                            http::Response::builder()
+                                .status(http::StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(body))
+                                .expect("fake TokenReview response body")
+                        }
+                        FakeResponse::Error(status) => http::Response::builder()
+                            .status(status)
+                            .body(Body::empty())
+                            .expect("fake error response body"),
+                    };
                     Ok::<_, BoxError>(response)
                 }
             }
@@ -271,6 +301,12 @@ mod tests {
         let status = Denial::PermissionDenied("nope".to_string()).into_status();
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
         assert_eq!(status.message(), "nope");
+    }
+
+    #[test]
+    fn unavailable_maps_to_grpc_code() {
+        let status = Denial::Unavailable.into_status();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[tokio::test]
@@ -324,5 +360,28 @@ mod tests {
             Err(Denial::Unauthenticated)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_returns_unavailable_for_api_errors_without_caching() {
+        use test_util::FakeResponse;
+
+        let (client, calls) = test_util::fake_kube_client_with_responses(vec![
+            FakeResponse::Error(http::StatusCode::INTERNAL_SERVER_ERROR),
+            FakeResponse::Error(http::StatusCode::INTERNAL_SERVER_ERROR),
+        ]);
+        let config = security_config(vec![allowed_ref("vllm", "worker")]);
+        let state = AuthState::new(client, &config);
+        let headers = bearer_headers("token");
+
+        assert!(matches!(
+            state.verify(&headers).await,
+            Err(Denial::Unavailable)
+        ));
+        assert!(matches!(
+            state.verify(&headers).await,
+            Err(Denial::Unavailable)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
