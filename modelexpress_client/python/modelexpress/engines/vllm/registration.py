@@ -12,7 +12,11 @@ from vllm.model_executor.model_loader import register_model_loader
 logger = logging.getLogger(__name__)
 
 
-_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
+# Keep the Dynamo role-specific aliases available when a newer Modelexpress
+# package replaces an older image installation. Spawned TP workers import the
+# plugin independently; all aliases must therefore be registered by the plugin,
+# not only in the parent process.
+_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx", "mx-source", "mx-target")
 
 
 def _patch_vllm_s3_format_check() -> None:

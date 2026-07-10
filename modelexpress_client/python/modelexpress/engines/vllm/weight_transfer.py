@@ -50,9 +50,10 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
     init_info_cls = MxInitInfo
     update_info_cls = MxUpdateInfo
 
-    def __init__(self, config, parallel_config) -> None:
-        super().__init__(config, parallel_config)
+    def __init__(self, config, parallel_config, model=None) -> None:
+        super().__init__(config, parallel_config, model)
         self._vllm_config = config
+        self._model = model
         self._updater = MxVllmWeightUpdater()
         self._mdl = None
 
@@ -102,7 +103,7 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
                 f"Invalid target TP identity: rank={update_info.tp_rank}, "
                 f"world_size={update_info.tp_world_size}"
             )
-        model = getattr(load_weights, "__self__", None)
+        model = self._model or getattr(load_weights, "__self__", None)
         if model is not None and update_info.moe_expert_filter:
             try:
                 for module in model.modules():
