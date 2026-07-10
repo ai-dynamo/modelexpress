@@ -22,6 +22,7 @@ than through this ABC (same base APIs).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Iterator
 
 import torch
@@ -53,6 +54,7 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
         super().__init__(config, parallel_config)
         self._vllm_config = config
         self._updater = MxVllmWeightUpdater()
+        self._mdl = None
 
     def init_transfer_engine(self, init_info: MxInitInfo) -> None:
         # One init request is fanned out to every vLLM worker. Derive local
@@ -100,9 +102,48 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
                 f"Invalid target TP identity: rank={update_info.tp_rank}, "
                 f"world_size={update_info.tp_world_size}"
             )
+        model = getattr(load_weights, "__self__", None)
+        if model is not None and update_info.moe_expert_filter:
+            try:
+                for module in model.modules():
+                    if hasattr(module, "expert_map") and hasattr(
+                        module, "global_num_experts"
+                    ):
+                        update_info.ep_world_size = int(
+                            getattr(module, "ep_size", 1) or 1
+                        )
+                        update_info.ep_rank = int(
+                            getattr(module, "ep_rank", 0) or 0
+                        )
+                        update_info.num_experts = int(
+                            getattr(module, "global_num_experts", 0) or 0
+                        )
+                        break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Unable to introspect live vLLM EP layout; using request "
+                    "values ep=%d rank=%d experts=%d: %s",
+                    update_info.ep_world_size,
+                    update_info.ep_rank,
+                    update_info.num_experts,
+                    exc,
+                )
+        load_callback = load_weights
+        if os.environ.get("MX_LOAD_MODE", "stock").lower() == "direct":
+            if model is None:
+                logger.warning(
+                    "MX_LOAD_MODE=direct requested, but load_weights is not a "
+                    "bound model method; using stock loader"
+                )
+            else:
+                if self._mdl is None:
+                    from .mdl import MdlLoader
+
+                    self._mdl = MdlLoader(model)
+                load_callback = self._mdl.load_weights
         version = int(getattr(update_info, "version", 0))
         self._updater.start_weight_update(version)
-        self._updater.update_weights(update_info, load_weights)
+        self._updater.update_weights(update_info, load_callback)
         self._updater.finish_weight_update(version)
 
     @staticmethod
