@@ -82,6 +82,12 @@ class MxUpdateInfo(WeightTransferUpdateInfo):
     ep_rank: int = 0
     num_experts: int = 0
     expert_placement: str = "linear"
+    # Receiver tensor-parallel identity. Checkpoint-format weights remain in
+    # full HF shape for vLLM's model-specific loaders to shard correctly, but
+    # the identity is required for slice planning, coverage, and direct-dest
+    # optimizations.
+    tp_world_size: int = 1
+    tp_rank: int = 0
     # Phase 0.5 / arena (fall back to env if unset here)
     buffer_loc: str | None = None
     use_arena: bool | None = None
@@ -427,6 +433,7 @@ class MxVllmWeightUpdater:
 
         inner = self._receiver._receiver
         hf_results: dict[str, torch.Tensor] = {}
+        expected_hf: set[str] = set()
         # Dedupe by ep_rank keeping the MOST RECENT source: the MX server can
         # retain stale registrations from prior (torn-down) trainers with the same
         # model name; connecting to a dead agent yields NIXL_ERR_REMOTE_DISCONNECT.
@@ -473,6 +480,7 @@ class MxVllmWeightUpdater:
                     pp_rank=cand.megatron_meta.pp_rank if cand.megatron_meta else 0,
                     role_descriptor=extras,
                 )
+                expected_hf.update(hfs)
                 shapes[td.name] = tuple(int(s) for s in td.global_shape)
             self._apply_subset(specs, subset)
             if not specs:
@@ -498,10 +506,20 @@ class MxVllmWeightUpdater:
             ):
                 hf_results.setdefault(hf_name, hf_t)
         weights = list(hf_results.items())
+        missing = sorted(expected_hf.difference(hf_results))
+        if missing:
+            sample = ", ".join(missing[:8])
+            raise RuntimeError(
+                "[mx-wt] incomplete Megatron EP-gather coverage: "
+                f"missing {len(missing)}/{len(expected_hf)} expected HF tensors "
+                f"(sample: {sample})"
+            )
         logger.info(
-            "[mx-wt] megatron EP-gather: %d HF tensors from %d EP sources%s",
-            len(weights), len(cands),
+            "[mx-wt] megatron EP-gather: %d/%d expected HF tensors from "
+            "%d EP sources%s (target_tp=%d rank=%d)",
+            len(weights), len(expected_hf), len(cands),
             f", EP-filtered to {len(wanted)} experts" if wanted is not None else "",
+            upd.tp_world_size, upd.tp_rank,
         )
         return weights
 

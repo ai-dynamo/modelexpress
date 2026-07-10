@@ -77,6 +77,29 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
         update_info: MxUpdateInfo,
         load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
     ) -> None:
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            update_info.tp_world_size = int(
+                get_tensor_model_parallel_world_size()
+            )
+            update_info.tp_rank = int(get_tensor_model_parallel_rank())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Unable to introspect vLLM TP layout; using request values "
+                "tp=%d rank=%d: %s",
+                update_info.tp_world_size,
+                update_info.tp_rank,
+                exc,
+            )
+        if not 0 <= update_info.tp_rank < update_info.tp_world_size:
+            raise ValueError(
+                f"Invalid target TP identity: rank={update_info.tp_rank}, "
+                f"world_size={update_info.tp_world_size}"
+            )
         version = int(getattr(update_info, "version", 0))
         self._updater.start_weight_update(version)
         self._updater.update_weights(update_info, load_weights)
