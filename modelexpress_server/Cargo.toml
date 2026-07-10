@@ -71,5 +71,10 @@ name = "in_process_server"
 path = "tests/in_process_server.rs"
 required-features = ["integration-tests"]
 
+[[test]]
+name = "auth_e2e"
+path = "tests/auth_e2e.rs"
+required-features = ["integration-tests"]
+
 [lints]
 workspace = true
