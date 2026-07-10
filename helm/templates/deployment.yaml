@@ -66,6 +66,12 @@ spec:
             {{- toYaml .Values.extraEnv | nindent 12 }}
             {{- end }}
             {{- if .Values.security.enabled }}
+            {{- if and (eq .Values.security.mode "enforce") (not .Values.security.tokenAudiences) }}
+            {{- fail "security.mode=enforce requires a non-empty security.tokenAudiences" }}
+            {{- end }}
+            {{- if and (eq .Values.security.mode "enforce") (not .Values.security.allowedServiceAccounts) }}
+            {{- fail "security.mode=enforce requires a non-empty security.allowedServiceAccounts" }}
+            {{- end }}
             - name: MODEL_EXPRESS_SECURITY_MODE
               value: {{ .Values.security.mode | quote }}
             {{- with .Values.security.tokenAudiences }}
