@@ -51,9 +51,25 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
 
     def __init__(self, config, parallel_config) -> None:
         super().__init__(config, parallel_config)
+        self._vllm_config = config
         self._updater = MxVllmWeightUpdater()
 
     def init_transfer_engine(self, init_info: MxInitInfo) -> None:
+        # One init request is fanned out to every vLLM worker. Derive local
+        # identity inside the worker rather than requiring the orchestrator to
+        # construct a different request per TP/DP rank.
+        init_info.device_id = (
+            torch.cuda.current_device() if torch.cuda.is_available() else 0
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            init_info.worker_rank = torch.distributed.get_rank()
+        if not init_info.model_name:
+            model_config = getattr(self._vllm_config, "model_config", None)
+            init_info.model_name = (
+                getattr(model_config, "model", None)
+                or getattr(model_config, "served_model_name", None)
+                or ""
+            )
         self._updater.initialize_weight_update_setup(init_info)
 
     def receive_weights(
