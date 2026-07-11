@@ -490,7 +490,9 @@ class MxRefitReceiver:
         logger.info(
             f"RDMA transfer complete: {transferred / 1e9:.2f} GB, "
             f"{len(source_tensors)} tensors, {elapsed:.2f}s, "
-            f"{bandwidth_gbps:.1f} Gbps (step={source.training_step})"
+            f"{bandwidth_gbps:.1f} Gbps "
+            f"(step={source.training_step}, source_rank={source.worker_rank}, "
+            f"source_id={source.mx_source_id[:8]})"
         )
 
         self._current_step = source.training_step
