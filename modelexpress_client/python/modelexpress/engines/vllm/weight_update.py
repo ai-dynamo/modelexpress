@@ -572,7 +572,14 @@ class MxVllmWeightUpdater:
                 self._receiver, candidates=[cand], context=ctx,
                 pull=lambda _s, _d: None, device=device, pre_assembled_buffers=pre,
             ):
-                hf_results.setdefault(hf_name, hf_t)
+                if hf_name not in hf_results:
+                    # Translation outputs are commonly views into the
+                    # persistent scratch buffers. The next EP source reuses
+                    # and overwrites those buffers, so retain an owned copy.
+                    # CPU staging bounds rollout HBM and matches the proven
+                    # legacy EP-gather path; TP-local/direct destinations can
+                    # replace this staging in the optimized path.
+                    hf_results[hf_name] = hf_t.detach().to("cpu")
         def _load_order(item: tuple[str, torch.Tensor]) -> tuple[int, int, str]:
             name = item[0]
             match = re.search(r"\.layers\.(\d+)\.", name)
