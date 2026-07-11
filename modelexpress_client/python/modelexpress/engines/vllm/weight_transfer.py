@@ -164,7 +164,14 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
 def register() -> None:
     """Register the MX backend with vLLM's WeightTransferEngineFactory."""
     from vllm.distributed.weight_transfer import WeightTransferEngineFactory
-    WeightTransferEngineFactory.register_engine(_MX_ENGINE_NAME, MxWeightTransferEngine)
+
+    registry = getattr(WeightTransferEngineFactory, "_registry", {})
+    if _MX_ENGINE_NAME in registry:
+        return
+    WeightTransferEngineFactory.register_engine(
+        _MX_ENGINE_NAME,
+        MxWeightTransferEngine,
+    )
 
 
 # Best-effort auto-register on import (safe: no-op if vLLM factory absent).

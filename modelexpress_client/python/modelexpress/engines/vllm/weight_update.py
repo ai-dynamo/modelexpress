@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -208,11 +209,12 @@ class MxVllmWeightUpdater:
     def update_weights(
         self,
         update_info: MxUpdateInfo,
-        load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], Any],
         subset: WeightSubset | None = None,
     ) -> None:
         if self._receiver is None:
             raise RuntimeError("initialize_weight_update_setup must be called first")
+        cycle_start = time.perf_counter()
 
         model_name = self._init_info.model_name
         cands = self._receiver.discover_v2_sources(
@@ -231,6 +233,7 @@ class MxVllmWeightUpdater:
             weights = self._receive_megatron(cands, update_info, subset)
         else:
             weights = self._receive_dtensor(cands, update_info, subset)
+        receive_elapsed = time.perf_counter() - cycle_start
 
         if update_info.verify_gt_path or os.environ.get("MX_VERIFY_BYTE_IDENTITY"):
             self._verify(
@@ -238,7 +241,19 @@ class MxVllmWeightUpdater:
                 update_info.verify_gt_path or os.environ["MX_VERIFY_BYTE_IDENTITY"],
             )
 
-        load_weights(weights)
+        load_start = time.perf_counter()
+        loaded = load_weights(weights)
+        load_elapsed = time.perf_counter() - load_start
+        loaded_count = len(loaded) if isinstance(loaded, set) else None
+        logger.info(
+            "[mx-wt] phase timing: receive_translate=%.3fs load=%.3fs "
+            "total=%.3fs incoming_hf=%d loaded_params=%s",
+            receive_elapsed,
+            load_elapsed,
+            time.perf_counter() - cycle_start,
+            len(weights),
+            loaded_count if loaded_count is not None else "unknown",
+        )
 
         if self._init_info.tree_scale_out:
             try:
@@ -460,19 +475,72 @@ class MxVllmWeightUpdater:
                 if not td.megatron_role or td.name.startswith("__mx_"):
                     continue
                 extras = dict(td.megatron_extras or {})
-                hfs = list(name_map.get(td.name, [td.name]))
-                if td.megatron_role.startswith("expert_"):
-                    gid = int(extras.get("expert_id", -1))
-                    lid = int(extras.get("local_expert_id", gid))
+                lookup_name = (
+                    td.name[len("module.") :]
+                    if td.name.startswith("module.")
+                    else td.name
+                )
+                is_expert = td.megatron_role.startswith("expert_")
+                gid = int(extras.get("expert_id", -1)) if is_expert else -1
+                lid = (
+                    int(extras.get("local_expert_id", gid))
+                    if is_expert
+                    else -1
+                )
+                # Older publishers advertise local ids in both fields. Recover
+                # the global id from the source's EP coordinate and the live
+                # rollout's global expert count. Newer publishers already
+                # provide a distinct global id and skip this compatibility path.
+                source_ep_size = int(
+                    cand.megatron_meta.ep_size
+                    if cand.megatron_meta is not None
+                    else len(ordered)
+                )
+                source_ep_rank = int(
+                    cand.megatron_meta.ep_rank
+                    if cand.megatron_meta is not None
+                    else 0
+                )
+                if (
+                    is_expert
+                    and gid == lid
+                    and source_ep_size > 1
+                    and upd.num_experts > 0
+                ):
+                    local_count = int(upd.num_experts) // source_ep_size
+                    gid = source_ep_rank * local_count + lid
+                    extras["expert_id"] = str(gid)
+                # Bridge introspection on an EP rank may key the sidecar by
+                # global weight index (weight64) while the published local
+                # parameter is named weight0. Prefer the global key derived
+                # from descriptor extras, then fall back to the local key for
+                # older sidecars.
+                global_lookup = lookup_name
+                if is_expert and gid >= 0 and lid >= 0:
+                    global_lookup = re.sub(
+                        rf"weight{lid}$",
+                        f"weight{gid}",
+                        lookup_name,
+                    )
+                hfs = list(
+                    name_map.get(
+                        global_lookup,
+                        name_map.get(
+                            lookup_name,
+                            name_map.get(td.name, [td.name]),
+                        ),
+                    )
+                )
+                if is_expert:
                     if wanted is not None and gid not in wanted:
                         continue
                     hfs = [_globalize(h, lid, gid) for h in hfs]
-                    nm_c[td.name] = hfs
                 else:
                     # replicated/dense: only pull from the first source that has it
                     if td.name in seen_nonexpert:
                         continue
                     seen_nonexpert.add(td.name)
+                nm_c[td.name] = hfs
                 specs[td.name] = ReceiveSpec(
                     megatron_name=td.name, hf_names=hfs, role=td.megatron_role,
                     target_shape=tuple(int(s) for s in td.global_shape),
@@ -505,7 +573,20 @@ class MxVllmWeightUpdater:
                 pull=lambda _s, _d: None, device=device, pre_assembled_buffers=pre,
             ):
                 hf_results.setdefault(hf_name, hf_t)
-        weights = list(hf_results.items())
+        def _load_order(item: tuple[str, torch.Tensor]) -> tuple[int, int, str]:
+            name = item[0]
+            match = re.search(r"\.layers\.(\d+)\.", name)
+            if match:
+                return (1, int(match.group(1)), name)
+            if "embed_tokens" in name:
+                return (0, 0, name)
+            return (2, 0, name)
+
+        # vLLM's layerwise reload wrapper only releases temporary module
+        # buffers when a parent layer is complete. EP-source insertion order
+        # interleaves every layer and can retain ~model-size extra HBM; natural
+        # layer order bounds the temporary working set to one layer.
+        weights = sorted(hf_results.items(), key=_load_order)
         missing = sorted(expected_hf.difference(hf_results))
         if missing:
             sample = ", ".join(missing[:8])

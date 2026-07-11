@@ -420,16 +420,23 @@ class MegatronReceiverContext:
 def discover_megatron_context(
     candidates: list[V2SourceCandidate],
 ) -> tuple[MegatronTransformerConfig | None, dict[str, list[str]]]:
-    """Inspect candidates for the first Megatron source and pull its
-    config + name map. Returns ``(None, {})`` if no Megatron source.
+    """Merge Megatron config + name maps across all source ranks.
+
+    Dense mappings are identical, but EP Bridge introspection can emit only
+    the global expert names owned by that source rank. Returning the first
+    source's map silently leaves other EP ranks unmapped, so union all maps
+    while retaining the first valid transformer config.
     """
+    config: MegatronTransformerConfig | None = None
+    merged_name_map: dict[str, list[str]] = {}
     for c in candidates:
         if c.megatron_meta is None:
             continue
         cfg, name_map = parse_megatron_sidecar(c)
-        if cfg is not None or name_map:
-            return cfg, name_map
-    return None, {}
+        if config is None and cfg is not None:
+            config = cfg
+        merged_name_map.update(name_map)
+    return config, merged_name_map
 
 
 def run_refit_cycle(
