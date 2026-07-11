@@ -638,6 +638,29 @@ class MxVllmWeightUpdater:
     def _verify(self, weights: list[tuple[str, torch.Tensor]], gt_path: str) -> None:
         gt = torch.load(gt_path, map_location="cpu", weights_only=False, mmap=True)
         gt = gt.get("hf_weights", gt) if isinstance(gt, dict) else gt
-        ok = sum(1 for k, v in weights
-                 if k in gt and torch.equal(v.cpu(), gt[k].cpu()))
-        logger.info("[mx-wt-verify] byte-identity: %d/%d match", ok, len(weights))
+        got = dict(weights)
+        missing = sorted(set(gt).difference(got))
+        extra = sorted(set(got).difference(gt))
+        drift: list[str] = []
+        ok = 0
+        for name in sorted(set(got).intersection(gt)):
+            value = got[name].detach().cpu()
+            expected = gt[name].detach().cpu()
+            if value.shape == expected.shape and torch.equal(value, expected):
+                ok += 1
+            else:
+                drift.append(name)
+        logger.info(
+            "[mx-wt-verify] byte-identity: %d ok / %d drift / %d missing / "
+            "%d extra / %d GT",
+            ok,
+            len(drift),
+            len(missing),
+            len(extra),
+            len(gt),
+        )
+        if missing or drift or extra:
+            raise RuntimeError(
+                "[mx-wt-verify] byte-identity failed: "
+                f"drift={drift[:5]} missing={missing[:5]} extra={extra[:5]}"
+            )

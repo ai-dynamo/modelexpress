@@ -551,6 +551,35 @@ def test_discover_megatron_context(env):
     assert cfg == cfg_in
     assert m == {"a": ["b"]}
 
+    # EP ranks can carry disjoint global expert mappings; discovery must merge
+    # all sidecars rather than returning only the first rank's map.
+    ep1_cand = v2.V2SourceCandidate(
+        ref=ref_cls(
+            mx_source_id="ep1",
+            worker_id="ep1-worker",
+            model_name="m",
+            worker_rank=1,
+            training_step=1,
+        ),
+        role=v2.ROLE_TRAINER,
+        worker_rank=1,
+        registry={
+            translator.SIDECAR_TRANSFORMER_CONFIG_KEY: cfg_in.to_dict(),
+            translator.SIDECAR_HF_NAME_MAP_KEY: [("expert.weight32", ["experts.32"])],
+        },
+        owned_experts_per_layer={},
+        updated_at=0,
+        megatron_meta=v2.MegatronSourceMeta(
+            tp_rank=0,
+            tp_size=1,
+            ep_rank=1,
+            ep_size=2,
+        ),
+    )
+    cfg, m = translator.discover_megatron_context([mt_cand, ep1_cand])
+    assert cfg == cfg_in
+    assert m == {"a": ["b"], "expert.weight32": ["experts.32"]}
+
 
 # ---------------------------------------------------------------------------
 # Test 8 — grouped per-expert linear_fc2 (row-parallel down_proj):
