@@ -96,6 +96,18 @@ class MdlLoader:
         self._moe_module_cache: dict[str, Any] = {}
         self._layout_sig: tuple | None = None
         self._cycles = 0
+        self._tp_size = 1
+        self._tp_rank = 0
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            self._tp_size = int(get_tensor_model_parallel_world_size())
+            self._tp_rank = int(get_tensor_model_parallel_rank())
+        except Exception:  # noqa: BLE001
+            pass
         # H1: some quantized models (block-fp8 MoE) replace their parameters in
         # process_weights_after_loading, so vLLM's own load_weights is not
         # re-entrant (it reads param.output_dim etc. that the processed params
@@ -199,23 +211,82 @@ class MdlLoader:
         self._layout_sig = None
 
     # ---- warm path ----
+    def _tp_local_tensor(
+        self,
+        tensor: torch.Tensor,
+        expected_shape: tuple[int, ...],
+    ) -> torch.Tensor | None:
+        """Return this TP rank's contiguous shard when ``tensor`` is global."""
+        if tuple(tensor.shape) == expected_shape:
+            return tensor
+        if self._tp_size <= 1 or tensor.ndim != len(expected_shape):
+            return None
+        candidates = []
+        for axis, (loaded, expected) in enumerate(
+            zip(tensor.shape, expected_shape, strict=True)
+        ):
+            if int(loaded) != int(expected) * self._tp_size:
+                continue
+            if all(
+                dim == axis or int(tensor.shape[dim]) == int(expected_shape[dim])
+                for dim in range(tensor.ndim)
+            ):
+                candidates.append(axis)
+        if len(candidates) != 1:
+            return None
+        axis = candidates[0]
+        local = int(expected_shape[axis])
+        return tensor.narrow(axis, self._tp_rank * local, local).contiguous()
+
+    def _tp_shape_compatible(
+        self,
+        loaded_shape: tuple[int, ...],
+        expected_shape: tuple[int, ...],
+    ) -> bool:
+        if loaded_shape == expected_shape:
+            return True
+        if self._tp_size <= 1 or len(loaded_shape) != len(expected_shape):
+            return False
+        mismatches = [
+            index
+            for index, (loaded, expected) in enumerate(
+                zip(loaded_shape, expected_shape, strict=True)
+            )
+            if int(loaded) != int(expected)
+        ]
+        return (
+            len(mismatches) == 1
+            and int(loaded_shape[mismatches[0]])
+            == int(expected_shape[mismatches[0]]) * self._tp_size
+        )
+
     def _try_write(self, hf_name: str, tensor: torch.Tensor) -> str | None:
         """In-place write `tensor` into its mapped slot if known; return the
         class it was written as (``direct``/``fused``/``expert``) or ``None``."""
         d = self._fused.get(hf_name)
         if d is not None:
             param, axis, off, sz = d
-            param.data.narrow(axis, off, sz).copy_(tensor, non_blocking=True)
+            dest = param.data.narrow(axis, off, sz)
+            local = self._tp_local_tensor(tensor, tuple(dest.shape))
+            if local is None:
+                return None
+            dest.copy_(local, non_blocking=True)
             return "fused"
         e = self._expert.get(hf_name)
         if e is not None:
             param, eid, axis, off, sz = e
-            param.data[eid].narrow(axis, off, sz).copy_(tensor, non_blocking=True)
+            dest = param.data[eid].narrow(axis, off, sz)
+            local = self._tp_local_tensor(tensor, tuple(dest.shape))
+            if local is None:
+                return None
+            dest.copy_(local, non_blocking=True)
             return "expert"
         p = self._direct.get(hf_name)
-        if p is not None and tuple(p.shape) == tuple(tensor.shape):
-            p.data.copy_(tensor, non_blocking=True)
-            return "direct"
+        if p is not None:
+            local = self._tp_local_tensor(tensor, tuple(p.shape))
+            if local is not None:
+                p.data.copy_(local, non_blocking=True)
+                return "direct"
         return None
 
     def _warm_load(self, weights: list[tuple[str, torch.Tensor]]) -> None:
@@ -296,7 +367,10 @@ class MdlLoader:
         groups: dict[str, list[tuple[int, str, int]]] = {}
         for hf_name in name_to_shape:
             param = params.get(hf_name)
-            if param is not None and tuple(param.shape) == name_to_shape[hf_name]:
+            if param is not None and self._tp_shape_compatible(
+                name_to_shape[hf_name],
+                tuple(param.shape),
+            ):
                 self._direct[hf_name] = param
                 continue
             if ".experts." in hf_name and expert_lookup:
@@ -318,6 +392,15 @@ class MdlLoader:
         for fused_name, members in groups.items():
             fused_param = params[fused_name]
             members.sort(key=lambda m: m[0])
+            full_rows = sum(rows for _o, _name, rows in members)
+            if (
+                self._tp_size > 1
+                and full_rows == int(fused_param.shape[0]) * self._tp_size
+            ):
+                members = [
+                    (order, name, rows // self._tp_size)
+                    for order, name, rows in members
+                ]
             off = 0
             for _o, hf_name, rows in members:
                 self._fused[hf_name] = (fused_param, 0, off, rows)
@@ -341,17 +424,13 @@ class MdlLoader:
             local = self._map_global_to_local(fused_name, eid)
             if local is None or local < 0 or local >= int(fp.shape[0]):
                 return None
-            rows = hf_shape[0]
             if shard == "w1":
-                axis, off, sz = 0, 0, rows
+                axis, off, sz = 0, 0, int(fp.shape[1]) // 2
             elif shard == "w3":
-                axis, off, sz = 0, rows, rows
+                local_rows = int(fp.shape[1]) // 2
+                axis, off, sz = 0, local_rows, local_rows
             else:  # w2
                 axis, off, sz = 0, 0, int(fp.shape[1])
-            if shard in ("w1", "w3") and sz != rows:
-                return None
-            if shard == "w2" and int(fp.shape[1]) != rows:
-                return None
             return (fp, local, axis, off, sz)
         return None
 
