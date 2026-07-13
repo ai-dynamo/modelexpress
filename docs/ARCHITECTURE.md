@@ -763,11 +763,11 @@ graph TD
 1. **Source loads**: Loads weights from storage (S3/GCS/Azure/local via ModelStreamer, GDS, or disk), runs `process_weights_after_loading()`
 2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then a `PublisherThread` calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
 3. **Publisher heartbeats**: `PublisherThread` sends `UpdateStatus(READY)` every 30s after publication succeeds, refreshing `updated_at`
-4. **Target discovers**: Calls `ListSources(identity, status=READY)`, filters by `worker_rank`
+4. **Target discovers**: Calls `ListSources(identity, status=READY)`, which returns only READY workers whose `updated_at` is still within `MX_HEARTBEAT_TIMEOUT_SECS`, then filters by `worker_rank`
 5. **Target fetches on demand**: Calls `GetMetadata(mx_source_id, worker_id)` for the chosen candidate. Auto-detects P2P mode if `worker_grpc_endpoint` is populated - fetches tensors or artifact manifest metadata from the source worker's `WorkerService` and NIXL metadata via the listen thread instead of from the central server.
 6. **Target transfers**: Executes RDMA reads from source; for cache artifacts, it prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. On `SourceTransferError` tries next candidate (max 3)
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
-8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; GC deletes after 1 hour
+8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
 Cache artifact checksums protect transfer integrity but do not authenticate the
 source or attest the contents. TorchInductor, Triton, DeepGEMM, TileLang, CuTe
