@@ -33,7 +33,7 @@ from modelexpress.reshard_refit.cuda_pool import classic_cuda_alloc
 from modelexpress.reshard_refit.transfer_plan import execute_transfer, plan_transfer
 from modelexpress.reshard_refit.rendezvous import gather_sources
 from modelexpress.reshard_refit.transport import NixlReshardTransport, ReadDescriptor
-from modelexpress.reshard_refit.types import CaptureResult
+from modelexpress.reshard_refit.types import CaptureResult, UnsupportedReshard
 
 logger = logging.getLogger("modelexpress.reshard_refit.receiver")
 
@@ -164,10 +164,14 @@ class ReshardReceiver:
         # their buffer addresses are stable for the run.
         plan = plan_transfer(capture, sources)
         if plan.fallback:
-            logger.warning(
-                "[reshard] %d source(s) fell back to full-pull (unsupported ops): %s",
-                len(plan.fallback),
-                plan.fallback[:10],
+            # Fallback params are dropped from the RDMA plan and never pulled or
+            # installed, so they would silently keep their initial (base-model)
+            # weights for the entire run. Until the full-pull/loader path exists
+            # (TODO), fail loudly rather than serve stale weights.
+            raise UnsupportedReshard(
+                f"[reshard] {len(plan.fallback)} source(s) need the unimplemented "
+                f"full-pull path (unsupported reshard ops); refusing to serve stale "
+                f"weights. Params: {plan.fallback[:10]}"
             )
         self._transport = NixlReshardTransport(self._manager, session_to_agent, session_to_device, timeout_seconds=timeout)
         self._plan = plan

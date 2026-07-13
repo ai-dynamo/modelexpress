@@ -48,7 +48,7 @@ def test_groups_per_session_and_resolves_agent_device():
     assert len(mgr.calls) == 2
     by_agent = {c[0]: c for c in mgr.calls}
 
-    a_agent, a_ranges, a_mem, a_timeout = by_agent["trainer-agent-A"]
+    _a_agent, a_ranges, a_mem, a_timeout = by_agent["trainer-agent-A"]
     assert a_mem == "VRAM" and a_timeout == 30.0
     # (remote_addr, local_addr, nbytes, remote_device_id); device 3 for sA.
     assert a_ranges == [(1000, 10, 16, 3), (1016, 26, 16, 3)]

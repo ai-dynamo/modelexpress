@@ -177,8 +177,16 @@ class VllmReshardReceiver(ReshardReceiver):
             for module, attrs in bare_snapshot.items():
                 for n, boot_t in attrs.items():
                     cur = module.__dict__.get(n)
-                    if isinstance(cur, torch.Tensor) and cur is not boot_t and cur.shape == boot_t.shape and cur.dtype == boot_t.dtype:
-                        boot_t.data.copy_(cur)
+                    if isinstance(cur, torch.Tensor) and cur is not boot_t:
+                        if cur.shape == boot_t.shape and cur.dtype == boot_t.dtype:
+                            boot_t.data.copy_(cur)
+                        else:
+                            logger.error(
+                                "[reshard] bare-attr %s.%s changed shape/dtype across refit "
+                                "(cur %s/%s vs boot %s/%s); skipping copy, re-attaching STALE boot tensor",
+                                type(module).__name__, n, tuple(cur.shape), cur.dtype,
+                                tuple(boot_t.shape), boot_t.dtype,
+                            )
                     setattr(module, n, boot_t)
 
         # Sanity: any param/buffer left on meta after the restore is a CUDA-graph

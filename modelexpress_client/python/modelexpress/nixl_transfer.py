@@ -681,22 +681,24 @@ class NixlTransferManager:
         remote_descs = [(remote_addr, nbytes, dev) for (remote_addr, _local, nbytes, dev) in ranges]
         local_descs = [(local_addr, nbytes, self._device_id) for (_remote, local_addr, nbytes, _dev) in ranges]
 
-        # Diagnostic: what we ask NIXL to READ from the remote. NIXL_ERR_NOT_FOUND
-        # at prep means these (addr,size,dev) aren't in a registered region of
-        # remote_agent_name as this agent knows it.
-        try:
-            _known = self._agent.check_remote_metadata(remote_agent_name)
-        except Exception:
-            _known = "n/a"
-        logger.info(
-            "execute_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
-            remote_agent_name,
-            mem,
-            len(remote_descs),
-            _known,
-            [(hex(a), n, d) for (a, n, d) in remote_descs[:3]],
-            self._device_id,
-        )
+        # Diagnostic (DEBUG only): what we ask NIXL to READ from the remote.
+        # NIXL_ERR_NOT_FOUND at prep means these (addr,size,dev) aren't in a
+        # registered region of remote_agent_name as this agent knows it. Gated so
+        # steady-state refits don't pay the check_remote_metadata call + formatting.
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                _known = self._agent.check_remote_metadata(remote_agent_name)
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never break the transfer
+                _known = f"n/a ({exc!r})"
+            logger.debug(
+                "execute_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
+                remote_agent_name,
+                mem,
+                len(remote_descs),
+                _known,
+                [(hex(a), n, d) for (a, n, d) in remote_descs[:3]],
+                self._device_id,
+            )
 
         start_time = time.perf_counter()
         handle = None
