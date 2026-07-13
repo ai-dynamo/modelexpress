@@ -84,7 +84,7 @@ class MetricsCollector:
             self.candidates = Histogram(
                 "mx_p2p_candidates",
                 "Candidate count at a selection stage.",
-                ["policy", "scheme", "stage"],  # listed|rank_matched
+                ["policy", "scheme", "stage"],  # listed|rank_matched|accelerator_matched
                 buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128),
             )
             self.selection_seconds = Histogram(

@@ -199,6 +199,7 @@ impl P2pService for P2pServiceImpl {
                 worker_id: info.worker_id,
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
+                accelerator: info.accelerator,
             })
             .collect();
 
@@ -521,6 +522,7 @@ mod tests {
                         metadata_endpoint: String::new(),
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
+                        accelerator: String::new(),
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -670,6 +672,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
+                    accelerator: "cuda".to_string(),
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -678,6 +681,7 @@ mod tests {
                     worker_rank: 1,
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
+                    accelerator: "cuda".to_string(),
                 },
             ])
         });
@@ -718,6 +722,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
+                    accelerator: "cuda".to_string(),
                 }])
             });
 
@@ -751,6 +756,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
+                    accelerator: "cuda".to_string(),
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -759,6 +765,7 @@ mod tests {
                     worker_rank: 1,
                     status: SourceStatus::Ready as i32,
                     updated_at: expired_updated_at,
+                    accelerator: "cuda".to_string(),
                 },
             ])
         });
@@ -796,6 +803,7 @@ mod tests {
                         metadata_endpoint: "10.0.0.1:5555".to_string(),
                         agent_name: "artifact-agent".to_string(),
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
+                        accelerator: "cuda".to_string(),
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),

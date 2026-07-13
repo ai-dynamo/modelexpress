@@ -51,6 +51,9 @@ pub struct SourceInstanceInfo {
     pub status: i32,
     /// Timestamp of last status update (unix millis).
     pub updated_at: i64,
+    /// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+    /// Empty when unknown (records that predate the field).
+    pub accelerator: String,
 }
 
 /// Backend-specific metadata for a worker
@@ -123,6 +126,8 @@ pub struct WorkerRecord {
     pub agent_name: String,
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     pub worker_grpc_endpoint: String,
+    /// Runtime accelerator family for compatibility filtering.
+    pub accelerator: String,
     /// Small discovery summary for file-backed artifact sources.
     pub artifact_source: Option<ArtifactSourceMetadataRecord>,
 }
@@ -177,6 +182,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             metadata_endpoint: meta.metadata_endpoint,
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
+            accelerator: meta.accelerator,
             artifact_source,
         }
     }
@@ -232,6 +238,7 @@ impl From<WorkerRecord> for WorkerMetadata {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            accelerator: record.accelerator,
             tensors: legacy_tensors,
             source_payload: Some(source_payload),
         }

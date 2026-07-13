@@ -41,12 +41,13 @@ def _ctx(worker_id="target-0", worker_rank=0, model_name="m"):
     )
 
 
-def _ref(mx_source_id, worker_id, worker_rank=0, model_name="m"):
+def _ref(mx_source_id, worker_id, worker_rank=0, model_name="m", accelerator=""):
     return p2p_pb2.SourceInstanceRef(
         mx_source_id=mx_source_id,
         worker_id=worker_id,
         model_name=model_name,
         worker_rank=worker_rank,
+        accelerator=accelerator,
     )
 
 
@@ -228,6 +229,49 @@ def test_find_source_instances_empty_on_list_error():
     assert RdmaStrategy()._find_source_instances(ctx) == []
 
 
+def test_find_source_instances_filters_incompatible_accelerator():
+    # A compatible source ranked last must survive incompatible ones ranked
+    # first, since filtering happens before the MAX_SOURCE_RETRIES slice.
+    # "other" is a placeholder for any non-matching accelerator family; the
+    # filter compares the strings and does not enumerate known backends.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "match-0", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "other-0", accelerator="other"),
+        _ref("s2aaaaaaaaaaaaaa", "other-1", accelerator="other"),
+        _ref("s3aaaaaaaaaaaaaa", "other-2", accelerator="other"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"match-0"}
+
+
+def test_find_source_instances_empty_accelerator_is_compatible():
+    # Empty source accelerator (records that predate the field) is treated as
+    # unknown and accepted; a populated mismatch is still filtered.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "legacy", accelerator=""),
+        _ref("s1aaaaaaaaaaaaaa", "other-0", accelerator="other"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"legacy"}
+
+
+def test_find_source_instances_unknown_target_accepts_all():
+    # Empty target accelerator (unknown) accepts every source regardless of
+    # the source's published accelerator.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "match-0", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "other-0", accelerator="other"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.accelerator_backend.name = ""
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"match-0", "other-0"}
+
+
 def test_load_slices_to_max_source_retries():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(5))
@@ -252,6 +296,7 @@ def test_load_metadata_miss_tries_next_candidate():
     strat._fetch_worker_metadata = MagicMock(side_effect=[None, worker])
     strat._load_as_target = MagicMock(return_value="loaded")
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
@@ -277,6 +322,7 @@ def test_load_transfer_failure_does_not_try_next_source():
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
@@ -364,8 +410,10 @@ def test_load_records_success_metrics(monkeypatch):
     strat._find_source_instances = MagicMock(return_value=cands)
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
     strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
-    assert strat.load(MagicMock(), MagicMock(global_rank=0)) == "loaded"
+    assert strat.load(MagicMock(), ctx) == "loaded"
     m.record_selection.assert_called_once_with("random", cands[0].worker_id)
     m.record_attempt.assert_any_call("random", "success")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "success")
@@ -379,9 +427,11 @@ def test_load_records_transfer_fallback_metrics(monkeypatch):
     strat._load_as_target = MagicMock(
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     with pytest.raises(StrategyFailed):
-        strat.load(MagicMock(), MagicMock(global_rank=0))
+        strat.load(MagicMock(), ctx)
     m.record_attempt.assert_any_call("random", "transfer_fallback")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "fallback")
 

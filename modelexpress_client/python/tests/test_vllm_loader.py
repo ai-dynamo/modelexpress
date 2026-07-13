@@ -1159,6 +1159,26 @@ class TestRdmaStrategyLoad:
 
         assert exc.value.mutated is False
 
+    def test_skips_mismatched_accelerator_before_target(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
+        source_resp.worker.accelerator = "cuda"
+        candidates = [_make_instance_ref(worker_id="w-1")]
+        strategy, attempts = self._setup(ctx, candidates, [source_resp])
+
+        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+            with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
+                strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is False
+        assert attempts == []
+
     def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
@@ -1237,6 +1257,7 @@ class TestPublishMetadataAndReady:
         mx_client.publish_metadata.assert_called_once()
         call_args = mx_client.publish_metadata.call_args
         assert call_args.args[0] is identity
+        assert call_args.args[1].accelerator == "cuda"
         assert call_args.args[2] == "inst-uuid"
 
     def test_publish_fn_retries_publish(self):

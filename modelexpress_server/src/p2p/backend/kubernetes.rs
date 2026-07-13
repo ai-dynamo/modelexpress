@@ -283,6 +283,7 @@ impl MetadataBackend for KubernetesBackend {
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            accelerator: worker_record.accelerator.clone(),
             artifact_source: worker_record
                 .artifact_source
                 .clone()
@@ -433,6 +434,7 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                accelerator: worker_status.accelerator.clone(),
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
@@ -537,6 +539,13 @@ impl MetadataBackend for KubernetesBackend {
                 })
                 .unwrap_or((0, 0));
 
+            let accelerator = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.accelerator.clone())
+                .unwrap_or_default();
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
@@ -544,6 +553,7 @@ impl MetadataBackend for KubernetesBackend {
                 worker_rank,
                 status,
                 updated_at,
+                accelerator,
             });
         }
 

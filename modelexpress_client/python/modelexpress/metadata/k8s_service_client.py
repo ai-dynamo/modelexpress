@@ -246,6 +246,7 @@ class MxK8sServiceClient(MxClientBase):
                     tensor_source=tensor_source_metadata(resp.tensors),
                     status=p2p_pb2.SOURCE_STATUS_READY,
                     worker_grpc_endpoint=endpoint,
+                    accelerator=resp.accelerator,
                 )
                 logger.info(
                     "MxK8sServiceClient.get_metadata: fetched "

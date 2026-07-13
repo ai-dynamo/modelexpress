@@ -85,6 +85,9 @@ spec:
                     workerGrpcEndpoint:
                       type: string
                       description: P2P worker gRPC endpoint for tensor manifest (host:port)
+                    accelerator:
+                      type: string
+                      description: Runtime accelerator family for compatibility filtering
                     artifactSource:
                       type: object
                       description: Small discovery summary for file-backed artifact sources
